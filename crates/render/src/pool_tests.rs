@@ -9,18 +9,22 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bms_model::TimeUs;
 use skin_model::chart_image::{
     ChartDir, ChartImage, ChartStretch, ChartUv, Fitted, POOL_LAYER, Slot, read,
 };
 use skin_model::{
-    Anchor, Ease, ElementDef, End, Filter, Fit, KeptLayers, KeyDef, Place, Region, RegionDef, Root,
-    ScreenKind, SelectionDefs, Side, Skin, SkinDef, SolidImageDef, Source, TimerRef, Track,
-    Variant, WidgetDefs, selection_timer,
+    Anchor, AppReadouts, Ease, ElementDef, End, Filter, Fit, KeptLayers, KeyDef, Layout, Place,
+    Region, RegionDef, Root, ScreenKind, SelectionDefs, SelectionFrame, SelectionTimers, Side,
+    Skin, SkinDef, SolidImageDef, Source, TimerRef, Track, Variant, WidgetDefs, selection_timer,
 };
 
-use super::{PoolWriteError, Renderer, SHARED_TEXELS, pool_fault};
+use super::{
+    Class, DestroyRecord, Destroyed, Part, PoolWriteError, RenderError, Renderer, SHARED_TEXELS,
+    pool_fault,
+};
 use crate::{ClipTable, SkinBundle};
 
 /// One layer of the pool of [`pool_bundle`]'s skin at 1 920×1 080: its
@@ -306,10 +310,11 @@ fn a_refused_pool_write_clears_its_slot() {
     assert_eq!(r.pool_table(l.generation, 1), None);
 }
 
-/// The pool given up to another kind's candidate keeps its firm layer
-/// when the device refuses the smaller array, and none when it refuses
-/// that too: its charges go with it, and the candidate is admitted. The
-/// next regrowth makes it again.
+/// The pool given up to another kind's candidate is retired at once, its
+/// smaller array owed; made once the retired one is destroyed, it keeps
+/// its firm layer when the device refuses the smaller array, and none
+/// when it refuses that too: its charges go with it, and the candidate is
+/// admitted. The next regrowth makes it again.
 #[test]
 fn a_reduced_pool_keeps_its_firm_layer_or_none() {
     let mut r = crate::test_common::offscreen(1_920, 1_080);
@@ -327,8 +332,6 @@ fn a_reduced_pool_keeps_its_firm_layer_or_none() {
     // A decision candidate as large as play's skin fits with one optional
     // layer.
     r.state_charge(&p, SHARED_TEXELS - sel - tiny - LAYER);
-    // The two-layer array is refused, then the firm layer alone: no pool.
-    r.pool_faults.set(2);
     let d = crate::test_decl::solid_bundle(
         &r,
         &crate::test_decl::Look::left([0, 0, 255, 255]),
@@ -336,6 +339,13 @@ fn a_reduced_pool_keeps_its_firm_layer_or_none() {
     );
     commit(&mut r, ScreenKind::Decision, &d, 3);
     assert_eq!(r.pool(), None);
+    assert!(r.pool_owed());
+    crate::test_common::settle(&mut r);
+    // The two-layer array is refused, then the firm layer alone: no pool.
+    r.pool_faults.set(2);
+    assert!(r.make_owed_pool());
+    assert_eq!(r.pool(), None);
+    assert!(!r.pool_owed());
     let a = r.admission();
     assert_eq!((a.firm, a.pool), (0, 0));
     assert_eq!(a.charge(ScreenKind::Selection), sel - LAYER);
@@ -351,13 +361,19 @@ fn a_reduced_pool_keeps_its_firm_layer_or_none() {
     let whole = r.regrow_pool().unwrap();
     assert_eq!(whole.layers, 4);
     r.state_charge(&p, SHARED_TEXELS - sel - 2 * tiny - LAYER);
-    r.pool_faults.set(1);
     let result = crate::test_decl::solid_bundle(
         &r,
         &crate::test_decl::Look::left([0, 255, 0, 255]),
         [16, 16],
     );
+    // The regrowth's retired array, still undestroyed, is destroyed in the
+    // staging's call before the whole one is retired.
+    assert_eq!(r.admission().retired_pool, 2 * LAYER);
     commit(&mut r, ScreenKind::Result, &result, 4);
+    assert_eq!(r.admission().retired_pool, 4 * LAYER);
+    crate::test_common::settle(&mut r);
+    r.pool_faults.set(1);
+    assert!(r.make_owed_pool());
     let firm = r.pool().unwrap();
     assert_eq!(firm.layers, 1);
     assert!(firm.generation > whole.generation);
@@ -368,9 +384,10 @@ fn a_reduced_pool_keeps_its_firm_layer_or_none() {
 }
 
 /// Every pool array takes a new generation, from a counter of the
-/// process: the install, a reduction for another kind's candidate, a
-/// regrowth, a restore and a renderer built again; removing the selection
-/// ends it, and a write of an ended generation is stale.
+/// process: the install, the owed array after a reduction for another
+/// kind's candidate, a regrowth, a restore and a renderer built again;
+/// removing the selection ends it, and a write of an ended generation is
+/// stale.
 #[test]
 fn each_pool_array_takes_a_new_generation_and_removal_ends_it() {
     let mut r = crate::test_common::offscreen(1_920, 1_080);
@@ -394,6 +411,9 @@ fn each_pool_array_takes_a_new_generation_and_removal_ends_it() {
         [16, 16],
     );
     commit(&mut r, ScreenKind::Decision, &d, 3);
+    assert_eq!(r.pool(), None);
+    crate::test_common::settle(&mut r);
+    assert!(r.make_owed_pool());
     let g2 = r.pool().unwrap();
     assert_eq!(g2.layers, 2);
     assert!(g2.generation > g1);
@@ -432,4 +452,471 @@ fn each_pool_array_takes_a_new_generation_and_removal_ends_it() {
     let mut again = crate::test_common::offscreen(1_920, 1_080);
     again.restore(ScreenKind::Selection, &installation).unwrap();
     assert!(again.pool().unwrap().generation > g4.generation);
+}
+
+/// The "chart pool" textures the device's allocator holds now, by their
+/// label (the placeholder's is another).
+fn pool_allocations(r: &Renderer) -> usize {
+    let report = r
+        .gpu
+        .device()
+        .generate_allocator_report()
+        .expect("the device's allocator report");
+    report
+        .allocations
+        .iter()
+        .filter(|a| a.name == "chart pool")
+        .count()
+}
+
+/// Play's tiny skin and the pool's selection committed, play's charged so
+/// that a tiny decision candidate fits with one optional layer: (play's
+/// bundle, the selection's, a tiny candidate's charge).
+fn pooled(r: &mut Renderer, dir: &Path) -> (Arc<SkinBundle>, Arc<SkinBundle>, u64) {
+    let p = solid(r, [255, 0, 0, 255]);
+    commit(r, ScreenKind::Play, &p, 1);
+    let b = pool_bundle(r, dir);
+    commit(r, ScreenKind::Selection, &b, 2);
+    let tiny = p.atlas_texels();
+    let sel = r.admission().charge(ScreenKind::Selection);
+    r.state_charge(&p, SHARED_TEXELS - sel - tiny - LAYER);
+    (p, b, tiny)
+}
+
+/// A tiny solid bundle of `rgba` over the left half.
+fn solid(r: &Renderer, rgba: [u8; 4]) -> Arc<SkinBundle> {
+    crate::test_decl::solid_bundle(r, &crate::test_decl::Look::left(rgba), [16, 16])
+}
+
+/// The destructions recorded since `from` of them were.
+fn recorded_since(r: &Renderer, from: usize) -> Vec<DestroyRecord> {
+    let all: Vec<_> = r.destructions().copied().collect();
+    let n = r.destructions_recorded() - from;
+    all[all.len() - n..].to_vec()
+}
+
+/// Polls the completion and destroys what is due, one heavy part a round,
+/// until the list holds nothing: the destructions recorded meanwhile.
+fn poll_until_destroyed(r: &mut Renderer) -> Vec<DestroyRecord> {
+    let from = r.destructions_recorded();
+    let began = Instant::now();
+    while r.filled() > 0 {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "still filled after 10 s"
+        );
+        r.poll_completion().unwrap();
+        let _ = r.destroy_due(true);
+        std::thread::yield_now();
+    }
+    recorded_since(r, from)
+}
+
+/// Every destruction in `records` came once a completion covering its
+/// last use was seen, on this thread.
+#[track_caller]
+fn each_after_its_completion(records: &[DestroyRecord]) {
+    assert!(!records.is_empty(), "nothing destroyed");
+    for d in records {
+        assert!(d.last_use <= d.seen, "{d:?}");
+        assert_eq!(d.thread, std::thread::current().id());
+    }
+}
+
+/// A selection frame of `b` built at 1 920×1 080 and submitted: presented
+/// unless the target is minimized.
+fn selection_frame(r: &mut Renderer, b: &SkinBundle) -> bool {
+    let mut sel = b.skin().prepare_selection();
+    let layout = Layout::AUTHOR;
+    let f = SelectionFrame {
+        now: TimeUs(0),
+        target: [1_920, 1_080],
+        layout: &layout,
+        timers: SelectionTimers::default(),
+        app: AppReadouts::LAUNCH,
+        pointer: None,
+    };
+    r.build_selection(&mut sel, &f, &[]).unwrap();
+    r.submit_selection(&[]).unwrap().presented()
+}
+
+/// V8a with a queued last use `S + 1` while the newest seen covers `S`:
+/// the pool's live array, retired by a reduction, is not destroyed at a
+/// boundary before a completion covering its last use is seen; the
+/// rolling watch submits the queued write, sees it, and the array is
+/// destroyed then. The device's allocator lists the retired array until
+/// its destruction and not after.
+fn the_retired_pool_waits(r: &mut Renderer, tiny: u64, s: u64) {
+    assert_eq!((r.gpu.seen(), r.gpu.latest()), (s, s));
+    assert!(r.gpu.write_queued());
+    assert_eq!(pool_allocations(r), 1, "the live pool");
+    r.admit_reclaiming(ScreenKind::Decision, tiny).unwrap();
+    assert_eq!(r.pool(), None, "retired at the reduction");
+    assert!(r.pool_owed());
+    assert_eq!(r.filled(), 1);
+    assert_eq!(pool_allocations(r), 1, "the retired pool dropped");
+    assert_eq!(
+        r.destroy_due(true),
+        Destroyed::default(),
+        "destroyed before its completion was seen"
+    );
+    assert!(r.pending_completion());
+    let records = poll_until_destroyed(r);
+    let [d] = records[..] else {
+        panic!("{records:?}");
+    };
+    assert_eq!(
+        (d.kind, d.class, d.part, d.in_call),
+        (ScreenKind::Selection, Class::RetiredPool, Part::Pool, false)
+    );
+    assert_eq!(d.last_use, s + 1);
+    assert!(d.seen > s, "no completion covering S + 1 seen: {d:?}");
+    assert_eq!(pool_allocations(r), 0, "the retired pool kept");
+}
+
+// Revert: `Filled::due` true whatever the last use -> `destroy_due`
+// before any poll destroys the pool, its write still queued.
+#[test]
+fn a_retired_pool_waits_for_its_queued_write() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, b, tiny) = pooled(&mut r, dir.path());
+    let l = r.pool().unwrap();
+    // The newest seen covers S, the pool's creation included.
+    let (s, _) = r.gpu.submit([]);
+    super::wait_for_gpu(&r.gpu).unwrap();
+    assert!(!r.gpu.write_queued());
+    // A write queued, which S + 1 will carry.
+    let stage = picture(l.cells.stage.unwrap(), [30, 50], [200, 10, 10]);
+    r.write_pool(l.generation, 0, Some(&stage), None).unwrap();
+    // Minimized: the selection frame returns before its submission.
+    r.resize(0, 0);
+    assert!(!selection_frame(&mut r, &b));
+    the_retired_pool_waits(&mut r, tiny, s);
+}
+
+// Revert: `ChartPool::create` recording the latest submission as its last
+// use, not the next -> the pool is destroyed at the first boundary, its
+// creation's writes still queued.
+#[test]
+fn a_retired_pool_waits_for_its_creation() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, tiny) = pooled(&mut r, dir.path());
+    // No frame since: the creation's writes are still queued.
+    let s = r.gpu.latest();
+    the_retired_pool_waits(&mut r, tiny, s);
+}
+
+// Revert: `reduce_pool` making the smaller array at once -> `pool()` is a
+// two-layer array after the reduction and a pool creation is counted.
+#[test]
+fn a_reduction_retires_the_pool_once_and_owes_the_smaller_array() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, tiny) = pooled(&mut r, dir.path());
+    let creations = r.pool_creations.get();
+    r.admit_reclaiming(ScreenKind::Decision, tiny).unwrap();
+    assert_eq!(r.pool(), None);
+    assert_eq!(r.pool_creations.get(), creations, "a pool array made");
+    let a = r.admission();
+    assert_eq!((a.firm, a.pool, a.retired_pool), (LAYER, LAYER, 4 * LAYER));
+    // A second reduction while the array is owed lowers its layers only.
+    r.admit_reclaiming(ScreenKind::Decision, tiny + LAYER)
+        .unwrap();
+    assert_eq!(r.filled(), 1, "retired again");
+    let a = r.admission();
+    assert_eq!((a.firm, a.pool), (LAYER, 0));
+    assert_eq!(r.pool_creations.get(), creations);
+    // Owed until the retired one is destroyed.
+    assert!(!r.make_owed_pool());
+    assert_eq!(pool_allocations(&r), 1);
+    crate::test_common::settle(&mut r);
+    assert_eq!(pool_allocations(&r), 0);
+    assert!(r.make_owed_pool());
+    assert_eq!(r.pool().unwrap().layers, 1);
+    assert_eq!(r.pool_creations.get(), creations + 1);
+    assert!(!r.pool_owed());
+}
+
+// Revert: `reduce_pool` retiring the live array beside an undestroyed
+// retired one -> no refusal where destruction is not allowed, and three
+// pool arrays allocated at once.
+#[test]
+fn at_most_one_pool_array_waits_beside_the_live_one() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let (p, _, tiny) = pooled(&mut r, dir.path());
+    // Reduced to two layers, then regrown whole: the two-layer array
+    // retired beside the live one.
+    r.admit_reclaiming(ScreenKind::Decision, tiny).unwrap();
+    crate::test_common::settle(&mut r);
+    assert!(r.make_owed_pool());
+    r.state_charge(&p, tiny);
+    assert_eq!(r.regrow_pool().unwrap().layers, 4);
+    assert_eq!(pool_allocations(&r), 2);
+    assert_eq!(r.admission().retired_pool, 2 * LAYER);
+    let sel = r.admission().charge(ScreenKind::Selection);
+    r.state_charge(&p, SHARED_TEXELS - sel - tiny - LAYER);
+    // Nothing destroyed where destruction is not allowed: refused.
+    r.set_destroy_allowed(false);
+    let e = r.admit_reclaiming(ScreenKind::Decision, tiny).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            RenderError::ListFull {
+                kind: ScreenKind::Decision
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(e.is_refusal());
+    assert_eq!(r.pool().unwrap().layers, 4, "the live pool kept");
+    // Allowed: the retired one destroyed in the call first.
+    r.set_destroy_allowed(true);
+    let from = r.destructions_recorded();
+    r.admit_reclaiming(ScreenKind::Decision, tiny).unwrap();
+    let records = recorded_since(&r, from);
+    each_after_its_completion(&records);
+    let got: Vec<_> = records
+        .iter()
+        .map(|d| (d.class, d.part, d.in_call))
+        .collect();
+    assert_eq!(got, [(Class::RetiredPool, Part::Pool, true)]);
+    assert_eq!(r.pool(), None);
+    assert_eq!(pool_allocations(&r), 1);
+    assert_eq!(r.admission().retired_pool, 4 * LAYER);
+}
+
+// Revert: `pool_held` counting only a pool a reduction or a regrowth
+// retired -> the new selection stages its own pool beside the removed
+// one's, two pool arrays allocated with the removed one still filled.
+#[test]
+fn no_pool_array_is_made_while_an_entry_holds_one() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    // Room for every array: no admission destroys an entry in its call.
+    let p = solid(&r, [255, 0, 0, 255]);
+    commit(&mut r, ScreenKind::Play, &p, 1);
+    let b = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &b, 2);
+    // The first commit's built-in resources destroyed: the list empty.
+    crate::test_common::settle(&mut r);
+    assert_eq!(r.filled(), 0);
+    assert_eq!(pool_allocations(&r), 1);
+    // Removed: its pool waits in the standing entry beside its atlas.
+    r.remove(ScreenKind::Selection);
+    assert_eq!(r.filled(), 1);
+    assert_eq!(pool_allocations(&r), 1);
+    // A new selection meanwhile stages with the placeholder and owes its
+    // pool; neither the owed array nor a regrowth is made while the
+    // removed one's pool is undestroyed.
+    let again = pool_bundle(&r, dir.path());
+    assert!(!Arc::ptr_eq(&again, &b));
+    commit(&mut r, ScreenKind::Selection, &again, 3);
+    assert_eq!(r.filled(), 1, "the removed one's entry kept");
+    assert_eq!(r.pool(), None);
+    assert!(r.pool_owed());
+    assert!(!r.make_owed_pool());
+    assert_eq!(r.regrow_pool(), None);
+    assert_eq!(pool_allocations(&r), 1, "only the removed one's");
+    // Destroyed, the owed array follows.
+    crate::test_common::settle(&mut r);
+    assert_eq!(pool_allocations(&r), 0);
+    assert!(r.make_owed_pool());
+    assert!(r.pool().is_some());
+    assert_eq!(pool_allocations(&r), 1);
+}
+
+// Revert: `regrow_pool` leaving the filled entries out of its sum -> the
+// pool regrows to four layers beside a removed result's entry, past the
+// limit.
+#[test]
+fn the_regrowth_counts_the_filled_entries() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = solid(&r, [255, 0, 0, 255]);
+    commit(&mut r, ScreenKind::Play, &p, 1);
+    let b = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &b, 2);
+    let result = solid(&r, [0, 255, 0, 255]);
+    commit(&mut r, ScreenKind::Result, &result, 3);
+    // The result charged two layers, play what leaves the pool its firm
+    // layer and one more beside them.
+    r.state_charge(&result, 2 * LAYER);
+    let sel = r.admission().charge(ScreenKind::Selection);
+    r.state_charge(&p, SHARED_TEXELS - sel - 3 * LAYER);
+    // A candidate as large as a layer: the pool down to its firm layer.
+    r.admit_reclaiming(ScreenKind::Decision, LAYER).unwrap();
+    crate::test_common::settle(&mut r);
+    assert!(r.make_owed_pool());
+    assert_eq!(r.pool().unwrap().layers, 1);
+    // Removed, the result's entry still charges its two layers.
+    r.remove(ScreenKind::Result);
+    assert_eq!(r.admission().filled, 2 * LAYER);
+    assert_eq!(r.regrow_pool().unwrap().layers, 2, "grown past the entry");
+    crate::test_common::settle(&mut r);
+    assert_eq!(r.regrow_pool().unwrap().layers, 4);
+}
+
+// Revert: `destroy_due` without its `due` filter -> a record whose last
+// use is past the completion seen at its destruction, at the first site
+// whose array a frame drew.
+#[test]
+fn every_retirement_site_destroys_only_after_its_last_use() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    // Play's first commit: the built-in resources it replaced.
+    let p = solid(&r, [255, 0, 0, 255]);
+    commit(&mut r, ScreenKind::Play, &p, 1);
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    assert_eq!(
+        (records[0].kind, records[0].class, records[0].id),
+        (ScreenKind::Play, Class::Replaced, None)
+    );
+    // A staging's replaced candidate.
+    let d1 = solid(&r, [0, 255, 0, 255]);
+    let _ = r.install(ScreenKind::Decision, &d1, 2).unwrap();
+    let d2 = solid(&r, [0, 255, 255, 255]);
+    let _ = r.install(ScreenKind::Decision, &d2, 3).unwrap();
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    assert_eq!(
+        (records[0].kind, records[0].class, records[0].id),
+        (ScreenKind::Decision, Class::Other, Some(d1.atlas_id()))
+    );
+    r.discard();
+    poll_until_destroyed(&mut r);
+    // A selection with its pool, drawn by a frame, replaced by another:
+    // its pool destroyed before its atlas.
+    let b = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &b, 4);
+    assert!(selection_frame(&mut r, &b));
+    let b2 = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &b2, 5);
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    let parts: Vec<_> = records.iter().map(|d| (d.class, d.part)).collect();
+    assert_eq!(
+        parts,
+        [
+            (Class::Replaced, Part::Pool),
+            (Class::Replaced, Part::Array)
+        ]
+    );
+    // A reduction after a frame drew the pool: not due before the poll.
+    assert!(selection_frame(&mut r, &b2));
+    let tiny = p.atlas_texels();
+    let sel = r.admission().charge(ScreenKind::Selection);
+    r.state_charge(&p, SHARED_TEXELS - sel - tiny - LAYER);
+    r.admit_reclaiming(ScreenKind::Decision, tiny).unwrap();
+    assert_eq!(r.destroy_due(true).heavy, None, "drawn and not yet seen");
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    assert_eq!(records[0].class, Class::RetiredPool);
+    // A regrowth after a frame drew the owed array.
+    assert!(r.make_owed_pool());
+    r.state_charge(&p, tiny);
+    assert!(selection_frame(&mut r, &b2));
+    assert_eq!(r.regrow_pool().unwrap().layers, 4);
+    assert_eq!(r.destroy_due(true).heavy, None, "drawn and not yet seen");
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    assert_eq!(records[0].class, Class::RetiredPool);
+    // A removal after a frame: the pool, then the atlas.
+    assert!(selection_frame(&mut r, &b2));
+    r.remove(ScreenKind::Selection);
+    assert_eq!(r.destroy_due(true).heavy, None, "drawn and not yet seen");
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    let parts: Vec<_> = records.iter().map(|d| (d.kind, d.part)).collect();
+    assert_eq!(
+        parts,
+        [
+            (ScreenKind::Selection, Part::Pool),
+            (ScreenKind::Selection, Part::Array)
+        ]
+    );
+    // Play's replaced installation; an error return, an upload the device
+    // refused.
+    let q = solid(&r, [0, 0, 255, 255]);
+    commit(&mut r, ScreenKind::Play, &q, 6);
+    r.fail_staged_buffers(true);
+    let e = r.install(ScreenKind::Decision, &d1, 7).unwrap_err();
+    r.fail_staged_buffers(false);
+    assert!(
+        matches!(e, RenderError::Atlas(crate::UploadError::Device(_))),
+        "{e:?}"
+    );
+    assert_eq!(r.filled(), 2, "play's replaced and the refused array");
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    let got: Vec<_> = records.iter().map(|d| (d.kind, d.class, d.id)).collect();
+    assert_eq!(
+        got,
+        [
+            (ScreenKind::Play, Class::Replaced, Some(p.atlas_id())),
+            (ScreenKind::Decision, Class::Other, Some(d1.atlas_id()))
+        ]
+    );
+}
+
+// Revert: R5's release left standing in the result's entry (not destroyed
+// in the call) -> the in-call records hold the decision candidate alone,
+// and three entries stay filled.
+#[test]
+fn one_staging_retires_four_arrays() {
+    let mut r = crate::test_common::offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = solid(&r, [255, 0, 0, 255]);
+    commit(&mut r, ScreenKind::Play, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let result = solid(&r, [0, 255, 0, 255]);
+    commit(&mut r, ScreenKind::Result, &result, 3);
+    crate::test_common::settle(&mut r);
+    let tiny = p.atlas_texels();
+    // A decision candidate staged; the selection charged so that a tiny
+    // play candidate fits only with the pool at its firm layer and the
+    // result released.
+    let d = solid(&r, [0, 0, 255, 255]);
+    let _ = r.install(ScreenKind::Decision, &d, 4).unwrap();
+    r.state_charge(&s, SHARED_TEXELS - LAYER - tiny);
+    let from = r.destructions_recorded();
+    // The play candidate's own upload refused by the device.
+    r.fail_staged_buffers(true);
+    let b = solid(&r, [255, 255, 0, 255]);
+    let e = r.install(ScreenKind::Play, &b, 5).unwrap_err();
+    r.fail_staged_buffers(false);
+    assert!(
+        matches!(e, RenderError::Atlas(crate::UploadError::Device(_))),
+        "{e:?}"
+    );
+    // The candidate and the released result destroyed in the call; the
+    // pool and the refused array retired.
+    let in_call = recorded_since(&r, from);
+    each_after_its_completion(&in_call);
+    let got: Vec<_> = in_call.iter().map(|x| (x.kind, x.id, x.in_call)).collect();
+    assert_eq!(
+        got,
+        [
+            (ScreenKind::Decision, Some(d.atlas_id()), true),
+            (ScreenKind::Result, Some(result.atlas_id()), true)
+        ]
+    );
+    assert!(r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_none());
+    assert_eq!(r.filled(), 2);
+    let records = poll_until_destroyed(&mut r);
+    each_after_its_completion(&records);
+    let mut got: Vec<_> = records.iter().map(|x| (x.kind, x.class, x.part)).collect();
+    got.sort_by_key(|&(k, _, _)| k == ScreenKind::Selection);
+    assert_eq!(
+        got,
+        [
+            (ScreenKind::Play, Class::Other, Part::Array),
+            (ScreenKind::Selection, Class::RetiredPool, Part::Pool)
+        ]
+    );
 }

@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bms_model::{TimeSource as _, TimeUs};
@@ -29,6 +29,7 @@ use crate::measure::{DecisionDrawnAs, DecisionFallback, DecisionRecord};
 
 use super::{Decided, DecidedSink, RigSink};
 use crate::menu_screen::{MenuPage, MenuScreen};
+use crate::render_side::tests::gate::Gate;
 use crate::render_side::tests::wait_until;
 use crate::render_side::{EndPage, MakeScreen, Screen, TakeoverAcks};
 use crate::select::{MenuInput, MenuKey, MenuQueue};
@@ -89,150 +90,6 @@ struct Drawn {
     at: TimeUs,
     frame: Frame,
     decision: Option<AtlasId>,
-}
-
-/// The frame gate's state: while `pace`, each frame wait takes one of
-/// `permits`, holding (`held`) until there is one.
-#[derive(Default)]
-struct GateState {
-    pace: bool,
-    permits: u32,
-    waits: u64,
-    held: bool,
-    /// Every frame wait answers that no frame is due, after a park of at
-    /// most a millisecond: nothing is drawn, and the render thread goes on
-    /// taking its messages.
-    suppress: bool,
-    /// The waits answered so while suppressed.
-    refused: u64,
-}
-
-/// The render thread's frames held and let through one at a time.
-#[derive(Default)]
-struct Gate {
-    state: Mutex<GateState>,
-    changed: Condvar,
-}
-
-impl Gate {
-    fn lock(&self) -> MutexGuard<'_, GateState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Waits on `changed` until `done`, within [`BOUND`].
-    #[track_caller]
-    fn until(&self, what: &str, done: impl Fn(&GateState) -> bool) {
-        let s = self.lock();
-        let (_s, waited) = self
-            .changed
-            .wait_timeout_while(s, BOUND, |s| !done(s))
-            .unwrap_or_else(PoisonError::into_inner);
-        assert!(!waited.timed_out(), "the render thread never {what}");
-    }
-
-    /// Frames held from the next frame wait on.
-    fn hold(&self) {
-        self.lock().pace = true;
-        self.until("held a frame", |s| s.held);
-    }
-
-    /// One frame, then held again at the next wait.
-    fn step(&self) {
-        let before = {
-            let mut s = self.lock();
-            s.permits = 1;
-            s.waits
-        };
-        self.changed.notify_all();
-        self.until("drew the frame let through", |s| {
-            s.waits > before && s.held && s.permits == 0
-        });
-    }
-
-    /// One frame let through, the gate held, until `done` holds.
-    #[track_caller]
-    fn step_into(&self, done: impl Fn() -> bool) {
-        self.lock().permits = 1;
-        self.changed.notify_all();
-        assert!(wait_until(done), "the frame let through never got there");
-    }
-
-    /// Frames go free again.
-    fn release(&self) {
-        self.lock().pace = false;
-        self.changed.notify_all();
-    }
-
-    /// No frame is drawn from now (`true`) while the render thread keeps
-    /// taking its messages: every frame wait, a held one woken included,
-    /// answers that none is due, and the screen counts as paced, so the
-    /// clock's pacing never draws either. Turned on, it waits until one
-    /// wait was answered so after the call: the render thread asks for a
-    /// wait only without a frame granted, so none granted before survives.
-    fn suppress(&self, on: bool) {
-        let before = {
-            let mut s = self.lock();
-            s.suppress = on;
-            s.refused
-        };
-        self.changed.notify_all();
-        if on {
-            self.until("answered a frame wait with none due", |s| {
-                s.refused > before
-            });
-        }
-    }
-
-    /// From suppressed to held, in one step: the render thread parks at
-    /// its next frame wait and takes no message until let go, no frame
-    /// drawn in between.
-    fn block(&self) {
-        {
-            let mut s = self.lock();
-            s.pace = true;
-            s.permits = 0;
-            s.suppress = false;
-        }
-        self.changed.notify_all();
-        self.until("held a frame", |s| s.held);
-    }
-
-    /// The render thread's frame wait: whether a frame is due.
-    fn wait(&self) -> bool {
-        let mut s = self.lock();
-        s.waits += 1;
-        while s.pace && s.permits == 0 && !s.suppress {
-            s.held = true;
-            self.changed.notify_all();
-            s = self.changed.wait(s).unwrap_or_else(PoisonError::into_inner);
-        }
-        if s.suppress {
-            s.held = false;
-            // A short park, so the render thread's loop does not spin.
-            let (mut s, _) = self
-                .changed
-                .wait_timeout(s, Duration::from_millis(1))
-                .unwrap_or_else(PoisonError::into_inner);
-            s.refused += 1;
-            drop(s);
-            self.changed.notify_all();
-            return false;
-        }
-        if s.pace {
-            s.permits -= 1;
-        }
-        s.held = false;
-        drop(s);
-        self.changed.notify_all();
-        true
-    }
-
-    /// Whether the frames are paced by the gate: held or suppressed, the
-    /// clock's pacing never draws.
-    fn pacing(&self) -> bool {
-        let s = self.lock();
-        s.pace || s.suppress
-    }
 }
 
 /// What the test sets and reads of the screens a render thread builds.
@@ -463,14 +320,59 @@ impl Screen for Noted {
     fn disable_result(&mut self) {
         self.menu.disable_result();
     }
-    fn drain_retired(&mut self) -> Option<skin_model::AtlasId> {
-        self.menu.drain_retired()
-    }
     fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
         self.menu.installed_pages(kind)
     }
-    fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
+    fn retained_atlases(
+        &self,
+        kind: ScreenKind,
+    ) -> [Option<skin_model::AtlasId>; render::RETAINED_ATLASES] {
         self.menu.retained_atlases(kind)
+    }
+    fn poll_completion(&mut self) -> Result<(), render::RenderError> {
+        self.menu.poll_completion()
+    }
+    fn set_destroy_allowed(&mut self, allowed: bool) {
+        self.menu.set_destroy_allowed(allowed);
+    }
+    fn filled(&self) -> u32 {
+        self.menu.filled()
+    }
+    fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
+        self.menu.destroy_due(heavy)
+    }
+    fn due_heavy(&self) -> bool {
+        self.menu.due_heavy()
+    }
+    fn pending_completion(&self) -> bool {
+        self.menu.pending_completion()
+    }
+    fn pool_owed(&self) -> bool {
+        self.menu.pool_owed()
+    }
+    fn make_owed_pool(&mut self) -> bool {
+        self.menu.make_owed_pool()
+    }
+    fn take_handoff(&mut self) -> Option<render::Handoff> {
+        self.menu.take_handoff()
+    }
+    fn return_handoff(&mut self, entry: usize, cpu: render::CpuParts) -> bool {
+        self.menu.return_handoff(entry, cpu)
+    }
+    fn result_changes(&self) -> u64 {
+        self.menu.result_changes()
+    }
+    fn heavy_ops(&self) -> render::HeavyOps {
+        self.menu.heavy_ops()
+    }
+    fn grant_ready(&self) -> bool {
+        self.menu.grant_ready()
+    }
+    fn bga_in_use(&self) -> bool {
+        self.menu.bga_in_use()
+    }
+    fn entries_holding_pages(&self) -> [bool; render::RETIREMENT_ENTRIES] {
+        self.menu.entries_holding_pages()
     }
     fn prepare_result(
         &mut self,
@@ -634,7 +536,7 @@ impl Screen for Noted {
         self.note(p == render::FrameOutcome::Shown, Frame::End);
         Ok(p)
     }
-    fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
+    fn splash(&mut self, elapsed: Duration) -> Option<Result<render::FrameOutcome, RenderError>> {
         self.menu.splash(elapsed)
     }
     fn loading(

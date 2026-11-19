@@ -64,9 +64,10 @@
 //!   per entry; counted on the render thread. `rf:wait_us` includes the
 //!   acquisition's or the admission's wait, which a frame still pending
 //!   lengthens.
-//! - `dr:*`, a drop: the drop of the handle it names; the memory read after
-//!   it can still be held, freed at the device's next maintenance
-//!   (`render::probe`).
+//! - `dr:*`, a drop: one retirement entry's part destroyed, at a frame
+//!   boundary or in a staging's call; the memory read after it can still
+//!   be held, freed at the device's next maintenance (`render::probe`).
+//!   A release (`rel:*`) only retires what it takes.
 //! - An upload's summary (`up:*`) is marked once its wait returned, or at
 //!   once when it was refused: no wait is added to the refusal, so a
 //!   refused upload's queued writes can still be in flight when its

@@ -41,6 +41,24 @@ use crate::{
     SkinError, Sprite, SpriteBatch,
 };
 
+// The retirement list, a child module so that it holds this module's
+// resources as they are.
+#[path = "retire.rs"]
+mod retire;
+
+use retire::{Array, ENTRIES, Filled, Hold, PoolPart, Retirements};
+pub use retire::{Class, CpuParts, Destroyed, Destruction, Handoff, HeavyOps, Part};
+#[cfg(any(test, feature = "dev-tools"))]
+pub use retire::{DestroyRecord, RECORD_LEN};
+
+/// The entries of the retirement list (design.md "Memory Budget"), made
+/// with the renderer and never grown.
+pub const RETIREMENT_ENTRIES: usize = ENTRIES;
+
+/// The places of [`Renderer::retained_atlases`]: the committed array, the
+/// staging's, the pages upload in hand, and each retirement entry.
+pub const RETAINED_ATLASES: usize = 3 + ENTRIES;
+
 /// The most sprites the selection screen's strip draws over its skin (a
 /// band under its search line, one under its notice, one under its
 /// list-cut line, and the composition's underline), from the reserve the
@@ -476,6 +494,18 @@ pub enum RenderError {
         /// The kind asked for.
         kind: ScreenKind,
     },
+    /// A staging found no free retirement entry to reserve, for its own
+    /// array or for the pool its admission would reduce, or its admission
+    /// would reduce the pool while a retired pool is undestroyed (one at a
+    /// time), and destruction is not allowed now
+    /// ([`Renderer::set_destroy_allowed`]): nothing of it was made, and a
+    /// request refused for its own entry was not taken, so the same
+    /// request may be asked again.
+    #[error("the {kind} staging found no free retirement entry")]
+    ListFull {
+        /// The kind asked for.
+        kind: ScreenKind,
+    },
 }
 
 impl RenderError {
@@ -496,6 +526,7 @@ impl RenderError {
             | Self::Admission { .. }
             | Self::ResultDisabled
             | Self::PagesKind { .. }
+            | Self::ListFull { .. }
             | Self::NotStaged
             | Self::LabelRegion { .. }
             | Self::ChartImage { .. } => true,
@@ -685,39 +716,6 @@ struct PagesRes {
     text_cache: TextCache,
 }
 
-/// What a commit replaced, kept with its device resources until the next
-/// staging or [`Renderer::drain_retired`] drops it, so no commit drops any
-/// of the device's: a layout replaced on the same array (its staging and
-/// instance buffer), or an installation or a pages-only installation
-/// replaced on another array.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "held once and moved only by a commit, which boxing would make allocate"
-)]
-enum Retired {
-    Layout {
-        staging: Staging,
-        /// Held only so that it is dropped outside the commit.
-        _instances: wgpu::Buffer,
-        /// The array's bind group the layout's own replaced (a selection
-        /// layout binding its own pool), held likewise.
-        _bind: Option<wgpu::BindGroup>,
-    },
-    Slot(Slot),
-    Pages(PagesRes),
-}
-
-impl Retired {
-    /// The array it holds, if it holds one.
-    fn atlas_id(&self) -> Option<AtlasId> {
-        match self {
-            Self::Layout { .. } => None,
-            Self::Slot(s) => Some(s.installation.bundle().atlas_id()),
-            Self::Pages(p) => Some(p.pages.id()),
-        }
-    }
-}
-
 #[cfg(feature = "dev-tools")]
 impl Renderer {
     /// The array a frame drawn `on` samples, as [`draw_on`](Self::draw_on)
@@ -781,79 +779,6 @@ impl Renderer {
             mem(self.gpu.device(), "pd:l", "pd:n", "pd:r");
         }
     }
-}
-
-/// Drops what a drain or a staging retired (the probe on): the CPU pages,
-/// the array and its view, the bind group and the text cache, in the
-/// fields' order as a whole drop would, or the slot, or the layout, and
-/// the selection's retired
-/// chart-image pool before them or after them as its site drops it
-/// (`pool_first`), each drop timed (`dr:*`), with memory before and after;
-/// then marks the next frames' submit and memory (`pd:*`).
-#[cfg(feature = "dev-tools")]
-fn probe_drop(
-    d: &wgpu::Device,
-    r: Option<Retired>,
-    pool: Option<ChartPool>,
-    pool_first: bool,
-    site: i64,
-) {
-    use crate::probe::{mark, mem, us};
-    let drop_pool = |pool: Option<ChartPool>| {
-        if let Some(p) = pool {
-            let t = crate::probe::Span::start();
-            drop(p);
-            mark("dr:pool_us", us(t.elapsed()));
-        }
-    };
-    mark("dr:site", site);
-    mem(d, "dr:l0", "dr:n0", "dr:r0");
-    let pool = if pool_first {
-        drop_pool(pool);
-        None
-    } else {
-        pool
-    };
-    match r {
-        None => mark("dr:kind", 0),
-        Some(Retired::Pages(PagesRes {
-            pages,
-            atlas,
-            atlas_bind,
-            text_cache,
-        })) => {
-            mark("dr:kind", 1);
-            mark(
-                "dr:pages_strong",
-                i64::try_from(Arc::strong_count(&pages)).unwrap_or(-1),
-            );
-            let t = crate::probe::Span::start();
-            drop(pages);
-            mark("dr:cpu_us", us(t.elapsed()));
-            let t = crate::probe::Span::start();
-            drop(atlas);
-            mark("dr:tex_view_us", us(t.elapsed()));
-            let t = crate::probe::Span::start();
-            drop(atlas_bind);
-            mark("dr:bind_us", us(t.elapsed()));
-            drop(text_cache);
-        }
-        Some(Retired::Slot(s)) => {
-            mark("dr:kind", 2);
-            let t = crate::probe::Span::start();
-            drop(s);
-            mark("dr:slot_us", us(t.elapsed()));
-        }
-        Some(layout @ Retired::Layout { .. }) => {
-            mark("dr:kind", 3);
-            let t = crate::probe::Span::start();
-            drop(layout);
-            mark("dr:layout_us", us(t.elapsed()));
-        }
-    }
-    drop_pool(pool);
-    mem(d, "dr:l1", "dr:n1", "dr:r1");
-    crate::probe::arm_post(8);
 }
 
 /// What a staging holds besides its skin.
@@ -920,27 +845,40 @@ struct Pending {
     /// `None` for one that keeps the committed pool (the same bundle) and
     /// for another kind.
     pool: Option<StagedPool>,
+    /// The retirement entry it reserved for its own array, which its
+    /// commit makes its installation's standing entry; `None` for one
+    /// with nothing of its own (the committed bundle, or the pages
+    /// installed).
+    entry: Option<usize>,
 }
 
 /// The chart-image pool a selection staging installs: its grid (`None`
 /// for a skin that draws no chart image, or whose atlas keeps a chart
 /// layer) and its array (`None` when the device refused even the firm
-/// layer).
+/// layer, or when a retired pool was still undestroyed, the array then
+/// owed: `decided` layers made after the commit).
 struct StagedPool {
     grid: Option<Grid>,
     pool: Option<ChartPool>,
+    owed: bool,
+    decided: u32,
 }
 
-/// What admitting a candidate takes once the pool's optional layers yield
-/// ([`Renderer::reclaim`]), computed before anything changes.
+/// What admitting a candidate takes once the filled retirement entries
+/// its phase lets it destroy are gone and the pool's optional layers
+/// yield ([`Renderer::reclaim`]), computed before anything changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reclaim {
     /// It fits as things are.
     Fits,
-    /// It fits once the pool is made again with this many layers.
+    /// It fits once filled entries are destroyed, oldest first.
+    Destroy,
+    /// It fits once every filled entry it may destroy is, and the pool
+    /// keeps this many layers.
     Reduce(u32),
-    /// Play's: it fits once the pool keeps its firm layer alone and the
-    /// result's installation is released.
+    /// Play's: it fits once every filled entry it may destroy is, the
+    /// pool keeps its firm layer alone and the result's installation is
+    /// released and destroyed.
     ReleaseResult,
     /// It does not fit: the level-0 texels it needs with the pool at its
     /// firm layer.
@@ -962,7 +900,14 @@ pub struct Admission {
     pub firm: u64,
     /// The chart-image pool's optional layers: a reclaimable term, which
     /// yields before any candidate is refused or the result released.
+    /// While a reduction's smaller array is owed, the layers it decided.
     pub pool: u64,
+    /// The filled retirement entries' charges, each until its array is
+    /// destroyed, a retired pool's left out.
+    pub filled: u64,
+    /// The pools a reduction or a regrowth retired, undestroyed: reported
+    /// apart, outside the sum.
+    pub retired_pool: u64,
 }
 
 impl Admission {
@@ -987,11 +932,14 @@ impl Admission {
             .saturating_add(result)
     }
 
-    /// Everything charged now: every kind's committed charge and the
-    /// pool's optional layers.
+    /// Everything charged now: every kind's committed charge, the pool's
+    /// optional layers and the filled retirement entries; a retired pool
+    /// is not.
     #[must_use]
     pub const fn total(&self) -> u64 {
-        self.committed_total().saturating_add(self.pool)
+        self.committed_total()
+            .saturating_add(self.pool)
+            .saturating_add(self.filled)
     }
 }
 
@@ -999,7 +947,7 @@ impl Admission {
 /// installation and the one staged installation of any kind, in bytes, as
 /// a witness of the peak a skin's replacement reaches (design.md "Memory
 /// Budget"): the installed resources and the staged ones live together
-/// until the commit, and what a commit replaces until the next staging.
+/// until the commit, and what is retired until its destruction.
 /// Pages shared by several holders are counted once ([`shared_cpu`]), and
 /// each bundle's own bytes in one term. The selection and decision
 /// screens' committed installations are reported only through
@@ -1068,8 +1016,9 @@ pub struct MemoryWitness {
     pub selection_state: u64,
     /// The pages on the CPU, shared by every bundle on them: counted once
     /// for each atlas identity ([`AtlasId`]) play's installation, the
-    /// staging or the result's installation holds
-    /// ([`SkinBundle::shared_bytes`]).
+    /// staging, the result's installation, a retirement entry still
+    /// holding them or a handoff place holds
+    /// ([`SkinBundle::shared_bytes`], [`Renderer::memory_with`]).
     pub shared_cpu: u64,
     /// The result's committed bundle's own CPU description, counted here
     /// alone when it is also staged.
@@ -1085,15 +1034,19 @@ pub struct MemoryWitness {
     /// prepared to replace them.
     pub result_text: u64,
     /// The loading presentations of the result's committed installation
-    /// and of a retired one, each distinct presentation once; a staging
-    /// sharing one of them adds nothing to `staged_loading`.
+    /// and of the result's retirement entries still holding theirs, each
+    /// distinct presentation once; a staging sharing one of them adds
+    /// nothing to `staged_loading`.
     pub result_loading: u64,
-    /// What commits replaced and keep until the next staging or
-    /// `drain_retired()`, whichever comes first: a layout's
-    /// staging and instance buffer on the same array, or a whole
-    /// installation on another array (its array, layout, text cache,
-    /// lines and own CPU description) or a pages-only one.
+    /// The filled retirement entries, each until its destruction, a
+    /// retired pool's apart: a layout's staging and instance buffer, or a
+    /// whole array with its layout, text cache and pool, and the CPU part
+    /// it still holds (lines, prepared attempt, own description, another
+    /// kind's presentation; its pages are in `shared_cpu`).
     pub retired: u64,
+    /// The pools a reduction or a regrowth retired, until their
+    /// destruction: every layer at its levels.
+    pub retired_pool: u64,
     /// The decision label slots' contents: their strings, tables and
     /// bitmap lines ([`with_decision`](Self::with_decision)).
     pub decision_labels: u64,
@@ -1139,6 +1092,7 @@ impl MemoryWitness {
             .saturating_add(self.result_text)
             .saturating_add(self.result_loading)
             .saturating_add(self.retired)
+            .saturating_add(self.retired_pool)
             .saturating_add(self.decision_labels)
             .saturating_add(self.decision_staged)
             .saturating_add(self.decision_text_mask)
@@ -1451,18 +1405,38 @@ pub struct Renderer {
     pending: Option<Pending>,
     /// The result kind's pages-only installation, in place of its slot.
     result_pages: Option<PagesRes>,
-    /// What the last commit replaced, until the next staging or a drain.
-    retired: Option<Retired>,
+    /// What is retired, each until its destruction, and the entries held
+    /// for what will retire (design.md "Memory Budget").
+    retire: Retirements,
+    /// The entry the staging in progress reserved for its own array,
+    /// until it returns.
+    staging_entry: Option<usize>,
+    /// The last submission watched for its completion, until a poll sees
+    /// it ([`poll_completion`](Self::poll_completion)).
+    watch: Option<(u64, wgpu::SubmissionIndex)>,
+    /// Whether a staging may destroy filled entries in its own call
+    /// ([`set_destroy_allowed`](Self::set_destroy_allowed)).
+    destroy_allowed: bool,
+    /// The heavy device operations run so far ([`heavy_ops`](Self::heavy_ops)).
+    heavy: std::cell::Cell<HeavyOps>,
     /// The committed selection installation's chart-image pool grid, its
     /// cells fixed at the installation; `None` without one, or for a skin
     /// that draws no chart image or whose atlas keeps a chart layer.
     pool_grid: Option<Grid>,
     /// The committed selection installation's chart-image pool, bound
-    /// beside its atlas; `None` without a grid, or when the device refused
-    /// even its firm layer.
+    /// beside its atlas; `None` without a grid, when the device refused
+    /// even its firm layer, or while its array is owed.
     pool: Option<ChartPool>,
-    /// The pool a commit replaced, kept as [`retired`](Self::retired) is.
-    retired_pool: Option<ChartPool>,
+    /// The pool's array is owed: a reduction retired the live one, or a
+    /// selection staged while a retired pool was undestroyed, and the
+    /// array of [`decided`](Self::decided) layers is made later
+    /// ([`make_owed_pool`](Self::make_owed_pool)).
+    owed: bool,
+    /// The layers charged while the array is owed.
+    decided: u32,
+    /// Unit tests: pool arrays made.
+    #[cfg(test)]
+    pool_creations: std::cell::Cell<u32>,
     /// Tests and development builds: pool arrays the device refuses
     /// next, one each.
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1691,6 +1665,12 @@ impl Renderer {
         let staging = Staging::new(capacity, &skin.canvas([size.0, size.1]));
         let instances = instance_buffer(device, staging.instance_capacity());
         finish_uploads(&gpu)?;
+        // Play's standing entry from the start: the first commit's
+        // replaced built-in resources retire into it.
+        let mut retire = Retirements::new();
+        let _ = retire.reserve(Hold::Standing(ScreenKind::Play));
+        #[cfg(feature = "dev-tools")]
+        retire.set_probe(gpu.device().clone());
         Ok(Self {
             gpu,
             #[cfg(feature = "dev-tools")]
@@ -1726,10 +1706,17 @@ impl Renderer {
             resource_ids: 0,
             pending: None,
             result_pages: None,
-            retired: None,
+            retire,
+            staging_entry: None,
+            watch: None,
+            destroy_allowed: true,
+            heavy: std::cell::Cell::new(HeavyOps::default()),
             pool_grid: None,
             pool: None,
-            retired_pool: None,
+            owed: false,
+            decided: 0,
+            #[cfg(test)]
+            pool_creations: std::cell::Cell::new(0),
             #[cfg(any(test, feature = "dev-tools"))]
             pool_faults: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -2007,7 +1994,7 @@ impl Renderer {
             if let Some(fault) = fault {
                 fault(&self.gpu);
             }
-            self.gpu.queue().submit([]);
+            self.gpu.submit([]);
             (atlas, bind)
         });
         if let Some(e) = refused {
@@ -2182,20 +2169,22 @@ impl Renderer {
     }
 
     /// Whether `bundle` as `kind`'s installation fits the texels the
-    /// screens share: every other kind's committed charge and `bundle`'s
-    /// ([`Admission`]), at most [`SHARED_TEXELS`], once the selection's
-    /// chart-image pool has given up as many optional layers as that
-    /// takes (design.md "Memory Budget"). The candidate replaces its
-    /// kind's charge, so the state after its commit is what is admitted; a
-    /// selection candidate is charged its pool's firm layer too, and
-    /// replaces the pool. `kind`'s committed bundle itself allocates
-    /// nothing again and is admitted as it is. Allocates nothing.
+    /// screens share: every other kind's committed charge, the filled
+    /// retirement entries' as they stand and `bundle`'s ([`Admission`]),
+    /// at most [`SHARED_TEXELS`], once the selection's chart-image pool
+    /// has given up as many optional layers as that takes (design.md
+    /// "Memory Budget"). The candidate replaces its kind's charge, so the
+    /// state after its commit is what is admitted; a selection candidate
+    /// is charged its pool's firm layer too, and replaces the pool.
+    /// `kind`'s committed bundle itself allocates nothing again and is
+    /// admitted as it is. Allocates nothing.
     ///
     /// A read-only budget query: `Ok` means the hypothetical replacement
-    /// fits the charges committed now. It reserves nothing, changes no
-    /// staging or pool, validates no device resource, and does not promise
-    /// that a later installation succeeds; every staging checks admission
-    /// itself.
+    /// fits the charges held now. It reserves nothing, destroys no filled
+    /// entry, changes no staging or pool, validates no device resource,
+    /// and does not promise that a later installation succeeds; every
+    /// staging checks admission itself, and may destroy filled entries
+    /// to fit ([`set_destroy_allowed`](Self::set_destroy_allowed)).
     ///
     /// # Errors
     ///
@@ -2209,8 +2198,8 @@ impl Renderer {
             return Ok(());
         }
         let charge = self.candidate_charge(kind, bundle);
-        match self.reclaim(kind, charge) {
-            Reclaim::Fits | Reclaim::Reduce(_) => Ok(()),
+        match self.reclaim(kind, charge, false) {
+            Reclaim::Fits | Reclaim::Destroy | Reclaim::Reduce(_) => Ok(()),
             Reclaim::ReleaseResult | Reclaim::Refused(_) => Err(RenderError::Admission {
                 kind,
                 needed: self.needed(kind, charge),
@@ -2220,49 +2209,84 @@ impl Renderer {
     }
 
     /// What admitting `charge` as `kind`'s takes, read only and before
-    /// anything is created (design.md "Memory Budget"): it fits beside
-    /// every other kind's committed charge and the pool's optional layers;
-    /// or it fits once the pool keeps the most optional layers that leave
-    /// it room, down to none; or, for play, once the pool keeps its firm
-    /// layer alone and the result's installation is released; or it is
-    /// refused. A selection candidate replaces the pool, so its optional
-    /// layers go with the kind.
-    fn reclaim(&self, kind: ScreenKind, charge: u64) -> Reclaim {
-        let base = self.needed(kind, charge);
-        let (layer, optional) = match &self.pool {
-            Some(p) if kind != ScreenKind::Selection => {
-                (p.grid().layer_texels(), p.layers().saturating_sub(1))
-            }
-            _ => (0, 0),
+    /// anything is created (design.md "Memory Budget"), in its order: it
+    /// fits beside every other kind's committed charge, the filled
+    /// retirement entries and the pool's optional layers; or it fits once
+    /// filled entries are destroyed (only when `destroy`, the phase
+    /// allowing it); or once, besides, the pool keeps the most optional
+    /// layers that leave it room, down to none; or, for play and only when
+    /// `destroy`, once the pool keeps its firm layer alone and the result's
+    /// installation is released and destroyed; or it is refused. A
+    /// selection candidate replaces the pool, so its optional layers go
+    /// with the kind. A retired pool is outside the sum.
+    fn reclaim(&self, kind: ScreenKind, charge: u64, destroy: bool) -> Reclaim {
+        let entries = self.retire.charged();
+        let base = self.committed_needed(kind, charge);
+        let all = base.saturating_add(entries);
+        let least = if destroy { base } else { all };
+        let (layer, optional) = if kind == ScreenKind::Selection {
+            (0, 0)
+        } else {
+            (self.pool_layer(), self.pool_layers().saturating_sub(1))
         };
-        let fits =
-            |kept: u32| base.saturating_add(layer.saturating_mul(u64::from(kept))) <= SHARED_TEXELS;
-        if fits(optional) {
+        let fits = |base: u64, kept: u32| {
+            base.saturating_add(layer.saturating_mul(u64::from(kept))) <= SHARED_TEXELS
+        };
+        if fits(all, optional) {
             return Reclaim::Fits;
         }
-        if let Some(kept) = (0..optional).rev().find(|&k| fits(k)) {
+        if fits(least, optional) {
+            return Reclaim::Destroy;
+        }
+        if let Some(kept) = (0..optional).rev().find(|&k| fits(least, k)) {
             return Reclaim::Reduce(kept + 1);
         }
         let result = self.charge(ScreenKind::Result);
-        if kind == ScreenKind::Play && result > 0 && base.saturating_sub(result) <= SHARED_TEXELS {
+        if destroy
+            && kind == ScreenKind::Play
+            && result > 0
+            && least.saturating_sub(result) <= SHARED_TEXELS
+        {
             return Reclaim::ReleaseResult;
         }
-        Reclaim::Refused(base)
+        Reclaim::Refused(least)
     }
 
     /// The level-0 texels `charge` as `kind`'s needs beside every other
-    /// kind's committed charge, the pool's optional layers left out.
+    /// kind's committed charge and the filled retirement entries as they
+    /// stand, the pool's optional layers left out.
     fn needed(&self, kind: ScreenKind, charge: u64) -> u64 {
+        self.committed_needed(kind, charge)
+            .saturating_add(self.retire.charged())
+    }
+
+    /// [`needed`](Self::needed) without the filled entries.
+    fn committed_needed(&self, kind: ScreenKind, charge: u64) -> u64 {
         KINDS
             .iter()
             .filter(|&&k| k != kind)
             .fold(charge, |sum, &k| sum.saturating_add(self.charge(k)))
     }
 
+    /// Whether `charge` as `kind`'s fits now, filled entries and the
+    /// pool's optional layers as they stand.
+    fn fits_now(&self, kind: ScreenKind, charge: u64) -> bool {
+        let optional = if kind == ScreenKind::Selection {
+            0
+        } else {
+            self.pool_optional()
+        };
+        self.needed(kind, charge).saturating_add(optional) <= SHARED_TEXELS
+    }
+
     /// Admits `charge` as `kind`'s ([`reclaim`](Self::reclaim)), applying
-    /// what that takes: the pool made again smaller, as a new generation,
-    /// then, for play, the result's installation released (no result is
-    /// drawn from Preparing until the result, and its owner installs it
+    /// what that takes, in its order: filled entries destroyed in this
+    /// call, oldest first, each once its last use completes (where
+    /// destruction is allowed); the pool's live array retired into the
+    /// pool's operation entry and the selection bound to the placeholder,
+    /// the smaller array owed; then, for play, the result's installation
+    /// released into its standing entry and destroyed here too (no result
+    /// is drawn from Preparing until the result, and its owner installs it
     /// again after play's commit, if it is admitted then).
     fn admit_reclaiming(&mut self, kind: ScreenKind, charge: u64) -> Result<(), RenderError> {
         #[cfg(feature = "dev-tools")]
@@ -2272,30 +2296,100 @@ impl Renderer {
                 i64::try_from(self.charge(ScreenKind::Result)).unwrap_or(-1),
             );
         }
-        match self.reclaim(kind, charge) {
+        match self.reclaim(kind, charge, self.destroy_allowed) {
             Reclaim::Fits => Ok(()),
-            Reclaim::Reduce(layers) => {
-                self.reduce_pool(layers);
+            Reclaim::Destroy => {
+                while !self.fits_now(kind, charge) {
+                    let Some(i) = self.retire.oldest(true) else {
+                        break;
+                    };
+                    self.destroy_now(i)?;
+                }
                 Ok(())
             }
+            Reclaim::Reduce(layers) => {
+                self.destroy_charged()?;
+                self.reduce_pool(layers, kind)
+            }
             Reclaim::ReleaseResult => {
-                self.reduce_pool(1);
+                self.destroy_charged()?;
+                self.reduce_pool(1, kind)?;
                 self.remove(ScreenKind::Result);
-                // The release's own marks (`rel:*`) time its drops, outside
-                // their memory readings.
+                // The release only retires the result's arrays (`rel:*`);
+                // their destruction is marked where the retirement list
+                // runs it (`dr:*`).
                 #[cfg(feature = "dev-tools")]
                 {
                     crate::probe::mark("adm:result_released", 1);
                     crate::probe::arm_post(8);
                 }
                 self.result_released = true;
-                Ok(())
+                // Released into its standing entry, and destroyed now: its
+                // charge stands until it is.
+                self.destroy_charged()
             }
             Reclaim::Refused(needed) => Err(RenderError::Admission {
                 kind,
                 needed,
                 limit: SHARED_TEXELS,
             }),
+        }
+    }
+
+    /// Destroys every filled entry admission charges, in this call, oldest
+    /// first, where destruction is allowed.
+    fn destroy_charged(&mut self) -> Result<(), RenderError> {
+        if !self.destroy_allowed {
+            return Ok(());
+        }
+        while let Some(i) = self.retire.oldest(true) {
+            self.destroy_now(i)?;
+        }
+        Ok(())
+    }
+
+    /// Destroys filled entry `i` whole, in this call: when its last use is
+    /// not yet seen complete, a write still queued is submitted and the
+    /// queue waited for first. Each texture's destruction is a heavy
+    /// operation.
+    fn destroy_now(&mut self, i: usize) -> Result<(), RenderError> {
+        if let Some(last) = self.retire.last_use(i)
+            && last > self.gpu.seen()
+        {
+            if last > self.gpu.latest() {
+                let _ = self.gpu.submit([]);
+            }
+            wait_for_gpu(&self.gpu)?;
+        }
+        let seen = self.gpu.seen();
+        while let Some(d) = self.retire.destroy_part(i, seen, true) {
+            if d.part != Part::Light {
+                self.note_heavy();
+            }
+            if d.freed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserves an entry for `hold`, for a staging of `kind`: when none is
+    /// free, destroys the oldest filled entry in this call where
+    /// destruction is allowed.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::ListFull`] where it is not; the device's failure of
+    /// a wait.
+    fn reserve_room(&mut self, hold: Hold, kind: ScreenKind) -> Result<usize, RenderError> {
+        loop {
+            if let Some(i) = self.retire.reserve(hold) {
+                return Ok(i);
+            }
+            match self.retire.oldest(false) {
+                Some(i) if self.destroy_allowed => self.destroy_now(i)?,
+                _ => return Err(RenderError::ListFull { kind }),
+            }
         }
     }
 
@@ -2326,6 +2420,36 @@ impl Renderer {
         charge_of(bundle).saturating_add(firm)
     }
 
+    /// The layers the committed selection's pool is charged: its array's,
+    /// or the decided ones while its array is owed.
+    fn pool_layers(&self) -> u32 {
+        match &self.pool {
+            Some(p) => p.layers(),
+            None if self.owed => self.decided,
+            None => 0,
+        }
+    }
+
+    /// One layer of the committed selection's pool grid: 0 without one.
+    fn pool_layer(&self) -> u64 {
+        self.pool_grid.as_ref().map_or(0, Grid::layer_texels)
+    }
+
+    /// The pool's firm layer, charged with the selection installation.
+    fn pool_firm(&self) -> u64 {
+        if self.pool_layers() > 0 {
+            self.pool_layer()
+        } else {
+            0
+        }
+    }
+
+    /// The pool's optional layers, a reclaimable term.
+    fn pool_optional(&self) -> u64 {
+        self.pool_layer()
+            .saturating_mul(u64::from(self.pool_layers().saturating_sub(1)))
+    }
+
     /// `kind`'s committed charge: its installation's, the selection's with
     /// its pool's firm layer, or the result's pages-only installation's
     /// array.
@@ -2333,7 +2457,7 @@ impl Renderer {
         match self.committed_installation(kind) {
             Some(i) if kind == ScreenKind::Selection => self
                 .committed_charge(i.bundle())
-                .saturating_add(self.pool.as_ref().map_or(0, ChartPool::firm_texels)),
+                .saturating_add(self.pool_firm()),
             Some(i) => self.committed_charge(i.bundle()),
             None if kind == ScreenKind::Result => self
                 .result_pages
@@ -2369,7 +2493,8 @@ impl Renderer {
     /// is a kind's committed installation, in place of its own charge (the
     /// selection's pool's firm layer is still charged beside it), so the
     /// shared limit is tested through [`admit`](Self::admit) without
-    /// committing arrays that large. A candidate is charged its own.
+    /// committing arrays that large. A candidate is charged its own; an
+    /// installation retired is charged what it was at its retirement.
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn state_charge(&mut self, bundle: &Arc<SkinBundle>, texels: u64) {
         self.stated.retain(|(b, _)| !Arc::ptr_eq(b, bundle));
@@ -2402,8 +2527,10 @@ impl Renderer {
         selection.saturating_add(self.charge(ScreenKind::Decision))
     }
 
-    /// The charges [`admit`](Self::admit) sums now, the staged
-    /// installation's and the chart-image pool's firm and optional layers.
+    /// The charges [`admit`](Self::admit) sums now: the staged
+    /// installation's, the chart-image pool's firm and optional layers (the
+    /// decided ones while its array is owed), the filled retirement
+    /// entries', and apart the retired pools'.
     #[must_use]
     pub fn admission(&self) -> Admission {
         Admission {
@@ -2416,8 +2543,10 @@ impl Renderer {
                 };
                 (p.token.kind, charge)
             }),
-            firm: self.pool.as_ref().map_or(0, ChartPool::firm_texels),
-            pool: self.pool.as_ref().map_or(0, ChartPool::optional_texels),
+            firm: self.pool_firm(),
+            pool: self.pool_optional(),
+            filled: self.retire.charged(),
+            retired_pool: self.retire.retired_pool(),
         }
     }
 
@@ -2448,7 +2577,9 @@ impl Renderer {
     /// A pool of `layers` layers of `grid` (or of its firm layer alone when
     /// the device refuses that) with `atlas`'s bind group binding it, made
     /// inside error scopes; `None` when the device refuses even the firm
-    /// layer. Queued, not submitted; waits for no GPU work.
+    /// layer. Queued, not submitted; waits for no GPU work. Each try is a
+    /// heavy operation; a refused try is dropped here, as the device
+    /// refused it, its only use its own queued writes.
     fn make_pool(
         &self,
         grid: Grid,
@@ -2462,6 +2593,8 @@ impl Renderer {
             #[cfg(any(test, feature = "dev-tools"))]
             self.pool_faults
                 .set(self.pool_faults.get().saturating_sub(1));
+            #[cfg(test)]
+            self.pool_creations.set(self.pool_creations.get() + 1);
             let device = self.gpu.device();
             let ((pool, bind), refused) = skin_atlas::scoped(device, || {
                 let pool = ChartPool::create(&self.gpu, grid, layers);
@@ -2472,6 +2605,7 @@ impl Renderer {
                 }
                 (pool, bind)
             });
+            self.note_heavy();
             refused.is_none().then_some((pool, bind))
         })
     }
@@ -2488,54 +2622,82 @@ impl Renderer {
         self.screens.get_mut(i)?.as_mut()
     }
 
-    /// Makes the committed selection's pool again with `layers` layers, a
-    /// new generation, when it has more: or with its firm layer alone when
-    /// the device refuses that, and none when it refuses even that, the
-    /// selection then bound to the placeholder. Rebinds the selection and
-    /// publishes the change. Not a frame's work: it allocates.
-    fn reduce_pool(&mut self, layers: u32) {
-        let Some(grid) = self
-            .pool
-            .as_ref()
-            .filter(|p| p.layers() > layers)
-            .map(ChartPool::grid)
-        else {
-            return;
-        };
-        // The old array goes first: the pool's handle, and the selection's
-        // bind group, which holds its view, rebound to the placeholder, so
-        // the old layers are given back before the smaller array is made,
-        // once the frames already submitted have read them.
-        self.pool = None;
-        let Some(slot) = self.selection_slot() else {
-            return;
-        };
-        let placeholder = self
-            .bindings
-            .bind(self.gpu.device(), &slot.resources.atlas, None);
-        if let Some(slot) = self.selection_slot_mut() {
-            slot.resources.atlas_bind = placeholder;
+    /// Rebinds the committed selection's atlas with `bind`, the bind group
+    /// it replaces returned.
+    fn rebind_selection(&mut self, bind: wgpu::BindGroup) -> Option<wgpu::BindGroup> {
+        let slot = self.selection_slot_mut()?;
+        Some(std::mem::replace(&mut slot.resources.atlas_bind, bind))
+    }
+
+    /// Reduces the committed selection's pool to `layers` layers, for a
+    /// staging of `kind` (design.md "Memory Budget"): the live array, when
+    /// it has more, is retired at once into the pool's operation entry with
+    /// the bind group that bound it, the selection bound to the placeholder,
+    /// and an array of `layers` owed, made later
+    /// ([`make_owed_pool`](Self::make_owed_pool)); a pool whose array is
+    /// already owed only lowers its layers. One retired pool at a time: one
+    /// still undestroyed is destroyed first, where destruction is allowed.
+    /// Nothing is created.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::ListFull`] when the retired pool, or the lack of a
+    /// free entry, would need a destruction where none is allowed: nothing
+    /// changes.
+    fn reduce_pool(&mut self, layers: u32, kind: ScreenKind) -> Result<(), RenderError> {
+        match &self.pool {
+            Some(p) if p.layers() > layers => {}
+            Some(_) => return Ok(()),
+            None => {
+                if self.owed && self.decided > layers {
+                    self.decided = layers;
+                }
+                return Ok(());
+            }
         }
-        let Some(slot) = self.selection_slot() else {
-            return;
-        };
-        let atlas = &slot.resources.atlas;
-        let Some((pool, bind)) = self.make_pool(grid, layers, atlas) else {
-            return;
-        };
-        if let Some(slot) = self.selection_slot_mut() {
-            slot.resources.atlas_bind = bind;
+        if let Some(i) = self.retire.retired_pool_entry() {
+            if !self.destroy_allowed {
+                return Err(RenderError::ListFull { kind });
+            }
+            self.destroy_now(i)?;
         }
-        self.pool = Some(pool);
+        let entry = self.reserve_room(Hold::PoolOp, kind)?;
+        let Some(pool) = self.pool.take() else {
+            self.retire.release(entry);
+            return Ok(());
+        };
+        let placeholder = self.selection_slot().map(|slot| {
+            self.bindings
+                .bind(self.gpu.device(), &slot.resources.atlas, None)
+        });
+        let replaced = placeholder.and_then(|b| self.rebind_selection(b));
+        let pool = pool.retire();
+        let f = Filled {
+            charge: pool.texels(),
+            last_use: pool.last_use,
+            pool: Some(PoolPart {
+                pool,
+                bind: replaced,
+            }),
+            ..Filled::new(Array::None, ScreenKind::Selection, Class::RetiredPool)
+        };
+        self.retire_into(Some(entry), f);
+        self.owed = true;
+        self.decided = layers;
+        Ok(())
     }
 
     /// Regrows the committed selection's chart-image pool to the most
-    /// layers that fit beside every committed charge and the staged
-    /// candidate's (design.md "Memory Budget"), as a new generation, when
-    /// that is more than it has; a refusal by the device keeps the pool it
-    /// has. The owner calls it at each selection entry and after a
-    /// renderer built again has restored every kind, so the pool is made
-    /// last, sized to what the kinds leave. Not a frame's work: it
+    /// layers that fit beside every committed charge, the staged
+    /// candidate's and the filled retirement entries' (design.md "Memory
+    /// Budget"), as a new generation, when that is more than it has, or
+    /// makes its owed array: the larger array is made first, then the one
+    /// it replaces is retired into the pool's operation entry with the bind
+    /// group that bound it. A refusal by the device keeps the pool it has.
+    /// Nothing grows while a filled entry holds a pool array. The owner calls
+    /// it at the boundary of the pass that takes each selection entry, and
+    /// after a renderer built again has restored every kind, so the pool
+    /// is made last, sized to what the kinds leave. Not a frame's work: it
     /// allocates. Returns the live pool.
     pub fn regrow_pool(&mut self) -> Option<PoolLayout> {
         if self.gpu.lost() {
@@ -2548,10 +2710,11 @@ impl Renderer {
             .pending
             .as_ref()
             .is_some_and(|p| p.token.kind == ScreenKind::Selection)
+            || self.retire.pool_held()
         {
             return self.pool();
         }
-        let current = self.pool.as_ref().map_or(0, ChartPool::layers);
+        let current = self.pool_layers();
         let firm = if current == 0 { grid.layer_texels() } else { 0 };
         let staged = self.admission().candidate;
         let used = KINDS.iter().fold(firm, |sum, &k| {
@@ -2561,26 +2724,105 @@ impl Renderer {
             };
             sum.saturating_add(charge)
         });
+        let used = used.saturating_add(self.retire.charged());
         if used > SHARED_TEXELS {
             return self.pool();
         }
         let layers = Self::fitting_layers(&grid, used);
-        if layers <= current {
+        let live = self.pool.as_ref().map_or(0, ChartPool::layers);
+        if live > 0 && layers <= live {
             return self.pool();
         }
-        // The pool it has stays until the larger one is made; the firm
-        // layer alone is taken only when there is no pool.
+        // The pool it has stays until the larger one is made, its entry
+        // reserved first; the firm layer alone is taken only when there is
+        // no array.
+        let entry = if live > 0 {
+            match self.retire.reserve(Hold::PoolOp) {
+                Some(i) => Some(i),
+                None => return self.pool(),
+            }
+        } else {
+            None
+        };
         let made = self.selection_slot().and_then(|slot| {
             self.make_pool(grid, layers, &slot.resources.atlas)
-                .filter(|(p, _)| current == 0 || p.layers() == layers)
+                .filter(|(p, _)| live == 0 || p.layers() == layers)
         });
-        if let Some((pool, bind)) = made {
-            if let Some(slot) = self.selection_slot_mut() {
-                slot.resources.atlas_bind = bind;
+        let Some((pool, bind)) = made else {
+            if let Some(i) = entry {
+                self.retire.release(i);
             }
-            self.pool = Some(pool);
+            if live == 0 {
+                // Owed and refused even its firm layer: none.
+                self.owed = false;
+                self.decided = 0;
+            }
+            return self.pool();
+        };
+        let replaced = self.rebind_selection(bind);
+        self.owed = false;
+        self.decided = 0;
+        match (self.pool.replace(pool), entry) {
+            (Some(old), Some(entry)) => {
+                let old = old.retire();
+                let f = Filled {
+                    charge: old.texels(),
+                    last_use: old.last_use,
+                    pool: Some(PoolPart {
+                        pool: old,
+                        bind: replaced,
+                    }),
+                    ..Filled::new(Array::None, ScreenKind::Selection, Class::RetiredPool)
+                };
+                self.retire_into(Some(entry), f);
+            }
+            (old, entry) => {
+                // No array before: the bind group replaced bound the
+                // placeholder.
+                drop(old);
+                if let Some(i) = entry {
+                    self.retire.release(i);
+                }
+            }
         }
         self.pool()
+    }
+
+    /// Makes the committed selection's owed pool array, of the layers its
+    /// reduction decided (or its firm layer alone when the device refuses
+    /// that, none when it refuses even that), as a new generation: a heavy
+    /// operation, for a boundary outside play and outside the result
+    /// before its first picture. Only once no filled entry holds a pool array
+    /// (design.md "Memory Budget", one retired pool at a time). Returns
+    /// whether it ran.
+    pub fn make_owed_pool(&mut self) -> bool {
+        if !self.owed || self.pool.is_some() || self.gpu.lost() || self.retire.pool_held() {
+            return false;
+        }
+        let Some(grid) = self.pool_grid else {
+            self.owed = false;
+            self.decided = 0;
+            return false;
+        };
+        let layers = self.decided.max(1);
+        let made = self
+            .selection_slot()
+            .and_then(|slot| self.make_pool(grid, layers, &slot.resources.atlas));
+        self.owed = false;
+        self.decided = 0;
+        if let Some((pool, bind)) = made {
+            // The bind group replaced bound the placeholder.
+            let _ = self.rebind_selection(bind);
+            self.pool = Some(pool);
+        }
+        true
+    }
+
+    /// Whether the committed selection's pool array is owed
+    /// ([`make_owed_pool`](Self::make_owed_pool)).
+    #[must_use]
+    pub const fn pool_owed(&self) -> bool {
+        self.owed
     }
 
     /// The live chart-image pool's layout: `None` without a pool, or once
@@ -2670,9 +2912,12 @@ impl Renderer {
     /// [`install`](Self::install) without one. A request not newer than
     /// every one asked for or committed (staged, discarded or refused
     /// included) is refused, the staging kept; any other refusal drops
-    /// the staging. Admission ([`admit`](Self::admit)) is checked before
-    /// anything is allocated. `kind`'s committed bundle keeps its loading
-    /// presentation; another gets a fresh one.
+    /// the staging. A staging with an array of its own reserves its
+    /// retirement entry before it takes the request, so a full list
+    /// refuses it with the request still open. Admission
+    /// ([`admit`](Self::admit)) is checked before anything is allocated.
+    /// `kind`'s committed bundle keeps its loading presentation; another
+    /// gets a fresh one.
     fn stage_with(
         &mut self,
         kind: ScreenKind,
@@ -2680,12 +2925,39 @@ impl Renderer {
         a: Option<&AttemptInput<'_>>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        // Never below `committed`: a commit takes only a staging's
-        // request, and every staging was asked for first.
         if kind == ScreenKind::Result && self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
-        self.begin_staging(request)?;
+        // The committed bundle keeps its resources: nothing of its own,
+        // and no entry.
+        let own = !self
+            .committed_installation(kind)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle));
+        let entry = self.begin_staging(request, kind, own)?;
+        self.staging_entry = entry;
+        let staged = self.stage_on(kind, bundle, a, request, entry);
+        self.staging_entry = None;
+        // Withdrawn before it made anything: its entry frees, and one its
+        // array filled stays.
+        if staged.is_err()
+            && let Some(i) = entry
+        {
+            self.retire.release(i);
+        }
+        staged
+    }
+
+    /// [`stage_with`](Self::stage_with) once its request is taken, with
+    /// `entry` reserved for its own array: an error return after its
+    /// array was made fills that entry.
+    fn stage_on(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+        a: Option<&AttemptInput<'_>>,
+        request: u64,
+        entry: Option<usize>,
+    ) -> Result<PreparedToken, RenderError> {
         // An attempt's staging that fails, at any step, leaves no earlier
         // preparation's text report.
         if a.is_some() {
@@ -2735,80 +3007,33 @@ impl Renderer {
             );
             cmark!("st", "resources_us", us(p_res.elapsed()));
         }
-        let mut skin = DeclSkin::of(&installation);
-        let mut text = Holder::default();
-        if let Some(a) = a {
-            let a = AttemptInput {
-                target: self.target(),
-                ..*a
-            };
-            #[cfg(feature = "dev-tools")]
-            let p_prep = crate::probe::Span::start();
-            skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
-            skin.set_bga_images(Arc::clone(&self.bga_table));
-            #[cfg(feature = "dev-tools")]
-            {
-                use crate::probe::{cmark, us};
-                cmark!("st", "skin_prepare_us", us(p_prep.elapsed()));
-            }
-            #[cfg(feature = "dev-tools")]
-            let p_text = crate::probe::Span::start();
-            if let Some(producer) = bundle.text_producer() {
-                let key = self.loading_text_key();
-                // The staging's own resources, or the installed ones,
-                // whose installed attempt's lines stay, with the installed
-                // loading lines and the loading text staged for them.
-                let (atlas, cache, held) = match &mut res {
-                    PendingRes::Own(r) => (&r.atlas, &mut r.text_cache, Vec::<&Holder>::new()),
-                    _ => {
-                        let staged = self
-                            .staged_text
-                            .as_ref()
-                            .filter(|t| key == Some(t.key))
-                            .map(|t| &t.holder);
-                        let held = [
-                            Some(&self.installed_text),
-                            Some(&self.installed_loading),
-                            staged,
-                        ];
-                        let held = held.into_iter().flatten().collect();
-                        (&self.atlas, &mut self.text_cache, held)
-                    }
-                };
-                let prepared = text_upload::prepare(
-                    text_upload::Prepare {
-                        gpu: &self.gpu,
-                        atlas,
-                        cache,
-                        scratch: &mut self.text_scratch,
-                        producer: producer.as_ref(),
-                        scope: bundle.text_scope(),
-                        held: &held,
-                        #[cfg(test)]
-                        hooks: &mut self.text_hooks,
-                        #[cfg(feature = "dev-tools")]
-                        wait_fault: &mut self.text_wait_fault,
-                    },
-                    &bundle
-                        .skin()
-                        .text_requests(a.text, a.target, &Layout::AUTHOR),
-                    bundle.skin().text_slots(),
-                );
-                let (table, holder, report) = prepared?;
-                self.text_report = report;
-                skin.attach_text(table).map_err(RenderError::Skin)?;
-                text = holder;
-            }
-            #[cfg(feature = "dev-tools")]
-            {
-                use crate::probe::{cmark, us};
-                cmark!("st", "text_total_us", us(p_text.elapsed()));
-            }
-        }
         let token = PreparedToken {
             request,
             device: self.id,
             kind,
+        };
+        let mut skin = DeclSkin::of(&installation);
+        let text = match a {
+            Some(a) => match self.prepare_staged(&mut skin, &mut res, bundle, a) {
+                Ok(text) => text,
+                Err(e) => {
+                    // Its array, its pool and what it prepared fill its
+                    // own entry.
+                    self.retire_candidate(Pending {
+                        token,
+                        skin: Some(skin),
+                        pages: None,
+                        res,
+                        text: Holder::default(),
+                        loading: Holder::default(),
+                        chart: None,
+                        pool,
+                        entry,
+                    });
+                    return Err(e);
+                }
+            },
+            None => Holder::default(),
         };
         self.pending = Some(Pending {
             token,
@@ -2819,26 +3044,121 @@ impl Renderer {
             loading: Holder::default(),
             chart: None,
             pool,
+            entry,
         });
         #[cfg(test)]
         self.text_hooks.steps.push(text_upload::Step::StageReturned);
         Ok(token)
     }
 
+    /// Prepares `skin` for attempt `a` on the staging's resources `res`
+    /// (its own, or the installed ones) and attaches its rasterized text:
+    /// the lines' holder.
+    fn prepare_staged(
+        &mut self,
+        skin: &mut DeclSkin,
+        res: &mut PendingRes,
+        bundle: &Arc<SkinBundle>,
+        a: &AttemptInput<'_>,
+    ) -> Result<Holder, RenderError> {
+        let a = AttemptInput {
+            target: self.target(),
+            ..*a
+        };
+        #[cfg(feature = "dev-tools")]
+        let p_prep = crate::probe::Span::start();
+        skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+        skin.set_bga_images(Arc::clone(&self.bga_table));
+        #[cfg(feature = "dev-tools")]
+        {
+            use crate::probe::{cmark, us};
+            cmark!("st", "skin_prepare_us", us(p_prep.elapsed()));
+        }
+        // Marked once the text is attached, or at once with none to prepare.
+        #[cfg(feature = "dev-tools")]
+        let p_text = {
+            let p = crate::probe::Span::start();
+            move || {
+                use crate::probe::{cmark, us};
+                cmark!("st", "text_total_us", us(p.elapsed()));
+            }
+        };
+        let Some(producer) = bundle.text_producer() else {
+            #[cfg(feature = "dev-tools")]
+            p_text();
+            return Ok(Holder::default());
+        };
+        let key = self.loading_text_key();
+        // The staging's own resources, or the installed ones, whose
+        // installed attempt's lines stay, with the installed loading lines
+        // and the loading text staged for them.
+        let (atlas, cache, held) = match res {
+            PendingRes::Own(r) => (&r.atlas, &mut r.text_cache, Vec::<&Holder>::new()),
+            _ => {
+                let staged = self
+                    .staged_text
+                    .as_ref()
+                    .filter(|t| key == Some(t.key))
+                    .map(|t| &t.holder);
+                let held = [
+                    Some(&self.installed_text),
+                    Some(&self.installed_loading),
+                    staged,
+                ];
+                let held = held.into_iter().flatten().collect();
+                (&self.atlas, &mut self.text_cache, held)
+            }
+        };
+        let prepared = text_upload::prepare(
+            text_upload::Prepare {
+                gpu: &self.gpu,
+                atlas,
+                cache,
+                scratch: &mut self.text_scratch,
+                producer: producer.as_ref(),
+                scope: bundle.text_scope(),
+                held: &held,
+                #[cfg(test)]
+                hooks: &mut self.text_hooks,
+                #[cfg(feature = "dev-tools")]
+                wait_fault: &mut self.text_wait_fault,
+            },
+            &bundle
+                .skin()
+                .text_requests(a.text, a.target, &Layout::AUTHOR),
+            bundle.skin().text_slots(),
+        );
+        let (table, holder, report) = prepared?;
+        self.text_report = report;
+        skin.attach_text(table).map_err(RenderError::Skin)?;
+        #[cfg(feature = "dev-tools")]
+        p_text();
+        Ok(holder)
+    }
+
     /// The chart-image pool a selection staging of `bundle` on `res` (its
     /// own array or a layout on the committed one) installs: its grid at
     /// the current target, and an array of as many layers as fit beside
-    /// every other kind's committed charge and the staging's own, down to
-    /// its firm layer, or none when the device refuses even that
-    /// (design.md "Rendering and Skins", chart images). The array's bind
-    /// group, with the pool or the placeholder, is made into `res` now, so
-    /// the commit allocates nothing.
+    /// every other kind's committed charge, the filled retirement entries
+    /// and the staging's own, down to its firm layer, or none when the
+    /// device refuses even that (design.md "Rendering and Skins", chart
+    /// images). While a retired pool is undestroyed no array is made: the
+    /// staging is bound to the placeholder, and those layers are owed from
+    /// its commit (design.md "Memory Budget", one retired pool at a time).
+    /// The array's bind group, with the pool or the placeholder, is made
+    /// into `res` now, so the commit allocates nothing.
     fn stage_pool(&self, bundle: &SkinBundle, res: &mut PendingRes) -> StagedPool {
         let grid = self.pool_grid_for(bundle);
+        let none = |grid| StagedPool {
+            grid,
+            pool: None,
+            owed: false,
+            decided: 0,
+        };
         // Own resources are bound to the placeholder already, and so is a
         // committed array without a pool.
         if grid.is_none() && (matches!(res, PendingRes::Own(_)) || self.pool.is_none()) {
-            return StagedPool { grid, pool: None };
+            return none(grid);
         }
         let used = self.needed(
             ScreenKind::Selection,
@@ -2850,9 +3170,14 @@ impl Renderer {
             PendingRes::Installed | PendingRes::Pages(_) => None,
         };
         let Some(atlas) = atlas else {
-            return StagedPool { grid, pool: None };
+            return none(grid);
         };
-        let made = grid.and_then(|g| self.make_pool(g, Self::fitting_layers(&g, used), atlas));
+        let layers = grid.map(|g| Self::fitting_layers(&g, used));
+        let owed = layers.is_some() && self.retire.pool_held();
+        let made = match (grid, layers) {
+            (Some(g), Some(layers)) if !owed => self.make_pool(g, layers, atlas),
+            _ => None,
+        };
         let (pool, bind) = match made {
             Some((pool, bind)) => (Some(pool), bind),
             None => (None, self.bindings.bind(self.gpu.device(), atlas, None)),
@@ -2864,7 +3189,12 @@ impl Renderer {
             PendingRes::Layout { bind: b, .. } => *b = Some(bind),
             PendingRes::Installed | PendingRes::Pages(_) => {}
         }
-        StagedPool { grid, pool }
+        StagedPool {
+            grid,
+            pool,
+            owed,
+            decided: if owed { layers.unwrap_or(0) } else { 0 },
+        }
     }
 
     /// What the last preparation of rasterized text did, an attempt's
@@ -2983,7 +3313,7 @@ impl Renderer {
             {
                 p_bind = p_b.until(p_s);
             }
-            self.gpu.queue().submit([]);
+            self.gpu.submit([]);
             #[cfg(feature = "dev-tools")]
             {
                 p_submit = p_s.elapsed();
@@ -3050,9 +3380,13 @@ impl Renderer {
             cmark!("up", "scoped_total_us", us(p_scoped));
             cmark!("up", "refused", i64::from(refused));
         };
+        self.note_heavy();
         if let Some(e) = refused {
             #[cfg(feature = "dev-tools")]
             p_summary(true);
+            // Made and its writes submitted: retired, never dropped
+            // before they complete.
+            self.retire_refused(pages, atlas, atlas_bind, buffer);
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
         #[cfg(feature = "dev-tools")]
@@ -3092,6 +3426,39 @@ impl Renderer {
         Ok((atlas, atlas_bind, buffer, text_cache))
     }
 
+    /// Retires an array of `pages` whose upload the device refused after
+    /// its texture was made and its writes submitted: into the entry the
+    /// staging in progress reserved, or, with none (a renderer built
+    /// again restoring), dropped here once its writes complete.
+    fn retire_refused(
+        &mut self,
+        pages: &PackedPages,
+        atlas: AtlasTexture,
+        atlas_bind: wgpu::BindGroup,
+        instances: Option<wgpu::Buffer>,
+    ) {
+        let at = self.staging_entry.filter(|&i| self.retire.is_reserved(i));
+        let kind = match at.and_then(|i| self.retire.hold_of(i)) {
+            Some(Hold::Staging(kind) | Hold::Standing(kind)) => kind,
+            _ => ScreenKind::Play,
+        };
+        let f = Filled {
+            id: Some(pages.id()),
+            charge: pages_texels(pages),
+            last_use: atlas.last_use(),
+            ..Filled::new(
+                Array::Refused {
+                    atlas,
+                    atlas_bind,
+                    instances,
+                },
+                kind,
+                Class::Other,
+            )
+        };
+        self.retire_into(at, f);
+    }
+
     /// A staging sized for `bundle`'s capacities, with its clips, projected
     /// on the current target.
     ///
@@ -3126,7 +3493,7 @@ impl Renderer {
         let device = self.gpu.device();
         let (buffer, refused) = skin_atlas::scoped(device, || {
             let buffer = self.staged_buffer(staging.instance_capacity());
-            self.gpu.queue().submit([]);
+            self.gpu.submit([]);
             buffer
         });
         if let Some(e) = refused {
@@ -3148,36 +3515,44 @@ impl Renderer {
         })
     }
 
-    /// Takes `request` for a staging: refused unless newer than every
-    /// request asked for or committed, then the earlier staging and what
-    /// the last commit replaced are dropped.
-    fn begin_staging(&mut self, request: u64) -> Result<(), RenderError> {
+    /// Takes `request` for a staging of `kind`: refused unless newer than
+    /// every request asked for or committed; then, for a staging that will
+    /// hold an array of its own (`own`), reserves its retirement entry
+    /// before the request is taken, so a full list refuses it with the
+    /// request still open; then the earlier staging fills the entry it
+    /// reserved. Returns the entry reserved.
+    fn begin_staging(
+        &mut self,
+        request: u64,
+        kind: ScreenKind,
+        own: bool,
+    ) -> Result<Option<usize>, RenderError> {
         // Never below `committed`: a commit takes only a staging's
         // request, and every staging was asked for first.
         let newer = self.requested;
         if request <= newer {
             return Err(RenderError::Superseded { request, newer });
         }
+        let entry = if own {
+            Some(self.reserve_room(Hold::Staging(kind), kind)?)
+        } else {
+            None
+        };
         self.requested = request;
         self.drop_pending();
-        #[cfg(feature = "dev-tools")]
-        if crate::probe::on() && (self.retired.is_some() || self.retired_pool.is_some()) {
-            let (r, pool) = (self.retired.take(), self.retired_pool.take());
-            probe_drop(self.gpu.device(), r, pool, false, 2);
-        }
-        self.retired = None;
-        self.retired_pool = None;
-        Ok(())
+        Ok(entry)
     }
 
     /// Stages the result kind's pages-only installation of `pages` for
     /// `request`: its prepared atlas, uploaded before any layout of it is
     /// staged ([`stage`](Self::stage)'s rules for requests). When `pages`
-    /// are the ones installed nothing is uploaded; otherwise the kind's
-    /// earlier installation is released first, since nothing of it is
-    /// drawn meanwhile, then the pages are admitted and uploaded. The
-    /// commit makes them the kind's installation, drawing nothing until a
-    /// layout on them is committed. Allocates and waits for the GPU.
+    /// are the ones installed nothing is uploaded and no entry reserved;
+    /// otherwise the kind's earlier installation is released first into
+    /// its standing entry, since nothing of it is drawn meanwhile, then the
+    /// pages are admitted (that entry charged until its destruction) and
+    /// uploaded. The commit makes them the kind's installation, drawing
+    /// nothing until a layout on them is committed. Allocates and waits for
+    /// the GPU.
     ///
     /// # Errors
     ///
@@ -3196,13 +3571,31 @@ impl Renderer {
         if self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
+        let installed = self.committed_atlas(kind) == Some(pages.id());
         #[cfg(feature = "dev-tools")]
-        crate::probe::mark(
-            "pg:already",
-            i64::from(self.committed_atlas(kind) == Some(pages.id())),
-        );
-        self.begin_staging(request)?;
-        let res = if self.committed_atlas(kind) == Some(pages.id()) {
+        crate::probe::mark("pg:already", i64::from(installed));
+        let entry = self.begin_staging(request, kind, !installed)?;
+        self.staging_entry = entry;
+        let staged = self.install_pages_on(kind, pages, request, installed, entry);
+        self.staging_entry = None;
+        if staged.is_err()
+            && let Some(i) = entry
+        {
+            self.retire.release(i);
+        }
+        staged
+    }
+
+    /// [`install_pages`](Self::install_pages) once its request is taken.
+    fn install_pages_on(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<PackedPages>,
+        request: u64,
+        installed: bool,
+        entry: Option<usize>,
+    ) -> Result<PreparedToken, RenderError> {
+        let res = if installed {
             PendingRes::Pages(None)
         } else {
             self.release(kind);
@@ -3223,13 +3616,16 @@ impl Renderer {
             loading: Holder::default(),
             chart: None,
             pool: None,
+            entry,
         });
         Ok(token)
     }
 
-    /// Drops `kind`'s committed installation, the result's pages-only one
+    /// Releases `kind`'s committed installation, the result's pages-only one
     /// and its staged lines included, and the selection's chart-image pool,
-    /// whose generation ends, leaving a staging in place.
+    /// whose generation ends, into the kind's standing entry (the pool
+    /// beside its atlas), leaving a staging in place: nothing is dropped
+    /// here.
     fn release(&mut self, kind: ScreenKind) {
         #[cfg(feature = "dev-tools")]
         let p_some = crate::probe::on()
@@ -3251,25 +3647,62 @@ impl Renderer {
         }
         #[cfg(feature = "dev-tools")]
         let p_t = crate::probe::Span::start();
-        if let Some(slot) = Self::screen(kind).and_then(|i| self.screens.get_mut(i)) {
-            *slot = None;
-        }
+        let slot = Self::screen(kind)
+            .and_then(|i| self.screens.get_mut(i))
+            .and_then(Option::take);
         #[cfg(feature = "dev-tools")]
-        let p_slot = p_t.elapsed();
-        if kind == ScreenKind::Selection {
+        let p_slot_taken = p_t.elapsed();
+        let pool = if kind == ScreenKind::Selection {
             self.pool_grid = None;
-            self.pool = None;
+            self.owed = false;
+            self.decided = 0;
+            self.pool.take().map(|p| PoolPart {
+                pool: p.retire(),
+                bind: None,
+            })
+        } else {
+            None
+        };
+        #[cfg(feature = "dev-tools")]
+        let (p_pool_taken, p_pool_alone) = (p_t.elapsed(), slot.is_none() && pool.is_some());
+        let pages = if kind == ScreenKind::Result {
+            self.staged_result_text = None;
+            self.result_pages.take()
+        } else {
+            None
+        };
+        #[cfg(feature = "dev-tools")]
+        let p_pages_taken = p_t.elapsed();
+        match slot {
+            Some(s) => {
+                let f = self.slot_retired(kind, s, pool, Class::Other);
+                self.retire_standing(kind, f);
+            }
+            None => {
+                if let Some(pool) = pool {
+                    self.retire_standing(kind, Self::pool_retired(pool, Class::Other));
+                }
+            }
         }
         #[cfg(feature = "dev-tools")]
-        let p_pool = p_t.elapsed().saturating_sub(p_slot);
-        if kind == ScreenKind::Result {
-            self.result_pages = None;
-            self.staged_result_text = None;
+        let p_retired = p_t.elapsed();
+        if let Some(p) = pages {
+            self.retire_standing(kind, Self::pages_retired(kind, p, Class::Other));
         }
+        // Each handle's take and retirement: the slot's with its pool
+        // beside it, the pool's alone when no slot holds it.
         #[cfg(feature = "dev-tools")]
         if p_some {
             use crate::probe::{mark, us};
-            let p_pages = p_t.elapsed().saturating_sub(p_slot + p_pool);
+            let retiring = p_retired.saturating_sub(p_pages_taken);
+            let pool_taking = p_pool_taken.saturating_sub(p_slot_taken);
+            let (p_slot, p_pool) = if p_pool_alone {
+                (p_slot_taken, pool_taking + retiring)
+            } else {
+                (p_slot_taken + retiring, pool_taking)
+            };
+            let p_pages = p_pages_taken.saturating_sub(p_pool_taken)
+                + p_t.elapsed().saturating_sub(p_retired);
             mark("rel:slot_us", us(p_slot));
             if kind == ScreenKind::Selection {
                 mark("rel:pool_us", us(p_pool));
@@ -3280,6 +3713,199 @@ impl Renderer {
             crate::probe::mem(self.gpu.device(), "rel:l1", "rel:n1", "rel:r1");
             crate::probe::arm_post(8);
         }
+    }
+
+    /// `s`, `kind`'s installation, retired: its resources as the array,
+    /// `pool` beside them, its installation and lines as its CPU part,
+    /// charged what it was committed at with the pool's every layer.
+    fn slot_retired(
+        &self,
+        kind: ScreenKind,
+        s: Slot,
+        pool: Option<PoolPart>,
+        class: Class,
+    ) -> Filled {
+        let bundle = s.installation.bundle();
+        let id = Some(bundle.atlas_id());
+        let pooled = pool.as_ref().map_or(0, |p| p.pool.texels());
+        let charge = self.committed_charge(bundle).saturating_add(pooled);
+        let pool_use = pool.as_ref().map_or(0, |p| p.pool.last_use);
+        let last_use = s.resources.atlas.last_use().max(pool_use);
+        Filled {
+            pool,
+            cpu: Some(CpuParts {
+                installation: Some(s.installation),
+                holders: [s.text, Holder::default()],
+                ..CpuParts::default()
+            }),
+            id,
+            charge,
+            last_use,
+            ..Filled::new(Array::Resources(s.resources), kind, class)
+        }
+    }
+
+    /// A pages-only installation retired: its array, its pages as its CPU
+    /// part.
+    fn pages_retired(kind: ScreenKind, p: PagesRes, class: Class) -> Filled {
+        Filled {
+            id: Some(p.pages.id()),
+            charge: pages_texels(&p.pages),
+            last_use: p.atlas.last_use(),
+            cpu: Some(CpuParts {
+                pages: Some(p.pages),
+                ..CpuParts::default()
+            }),
+            ..Filled::new(
+                Array::Pages {
+                    atlas: p.atlas,
+                    atlas_bind: p.atlas_bind,
+                    text_cache: p.text_cache,
+                },
+                kind,
+                class,
+            )
+        }
+    }
+
+    /// A selection's pool alone retired (no slot beside it).
+    fn pool_retired(pool: PoolPart, class: Class) -> Filled {
+        Filled {
+            charge: pool.pool.texels(),
+            last_use: pool.pool.last_use,
+            pool: Some(pool),
+            ..Filled::new(Array::None, ScreenKind::Selection, class)
+        }
+    }
+
+    /// Fills `kind`'s standing entry with `f`, or, should the kind have
+    /// none (an installation restored where no entry was free), a free
+    /// one: a removal, release or replacement never waits.
+    fn retire_standing(&mut self, kind: ScreenKind, f: Filled) {
+        let at = self
+            .retire
+            .reserved(Hold::Standing(kind))
+            .or_else(|| self.retire.reserve(Hold::Standing(kind)));
+        self.retire_into(at, f);
+    }
+
+    /// Fills reserved entry `at` with `f`. Without one, which no path that
+    /// reserves first reaches, `f` is dropped here once its last use
+    /// completes, a heavy operation.
+    fn retire_into(&mut self, at: Option<usize>, f: Filled) {
+        let f = match at {
+            Some(i) => match self.retire.fill(i, f) {
+                Ok(()) => return,
+                Err(f) => f,
+            },
+            None => f,
+        };
+        if f.last_use > self.gpu.seen() {
+            if f.last_use > self.gpu.latest() {
+                let _ = self.gpu.submit([]);
+            }
+            let _ = wait_for_gpu(&self.gpu);
+        }
+        if f.array.atlas().is_some() || f.pool.is_some() {
+            self.note_heavy();
+        }
+        drop(f);
+    }
+
+    /// A staging dropped: its own array, its pool and its CPU side fill
+    /// the entry it reserved; one with nothing of its own (the committed
+    /// bundle, the pages installed) holds no device resource and is
+    /// dropped here.
+    fn retire_candidate(&mut self, p: Pending) {
+        let Pending {
+            skin,
+            pages,
+            res,
+            text,
+            loading,
+            pool,
+            entry,
+            ..
+        } = p;
+        let pool = pool.and_then(|s| s.pool).map(|p| PoolPart {
+            pool: p.retire(),
+            bind: None,
+        });
+        let pooled = pool.as_ref().map_or(0, |p| p.pool.texels());
+        let pool_use = pool.as_ref().map_or(0, |p| p.pool.last_use);
+        let kind =
+            entry
+                .and_then(|i| self.retire.hold_of(i))
+                .map_or(ScreenKind::Play, |h| match h {
+                    Hold::Staging(k) | Hold::Standing(k) => k,
+                    Hold::PoolOp => ScreenKind::Selection,
+                });
+        let bundle_charge = skin.as_ref().map_or(0, |s| charge_of(s.bundle()));
+        let bundle_id = skin.as_ref().map(|s| s.bundle().atlas_id());
+        let (array, id, charge, last_use, pages) = match res {
+            PendingRes::Installed | PendingRes::Pages(None) => {
+                if let Some(i) = entry {
+                    self.retire.release(i);
+                }
+                return;
+            }
+            PendingRes::Own(r) => {
+                let last_use = r.atlas.last_use();
+                (Array::Own(r), bundle_id, bundle_charge, last_use, pages)
+            }
+            // A layout's buffers, made and waited for, are not drawn
+            // before its commit: its pool's use is the last.
+            PendingRes::Layout {
+                staging,
+                instances,
+                bind,
+            } => (
+                Array::Layout {
+                    staging: *staging,
+                    instances,
+                    bind,
+                },
+                None,
+                0,
+                0,
+                pages,
+            ),
+            PendingRes::Pages(Some(p)) => {
+                let PagesRes {
+                    pages: held,
+                    atlas,
+                    atlas_bind,
+                    text_cache,
+                } = *p;
+                let (id, charge, last_use) =
+                    (Some(held.id()), pages_texels(&held), atlas.last_use());
+                (
+                    Array::Pages {
+                        atlas,
+                        atlas_bind,
+                        text_cache,
+                    },
+                    id,
+                    charge,
+                    last_use,
+                    pages.or(Some(held)),
+                )
+            }
+        };
+        let f = Filled {
+            pool,
+            cpu: Some(CpuParts {
+                pages,
+                staged: skin,
+                holders: [text, loading],
+                ..CpuParts::default()
+            }),
+            id,
+            charge: charge.saturating_add(pooled),
+            last_use: last_use.max(pool_use),
+            ..Filled::new(array, kind, Class::Other)
+        };
+        self.retire_into(entry, f);
     }
 
     /// A staging's instance buffer of `instances` sprites.
@@ -3299,10 +3925,15 @@ impl Renderer {
     /// Installs the staging of `token` whole, between frames. Play's: its
     /// skin with its prepared attempt, and its atlas, bind group, clips,
     /// staging and instance buffer together when it has its own; the ones
-    /// they replace are dropped, and frames are built again after a
-    /// refused one. Another kind's: its installation and resources become
-    /// that kind's slot, nothing of play's changing; a staging of the
-    /// kind's committed bundle keeps the slot.
+    /// they replace, with the installation and skin they served, fill
+    /// play's standing entry, and frames are built again after a refused
+    /// one. Another kind's: its installation and resources become that
+    /// kind's slot, nothing of play's changing; what it replaces (an
+    /// installation with its pool, a layout's staging and instance buffer,
+    /// a pages-only array) fills the kind's standing entry; a staging of
+    /// the kind's committed bundle keeps the slot. The staging's own entry
+    /// becomes its installation's standing entry. Nothing is dropped and
+    /// nothing allocated.
     ///
     /// # Errors
     ///
@@ -3342,19 +3973,50 @@ impl Renderer {
         };
         self.committed = token.request;
         let target = self.target();
-        match Self::screen(token.kind) {
+        let kind = token.kind;
+        let entry = pending.entry;
+        match Self::screen(kind) {
             None => {
                 let staged_chart = pending.chart;
-                if let PendingRes::Own(r) = pending.res {
-                    self.replace_resources(*r);
-                    // The staged presentation's loading lines, in the cache
-                    // that moved with its resources: its key unchanged,
-                    // nothing is prepared again.
-                    self.installed_loading = pending.loading;
-                }
+                let old = match pending.res {
+                    PendingRes::Own(r) => {
+                        let old = self.replace_resources(*r);
+                        // The staged presentation's loading lines, in the
+                        // cache that moved with its resources: its key
+                        // unchanged, nothing is prepared again.
+                        self.installed_loading = pending.loading;
+                        Some(old)
+                    }
+                    _ => None,
+                };
                 self.installed_text = pending.text;
-                if let Some(skin) = pending.skin {
-                    self.activate_decl_skin(skin);
+                let replaced = pending.skin.map(|skin| self.activate_decl_skin(skin));
+                match old {
+                    Some(old) => {
+                        // Play's replaced array, with the installation and
+                        // skin it served, fills play's standing entry.
+                        let (installation, skin) =
+                            replaced.map_or((None, None), |(i, s)| (i, Some(s)));
+                        let id = installation.as_ref().map(|i| i.bundle().atlas_id());
+                        let charge = installation
+                            .as_ref()
+                            .map_or(0, |i| self.committed_charge(i.bundle()));
+                        let f = Filled {
+                            last_use: old.atlas.last_use(),
+                            cpu: Some(CpuParts {
+                                installation,
+                                skin,
+                                ..CpuParts::default()
+                            }),
+                            id,
+                            charge,
+                            ..Filled::new(Array::Resources(old), kind, Class::Replaced)
+                        };
+                        self.retire_standing(kind, f);
+                        self.stand(entry, kind);
+                    }
+                    // The same resources: nothing of the device's replaced.
+                    None => self.release_entry(entry),
                 }
                 // Images published into the staged array, keyed for it at
                 // publication: after the activation the live key names the
@@ -3374,16 +4036,20 @@ impl Renderer {
             }
             Some(i) => {
                 let installation = pending.skin.as_ref().map(DeclSkin::installation);
-                let result = token.kind == ScreenKind::Result;
+                let result = kind == ScreenKind::Result;
                 // A selection staging's own pool replaces the committed
-                // one, which is kept as what the commit replaced.
+                // one, which retires with what the commit replaced.
+                let mut old_pool = None;
                 if let Some(staged) = pending.pool {
-                    self.retired_pool = self.pool.take();
+                    old_pool = self.pool.take().map(|p| PoolPart {
+                        pool: p.retire(),
+                        bind: None,
+                    });
                     self.pool_grid = staged.grid;
                     self.pool = staged.pool;
+                    self.owed = staged.owed;
+                    self.decided = staged.decided;
                 }
-                // What it replaces keeps its device resources until the
-                // next staging or a drain: a commit drops none of them.
                 let old = self.screens.get_mut(i).and_then(Option::take);
                 let pages = if result {
                     self.result_pages.take()
@@ -3405,7 +4071,25 @@ impl Renderer {
                                 text: Holder::default(),
                             });
                         }
-                        self.retired = old.map(Retired::Slot).or_else(|| pages.map(Retired::Pages));
+                        match (old, pages) {
+                            (Some(s), _) => {
+                                let f = self.slot_retired(kind, s, old_pool, Class::Replaced);
+                                self.retire_standing(kind, f);
+                            }
+                            (None, Some(p)) => {
+                                let f = Self::pages_retired(kind, p, Class::Replaced);
+                                self.retire_standing(kind, f);
+                            }
+                            (None, None) => {
+                                if let Some(pool) = old_pool {
+                                    self.retire_standing(
+                                        kind,
+                                        Self::pool_retired(pool, Class::Replaced),
+                                    );
+                                }
+                            }
+                        }
+                        self.stand(entry, kind);
                     }
                     (
                         PendingRes::Layout {
@@ -3424,11 +4108,37 @@ impl Renderer {
                                     Some(b) => (b, Some(s.resources.atlas_bind)),
                                     None => (s.resources.atlas_bind, None),
                                 };
-                                self.retired = Some(Retired::Layout {
-                                    staging: s.resources.staging,
-                                    _instances: s.resources.instances,
-                                    _bind: replaced,
-                                });
+                                // The layout's staging and instance buffer
+                                // fill the standing entry, the replaced pool
+                                // with the bind group that bound it.
+                                let atlas_use = s.resources.atlas.last_use();
+                                let (pool, bind) = match old_pool {
+                                    Some(p) => (
+                                        Some(PoolPart {
+                                            bind: replaced,
+                                            ..p
+                                        }),
+                                        None,
+                                    ),
+                                    None => (None, replaced),
+                                };
+                                let pool_use = pool.as_ref().map_or(0, |p| p.pool.last_use);
+                                let f = Filled {
+                                    charge: pool.as_ref().map_or(0, |p| p.pool.texels()),
+                                    last_use: atlas_use.max(pool_use),
+                                    pool,
+                                    ..Filled::new(
+                                        Array::Layout {
+                                            staging: s.resources.staging,
+                                            instances: s.resources.instances,
+                                            bind,
+                                        },
+                                        kind,
+                                        Class::Replaced,
+                                    )
+                                };
+                                self.retire_standing(kind, f);
+                                self.stand(entry, kind);
                                 Some((
                                     s.resources.atlas,
                                     atlas_bind,
@@ -3438,9 +4148,15 @@ impl Renderer {
                                 ))
                             }
                             (None, Some(p)) => {
+                                // The pages-only array moves into the
+                                // slot, its standing entry the slot's.
+                                self.release_entry(entry);
                                 Some((p.atlas, p.atlas_bind, p.text_cache, None, Holder::default()))
                             }
-                            (None, None) => None,
+                            (None, None) => {
+                                self.release_entry(entry);
+                                None
+                            }
                         };
                         let canvas = installation.bundle().skin().canvas(target);
                         staging.project(&canvas);
@@ -3467,6 +4183,7 @@ impl Renderer {
                         // `install_pages` released any installation first.
                         self.staged_result_text = None;
                         self.result_pages = Some(*p);
+                        self.stand(entry, kind);
                     }
                     (_, _) => {
                         // Its own installation stays: the same bundle, or
@@ -3477,6 +4194,7 @@ impl Renderer {
                         if result {
                             self.result_pages = pages;
                         }
+                        self.release_entry(entry);
                     }
                 }
             }
@@ -3484,14 +4202,29 @@ impl Renderer {
         Ok(())
     }
 
+    /// Makes `entry`, a staging's own, `kind`'s standing entry.
+    fn stand(&mut self, entry: Option<usize>, kind: ScreenKind) {
+        if let Some(i) = entry {
+            self.retire.rehold(i, Hold::Standing(kind));
+        }
+    }
+
+    /// Frees `entry`, a staging's own that nothing filled.
+    fn release_entry(&mut self, entry: Option<usize>) {
+        if let Some(i) = entry {
+            self.retire.release(i);
+        }
+    }
+
     /// Puts `skin` in use, its installation the one installed, and builds
     /// frames afresh: no refusal kept, no frame started, the projection
     /// made again for its canvas. A loading refusal stays only with the
     /// installation's own presentation, so the same installation keeps it
-    /// for its lifetime and another starts afresh.
-    fn activate_decl_skin(&mut self, skin: DeclSkin) {
-        self.installed = Some(skin.installation());
-        self.skin = Box::new(skin);
+    /// for its lifetime and another starts afresh. Returns the
+    /// installation and the skin it replaced.
+    fn activate_decl_skin(&mut self, skin: DeclSkin) -> (Option<Installation>, Box<dyn PlaySkin>) {
+        let installed = self.installed.replace(skin.installation());
+        let replaced = std::mem::replace(&mut self.skin, Box::new(skin));
         self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.refused = None;
         self.loading_refused = None;
@@ -3499,23 +4232,30 @@ impl Renderer {
         self.project();
         // The chart images valid for the array now in use, or none.
         self.sync_chart();
+        (installed, replaced)
     }
 
     /// Replaces the atlas, its bind group, the staging and the instance
-    /// buffer with `r`, together, taking its number. The installed loading
-    /// lines' holder goes with the cache it held lines in: a commit moves
-    /// the staging's own in after ([`commit`](Self::commit)); otherwise the
-    /// new key makes the presentation's loading text stale, and the player
-    /// clears it before the next loading frame is built.
-    fn replace_resources(&mut self, r: Resources) {
-        self.atlas = r.atlas;
-        self.atlas_bind = r.atlas_bind;
-        self.staging = r.staging;
-        self.instances = r.instances;
-        self.text_cache = r.text_cache;
+    /// buffer with `r`, together, taking its number, and returns the ones
+    /// replaced. The installed loading lines' holder goes with the cache it
+    /// held lines in: a commit moves the staging's own in after
+    /// ([`commit`](Self::commit)); otherwise the new key makes the
+    /// presentation's loading text stale, and the player clears it before
+    /// the next loading frame is built.
+    fn replace_resources(&mut self, r: Resources) -> Resources {
+        let old = Resources {
+            id: self.resources,
+            atlas: std::mem::replace(&mut self.atlas, r.atlas),
+            atlas_bind: std::mem::replace(&mut self.atlas_bind, r.atlas_bind),
+            staging: std::mem::replace(&mut self.staging, r.staging),
+            instances: std::mem::replace(&mut self.instances, r.instances),
+            text_cache: std::mem::replace(&mut self.text_cache, r.text_cache),
+            labels: None,
+        };
         self.installed_loading = Holder::default();
         self.resources = r.id;
         self.cancel_built();
+        old
     }
 
     /// The step every replacement of the play array passes: any frame
@@ -3526,11 +4266,13 @@ impl Renderer {
         self.started = None;
     }
 
-    /// Drops the staging, if any, and the loading text staged on its own
-    /// resources, whose lines go with their cache: text staged for the
-    /// installation in use stays.
+    /// Drops the staging, if any, into the entry it reserved, and the
+    /// loading text staged on its own resources, whose lines go with their
+    /// cache: text staged for the installation in use stays.
     fn drop_pending(&mut self) {
-        self.pending = None;
+        if let Some(p) = self.pending.take() {
+            self.retire_candidate(p);
+        }
         let installed = self.loading_text_key();
         if self
             .staged_text
@@ -3547,7 +4289,8 @@ impl Renderer {
         self.resource_ids
     }
 
-    /// Drops the staged installation, if any: its resources go, and the
+    /// Drops the staged installation, if any: its resources fill the entry
+    /// it reserved, destroyed once their last use completes, and the
     /// installation in use stays.
     pub fn discard(&mut self) {
         self.drop_pending();
@@ -3561,7 +4304,9 @@ impl Renderer {
     /// which reuses its resources. A staging is dropped. Admission is
     /// checked as for a staging: kinds restored one at a time, in
     /// [`Admission::committed`]'s order, are each a subset of a set
-    /// admitted together.
+    /// admitted together. The rebuild's work, inline: what a restore
+    /// replaces on a live renderer is dropped here, and the kind's
+    /// standing entry is reserved.
     ///
     /// # Errors
     ///
@@ -3591,9 +4336,9 @@ impl Renderer {
         });
         match Self::screen(kind) {
             None => {
-                self.replace_resources(r);
+                drop(self.replace_resources(r));
                 self.installed_text = Holder::default();
-                self.activate_decl_skin(DeclSkin::of(installation));
+                drop(self.activate_decl_skin(DeclSkin::of(installation)));
             }
             Some(i) => {
                 if let Some(slot) = self.screens.get_mut(i) {
@@ -3608,14 +4353,27 @@ impl Renderer {
         if let Some((grid, pool)) = pool {
             self.pool_grid = grid;
             self.pool = pool;
+            self.owed = false;
+            self.decided = 0;
         }
+        self.reserve_standing(kind);
         Ok(())
     }
 
-    /// Drops `kind`'s committed installation and its charge, and a
-    /// staging of `kind`: its screen draws its built-in presentation.
-    /// Play's installation is never removed this way: for play it does
-    /// nothing.
+    /// Reserves `kind`'s standing entry for its installation restored,
+    /// unless it holds one.
+    fn reserve_standing(&mut self, kind: ScreenKind) {
+        if self.retire.reserved(Hold::Standing(kind)).is_none() {
+            let _ = self.retire.reserve(Hold::Standing(kind));
+        }
+    }
+
+    /// Removes `kind`'s committed installation, and a staging of `kind`:
+    /// its screen draws its built-in presentation. The installation fills
+    /// the kind's standing entry, charged until its destruction, and the
+    /// staging the entry it reserved: nothing waits, nothing is dropped
+    /// here. Play's installation is never removed this way: for play it
+    /// does nothing.
     pub fn remove(&mut self, kind: ScreenKind) {
         if Self::screen(kind).is_none() {
             return;
@@ -3649,6 +4407,7 @@ impl Renderer {
         self.release(kind);
         self.admit_reclaiming(kind, pages_texels(pages))?;
         self.result_pages = Some(self.pages_for(pages)?);
+        self.reserve_standing(kind);
         Ok(())
     }
 
@@ -3806,7 +4565,8 @@ impl Renderer {
                         fault(&self.gpu);
                     }
                 }
-                self.gpu.queue().submit([]);
+                let (n, _) = self.gpu.submit([]);
+                self.atlas.mark(n);
             });
             // Submitted work is waited for, a refused write's included.
             #[cfg(feature = "dev-tools")]
@@ -3927,7 +4687,8 @@ impl Renderer {
                 if let Some(fault) = self.chart_fault.take() {
                     fault(&self.gpu);
                 }
-                self.gpu.queue().submit([]);
+                let (n, _) = self.gpu.submit([]);
+                res.atlas.mark(n);
             });
             #[cfg(feature = "dev-tools")]
             let p_v = crate::probe::Span::start();
@@ -4246,6 +5007,8 @@ impl Renderer {
         self.bga_serial += 1;
         let array =
             crate::bga::BgaArray::new(&self.gpu, &self.bindings.bga, pages, self.bga_serial)?;
+        // The array's creation: a heavy operation.
+        self.note_heavy();
         let key = array.key(self.id).ok_or(crate::BgaFault::Stale)?;
         self.bga = array;
         Ok(key)
@@ -4354,7 +5117,7 @@ impl Renderer {
                     }
                     submits.set(submits.get() + 1);
                 }
-                gpu.queue().submit([]);
+                gpu.submit([]);
             });
             // In flight until a later round sees it, whatever becomes of
             // the batch: the next step waits for it.
@@ -4444,7 +5207,13 @@ impl Renderer {
     /// Drops the BGA array and its table: the stand-in is bound again.
     pub fn drop_bga(&mut self) {
         self.set_bga_table(Arc::new(skin_model::bga::BgaTable::ABSENT));
+        // An array in use is destroyed here, a heavy operation; the
+        // stand-in's is not one.
+        let real = self.bga.key(self.id).is_some();
         self.bga = crate::bga::BgaArray::stand_in(&self.gpu, &self.bindings.bga);
+        if real {
+            self.note_heavy();
+        }
     }
 
     /// The BGA array's bytes on the GPU (0 for the stand-in).
@@ -4502,22 +5271,138 @@ impl Renderer {
         self.remove(ScreenKind::Result);
     }
 
-    /// Drops what the last commit replaced (a layout on the same array, or
-    /// an installation or pages-only installation on another), outside the
-    /// commit point: dropping device resources allocates. Returns the array
-    /// it released, if any, so the owner can acknowledge it (the S10-09i
-    /// design's §2.1 Q3) before another atlas build is considered. The next
-    /// staging drains it too.
-    pub fn drain_retired(&mut self) -> Option<AtlasId> {
-        #[cfg(feature = "dev-tools")]
-        if crate::probe::on() && (self.retired.is_some() || self.retired_pool.is_some()) {
-            let (pool, r) = (self.retired_pool.take(), self.retired.take());
-            let id = r.as_ref().and_then(Retired::atlas_id);
-            probe_drop(self.gpu.device(), r, pool, true, 1);
-            return id;
+    /// Looks, without blocking, whether the completion watched is seen,
+    /// and keeps one watch in flight (design.md "Memory Budget",
+    /// completion seen without a wait): once the one watched is seen, or
+    /// with none, a write still queued with no submission is submitted
+    /// first, then the last submission is watched when no completion seen
+    /// covers it yet. The owner calls it once a pass, outside READY's
+    /// cutoff; nothing is registered with the device, and nothing
+    /// allocates on the renderer's side.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::Poll`] when the device fails the poll: the screen is
+    /// dropped, as after any device failure.
+    pub fn poll_completion(&mut self) -> Result<(), RenderError> {
+        if let Some((number, index)) = self.watch.clone() {
+            match self.gpu.poll_watch(number, &index) {
+                Ok(gpu::Watched::Pending) => return Ok(()),
+                Ok(gpu::Watched::Done(_)) => self.watch = None,
+                Err(e) => return Err(RenderError::Poll(e)),
+            }
         }
-        self.retired_pool = None;
-        self.retired.take().and_then(|r| r.atlas_id())
+        if self.gpu.write_queued() {
+            let _ = self.gpu.submit([]);
+        }
+        let seen = self.gpu.seen();
+        self.watch = self.gpu.latest_index().filter(|&(n, _)| n > seen);
+        Ok(())
+    }
+
+    /// Whether a staging may destroy filled retirement entries in its own
+    /// call, waiting for their completion when it is not yet seen, to
+    /// reserve its entry or to fit its admission: the owner sets it each
+    /// pass, false under READY's cutoff, in play and in the result before
+    /// its first picture, where such a staging is refused instead
+    /// ([`RenderError::ListFull`], [`RenderError::Admission`]). True from
+    /// the renderer's making.
+    pub const fn set_destroy_allowed(&mut self, allowed: bool) {
+        self.destroy_allowed = allowed;
+    }
+
+    /// How many retirement entries are filled, retired pools included:
+    /// what READY waits to see at zero.
+    #[must_use]
+    pub fn filled(&self) -> u32 {
+        self.retire.filled()
+    }
+
+    /// At a boundary where destruction is allowed: destroys every filled
+    /// entry whose last use a completion seen covers and that holds only a
+    /// layout's buffers, and with `heavy` (the boundary's heavy operation
+    /// free) at most one heavy part, by priority: a commit's replaced
+    /// installation first, a replaced selection's pool before its atlas,
+    /// then the others first in, first out, retired pools among them. A CPU
+    /// part still in an entry whose array goes is dropped with it, here.
+    /// Returns what it did; a heavy part destroyed is counted in
+    /// [`heavy_ops`](Self::heavy_ops).
+    pub fn destroy_due(&mut self, heavy: bool) -> Destroyed {
+        let (out, ran) = self.retire.destroy_due(self.gpu.seen(), heavy);
+        if ran {
+            self.note_heavy();
+        }
+        out
+    }
+
+    /// Whether a filled entry with a heavy part to destroy is due now.
+    #[must_use]
+    pub fn due_heavy(&self) -> bool {
+        self.retire.due_heavy(self.gpu.seen())
+    }
+
+    /// Whether a filled entry waits for a completion not yet seen.
+    #[must_use]
+    pub fn pending_completion(&self) -> bool {
+        self.retire.pending_completion(self.gpu.seen())
+    }
+
+    /// Takes the CPU part of the oldest filled entry whose last use a
+    /// completion seen covers and that still holds one, to hand to the
+    /// worker: the entry keeps its array, charge and identity until its
+    /// destruction.
+    pub fn take_handoff(&mut self) -> Option<Handoff> {
+        self.retire.take_handoff(self.gpu.seen())
+    }
+
+    /// Puts `cpu`, which the worker could not take, back into `entry`, the
+    /// handoff's: dropped with its array there. Returns whether it went
+    /// back; `false` when the entry no longer waits for it, `cpu` dropped
+    /// here.
+    pub fn return_handoff(&mut self, entry: usize, cpu: CpuParts) -> bool {
+        self.retire.return_handoff(entry, cpu).is_ok()
+    }
+
+    /// A counter bumped at every fill, destruction and handoff of an entry
+    /// retired from the result kind: the result's atlas report changes
+    /// only when it moves.
+    #[must_use]
+    pub const fn result_changes(&self) -> u64 {
+        self.retire.result_changes()
+    }
+
+    /// The heavy device operations the renderer ran (design.md "Load
+    /// Pipeline", one heavy operation a frame interval): a skin or pages
+    /// array's creation, a pool array's creation, a BGA array's begin or
+    /// drop, and every texture's destruction, in a staging's call or at a
+    /// boundary.
+    #[must_use]
+    pub fn heavy_ops(&self) -> HeavyOps {
+        self.heavy.get()
+    }
+
+    /// One more heavy operation, ended now.
+    fn note_heavy(&self) {
+        let h = self.heavy.get();
+        self.heavy.set(HeavyOps {
+            count: h.count + 1,
+            last_end: Some(Instant::now()),
+        });
+    }
+
+    /// Tests and development builds: the last [`RECORD_LEN`] destructions,
+    /// oldest first.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn destructions(&self) -> impl Iterator<Item = &DestroyRecord> {
+        self.retire.record()
+    }
+
+    /// Tests and development builds: how many destructions were recorded
+    /// since the renderer was made.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[must_use]
+    pub const fn destructions_recorded(&self) -> usize {
+        self.retire.recorded()
     }
 
     /// Whether play's admission released the result's installation since
@@ -4536,12 +5421,15 @@ impl Renderer {
         self.result_disabled
     }
 
-    /// The atlas identities the renderer holds for `kind`: its committed
-    /// array's (an installation's, or the result's pages-only one's) and
-    /// the staging's, if it has its own array or is a pages-only one.
-    /// Allocates nothing.
+    /// The atlas identities the renderer holds for `kind`, in this order:
+    /// its committed array's (an installation's, or the result's
+    /// pages-only one's), the staging's if it has its own array or is a
+    /// pages-only one, the pages upload in hand (none yet), and each filled
+    /// retirement entry retired from `kind` holding an array of pages, in
+    /// the list's order, until its array is destroyed, whether or not its
+    /// CPU part was handed on. Allocates nothing.
     #[must_use]
-    pub fn retained_atlases(&self, kind: ScreenKind) -> [Option<AtlasId>; 3] {
+    pub fn retained_atlases(&self, kind: ScreenKind) -> [Option<AtlasId>; RETAINED_ATLASES] {
         let staged = self
             .pending
             .as_ref()
@@ -4551,14 +5439,25 @@ impl Renderer {
                 (PendingRes::Pages(Some(r)), _) => Some(r.pages.id()),
                 _ => None,
             });
-        let retired = self.retired.as_ref().and_then(|r| match r {
-            Retired::Slot(s) => (Self::screen(kind)
-                == Self::screen(s.installation.bundle().skin().kind()))
-            .then(|| s.installation.bundle().atlas_id()),
-            Retired::Pages(p) => (kind == ScreenKind::Result).then(|| p.pages.id()),
-            Retired::Layout { .. } => None,
-        });
-        [self.committed_atlas(kind), staged, retired]
+        let mut out = [None; RETAINED_ATLASES];
+        let [committed, staging, upload, entries @ ..] = &mut out;
+        *committed = self.committed_atlas(kind);
+        *staging = staged;
+        *upload = None;
+        for (o, id) in entries.iter_mut().zip(self.retire.ids(kind)) {
+            *o = id;
+        }
+        out
+    }
+
+    /// Development builds: for each retirement entry by its index (as
+    /// [`retained_atlases`](Self::retained_atlases) places them after its
+    /// first three), whether it is filled and still holds its pages, not
+    /// yet handed to the worker.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn entries_holding_pages(&self) -> [bool; RETIREMENT_ENTRIES] {
+        self.retire.holding_cpu()
     }
 
     /// The bytes `id`'s pages keep resident wherever the renderer holds
@@ -4570,7 +5469,9 @@ impl Renderer {
         let mut gpu = 0u64;
         for (i, c, g) in self.shared_holders().into_iter().flatten() {
             if i == id {
-                cpu.get_or_insert(c);
+                if c > 0 {
+                    cpu.get_or_insert(c);
+                }
                 gpu = gpu.saturating_add(g);
             }
         }
@@ -4578,19 +5479,22 @@ impl Renderer {
     }
 
     /// Every holder of pages the witness counts, in its order: play's
-    /// installation, the staging, the result's installation and the
-    /// result's pages-only installation, each with its pages' identity,
-    /// their CPU bytes and their array's bytes on the GPU (0 when the
+    /// installation, the staging, the result's installation, the result's
+    /// pages-only installation, then each filled retirement entry, each
+    /// with its pages' identity, their CPU bytes (0 for an entry whose CPU
+    /// part was handed on) and their array's bytes on the GPU (0 when the
     /// array is another holder's).
-    fn shared_holders(&self) -> [Option<(AtlasId, u64, u64)>; 5] {
+    fn shared_holders(&self) -> [Option<(AtlasId, u64, u64)>; 4 + ENTRIES] {
         let result = Self::screen(ScreenKind::Result)
             .and_then(|i| self.screens.get(i))
             .and_then(Option::as_ref);
-        let play = self.installed.as_ref().map(|i| {
+        let mut out = [None; 4 + ENTRIES];
+        let [play, staged, slot, pages, entries @ ..] = &mut out;
+        *play = self.installed.as_ref().map(|i| {
             let b = i.bundle();
             (b.atlas_id(), b.shared_bytes(), self.atlas.bytes())
         });
-        let staged = self.pending.as_ref().and_then(|p| {
+        *staged = self.pending.as_ref().and_then(|p| {
             let gpu = match &p.res {
                 PendingRes::Own(r) => r.atlas.bytes(),
                 PendingRes::Pages(Some(r)) => r.atlas.bytes(),
@@ -4602,23 +5506,22 @@ impl Renderer {
                 (None, None) => None,
             }
         });
-        let slot = result.map(|s| {
+        *slot = result.map(|s| {
             let b = s.installation.bundle();
             (b.atlas_id(), b.shared_bytes(), s.resources.atlas.bytes())
         });
-        let pages = self
+        *pages = self
             .result_pages
             .as_ref()
             .map(|p| (p.pages.id(), pages_bytes(&p.pages), p.atlas.bytes()));
-        let retired = self.retired.as_ref().and_then(|r| match r {
-            Retired::Slot(s) => {
-                let b = s.installation.bundle();
-                Some((b.atlas_id(), b.shared_bytes(), s.resources.atlas.bytes()))
-            }
-            Retired::Pages(p) => Some((p.pages.id(), pages_bytes(&p.pages), p.atlas.bytes())),
-            Retired::Layout { .. } => None,
-        });
-        [play, staged, slot, pages, retired]
+        for (o, (_, f)) in entries.iter_mut().zip(self.retire.filled_entries()) {
+            let gpu = f.array.atlas().map_or(0, AtlasTexture::bytes);
+            *o = match &f.cpu {
+                Some(c) => c.id().map(|id| (id, c.pages_bytes(), gpu)),
+                None => f.id.map(|id| (id, 0, gpu)),
+            };
+        }
+        out
     }
 
     /// The bytes held for the play skin now, the staged installation's
@@ -4629,20 +5532,32 @@ impl Renderer {
     /// presentation.
     #[must_use]
     pub fn memory(&self) -> MemoryWitness {
-        self.memory_with(None)
+        self.memory_with(None, &[])
     }
 
     /// [`memory`](Self::memory) with `selection`, the selection skin's
     /// state its owner keeps beside the renderer (the render thread, for
-    /// the screen's lifetime), counted.
+    /// the screen's lifetime), counted, and `handed`, the pages of the CPU
+    /// parts handed to the worker and not yet dropped, each as its
+    /// identity and its bytes: counted once for each identity no holder of
+    /// the renderer's counts already.
     #[must_use]
-    pub fn memory_with(&self, selection: Option<&Selection>) -> MemoryWitness {
+    pub fn memory_with(
+        &self,
+        selection: Option<&Selection>,
+        handed: &[(AtlasId, u64)],
+    ) -> MemoryWitness {
+        /// An entry's loading presentation, while its CPU part holds one.
+        fn entry_loading(f: &Filled) -> Option<&crate::decl::LoadingPresentation> {
+            f.cpu.as_ref().and_then(CpuParts::loading)
+        }
         let bytes = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         // A text layer's cache with the lines its holders keep.
         let cache = |c: &TextCache, held: &[&Holder]| {
             held.iter()
                 .fold(c.bytes(), |sum, h| sum.saturating_add(bytes(h.bytes())))
         };
+        let entries = || self.retire.filled_entries().map(|(_, f)| f);
         let selection_text = Self::screen(ScreenKind::Selection)
             .and_then(|i| self.screens.get(i))
             .and_then(Option::as_ref)
@@ -4651,10 +5566,6 @@ impl Renderer {
             .and_then(|i| self.screens.get(i))
             .and_then(Option::as_ref);
         let result_installation = result_slot.map(|s| &s.installation);
-        let retired_slot = match &self.retired {
-            Some(Retired::Slot(s)) => Some(s),
-            _ => None,
-        };
         let installed = self.installed.as_ref();
         let pending = self.pending.as_ref();
         let staged = pending.and_then(|p| p.skin.as_ref().map(DeclSkin::installation));
@@ -4687,62 +5598,82 @@ impl Renderer {
                 .any(|i| Arc::ptr_eq(i.bundle(), s.bundle()))
         });
         // Each distinct loading presentation once: play's, the result's,
-        // a retired installation's, then the staging's.
+        // an entry's, then the staging's.
         let staged_loading = staged.as_ref().filter(|s| {
-            ![
-                installed,
-                result_installation,
-                retired_slot.map(|r| &r.installation),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|i| i.loading().same(s.loading()))
+            let held = [installed, result_installation]
+                .into_iter()
+                .flatten()
+                .any(|i| i.loading().same(s.loading()));
+            !held
+                && !entries()
+                    .filter_map(entry_loading)
+                    .any(|l| l.same(s.loading()))
         });
-        let result_loading = result_installation
-            .map_or(0, |i| i.loading().bytes())
-            .saturating_add(
-                retired_slot
-                    .map(|r| &r.installation)
-                    .filter(|r| !result_installation.is_some_and(|i| i.loading().same(r.loading())))
-                    .map_or(0, |r| r.loading().bytes()),
-            );
-        // The pages each distinct identity keeps, once; an array on the
-        // GPU is counted with its holder's resources.
-        let mut seen: [Option<AtlasId>; 5] = [None; 5];
-        let mut shared_cpu = 0u64;
-        for (k, (id, cpu, _)) in self.shared_holders().into_iter().flatten().enumerate() {
-            if !seen.contains(&Some(id)) {
-                shared_cpu = shared_cpu.saturating_add(cpu);
+        // The result's committed presentation, then each result entry's
+        // distinct one; another kind's entry counts its own in `retired`.
+        let mut result_loading = result_installation.map_or(0, |i| i.loading().bytes());
+        for (k, f) in entries().enumerate() {
+            let Some(l) = entry_loading(f).filter(|_| f.kind == ScreenKind::Result) else {
+                continue;
+            };
+            let earlier = entries()
+                .take(k)
+                .filter(|e| e.kind == ScreenKind::Result)
+                .filter_map(entry_loading)
+                .any(|e| e.same(l));
+            if !earlier && !result_installation.is_some_and(|i| i.loading().same(l)) {
+                result_loading = result_loading.saturating_add(l.bytes());
             }
-            if let Some(s) = seen.get_mut(k) {
+        }
+        // The pages each distinct identity keeps, once; an array on the
+        // GPU is counted with its holder's resources. A holder whose CPU
+        // part was handed on counts none: the handoff place counts them.
+        let mut seen: [Option<AtlasId>; 4 + ENTRIES] = [None; 4 + ENTRIES];
+        let mut marked = 0;
+        let mut shared_cpu = 0u64;
+        for (id, cpu, _) in self.shared_holders().into_iter().flatten() {
+            if cpu == 0 || seen.contains(&Some(id)) {
+                continue;
+            }
+            shared_cpu = shared_cpu.saturating_add(cpu);
+            if let Some(s) = seen.get_mut(marked) {
                 *s = Some(id);
+                marked += 1;
+            }
+        }
+        for (k, &(id, cpu)) in handed.iter().enumerate() {
+            let earlier = handed.iter().take(k).any(|&(e, _)| e == id);
+            if !earlier && !seen.contains(&Some(id)) {
+                shared_cpu = shared_cpu.saturating_add(cpu);
             }
         }
         // The default font, shared by every producer, once: any bundle
-        // still held, a retired one's included, keeps it.
-        let default_font = [
+        // still held, an entry's included, keeps it.
+        let held_bundles = [
             installed.map(Installation::bundle),
             staged.as_ref().map(Installation::bundle),
             result_installation.map(Installation::bundle),
-            retired_slot.map(|r| r.installation.bundle()),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|b| b.text_producer())
-        .map(|t| t.resident().default_font)
-        .max()
-        .unwrap_or(0);
-        let retired = self.retired.as_ref().map_or(0, |r| match r {
-            Retired::Layout { staging, .. } => staging.bytes(),
-            Retired::Slot(s) => s
-                .resources
-                .atlas
-                .bytes()
-                .saturating_add(s.resources.staging.bytes())
-                .saturating_add(cache(&s.resources.text_cache, &[&s.text]))
-                .saturating_add(s.installation.bundle().resident_bytes()),
-            Retired::Pages(p) => p.atlas.bytes().saturating_add(p.text_cache.bytes()),
-        });
+        ];
+        let default_font = held_bundles
+            .into_iter()
+            .flatten()
+            .chain(entries().filter_map(|f| f.cpu.as_ref().and_then(CpuParts::bundle)))
+            .filter_map(|b| b.text_producer())
+            .map(|t| t.resident().default_font)
+            .max()
+            .unwrap_or(0);
+        let retired = entries()
+            .filter(|f| f.class != Class::RetiredPool)
+            .fold(0u64, |sum, f| {
+                let cpu = f
+                    .cpu
+                    .as_ref()
+                    .map_or(0, |c| c.own_bytes(f.kind != ScreenKind::Result));
+                sum.saturating_add(f.gpu_bytes()).saturating_add(cpu)
+            });
+        let retired_pool = entries()
+            .filter(|f| f.class == Class::RetiredPool)
+            .fold(0u64, |sum, f| sum.saturating_add(f.gpu_bytes()));
         let staged_result_text = self.staged_result_text.as_ref().map(|(_, h)| h);
         MemoryWitness {
             default_font,
@@ -4789,6 +5720,7 @@ impl Renderer {
                 .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
             result_loading,
             retired,
+            retired_pool,
             // Kept apart from the renderer: `with_decision` adds them.
             decision_labels: 0,
             decision_staged: 0,
@@ -6616,11 +7548,12 @@ impl Renderer {
         }
         #[cfg(feature = "dev-tools")]
         let p_s = crate::probe::Span::start();
-        let submitted = queue.submit([encoder.finish()]);
+        let (number, submitted) = self.gpu.submit([encoder.finish()]);
         #[cfg(feature = "dev-tools")]
         let p_submitted = crate::probe::on().then(Instant::now);
         #[cfg(feature = "dev-tools")]
         let p_submit = p_s.elapsed();
+        self.stamp_drawn(on, number);
         let cpu = start.elapsed() - acquired;
         // The probe's own work in the frame is not its CPU time.
         #[cfg(feature = "dev-tools")]
@@ -6651,6 +7584,34 @@ impl Renderer {
             }
         }
         Ok(out)
+    }
+
+    /// Records the frame's submission `number` as the last use of the
+    /// array it bound: play's, the slot's (a selection's live pool with
+    /// its atlas) or the play staging's own. A frame that returned before
+    /// its submission records nothing.
+    fn stamp_drawn(&self, on: Draw, number: u64) {
+        match on {
+            Draw::Play => self.atlas.mark(number),
+            Draw::Slot(i) => match self.screens.get(i).and_then(Option::as_ref) {
+                Some(slot) => {
+                    slot.resources.atlas.mark(number);
+                    if Self::screen(ScreenKind::Selection) == Some(i)
+                        && let Some(pool) = &self.pool
+                    {
+                        pool.mark(number);
+                    }
+                }
+                None => self.atlas.mark(number),
+            },
+            Draw::Pending => match &self.pending {
+                Some(Pending {
+                    res: PendingRes::Own(r),
+                    ..
+                }) => r.atlas.mark(number),
+                _ => self.atlas.mark(number),
+            },
+        }
     }
 
     fn chain(&self) -> Option<&IDXGISwapChain3> {
@@ -6743,7 +7704,7 @@ impl Renderer {
             },
             extent(width, height),
         );
-        self.gpu.queue().submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.expect("map the read back"));
         device
@@ -6781,7 +7742,7 @@ const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_millis(100);
 /// so none is left for the first frame of play (design.md "Display Latency and
 /// Stutter").
 fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
-    gpu.queue().submit([]);
+    gpu.submit([]);
     wait_for_gpu(gpu)
 }
 
@@ -6900,7 +7861,8 @@ fn write_chart_set(
             if let Some(fault) = seams.fault {
                 fault(gpu);
             }
-            gpu.queue().submit([]);
+            let (n, _) = gpu.submit([]);
+            atlas.mark(n);
         });
         #[cfg(feature = "dev-tools")]
         let p_v = crate::probe::Span::start();
@@ -6923,11 +7885,13 @@ fn write_chart_set(
     Ok((table, true))
 }
 
-/// Waits until the GPU has done every submission, submitting nothing.
+/// Waits until the GPU has done every submission, submitting nothing, and
+/// records them all as seen complete.
 pub(crate) fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
+    let made = gpu.latest();
     gpu.device()
         .poll(wgpu::PollType::wait_indefinitely())
-        .map(|_| ())
+        .map(|_| gpu.saw(made))
         .map_err(RenderError::Poll)
 }
 

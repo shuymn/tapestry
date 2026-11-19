@@ -1,9 +1,37 @@
 //! Instance, adapter and device setup on DX12.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::RenderError;
+
+/// The queue's submissions, numbered by the one function that makes them
+/// ([`Gpu::submit`]), and the newest number seen complete (design.md
+/// "Memory Budget": a retired array is destroyed only once its last use is
+/// covered).
+#[derive(Debug, Default)]
+struct Submissions {
+    /// The number the last submission took; numbers start at 1.
+    count: AtomicU64,
+    /// The newest number seen complete: by a wait for the queue, or by the
+    /// rolling watch's poll ([`Gpu::poll_watch`]).
+    seen: AtomicU64,
+    /// A write is queued that no submission has carried yet: the next
+    /// submission, whatever makes it, carries it.
+    queued: AtomicBool,
+    /// The last submission's number and the queue's index for it.
+    latest: Mutex<Option<(u64, wgpu::SubmissionIndex)>>,
+}
+
+/// What a non-blocking look at a watched submission found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watched {
+    /// Complete: every submission up to the number given is done.
+    Done(u64),
+    /// Not complete yet.
+    Pending,
+}
 
 /// Which DX12 adapter to render with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,9 +56,106 @@ pub struct Gpu {
     /// returns, so a write that must reach the GPU checks this after its
     /// wait (the chart images' publication, S10-12).
     lost: Arc<AtomicBool>,
+    /// The numbered submissions, shared by every clone of this device.
+    submissions: Arc<Submissions>,
 }
 
 impl Gpu {
+    /// Submits `buffers` and numbers the submission: every submission the
+    /// renderer makes goes through here, whatever its site, so the number a
+    /// use records is never earlier than the submission that carries it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
+        &self,
+        buffers: I,
+    ) -> (u64, wgpu::SubmissionIndex) {
+        let index = self.queue.submit(buffers);
+        let s = &self.submissions;
+        let number = s.count.fetch_add(1, Ordering::AcqRel) + 1;
+        s.queued.store(false, Ordering::Release);
+        *s.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some((number, index.clone()));
+        (number, index)
+    }
+
+    /// The number of the submission that will carry a write queued now with
+    /// no submission of its own (a pool's creation or row, a decision label
+    /// row): the next one, whatever makes it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn queued_use(&self) -> u64 {
+        let s = &self.submissions;
+        s.queued.store(true, Ordering::Release);
+        s.count.load(Ordering::Acquire) + 1
+    }
+
+    /// Whether a write is queued that no submission has carried yet.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn write_queued(&self) -> bool {
+        self.submissions.queued.load(Ordering::Acquire)
+    }
+
+    /// The number the last submission took (0 before any).
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn latest(&self) -> u64 {
+        self.submissions.count.load(Ordering::Acquire)
+    }
+
+    /// The newest submission number seen complete.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn seen(&self) -> u64 {
+        self.submissions.seen.load(Ordering::Acquire)
+    }
+
+    /// Records that every submission up to `number` is complete.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn saw(&self, number: u64) {
+        self.submissions.seen.fetch_max(number, Ordering::AcqRel);
+    }
+
+    /// The last submission's number and index, to watch it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn latest_index(&self) -> Option<(u64, wgpu::SubmissionIndex)> {
+        self.submissions
+            .latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Looks, without blocking, whether the watched submission `index`
+    /// (number `number`) is complete, and records what it finds: a queue
+    /// found empty covers every submission made before the look.
+    ///
+    /// # Errors
+    ///
+    /// The device's error from the poll (a lost device among them).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn poll_watch(
+        &self,
+        number: u64,
+        index: &wgpu::SubmissionIndex,
+    ) -> Result<Watched, wgpu::PollError> {
+        let before = self.latest();
+        match self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(index.clone()),
+            timeout: Some(Duration::ZERO),
+        }) {
+            Ok(wgpu::PollStatus::QueueEmpty) => {
+                let done = before.max(number);
+                self.saw(done);
+                Ok(Watched::Done(done))
+            }
+            Ok(_) => {
+                self.saw(number);
+                Ok(Watched::Done(number))
+            }
+            Err(wgpu::PollError::Timeout) => Ok(Watched::Pending),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Whether the device was lost or destroyed since it was created.
     #[must_use]
     pub fn lost(&self) -> bool {
@@ -126,6 +251,7 @@ pub(crate) fn device(adapter: &wgpu::Adapter) -> Result<Gpu, RenderError> {
         queue,
         info: adapter.get_info(),
         lost,
+        submissions: Arc::default(),
     })
 }
 

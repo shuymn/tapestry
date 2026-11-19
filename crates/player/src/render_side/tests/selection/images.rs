@@ -819,10 +819,11 @@ fn the_probe_ends_each_awaited_first_use_once() {
 /// each mark at its event: the first frame that draws the selection skin
 /// uploaded last is its first use (`fu:*`), though its pool binds that
 /// array again before the commit, for the first skin and for each
-/// replacement; a replacement's commit retires the old pool, whose drop
-/// lies inside the memory readings of the drop that takes it
-/// (`dr:pool_us`); a refused skin's release times its pool beside its slot
-/// (`rel:pool_us`), with no pages phase (`rel:pages_us` is a result's).
+/// replacement; a replacement's commit retires the old pool, whose
+/// destruction lies inside the memory readings of the drop that takes it
+/// (`dr:pool_us`); a refused skin's release times taking its pool beside
+/// its slot's retirement (`rel:pool_us`), with no pages phase
+/// (`rel:pages_us` is a result's).
 #[test]
 fn the_probe_marks_the_selections_pool_at_its_events() {
     use crate::dev::loop_probe::tests::{marks, now, turn_on};
@@ -854,8 +855,8 @@ fn the_probe_marks_the_selections_pool_at_its_events() {
     let r = rig_on(&bad);
     assert!(r.pool().layers > 0, "no pool to bind");
     first_use();
-    // A replacement retires the old pool, which the next staging drops
-    // (this rig's screen drains nothing).
+    // A replacement retires the old pool, destroyed once a completion
+    // covering its last use is seen.
     let replaced = now();
     let mut dirs = Vec::new();
     for revision in [2, 3] {
