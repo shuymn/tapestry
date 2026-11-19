@@ -778,6 +778,14 @@ fn concat(dir: &Path, name: &str, parts: &[PathBuf]) -> PathBuf {
     path
 }
 
+/// How far the ENOMEM tests take player 2's frames while player 1 runs to
+/// its failure: half of player 2's clip. Each player decodes on a thread of
+/// its own, as fast as its ring is emptied, so player 2's ring stays full
+/// past this stamp instead, and it cannot end first however the threads are
+/// scheduled.
+#[cfg(feature = "dev-tools")]
+const HOLD: i64 = 30_000_000;
+
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -833,7 +841,7 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
             worker.log()
         );
         frames[0] += usize::from(one.poll(i64::MAX).is_some());
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
         }
@@ -1620,7 +1628,7 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
             worker.log()
         );
         frames[0] += usize::from(one.poll(i64::MAX).is_some());
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
         }
