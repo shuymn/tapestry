@@ -1,10 +1,12 @@
 //! The frame ring a video's frames cross from the media worker (design.md
-//! "Rendering and Skins", video frames; "Threat Model" T02): a cooperating
-//! worker's frames come out whole, and whatever a worker writes, the game's
-//! reads stay inside the ring and a broken slot fails the player.
+//! "Rendering and Skins", video frames; "Threat Model" T02): frames come out
+//! whole, and whatever a worker writes, the game's reads stay inside the
+//! ring and a broken slot fails the player. `media_interleavings.rs` checks
+//! a cooperating worker against every interleaving with the game's reads.
 //!
-//! The tests that interleave a reader and a writer hold the two threads at
-//! a meeting point: one of them asks the ring for a chosen run of words,
+//! The tests that interleave a reader and a writer that breaks the
+//! protocol hold the two threads at a meeting point: one of them asks the
+//! ring for a chosen run of words,
 //! and waits there while the other acts. Neither waits forever: the test
 //! fails at once when that thread finishes without asking for those words,
 //! and the stopped thread goes on when the test's thread lets it go or
@@ -296,7 +298,6 @@ fn ring_round_trip_writer_to_reader() {
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     let writer = Writer::attach(ring).unwrap();
     assert_eq!(writer.geometry(), g, "the worker reads the game's geometry");
-    assert_eq!(writer.run(ring), 1);
 
     // Three frames; the first is not due yet.
     for seq in 1..=3 {
@@ -343,8 +344,7 @@ fn ring_round_trip_writer_to_reader() {
         first: 5_000_000,
         last: 9_000_000,
     };
-    assert_eq!(reader.start_run(ring, window), 2);
-    assert_eq!(writer.run(ring), 2, "the worker sees the new run");
+    assert_eq!(reader.start_run(window), 2);
     assert_eq!(reader.staged(), None);
     assert_eq!(
         reader.poll(ring, 9_000_000),
@@ -561,168 +561,6 @@ fn ring_reader_copies_only_parent_sized_bytes() {
         g.frame_words(),
         "the staging buffer keeps the game's size"
     );
-}
-
-// Covers: T02
-#[test]
-fn ring_cooperating_writer_never_tears() {
-    let g = large();
-
-    // A writer stopped between its two chunks: a poll then takes nothing
-    // new and finds nothing wrong; the frame comes out whole once
-    // published. The slot it writes held frame 1, whose words are still
-    // there.
-    let mem = section(g);
-    let ring = &*mem;
-    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
-    assert_eq!(publish(ring, 1, 1, 1_000), 0);
-    assert_eq!(reader.poll(ring, 1_000).unwrap().staged.unwrap().seq, 1);
-    let meeting = Meeting::default();
-    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
-    thread::scope(|s| {
-        let writer = s.spawn(|| {
-            let _done = Done(&meeting);
-            let w = Writer::attach(&watched).unwrap();
-            let slot = w.claim(&watched).unwrap();
-            assert_eq!(slot.index(), 0, "the slot frame 1 was taken from");
-            w.publish(&watched, slot, &frame(g, 2), 2, 1, 2_000)
-        });
-        let release = meeting.meet();
-        assert_eq!(
-            reader.poll(ring, 2_000),
-            Ok(Poll::default()),
-            "a poll while the writer is between its chunks takes nothing"
-        );
-        assert_whole(&reader, 1);
-        drop(release);
-        writer.join().unwrap().unwrap();
-    });
-    assert_eq!(reader.poll(ring, 2_000).unwrap().staged.unwrap().seq, 2);
-    assert_whole(&reader, 2);
-
-    // A reader stopped between its two chunks while the writer publishes
-    // into every other slot: the writer cannot claim the slot being copied,
-    // and the copy comes out whole.
-    let mem = section(g);
-    let ring = &*mem;
-    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
-    assert_eq!(publish(ring, 1, 1, 1_000), 0);
-    let meeting = Meeting::default();
-    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
-    thread::scope(|s| {
-        let read = s.spawn(|| {
-            let _done = Done(&meeting);
-            let polled = reader.poll(&watched, 1_000);
-            (polled, staged_bytes(&reader))
-        });
-        let release = meeting.meet();
-        for seq in 2..=SLOTS as u64 {
-            assert_ne!(publish(ring, seq, 1, 1_000 * seq as i64), 0);
-        }
-        assert!(
-            Writer::attach(ring).unwrap().claim(ring).is_none(),
-            "the slot being copied is not free"
-        );
-        drop(release);
-        let (polled, (staged, bytes)) = read.join().unwrap();
-        assert_eq!(polled.unwrap().staged, Some(staged));
-        assert_eq!(staged.seq, 1);
-        assert!(
-            bytes[..g.frame_bytes()] == frame(g, 1),
-            "frame 1 is copied whole"
-        );
-    });
-    let last = SLOTS as u64;
-    assert_eq!(
-        reader
-            .poll(ring, 1_000 * last as i64)
-            .unwrap()
-            .staged
-            .unwrap()
-            .seq,
-        last
-    );
-    assert_whole(&reader, last);
-}
-
-// Covers: T02
-#[test]
-fn ring_frames_published_during_a_scan_wait_for_the_next_poll() {
-    let g = Geometry::new(16, 9).unwrap();
-    // The reader stops as it turns to slot 1, slot 0 found free; meanwhile
-    // the worker publishes two frames, the first into slot 0, which the
-    // reader has passed, the second into slot 1, which it reads next.
-    let scan = |ring: &[AtomicU64], reader: &mut Reader, run: u64| {
-        let meeting = Meeting::default();
-        let watched =
-            Watched::stopping_at(ring, (g.frame_start(1) - SLOT_HEADER_WORDS, 1), &meeting);
-        thread::scope(|s| {
-            let read = s.spawn(|| {
-                let _done = Done(&meeting);
-                reader.poll(&watched, 5_000)
-            });
-            let release = meeting.meet();
-            assert_eq!(publish(ring, 1, run, 1_000), 0);
-            assert_eq!(publish(ring, 2, run, 2_000), 1);
-            drop(release);
-            read.join().unwrap()
-        })
-    };
-
-    // Both frames due in the current run: the second waits for the next
-    // poll, which takes it and frees the first with it, so the first is
-    // never left behind a taken frame, which would fail the player.
-    let mem = section(g);
-    let ring = &*mem;
-    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
-    assert_eq!(
-        scan(ring, &mut reader, 1),
-        Ok(Poll::default()),
-        "a frame published during the scan waits"
-    );
-    assert_eq!(
-        reader.poll(ring, 5_000),
-        Ok(Poll {
-            staged: Some(Frame {
-                seq: 2,
-                stamp: 2_000
-            }),
-            freed: true
-        }),
-        "the next poll takes the newest and frees the one before it"
-    );
-    assert_whole(&reader, 2);
-    assert_eq!(reader.poll(ring, 5_000), Ok(Poll::default()));
-    let writer = Writer::attach(ring).unwrap();
-    let claimed: Vec<_> = (0..SLOTS).map_while(|_| writer.claim(ring)).collect();
-    assert_eq!(claimed.len(), SLOTS, "both frames' slots are free again");
-
-    // Frames of an earlier run, from a worker that has not seen the new
-    // one yet: the second is not freed during the scan either, so the
-    // next poll frees both unread, and the run's own frame then shows.
-    let mem = section(g);
-    let ring = &*mem;
-    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
-    let run = reader.start_run(ring, WINDOW);
-    assert_eq!(
-        scan(ring, &mut reader, 1),
-        Ok(Poll::default()),
-        "an earlier run's frame published during the scan waits too"
-    );
-    assert_eq!(
-        reader.poll(ring, 5_000),
-        Ok(Poll {
-            staged: None,
-            freed: true
-        }),
-        "the next poll frees both unread"
-    );
-    publish(ring, 3, run, 3_000);
-    assert_eq!(
-        reader.poll(ring, 5_000).unwrap().staged.map(|f| f.seq),
-        Some(3)
-    );
-    assert_eq!(reader.fault(), None);
 }
 
 /// A small generator of words, the same for every run.

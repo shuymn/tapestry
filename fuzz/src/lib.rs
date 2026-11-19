@@ -4037,7 +4037,7 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
     let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(0)).collect();
     let mut reader = Reader::new(&*mem, g, RING_WINDOW).expect("a ring");
     if size & RING_SECOND_RUN != 0 {
-        reader.start_run(&*mem, RING_WINDOW);
+        reader.start_run(RING_WINDOW);
     }
     for (word, bytes) in mem.iter().zip(words.chunks(8)) {
         let mut le = [0; 8];
