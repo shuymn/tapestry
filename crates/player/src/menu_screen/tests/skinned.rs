@@ -299,7 +299,7 @@ fn a_preset_step_gives_the_update_the_new_presets_gauge() {
 #[test]
 fn the_memory_witness_counts_the_selection_lines_and_state() {
     let (_dir, mut screen, mut logic, _) = skinned();
-    let before = screen.renderer.memory_with(Some(&logic.sel));
+    let before = screen.renderer.memory_with(Some(&logic.sel), &[]);
     assert_eq!(before.selection_text, 0);
     assert_eq!(before.selection_state, logic.sel.resident_bytes());
     let mut feed = SkinFeed::default();
@@ -309,7 +309,7 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
     u.view = rows_at(3, 10);
     drawn(&mut screen, &mut logic, &u, true, 0);
     let without = screen.renderer.memory();
-    let with = screen.renderer.memory_with(Some(&logic.sel));
+    let with = screen.renderer.memory_with(Some(&logic.sel), &[]);
     assert!(with.selection_text > 0, "{with:?}");
     assert_eq!(without.selection_text, with.selection_text);
     assert!(with.selection_state > 0);

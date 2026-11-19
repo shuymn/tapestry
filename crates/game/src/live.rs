@@ -316,6 +316,29 @@ pub trait Rig {
     fn end_loading(&mut self) -> Result<(), Self::ScreenError> {
         Ok(())
     }
+    /// Where the render side's cutoff before recording opens stands, for
+    /// every play once its end of loading returned: the first call of an
+    /// attempt asks for it, each later one reports its phase. Cut off once
+    /// the render thread acknowledged it, which it does only with nothing
+    /// left that its play would retire. A deferred opening of the same
+    /// attempt asks no second cutoff. By default, for a rig without a
+    /// render thread, cut off at once.
+    ///
+    /// # Errors
+    ///
+    /// The screen lost while the cutoff was asked and not cut off, which
+    /// ends the run: recording does not open.
+    fn cutoff(&mut self) -> Result<Cutoff, Self::ScreenError> {
+        Ok(Cutoff::CutOff)
+    }
+    /// One slice of the wait for the cutoff, after it answered
+    /// [`Cutoff::Waiting`]: production parks 10 ms at most, woken early
+    /// when the render thread answers, and serves the player's
+    /// adjustments meanwhile; a virtual rig moves its clock. By default,
+    /// one [`wait`](Self::wait).
+    fn cutoff_park(&mut self) {
+        self.wait();
+    }
     /// Waits until audio is ready for a play: the previous play's switch
     /// taken and, where the rig has system sounds, every pick of theirs
     /// settled (design.md "Play Lifecycle", preparing each attempt). Before
@@ -710,6 +733,16 @@ pub enum Rearm {
     Held,
 }
 
+/// Where the render side's cutoff before recording opens stands
+/// ([`Rig::cutoff`]); a screen lost under it is the method's error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cutoff {
+    /// The render thread acknowledged it: recording may open.
+    CutOff,
+    /// Asked, not acknowledged yet.
+    Waiting,
+}
+
 /// Why the run of plays stopped short.
 #[derive(Debug, thiserror::Error)]
 pub enum LiveError<S> {
@@ -815,6 +848,44 @@ pub(crate) fn preflight<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>
         return Err(LiveError::ScreenLost);
     }
     Ok(())
+}
+
+/// The wait for the render side's cutoff ([`Rig::cutoff`]), after the
+/// end of loading and before the last look, in both openings: `true` once
+/// cut off, `false` when the player left meanwhile, by a close or by the
+/// quit key as `quit` looks for it (each opening's own form, as at its
+/// last look). The cutoff's answer comes first, so a screen lost under the
+/// asked cutoff ends the run with the rig's error; while it waits, each
+/// slice looks before it parks, in the loading wait's order after the
+/// commit: a thread's failure, a close, a failed screen, then the quit
+/// key. The first look comes before any park.
+///
+/// # Errors
+///
+/// The screen lost under the cutoff ([`LiveError::Screen`]), another
+/// thread's failure, or a screen failed while waiting
+/// ([`LiveError::ScreenLost`]).
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) fn wait_cutoff<R: Rig>(
+    rig: &mut R,
+    mut quit: impl FnMut(&mut R) -> bool,
+) -> Result<bool, LiveError<R::ScreenError>> {
+    loop {
+        if rig.cutoff().map_err(LiveError::Screen)? == Cutoff::CutOff {
+            return Ok(true);
+        }
+        threads_over(rig)?;
+        if rig.quitting() {
+            return Ok(false);
+        }
+        if rig.screen_failed() {
+            return Err(LiveError::ScreenLost);
+        }
+        if quit(rig) {
+            return Ok(false);
+        }
+        rig.cutoff_park();
+    }
 }
 
 /// How the plays of a chart were left.
@@ -1415,11 +1486,13 @@ pub fn play<R: Rig>(
 /// The rest of a play's preparation, once its preset was refreshed
 /// (design.md "Play Lifecycle"): audio, the attempt on the screen and a
 /// practice round's restore check, then, after a look for a quit or a
-/// failure, the attempt's commit and the end of the loading state, with a
-/// quit or a failure looked for again after it. `false` when the player
-/// cancelled or quit before recording opens: the commands that did are
-/// taken, so they leave only this play. Whatever ends it before the
-/// commit discards what the preparation readied.
+/// failure, the attempt's commit, the end of the loading state and the
+/// wait for the render side's cutoff ([`wait_cutoff`]), with a quit or a
+/// failure looked for at each of its slices and again after it, the last
+/// look. `false` when the player cancelled or quit before recording
+/// opens: the commands that did are taken, so they leave only this play.
+/// Whatever ends it before the commit discards what the preparation
+/// readied.
 ///
 /// # Errors
 ///
@@ -1437,9 +1510,14 @@ fn ready_to_open<R: Rig>(
     }
     rig.commit_attempt().map_err(LiveError::Screen)?;
     rig.end_loading().map_err(LiveError::Screen)?;
-    // And again once no loading frame can follow: the last look before
-    // recording opens. A retry or suspend from before this play belongs to
-    // no play.
+    if !wait_cutoff(rig, |rig| {
+        rig.quitting() || rig.take() == Some(Command::Quit)
+    })? {
+        return Ok(false);
+    }
+    // And again once no loading frame can follow and the render side is
+    // cut off: the last look before recording opens. A retry or suspend
+    // from before this play belongs to no play.
     preflight(rig)?;
     Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
 }

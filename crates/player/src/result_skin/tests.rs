@@ -133,14 +133,14 @@ fn settled(rs: &mut ResultSkin) {
 }
 
 /// The published bundle and the pages it shares.
-fn shown(rs: &ResultSkin) -> Arc<render::SkinBundle> {
+pub(crate) fn shown(rs: &ResultSkin) -> Arc<render::SkinBundle> {
     match rs.published().0 {
         Some(Published::Skin(b, _, _)) => Arc::clone(b),
         other => panic!("{other:?}"),
     }
 }
 
-fn staged(rs: &mut ResultSkin) {
+pub(crate) fn staged(rs: &mut ResultSkin) {
     assert_eq!(
         rs.image_stage(chart(), Some(JudgeClass::Normal), || false, || false),
         Staged::Ready
@@ -548,7 +548,7 @@ impl FakeRenderer {
 }
 
 /// Polls `rs` until no layout job runs, at most 20 s.
-fn ran(rs: &mut ResultSkin) {
+pub(crate) fn ran(rs: &mut ResultSkin) {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         rs.poll();
@@ -562,10 +562,10 @@ fn ran(rs: &mut ResultSkin) {
 
 /// Every atlas seen, by a weak reference.
 #[derive(Default)]
-struct Seen(Vec<std::sync::Weak<skin_model::PackedPages>>);
+pub(crate) struct Seen(Vec<std::sync::Weak<skin_model::PackedPages>>);
 
 impl Seen {
-    fn note(&mut self, rs: &ResultSkin) {
+    pub(crate) fn note(&mut self, rs: &ResultSkin) {
         if let Some(e) = rs.image() {
             self.0.push(Arc::downgrade(e.pages()));
         }
@@ -575,7 +575,7 @@ impl Seen {
     }
 
     /// The distinct atlases still alive.
-    fn alive(&self) -> usize {
+    pub(crate) fn alive(&self) -> usize {
         let mut ids: Vec<_> = self
             .0
             .iter()
@@ -679,6 +679,131 @@ pub(super) fn layout_starts() {
     if FAIL.compare_exchange(3, 0, SeqCst, SeqCst).is_ok() {
         panic!("the layout's job, before its plan");
     }
+}
+
+/// The no-room lines the builds printed, kept for the tests that read
+/// them ([`take_room_lines`]; development builds).
+#[cfg(feature = "dev-tools")]
+static ROOM_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A build that found no room printed `line` (development builds).
+#[cfg(feature = "dev-tools")]
+pub(super) fn room_line(line: &str) {
+    ROOM_LINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(line.to_owned());
+}
+
+/// The no-room lines printed since the last take (development builds).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn take_room_lines() -> Vec<String> {
+    std::mem::take(
+        &mut *ROOM_LINES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Development builds: a build that finds no room says so, naming its
+/// stage and each atlas counted with its holders, and `conservative`
+/// exactly when leaving out the atlases held only by retirement entries
+/// whose pages left them would leave room.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_build_with_no_room_names_the_holders_it_counted() {
+    use crate::result_present::Holders;
+    let _s = serial();
+    let d = skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged(&mut rs);
+    rs.request(view(2));
+    settled(&mut rs);
+    let other = skin_model::AtlasId(u64::MAX);
+    let ours = |lines: Vec<String>| -> Vec<String> {
+        lines
+            .into_iter()
+            .filter(|l| l.contains(&format!(" {}:", other.0)))
+            .collect()
+    };
+    let _ = take_room_lines();
+    // Held only by an entry whose pages went to the worker: the shown
+    // binding alone would leave room.
+    let array_only = Holders {
+        entry_array: true,
+        ..Holders::default()
+    };
+    rs.set_holders(&[(other, array_only)]);
+    rs.set_retained(&[other]);
+    rs.set_stage("a switch's build");
+    rs.request(view(3));
+    ran(&mut rs);
+    assert!(rs.deferred());
+    let lines = ours(take_room_lines());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.starts_with("dev: result build: no room at a switch's build: "),
+        "{line}"
+    );
+    assert!(line.contains(&format!("{}:entry-array", other.0)), "{line}");
+    assert!(
+        line.contains(":game"),
+        "the shown binding is the game's: {line}"
+    );
+    assert!(line.ends_with(" conservative"), "{line}");
+    // Still holding its pages: not conservative.
+    let with_pages = Holders {
+        entry_pages: true,
+        ..Holders::default()
+    };
+    rs.set_holders(&[(other, with_pages)]);
+    rs.request(view(3));
+    ran(&mut rs);
+    assert!(rs.deferred());
+    let lines = ours(take_room_lines());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with(&format!(" {}:entry", other.0)),
+        "not conservative: {}",
+        lines[0]
+    );
+}
+
+/// V18d's third case, on the line itself: an atlas held only by an
+/// array-only retirement entry makes the count conservative, unless the
+/// game's published binding is that atlas too, since the game then holds
+/// its pages.
+// Revert: the flag computed without the game's own holdings (`filter(|id|
+// !held(id).array_only())` in `RoomLine::line`) -> "the game holds its
+// pages: not conservative".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_atlas_the_game_binds_is_never_left_out_as_array_only() {
+    use crate::result_present::Holders;
+    let (shown, other) = (skin_model::AtlasId(1), skin_model::AtlasId(2));
+    let array_only = Holders {
+        entry_array: true,
+        ..Holders::default()
+    };
+    let line = |game: Vec<skin_model::AtlasId>| {
+        super::RoomLine {
+            stage: "a switch's build",
+            holders: vec![(other, array_only)],
+            game,
+        }
+        .line(&[shown, other], None)
+    };
+    assert!(line(vec![shown]).ends_with(" conservative"));
+    let bound = line(vec![shown, other]);
+    assert!(
+        !bound.ends_with(" conservative"),
+        "the game holds its pages: not conservative: {bound}"
+    );
+    assert!(bound.contains("2:entry-array+game"), "{bound}");
 }
 
 /// A payload whose drop panics.

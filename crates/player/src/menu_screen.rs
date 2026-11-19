@@ -1093,21 +1093,99 @@ impl Screen for MenuScreen {
         self.renderer.disable_result();
     }
 
-    fn drain_retired(&mut self) -> Option<skin_model::AtlasId> {
-        self.renderer.drain_retired()
-    }
-
     fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
         self.renderer.installed_pages(kind).cloned()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
+    fn retained_atlases(
+        &self,
+        kind: ScreenKind,
+    ) -> [Option<skin_model::AtlasId>; render::RETAINED_ATLASES] {
         self.renderer.retained_atlases(kind)
     }
 
     fn menus(&self) -> u64 {
         self.renderer.menu_charges()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn entries_holding_pages(&self) -> [bool; render::RETIREMENT_ENTRIES] {
+        self.renderer.entries_holding_pages()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn poll_completion(&mut self) -> Result<(), RenderError> {
+        self.renderer.poll_completion()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn set_destroy_allowed(&mut self, allowed: bool) {
+        self.renderer.set_destroy_allowed(allowed);
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn filled(&self) -> u32 {
+        self.renderer.filled()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
+        self.renderer.destroy_due(heavy)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn due_heavy(&self) -> bool {
+        self.renderer.due_heavy()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn pending_completion(&self) -> bool {
+        self.renderer.pending_completion()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn pool_owed(&self) -> bool {
+        self.renderer.pool_owed()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn make_owed_pool(&mut self) -> bool {
+        self.renderer.make_owed_pool()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_handoff(&mut self) -> Option<render::Handoff> {
+        self.renderer.take_handoff()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn return_handoff(&mut self, entry: usize, cpu: render::CpuParts) -> bool {
+        self.renderer.return_handoff(entry, cpu)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_changes(&self) -> u64 {
+        self.renderer.result_changes()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn heavy_ops(&self) -> render::HeavyOps {
+        self.renderer.heavy_ops()
+    }
+
+    /// The frame latency waitable object signaled now, without waiting;
+    /// never offscreen or minimized (design.md "Load Pipeline", the
+    /// stalled boundary's grant check).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn grant_ready(&self) -> bool {
+        self.paced() && !self.minimized() && self.renderer.wait_for_frame(0)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn bga_in_use(&self) -> bool {
+        self.renderer.bga_key().is_some()
     }
 
     fn prepare_result(
@@ -1344,14 +1422,17 @@ impl Screen for MenuScreen {
         Ok(outcome)
     }
 
-    fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
+    fn splash(&mut self, elapsed: Duration) -> Option<Result<FrameOutcome, RenderError>> {
         self.sink.as_ref()?;
         Some(if self.fonts.is_some() {
             self.fade_splash(splash_alpha(elapsed))
                 .and_then(|()| self.splash_frame())
         } else {
             // A screen for plays only: black, so the window shows.
-            self.text(&[])
+            self.renderer.text_frame(&[]).map(|t| {
+                self.shown(t.presented());
+                t.outcome
+            })
         })
     }
 
@@ -1589,13 +1670,15 @@ impl MenuScreen {
         Ok(())
     }
 
-    /// Draws the launch screen as last prepared.
-    fn splash_frame(&mut self) -> Result<bool, RenderError> {
+    /// Draws the launch screen as last prepared, and says what became of
+    /// the frame.
+    fn splash_frame(&mut self) -> Result<FrameOutcome, RenderError> {
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        let presented = self.renderer.menu_frame(|_| {}, text)?.presented();
-        Ok(self.shown(presented))
+        let outcome = self.renderer.menu_frame(|_| {}, text)?.outcome;
+        self.shown(outcome == FrameOutcome::Shown);
+        Ok(outcome)
     }
 
     /// Draws `page`, laid out again when `changed`.
@@ -1873,12 +1956,15 @@ mod tests {
         let fonts = Some(Fonts::runtime().unwrap());
         let mut screen = MenuScreen::new(warp(), fonts).with_sink(Box::new(sent.clone()));
         assert!(!sent.1.load(Ordering::Acquire));
-        assert!(matches!(screen.splash(Duration::ZERO), Some(Ok(true))));
+        assert!(matches!(
+            screen.splash(Duration::ZERO),
+            Some(Ok(render::FrameOutcome::Shown))
+        ));
         assert_eq!(lit(&screen), 0);
         assert!(sent.1.load(Ordering::Acquire));
         assert!(matches!(
             screen.splash(Duration::from_millis(750)),
-            Some(Ok(true))
+            Some(Ok(render::FrameOutcome::Shown))
         ));
         assert!(lit(&screen) > 100);
         // A page after it draws the page alone.
@@ -1889,7 +1975,7 @@ mod tests {
         let mut screen = MenuScreen::new(warp(), None).with_sink(Box::new(sent.clone()));
         assert!(matches!(
             screen.splash(Duration::from_millis(750)),
-            Some(Ok(true))
+            Some(Ok(render::FrameOutcome::Shown))
         ));
         assert_eq!(lit(&screen), 0);
         assert!(sent.1.load(Ordering::Acquire));
@@ -1927,7 +2013,7 @@ mod tests {
         let mut screen = MenuScreen::new(warp(), None).with_sink(Box::new(Sent::default()));
         assert!(matches!(
             screen.splash(Duration::from_millis(750)),
-            Some(Ok(true))
+            Some(Ok(render::FrameOutcome::Shown))
         ));
         screen.text(&["play"]).unwrap();
         assert!(screen.fonts.is_none());

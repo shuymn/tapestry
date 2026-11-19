@@ -63,6 +63,7 @@ mod result_input;
 mod result_present;
 mod result_skin;
 mod result_view;
+mod retire_worker;
 mod screens;
 mod select;
 mod selection;
@@ -1054,6 +1055,7 @@ fn rig<'a>(
         presenter: crate::result_present::Presenter::default(),
         result_labels: None,
         result_withdrawn: false,
+        cutoff_asked: false,
         result_facts: None,
         result_offset: None,
         result_leaving: false,
