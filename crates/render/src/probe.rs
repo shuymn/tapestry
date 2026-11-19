@@ -20,8 +20,10 @@
 //! which the probe does not force. The readings after a drop (`dr:l1`)
 //! can therefore show memory still held; the next frames' readings
 //! (`pd:*`) show it freed. A release (`rel:*_us`) drops nothing: it times
-//! taking each handle and retiring it into its entry, whose destruction
-//! is marked later as a drop.
+//! taking each handle and retiring it into its entry (`rel:slot_us` the
+//! slot with the selection's pool beside it, `rel:pool_us` the pool's
+//! take, and its retirement when no slot holds it, `rel:pages_us` the
+//! result's pages), whose destruction is marked later as a drop.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

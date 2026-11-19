@@ -214,10 +214,11 @@ pub(crate) struct AtlasTexture {
 /// The next [`AtlasTexture::serial`].
 static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// An array dropped before any frame sampled it, whatever drops it (a
-/// staging replaced or refused after its upload, a release, a drain), ends
-/// its first use's wait (`fu:discarded`, dev-tools); one drawn or replaced
-/// by a newer upload is no longer awaited, and nothing is marked.
+/// An array dropped before any frame sampled it, whatever drops it (its
+/// retirement entry's destruction, after a staging replaced or refused
+/// after its upload or a release retired it), ends its first use's wait
+/// (`fu:discarded`, dev-tools); one drawn or replaced by a newer upload is
+/// no longer awaited, and nothing is marked.
 #[cfg(feature = "dev-tools")]
 impl Drop for AtlasTexture {
     fn drop(&mut self) {

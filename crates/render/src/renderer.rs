@@ -2315,8 +2315,9 @@ impl Renderer {
                 self.destroy_charged()?;
                 self.reduce_pool(1, kind)?;
                 self.remove(ScreenKind::Result);
-                // The release's own marks (`rel:*`) time its drops, outside
-                // their memory readings.
+                // The release only retires the result's arrays (`rel:*`);
+                // their destruction is marked where the retirement list
+                // runs it (`dr:*`).
                 #[cfg(feature = "dev-tools")]
                 {
                     crate::probe::mark("adm:result_released", 1);
@@ -3650,7 +3651,7 @@ impl Renderer {
             .and_then(|i| self.screens.get_mut(i))
             .and_then(Option::take);
         #[cfg(feature = "dev-tools")]
-        let p_slot = p_t.elapsed();
+        let p_slot_taken = p_t.elapsed();
         let pool = if kind == ScreenKind::Selection {
             self.pool_grid = None;
             self.owed = false;
@@ -3663,13 +3664,15 @@ impl Renderer {
             None
         };
         #[cfg(feature = "dev-tools")]
-        let p_pool = p_t.elapsed().saturating_sub(p_slot);
+        let (p_pool_taken, p_pool_alone) = (p_t.elapsed(), slot.is_none() && pool.is_some());
         let pages = if kind == ScreenKind::Result {
             self.staged_result_text = None;
             self.result_pages.take()
         } else {
             None
         };
+        #[cfg(feature = "dev-tools")]
+        let p_pages_taken = p_t.elapsed();
         match slot {
             Some(s) => {
                 let f = self.slot_retired(kind, s, pool, Class::Other);
@@ -3681,13 +3684,25 @@ impl Renderer {
                 }
             }
         }
+        #[cfg(feature = "dev-tools")]
+        let p_retired = p_t.elapsed();
         if let Some(p) = pages {
             self.retire_standing(kind, Self::pages_retired(kind, p, Class::Other));
         }
+        // Each handle's take and retirement: the slot's with its pool
+        // beside it, the pool's alone when no slot holds it.
         #[cfg(feature = "dev-tools")]
         if p_some {
             use crate::probe::{mark, us};
-            let p_pages = p_t.elapsed().saturating_sub(p_slot + p_pool);
+            let retiring = p_retired.saturating_sub(p_pages_taken);
+            let pool_taking = p_pool_taken.saturating_sub(p_slot_taken);
+            let (p_slot, p_pool) = if p_pool_alone {
+                (p_slot_taken, pool_taking + retiring)
+            } else {
+                (p_slot_taken + retiring, pool_taking)
+            };
+            let p_pages = p_pages_taken.saturating_sub(p_pool_taken)
+                + p_t.elapsed().saturating_sub(p_retired);
             mark("rel:slot_us", us(p_slot));
             if kind == ScreenKind::Selection {
                 mark("rel:pool_us", us(p_pool));

@@ -718,6 +718,10 @@ impl Retirements {
             (d, timed)
         });
         let began = Instant::now();
+        // The probe's own work inside the destruction (an array's first
+        // use given up) left out of its mark.
+        #[cfg(feature = "dev-tools")]
+        let p_span = crate::probe::Span::at(began);
         let (kind, id, class, last_use) = (f.kind, f.id, f.class, f.last_use);
         let (part, cpu_dropped, freed) = match f.pool.take() {
             Some(pool) => {
@@ -739,7 +743,7 @@ impl Retirements {
         let took = began.elapsed();
         #[cfg(feature = "dev-tools")]
         if let Some((d, timed)) = probe {
-            crate::probe::mark(timed, crate::probe::us(took));
+            crate::probe::mark(timed, crate::probe::us(p_span.elapsed()));
             crate::probe::mark("dr:with_cpu", i64::from(cpu_dropped));
             crate::probe::mem(d, "dr:l1", "dr:n1", "dr:r1");
             crate::probe::arm_post(8);
