@@ -5,10 +5,13 @@
 //! indexes types, so a caller compares the type with that of a handle whose
 //! type it knows.
 //!
-//! The query is `NtQueryInformationProcess(ProcessHandleInformation)`, the
-//! one the system's process snapshots make (`PssCaptureSnapshot` with
-//! `PSS_CAPTURE_HANDLES`); the snapshot API would also query each handle's
-//! names, which can block on a pipe, where this reads only the table.
+//! The query is `NtQueryInformationProcess(ProcessHandleInformation)`: one
+//! call that gives each handle's value, granted access and type index, all
+//! that is read here. The system's process snapshots reach the same table
+//! (`PssCaptureSnapshot` with `PSS_CAPTURE_HANDLES`), with each handle's
+//! access only under `PSS_CAPTURE_HANDLE_BASIC_INFORMATION` too and its
+//! names only under `PSS_CAPTURE_HANDLE_NAME_INFORMATION`, through a
+//! snapshot to make, walk and free, which the query does without.
 //!
 //! The game's host (`src/media_host/handles.rs`) and the worker
 //! (`src/bin/tapestry-media/handles.rs`) each compile a copy of this file,

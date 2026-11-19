@@ -24,7 +24,11 @@ pub const MAX_FRAME: usize = 8_192;
 pub const MAX_TEXT: usize = 4_096;
 
 /// The access of the file handle an [`Command::Open`] names: reading the
-/// file's bytes (`FILE_READ_DATA`), and nothing else.
+/// file's bytes (`FILE_READ_DATA`), and nothing else. The handle still
+/// names its file: Windows gives the path of the file a handle refers to,
+/// whatever the handle's access (`GetFinalPathNameByHandleW`), so the worker
+/// can learn where a video lies; its AppContainer keeps it from opening the
+/// user's files by that path.
 pub const FILE_ACCESS: u32 = 0x0001;
 
 /// The access of the section handle a [`Command::Play`] names: mapping the
