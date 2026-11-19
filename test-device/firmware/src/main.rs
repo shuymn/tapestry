@@ -101,6 +101,17 @@ fn enter_bootsel(watchdog: &mut Watchdog) -> ! {
     }
 }
 
+/// The TRNG's setup: the driver's default with the ring oscillator's
+/// shortest inverter chain. Its default chain (`One`) fails the entropy
+/// checks on the board, and the driver's interrupt handler clears a CRNGT
+/// or von Neumann error without waking the draw, so that draw never ends;
+/// the shortest chain passes them. The checks stay on.
+fn trng_config() -> trng::Config {
+    let mut config = trng::Config::default();
+    config.inverter_chain_length = trng::InverterChainLength::None;
+    config
+}
+
 /// The boot's 64 bits from the TRNG, the first half of every session
 /// token of this boot (docs/test-device.md "Lease and Disarm"); `None` when
 /// the draw does not complete in [`DRAW_TIMEOUT`] or reads a stuck value
@@ -132,7 +143,7 @@ async fn main(_spawner: Spawner) {
     device::boot_hang(&mut watchdog, cause);
     let mode = Mode::from_scratch(watchdog.get_scratch(0));
 
-    let draw = draw(Trng::new(p.TRNG, Irqs, trng::Config::default())).await;
+    let draw = draw(Trng::new(p.TRNG, Irqs, trng_config())).await;
 
     let state: &'static RefCell<State> = STATE.take();
     state.borrow_mut().set_boot(mode, cause, count);
