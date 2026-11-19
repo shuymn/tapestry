@@ -559,6 +559,7 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
         pid,
         job,
         watch,
+        open_files: std::collections::BTreeMap::new(),
         _desktop: desktop,
         #[cfg(test)]
         log,

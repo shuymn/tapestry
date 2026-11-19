@@ -17,15 +17,19 @@
 //! is sent meanwhile on another, best effort.
 //!
 //! A watcher ends a worker whose memory reaches its job's cap ([`watch`])
-//! and records how each worker ended, which the game reads
-//! ([`Worker::end`]).
+//! and records how each worker ended; the game reads that end
+//! ([`Worker::end`]), and each file open in a worker that ended without
+//! the game asking gets a strike, two of which keep the file from being
+//! opened again in the run ([`strikes`], [`Worker::reap`]).
 
 pub mod handles;
 pub mod launch;
+pub mod strikes;
 pub mod watch;
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -45,6 +49,7 @@ use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, WaitFor
 use windows::core::{PCWSTR, w};
 
 use launch::{LaunchError, Setup};
+use strikes::{FileId, Strikes};
 use watch::{End, Watch};
 
 /// A kind of handle the game hands the worker.
@@ -171,6 +176,8 @@ pub struct Worker {
     job: Option<Owned>,
     /// The job's watcher (with the job).
     watch: Option<Watch>,
+    /// The file each player the game opened is reading, until it closes.
+    open_files: BTreeMap<u8, FileId>,
     /// The window station and desktop the worker runs on, kept while it
     /// runs.
     _desktop: Option<launch::Desktop>,
@@ -276,6 +283,77 @@ impl Worker {
     pub fn end(&self) -> Option<End> {
         self.watch.as_ref().and_then(Watch::end)
     }
+
+    /// Opens `file` as player `player`, unless it has the strikes that keep
+    /// it from being opened: hands the worker its handle and sends `Open`,
+    /// whose reply comes as any other. The file is open in the worker until
+    /// the worker answers that the player closed ([`Self::closed`]).
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Struck`], or the system's error that kept the file
+    /// from being handed or the command from being sent.
+    pub fn open(
+        &mut self,
+        player: u8,
+        file: &std::fs::File,
+        strikes: &Strikes,
+    ) -> Result<(), OpenError> {
+        let id = FileId::of(file).map_err(OpenError::System)?;
+        if strikes.out(id) {
+            return Err(OpenError::Struck);
+        }
+        let value = self
+            .hand_in(HANDLE(file.as_raw_handle()), Kind::File)
+            .map_err(OpenError::System)?;
+        self.send(&Command::Open {
+            player,
+            file: value,
+        })
+        .map_err(OpenError::Pipe)?;
+        self.open_files.insert(player, id);
+        Ok(())
+    }
+
+    /// Asks the worker to close player `player`. Its file stays open in the
+    /// worker until the worker answers, so a worker that ends while closing
+    /// it gives it a strike.
+    ///
+    /// # Errors
+    ///
+    /// When the pipe is closed: the worker has ended.
+    pub fn close(&mut self, player: u8) -> std::io::Result<()> {
+        self.send(&Command::Close { player })
+    }
+
+    /// Takes the worker's answer that player `player` closed: its file is
+    /// no longer open in the worker.
+    pub fn closed(&mut self, player: u8) {
+        self.open_files.remove(&player);
+    }
+
+    /// How the worker ended, once its watcher has seen it end: each player
+    /// open in it then fails, passed to `failed`, and its file gets a
+    /// strike, once.
+    pub fn reap(&mut self, strikes: &mut Strikes, mut failed: impl FnMut(u8)) -> Option<End> {
+        let end = self.end()?;
+        while let Some((player, file)) = self.open_files.pop_first() {
+            strikes.strike(file);
+            failed(player);
+        }
+        Some(end)
+    }
+}
+
+/// Why a file was not opened.
+#[derive(Debug)]
+pub enum OpenError {
+    /// It has the strikes that keep it from being opened again in the run.
+    Struck,
+    /// The system's error reading its identity or handing it in.
+    System(windows::core::Error),
+    /// The pipe is closed: the worker has ended.
+    Pipe(std::io::Error),
 }
 
 #[cfg(test)]

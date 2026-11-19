@@ -11,8 +11,10 @@
 //! the decoded frames' stamps, the seek's back-off and the zlib-compressed
 //! containers (`media_sandbox.rs` checks the sandbox itself). They check
 //! the game's supervision of the worker too: the job watcher's two paths
-//! to ending a worker at its memory cap, each apart, a job for each launch
-//! and the peak of the four largest players.
+//! to ending a worker at its memory cap, each apart, a job for each
+//! launch, the peak of the four largest players, and the strikes that keep
+//! a file from being opened again once it has been open in two workers
+//! that ended without the game asking.
 //!
 //! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), run
 //! as a command of its own, and the memory the job's cap is tested with by
@@ -37,9 +39,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "dev-tools")]
 use media_support::WORKER;
-use media_support::media_host::watch::LINE;
+use media_support::media_host::strikes::{FileId, Strikes};
 #[cfg(feature = "dev-tools")]
-use media_support::media_host::watch::{self, End, Event};
+use media_support::media_host::watch::{self, Event};
+use media_support::media_host::watch::{End, LINE};
 use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
 use skin_model::media::control::{Command as Order, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
@@ -1845,6 +1848,10 @@ fn job_memory_message_alone_terminates_below_the_line() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn job_memory_cap_terminates_when_the_message_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = gen_clip(dir.path(), "steady.mpg", "mpeg1video mpeg 64x48 24 240 12");
+    let file = std::fs::File::open(&clip).unwrap();
+    let mut strikes = Strikes::default();
     let stage = Stage::new();
     // The job's message discarded before the watcher sees it: the first
     // scheduled read at or past the line ends the worker.
@@ -1853,7 +1860,8 @@ fn job_memory_cap_terminates_when_the_message_is_lost() {
         no_accounting: false,
         discard_message: true,
     };
-    let worker = balloon(&stage, "32 640", lost);
+    let mut worker = balloon(&stage, "32 640", lost);
+    worker.open(1, &file, &strikes).unwrap();
     assert_eq!(ended(&worker), End::Line);
     assert_eq!(worker.wait_exit(REPLY), Some(watch::ENDED_AT_LINE));
     let events = worker.watch_events();
@@ -1884,6 +1892,15 @@ fn job_memory_cap_terminates_when_the_message_is_lost() {
         "{events:?}"
     );
     eprintln!("the watcher saw {events:?}");
+    // The game records what it records on the message: the player failed,
+    // and its file has a strike.
+    let mut failed = Vec::new();
+    assert_eq!(
+        worker.reap(&mut strikes, |p| failed.push(p)),
+        Some(End::Line)
+    );
+    assert_eq!(failed, [1]);
+    assert_eq!(strikes.of(FileId::of(&file).unwrap()), 1);
 }
 
 // Covers: T02
@@ -2018,4 +2035,72 @@ fn four_largest_players_stay_below_the_termination_line() {
     for player in [1, 2, 3, 4] {
         worker.close(player);
     }
+}
+
+/// The exit code the strikes test ends its workers with: an access
+/// violation's, as a crash's.
+const CRASH: u32 = 0xc000_0005;
+
+// Covers: T02
+#[test]
+fn a_file_with_two_strikes_is_not_reopened_that_run() {
+    use media_host::OpenError;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let file = std::fs::File::open(&fixture).unwrap();
+    let id = FileId::of(&file).unwrap();
+    let other =
+        std::fs::File::open(root().join("crates/player/tests/media/zlib/plain.mov")).unwrap();
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    // The file is open in two workers that crash: a strike each. Another,
+    // which each closed before it crashed, gets none.
+    for strike in 1..=2 {
+        let mut worker = stage.launch(&recipe()).unwrap();
+        worker.open(1, &file, &strikes).unwrap();
+        worker.open(2, &other, &strikes).unwrap();
+        worker.close(2).unwrap();
+        loop {
+            match worker.recv(REPLY).unwrap() {
+                Reply::Closed { player: 2 } => break,
+                Reply::Probed { .. } => {}
+                reply => panic!("{reply:?}"),
+            }
+        }
+        worker.closed(2);
+        // SAFETY: the worker's process handle, which has every access.
+        unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+        let deadline = Instant::now() + REPLY;
+        let mut failed = Vec::new();
+        let end = loop {
+            if let Some(end) = worker.reap(&mut strikes, |p| failed.push(p)) {
+                break end;
+            }
+            assert!(Instant::now() < deadline, "{:?}", worker.watch_events());
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(end, End::Exited(CRASH));
+        assert_eq!(failed, [1]);
+        assert_eq!(strikes.of(id), strike);
+        assert_eq!(strikes.of(FileId::of(&other).unwrap()), 0);
+    }
+    // It is not opened again in the run, by this handle or another; the
+    // other file is.
+    let mut worker = stage.launch(&recipe()).unwrap();
+    assert!(matches!(
+        worker.open(1, &file, &strikes),
+        Err(OpenError::Struck)
+    ));
+    let again = std::fs::File::open(&fixture).unwrap();
+    assert!(matches!(
+        worker.open(1, &again, &strikes),
+        Err(OpenError::Struck)
+    ));
+    worker.open(2, &other, &strikes).unwrap();
+    let probe = worker.recv(REPLY).unwrap();
+    assert!(
+        matches!(probe, Reply::Probed { player: 2, .. }),
+        "{probe:?}"
+    );
 }
