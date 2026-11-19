@@ -2861,8 +2861,6 @@ impl PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             crate::dev::stages_begin(self.clock, sel.chosen_at);
             #[cfg(feature = "dev-tools")]
-            crate::dev::loop_probe::mark_at("g:choice", sel.chosen_at, 0);
-            #[cfg(feature = "dev-tools")]
             crate::dev::loop_probe::mark("cur:chose", 0);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
@@ -3496,13 +3494,11 @@ impl PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        // A practice's Start chooses again: its load times run from it.
-        let now = self.clock.now();
+        // A practice's Start chose again when it was taken
+        // ([`start_ready`](game::AppRig::start_ready)): its load times run
+        // from there, its read at the chosen speed and its fit included.
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         if loaded.section().is_some() {
-            sel.chosen_at = now;
-            #[cfg(feature = "dev-tools")]
-            crate::dev::loop_probe::mark_at("g:choice", now, 1);
             // A Start decodes its own: a page bank still waiting for the
             // background is given up, and the Start waits for it itself.
             if let Some((_, pause)) = sel.page.take_pending() {
@@ -4389,9 +4385,15 @@ impl AppRig for PlayerRig<'_> {
     /// and after every return (a refused Start, a refused opening or
     /// restore, the rounds left by the quit key or a result's back).
     fn start_ready(&mut self) -> Result<(), String> {
+        // A Start taken chooses again: its load times run from here.
+        let now = self.clock.now();
         self.skin.ready().inspect_err(|notice| {
             println!("practice: not started: {notice}");
-        })
+        })?;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.chosen_at = now;
+        }
+        Ok(())
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {

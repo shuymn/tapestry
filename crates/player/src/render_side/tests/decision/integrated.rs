@@ -1850,11 +1850,11 @@ fn load_stages_are_recorded_in_order() {
     assert!(stages.iter().all(|&(_, v)| v <= ready), "{stages:?}");
 }
 
-/// With the transition probe on the game's clock, the deciding marks join
-/// on it: the choice, made with the clock held 600 s from its origin, is
-/// marked at 600 s (`g:choice`), READY (`g:ready`) at the choice plus the
-/// load's own `ready` stage, to the µs, and the preparation's and the
-/// opening's marks lie between them, in order.
+/// With the transition probe on, its deciding marks are on the game's
+/// clock, between the game's own times: the choice, made with the clock
+/// held 600 s from its origin, and READY, the choice plus the load's own
+/// `ready` stage; the preparation's mark (`prep:begin`) before the
+/// opening's (`g:open`), each once.
 #[test]
 fn the_probe_marks_the_deciding_events_on_the_games_clock() {
     let set = Set::new("s.luaskin");
@@ -1886,12 +1886,7 @@ fn the_probe_marks_the_deciding_events_on_the_games_clock() {
             .map(|m| (i64::try_from(m.0).unwrap(), m.2))
             .collect()
     };
-    assert_eq!(at("g:choice"), [(600_000_000, 0)], "the choice");
-    let ready = at("g:ready");
-    assert_eq!(ready.len(), 1, "{ready:?}");
-    let (ready, kind) = ready[0];
-    assert_eq!(kind, 0, "a play's READY");
-    assert_eq!(ready - 600_000_000, ready_stage, "choice -> READY");
+    let ready = 600_000_000 + ready_stage;
     let (prep, open) = (at("prep:begin"), at("g:open"));
     assert_eq!((prep.len(), open.len()), (1, 1), "{prep:?} {open:?}");
     assert!(

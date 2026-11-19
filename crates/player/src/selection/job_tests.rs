@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use audio::{BankError, Cap, Found, Gain};
-use bms_model::{Speed, TimeUs};
+use bms_model::{Speed, TimeSource as _, TimeUs};
 use game::coord::{Class, Coordinator, Failure, JobKind, JobPanic, Lease, LoadFailure, Spawner};
 use game::{AppRig as _, Chain, DataRoot, Loaded, Loading};
 
@@ -1235,6 +1235,36 @@ fn practiced(dir: &Path, path: &Path, speed: Speed) -> Loaded {
     let practice = screen.practice(&l);
     l.start_practice(practice).unwrap();
     l
+}
+
+/// A practice Start's load times run from the Start's acceptance
+/// ([`start_ready`](game::AppRig::start_ready)), not from its load: a load
+/// that begins 20 ms later, as after the chart's read at another speed and
+/// the practice's fit, keeps the Start's time as the choice's.
+#[test]
+fn a_practice_start_times_its_load_from_its_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let before = rig.clock.now();
+            rig.start_ready().unwrap();
+            let accepted = sel(rig).chosen_at;
+            assert!(accepted >= before, "{accepted:?} {before:?}");
+            std::thread::sleep(Duration::from_millis(20));
+            let start = practiced(dir.path(), &path, Speed::FASTEST);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Ready
+            );
+            assert_eq!(sel(rig).chosen_at, accepted, "timed from its load");
+            assert!(rig.clock.now().0 - accepted.0 >= 20_000);
+        },
+    );
 }
 
 /// A hook that records, at each release barrier before its unload, the

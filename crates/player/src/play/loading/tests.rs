@@ -551,8 +551,8 @@ fn the_offset_keys_are_revoked_on_leaving_the_result() {
     }
 }
 
-/// The transition probe on (`TAPESTRY_LOOP_PROBE`): the rig's opening is
-/// marked once at each call, `g:open` 0 at a full opening and 1 at a
+/// The transition probe on (`TAPESTRY_LOOP_PROBE`): each opening the rig
+/// makes is marked once, `g:open` 0 at a full opening and 1 at a
 /// round's candidate, within the call. It turns the process's probe on, so
 /// it runs in a process of its own (nextest).
 #[test]

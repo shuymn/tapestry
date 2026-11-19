@@ -3736,7 +3736,9 @@ fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
 
 /// With the transition probe on, an entry whose built-in page shows with
 /// no result lifetime has its first three frames probed (`rf:*`), once:
-/// its later frames are not, and the next such entry's first three are.
+/// its later frames are not, nor a page shown again with no entry entered
+/// (the entry's first picture was shown), and the next such entry's
+/// first three are.
 #[test]
 fn the_probe_marks_the_first_frames_of_each_built_in_entry() {
     use crate::dev::loop_probe::tests::{marks, turn_on};
@@ -3765,6 +3767,11 @@ fn the_probe_marks_the_first_frames_of_each_built_in_entry() {
     rig.clear();
     assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
     assert_eq!(left(), [2, 1, 0], "probed past its first frames");
+    rig.link.clear_end();
+    rig.clear();
+    rig.link.show_end(page());
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "a page of an entry already shown probed");
     rig.link.clear_end();
     rig.link.enter_result_entry(None);
     rig.link.show_end(page());

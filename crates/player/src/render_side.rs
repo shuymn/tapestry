@@ -4299,8 +4299,6 @@ pub fn spawn(
                 frames,
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
-                #[cfg(feature = "dev-tools")]
-                rf_entry: 0,
                 granted: false,
                 image: Image::default(),
                 first_frame: None,
@@ -5559,10 +5557,6 @@ struct Run {
     shared: Arc<Shared>,
     /// The end screen's page last taken from the slot, and its number.
     end_page: (u64, EndPage),
-    /// The Result entry whose built-in page, with no result lifetime, had
-    /// its first frames probed (`rf:*`, dev-tools): once per entry.
-    #[cfg(feature = "dev-tools")]
-    rf_entry: u64,
     /// The screen's wait granted a frame that no draw has taken yet: the
     /// end screen was left or nothing was to be drawn. Only a presented
     /// frame gives the grant back (a swap chain's waitable object, one
@@ -7489,16 +7483,22 @@ impl Run {
                     result_picture = (!self.shared.result_slot().open())
                         .then(|| self.shared.result_entries.drawing());
                     // The first frames of an entry's built-in page with no
-                    // result lifetime, once per entry, as a lifetime's
-                    // first view's are (`rf:*`, dev-tools).
+                    // result lifetime, as a lifetime's first view's are
+                    // (`rf:*`, dev-tools): armed while the entry's first
+                    // picture is not acknowledged, so a page after a
+                    // picture the entry already showed arms nothing.
                     #[cfg(feature = "dev-tools")]
                     {
                         if let Some(entry) = result_picture
                             && entry != 0
-                            && entry != self.rf_entry
+                            && entry
+                                != self
+                                    .shared
+                                    .result_entries
+                                    .acknowledged
+                                    .load(Ordering::Acquire)
                             && crate::dev::loop_probe::on()
                         {
-                            self.rf_entry = entry;
                             crate::dev::loop_probe::RESULT_FRAMES
                                 .store(3, std::sync::atomic::Ordering::Relaxed);
                         }

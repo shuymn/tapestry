@@ -2667,10 +2667,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
-        // The opening's mark, then G2's sample (dev-tools):
+        // The opening's time, then G2's sample (dev-tools):
         // `commit_ready`'s return to here.
         #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark_open(0, self.probe_ready.take(), &mut std::io::stderr());
+        let p_open =
+            crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -2690,6 +2691,7 @@ impl Rig for PlayerRig<'_> {
         });
         #[cfg(feature = "dev-tools")]
         if opened.is_ok() {
+            crate::dev::loop_probe::opened(p_open, 0);
             Self::print_lua("open");
         }
         opened
@@ -2735,10 +2737,11 @@ impl Rig for PlayerRig<'_> {
         lead_in: TimeUs,
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
-        // The opening's mark, then G2's sample (dev-tools), as at
-        // [`open`](Rig::open).
+        // The opening's time, then G2's sample (dev-tools), as at
+        // [`open`](Rig::open): marked only if it opens.
         #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark_open(1, self.probe_ready.take(), &mut std::io::stderr());
+        let p_open =
+            crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
@@ -2767,6 +2770,7 @@ impl Rig for PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         if opened.is_some() {
+            crate::dev::loop_probe::opened(p_open, 1);
             Self::print_lua("open");
         }
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
@@ -2833,6 +2837,9 @@ impl Rig for PlayerRig<'_> {
         history: &mut game::HistoryRecorder,
         start: &mut eval::InputStart,
     ) -> Result<game::Rearm, InputWaitError> {
+        // The rearm's opening time (dev-tools): marked only if it opens.
+        #[cfg(feature = "dev-tools")]
+        let p_open = crate::dev::loop_probe::stamp();
         // The cancellation's and the previous opening's markers are taken
         // first: the tap owes one of each at most.
         let cancelled = self.gate.as_ref().map(|g| g.state().generation);
@@ -2855,7 +2862,7 @@ impl Rig for PlayerRig<'_> {
             self.origin = Some(origin);
             self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
             #[cfg(feature = "dev-tools")]
-            crate::dev::loop_probe::mark_at("g:ready", TimeUs(origin.0 - lead_in.0), 1);
+            crate::dev::loop_probe::opened(p_open, 2);
         }
         if rearmed == game::Rearm::Held
             && let Some(driver) = &mut self.adjust
@@ -2902,8 +2909,6 @@ impl Rig for PlayerRig<'_> {
         let page_faults = process_page_faults();
         let ready_state_at = TimeUs(origin.0 - self.lead_in.0);
         self.ready_state_at = Some(ready_state_at);
-        #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark_at("g:ready", ready_state_at, 0);
         #[cfg(feature = "dev-tools")]
         if let Some((_, ack)) = self.render.loading_ack() {
             let end = game::minimum_ends(ack, self.render.loading_loadend());

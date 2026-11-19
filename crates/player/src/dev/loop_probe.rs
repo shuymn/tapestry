@@ -15,12 +15,20 @@
 //! a mark is one atomic load.
 //!
 //! Two classes of mark. The deciding marks are exact at their events, on
-//! the game's clock: `g:choice` at the game's own time of the accepted
-//! choice (0) or a practice's Start (1), `prep:begin` and `g:open` read
-//! as the preparation and the opening begin, before anything else they
-//! do, and `g:ready` at the game's own READY (`ready_state_at`: 0 a play's,
-//! 1 a round's), so every end-to-end span a transition is judged by is a
-//! subtraction of two of them. Every other mark is diagnostic: it names its
+//! the game's clock: `prep:begin`, read as an attempt's preparation
+//! begins, and `g:open`, read as the opening call that opened begins
+//! (once per accepted opening: 0 without a start gate, 1 a gated
+//! candidate's, 2 a rearmed candidate's), before anything else either
+//! does. The game keeps the other ends of the spans a transition is
+//! judged by, on the same clock: the choice's or a practice Start's
+//! acceptance (`chosen_at`), from which the `load: READY started … ms
+//! after the choice` line and the play's `[load_stages]` (READY's
+//! `ready_state_at`, the decision screen's end, the loading minimum's end)
+//! count, and the scenario's transition record (each state's first
+//! presented frame, READY's included). So choice → READY is the game's
+//! own line, and preparation → READY, or → the opening, is a subtraction
+//! of `prep:begin` from the record's READY or `g:open`. Every other mark
+//! is diagnostic: it names its
 //! event truly (the array, view or upload it is of), and its interval is
 //! what is measured, with what it cannot leave out:
 //!
@@ -30,12 +38,13 @@
 //!   submit's return time; `fu:cpu_us` the frame's CPU time as its timing
 //!   counts it, the image's acquisition or admission left out;
 //!   `fu:gpu_done_us` runs from the submit's return to wgpu's completion
-//!   callback, which wgpu runs at the device's next submit or poll, so it
-//!   is the latency of that callback, with no bound on the wait for that
-//!   call. The callback can run inside another submit or a timed poll, an
-//!   upload's included, so its mark can fall among that upload's marks;
-//!   marks are the probe's own work, left out of the upload's figures,
-//!   though they overlap the GPU's work its wait times.
+//!   callback, which wgpu runs at the device's first submit or poll after
+//!   the GPU finished, so it is the latency of that callback, with no
+//!   bound on the wait for that call. The callback can run inside another
+//!   submit or a timed poll, an upload's included, so its mark can fall
+//!   among that upload's marks; marks are the probe's own work, left out
+//!   of the upload's figures, though they overlap the GPU's work its
+//!   wait times.
 //! - `tx:*`, a text preparation: each step as timed; `tx:gpu_wait_us`
 //!   from just before the wait to its return, zero when every line was
 //!   cached and nothing was submitted, and the time to the failure when a
@@ -241,30 +250,44 @@ pub fn mark(tag: &'static str, v: i64) {
     }
 }
 
-/// Keeps a deciding mark at `at`, the game's own time of its event on the
-/// game's clock (the probe's).
-pub fn mark_at(tag: &'static str, at: TimeUs, v: i64) {
-    if REC.on() {
-        render::probe::own(|| REC.mark_at(tag, at, v));
+/// The probe's clock now, the game's, for a mark kept later at this time
+/// ([`opened`]); none with the probe off.
+pub fn stamp() -> Option<TimeUs> {
+    if !REC.on() {
+        return None;
     }
+    REC.now()
+        .map(|t| TimeUs(i64::try_from(t).unwrap_or(i64::MAX)))
 }
 
-/// Marks an opening (`g:open`, `kind` 0 a full one, 1 a round's
-/// candidate) as it begins, then writes G2's sample (`commit_ready`'s
-/// return to here) to `out`: a stalled writer delays the opening, not its
-/// mark.
-pub fn mark_open(
-    kind: i64,
+/// An opening call begins: its time, read first, then G2's sample
+/// (`commit_ready`'s return to here) written to `out`, so a stalled
+/// writer delays the opening, not its time. The sample's figure includes
+/// that reading.
+pub fn opening(
     ready: Option<(std::time::Instant, &str)>,
     out: &mut impl std::io::Write,
-) {
-    mark("g:open", kind);
+) -> Option<TimeUs> {
+    let at = stamp();
     if let Some((at, step)) = ready {
         let _ = writeln!(
             out,
             "dev: probe G2 ready to open: {} us result {step}",
             at.elapsed().as_micros()
         );
+    }
+    at
+}
+
+/// Marks an opening accepted (`g:open`) at `at`, its call's beginning
+/// ([`opening`], [`stamp`]): `kind` 0 an opening without a start gate, 1
+/// a gated candidate's, 2 a rearmed candidate's. A deferred call is not
+/// marked, so each accepted opening is marked once.
+pub fn opened(at: Option<TimeUs>, kind: i64) {
+    if let Some(at) = at
+        && REC.on()
+    {
+        render::probe::own(|| REC.mark_at("g:open", at, kind));
     }
 }
 
@@ -488,9 +511,9 @@ pub(crate) mod tests {
     }
 
     /// A mark is the probe's own work, left out of the figures around it.
-    /// An opening is marked as it begins, before G2's sample is written:
-    /// a writer that stalls 20 ms at each write delays the opening, not
-    /// its mark.
+    /// An opening's time is read as its call begins, before G2's sample is
+    /// written: a writer that stalls 20 ms at each write delays the
+    /// opening, not its mark.
     #[test]
     fn the_probe_marks_an_opening_before_its_sample() {
         struct Stalled(Vec<u64>);
@@ -506,7 +529,8 @@ pub(crate) mod tests {
         }
         turn_on();
         let mut out = Stalled(Vec::new());
-        super::mark_open(0, Some((std::time::Instant::now(), "x")), &mut out);
+        let at = super::opening(Some((std::time::Instant::now(), "x")), &mut out);
+        super::opened(at, 0);
         let opened: Vec<u64> = marks()
             .iter()
             .filter(|m| m.1 == "g:open")
