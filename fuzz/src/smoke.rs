@@ -1357,6 +1357,9 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "callback_dropped",
             "facts",
             "result_facts",
+            "coercion",
+            "observers",
+            "composition",
             "callback_replaced",
             "callback_effect",
             "host_write",
@@ -1406,6 +1409,31 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     assert_eq!(
                         i.dependencies,
                         ["s.luaskin", "m.lua", "parts/p.lua"],
+                        "{name}"
+                    );
+                }
+            }
+            "coercion" | "observers" | "composition" => {
+                use skin_beatoraja::lua::Disposition;
+                use skin_beatoraja::{FactId, FactRead, FactValue};
+                let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let want: &[Disposition] = match name {
+                    "coercion" => &[],
+                    // The true observer untimed, the false one never drawn.
+                    "observers" => &[Disposition::Lowered, Disposition::Lowered],
+                    // The text folded to its literal.
+                    _ => &[Disposition::Lowered],
+                };
+                assert_eq!(i.callbacks, want, "{name}");
+                if name == "composition" {
+                    let read = |fact, v| FactRead {
+                        fact,
+                        value: FactValue::Int(v),
+                    };
+                    assert_eq!(
+                        i.facts.reads,
+                        [read(FactId::ChartTotal, 333), read(FactId::ChartNotes, 82)],
                         "{name}"
                     );
                 }
@@ -1571,10 +1599,11 @@ fn present_seeds_verify_or_fail_as_built() {
             "enum_read",
             "const_edge",
             "const_wide",
+            "latch",
         ],
     );
     for (name, data) in &seeds {
-        let want = matches!(*name, "accepted" | "const_edge").then_some(2);
+        let want = matches!(*name, "accepted" | "const_edge" | "latch").then_some(2);
         assert_eq!(crate::present(data), want, "{name}");
     }
 }

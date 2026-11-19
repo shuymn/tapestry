@@ -74,6 +74,67 @@ fn luaj_long(r: Raw) -> i64 {
     }
 }
 
+/// A slider's value as `tofloat()` reads it (`SkinLuaAccessor.java:
+/// 665-677`; design.md "beatoraja Lua Skins", numbers and numeric
+/// strings): a number as the source's interpreter holds it, with no
+/// negative zero, a string as a plain numeral ([`numeral`], a −0 keeping
+/// its sign, none 0), nil, booleans and anything else 0; then narrowed to
+/// `float`. Restated here, not called, so the comparator checks
+/// production's conversion against the rule.
+fn luaj_float(r: Raw) -> f32 {
+    #[expect(clippy::cast_precision_loss, reason = "LuaJ holds a double")]
+    let d = match r {
+        Raw::Int(n) => n as f64,
+        // Matches −0 too: the source holds an integer zero.
+        Raw::Float(0.0) => 0.0,
+        Raw::Float(f) => f,
+        Raw::Text(s) => numeral(s).unwrap_or(0.0),
+        _ => 0.0,
+    };
+    #[expect(clippy::cast_possible_truncation, reason = "Java's d2f")]
+    let f = d as f32;
+    f
+}
+
+/// String `s` as a plain numeral (design.md "beatoraja Lua Skins",
+/// numeric strings): Lua's six ASCII whitespace characters ignored at
+/// both ends, an optional sign, then a decimal numeral (digits with an
+/// optional fraction, or a fraction alone, then an optional exponent) or
+/// `0x` and hexadecimal digits worth less than 2^64, rounded once; `None`
+/// for anything else.
+pub(crate) fn numeral(s: &str) -> Option<f64> {
+    let t = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "rounded once")]
+        let v = u64::from_str_radix(h, 16).ok()? as f64;
+        v
+    } else {
+        let (mantissa, exponent) = match t.find(['e', 'E']) {
+            Some(i) => (t.get(..i)?, Some(t.get(i + 1..)?)),
+            None => (t, None),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+        let exponent_ok = exponent.is_none_or(|e| {
+            let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+            !e.is_empty() && digits(e)
+        });
+        if whole.len() + fraction.len() == 0 || !digits(whole) || !digits(fraction) || !exponent_ok
+        {
+            return None;
+        }
+        t.parse::<f64>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
 /// Whether two numbers are the same real number (NaN with NaN; −0.0 and
 /// 0.0 are equal as IEEE compares them).
 fn same_number(a: Raw, b: Raw) -> bool {
@@ -119,6 +180,10 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
         ("timer", Outcome::Value(r)) => Converted::Long(Some(luaj_long(r))),
         ("timer", Outcome::Error) => Converted::Long(Some(i64::MIN)),
         ("timer", Outcome::Unavailable) => Converted::Long(None),
+        // A slider's value: its `tofloat()`, a caught error `0f`.
+        ("slider", Outcome::Value(r)) => Converted::Float(luaj_float(r).to_bits(), true),
+        ("slider", Outcome::Error) => Converted::Float(0.0_f32.to_bits(), true),
+        ("slider", Outcome::Unavailable) => Converted::Float(0, false),
         ("value", Outcome::Value(r)) => {
             let n = toint(r);
             Converted::Int(n, n != i32::MIN && n != i32::MAX)
@@ -141,7 +206,9 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
 /// (`toint()`, `toboolean()`). The pair agrees only when the converted
 /// output is equal, so a `value` agrees (0 drawn on both sides) and a
 /// `draw` does not (`nil` false, 0 true); `nil` against any other integer
-/// stays a raw difference.
+/// stays a raw difference. A slider's string or boolean has no raw
+/// counterpart: the import reads a known one into the number the program
+/// returns, so only its converted float is compared.
 fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> Option<String> {
     let (result, conv) = prod;
     let class = match (result, refo) {
@@ -153,16 +220,35 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
     if class.is_some() {
         return class;
     }
+    let read_at_import =
+        field == "slider" && matches!(refo, Outcome::Value(Raw::Text(_) | Raw::Bool(_)));
     if let (Ok(v), Outcome::Value(r)) = (result, refo)
+        && !read_at_import
         && !same_raw(val_raw(v), r)
         && !matches!((v, r), (Val::Int(0), Raw::Nil))
     {
         return Some(format!("raw: production {v:?}, reference {r:?}"));
     }
     match converted(field, refo) {
-        Some(c) if c == conv => None,
+        Some(c) if same_converted(c, conv) => None,
         c => Some(format!("converted: production {conv:?}, reference {c:?}")),
     }
+}
+
+/// Whether two conversions agree: exactly, but a float's NaN agrees with
+/// any NaN, whatever its bits (the reference VM's native division may give
+/// another NaN than the program's canonical one); whether it gave a value
+/// is compared exactly.
+fn same_converted(a: Converted, b: Converted) -> bool {
+    match (a, b) {
+        (Converted::Float(x, xok), Converted::Float(y, yok)) => xok == yok && same_bits(x, y),
+        _ => a == b,
+    }
+}
+
+/// Whether two `float`s' bits are the same, any NaN with any NaN.
+fn same_bits(x: u32, y: u32) -> bool {
+    x == y || (f32::from_bits(x).is_nan() && f32::from_bits(y).is_nan())
 }
 
 /// What an intended difference from the source is counted under: a
@@ -766,6 +852,7 @@ fn expected_out(field: &str, o: Outcome) -> (i32, i32) {
     match converted(field, o) {
         Some(Converted::Bool(b)) => (i32::from(b), i32::from(o != Outcome::Unavailable)),
         Some(Converted::Int(n, ok)) => (n, i32::from(ok)),
+        Some(Converted::Float(bits, ok)) => (bits.cast_signed(), i32::from(ok)),
         _ => (0, 0),
     }
 }
@@ -775,7 +862,7 @@ fn expected_out(field: &str, o: Outcome) -> (i32, i32) {
 /// an `op` true.
 fn allows(field: &str, o: Outcome) -> bool {
     match converted(field, o) {
-        Some(Converted::Int(_, ok)) => ok,
+        Some(Converted::Int(_, ok) | Converted::Float(_, ok)) => ok,
         Some(Converted::Bool(b)) => b && o != Outcome::Unavailable,
         _ => false,
     }
@@ -1102,6 +1189,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         let mut seen: BTreeSet<u16> = BTreeSet::new();
         let mut order: Vec<u16> = Vec::new();
         let mut outs: BTreeMap<u16, (i32, i32)> = BTreeMap::new();
+        // The callbacks whose output cell holds a float's bits.
+        let mut floats: BTreeSet<u16> = BTreeSet::new();
         // Each installed object's occurrences, once, in schedule order;
         // `blocked`: the last compiled consumer before did not allow what
         // follows.
@@ -1227,6 +1316,12 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 };
                 seen.insert(k);
                 rep.matched += 1;
+                // A slider's value is converted as a float.
+                let field = if obs.sliders.contains(&key) {
+                    "slider"
+                } else {
+                    key.field
+                };
                 if let Point::NotReached { why, .. } = occ.first {
                     let was_blocked = blocked;
                     if key.field != "timer" {
@@ -1260,8 +1355,11 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 if let Some(outcome) = call {
                     order.push(k);
                     if key.field != "timer" {
-                        blocked = !allows(key.field, outcome);
-                        outs.insert(k, expected_out(key.field, outcome));
+                        blocked = !allows(field, outcome);
+                        outs.insert(k, expected_out(field, outcome));
+                        if field == "slider" {
+                            floats.insert(k);
+                        }
                     }
                     match (outcome, p.first.get(&k)) {
                         (Outcome::Unanswered(api), _) => {
@@ -1282,10 +1380,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         }
                         (_, Some(First::Ran(prod))) => {
                             used.insert(k);
-                            if toint_differs(key.field, outcome) {
+                            if toint_differs(field, outcome) {
                                 *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
                             }
-                            match differ(key.field, *prod, outcome) {
+                            match differ(field, *prod, outcome) {
                                 None => rep.agreed += 1,
                                 Some(d) => {
                                     let hint = luaj_hint(obs, key.callable);
@@ -1397,7 +1495,12 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 pf.outs.get(at).copied().unwrap_or(i32::MIN),
                 pf.outs.get(at + 1).copied().unwrap_or(i32::MIN),
             );
-            if got != (v, ok) {
+            let same = if floats.contains(&k) {
+                got.1 == ok && same_bits(got.0.cast_unsigned(), v.cast_unsigned())
+            } else {
+                got == (v, ok)
+            };
+            if !same {
                 find(
                     key_k(k),
                     i,

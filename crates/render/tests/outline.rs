@@ -105,7 +105,7 @@ fn stage(
 fn frame(r: &mut Renderer) -> Vec<u8> {
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     read_back(r)
 }
 
@@ -481,7 +481,7 @@ fn staged_loading_lines_move_with_the_commit() {
     let staged_frame = |r: &mut Renderer| {
         let f = common::loading_frame(1, TimeUs(0), TimeUs(0));
         let t = r.loading_frame_on(on, &f, &menu).unwrap().unwrap();
-        assert!(t.presented);
+        assert!(t.presented());
         read_back(r)
     };
     // The first staged frame enters the lifetime.
@@ -531,7 +531,7 @@ fn a_reused_specialization_draws_with_no_upload() {
     let lifetime_2 = common::loading_frame(2, TimeUs(0), TimeUs(0));
     let staged = |r: &mut Renderer| {
         let t = r.loading_frame_on(on, &lifetime_2, &menu).unwrap().unwrap();
-        assert!(t.presented);
+        assert!(t.presented());
         read_back(r)
     };
     let before = staged(&mut r);

@@ -6,8 +6,9 @@
 //! executor; s7-06e-design.md §3.2-§3.3; s7-06e-1-r1-tables.md, B).
 //!
 //! Modelled kinds: system images, plain and grouped images, image sets,
-//! numbers, and texts whose value is a function. Every other kind is
-//! listed with every callable it holds, its nested parts' included.
+//! numbers, and texts and sliders whose value is a function (a slider
+//! holding no other function). Every other kind is listed with every
+//! callable it holds, its nested parts' included.
 
 use std::collections::BTreeMap;
 
@@ -19,6 +20,7 @@ use crate::inputs::{FrameInputs, Host};
 use crate::observed::{
     Cause, Key, Listed, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern,
 };
+use crate::production::compare::numeral;
 
 /// How an image or a number chooses what it shows.
 enum Sel {
@@ -46,6 +48,42 @@ enum Kind {
     Number,
     /// A text whose value is a function: only that string is compared.
     Text,
+    /// A slider whose value is a function: only that float is compared.
+    Slider,
+}
+
+/// A slider's destination timer as its serializer reads it
+/// (`LuaSkinLoader.java:132-134`, `:155-167`,
+/// `TimerPropertyFactory.java:6-8`): none (absent, a negative id, or a
+/// value the serializer ignores), an id, or a string the source runs as
+/// a script, which the model does not. A function is [`Obj::timer`].
+#[derive(Clone, Copy)]
+pub(crate) enum TimerRef {
+    None,
+    Id(i32),
+    Undecided,
+}
+
+/// What decides whether a slider past its conditions draws, and so reads
+/// its value (`SkinObject.java:591-607`, `:348-375`): its timer, its
+/// keyframes' first and last times (ms) and its loop, and whether a mouse
+/// rectangle decides it.
+pub(crate) struct Timing {
+    pub timer: TimerRef,
+    pub first: i64,
+    pub last: i64,
+    pub looping: i64,
+    pub mouse: bool,
+}
+
+/// The clock an object's prepare path leaves its draw on: untimed, its
+/// timer function's start (µs), off, or undecided.
+#[derive(Clone, Copy)]
+enum Clock {
+    Untimed,
+    Start(i64),
+    Off,
+    Undecided,
 }
 
 enum Cond {
@@ -74,8 +112,10 @@ struct Obj {
     entries: Vec<Validity>,
     conds: Vec<Cond>,
     timer: Option<(Function, Key)>,
-    /// A text's value, run after everything else.
-    text: Option<(Function, Key)>,
+    /// A text's or a slider's value, run after everything else.
+    value: Option<(Function, Key)>,
+    /// A slider's draw past its conditions.
+    timing: Option<Timing>,
     options: Vec<i32>,
     validity: Validity,
 }
@@ -438,7 +478,7 @@ impl<'a> Reference<'a> {
         // (`JsonSkinObjectLoader.java:42-124`).
         let system = id.parse::<i32>().is_ok_and(|n| n < 0);
         let mut entries = Vec::new();
-        let mut text = None;
+        let mut value = None;
         let (kind, sel, validity) = if system {
             (Kind::Image, Sel::Zero, Validity::Valid)
         } else if let Some(img) = find(skin, "image", &id) {
@@ -497,13 +537,27 @@ impl<'a> Reference<'a> {
             let font = id_string(&raw(&def, "font")).and_then(|f| find(skin, "font", &f));
             let k = self.key_at(&f, index, ("value", 0), "def");
             self.observed.texts.insert(k);
-            text = Some((f, k));
+            value = Some((f, k));
             let validity = if font.is_some() {
                 Validity::Valid
             } else {
                 Validity::Invalid
             };
             (Kind::Text, Sel::Zero, validity)
+        } else if let Some((def, f)) =
+            find(skin, "slider", &id).and_then(|s| match raw(&s, "value") {
+                Value::Function(f) if only_value(&s) => Some((s, f)),
+                _ => None,
+            })
+        {
+            // A slider is built only from a loaded texture
+            // (`JsonSkinObjectLoader.java:393-416`); its value is a float
+            // property over the function (`SkinLuaAccessor.java:665-677`).
+            let validity = self.source(skin, &raw(&def, "src"));
+            let k = self.key_at(&f, index, ("value", 0), "def");
+            self.observed.sliders.insert(k);
+            value = Some((f, k));
+            (Kind::Slider, Sel::Zero, validity)
         } else {
             let other = other_kind(skin, &id);
             let callables = self.all_callables(index, dest, other.as_ref().map(|(_, t)| t));
@@ -580,6 +634,7 @@ impl<'a> Reference<'a> {
             }
             _ => None,
         };
+        let timing = matches!(kind, Kind::Slider).then(|| timing(dest));
         let obj = Obj {
             dest: index,
             kind,
@@ -587,7 +642,8 @@ impl<'a> Reference<'a> {
             entries,
             conds,
             timer,
-            text,
+            value,
+            timing,
             options,
             validity,
         };
@@ -799,7 +855,7 @@ fn obj_keys(o: &Obj) -> Vec<Key> {
     if let Some((_, k)) = &o.timer {
         out.push(*k);
     }
-    if let Some((_, k)) = &o.text {
+    if let Some((_, k)) = &o.value {
         out.push(*k);
     }
     out
@@ -865,13 +921,15 @@ fn prop(vm: &ReferenceVm, p: &PropRef, kind: &Kind) -> Result<i32, Cause> {
     match (v, kind) {
         (PropValue::Value(n), _) => Ok(n),
         (PropValue::Null, Kind::Number) => Ok(i32::MIN),
-        (PropValue::Null, Kind::Image | Kind::Text) => Ok(0),
+        (PropValue::Null, Kind::Image | Kind::Text | Kind::Slider) => Ok(0),
         (PropValue::Unavailable, _) => Err(Cause::Unavailable),
         (PropValue::Unsupported, _) => Err(Cause::Inconclusive),
     }
 }
 
-/// A text's string, interned; any other outcome as [`outcome`] gives it.
+/// A returned string, interned (a text's, or a slider's value, which the
+/// comparator reads as a number); any other outcome as [`outcome`] gives
+/// it.
 fn text_outcome(c: &Called) -> Outcome {
     match c {
         Called::Value(Value::String(s)) => Outcome::Value(Raw::Text(intern(&s.to_string_lossy()))),
@@ -879,22 +937,178 @@ fn text_outcome(c: &Called) -> Outcome {
     }
 }
 
-/// `o`'s prepare path on the frame the VM holds, then a text's value:
-/// the source's text runs its value after its object's prepare, whatever
-/// that gave (`SkinText.java:100-109`).
+/// `o`'s prepare path on the frame the VM holds, then its value: a
+/// text runs it after its object's prepare, whatever that gave
+/// (`SkinText.java:100-109`); a slider only once that prepare leaves it
+/// drawn (`SkinSlider.java:104-114`, [`draws`]).
 fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut RefFrame) {
-    prepare_object(vm, items, o, out);
-    if let Some((f, k)) = &o.text {
-        let c = vm.call(f);
-        out.points.push(Point::Ran {
-            key: *k,
-            outcome: text_outcome(&c),
-        });
+    let clock = prepare_object(vm, items, o, out);
+    let Some((f, k)) = &o.value else {
+        return;
+    };
+    // Only a slider has a timing.
+    let drawn = match &o.timing {
+        Some(t) => clock.and_then(|c| draws(vm, t, c)),
+        None => Ok(()),
+    };
+    match drawn {
+        Ok(()) => {
+            let c = vm.call(f);
+            let outcome = match o.kind {
+                Kind::Text | Kind::Slider => text_outcome(&c),
+                _ => outcome(&c),
+            };
+            out.points.push(Point::Ran { key: *k, outcome });
+        }
+        Err(why) => out.points.push(Point::NotReached { key: *k, why }),
     }
 }
 
-/// `o`'s object prepare path on the frame the VM holds.
-fn prepare_object(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut RefFrame) {
+/// Whether a slider past its conditions on clock `clock` draws on the
+/// frame the VM holds (`SkinObject.java:591-607`, `:348-375`): its timer
+/// on, its keyframes reaching the time, which the timer's start makes
+/// relative (both in ms, as Java's `long` division gives them), and then
+/// no mouse rectangle deciding it, which the model cannot. A slider's
+/// image is never null once it installs: a loaded texture's grid has a
+/// cell.
+fn draws(vm: &ReferenceVm, t: &Timing, clock: Clock) -> Result<(), Cause> {
+    let start = match (clock, t.timer) {
+        (Clock::Undecided, _) | (_, TimerRef::Undecided) => return Err(Cause::Inconclusive),
+        (Clock::Off, _) => return Err(Cause::Hidden),
+        (Clock::Start(s), _) => Some(s),
+        (Clock::Untimed, TimerRef::None) => None,
+        (Clock::Untimed, TimerRef::Id(id)) => match vm.timer(id) {
+            None => return Err(Cause::Inconclusive),
+            Some(i64::MIN) => return Err(Cause::Hidden),
+            Some(s) => Some(s),
+        },
+    };
+    let now = vm.state_us().ok_or(Cause::Inconclusive)? / 1000;
+    let time = start.map_or(now, |s| now.saturating_sub(s / 1000));
+    shown(t, time)
+}
+
+/// Whether a slider whose timer is on draws at `time` (ms past its
+/// timer's start): hidden where its keyframes do not reach it, then
+/// undecided where a mouse rectangle decides it (`SkinObject.java:
+/// 591-607`).
+pub(crate) fn shown(t: &Timing, time: i64) -> Result<(), Cause> {
+    if !reaches(t, time) {
+        Err(Cause::Hidden)
+    } else if t.mouse {
+        Err(Cause::Inconclusive)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `t`'s keyframes reach `time` (ms past its timer's start):
+/// past the last one a loop of -1 hides it, a loop before it repeats from
+/// the loop, and a time before the first one hides it
+/// (`SkinObject.java:360-375`).
+pub(crate) fn reaches(t: &Timing, mut time: i64) -> bool {
+    if t.looping == -1 {
+        if time > t.last {
+            time = -1;
+        }
+    } else if t.last > 0 && time > t.looping {
+        time = if t.last == t.looping {
+            t.looping
+        } else {
+            (time - t.looping)
+                .checked_rem(t.last - t.looping)
+                .unwrap_or(0)
+                + t.looping
+        };
+    }
+    t.first <= time
+}
+
+/// A slider destination's [`Timing`] as the loader reads it
+/// (`JSONSkinLoader.java:425-462`): a keyframe's absent time, and one of
+/// `Integer.MIN_VALUE`, which the loader takes for absent, is the one
+/// before it (0 for the first), and the keyframes sort by time
+/// (`SkinObject.java:240-247`). The timer by its serializer
+/// (`LuaSkinLoader.java:155-167`): a function is [`Obj::timer`], a number
+/// an id, a string read as a number an id (as a plain numeral, so `"0x29"`
+/// is timer 41; design.md "beatoraja Lua Skins", numeric strings), another
+/// string a script, anything else (a boolean, a table) no timer.
+pub(crate) fn timing(dest: &Table) -> Timing {
+    let id = |n: i32| {
+        if n >= 0 {
+            TimerRef::Id(n)
+        } else {
+            TimerRef::None
+        }
+    };
+    let timer = match raw(dest, "timer") {
+        v @ Value::String(_) => match string(&v).as_deref().and_then(numeral) {
+            Some(d) => id(d2i(d)),
+            None => TimerRef::Undecided,
+        },
+        v if lua_number(&v).is_some() => toint(&v).map_or(TimerRef::None, id),
+        _ => TimerRef::None,
+    };
+    let mut prev = 0;
+    let (mut first, mut last) = (i64::MAX, i64::MIN);
+    for k in list(&raw(dest, "dst")) {
+        if let Value::Table(k) = k {
+            prev = toint(&raw(&k, "time"))
+                .filter(|&t| t != i32::MIN)
+                .unwrap_or(prev);
+        }
+        first = first.min(i64::from(prev));
+        last = last.max(i64::from(prev));
+    }
+    Timing {
+        timer,
+        first,
+        last,
+        looping: i64::from(toint(&raw(dest, "loop")).unwrap_or(0)),
+        mouse: !matches!(raw(dest, "mouseRect"), Value::Nil),
+    }
+}
+
+/// Whether slider `s` holds no function but its own `value`, at any
+/// depth: any other (a source timer, an event, one in a nested table)
+/// may run where the model does not, so such a slider is listed.
+pub(crate) fn only_value(s: &Table) -> bool {
+    /// Whether `t` holds a function, other than `value` at the top, each
+    /// table once on the way down; a table past a few levels counts as one,
+    /// since the scan cannot tell.
+    fn other(t: &Table, top: bool, stack: &mut Vec<usize>) -> bool {
+        let at = t.to_pointer().addr();
+        if stack.contains(&at) {
+            return false;
+        }
+        if stack.len() > 6 {
+            return true;
+        }
+        stack.push(at);
+        let mut found = false;
+        let _ = t.for_each(|k: Value, v: Value| {
+            found |= match &v {
+                Value::Function(_) => !(top && id_string(&k).as_deref() == Some("value")),
+                Value::Table(t) => other(t, false, stack),
+                _ => false,
+            };
+            Ok(())
+        });
+        stack.pop();
+        found
+    }
+    !other(s, true, &mut Vec::new())
+}
+
+/// `o`'s object prepare path on the frame the VM holds: the clock it
+/// leaves the object's draw on, or why it stopped (every occurrence after
+/// the stop marked not reached).
+fn prepare_object(
+    vm: &ReferenceVm,
+    items: &BTreeMap<i32, bool>,
+    o: &Obj,
+    out: &mut RefFrame,
+) -> Result<Clock, Cause> {
     // 1. The selector or value.
     let sel: Result<i32, Cause> = match &o.sel {
         Sel::Zero => Ok(0),
@@ -917,15 +1131,20 @@ fn prepare_object(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &
     };
     let sel = match sel {
         Ok(v) => v,
-        Err(why) => return not_reached(o, 0, why, out),
+        Err(why) => {
+            not_reached(o, 0, why, out);
+            return Err(why);
+        }
     };
     // 2. The kind's own gate before the conditions.
-    match o.kind {
-        Kind::Image if sel < 0 => return not_reached(o, 0, Cause::Selector, out),
-        Kind::Number if sel == i32::MIN || sel == i32::MAX => {
-            return not_reached(o, 0, Cause::Sentinel, out);
-        }
-        _ => {}
+    let gate = match o.kind {
+        Kind::Image if sel < 0 => Some(Cause::Selector),
+        Kind::Number if sel == i32::MIN || sel == i32::MAX => Some(Cause::Sentinel),
+        _ => None,
+    };
+    if let Some(why) = gate {
+        not_reached(o, 0, why, out);
+        return Err(why);
     }
     // 3. The conditions, the first false stopping.
     for (i, c) in o.conds.iter().enumerate() {
@@ -948,45 +1167,57 @@ fn prepare_object(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &
         };
         match holds {
             Ok(true) => {}
-            Ok(false) => return not_reached(o, i + 1, Cause::Condition, out),
-            Err(why) => return not_reached(o, i + 1, why, out),
+            Ok(false) => {
+                not_reached(o, i + 1, Cause::Condition, out);
+                return Err(Cause::Condition);
+            }
+            Err(why) => {
+                not_reached(o, i + 1, why, out);
+                return Err(why);
+            }
         }
     }
     // 4. The timer: once, its one result both whether it is on and its
     // start, as the program runs it (design.md "beatoraja Lua Skins",
     // Differences from the source, timer callbacks run once).
-    if let Some((f, k)) = &o.timer {
-        let c = vm.call(f);
-        out.points.push(Point::Ran {
-            key: *k,
-            outcome: outcome(&c),
-        });
-        let start = match &c {
-            Called::Value(v) => Some(to_long(v)),
-            Called::Error => Some(i64::MIN),
-            _ => None,
-        };
-        let on = start.is_some_and(|v| v != i64::MIN);
-        // 5. The chosen source (`SkinImage.java:133-139`): past the end
-        // selects 0; a hole hides the object after all this.
-        let shown = if o.entries.is_empty() {
-            Some(true)
-        } else {
-            let i = usize::try_from(sel)
-                .ok()
-                .filter(|&i| i < o.entries.len())
-                .unwrap_or(0);
-            match o.entries.get(i) {
-                Some(Validity::Valid) => Some(true),
-                Some(Validity::Unknown | Validity::Movie) => None,
-                _ => Some(false),
-            }
-        };
-        out.timers.push(TimerOut {
-            key: *k,
-            on,
-            start,
-            shown,
-        });
-    }
+    let Some((f, k)) = &o.timer else {
+        return Ok(Clock::Untimed);
+    };
+    let c = vm.call(f);
+    out.points.push(Point::Ran {
+        key: *k,
+        outcome: outcome(&c),
+    });
+    let start = match &c {
+        Called::Value(v) => Some(to_long(v)),
+        Called::Error => Some(i64::MIN),
+        _ => None,
+    };
+    let on = start.is_some_and(|v| v != i64::MIN);
+    // 5. The chosen source (`SkinImage.java:133-139`): past the end
+    // selects 0; a hole hides the object after all this.
+    let shown = if o.entries.is_empty() {
+        Some(true)
+    } else {
+        let i = usize::try_from(sel)
+            .ok()
+            .filter(|&i| i < o.entries.len())
+            .unwrap_or(0);
+        match o.entries.get(i) {
+            Some(Validity::Valid) => Some(true),
+            Some(Validity::Unknown | Validity::Movie) => None,
+            _ => Some(false),
+        }
+    };
+    out.timers.push(TimerOut {
+        key: *k,
+        on,
+        start,
+        shown,
+    });
+    Ok(match start {
+        Some(s) if on => Clock::Start(s),
+        Some(_) => Clock::Off,
+        None => Clock::Undecided,
+    })
 }

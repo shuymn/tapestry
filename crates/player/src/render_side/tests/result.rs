@@ -5,7 +5,7 @@
 //! disables the kind for the run, and a screen built again draws on from
 //! the revision presented.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,11 @@ pub(super) struct Faults {
     pub(super) charge_result: std::sync::atomic::AtomicU64,
     /// The next result frame submitted fails as a lost device.
     pub(super) lose: AtomicBool,
+    /// What becomes of each result frame, the skin's or a page, in order,
+    /// in place of what the screen gave (a window's outcomes offscreen).
+    pub(super) outcomes: Mutex<std::collections::VecDeque<render::FrameOutcome>>,
+    /// Run inside the next result frame's submit, the skin's or a page's.
+    pub(super) during_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The next result frame is refused by the skin.
     pub(super) refuse: AtomicBool,
     /// A screen built again refuses to restore the result's installation.
@@ -418,7 +423,13 @@ impl Screen for Recorded {
         if self.faults.lose.swap(false, Ordering::AcqRel) {
             return Err(render::RenderError::SurfaceLost);
         }
-        let t = self.menu.submit_result()?;
+        let mut t = self.menu.submit_result()?;
+        if let Some(f) = self.faults.during_submit.lock().unwrap().take() {
+            f();
+        }
+        if let Some(o) = self.faults.outcomes.lock().unwrap().pop_front() {
+            t.outcome = o;
+        }
         self.faults.submits.fetch_add(1, Ordering::AcqRel);
         let quads = self.menu.result_quads().unwrap_or_default();
         let strip = self.menu.result_strip();
@@ -440,7 +451,7 @@ impl Screen for Recorded {
         drawn.push(Drawn::Skin(quads, strip));
         Ok(t)
     }
-    fn end(&mut self, page: &EndPage) -> Result<bool, render::RenderError> {
+    fn end(&mut self, page: &EndPage) -> Result<render::FrameOutcome, render::RenderError> {
         if self.faults.lose_page.swap(false, Ordering::AcqRel) {
             return Err(render::RenderError::SurfaceLost);
         }
@@ -448,7 +459,13 @@ impl Screen for Recorded {
             !self.faults.panic_page.swap(false, Ordering::AcqRel),
             "the render thread panics (a test's fault)"
         );
-        let p = self.menu.end(page)?;
+        let mut p = self.menu.end(page)?;
+        if let Some(f) = self.faults.during_submit.lock().unwrap().take() {
+            f();
+        }
+        if let Some(o) = self.faults.outcomes.lock().unwrap().pop_front() {
+            p = o;
+        }
         self.drawn
             .lock()
             .unwrap()
@@ -1392,6 +1409,43 @@ fn a_refused_first_presentation_draws_its_own_page() {
     );
     assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
     assert_eq!(rig.link.result_status().shown, Some((1, false)));
+    rig.link.exit();
+}
+
+/// With the transition probe on, a result whose first view is the
+/// built-in page, its skin's text refused, has its first frames probed
+/// (`rf:*`) as a skin's first view has: the first view committed, with a
+/// staging or without.
+#[test]
+fn the_probe_marks_the_first_frames_of_a_built_in_first_view() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.faults.refuse_text.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| !rig.drawn().is_empty()));
+    assert!(matches!(rig.drawn().first(), Some(Drawn::Page(_))));
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    assert!(
+        wait_until(|| left().len() == 3),
+        "the first view's frames not probed: {:?}",
+        marks()
+    );
+    assert_eq!(left(), [2, 1, 0]);
     rig.link.exit();
 }
 
@@ -3570,4 +3624,331 @@ fn a_result_frames_time_and_readouts_are_one_reading() {
         let second = i32::try_from(app.uptime_us / 1_000_000 % 60).unwrap();
         assert_eq!(held, [i32::from(app.local.year), second], "{now:?}");
     }
+}
+
+/// Holds `rig`'s frames from now on, before any is drawn: the next frame
+/// waits for [`Gate::step`].
+fn paced(rig: &Rig) {
+    rig.gate.pace.store(true, Ordering::Release);
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): a
+/// Result entry is acknowledged at its first result picture, a frame whose
+/// commit point holds a view of the entry, the skin's or a built-in one
+/// (an attempt's fallback), once that frame ends shown or deliberately not
+/// shown (a window minimized or occluded); a frame that is to be tried
+/// again (a swap chain image timed out or outdated, the offscreen pacer's
+/// skip) or that was not built acknowledges nothing, and the next one
+/// does. The acknowledgement wakes the thread the entry named.
+#[test]
+fn a_result_entry_is_acknowledged_at_its_first_counted_picture() {
+    use render::FrameOutcome::{Invisible, NotBuilt, Retry, Shown};
+    let (_dir, skin) = fixed_skin();
+    for (skinned, first) in [
+        (true, Retry),
+        (true, NotBuilt),
+        (true, Invisible),
+        (true, Shown),
+        (false, Retry),
+        (false, Invisible),
+    ] {
+        let case = format!("skinned {skinned}, first {first:?}");
+        let rig = Rig::new();
+        let lifetime = installed(&rig, &skin);
+        let entry = rig.link.enter_result_entry(Some(std::thread::current()));
+        assert_eq!(rig.link.result_acknowledged(), 0, "{case}");
+        rig.faults.outcomes.lock().unwrap().push_back(first);
+        paced(&rig);
+        let view = payload(1, skinned.then_some(&skin), 1_111, &[]);
+        show(&rig.link, lifetime, 1, &view, &Overlay::default());
+        assert!(
+            wait_until(|| rig.gate.held.load(Ordering::Acquire)),
+            "{case}"
+        );
+        assert_eq!(rig.link.result_acknowledged(), 0, "{case}: before a frame");
+        rig.gate.step();
+        let drew = rig.drawn();
+        assert_eq!(drew.len(), 1, "{case}: {drew:?}");
+        assert_eq!(skin_frame(&drew[0]).is_some(), skinned, "{case}: {drew:?}");
+        let counted = matches!(first, Invisible | Shown);
+        assert_eq!(
+            rig.link.result_acknowledged(),
+            if counted { entry } else { 0 },
+            "{case}: the first frame"
+        );
+        rig.gate.step();
+        assert_eq!(
+            rig.link.result_acknowledged(),
+            entry,
+            "{case}: the next frame"
+        );
+        // The acknowledgement woke this thread: its token is waiting.
+        let began = Instant::now();
+        std::thread::park_timeout(Duration::from_secs(20));
+        assert!(began.elapsed() < Duration::from_secs(10), "{case}: woken");
+        rig.gate.release();
+        rig.link.exit();
+    }
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): the
+/// built-in result page acknowledges an entry without a result lifetime
+/// at its first frame; an entry whose lifetime began is acknowledged at
+/// its first committed view, not at a page drawn before it, and until then
+/// the acknowledgement stays the earlier entry's.
+#[test]
+fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let page = || EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    };
+    let first = rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    assert!(wait_until(|| rig.link.result_acknowledged() == first));
+    rig.link.clear_end();
+    let lifetime = installed(&rig, &skin);
+    let second = rig.link.enter_result_entry(None);
+    rig.clear();
+    rig.link.show_end(page());
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert!(rig.drawn().iter().all(|d| matches!(d, Drawn::Page(_))));
+    assert_eq!(
+        rig.link.result_acknowledged(),
+        first,
+        "a page of the lifetime"
+    );
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(wait_until(|| rig.link.result_acknowledged() == second));
+    rig.link.exit();
+}
+
+/// With the transition probe on, an entry whose built-in page shows with
+/// no result lifetime has its first three frames probed (`rf:*`), once:
+/// its later frames are not, nor a page shown again with no entry entered
+/// (the entry's first picture was shown), and the next such entry's
+/// first three are.
+#[test]
+fn the_probe_marks_the_first_frames_of_each_built_in_entry() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let rig = Rig::new();
+    let page = || EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    };
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(
+        wait_until(|| left().len() == 3),
+        "the entry's frames not probed: {:?}",
+        left()
+    );
+    rig.clear();
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "probed past its first frames");
+    rig.link.clear_end();
+    rig.clear();
+    rig.link.show_end(page());
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "a page of an entry already shown probed");
+    rig.link.clear_end();
+    rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(
+        wait_until(|| left().len() == 6),
+        "the next entry's frames not probed: {:?}",
+        left()
+    );
+    assert_eq!(left(), [2, 1, 0, 2, 1, 0]);
+    rig.link.exit();
+}
+
+/// With the transition probe on, a built-in entry's first frame tried again
+/// (not presented, so the entry not yet acknowledged) does not arm its
+/// probed frames (`rf:*`) again: its frames are probed three times, from
+/// the frame tried again on.
+#[test]
+fn the_probe_arms_a_built_in_entry_once_across_a_frame_tried_again() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let rig = Rig::new();
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    let entry = rig.link.enter_result_entry(None);
+    rig.faults
+        .outcomes
+        .lock()
+        .unwrap()
+        .push_back(render::FrameOutcome::Retry);
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    });
+    assert!(wait_until(|| rig.link.result_acknowledged() == entry));
+    assert!(wait_until(|| left().len() >= 3), "{:?}", left());
+    rig.clear();
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "armed again at the frame tried again");
+    rig.link.exit();
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): a
+/// frame acknowledges the entry it draws a picture of, not one entered
+/// while it draws, the skin's view and a built-in one alike, frames
+/// stepped one at a time. As a retry does, the first entry's lifetime ends
+/// before the next entry's view comes, so the first entry's view never
+/// acknowledges the next entry; the next entry's own view, a different
+/// one, does. The acknowledgement is written once per entry, a later
+/// counted frame of the same entry writing nothing.
+#[test]
+fn a_frame_acknowledges_the_entry_it_draws() {
+    let (_dir, skin) = fixed_skin();
+    for skinned in [true, false] {
+        let rig = Rig::new();
+        let shared = Arc::clone(&rig.link.shared);
+        let entered = Arc::new(AtomicU64::new(0));
+        let next = Arc::clone(&entered);
+        // Inside the first frame's draw: the first entry's lifetime ends
+        // (the slot empties, as the retry's leaving does) and the next
+        // entry enters.
+        *rig.faults.during_submit.lock().unwrap() = Some(Box::new(move || {
+            shared.result_slot().enter(0);
+            next.store(shared.result_entries.enter(None), Ordering::Release);
+        }));
+        let lifetime = installed(&rig, &skin);
+        let first = rig.link.enter_result_entry(None);
+        let entries = &rig.link.shared.result_entries;
+        // Frames go one at a time: each step draws one.
+        paced(&rig);
+        let skin_of = skinned.then_some(&skin);
+        let a = payload(1, skin_of, 1_111, &["first entry"]);
+        show(&rig.link, lifetime, 1, &a, &Overlay::default());
+        let case = format!("skinned {skinned}");
+        assert!(
+            wait_until(|| rig.gate.held.load(Ordering::Acquire)),
+            "{case}"
+        );
+        rig.gate.step();
+        assert_eq!(rig.drawn().len(), 1, "{case}: {:?}", rig.drawn());
+        let second = entered.load(Ordering::Acquire);
+        assert_eq!(second, first + 1, "{case}: entered while drawing");
+        assert_eq!(
+            rig.link.result_acknowledged(),
+            first,
+            "{case}: the entry drawn"
+        );
+        // The next entry's own lifetime and view: the frame held meanwhile
+        // draws it, not the first entry's ended one, and acknowledges the
+        // next entry.
+        let next_lifetime = rig.link.begin_result();
+        let b = payload(2, skin_of, 2_222, &["next entry"]);
+        show(&rig.link, next_lifetime, 1, &b, &Overlay::default());
+        rig.gate.step();
+        let drawn = rig.drawn();
+        assert_eq!(drawn.len(), 2, "{case}: {drawn:?}");
+        assert_ne!(drawn[0], drawn[1], "{case}: the next entry's own view");
+        assert_eq!(
+            rig.link.result_acknowledged(),
+            second,
+            "{case}: the next entry's view"
+        );
+        for _ in 0..3 {
+            rig.gate.step();
+        }
+        let drawn = rig.drawn();
+        assert_eq!(drawn.len(), 5, "{case}: {drawn:?}");
+        // No frame after the first draws the first entry's view, so none of
+        // it acknowledged the next entry.
+        assert!(
+            drawn[1..].iter().all(|d| *d == drawn[1]),
+            "{case}: only the next entry's view after the first frame: {drawn:?}"
+        );
+        assert_eq!(
+            entries.publications.load(Ordering::Relaxed),
+            2,
+            "{case}: one write per entry"
+        );
+        rig.gate.release();
+        rig.link.exit();
+    }
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): the
+/// render thread prints what the result shows once it has let the result's
+/// status go, so a game thread reading the status is not held behind a
+/// stalled print.
+#[test]
+fn the_result_shown_print_lets_the_status_go() {
+    use crate::render_side::{SHOWN_PRINT_HELD, SHOWN_PRINT_HOLD};
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    SHOWN_PRINT_HELD.store(false, Ordering::Release);
+    SHOWN_PRINT_HOLD.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    let held = wait_until(|| SHOWN_PRINT_HELD.load(Ordering::Acquire));
+    let free = rig.link.shared.result_status.try_lock().is_ok();
+    SHOWN_PRINT_HOLD.store(false, Ordering::Release);
+    assert!(held, "the print was reached");
+    assert!(free, "the status was let go before the print");
+    rig.link.exit();
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): the
+/// first result frame lost with its device acknowledges nothing; the first
+/// frame of the screen built again does.
+#[test]
+fn a_first_frame_lost_is_acknowledged_after_its_recovery() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let entry = rig.link.enter_result_entry(None);
+    rig.faults.lose.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.failed()));
+    assert_eq!(rig.link.result_acknowledged(), 0, "the lost frame");
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(wait_until(|| rig.link.result_acknowledged() == entry));
+    rig.link.exit();
 }

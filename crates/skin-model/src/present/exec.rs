@@ -132,10 +132,10 @@ impl Present {
                 super::trace::record(|| super::trace::Event::Ran {
                     k: id,
                     result: r,
-                    conv: if cb.conv == Conv::Truthy {
-                        super::trace::Converted::Bool(out.0 != 0)
-                    } else {
-                        super::trace::Converted::Int(out.0, out.1)
+                    conv: match cb.conv {
+                        Conv::Truthy => super::trace::Converted::Bool(out.0 != 0),
+                        Conv::Float => super::trace::Converted::Float(out.0.cast_unsigned(), out.1),
+                        Conv::Int | Conv::Timer => super::trace::Converted::Int(out.0, out.1),
                     },
                 });
                 out

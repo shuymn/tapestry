@@ -745,6 +745,13 @@ pub fn set_dev_window(size: (u32, u32)) {
     let _ = DEV_WINDOW.set(size);
 }
 
+/// Whether the window opens borderless fullscreen: every window but a
+/// `--dev-window` one (dev-tools), and nothing changes it once open.
+#[cfg(feature = "dev-tools")]
+pub fn opens_fullscreen() -> bool {
+    DEV_WINDOW.get().is_none()
+}
+
 /// The window's attributes, hidden until shown, and the fullscreen it
 /// takes once made: borderless fullscreen on `monitor`; with
 /// `--dev-window` (dev-tools), [`dev_window`]'s and none. The fullscreen

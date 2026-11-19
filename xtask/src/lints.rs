@@ -417,6 +417,9 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     Site::File("crates/player/src/audio_side.rs"),
+    // The transition probe's marks (dev-tools), taken in play.
+    Site::File("crates/player/src/dev/loop_probe.rs"),
+    Site::File("crates/render/src/probe.rs"),
     // The render thread's frame.
     // The selection's chart-image pool: a frame builds the cursor's table
     // from a slot's record, and the boundary's write runs beside the

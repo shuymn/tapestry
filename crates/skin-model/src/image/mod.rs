@@ -427,6 +427,26 @@ pub struct Sheet {
 
 #[cfg(feature = "dev-tools")]
 impl Sheet {
+    /// Every cell as the atlas's uv lookup matches it under `v`: the
+    /// version's file name (or the colour) and the rectangle in that
+    /// version's pixels (the transition probe's `dev: probe-miss`).
+    #[must_use]
+    pub fn survey_cells(&self, v: crate::atlas::Variant) -> Vec<(String, [u32; 4])> {
+        self.cells
+            .iter()
+            .filter_map(|c| match c.source {
+                CellSource::File(f) => {
+                    let (ver, hi) = self.files.get(usize::try_from(f).ok()?)?.version(v);
+                    Some((
+                        ver.name.clone(),
+                        if hi { c.rect.map(|x| x * 2) } else { c.rect },
+                    ))
+                }
+                CellSource::Solid(rgba, g) => Some((format!("#{rgba:?}{g:?}"), c.rect)),
+            })
+            .collect()
+    }
+
     /// What frame `frame`, an index in the uv table, shows.
     pub(crate) fn frame_source(&self, frame: u32) -> Option<crate::observation::Cell> {
         use crate::observation::Cell as Shown;

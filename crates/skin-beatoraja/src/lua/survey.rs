@@ -19,7 +19,8 @@ use super::convert::{callables, field};
 use super::facts::{FactRead, ImportFacts};
 use super::ledger::Stop;
 use super::{
-    Cancel, Disposition, HOST_APIS, LAST_FACTS, LuaUsage, LuaWhy, Unsupported, header_pass,
+    Cancel, Disposition, HOST_APIS, LAST_FACTS, LuaLimit, LuaUsage, LuaWhy, Unsupported,
+    header_pass,
 };
 use crate::error::{ImportError, Loc};
 use crate::import::ledger;
@@ -108,6 +109,10 @@ pub struct Survey {
     /// An imported skin's gauge widgets: each one's segments and motion,
     /// written out (dev-tools; empty without).
     pub gauges: Vec<(u16, String)>,
+    /// Whether the import was refused by a wall-clock limit (the Lua or
+    /// the analysis time limit), in the header pass or the configured
+    /// pass: an outcome the host's load can decide.
+    pub timed_out: bool,
 }
 
 /// One runtime frame of a surveyed skin (docs/stage3.md S7-07): a first
@@ -670,19 +675,134 @@ pub fn survey_with(
     local: bool,
     choice: &Choice,
 ) -> Survey {
-    let header = header_pass(root, entry, cancel);
-    let h = match header.result {
-        Ok(h) => h,
-        Err(e) => {
-            return Survey {
-                outcome: format!("header {}", label(&e)),
-                at: locate(at_of(&e), &header.dependencies),
-                modules: header.dependencies.len(),
-                usage: header.counts,
-                ..Survey::default()
-            };
+    survey_probe(
+        &mut lua_probe(root, entry, cancel),
+        facts,
+        cancel,
+        local,
+        choice,
+    )
+}
+
+/// One read of a skin's header ([`probe`]), kept so that a survey of it
+/// ([`survey_probe`]) resolves its configuration against this very
+/// header rather than reading it again.
+pub struct Probe {
+    inner: ProbeInner,
+}
+
+enum ProbeInner {
+    Lua {
+        result: Result<super::LuaHeader, ImportError>,
+        dependencies: Vec<String>,
+        usage: LuaUsage,
+    },
+    Json(Result<(crate::Definition, crate::Header), ImportError>),
+}
+
+/// Reads the header of `entry` in skin folder `root`: a JSON skin's (an
+/// entry ending in `.json`) as the JSON import reads it, every other
+/// entry's by the Lua header pass.
+#[must_use]
+pub fn probe(root: &Path, entry: &str, cancel: &Cancel) -> Probe {
+    if entry.ends_with(".json") {
+        Probe {
+            inner: ProbeInner::Json(crate::read_header(root, entry)),
         }
-    };
+    } else {
+        lua_probe(root, entry, cancel)
+    }
+}
+
+fn lua_probe(root: &Path, entry: &str, cancel: &Cancel) -> Probe {
+    let pass = header_pass(root, entry, cancel);
+    Probe {
+        inner: ProbeInner::Lua {
+            result: pass.result,
+            dependencies: pass.dependencies,
+            usage: pass.counts,
+        },
+    }
+}
+
+impl Probe {
+    /// The header read, `None` when it was refused.
+    #[must_use]
+    pub fn header(&self) -> Option<&crate::Header> {
+        match &self.inner {
+            ProbeInner::Lua { result, .. } => result.as_ref().ok().map(super::LuaHeader::header),
+            ProbeInner::Json(read) => read.as_ref().ok().map(|(_, h)| h),
+        }
+    }
+
+    /// The survey of a refused header: its label, and for a Lua skin its
+    /// location, modules and usage; `None` when the header was read.
+    #[must_use]
+    pub fn refused(&self) -> Option<Survey> {
+        match &self.inner {
+            ProbeInner::Lua {
+                result: Err(e),
+                dependencies,
+                usage,
+            } => Some(Survey {
+                outcome: format!("header {}", label(e)),
+                at: locate(at_of(e), dependencies),
+                modules: dependencies.len(),
+                usage: *usage,
+                timed_out: timed_out(e),
+                ..Survey::default()
+            }),
+            ProbeInner::Json(Err(e)) => Some(Survey {
+                outcome: format!("header {}", label(e)),
+                timed_out: timed_out(e),
+                ..Survey::default()
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `e` is a refusal by a wall-clock limit: the Lua time limit or
+/// the analysis time limit.
+fn timed_out(e: &ImportError) -> bool {
+    matches!(
+        e,
+        ImportError::Lua {
+            why: LuaWhy::Limit(LuaLimit::Time | LuaLimit::AnalysisTime),
+            ..
+        }
+    )
+}
+
+/// The survey of `probe`'s header with the configuration `choice` names:
+/// [`survey_with`] for a Lua skin, [`survey_json`] for a JSON skin (which
+/// reads neither `facts`, `cancel` nor `local`), each resolving against
+/// the header `probe` read.
+#[must_use]
+pub fn survey_probe(
+    probe: &mut Probe,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+    local: bool,
+    choice: &Choice,
+) -> Survey {
+    if let Some(refused) = probe.refused() {
+        return refused;
+    }
+    match &mut probe.inner {
+        ProbeInner::Lua { result: Ok(h), .. } => survey_lua(h, facts, cancel, local, choice),
+        ProbeInner::Json(Ok((def, header))) => survey_json_header(def, header, choice),
+        _ => Survey::default(),
+    }
+}
+
+fn survey_lua(
+    h: &super::LuaHeader,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+    local: bool,
+    choice: &Choice,
+) -> Survey {
     let config = match Config::named(
         h.header(),
         choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
@@ -787,6 +907,7 @@ pub fn survey_with(
         Err(Stop::Fault(e)) => {
             s.outcome = label(&e);
             s.at = locate(at_of(&e), &o.dependencies);
+            s.timed_out = timed_out(&e);
         }
     }
     s
@@ -951,22 +1072,30 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
 /// outcome, the kind, the notes by kind and the frames are filled.
 #[must_use]
 pub fn survey_json(root: &Path, entry: &str, choice: &Choice) -> Survey {
-    let (mut def, header) = match crate::read_header(root, entry) {
-        Ok(read) => read,
-        Err(e) => {
-            return Survey {
-                outcome: format!("header {}", label(&e)),
-                ..Survey::default()
-            };
-        }
+    let mut probe = Probe {
+        inner: ProbeInner::Json(crate::read_header(root, entry)),
     };
+    survey_probe(
+        &mut probe,
+        &ImportFacts::unavailable(ScreenKind::Play),
+        &Cancel::new(),
+        false,
+        choice,
+    )
+}
+
+fn survey_json_header(
+    def: &mut crate::Definition,
+    header: &crate::Header,
+    choice: &Choice,
+) -> Survey {
     let kind = header.kind;
     let mut s = Survey {
         kind: Some(kind),
         ..Survey::default()
     };
     let config = match Config::named(
-        &header,
+        header,
         choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
         choice.files.iter().map(|(f, c)| (f.as_str(), c.as_str())),
     ) {
@@ -979,7 +1108,7 @@ pub fn survey_json(root: &Path, entry: &str, choice: &Choice) -> Survey {
             return s;
         }
     };
-    match crate::import(&mut def, &header, &config, kind) {
+    match crate::import(def, header, &config, kind) {
         Ok(imported) => {
             imported_into(&mut s, &imported, kind, choice);
         }
@@ -1781,5 +1910,74 @@ return { type = 0 }",
         assert_eq!(s.kind, Some(ScreenKind::Play));
         let (module, line, _) = s.at.unwrap();
         assert_eq!((module, line), (0, 0));
+    }
+
+    /// A play skin that loops before its header returns, so that the
+    /// header pass meets its time checks, with option `fc` whose item
+    /// `on` enables `op`.
+    fn timed_header(op: i32) -> String {
+        format!(
+            "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080,\n\
+               property = {{ {{ name = \"fc\", item = {{ {{ name = \"off\", op = 905 }}, {{ name = \"on\", op = {op} }} }} }} }} }}\n\
+             for i = 1, 20000 do end\n\
+             if not skin_config then return skin end\n\
+             skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+             skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 }} }}\n\
+             skin.destination = {{ {{ id = \"i\", draw = function() return true end, dst = {{ {{ w = 64, h = 64 }} }} }} }}\n\
+             return skin\n"
+        )
+    }
+
+    /// `timed_out` is set when a wall-clock limit refused the import: the
+    /// Lua time limit in the header pass (the crate's test time limit at
+    /// zero), the analysis time limit in the configured pass (the test
+    /// clock advanced past it inside the effect walk); another refusal
+    /// leaves it unset, and so does an import.
+    #[test]
+    fn a_time_limit_refusal_sets_timed_out() {
+        use crate::lua::clock::{Phase, fake};
+        let d = crate::lua::callback_tests::folder(&timed_header(906));
+        let facts = ImportFacts::unavailable(ScreenKind::Play);
+        let plain = survey(d.path(), "s.luaskin", &facts, &Cancel::new(), false);
+        assert_eq!(plain.outcome, "imported");
+        assert!(!plain.timed_out);
+        crate::lua::tests::TIME_LIMIT.with(|t| t.set(Some(std::time::Duration::ZERO)));
+        let p = super::probe(d.path(), "s.luaskin", &Cancel::new());
+        crate::lua::tests::TIME_LIMIT.with(|t| t.set(None));
+        let refused = p.refused().unwrap();
+        assert_eq!(refused.outcome, "header lua Limit(Time)");
+        assert!(refused.timed_out);
+        fake::at_phase(Phase::Walk, true, || {
+            fake::advance(std::time::Duration::from_secs(6));
+        });
+        let s = survey(d.path(), "s.luaskin", &facts, &Cancel::new(), false);
+        assert_eq!(s.outcome, "lua Limit(AnalysisTime)");
+        assert!(s.timed_out);
+        let bad = folder(&[("s.luaskin", "this is not lua (")]);
+        let s = survey(bad.path(), "s.luaskin", &facts, &Cancel::new(), false);
+        assert_ne!(s.outcome, "imported");
+        assert!(!s.timed_out, "{}", s.outcome);
+    }
+
+    /// A survey of a probe resolves its configuration against the header
+    /// that probe read, even when the files change after it: item `on`
+    /// keeps the `op` the probe read, where a new probe reads the new one.
+    #[test]
+    fn the_survey_resolves_against_the_probed_header() {
+        let d = crate::lua::callback_tests::folder(&timed_header(906));
+        let mut p = super::probe(d.path(), "s.luaskin", &Cancel::new());
+        std::fs::write(d.path().join("s.luaskin"), timed_header(907)).unwrap();
+        let choice = Choice {
+            options: vec![("fc".to_owned(), "on".to_owned())],
+            ..Choice::default()
+        };
+        let facts = ImportFacts::unavailable(ScreenKind::Play);
+        let op = |p: &mut super::Probe| {
+            let s = super::survey_probe(p, &facts, &Cancel::new(), true, &choice);
+            s.resolved.unwrap().options[0].2
+        };
+        assert_eq!(op(&mut p), Some(906));
+        let mut fresh = super::probe(d.path(), "s.luaskin", &Cancel::new());
+        assert_eq!(op(&mut fresh), Some(907));
     }
 }
