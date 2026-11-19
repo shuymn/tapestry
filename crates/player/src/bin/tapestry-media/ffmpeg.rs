@@ -637,30 +637,24 @@ pub struct Probe {
     pub container: String,
 }
 
-/// A dictionary of FFmpeg options, freed when dropped.
-struct Options(*mut ff::AVDictionary);
-
-impl Options {
-    /// The options `pairs` name, or `None` when FFmpeg could not set one.
-    fn new(pairs: &[(&CStr, &CStr)]) -> Option<Self> {
-        let mut options = Self(ptr::null_mut());
-        for (key, value) in pairs {
-            // SAFETY: NUL-terminated strings, which FFmpeg copies into the
-            // dictionary.
-            let r = unsafe { ff::av_dict_set(&raw mut options.0, key.as_ptr(), value.as_ptr(), 0) };
-            if r < 0 {
-                return None;
-            }
+/// Sets the string options `pairs` on an FFmpeg context before it opens,
+/// each checked: FFmpeg's error for the first it could not set, a copy of
+/// its value refused among them. An open given a dictionary instead goes
+/// on without what it could not copy of it.
+///
+/// # Safety
+///
+/// `context` is an allocated `AVFormatContext` or `AVCodecContext`.
+unsafe fn set_options(context: *mut c_void, pairs: &[(&CStr, &CStr)]) -> Result<(), c_int> {
+    for (key, value) in pairs {
+        // SAFETY: the caller's context, whose class has these options, and
+        // NUL-terminated strings, which FFmpeg copies.
+        let r = unsafe { ff::av_opt_set(context, key.as_ptr(), value.as_ptr(), 0) };
+        if r < 0 {
+            return Err(r);
         }
-        Some(options)
     }
-}
-
-impl Drop for Options {
-    fn drop(&mut self) {
-        // SAFETY: this dictionary, or what FFmpeg left of it; null is none.
-        unsafe { ff::av_dict_free(&raw mut self.0) };
-    }
+    Ok(())
 }
 
 /// Says that an allocation of `size` bytes was refused.
@@ -818,12 +812,12 @@ impl Input {
                 codec_list(),
             ]
             .concat();
-            let mut options = Options::new(&lists).ok_or(no_memory)?;
+            set_options(self.fc.cast(), &lists).map_err(|r| (Refusal::Decoder, r))?;
             let r = ff::avformat_open_input(
                 &raw mut self.fc,
                 c"".as_ptr(),
                 ptr::null(),
-                &raw mut options.0,
+                ptr::null_mut(),
             );
             if r < 0 {
                 let why = if r == averror(ff::EIO) {
@@ -878,8 +872,8 @@ impl Input {
             (*self.dec).thread_count = THREADS;
             (*self.dec).pkt_timebase = (*st).time_base;
             hooks::cap(self.dec);
-            let mut options = Options::new(codec_list()).ok_or(no_memory)?;
-            let r = ff::avcodec_open2(self.dec, decoder, &raw mut options.0);
+            set_options(self.dec.cast(), codec_list()).map_err(|r| (Refusal::Decoder, r))?;
+            let r = ff::avcodec_open2(self.dec, decoder, ptr::null_mut());
             if r < 0 {
                 return Err((Refusal::Decoder, r));
             }
