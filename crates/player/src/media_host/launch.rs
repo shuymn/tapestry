@@ -4,11 +4,13 @@
 //! 1. a job: its committed memory capped, the worker ended when the job
 //!    closes and on an unhandled exception, one process, its UI
 //!    restricted;
-//! 2. the worker's AppContainer profile, with no capability, one for each
-//!    installation directory, named for the directory opened, not its path
-//!    ([`Installation`]), and an ACE granting it read and execute on that
-//!    same directory, inherited by the files directly in it (the executable
-//!    and its DLLs);
+//! 2. the worker's AppContainer profile, with no capability, the user's
+//!    one `tapestry.media` ([`PROFILE`]), and the worker's copies
+//!    ([`stage`](super::stage)): its executable and the build's DLLs,
+//!    copied byte for byte into a directory of that build's own under the
+//!    game's data folder, granted to the AppContainer, checked against the
+//!    installation's files and held until the worker has loaded them;
+//!    nothing is granted on the installation directory;
 //! 3. a desktop of its own, granted to the AppContainer, in the session's
 //!    alternate window station (`CreateWindowStationW` with no name),
 //!    which other launches share and the launch leaves as it is;
@@ -18,8 +20,8 @@
 //!    only from local files without a low label and from System32 first,
 //!    no extension points) and the AppContainer;
 //! 5. the process created suspended, detached and below normal priority,
-//!    with an environment the launch builds ([`environment`]), then put in
-//!    the job;
+//!    from the copies, with an environment the launch builds
+//!    ([`environment`]), then put in the job;
 //! 6. the check before it runs: it is still suspended and in the job, the
 //!    job's limits and UI restrictions read back exactly as set, the
 //!    queried mitigation policies hold, its token is the AppContainer's
@@ -29,58 +31,54 @@
 //!
 //! A step that fails, or a check that finds anything else, terminates the
 //! process, if one was made, and fails the launch: never a weaker sandbox.
+//! The launch watches the process end for 5 s: one that has not ended by
+//! then, or whose end cannot be asked, stays with the error
+//! ([`LaunchError::unended`]), as does one Windows refused to terminate.
 //! The desktop is made as browsers' sandboxes make an alternate desktop for
 //! their sandboxed processes: the process's window station is switched to
 //! the alternate one while the desktop is created in it, under a lock, and
 //! switched back.
 //!
 //! A test's setup ([`Setup`], only under `cfg(test)`) removes restrictions,
-//! changes what the check expects, makes a step fail, or passes the worker
-//! arguments; a build of the game holds the recipe alone. A setup without
-//! the win32k lockdown, whose worker connects to the window station when it
-//! loads USER32, grants the AppContainer the station too, until the worker
-//! drops.
+//! changes what the check expects, makes a step fail, passes the worker
+//! arguments, names its AppContainer profile, or watches a terminated
+//! process for another time; a build of the game holds the recipe alone. A
+//! setup without the win32k lockdown, whose worker connects to the window
+//! station when it loads USER32, grants the AppContainer the station too,
+//! until the worker drops.
 
 use std::ffi::c_void;
-use std::fmt::Write as _;
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::fs::OpenOptionsExt as _;
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use sha2::{Digest as _, Sha256};
 use skin_model::media::control::{self, Reply};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_TIMEOUT, GENERIC_ALL, GetLastError, HANDLE,
     HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation, WAIT_ABANDONED,
-    WAIT_OBJECT_0,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SE_FILE_OBJECT,
-    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SDDL_REVISION_1, SE_OBJECT_TYPE,
+    SE_WINDOW_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-    DACL_SECURITY_INFORMATION, EqualSid, FreeSid, GetAce, GetAclInformation, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, NO_INHERITANCE, NO_PROPAGATE_INHERIT_ACE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel,
-    TokenIsAppContainer, TokenUser,
+    ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid,
+    TokenCapabilities, TokenIntegrityLevel, TokenIsAppContainer, TokenUser,
 };
-use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
-    GetFileInformationByHandleEx, READ_CONTROL, WRITE_DAC,
-};
+use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT,
@@ -135,6 +133,14 @@ const HANDSHAKE: Duration = Duration::from_secs(2);
 
 /// The exit code a failed launch terminates the worker with.
 pub const REFUSED: u32 = 0xc0de_0001;
+
+/// The worker's AppContainer profile, the user's one for every launch: what
+/// it is granted (the copies, its desktop) holds nothing of an
+/// installation.
+pub const PROFILE: &str = "tapestry.media";
+
+/// How long a launch watches a process it terminated end.
+const OBSERVE: Duration = Duration::from_secs(5);
 
 /// The most log lines the game takes from one worker; past it the worker's
 /// log is dropped, with one line saying so.
@@ -208,7 +214,7 @@ impl Restrictions {
 pub enum Step {
     Job,
     Profile,
-    Grant,
+    Stage,
     Desktop,
     Pipes,
     Attributes,
@@ -225,7 +231,7 @@ impl Step {
     pub const ALL: [Self; 11] = [
         Self::Job,
         Self::Profile,
-        Self::Grant,
+        Self::Stage,
         Self::Desktop,
         Self::Pipes,
         Self::Attributes,
@@ -248,6 +254,9 @@ pub struct LaunchError {
     pub what: String,
     /// What became of the process, when the launch made one.
     pub process: Made,
+    /// The process, when the launch made one and did not see it end: to
+    /// wait on, or terminate again. Dropping it closes the handle alone.
+    pub unended: Option<OwnedHandle>,
 }
 
 /// What became of the process a failed launch made.
@@ -259,8 +268,12 @@ pub enum Made {
     /// gave it.
     Ended(Option<u32>),
     /// The launch terminated it, and it had not ended when the launch
-    /// stopped waiting, 5 s on.
-    Running,
+    /// stopped watching (5 s on, as the game launches it).
+    Pending,
+    /// Windows refused to terminate it (the error), and it had not ended.
+    NotTerminated(u32),
+    /// Windows did not say whether it ended (the error of the wait).
+    Unknown(u32),
 }
 
 impl std::fmt::Display for LaunchError {
@@ -274,7 +287,17 @@ impl std::fmt::Display for LaunchError {
             Made::Nothing => Ok(()),
             Made::Ended(Some(exit)) => write!(f, "; it was ended (exit code {exit:#x})"),
             Made::Ended(None) => write!(f, "; it was ended"),
-            Made::Running => write!(f, "; it had not ended 5 s after it was terminated"),
+            Made::Pending => write!(
+                f,
+                "; it was terminated and had not ended when the launch stopped watching"
+            ),
+            Made::NotTerminated(code) => {
+                write!(
+                    f,
+                    "; terminating it failed (error {code}), and it had not ended"
+                )
+            }
+            Made::Unknown(code) => write!(f, "; whether it ended is unknown (error {code})"),
         }
     }
 }
@@ -282,7 +305,7 @@ impl std::fmt::Display for LaunchError {
 impl std::error::Error for LaunchError {}
 
 /// A step's failure: the system's error and what failed.
-type Failure = (u32, String);
+pub(super) type Failure = (u32, String);
 
 /// What a launch applies and checks: the recipe, or a test's variation.
 #[derive(Clone, Debug)]
@@ -295,6 +318,10 @@ pub struct Setup {
     args: Vec<String>,
     #[cfg(test)]
     handshake: Duration,
+    #[cfg(test)]
+    profile: Option<String>,
+    #[cfg(test)]
+    observe: Duration,
 }
 
 impl Setup {
@@ -309,6 +336,10 @@ impl Setup {
             args: Vec::new(),
             #[cfg(test)]
             handshake: HANDSHAKE,
+            #[cfg(test)]
+            profile: None,
+            #[cfg(test)]
+            observe: OBSERVE,
         }
     }
 
@@ -356,6 +387,36 @@ impl Setup {
     const fn handshake(&self) -> Duration {
         HANDSHAKE
     }
+
+    /// The worker's AppContainer profile.
+    #[cfg(test)]
+    fn profile(&self) -> &str {
+        self.profile.as_deref().unwrap_or(PROFILE)
+    }
+
+    #[cfg(not(test))]
+    #[expect(
+        clippy::unused_self,
+        reason = "a test's setup names its own profile; the recipe's is `PROFILE`"
+    )]
+    const fn profile(&self) -> &str {
+        PROFILE
+    }
+
+    /// How long a terminated process is watched end.
+    #[cfg(test)]
+    const fn observe(&self) -> Duration {
+        self.observe
+    }
+
+    #[cfg(not(test))]
+    #[expect(
+        clippy::unused_self,
+        reason = "a test's setup may watch for another time; the recipe watches `OBSERVE`"
+    )]
+    const fn observe(&self) -> Duration {
+        OBSERVE
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +457,19 @@ impl Setup {
         self.handshake = limit;
         self
     }
+
+    /// In the AppContainer profile `name`, a test's own, which the test
+    /// deletes.
+    pub fn in_profile(mut self, name: &str) -> Self {
+        self.profile = Some(name.to_owned());
+        self
+    }
+
+    /// Watching a terminated process end for `limit`.
+    pub const fn observing(mut self, limit: Duration) -> Self {
+        self.observe = limit;
+        self
+    }
 }
 
 /// The calling thread's last error.
@@ -405,7 +479,7 @@ fn last_error() -> u32 {
 }
 
 /// The system's error a failed call returned.
-fn code_of(e: &windows::core::Error) -> u32 {
+pub(super) fn code_of(e: &windows::core::Error) -> u32 {
     let code = e.code().0.cast_unsigned();
     // A Win32 error wrapped as an HRESULT.
     if code & 0xffff_0000 == 0x8007_0000 {
@@ -416,12 +490,12 @@ fn code_of(e: &windows::core::Error) -> u32 {
 }
 
 /// `what` failed with `e`.
-fn failed(what: &str) -> impl FnOnce(windows::core::Error) -> Failure + '_ {
+pub(super) fn failed(what: &str) -> impl FnOnce(windows::core::Error) -> Failure + '_ {
     move |e| (code_of(&e), what.to_owned())
 }
 
 /// `path`, nul-terminated.
-fn wide(path: &Path) -> Vec<u16> {
+pub(super) fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
@@ -444,34 +518,41 @@ fn early((step, (code, what)): (Step, Failure)) -> LaunchError {
         code,
         what,
         process: Made::Nothing,
+        unended: None,
     }
 }
 
-/// Launches the worker in `dir` under `setup`.
-pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
+/// Launches the worker installed in `installation` under `setup`, from
+/// copies of its files staged in the game's data folder `data`.
+pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     let applied = setup.applied;
     let job = if applied.has(Restrictions::JOB) {
         Some(run(setup, Step::Job, || job(applied)).map_err(early)?)
     } else {
         None
     };
-    // The installation stays open, so where it is, until the launch ends.
     let profiled = if applied.has(Restrictions::APP_CONTAINER) {
-        Some(
-            run(setup, Step::Profile, || {
-                let installation = Installation::open(dir)?;
-                let sid = profile(&installation.profile_name()?)?;
-                Ok((installation, sid))
-            })
-            .map_err(early)?,
-        )
+        Some(run(setup, Step::Profile, || profile(setup.profile())).map_err(early)?)
     } else {
         None
     };
-    if let Some((installation, sid)) = &profiled {
-        run(setup, Step::Grant, || installation.grant(sid)).map_err(early)?;
-    }
-    let sid = profiled.as_ref().map(|(_, sid)| sid);
+    let sid = profiled.as_ref();
+    // The copies are granted to the profile's AppContainer whether or not
+    // this launch runs in it: a test's setup without one stages the same.
+    let staged = run(setup, Step::Stage, || {
+        let derived;
+        let container = match sid {
+            Some(sid) => sid,
+            None => {
+                derived = derive(setup.profile())?;
+                &derived
+            }
+        };
+        let _one_at_a_time = Launches::hold()?;
+        super::stage::stage(installation, data, container.0)
+    })
+    .map_err(early)?;
+    let dir = staged.dir();
     let desktop = if applied.has(Restrictions::OWN_DESKTOP) {
         Some(
             run(setup, Step::Desktop, || {
@@ -513,7 +594,7 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     })();
     let table = match checked {
         Ok(table) => table,
-        Err(e) => return Err(child.refuse(e)),
+        Err(e) => return Err(child.refuse(e, setup.observe())),
     };
     #[cfg(test)]
     let log = std::sync::Arc::new(Mutex::new(String::new()));
@@ -537,12 +618,17 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     };
     if let Err(e) = reading {
         let code = e.raw_os_error().map_or(0, i32::cast_unsigned);
-        return Err(child.refuse((Step::Handshake, (code, "its replies' thread".to_owned()))));
+        return Err(child.refuse(
+            (Step::Handshake, (code, "its replies' thread".to_owned())),
+            setup.observe(),
+        ));
     }
     let hello = match run(setup, Step::Handshake, || handshake(&rx, setup.handshake())) {
         Ok(hello) => hello,
-        Err(e) => return Err(child.refuse(e)),
+        Err(e) => return Err(child.refuse(e, setup.observe())),
     };
+    // The worker has loaded its copies, which its images now hold.
+    drop(staged);
     let (process, pid) = child.release();
     // SAFETY: the game's end of the pipe to the worker, owned by the file
     // from here.
@@ -654,215 +740,44 @@ impl Drop for Sid {
 /// How many times the profile is asked for while another process makes it.
 const PROFILE_ATTEMPTS: u32 = 20;
 
-/// The installation directory, open: the worker's AppContainer profile is
-/// named for the directory this handle opened, and the grant goes to that
-/// directory alone. The directory cannot be renamed or deleted while it is
-/// open.
-pub struct Installation {
-    /// The directory, open to read its DACL and its ID.
-    dir: std::fs::File,
-    /// The path it was opened by.
-    path: std::path::PathBuf,
-}
+/// How long a launch waits for another making a profile or staging copies.
+const LAUNCHES_WAIT_MS: u32 = 30_000;
 
-impl Installation {
-    /// Opens the directory `dir`.
-    ///
-    /// # Errors
-    ///
-    /// When the directory cannot be opened.
-    pub fn open(dir: &Path) -> Result<Self, Failure> {
-        Ok(Self {
-            dir: open_directory(dir, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)?,
-            path: dir.to_path_buf(),
-        })
-    }
+/// Every access to a mutex (`MUTANT_ALL_ACCESS`, winnt.h).
+const MUTEX_ALL_ACCESS: u32 = 0x001f_0001;
 
-    /// The directory's handle.
-    fn handle(&self) -> HANDLE {
-        HANDLE(self.dir.as_raw_handle())
-    }
-
-    /// The name of the worker's AppContainer profile for this installation:
-    /// `tapestry.media.` and the first 16 bytes of the SHA-256 of the
-    /// directory's volume serial number and 128-bit file ID, in hex. A
-    /// directory keeps its ID when it is renamed and shares it with no other
-    /// on its volume, so each installation's worker runs as an AppContainer
-    /// of its own: another directory put where one was, or one whose path
-    /// differs from another's in case alone, gets a profile of its own, and
-    /// the grant one installation's directory gets reaches no other
-    /// installation's worker. Windows keeps a profile until it is deleted:
-    /// an installation removed leaves its profile, which grants nothing
-    /// outside that installation's own directory, and the game deletes
-    /// none, since it cannot tell whether that installation still runs.
-    ///
-    /// # Errors
-    ///
-    /// When the system does not give the directory's ID.
-    pub fn profile_name(&self) -> Result<String, Failure> {
-        let (volume, file) = id(self.handle())?;
-        let mut digest = Sha256::new();
-        digest.update(volume.to_le_bytes());
-        digest.update(file);
-        let hash = digest.finalize();
-        let mut name = "tapestry.media.".to_owned();
-        for byte in hash.iter().take(16) {
-            let _ = write!(name, "{byte:02x}");
-        }
-        Ok(name)
-    }
-
-    /// Step 2: grants the AppContainer read and execute on the directory
-    /// and the files directly in it, unless an equal ACE is there already.
-    /// Windows opens no directory again from a handle (`ReOpenFile` refuses
-    /// one), so the directory is opened again by its path, with the right to
-    /// change its DACL, and granted only when that is the directory this
-    /// value holds: the same volume and file ID. While this value holds it,
-    /// its path names no other.
-    fn grant(&self, sid: &Sid) -> Result<(), Failure> {
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the directory's handle, opened to read its DACL; the
-        // descriptor returned holds the DACL and is freed by `Local`.
-        let read = unsafe {
-            GetSecurityInfo(
-                self.handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(&raw mut dacl),
-                None,
-                Some(&raw mut descriptor),
-            )
-        };
-        let _descriptor = Local(descriptor.0);
-        if read.is_err() {
-            return Err((read.0, "the directory's DACL".to_owned()));
-        }
-        if granted(dacl, sid) {
-            return Ok(());
-        }
-        let entry = explicit(sid.0, DIRECTORY_ACCESS, DIRECTORY_INHERITANCE);
-        let mut new: *mut ACL = std::ptr::null_mut();
-        // SAFETY: one entry naming the SID, merged into the directory's
-        // DACL; the ACL returned is freed by `Local`.
-        let merged = unsafe { SetEntriesInAclW(Some(&[entry]), Some(dacl), &raw mut new) };
-        let _new = Local(new.cast());
-        if merged.is_err() {
-            return Err((merged.0, "the directory's new DACL".to_owned()));
-        }
-        let opened = open_directory(&self.path, (READ_CONTROL | WRITE_DAC).0)?;
-        let writable = HANDLE(opened.as_raw_handle());
-        if id(writable)? != id(self.handle())? {
-            return Err((
-                0,
-                "the directory, to grant it: its path names another".to_owned(),
-            ));
-        }
-        // SAFETY: the directory opened again, with the right to change its
-        // DACL; the DACL is applied to it and inherited by the files in it.
-        let set = unsafe {
-            SetSecurityInfo(
-                writable,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(new),
-                None,
-            )
-        };
-        if set.is_err() {
-            return Err((set.0, "granting the directory".to_owned()));
-        }
-        Ok(())
-    }
-}
-
-/// Opens the directory `dir` with `access`, sharing read and write, not
-/// delete.
-fn open_directory(dir: &Path, access: u32) -> Result<std::fs::File, Failure> {
-    std::fs::OpenOptions::new()
-        .access_mode(access)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
-        .open(dir)
-        .map_err(|e| {
-            let code = e.raw_os_error().and_then(|c| u32::try_from(c).ok());
-            (code.unwrap_or(0), "the installation directory".to_owned())
-        })
-}
-
-/// The volume serial number and 128-bit file ID of the file or directory
-/// `handle` opened.
-fn id(handle: HANDLE) -> Result<(u64, [u8; 16]), Failure> {
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: an open handle, and a struct of the size given.
-    unsafe {
-        GetFileInformationByHandleEx(
-            handle,
-            FileIdInfo,
-            (&raw mut info).cast(),
-            u32::try_from(size_of_val(&info)).unwrap_or(0),
-        )
-    }
-    .map_err(failed("the installation directory's ID"))?;
-    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
-}
-
-/// The name of the worker's AppContainer profile for the installation in
-/// `dir` ([`Installation::profile_name`]).
-///
-/// # Errors
-///
-/// When the directory cannot be opened or gives no ID.
-pub fn profile_name(dir: &Path) -> Result<String, Failure> {
-    Installation::open(dir)?.profile_name()
-}
-
-/// How long a launch waits for another making a profile.
-const PROFILES_WAIT_MS: u32 = 30_000;
-
-/// Step 2: the SID of the AppContainer profile `name`. The first launch
-/// from an installation makes its profile, which Windows keeps; a later one
-/// finds its folder and leaves it alone. Asking `CreateAppContainerProfile`
-/// for a profile that exists is not harmless: the call, made while another
-/// launch creates its process in the AppContainer, can fail that creation
-/// with `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four threads at
-/// once). So the user's launches, in every process of the session, make a
-/// profile one at a time, each looking for it again once it holds the
-/// mutex ([`profiles_mutex`]).
-fn profile(name: &str) -> Result<Sid, Failure> {
+/// The SID of the AppContainer `name`, which needs no profile.
+fn derive(name: &str) -> Result<Sid, Failure> {
     let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // SAFETY: a nul-terminated name; the SID returned is freed by `Sid`.
-    let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) }
+    unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) }
         .map(Sid)
-        .map_err(failed("the profile's SID"))?;
+        .map_err(failed("the profile's SID"))
+}
+
+/// Step 2: the SID of the AppContainer profile `name`. The first launch
+/// makes the profile, which Windows keeps; a later one finds its folder and
+/// leaves it alone. Asking `CreateAppContainerProfile` for a profile that
+/// exists is not harmless: the call, made while another launch creates its
+/// process in the AppContainer, can fail that creation with
+/// `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four threads at once). So
+/// the user's launches make a profile one at a time ([`Launches`]), each
+/// looking for it again once it holds the mutex.
+fn profile(name: &str) -> Result<Sid, Failure> {
+    let sid = derive(name)?;
     if made(&sid)? {
         return Ok(sid);
     }
-    let mutex = profiles_mutex()?;
-    // SAFETY: the mutex just opened. One a process ended holding is taken
-    // all the same: the profile is looked for again under it.
-    let waited = unsafe { WaitForSingleObject(mutex.0, PROFILES_WAIT_MS) };
-    if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
-        return Err((ERROR_TIMEOUT.0, "the profiles' mutex".to_owned()));
+    let _one_at_a_time = Launches::hold()?;
+    if !made(&sid)? {
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        make_profile(&name)?;
     }
-    let making = (|| {
-        if !made(&sid)? {
-            make_profile(&name)?;
-        }
-        Ok(())
-    })();
-    // SAFETY: the mutex this thread holds.
-    let _ = unsafe { ReleaseMutex(mutex.0) };
-    making.map(|()| sid)
+    Ok(sid)
 }
 
-/// The mutex the user's launches take to make a profile, in the session's
-/// namespace: `Local\tapestry-media-profiles-` and the user's SID.
-fn profiles_mutex() -> Result<Owned, Failure> {
+/// The user's text SID, from this process's token.
+pub fn user_sid() -> Result<String, Failure> {
     let mut token = HANDLE::default();
     // SAFETY: this process's own token, closed by `Owned`.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }
@@ -877,16 +792,82 @@ fn profiles_mutex() -> Result<Owned, Failure> {
         .map_err(failed("the user's SID as text"))?;
     let _text = Local(text.0.cast());
     // SAFETY: the nul-terminated string the call returned.
-    let sid = unsafe { text.as_wide() };
-    let name: Vec<u16> = "Local\\tapestry-media-profiles-"
-        .encode_utf16()
-        .chain(sid.iter().copied())
-        .chain([0])
-        .collect();
-    // SAFETY: a nul-terminated name; the mutex is closed by `Owned`.
-    unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
-        .map(Owned)
-        .map_err(failed("the profiles' mutex"))
+    unsafe { text.to_string() }.map_err(|_| (0, "the user's SID as text".to_owned()))
+}
+
+/// The user's launches, in every process and session, one at a time where
+/// they make the profile and stage the copies: the mutex
+/// `Global\tapestry-media-` and the user's SID, whose DACL grants the user
+/// alone. One a process ended holding is taken all the same: what it
+/// guards is looked at again under it. Held until dropped.
+pub struct Launches(Owned);
+
+impl Launches {
+    /// Takes the mutex, waiting up to 30 s.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be made or opened, or another launch holds it longer.
+    pub fn hold() -> Result<Self, Failure> {
+        let mutex = Self::mutex()?;
+        // SAFETY: the mutex just opened.
+        let waited = unsafe { WaitForSingleObject(mutex.0, LAUNCHES_WAIT_MS) };
+        if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+            return Err((ERROR_TIMEOUT.0, "the launches' mutex".to_owned()));
+        }
+        Ok(Self(mutex))
+    }
+
+    /// The mutex, made with its DACL or opened.
+    fn mutex() -> Result<Owned, Failure> {
+        let user = user_sid()?;
+        let sddl: Vec<u16> = format!("D:P(A;;0x{MUTEX_ALL_ACCESS:x};;;{user})")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: a nul-terminated SDDL string; the descriptor returned is
+        // freed by `Local`.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &raw mut descriptor,
+                None,
+            )
+        }
+        .map_err(failed("the launches' mutex's DACL"))?;
+        let _descriptor = Local(descriptor.0);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        };
+        let name: Vec<u16> = format!("Global\\tapestry-media-{user}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: a nul-terminated name, and attributes whose descriptor
+        // lives through the call; the mutex is closed by `Owned`.
+        unsafe { CreateMutexW(Some(&raw const attributes), false, PCWSTR(name.as_ptr())) }
+            .map(Owned)
+            .map_err(failed("the launches' mutex"))
+    }
+}
+
+#[cfg(test)]
+impl Launches {
+    /// The mutex's handle, to read its DACL.
+    pub fn handle(&self) -> HANDLE {
+        self.0.0
+    }
+}
+
+impl Drop for Launches {
+    fn drop(&mut self) {
+        // SAFETY: the mutex this thread holds.
+        let _ = unsafe { ReleaseMutex(self.0.0) };
+    }
 }
 
 /// Whether the profile of `sid` exists: whether Windows gives its folder.
@@ -949,14 +930,11 @@ fn make_profile(name: &[u16]) -> Result<(), Failure> {
     }
 }
 
-/// The access the AppContainer gets on the worker's directory and files.
-const DIRECTORY_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
-/// Inherited by the files directly in the directory, and no further.
-const DIRECTORY_INHERITANCE: ACE_FLAGS =
-    ACE_FLAGS(OBJECT_INHERIT_ACE.0 | NO_PROPAGATE_INHERIT_ACE.0);
+/// The access the AppContainer gets on the copies and their directory.
+pub(super) const DIRECTORY_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 
 /// Memory `LocalAlloc` made, freed when dropped.
-struct Local(*mut c_void);
+pub(super) struct Local(pub(super) *mut c_void);
 
 impl Drop for Local {
     fn drop(&mut self) {
@@ -965,53 +943,6 @@ impl Drop for Local {
             let _ = unsafe { LocalFree(Some(HLOCAL(self.0))) };
         }
     }
-}
-
-/// Whether `dacl` holds an explicit ACE allowing `sid` the directory's
-/// access with its inheritance.
-fn granted(dacl: *const ACL, sid: &Sid) -> bool {
-    if dacl.is_null() {
-        return false;
-    }
-    let mut size = ACL_SIZE_INFORMATION::default();
-    // SAFETY: a DACL the security call returned, and a struct of the size
-    // given.
-    let counted = unsafe {
-        GetAclInformation(
-            dacl,
-            (&raw mut size).cast(),
-            u32::try_from(size_of_val(&size)).unwrap_or(0),
-            AclSizeInformation,
-        )
-    };
-    if counted.is_err() {
-        return false;
-    }
-    (0..size.AceCount).any(|i| {
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        // SAFETY: ACE `i` of the DACL, which holds `AceCount` of them.
-        if unsafe { GetAce(dacl, i, &raw mut ace) }.is_err() {
-            return false;
-        }
-        // SAFETY: each ACE starts with its header.
-        let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
-        if u32::from(header.AceType)
-            != windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE
-            || u32::from(header.AceFlags) != DIRECTORY_INHERITANCE.0
-        {
-            return false;
-        }
-        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-        // SAFETY: an allowed ACE: its mask, then its SID from `SidStart`.
-        let (mask, ace_sid) = unsafe {
-            (
-                (&raw const (*allowed).Mask).read_unaligned(),
-                PSID((&raw mut (*allowed).SidStart).cast()),
-            )
-        };
-        // SAFETY: two valid SIDs.
-        mask & DIRECTORY_ACCESS == DIRECTORY_ACCESS && unsafe { EqualSid(ace_sid, sid.0) }.is_ok()
-    })
 }
 
 /// An entry granting `sid` `access` with `inheritance`.
@@ -1059,7 +990,8 @@ fn change_object(object: HANDLE, entry: EXPLICIT_ACCESS_W, what: &str) -> Result
         return Err((read.0, format!("{what}'s DACL")));
     }
     let mut new: *mut ACL = std::ptr::null_mut();
-    // SAFETY: as in `grant`.
+    // SAFETY: one entry merged into the object's DACL; the ACL returned is
+    // freed by `Local`.
     let merged = unsafe { SetEntriesInAclW(Some(&[entry]), Some(dacl), &raw mut new) };
     let _new = Local(new.cast());
     if merged.is_err() {
@@ -1471,14 +1403,23 @@ impl Child {
         Ok(())
     }
 
-    /// Terminates it for `(step, failure)`, waiting until it has ended.
-    fn refuse(mut self, (step, (code, what)): (Step, Failure)) -> LaunchError {
+    /// Terminates it for `(step, failure)`, watching it end for `observe`:
+    /// its handle stays with the error unless it ended.
+    fn refuse(mut self, (step, (code, what)): (Step, Failure), observe: Duration) -> LaunchError {
         self.armed = false;
+        let process = terminate(self.process.0, observe);
+        let unended = (!matches!(process, Made::Ended(_))).then(|| {
+            let handle = std::mem::replace(&mut self.process, Owned(HANDLE::default())).release();
+            // SAFETY: the process handle this value owned, owned by the
+            // value returned from here.
+            unsafe { OwnedHandle::from_raw_handle(handle.0) }
+        });
         LaunchError {
             step,
             code,
             what,
-            process: terminate(self.process.0),
+            process,
+            unended,
         }
     }
 
@@ -1493,24 +1434,32 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.armed {
-            let _ = terminate(self.process.0);
+            let _ = terminate(self.process.0, OBSERVE);
         }
     }
 }
 
-/// Terminates `process` and waits up to 5 s until it has ended: whether it
-/// ended, and with what.
-fn terminate(process: HANDLE) -> Made {
+/// Terminates `process` and watches it end for `observe`: whether it ended,
+/// with what, and otherwise whether terminating it or the wait failed.
+fn terminate(process: HANDLE, observe: Duration) -> Made {
     // SAFETY: a process this launch made.
-    let _ = unsafe { TerminateProcess(process, REFUSED) };
+    let terminated = unsafe { TerminateProcess(process, REFUSED) };
+    let ms = u32::try_from(observe.as_millis()).unwrap_or(u32::MAX);
     // SAFETY: as above.
-    if unsafe { WaitForSingleObject(process, 5_000) } != WAIT_OBJECT_0 {
-        return Made::Running;
+    let waited = unsafe { WaitForSingleObject(process, ms) };
+    if waited == WAIT_OBJECT_0 {
+        let mut exit = 0;
+        // SAFETY: as above.
+        let read = unsafe { GetExitCodeProcess(process, &raw mut exit) };
+        return Made::Ended(read.is_ok().then_some(exit));
     }
-    let mut exit = 0;
-    // SAFETY: as above.
-    let read = unsafe { GetExitCodeProcess(process, &raw mut exit) };
-    Made::Ended(read.is_ok().then_some(exit))
+    if waited != WAIT_TIMEOUT {
+        return Made::Unknown(last_error());
+    }
+    match terminated {
+        Ok(()) => Made::Pending,
+        Err(e) => Made::NotTerminated(code_of(&e)),
+    }
 }
 
 /// The attribute list's storage, deleted when dropped.
