@@ -429,7 +429,9 @@ fn a_lost_device_reads_the_cursors_row_into_the_next_pool() {
         dir: images.path().to_path_buf(),
         names: fixture_names(),
     };
-    let rest = || w.rest(w.cursor_request(row.dir.clone(), row.names.clone(), &coord));
+    let rest = || {
+        w.rest(w.cursor_request(row.dir.clone(), row.names.clone(), Vec::new(), &coord));
+    };
     w.cursor_changed(&coord, Some(row.clone()));
     r.link
         .show_selection(update(1, 2, "", w.update_chart(false)));
@@ -539,7 +541,9 @@ fn a_refused_selection_skin_ends_its_pool() {
         dir: images.path().to_path_buf(),
         names: fixture_names(),
     };
-    let rest = || w.rest(w.cursor_request(row.dir.clone(), row.names.clone(), &coord));
+    let rest = || {
+        w.rest(w.cursor_request(row.dir.clone(), row.names.clone(), Vec::new(), &coord));
+    };
     w.cursor_changed(&coord, Some(row.clone()));
     rest();
     step_until(&w, &coord, &r.link, &rest, |w| {

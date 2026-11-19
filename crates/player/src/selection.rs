@@ -530,7 +530,8 @@ impl Selection {
     }
 
     /// The cursor's request, once it rested [`REST`] on a chart at `now`
-    /// and none was made for this rest (SC1).
+    /// and none was made for this rest (SC1), with the rows its fill reads
+    /// after it ([`neighbours`](Self::neighbours)).
     fn rest_request(
         &mut self,
         images: CursorImages<'_>,
@@ -543,14 +544,46 @@ impl Selection {
         if now.0.saturating_sub(self.rest.since.0) < REST.0 {
             return None;
         }
+        let dir = crate::chart_images::folder(&chart.path);
+        let names = [chart.names.stagefile.clone(), chart.names.banner.clone()];
+        let neighbours = self.neighbours(&dir, &names);
         self.rest.asked = true;
         #[cfg(feature = "dev-tools")]
         crate::dev::loop_probe::mark("cur:rest", 0);
-        Some(images.worker.cursor_request(
-            crate::chart_images::folder(&chart.path),
-            [chart.names.stagefile.clone(), chart.names.banner.clone()],
-            &self.coord,
-        ))
+        Some(
+            images
+                .worker
+                .cursor_request(dir, names, neighbours, &self.coord),
+        )
+    }
+
+    /// The rows the fill reads after the cursor's own (design.md
+    /// "Rendering and Skins", chart images): the charts within
+    /// [`FILL_REACH`](crate::chart_images::FILL_REACH) rows of it, nearest
+    /// first, each folder's names once and never the cursor's (`dir`,
+    /// `names`); a chart whose names the library refused, or that names no
+    /// image, is passed over.
+    fn neighbours(
+        &self,
+        dir: &std::path::Path,
+        names: &[library::Name; 2],
+    ) -> Vec<crate::chart_images::CursorId> {
+        let mut ids: Vec<crate::chart_images::CursorId> = Vec::new();
+        for entry in self.screen.charts_near(crate::chart_images::FILL_REACH) {
+            let Some(n) = entry.images.as_ref() else {
+                continue;
+            };
+            let id = crate::chart_images::CursorId {
+                dir: crate::chart_images::folder(&entry.path),
+                names: [n.stagefile.clone(), n.banner.clone()],
+            };
+            let own = id.dir == dir && id.names == *names;
+            let none = id.names.iter().all(|n| *n == library::Name::None);
+            if !own && !none && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
     }
 
     /// When the rest comes due, while it has not asked yet.
@@ -1196,6 +1229,16 @@ impl Selection {
             if images.drawn {
                 let refreshed = self.feed.list_revision != self.rest.list_revision;
                 update.cursor_chart = images.worker.update_chart(refreshed);
+                // The list changed around a cursor whose read was asked:
+                // the fill reads the rows near it now.
+                if refreshed
+                    && self.rest.asked
+                    && let Some(chart) = &self.rest.chart
+                {
+                    let dir = crate::chart_images::folder(&chart.path);
+                    let names = [chart.names.stagefile.clone(), chart.names.banner.clone()];
+                    images.worker.refill(self.neighbours(&dir, &names));
+                }
             }
             self.rest.list_revision = self.feed.list_revision;
             render.show_selection(update);

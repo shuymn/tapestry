@@ -351,6 +351,8 @@ mod tests {
             "90",
             "--dev-stop-timeout",
             "30",
+            "--dev-speculative-permits",
+            "2",
         ]);
         assert!(s.dev.headless);
         assert_eq!(s.dev.rescan_ms, Some(50));
@@ -360,6 +362,7 @@ mod tests {
             Some(std::time::Duration::from_secs(90))
         );
         assert_eq!(s.dev.stop_timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(s.dev.speculative_permits, Some(2));
         assert_eq!(s.dev.window, None);
         assert_eq!(
             s.dev.script,

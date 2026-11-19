@@ -56,6 +56,76 @@ fn bga_images_seeds_read_or_fail_as_built() {
     assert_eq!(outcome("unknown"), BgaOutcome::Absent(Absent::Format));
 }
 
+/// The frame ring seeds stage a due frame, then the next a second later,
+/// wait for one not due, stage the newest of a full ring, free an earlier
+/// run's frame unread, and fail the player for each broken slot they were
+/// built with.
+#[test]
+fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
+    use crate::{RingOutcome, ring_bytes};
+    use skin_model::media::{Fault, Frame};
+    let seeds = seeds::rings();
+    assert_names(
+        &seeds,
+        &[
+            "empty",
+            "due",
+            "not_due",
+            "full",
+            "earlier_run",
+            "above_watermark",
+            "run_zero",
+            "state",
+            "index",
+            "size",
+            "run",
+            "shared_seq",
+            "stamp_order",
+            "stamp_outside",
+        ],
+    );
+    let outcome = |name: &str| {
+        let (_, bytes) = seeds.iter().find(|(n, _)| *n == name).unwrap();
+        ring_bytes(bytes)
+    };
+    let staged = |seq, stamp| RingOutcome::Staged(Frame { seq, stamp });
+    assert_eq!(outcome("empty"), RingOutcome::Nothing);
+    assert_eq!(outcome("due"), staged(2, 1_000_000));
+    assert_eq!(outcome("not_due"), staged(1, 1_000), "due a second later");
+    assert_eq!(outcome("full"), staged(4, 40_000));
+    assert_eq!(
+        outcome("earlier_run"),
+        staged(2, 2_000),
+        "run 1's frame freed unread, run 2's shown"
+    );
+    assert_eq!(
+        outcome("above_watermark"),
+        staged(1, 1_000),
+        "the frame above the watermark waits"
+    );
+    let fault = RingOutcome::Fault;
+    assert_eq!(outcome("run_zero"), fault(Fault::Run { slot: 1, value: 0 }));
+    assert_eq!(outcome("state"), fault(Fault::State { slot: 2, value: 3 }));
+    assert_eq!(outcome("index"), fault(Fault::Index { slot: 1, value: 0 }));
+    assert_eq!(outcome("size"), fault(Fault::Size { slot: 0, value: 8 }));
+    assert_eq!(outcome("run"), fault(Fault::Run { slot: 1, value: 2 }));
+    assert_eq!(
+        outcome("shared_seq"),
+        fault(Fault::Sequence { slot: 0, value: 1 })
+    );
+    assert_eq!(
+        outcome("stamp_order"),
+        fault(Fault::Sequence { slot: 0, value: 1 })
+    );
+    assert_eq!(
+        outcome("stamp_outside"),
+        fault(Fault::Stamp {
+            slot: 1,
+            value: 1 << 21
+        })
+    );
+}
+
 /// Every seed in `expected` is generated, and no other: a deleted seed
 /// fails the test instead of going unchecked.
 fn assert_names(seeds: &[seeds::Seed], expected: &[&str]) {

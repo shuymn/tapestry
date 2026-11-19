@@ -45,6 +45,8 @@ struct Charts {
     unpresented: bool,
     /// The selection frames drawn before each pool write applied.
     write_frames: Vec<u32>,
+    /// Pool writes answered, applied or not.
+    write_calls: u32,
 }
 
 /// A screen with a chart layer: its committed layer's key names
@@ -173,6 +175,7 @@ impl Screen for ChartScreen {
         slot: u16,
         [stage, banner]: [Option<&skin_model::chart_image::Fitted>; 2],
     ) -> Result<(), render::PoolWriteError> {
+        self.charts.lock().unwrap().write_calls += 1;
         if self
             .pool()
             .is_none_or(|p| p.generation != generation || slot >= p.slots)
