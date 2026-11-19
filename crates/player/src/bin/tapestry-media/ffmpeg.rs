@@ -546,6 +546,9 @@ unsafe extern "C" fn refuse_open(
 /// seeks left to the probe or the seek under way.
 struct Budgeted {
     file: std::fs::File,
+    /// What a read lands in before it is copied to FFmpeg's buffer, which
+    /// FFmpeg may hand uninitialized.
+    scratch: Box<[u8]>,
     /// The bytes and seeks left, `None` while the player plays on.
     left: Option<(u64, u32)>,
     /// A read or a seek was refused for the budget.
@@ -562,7 +565,7 @@ unsafe extern "C" fn read(opaque: *mut c_void, buf: *mut u8, size: c_int) -> c_i
     }
     // SAFETY: `opaque` is the source this module boxed for this context,
     // alive until the context is freed and reached only through it while
-    // FFmpeg runs, and FFmpeg hands a buffer of `size` bytes.
+    // FFmpeg runs.
     let source = unsafe { &mut *opaque.cast::<Budgeted>() };
     if let Some((bytes, _)) = source.left {
         if bytes == 0 {
@@ -571,11 +574,19 @@ unsafe extern "C" fn read(opaque: *mut c_void, buf: *mut u8, size: c_int) -> c_i
         }
         len = len.min(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
-    // SAFETY: as above; `len` is at most `size`.
-    let buf = unsafe { std::slice::from_raw_parts_mut(buf, len) };
-    match source.file.read(buf) {
+    // FFmpeg's buffer may be uninitialized, which no slice may cover: the
+    // file is read into the source's own bytes, then copied.
+    let take = len.min(source.scratch.len());
+    let Some(scratch) = source.scratch.get_mut(..take) else {
+        return averror(ff::EINVAL);
+    };
+    match source.file.read(scratch) {
         Ok(0) => ff::AVERROR_EOF,
         Ok(n) => {
+            // SAFETY: FFmpeg hands a buffer of `size` bytes; `n` is at most
+            // `take`, which is at most `size`, and the scratch is the
+            // source's own.
+            unsafe { ptr::copy_nonoverlapping(scratch.as_ptr(), buf, n) };
             if let Some((bytes, _)) = &mut source.left {
                 *bytes = bytes.saturating_sub(n as u64);
             }
@@ -707,6 +718,7 @@ impl Input {
     pub fn open(file: std::fs::File, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
         let source = Box::new(Budgeted {
             file,
+            scratch: vec![0; IO_BUFFER.unsigned_abs() as usize].into_boxed_slice(),
             left: Some(BUDGET),
             spent: false,
         });
