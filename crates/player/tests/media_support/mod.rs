@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use media_host::launch::{
-    LaunchError, REFUSED, Restrictions, Setup, Step, change_shared, granted_all, revoked,
+    LaunchError, Made, REFUSED, Restrictions, Setup, Step, change_shared, granted_all, revoked,
 };
 pub use media_host::{Kind, Worker};
 use windows::Win32::Foundation::{
@@ -73,18 +73,35 @@ pub struct Stage {
     dir: tempfile::TempDir,
 }
 
+/// Copies the worker and its DLLs into `dir`, an installation of its own.
+pub fn install(dir: &Path) {
+    let from = Path::new(WORKER).parent().unwrap();
+    std::fs::copy(WORKER, dir.join("tapestry-media.exe")).unwrap();
+    for dll in dlls() {
+        let name = format!("{dll}.dll");
+        std::fs::copy(from.join(&name), dir.join(&name)).unwrap();
+    }
+}
+
+/// Deletes the AppContainer profile `name`, which Windows would otherwise
+/// keep; deleting one no launch made fails, and is ignored.
+pub fn delete_profile(name: &str) {
+    let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    // SAFETY: a nul-terminated name.
+    let _ = unsafe {
+        windows::Win32::Security::Isolation::DeleteAppContainerProfile(windows::core::PCWSTR(
+            name.as_ptr(),
+        ))
+    };
+}
+
 impl Stage {
     pub fn new() -> Self {
-        let from = Path::new(WORKER).parent().unwrap();
         let dir = tempfile::Builder::new()
             .prefix("media-stage-")
             .tempdir()
             .unwrap();
-        std::fs::copy(WORKER, dir.path().join("tapestry-media.exe")).unwrap();
-        for dll in dlls() {
-            let name = format!("{dll}.dll");
-            std::fs::copy(from.join(&name), dir.path().join(&name)).unwrap();
-        }
+        install(dir.path());
         Self { dir }
     }
 
@@ -103,17 +120,9 @@ impl Drop for Stage {
     /// directory, which Windows would otherwise keep: each stage is an
     /// installation of its own.
     fn drop(&mut self) {
-        let name: Vec<u16> = media_host::launch::profile_name(self.dir())
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        // SAFETY: a nul-terminated name; deleting a profile no launch made
-        // fails, and is ignored.
-        let _ = unsafe {
-            windows::Win32::Security::Isolation::DeleteAppContainerProfile(windows::core::PCWSTR(
-                name.as_ptr(),
-            ))
-        };
+        if let Ok(name) = media_host::launch::profile_name(self.dir()) {
+            delete_profile(&name);
+        }
     }
 }
 

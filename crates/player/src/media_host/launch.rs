@@ -5,9 +5,10 @@
 //!    closes and on an unhandled exception, one process, its UI
 //!    restricted;
 //! 2. the worker's AppContainer profile, with no capability, one for each
-//!    installation directory ([`profile_name`]), and an ACE granting it
-//!    read and execute on that directory, inherited by the files directly
-//!    in it (the executable and its DLLs);
+//!    installation directory, named for the directory opened, not its path
+//!    ([`Installation`]), and an ACE granting it read and execute on that
+//!    same directory, inherited by the files directly in it (the executable
+//!    and its DLLs);
 //! 3. a desktop of its own, granted to the AppContainer, in the session's
 //!    alternate window station (`CreateWindowStationW` with no name),
 //!    which other launches share and the launch leaves as it is;
@@ -43,7 +44,8 @@
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::io::FromRawHandle as _;
+use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -54,12 +56,13 @@ use sha2::{Digest as _, Sha256};
 use skin_model::media::control::{self, Reply};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_TIMEOUT, GENERIC_ALL, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation, WAIT_ABANDONED,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SetEntriesInAclW,
-    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SE_FILE_OBJECT,
+    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
@@ -70,9 +73,14 @@ use windows::Win32::Security::{
     GetSidSubAuthorityCount, GetTokenInformation, NO_INHERITANCE, NO_PROPAGATE_INHERIT_ACE,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
     TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel, TokenIsAppContainer,
+    TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel,
+    TokenIsAppContainer, TokenUser,
 };
-use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+    GetFileInformationByHandleEx, READ_CONTROL, WRITE_DAC,
+};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT,
@@ -94,16 +102,17 @@ use windows::Win32::System::StationsAndDesktops::{
 use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
 use windows::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, GetProcessMitigationPolicy, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    PROCESS_MITIGATION_POLICY, ProcessChildProcessPolicy, ProcessDynamicCodePolicy,
-    ProcessExtensionPointDisablePolicy, ProcessImageLoadPolicy, ProcessStrictHandleCheckPolicy,
-    ProcessSystemCallDisablePolicy, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW, SuspendThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW,
+    CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessMitigationPolicy,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_MITIGATION_POLICY,
+    ProcessChildProcessPolicy, ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy,
+    ProcessImageLoadPolicy, ProcessStrictHandleCheckPolicy, ProcessSystemCallDisablePolicy,
+    ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SuspendThread,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
 use windows::core::{PCWSTR, PWSTR, w};
@@ -237,10 +246,21 @@ pub struct LaunchError {
     pub code: u32,
     /// What failed or differed.
     pub what: String,
-    /// The process's exit code once the launch terminated it, when it made
-    /// one.
-    #[cfg(test)]
-    pub exit: Option<u32>,
+    /// What became of the process, when the launch made one.
+    pub process: Made,
+}
+
+/// What became of the process a failed launch made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Made {
+    /// The launch failed before it made one.
+    Nothing,
+    /// The launch terminated it, and it ended: its exit code, when Windows
+    /// gave it.
+    Ended(Option<u32>),
+    /// The launch terminated it, and it had not ended when the launch
+    /// stopped waiting, 5 s on.
+    Running,
 }
 
 impl std::fmt::Display for LaunchError {
@@ -249,7 +269,13 @@ impl std::fmt::Display for LaunchError {
             f,
             "the media worker's launch failed at {:?}: {} (error {})",
             self.step, self.what, self.code
-        )
+        )?;
+        match self.process {
+            Made::Nothing => Ok(()),
+            Made::Ended(Some(exit)) => write!(f, "; it was ended (exit code {exit:#x})"),
+            Made::Ended(None) => write!(f, "; it was ended"),
+            Made::Running => write!(f, "; it had not ended 5 s after it was terminated"),
+        }
     }
 }
 
@@ -417,8 +443,7 @@ fn early((step, (code, what)): (Step, Failure)) -> LaunchError {
         step,
         code,
         what,
-        #[cfg(test)]
-        exit: None,
+        process: Made::Nothing,
     }
 }
 
@@ -430,20 +455,29 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     } else {
         None
     };
-    let sid = if applied.has(Restrictions::APP_CONTAINER) {
-        Some(run(setup, Step::Profile, || profile(&profile_name(dir))).map_err(early)?)
+    // The installation stays open, so where it is, until the launch ends.
+    let profiled = if applied.has(Restrictions::APP_CONTAINER) {
+        Some(
+            run(setup, Step::Profile, || {
+                let installation = Installation::open(dir)?;
+                let sid = profile(&installation.profile_name()?)?;
+                Ok((installation, sid))
+            })
+            .map_err(early)?,
+        )
     } else {
         None
     };
-    if let Some(sid) = &sid {
-        run(setup, Step::Grant, || grant(dir, sid)).map_err(early)?;
+    if let Some((installation, sid)) = &profiled {
+        run(setup, Step::Grant, || installation.grant(sid)).map_err(early)?;
     }
+    let sid = profiled.as_ref().map(|(_, sid)| sid);
     let desktop = if applied.has(Restrictions::OWN_DESKTOP) {
         Some(
             run(setup, Step::Desktop, || {
-                let desktop = Desktop::new(sid.as_ref())?;
+                let desktop = Desktop::new(sid)?;
                 #[cfg(test)]
-                let desktop = desktop.for_setup(sid.as_ref(), applied)?;
+                let desktop = desktop.for_setup(sid, applied)?;
                 Ok(desktop)
             })
             .map_err(early)?,
@@ -452,7 +486,7 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
         None
     };
     let pipes = run(setup, Step::Pipes, Pipes::new).map_err(early)?;
-    let child = create(dir, setup, sid.as_ref(), &pipes, desktop.as_ref()).map_err(early)?;
+    let child = create(dir, setup, sid, &pipes, desktop.as_ref()).map_err(early)?;
     let pipe_ends = [pipes.worker_in.0, pipes.worker_out.0].map(value);
     let Pipes {
         commands,
@@ -471,15 +505,10 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
             })?;
         }
         let table = run(setup, Step::Check, || {
-            check(
-                &child,
-                job.as_ref(),
-                sid.as_ref(),
-                pipe_ends,
-                setup.expected,
-            )
+            check(&child, job.as_ref(), sid, pipe_ends, setup.expected)
         })?;
-        run(setup, Step::Resume, || child.resume())?;
+        // Suspended once, by its creation.
+        run(setup, Step::Resume, || child.resume(1))?;
         Ok(table)
     })();
     let table = match checked {
@@ -625,37 +654,175 @@ impl Drop for Sid {
 /// How many times the profile is asked for while another process makes it.
 const PROFILE_ATTEMPTS: u32 = 20;
 
-/// The name of the worker's AppContainer profile for the installation in
-/// `dir`: `tapestry.media.` and the first 16 bytes of the SHA-256 of the
-/// directory's path (made absolute, its ASCII letters lowercased, as
-/// UTF-16), in hex. Each installation's worker runs as an AppContainer of
-/// its own, so the grant one installation's directory gets reaches no other
-/// installation's worker. Windows keeps a profile until it is deleted: an
-/// installation moved or removed leaves its profile, which grants nothing
-/// outside that installation's own directory, and the game deletes none,
-/// since it cannot tell whether that installation still runs.
-pub fn profile_name(dir: &Path) -> String {
-    let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut digest = Sha256::new();
-    for unit in absolute.as_os_str().encode_wide() {
-        let unit = if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
-            unit + 32
-        } else {
-            unit
-        };
-        digest.update(unit.to_le_bytes());
-    }
-    let hash = digest.finalize();
-    let mut name = "tapestry.media.".to_owned();
-    for byte in hash.iter().take(16) {
-        let _ = write!(name, "{byte:02x}");
-    }
-    name
+/// The installation directory, open: the worker's AppContainer profile is
+/// named for the directory this handle opened, and the grant goes to that
+/// directory alone. The directory cannot be renamed or deleted while it is
+/// open.
+pub struct Installation {
+    /// The directory, open to read its DACL and its ID.
+    dir: std::fs::File,
+    /// The path it was opened by.
+    path: std::path::PathBuf,
 }
 
-/// Launches in this process make a profile one at a time, each looking for
-/// it again once it holds the lock.
-static PROFILES: Mutex<()> = Mutex::new(());
+impl Installation {
+    /// Opens the directory `dir`.
+    ///
+    /// # Errors
+    ///
+    /// When the directory cannot be opened.
+    pub fn open(dir: &Path) -> Result<Self, Failure> {
+        Ok(Self {
+            dir: open_directory(dir, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)?,
+            path: dir.to_path_buf(),
+        })
+    }
+
+    /// The directory's handle.
+    fn handle(&self) -> HANDLE {
+        HANDLE(self.dir.as_raw_handle())
+    }
+
+    /// The name of the worker's AppContainer profile for this installation:
+    /// `tapestry.media.` and the first 16 bytes of the SHA-256 of the
+    /// directory's volume serial number and 128-bit file ID, in hex. A
+    /// directory keeps its ID when it is renamed and shares it with no other
+    /// on its volume, so each installation's worker runs as an AppContainer
+    /// of its own: another directory put where one was, or one whose path
+    /// differs from another's in case alone, gets a profile of its own, and
+    /// the grant one installation's directory gets reaches no other
+    /// installation's worker. Windows keeps a profile until it is deleted:
+    /// an installation removed leaves its profile, which grants nothing
+    /// outside that installation's own directory, and the game deletes
+    /// none, since it cannot tell whether that installation still runs.
+    ///
+    /// # Errors
+    ///
+    /// When the system does not give the directory's ID.
+    pub fn profile_name(&self) -> Result<String, Failure> {
+        let (volume, file) = id(self.handle())?;
+        let mut digest = Sha256::new();
+        digest.update(volume.to_le_bytes());
+        digest.update(file);
+        let hash = digest.finalize();
+        let mut name = "tapestry.media.".to_owned();
+        for byte in hash.iter().take(16) {
+            let _ = write!(name, "{byte:02x}");
+        }
+        Ok(name)
+    }
+
+    /// Step 2: grants the AppContainer read and execute on the directory
+    /// and the files directly in it, unless an equal ACE is there already.
+    /// Windows opens no directory again from a handle (`ReOpenFile` refuses
+    /// one), so the directory is opened again by its path, with the right to
+    /// change its DACL, and granted only when that is the directory this
+    /// value holds: the same volume and file ID. While this value holds it,
+    /// its path names no other.
+    fn grant(&self, sid: &Sid) -> Result<(), Failure> {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the directory's handle, opened to read its DACL; the
+        // descriptor returned holds the DACL and is freed by `Local`.
+        let read = unsafe {
+            GetSecurityInfo(
+                self.handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw mut dacl),
+                None,
+                Some(&raw mut descriptor),
+            )
+        };
+        let _descriptor = Local(descriptor.0);
+        if read.is_err() {
+            return Err((read.0, "the directory's DACL".to_owned()));
+        }
+        if granted(dacl, sid) {
+            return Ok(());
+        }
+        let entry = explicit(sid.0, DIRECTORY_ACCESS, DIRECTORY_INHERITANCE);
+        let mut new: *mut ACL = std::ptr::null_mut();
+        // SAFETY: one entry naming the SID, merged into the directory's
+        // DACL; the ACL returned is freed by `Local`.
+        let merged = unsafe { SetEntriesInAclW(Some(&[entry]), Some(dacl), &raw mut new) };
+        let _new = Local(new.cast());
+        if merged.is_err() {
+            return Err((merged.0, "the directory's new DACL".to_owned()));
+        }
+        let opened = open_directory(&self.path, (READ_CONTROL | WRITE_DAC).0)?;
+        let writable = HANDLE(opened.as_raw_handle());
+        if id(writable)? != id(self.handle())? {
+            return Err((
+                0,
+                "the directory, to grant it: its path names another".to_owned(),
+            ));
+        }
+        // SAFETY: the directory opened again, with the right to change its
+        // DACL; the DACL is applied to it and inherited by the files in it.
+        let set = unsafe {
+            SetSecurityInfo(
+                writable,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(new),
+                None,
+            )
+        };
+        if set.is_err() {
+            return Err((set.0, "granting the directory".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+/// Opens the directory `dir` with `access`, sharing read and write, not
+/// delete.
+fn open_directory(dir: &Path, access: u32) -> Result<std::fs::File, Failure> {
+    std::fs::OpenOptions::new()
+        .access_mode(access)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(dir)
+        .map_err(|e| {
+            let code = e.raw_os_error().and_then(|c| u32::try_from(c).ok());
+            (code.unwrap_or(0), "the installation directory".to_owned())
+        })
+}
+
+/// The volume serial number and 128-bit file ID of the file or directory
+/// `handle` opened.
+fn id(handle: HANDLE) -> Result<(u64, [u8; 16]), Failure> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: an open handle, and a struct of the size given.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            u32::try_from(size_of_val(&info)).unwrap_or(0),
+        )
+    }
+    .map_err(failed("the installation directory's ID"))?;
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+/// The name of the worker's AppContainer profile for the installation in
+/// `dir` ([`Installation::profile_name`]).
+///
+/// # Errors
+///
+/// When the directory cannot be opened or gives no ID.
+pub fn profile_name(dir: &Path) -> Result<String, Failure> {
+    Installation::open(dir)?.profile_name()
+}
+
+/// How long a launch waits for another making a profile.
+const PROFILES_WAIT_MS: u32 = 30_000;
 
 /// Step 2: the SID of the AppContainer profile `name`. The first launch
 /// from an installation makes its profile, which Windows keeps; a later one
@@ -663,18 +830,63 @@ static PROFILES: Mutex<()> = Mutex::new(());
 /// for a profile that exists is not harmless: the call, made while another
 /// launch creates its process in the AppContainer, can fail that creation
 /// with `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four threads at
-/// once).
+/// once). So the user's launches, in every process of the session, make a
+/// profile one at a time, each looking for it again once it holds the
+/// mutex ([`profiles_mutex`]).
 fn profile(name: &str) -> Result<Sid, Failure> {
     let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // SAFETY: a nul-terminated name; the SID returned is freed by `Sid`.
     let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) }
         .map(Sid)
         .map_err(failed("the profile's SID"))?;
-    let _making = PROFILES.lock().unwrap_or_else(PoisonError::into_inner);
-    if !made(&sid)? {
-        make_profile(&name)?;
+    if made(&sid)? {
+        return Ok(sid);
     }
-    Ok(sid)
+    let mutex = profiles_mutex()?;
+    // SAFETY: the mutex just opened. One a process ended holding is taken
+    // all the same: the profile is looked for again under it.
+    let waited = unsafe { WaitForSingleObject(mutex.0, PROFILES_WAIT_MS) };
+    if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+        return Err((ERROR_TIMEOUT.0, "the profiles' mutex".to_owned()));
+    }
+    let making = (|| {
+        if !made(&sid)? {
+            make_profile(&name)?;
+        }
+        Ok(())
+    })();
+    // SAFETY: the mutex this thread holds.
+    let _ = unsafe { ReleaseMutex(mutex.0) };
+    making.map(|()| sid)
+}
+
+/// The mutex the user's launches take to make a profile, in the session's
+/// namespace: `Local\tapestry-media-profiles-` and the user's SID.
+fn profiles_mutex() -> Result<Owned, Failure> {
+    let mut token = HANDLE::default();
+    // SAFETY: this process's own token, closed by `Owned`.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }
+        .map_err(failed("the game's token"))?;
+    let token = Owned(token);
+    let buffer = token_information(token.0, TokenUser)?;
+    // SAFETY: the buffer holds a `TOKEN_USER`, whose SID lies inside it.
+    let user = unsafe { buffer.as_ptr().cast::<TOKEN_USER>().read() };
+    let mut text = PWSTR::null();
+    // SAFETY: the user's SID; the string returned is freed by `Local`.
+    unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut text) }
+        .map_err(failed("the user's SID as text"))?;
+    let _text = Local(text.0.cast());
+    // SAFETY: the nul-terminated string the call returned.
+    let sid = unsafe { text.as_wide() };
+    let name: Vec<u16> = "Local\\tapestry-media-profiles-"
+        .encode_utf16()
+        .chain(sid.iter().copied())
+        .chain([0])
+        .collect();
+    // SAFETY: a nul-terminated name; the mutex is closed by `Owned`.
+    unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        .map(Owned)
+        .map_err(failed("the profiles' mutex"))
 }
 
 /// Whether the profile of `sid` exists: whether Windows gives its folder.
@@ -753,61 +965,6 @@ impl Drop for Local {
             let _ = unsafe { LocalFree(Some(HLOCAL(self.0))) };
         }
     }
-}
-
-/// Step 2: grants the AppContainer read and execute on `dir` and the files
-/// directly in it, unless an equal ACE is there already.
-fn grant(dir: &Path, sid: &Sid) -> Result<(), Failure> {
-    let path = wide(dir);
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: a nul-terminated path; the descriptor returned holds the DACL
-    // and is freed by `Local`.
-    let read = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(path.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&raw mut dacl),
-            None,
-            &raw mut descriptor,
-        )
-    };
-    let _descriptor = Local(descriptor.0);
-    if read.is_err() {
-        return Err((read.0, "the directory's DACL".to_owned()));
-    }
-    if granted(dacl, sid) {
-        return Ok(());
-    }
-    let entry = explicit(sid.0, DIRECTORY_ACCESS, DIRECTORY_INHERITANCE);
-    let mut new: *mut ACL = std::ptr::null_mut();
-    // SAFETY: one entry naming the SID, merged into the directory's DACL;
-    // the ACL returned is freed by `Local`.
-    let merged = unsafe { SetEntriesInAclW(Some(&[entry]), Some(dacl), &raw mut new) };
-    let _new = Local(new.cast());
-    if merged.is_err() {
-        return Err((merged.0, "the directory's new DACL".to_owned()));
-    }
-    // SAFETY: as above; the DACL is applied to the directory and inherited
-    // by the files in it.
-    let set = unsafe {
-        SetNamedSecurityInfoW(
-            PCWSTR(path.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(new),
-            None,
-        )
-    };
-    if set.is_err() {
-        return Err((set.0, "granting the directory".to_owned()));
-    }
-    Ok(())
 }
 
 /// Whether `dacl` holds an explicit ACE allowing `sid` the directory's
@@ -943,18 +1100,17 @@ const SHARED_DACL_WAIT_MS: u32 = 10_000;
 pub fn change_shared(object: HANDLE, entry: EXPLICIT_ACCESS_W, what: &str) -> Result<(), Failure> {
     // SAFETY: a mutex named in the session's namespace, closed by `Owned`.
     let mutex = Owned(
-        unsafe { windows::Win32::System::Threading::CreateMutexW(None, false, SHARED_DACL) }
-            .map_err(failed("the DACL's mutex"))?,
+        unsafe { CreateMutexW(None, false, SHARED_DACL) }.map_err(failed("the DACL's mutex"))?,
     );
     // SAFETY: the mutex just opened. One a process ended holding is taken
     // all the same: its change was one call, made or not.
     let waited = unsafe { WaitForSingleObject(mutex.0, SHARED_DACL_WAIT_MS) };
-    if waited != WAIT_OBJECT_0 && waited != windows::Win32::Foundation::WAIT_ABANDONED {
+    if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
         return Err((ERROR_TIMEOUT.0, format!("{what}'s DACL mutex")));
     }
     let changed = change_object(object, entry, what);
     // SAFETY: the mutex this thread holds.
-    let _ = unsafe { windows::Win32::System::Threading::ReleaseMutex(mutex.0) };
+    let _ = unsafe { ReleaseMutex(mutex.0) };
     changed
 }
 
@@ -1108,27 +1264,35 @@ impl Desktop {
                 windows::Win32::Security::CopySid(bytes, PSID(copy.as_mut_ptr().cast()), sid.0)
             }
             .map_err(failed("the SID's copy"))?;
-            change_shared(
-                self.station(),
-                granted_all(PSID(copy.as_mut_ptr().cast())),
-                "the window station",
-            )?;
+            let mut grants = STATION_GRANTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((_, users)) = grants.iter_mut().find(|(s, _)| *s == copy) {
+                *users += 1;
+            } else {
+                change_shared(
+                    self.station(),
+                    granted_all(PSID(copy.as_mut_ptr().cast())),
+                    "the window station",
+                )?;
+                grants.push((copy.clone(), 1));
+            }
             self.station_grant = Some(copy);
         }
         Ok(self)
     }
 }
 
+/// The station grants this process's workers hold, by SID, each with how
+/// many workers use it: the first grants it and the last revokes it, so a
+/// worker dropping never takes the grant from another of its AppContainer.
+#[cfg(test)]
+static STATION_GRANTS: Mutex<Vec<(Vec<u32>, usize)>> = Mutex::new(Vec::new());
+
 impl Drop for Desktop {
     fn drop(&mut self) {
         #[cfg(test)]
-        if let Some(mut sid) = self.station_grant.take() {
-            let revoked = revoked(PSID(sid.as_mut_ptr().cast()));
-            if let Err((code, what)) = change_shared(self.station(), revoked, "the window station")
-            {
-                eprintln!("revoking a test's grant of {what} failed (error {code})");
-            }
-        }
+        let failed = self.release_station();
         // SAFETY: the desktop and window station this value made, unused
         // after this.
         unsafe {
@@ -1137,6 +1301,42 @@ impl Drop for Desktop {
             }
             let _ = CloseWindowStation(self.station);
         }
+        // A grant left behind outlives the test: the test fails.
+        #[cfg(test)]
+        if let Some(message) = failed {
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Desktop {
+    /// Gives up this worker's use of its station grant, revoked when it was
+    /// the last to use it: what failed, if the revocation did.
+    fn release_station(&mut self) -> Option<String> {
+        let mut sid = self.station_grant.take()?;
+        let mut grants = STATION_GRANTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let users = grants
+            .iter_mut()
+            .find(|(s, _)| *s == sid)
+            .map(|(_, users)| {
+                *users -= 1;
+                *users
+            });
+        grants.retain(|(_, users)| *users > 0);
+        if users.is_some_and(|n| n > 0) {
+            return None;
+        }
+        let revoked = revoked(PSID(sid.as_mut_ptr().cast()));
+        change_shared(self.station(), revoked, "the window station")
+            .err()
+            .map(|(code, what)| format!("revoking a test's grant of {what} failed (error {code})"))
     }
 }
 
@@ -1254,11 +1454,19 @@ struct Child {
 }
 
 impl Child {
-    /// Resumes its thread.
-    fn resume(&self) -> Result<(), Failure> {
+    /// Resumes its thread, which must have been suspended `times` times: with
+    /// more it would stay suspended.
+    fn resume(&self, times: u32) -> Result<(), Failure> {
         // SAFETY: the thread this launch made suspended.
-        if unsafe { ResumeThread(self.thread.0) } == u32::MAX {
+        let previous = unsafe { ResumeThread(self.thread.0) };
+        if previous == u32::MAX {
             return Err((last_error(), "resuming it".to_owned()));
+        }
+        if previous != times {
+            return Err((
+                0,
+                format!("its thread was suspended {previous} times, not {times}"),
+            ));
         }
         Ok(())
     }
@@ -1266,15 +1474,11 @@ impl Child {
     /// Terminates it for `(step, failure)`, waiting until it has ended.
     fn refuse(mut self, (step, (code, what)): (Step, Failure)) -> LaunchError {
         self.armed = false;
-        let exit = terminate(self.process.0);
-        #[cfg(not(test))]
-        let _ = exit;
         LaunchError {
             step,
             code,
             what,
-            #[cfg(test)]
-            exit,
+            process: terminate(self.process.0),
         }
     }
 
@@ -1294,19 +1498,19 @@ impl Drop for Child {
     }
 }
 
-/// Terminates `process` and waits up to 5 s until it has ended: its exit
-/// code, or `None` when it has not ended by then.
-fn terminate(process: HANDLE) -> Option<u32> {
+/// Terminates `process` and waits up to 5 s until it has ended: whether it
+/// ended, and with what.
+fn terminate(process: HANDLE) -> Made {
     // SAFETY: a process this launch made.
     let _ = unsafe { TerminateProcess(process, REFUSED) };
     // SAFETY: as above.
     if unsafe { WaitForSingleObject(process, 5_000) } != WAIT_OBJECT_0 {
-        return None;
+        return Made::Running;
     }
     let mut exit = 0;
     // SAFETY: as above.
-    unsafe { GetExitCodeProcess(process, &raw mut exit) }.ok()?;
-    Some(exit)
+    let read = unsafe { GetExitCodeProcess(process, &raw mut exit) };
+    Made::Ended(read.is_ok().then_some(exit))
 }
 
 /// The attribute list's storage, deleted when dropped.
@@ -1546,7 +1750,7 @@ fn check(
             format!("its thread was resumed ({previous} suspensions)"),
         ));
     }
-    child.resume()?;
+    child.resume(2)?;
     if expected.has(Restrictions::JOB) {
         let Some(job) = job else {
             return Err((0, "no job".to_owned()));
