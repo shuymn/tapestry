@@ -165,6 +165,26 @@ impl Screen {
         let _ = self.images();
         self.w.cursor_entry().unwrap().0
     }
+
+    /// Steps the worker until the cursor's request is served, its fill
+    /// has ended and nothing runs or waits, taking the changes of the
+    /// cursor's value.
+    fn filled(&self) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let _ = self.w.take_changed();
+            if !self.w.cursor_waiting() && self.w.idle() {
+                break;
+            }
+            assert!(Instant::now() < end, "{:?}", self.w);
+            self.w.cursor_step(
+                &self.sel.coord,
+                self.sel.spawner,
+                &self.render.chart_publisher(),
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// The cursor's request is made once it rested 150 ms on a chart, not
@@ -215,8 +235,10 @@ fn a_move_before_the_rest_makes_no_request() {
     assert!(!s.rest(289));
     assert!(s.rest(290));
     assert!(matches!(s.read(), EntryState::Resident { .. }));
-    assert_eq!(s.w.begun(), 1);
-    assert_eq!(s.w.counts().0, 1);
+    // b's read, then the fill's of a, its neighbour.
+    s.filled();
+    assert_eq!(s.w.begun(), 2);
+    assert_eq!(s.w.counts().0, 2);
 }
 
 /// A row that is no chart asks for nothing and is absent; a chart naming
@@ -303,6 +325,74 @@ fn a_rescan_changes_the_request_only_with_its_chart() {
             .map(|c| matches!(c, CursorChart::Resident { .. })),
         Some(true)
     );
+}
+
+/// After the cursor's rest the fill reads the charts near it on the list,
+/// nearest first around the ring, each folder's names once (AC-S3): the
+/// cursor on the third of six charts, its row takes slot 0 and its
+/// neighbours the next slots in the order +1, −1, +2, −2, +3; a chart
+/// naming no image is passed over, and a list read again keeping the
+/// cursor reads a chart that came near it.
+#[test]
+fn the_fill_reads_the_charts_near_the_cursor_nearest_first() {
+    let _serial = crate::imports::tests::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let names = [
+        ("c0.bms", Some("hidden-a.png"), Some("hidden-n.png")),
+        ("c1.bms", Some("hidden-a.png"), Some("hidden-m.png")),
+        ("c2.bms", Some("hidden-b.png"), Some("hidden-n.png")),
+        ("c3.bms", Some("hidden-b.png"), Some("hidden-m.png")),
+        ("c4.bms", Some("hidden-a.png"), None),
+        ("c5.bms", None, Some("hidden-n.png")),
+        ("c6.bms", None, None),
+    ];
+    let (sel, root) = library(dir.path(), &names);
+    let mut s = Screen::new(sel);
+    let id = |i: usize| {
+        let (_, stage, banner) = names[i];
+        let name =
+            |n: Option<&str>| n.map_or(library::Name::None, |n| library::Name::Named(n.to_owned()));
+        crate::chart_images::CursorId {
+            dir: root.clone(),
+            names: [name(stage), name(banner)],
+        }
+    };
+    let slot = |s: &Screen, i: usize| match s.w.entry(&id(i)).map(|e| e.0) {
+        Some(EntryState::Resident { slot, .. }) => Some(slot),
+        _ => None,
+    };
+    // The all-charts row, then c0 to c6: the cursor on c2.
+    keys(&mut s.sel, &[MenuKey::Down, MenuKey::Down, MenuKey::Down]);
+    s.show(0);
+    assert_eq!(
+        s.sel.screen.selected().map(|c| c.path.clone()),
+        Some(root.join("c2.bms"))
+    );
+    assert!(s.rest(150));
+    s.filled();
+    // c2, then c3, c1, c4, c0, c5; c6 names no image (the ring's +4 is
+    // the all-charts row, past half of eight rows).
+    let order: Vec<Option<u16>> = [2, 3, 1, 4, 0, 5].iter().map(|&i| slot(&s, i)).collect();
+    assert_eq!(order, (0..6).map(Some).collect::<Vec<_>>());
+    assert!(s.w.entry(&id(6)).is_none());
+    assert_eq!(s.w.begun(), 6);
+    // A chart that came near the cursor, read at the list's refresh.
+    write(&root, "c21.bms", Some("hidden-b.png"), None);
+    settle(&mut s.sel);
+    s.show(400);
+    s.filled();
+    let new = crate::chart_images::CursorId {
+        dir: root.clone(),
+        names: [
+            library::Name::Named("hidden-b.png".to_owned()),
+            library::Name::None,
+        ],
+    };
+    assert!(matches!(
+        s.w.entry(&new).map(|e| e.0),
+        Some(EntryState::Resident { slot: 6, .. })
+    ));
+    assert_eq!(s.w.begun(), 7, "a filled row read again");
 }
 
 /// Lets go of [`HOLD_HARD`] when dropped.
@@ -425,10 +515,12 @@ fn a_deferred_request_wakes_the_select_screen_within_a_slice() {
         assert!(wake.0 <= after.0 + slice, "{wake:?} {after:?}");
         HOLD_HARD.store(false, Ordering::Release);
         rig.clock.run();
-        look_until(rig, |w| w.begun() == 2);
+        look_until(rig, |w| w.begun() >= 2);
         look_until(rig, resident);
-        // B's stage file alone.
-        assert_eq!(rig.chart_images.counts().0, 1);
+        // B's stage file alone, then the fill's read of A, its neighbour:
+        // A's stage file and banner.
+        look_until(rig, |w| w.begun() == 3 && w.idle() && !w.cursor_waiting());
+        assert_eq!(rig.chart_images.counts().0, 3);
     });
 }
 

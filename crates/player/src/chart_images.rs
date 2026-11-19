@@ -39,7 +39,17 @@
 //!   at once while its entry stays; each use of an entry is checked after
 //!   it by a job of its own (design.md "Load Pipeline", Freshness). A new
 //!   pool generation drops the resident entries.
+//! - **The fill**: once the cursor's row is served, the rows near it (the
+//!   request's neighbours, nearest first) are read the same way, each by a
+//!   speculative job of its own in Windows background mode
+//!   ([`crate::page_jobs::JobMode`]), one at a time, admitted a slot no
+//!   pin holds and the rest has not filled, shown or kept
+//!   ([`pool::Slots::admit_within`]); a resident row of the window is kept
+//!   for the rest. A change of the cursor stops it; with no speculative
+//!   permit it never runs, and a refused background mode ends it for the
+//!   run.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +74,11 @@ pub(crate) use pool::{EntryState, SlotState};
 #[cfg(test)]
 pub static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A row read's filesystem steps: its folder, and each image it resolves
+/// (tests).
+#[cfg(test)]
+pub static FS_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub use crate::chart_currency::{ChartNow, PublicationKey, PublishedTo};
 
 // A name the library keeps is one the chart-image reader accepts.
@@ -73,6 +88,16 @@ const _: () = assert!(library::IMAGE_NAME_BYTES == skin_model::MAX_PATH_BYTES);
 /// (tests: a job that ignores its cancel).
 #[cfg(test)]
 pub static HOLD_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds every row read (the cursor's or a neighbour's) until let go,
+/// whatever its cancel says, and no attempt's read (tests: a fill read
+/// stalled for a core).
+#[cfg(test)]
+pub static HOLD_ROW_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a row read is held by [`HOLD_ROW_HARD`] (tests).
+#[cfg(test)]
+pub static HELD_ROW_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set while a read is held by [`HOLD_HARD`] (tests).
 #[cfg(test)]
@@ -549,8 +574,22 @@ pub struct CursorId {
 #[derive(Debug)]
 pub struct CursorRequest {
     id: CursorId,
+    /// The rows the fill reads after it, nearest first.
+    neighbours: Vec<CursorId>,
     cursor_generation: u64,
     subscriber: game::coord::Subscriber,
+}
+
+/// How many selectable rows on either side of the cursor the fill reads
+/// (design.md "Rendering and Skins", chart images).
+pub const FILL_REACH: usize = 16;
+
+/// The fill of one rest: its cursor generation, and the rows it has still
+/// to read, nearest first.
+#[derive(Debug)]
+struct Fill {
+    cursor_generation: u64,
+    rows: VecDeque<CursorId>,
 }
 
 /// The binding of `which`'s name in `id` as observed now: its name
@@ -652,9 +691,22 @@ fn read_row(
     cells: chart_image::ChartCells,
     cancel: &dyn Fn() -> bool,
 ) -> ChartImages {
+    let cancelled = || {
+        Arc::new(Read {
+            binding: chart_image::Binding::NoHeader,
+            image: Err(Absent::Cancelled),
+        })
+    };
+    if cancel() {
+        return ChartImages::of(ChartImage::ALL.map(|_| cancelled()));
+    }
+    #[cfg(test)]
+    FS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = ChartDir::new(&id.dir);
     #[cfg(test)]
     hold(cancel);
+    #[cfg(test)]
+    hold_row_hard();
     let identity: chart_image::Identity<'_> = &file_identity;
     let [stage, banner] = &id.names;
     let reads = ChartImage::ALL.map(|which| {
@@ -663,6 +715,11 @@ fn read_row(
             ChartImage::Banner => (banner, cells.of(which)),
             ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
         };
+        if cancel() {
+            return cancelled();
+        }
+        #[cfg(test)]
+        FS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let binding = binding_now(&dir, name, identity);
         let (Ok(dir), chart_image::Binding::Resolved { .. }, Some(_)) = (&dir, &binding, cell)
         else {
@@ -716,6 +773,94 @@ fn hold_check() {
         std::thread::sleep(Duration::from_millis(1));
     }
     CHECK_HELD.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Where a fill read stops while its worker's [`FillGates`] are shut
+/// (tests): as it begins, before its first checkpoint, and once read, its
+/// result made but not returned. A read held there ignores its stop, as
+/// one starved of a core or past its last checkpoint does.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillGate {
+    Begun = 1,
+    Read = 2,
+}
+
+/// A worker's fill gates (tests): while `shut`, every fill read it begins
+/// stops at each [`FillGate`] until a pass is granted; open, it passes.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct FillGates {
+    pub shut: std::sync::atomic::AtomicBool,
+    /// The gate a fill read waits at, as a [`FillGate`]'s value; 0 for
+    /// none.
+    pub at: std::sync::atomic::AtomicU8,
+    /// Passes granted: each lets one waiting fill read through its gate.
+    pub pass: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(test)]
+impl FillGates {
+    /// Stops a fill read at `at` while shut, until a pass is granted or
+    /// the gates open.
+    fn wait(&self, at: FillGate) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        if !self.shut.load(Acquire) {
+            return;
+        }
+        self.at.store(at as u8, Release);
+        while self.shut.load(Acquire)
+            && self
+                .pass
+                .try_update(AcqRel, Acquire, |p| p.checked_sub(1))
+                .is_err()
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.at.store(0, Release);
+    }
+}
+
+/// A read seen by [`ChartImageWorker::fill_probe`] (tests): its row, its
+/// version, its fill epoch if a neighbour's, and whether its thread ended
+/// (a pool write: whether it was sent).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probed {
+    pub row: CursorId,
+    pub version: u64,
+    pub epoch: Option<u64>,
+    pub done: bool,
+}
+
+/// What the fill's interleavings look at (tests).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillProbe {
+    /// The read in flight.
+    pub job: Option<Probed>,
+    /// Whether a read is left behind, and whether its thread ended.
+    pub left_behind: Option<bool>,
+    /// The pool write from a read's end to its answer.
+    pub write: Option<Probed>,
+    pub fill_epoch: u64,
+    /// Whether a cursor request is deferred, the cursor's read is to be
+    /// asked again, the fill has rows, and it is off for the run.
+    pub flags: [bool; 4],
+    pub slots: Vec<SlotState>,
+    /// The row last asked for, and the fill's rows left.
+    pub asked: Option<CursorId>,
+    pub fill_rows: Vec<CursorId>,
+}
+
+/// Holds a row read while [`HOLD_ROW_HARD`] is set (tests).
+#[cfg(test)]
+fn hold_row_hard() {
+    while HOLD_ROW_HARD.load(std::sync::atomic::Ordering::Acquire) {
+        HELD_ROW_HARD.store(true, std::sync::atomic::Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    HELD_ROW_HARD.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Holds a read while [`HOLD`] is set and `cancel` does not answer, and
@@ -778,15 +923,52 @@ enum Target {
         fresh: bool,
         derive: [bool; 2],
     },
-    /// The cursor's request, for its cursor generation (I6), read into
-    /// slot `slot` of pool generation `generation` as read `version`.
+    /// The cursor's request, or a neighbour of its fill, for its cursor
+    /// generation (I6), read into slot `slot` of pool generation
+    /// `generation` as read `version`; a neighbour's job has its thread's
+    /// mode.
     Cursor {
         id: CursorId,
         cursor_generation: u64,
         generation: u64,
         slot: u16,
         version: u64,
+        fill: Option<FillRead>,
     },
+}
+
+/// A fill read's identity, fixed when it begins: the fill epoch it
+/// belongs to and its thread's mode (design.md "Rendering and Skins",
+/// chart images). Its role, a neighbour's, is that it has one.
+#[derive(Debug, Clone)]
+struct FillRead {
+    epoch: u64,
+    mode: Arc<crate::page_jobs::JobMode>,
+}
+
+/// What a read was begun as, which its pool write keeps to its answer:
+/// the cursor's row, or a neighbour of fill epoch `epoch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Cursor,
+    Fill { epoch: u64 },
+}
+
+/// The bytes a fill read left behind at a choice is counted at until its
+/// thread ends ("Memory Budget"): a row read holds its completed fit, at
+/// most a fit's bound, beside the image it is decoding, at most one
+/// image's whole-decode bound.
+pub const LEFT_BEHIND_BYTES: u64 = FIT_BYTES + chart_image::DECODE_LIMIT;
+
+/// One fit's bound ("Memory Budget"): 12 Mi texels at their largest
+/// padded allocation, with its mips.
+pub const FIT_BYTES: u64 = 67_718_480;
+
+/// A fill read left behind at a choice: its job, stopped, and its mode,
+/// whose refusal is recorded when it settles.
+struct LeftBehind {
+    job: OwnedJob<Arc<Output>>,
+    mode: Arc<crate::page_jobs::JobMode>,
 }
 
 /// A row's pool write, from its read's end to its answer: what it is for,
@@ -795,8 +977,13 @@ enum Target {
 struct PendingWrite {
     generation: u64,
     slot: u16,
+    /// The rest (cursor generation) its read was of.
+    rest: u64,
     row: CursorId,
     version: u64,
+    /// What its read was begun as: its answer is adopted under that
+    /// role's eviction rule.
+    role: Role,
     fits: Arc<ChartImages>,
     /// The answer, once sent; `None` until the select screen's step sends
     /// it.
@@ -862,6 +1049,13 @@ struct Core {
     job: Option<Job>,
     /// A job of an earlier want or generation, its thread not yet joined.
     obsolete: Option<OwnedJob<Arc<Output>>>,
+    /// A fill read left behind at a choice, stopped, its thread not yet
+    /// joined: no job waits for it, its output is never taken, and no
+    /// fill read begins while it lives, so at most one is alive (design.md
+    /// "Load Pipeline", speculation is never waited on).
+    left_behind: Option<LeftBehind>,
+    /// The fill epoch: a fill read of another is discarded.
+    fill_epoch: u64,
     /// The selection's cursor generation: a new one at each change of the
     /// cursor's request.
     cursor_generation: u64,
@@ -873,6 +1067,12 @@ struct Core {
     /// The cursor's row whose request was taken in this rest, if any: a
     /// pool generation that drops what it read reads it again.
     asked: Option<CursorId>,
+    /// The fill of the rows near the cursor, once its row was taken.
+    fill: Option<Fill>,
+    /// The fill's thread mode, and whether a refused background mode
+    /// ended the fill for the run.
+    fill_mode: Arc<dyn crate::priority::ThreadMode>,
+    fill_off: bool,
     /// The rows read (design.md "Rendering and Skins", chart images).
     entries: pool::Entries,
     /// The live pool generation (0 for none) and its slots.
@@ -952,6 +1152,16 @@ struct Core {
     settled: u64,
     #[cfg(test)]
     abandoned: u64,
+    /// Tests: each entry evicted, by the version it held, and whether a
+    /// neighbour's read or write evicted it.
+    #[cfg(test)]
+    evictions: Vec<(bool, u64)>,
+    /// Tests: the fill reads' gates, and whether a read of an ended fill
+    /// epoch counts as current (the interleaving test's control).
+    #[cfg(test)]
+    gates: Arc<FillGates>,
+    #[cfg(test)]
+    epoch_control: bool,
 }
 
 /// The run's one owner of the chart-image worker (module doc): a handle,
@@ -975,8 +1185,11 @@ impl std::fmt::Debug for ChartImageWorker {
             .field("generation", &c.generation())
             .field("job", &c.job.as_ref().map(|j| &j.target))
             .field("obsolete", &c.obsolete.is_some())
+            .field("left_behind", &c.left_behind.is_some())
             .field("cursor", &c.cursor)
             .field("cursor_row", &c.cursor_row)
+            .field("fill", &c.fill)
+            .field("fill_off", &c.fill_off)
             .field("entries", &c.entries.len())
             .field("pool_generation", &c.pool_generation)
             .field("pending_write", &c.pending_write)
@@ -1013,10 +1226,22 @@ impl ChartImageWorker {
                 generation,
                 job: None,
                 obsolete: None,
+                left_behind: None,
+                fill_epoch: 0,
                 cursor_generation: 0,
                 cursor: None,
                 cursor_row: None,
                 asked: None,
+                fill: None,
+                #[cfg(not(test))]
+                fill_mode: Arc::new(crate::priority::Checked::SYSTEM),
+                // Tests keep a fill read at its thread's priority: in
+                // background mode it can wait seconds for a core while a
+                // whole test run keeps every core busy. The mode's own
+                // tests set theirs (`with_fill_mode`).
+                #[cfg(test)]
+                fill_mode: Arc::new(crate::priority::Checked::with(|_| Ok(()))),
+                fill_off: false,
                 entries: pool::Entries::default(),
                 pool_generation: 0,
                 slots: None,
@@ -1053,8 +1278,23 @@ impl ChartImageWorker {
                 settled: 0,
                 #[cfg(test)]
                 abandoned: 0,
+                #[cfg(test)]
+                evictions: Vec::new(),
+                #[cfg(test)]
+                gates: Arc::default(),
+                #[cfg(test)]
+                epoch_control: false,
             })),
         }
+    }
+
+    /// The worker with its fill's thread mode `mode` in place of the
+    /// system's (tests inject a refusal through it).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_fill_mode(self, mode: Arc<dyn crate::priority::ThreadMode>) -> Self {
+        self.core().fill_mode = mode;
+        self
     }
 
     fn core(&self) -> MutexGuard<'_, Core> {
@@ -1159,17 +1399,20 @@ impl ChartImageWorker {
     }
 
     /// The cursor's request for `dir`'s images `names` (the stage file's,
-    /// then the banner's): for the current cursor generation, its
-    /// subscriber to `coord`'s cursor scope taken now (D2).
+    /// then the banner's), and the `neighbours` its fill reads after it,
+    /// nearest first: for the current cursor generation, its subscriber to
+    /// `coord`'s cursor scope taken now (D2).
     pub fn cursor_request(
         &self,
         dir: PathBuf,
         names: [library::Name; 2],
+        neighbours: Vec<CursorId>,
         coord: &Coordinator,
     ) -> CursorRequest {
         let c = self.core();
         CursorRequest {
             id: CursorId { dir, names },
+            neighbours,
             cursor_generation: c.cursor_generation,
             subscriber: coord.subscriber(Scope::Cursor),
         }
@@ -1201,6 +1444,28 @@ impl ChartImageWorker {
         }
     }
 
+    /// The list was read again with the cursor kept on its row: the fill
+    /// reads `neighbours`, the rows near it now, nearest first, in place of
+    /// what it had left (the request's, while it is deferred). Nothing
+    /// before the cursor's row was taken in this rest.
+    pub fn refill(&self, neighbours: Vec<CursorId>) {
+        let mut c = self.core();
+        if c.ended {
+            return;
+        }
+        c.end_fill_epoch();
+        if let Some(request) = c.cursor.as_mut() {
+            request.neighbours = neighbours;
+            return;
+        }
+        if c.asked.is_some() && c.asked == c.cursor_row {
+            c.fill = Some(Fill {
+                cursor_generation: c.cursor_generation,
+                rows: neighbours.into(),
+            });
+        }
+    }
+
     /// Selection is left (D2, SC5), before the play generation renews:
     /// what [`cursor_changed`](Self::cursor_changed) does, and the
     /// selection's starter goes, so nothing of selection begins after it;
@@ -1211,6 +1476,7 @@ impl ChartImageWorker {
     pub fn leave_selection(&self, coord: &Coordinator) {
         let mut c = self.core();
         c.cursor_changed(coord, None);
+        c.abandon_fill_read();
         if c.starter_cursor {
             c.starter = None;
             c.starter_cursor = false;
@@ -1288,11 +1554,12 @@ impl ChartImageWorker {
                 .as_ref()
                 .is_some_and(|s| s.row.as_ref() == Some(r) && s.version == Some(v));
             c.entries.touch(r);
+            let rest = c.cursor_generation;
             if let CursorChart::Resident { generation, slot } = chart
                 && generation == c.pool_generation
                 && let Some(slots) = c.slots.as_mut()
             {
-                slots.touch(slot);
+                slots.touch(slot, rest);
             }
             if !same || entered || refreshed {
                 c.use_clock += 1;
@@ -1336,6 +1603,7 @@ impl ChartImageWorker {
                 .as_ref()
                 .is_some_and(|j| matches!(j.target, Target::Cursor { .. }))
             || c.pending_write.is_some()
+            || c.fill.is_some()
             || c.check.is_some()
             || c.check_queued.is_some()
             || c.rearm
@@ -1437,6 +1705,28 @@ impl ChartImageWorker {
     #[must_use]
     pub fn cursor_generation(&self) -> u64 {
         self.core().cursor_generation
+    }
+
+    /// Pads the entries with rows no list has, newer than every entry
+    /// there: absent ones, or ones in `like`'s slot (which its rest and
+    /// pins protect); up to the count bound, or with `leave`, one that
+    /// leaves `leave` bytes below the byte bound (tests).
+    #[cfg(test)]
+    pub fn pad_entries(&self, like: Option<&CursorId>, leave: Option<usize>) {
+        let mut c = self.core();
+        let state = like
+            .and_then(|r| c.entries.get(r))
+            .map_or(pool::EntryState::Absent, |e| e.state);
+        c.entries.pad(state, leave);
+    }
+
+    /// Whether the fill has rows left, and whether a refused background
+    /// mode ended it for the run (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn fill_state(&self) -> (bool, bool) {
+        let c = self.core();
+        (c.fill.is_some(), c.fill_off)
     }
 
     /// Whether a cursor request is deferred (tests).
@@ -1693,7 +1983,101 @@ impl ChartImageWorker {
     #[must_use]
     pub fn idle(&self) -> bool {
         let c = self.core();
-        c.job.is_none() && c.obsolete.is_none()
+        c.job.is_none() && c.obsolete.is_none() && c.left_behind.is_none()
+    }
+
+    /// Whether a fill read left behind at a choice is still alive (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn left_behind_alive(&self) -> bool {
+        self.core().left_behind.is_some()
+    }
+
+    /// The speculative bytes counted for a fill read left behind at a
+    /// choice (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn left_behind_bytes(&self) -> u64 {
+        self.core().left_behind_bytes()
+    }
+
+    /// The fill's state for its interleavings (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn fill_probe(&self) -> FillProbe {
+        let c = self.core();
+        let job = c.job.as_ref().and_then(|j| match &j.target {
+            Target::Cursor {
+                id, version, fill, ..
+            } => Some(Probed {
+                row: id.clone(),
+                version: *version,
+                epoch: fill.as_ref().map(|f| f.epoch),
+                done: j.job.finished(),
+            }),
+            Target::Attempt { .. } => None,
+        });
+        let write = c.pending_write.as_ref().map(|p| Probed {
+            row: p.row.clone(),
+            version: p.version,
+            epoch: match p.role {
+                Role::Cursor => None,
+                Role::Fill { epoch } => Some(epoch),
+            },
+            done: p.rx.is_some(),
+        });
+        FillProbe {
+            job,
+            left_behind: c.left_behind.as_ref().map(|l| l.job.finished()),
+            write,
+            fill_epoch: c.fill_epoch,
+            flags: [c.cursor.is_some(), c.rearm, c.fill.is_some(), c.fill_off],
+            slots: c
+                .slots
+                .as_ref()
+                .map(pool::Slots::states)
+                .unwrap_or_default(),
+            asked: c.asked.clone(),
+            fill_rows: c
+                .fill
+                .as_ref()
+                .map(|f| f.rows.iter().cloned().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The gates its fill reads stop at (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn fill_gates(&self) -> Arc<FillGates> {
+        Arc::clone(&self.core().gates)
+    }
+
+    /// Breaks the fill epoch's discard: a read of an ended epoch counts as
+    /// current (tests: the interleaving test's control).
+    #[cfg(test)]
+    pub fn break_epoch(&self) {
+        self.core().epoch_control = true;
+    }
+
+    /// The entries evicted since the last call, by version, and whether a
+    /// neighbour's read or write evicted each (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn take_evictions(&self) -> Vec<(bool, u64)> {
+        std::mem::take(&mut self.core().evictions)
+    }
+
+    /// Withdraws the cursor's row's entry, if it has one, as a check that
+    /// found it changed does (tests).
+    #[cfg(test)]
+    pub fn withdraw_cursor_entry(&self) {
+        let mut c = self.core();
+        if let Some(row) = c.cursor_row.clone()
+            && c.entries.get(&row).is_some()
+        {
+            c.withdraw(&row);
+        }
     }
 
     /// At the run's end: nothing begins from here (no want, step, service
@@ -1716,6 +2100,7 @@ impl ChartImageWorker {
         c.cursor = None;
         c.cursor_row = None;
         c.asked = None;
+        c.fill = None;
         c.entries.clear();
         c.slots = None;
         c.pool_generation = 0;
@@ -1725,7 +2110,11 @@ impl ChartImageWorker {
         c.rearm = false;
         c.changed = false;
         let deadline = Instant::now() + STOP_WAIT;
-        let jobs = [c.job.take().map(|j| j.job), c.obsolete.take()];
+        let jobs = [
+            c.job.take().map(|j| j.job),
+            c.obsolete.take(),
+            c.left_behind.take().map(|l| l.job),
+        ];
         let check = c.check.take().map(|k| k.job);
         let ended = jobs
             .into_iter()
@@ -1856,7 +2245,9 @@ impl Core {
         coord.advance(Scope::Cursor);
         self.cursor_row = row;
         self.asked = None;
+        self.fill = None;
         self.rearm = false;
+        self.end_fill_epoch();
     }
 
     /// Whether play's publication is unanswered.
@@ -1929,10 +2320,26 @@ impl Core {
     /// Inserts `entry` for `row`, freeing the slots of the entries it
     /// evicts and its own if it is not kept; the cursor row's value
     /// changes when it is the cursor's.
-    fn adopt_entry(&mut self, row: CursorId, entry: pool::Entry) {
+    fn adopt_entry(&mut self, (row, role): (CursorId, Role), entry: pool::Entry) {
         let (version, state) = (entry.version, entry.state);
         let cursor = self.cursor_row.as_ref() == Some(&row);
-        let (kept, gone) = self.entries.insert(row, entry);
+        let fill = matches!(role, Role::Fill { .. });
+        let pins = self.fill_pins();
+        let (generation, rest, slots) = (
+            self.pool_generation,
+            self.cursor_generation,
+            self.slots.as_ref(),
+        );
+        // The cursor's read of the cursor's row may evict any entry; a
+        // neighbour's evicts none whose slot this rest filled, showed or
+        // kept, or a pin holds, as its slot admission takes none of them,
+        // even when the cursor has since moved onto its row.
+        let free = cursor && !fill;
+        let evictable = |e: &pool::Entry| free || !protected(e, generation, rest, slots, pins);
+        let (kept, gone) = self.entries.insert(row, entry, &evictable);
+        #[cfg(test)]
+        self.evictions
+            .extend(gone.iter().map(|e| (fill, e.version)));
         for e in gone {
             if let pool::EntryState::Resident { generation, slot } = e.state {
                 self.free_slot(generation, slot, e.version);
@@ -1940,6 +2347,11 @@ impl Core {
         }
         if !kept && let pool::EntryState::Resident { generation, slot } = state {
             self.free_slot(generation, slot, version);
+        }
+        // No room left for this rest's rows: the fill stops, never
+        // evicting what it filled.
+        if !kept && fill {
+            self.fill = None;
         }
         if cursor {
             self.changed = true;
@@ -1970,7 +2382,11 @@ impl Core {
         match answer {
             Ok(()) if p.generation == self.pool_generation => {
                 if let Some(slots) = self.slots.as_mut() {
-                    slots.set(p.slot, pool::SlotState::Resident { version: p.version });
+                    slots.set(
+                        p.slot,
+                        pool::SlotState::Resident { version: p.version },
+                        p.rest,
+                    );
                 }
                 let bindings = [
                     p.fits.read(ChartImage::Stage).binding.clone(),
@@ -1980,7 +2396,10 @@ impl Core {
                     generation: p.generation,
                     slot: p.slot,
                 };
-                self.adopt_entry(p.row, pool::Entry::new(p.version, bindings, state));
+                self.adopt_entry(
+                    (p.row, p.role),
+                    pool::Entry::new(p.version, bindings, state),
+                );
             }
             Ok(()) => {}
             Err(e) => {
@@ -2012,10 +2431,10 @@ impl Core {
 
     /// Reads the live pool (P-h): when its generation changed or ended,
     /// the resident entries and the slots go, the absent entries stay, a
-    /// read's write not yet sent goes, and the cursor's row, its read
-    /// asked in this rest and now without an entry, is read again as on a
-    /// cold start. Logs the pool's change once, and its absence at the
-    /// first read.
+    /// read's write not yet sent goes, the fill stops, and the cursor's
+    /// row, its read asked in this rest, is requested again as on a cold
+    /// start, its neighbours after it. Logs the pool's change once, and its
+    /// absence at the first read.
     fn sync_pool(&mut self, publisher: &crate::render_side::ChartPublisher) {
         let (layout, _) = publisher.pool_now();
         let generation = layout.map_or(0, |l| l.generation);
@@ -2051,13 +2470,17 @@ impl Core {
         if self.pending_write.as_ref().is_some_and(|p| p.rx.is_none()) {
             self.pending_write = None;
         }
+        self.fill = None;
+        // A fill read in flight is of the old generation, its output to
+        // be dropped: its epoch ends, so the cursor's read asked again
+        // below does not wait for it to get a permit or finish its file.
+        self.end_fill_epoch();
         if resident {
             self.changed = true;
         }
         if generation != 0
             && let Some(row) = &self.cursor_row
             && self.asked.as_ref() == Some(row)
-            && self.entries.get(row).is_none()
         {
             self.rearm = true;
         }
@@ -2208,15 +2631,122 @@ impl Core {
             "chart images: {} changed since it was read",
             k.row.dir.display()
         );
-        if let Some(e) = self.entries.remove(&k.row)
+        self.withdraw(&k.row);
+    }
+
+    /// Withdraws `row`'s entry, its slot freed; when it is the cursor's
+    /// row, its value changes and its read is requested again with no
+    /// move, before the fill's rows: the fill epoch ends.
+    fn withdraw(&mut self, row: &CursorId) {
+        if let Some(e) = self.entries.remove(row)
             && let pool::EntryState::Resident { generation, slot } = e.state
         {
             self.free_slot(generation, slot, e.version);
         }
-        if self.cursor_row.as_ref() == Some(&k.row) {
+        if self.cursor_row.as_ref() == Some(row) {
             self.changed = true;
             self.rearm = true;
+            // The cursor's row goes first: the fill's epoch ends; the
+            // request asked again brings the fill's rows.
+            self.end_fill_epoch();
         }
+    }
+
+    /// Ends the fill epoch (design.md "Rendering and Skins", chart
+    /// images): the fill read in flight is stopped and its result, when it
+    /// ends, discarded ([`cursor_finished`](Self::cursor_finished)), and a
+    /// fill write not yet sent is dropped, its slot freed. A write already
+    /// sent is the render thread's: its answer is adopted under its role.
+    fn end_fill_epoch(&mut self) {
+        self.fill_epoch += 1;
+        if let Some(Job {
+            target: Target::Cursor { fill: Some(_), .. },
+            job,
+        }) = &self.job
+        {
+            job.stop();
+        }
+        if self
+            .pending_write
+            .as_ref()
+            .is_some_and(|p| p.rx.is_none() && matches!(p.role, Role::Fill { .. }))
+            && let Some(p) = self.pending_write.take()
+        {
+            self.free_slot(p.generation, p.slot, p.version);
+        }
+    }
+
+    /// Whether a read begun as `role` is still of the current fill epoch:
+    /// the cursor's always, a neighbour's while its epoch lives.
+    fn role_current(&self, role: Role) -> bool {
+        #[cfg(test)]
+        if self.epoch_control {
+            return true;
+        }
+        match role {
+            Role::Cursor => true,
+            Role::Fill { epoch } => epoch == self.fill_epoch,
+        }
+    }
+
+    /// The speculative bytes counted for a fill read left behind at a
+    /// choice, from its abandonment until its thread ends ("Memory
+    /// Budget"): [`LEFT_BEHIND_BYTES`] while it lives, else none.
+    fn left_behind_bytes(&self) -> u64 {
+        if self.left_behind.is_some() {
+            LEFT_BEHIND_BYTES
+        } else {
+            0
+        }
+    }
+
+    /// The slots a pin holds now: the newest update sent, and the one the
+    /// render thread displayed when the worker last had its publisher.
+    fn fill_pins(&self) -> [Option<u16>; 2] {
+        self.starter
+            .as_ref()
+            .and_then(|(_, _, p)| p.as_ref())
+            .map_or([None, None], |p| {
+                pins(self.sent.as_ref(), self.pool_generation, p)
+            })
+    }
+
+    /// At a choice, a fill read in flight is stopped and left behind, so
+    /// the chosen chart's job never waits for it: its slot is freed now,
+    /// as its output is never taken, and it is settled once its thread
+    /// ends. A read in background mode can wait seconds for a core while
+    /// the chart's load or other software keeps every core busy (design.md
+    /// "Load Pipeline"). With one already left behind no fill read began,
+    /// so there is none to leave.
+    fn abandon_fill_read(&mut self) {
+        if !self
+            .job
+            .as_ref()
+            .is_some_and(|j| matches!(j.target, Target::Cursor { fill: Some(_), .. }))
+            || self.left_behind.is_some()
+        {
+            return;
+        }
+        let Some(Job {
+            target:
+                Target::Cursor {
+                    generation,
+                    slot,
+                    version,
+                    fill: Some(FillRead { mode, .. }),
+                    ..
+                },
+            job,
+        }) = self.job.take()
+        else {
+            return;
+        };
+        job.stop();
+        self.free_slot(generation, slot, version);
+        log::info!(
+            "chart images: a fill read left behind, {LEFT_BEHIND_BYTES} bytes counted until it ends"
+        );
+        self.left_behind = Some(LeftBehind { job, mode });
     }
 
     fn retire(&mut self, job: OwnedJob<Arc<Output>>) {
@@ -2359,8 +2889,9 @@ impl Core {
             self.result = Some(h);
         }
         log::info!(
-            "chart images: read; {} bytes retained",
-            self.retained_bytes()
+            "chart images: read; {} bytes retained, {} counted for a fill read left behind",
+            self.retained_bytes(),
+            self.left_behind_bytes()
         );
     }
 
@@ -2375,6 +2906,20 @@ impl Core {
             && let Some(old) = self.obsolete.take()
         {
             settle_logged(old);
+        }
+        if self.left_behind.as_ref().is_some_and(|l| l.job.finished())
+            && let Some(old) = self.left_behind.take()
+        {
+            settle_logged(old.job);
+            log::info!(
+                "chart images: the fill read left behind ended, its {LEFT_BEHIND_BYTES} bytes no longer counted"
+            );
+            // A refused background mode ends the fill for the run, as for
+            // a read taken (below); its job logged it once.
+            if old.mode.refused() {
+                self.fill_off = true;
+                self.fill = None;
+            }
         }
         let Some(job) = self.job.take() else {
             return;
@@ -2398,7 +2943,22 @@ impl Core {
                 generation,
                 slot,
                 version,
-            } => self.cursor_finished(id, cursor_generation, (generation, slot, version), outcome),
+                fill,
+            } => {
+                // A refused background mode ends the fill for the run; its
+                // job logged it once.
+                if fill.as_ref().is_some_and(|f| f.mode.refused()) {
+                    self.fill_off = true;
+                    self.fill = None;
+                }
+                let role = fill.map_or(Role::Cursor, |f| Role::Fill { epoch: f.epoch });
+                self.cursor_finished(
+                    (id, role),
+                    cursor_generation,
+                    (generation, slot, version),
+                    outcome,
+                );
+            }
         }
     }
 
@@ -2460,7 +3020,7 @@ impl Core {
     /// read again at a later rest.
     fn cursor_finished(
         &mut self,
-        id: CursorId,
+        (id, role): (CursorId, Role),
         cursor_generation: u64,
         (generation, slot, version): (u64, u16, u64),
         outcome: Option<Outcome<Arc<Output>>>,
@@ -2487,8 +3047,9 @@ impl Core {
             }
             Some(Outcome::Cancelled) | None => None,
         };
-        let current =
-            cursor_generation == self.cursor_generation && generation == self.pool_generation;
+        let current = cursor_generation == self.cursor_generation
+            && generation == self.pool_generation
+            && self.role_current(role);
         let read =
             [ChartImage::Stage, ChartImage::Banner].map(|w| fits.as_ref().map(|f| f.read(w)));
         let whole = read.iter().all(|r| r.is_some_and(reusable));
@@ -2505,7 +3066,7 @@ impl Core {
                 fits.read(ChartImage::Banner).binding.clone(),
             ];
             self.adopt_entry(
-                id,
+                (id, role),
                 pool::Entry::new(version, bindings, pool::EntryState::Absent),
             );
             return;
@@ -2513,8 +3074,10 @@ impl Core {
         self.pending_write = Some(PendingWrite {
             generation,
             slot,
+            rest: cursor_generation,
             row: id,
             version,
+            role,
             fits,
             rx: None,
         });
@@ -2538,6 +3101,7 @@ impl Core {
         let Some(want) = self.want.clone() else {
             if self.starter_cursor {
                 self.begin_cursor(&coord, spawner, publish.as_ref());
+                self.begin_fill(&coord, spawner, publish.as_ref());
             } else {
                 self.starter = None;
             }
@@ -2667,6 +3231,10 @@ impl Core {
             return;
         }
         self.asked = Some(request.id.clone());
+        self.fill = Some(Fill {
+            cursor_generation: self.cursor_generation,
+            rows: request.neighbours.iter().cloned().collect(),
+        });
         if self.entries.get(&request.id).is_some() {
             return;
         }
@@ -2680,28 +3248,14 @@ impl Core {
                 ],
                 pool::EntryState::Absent,
             );
-            self.adopt_entry(request.id, entry);
+            self.adopt_entry((request.id, Role::Cursor), entry);
             return;
         }
         let Some((slots, publish)) = self.slots.as_mut().zip(publish) else {
             return;
         };
         let generation = slots.layout().generation;
-        // The pins: the slot the newest update sent names, and the one the
-        // render thread displayed last, read now.
-        let in_pool =
-            |chart: Option<(u64, u16)>| chart.filter(|&(g, _)| g == generation).map(|(_, s)| s);
-        let sent = self.sent.as_ref().and_then(|s| match s.chart {
-            crate::chart_currency::CursorChart::Resident { generation, slot } => {
-                Some((generation, slot))
-            }
-            _ => None,
-        });
-        let (_, displayed) = publish.pool_now();
-        let pins = [
-            in_pool(sent),
-            in_pool(crate::chart_currency::CursorChart::unpack(displayed)),
-        ];
+        let pins = pins(self.sent.as_ref(), generation, publish);
         let Some((slot, evicted)) = slots.admit(pins) else {
             // Every slot pinned or written: the request waits for a frame.
             self.cursor = Some(request);
@@ -2710,9 +3264,17 @@ impl Core {
         let cells = slots.layout().cells;
         self.versions += 1;
         let version = self.versions;
-        slots.set(slot, pool::SlotState::Writing { version });
-        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned() {
-            self.entries.remove(&row);
+        slots.set(
+            slot,
+            pool::SlotState::Writing { version },
+            self.cursor_generation,
+        );
+        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned()
+            && let Some(gone) = self.entries.remove(&row)
+        {
+            #[cfg(test)]
+            self.evictions.push((false, gone.version));
+            let _ = gone;
         }
         let CursorRequest { id, subscriber, .. } = request;
         self.begun += 1;
@@ -2739,6 +3301,7 @@ impl Core {
                         generation,
                         slot,
                         version,
+                        fill: None,
                     },
                     job,
                 });
@@ -2747,6 +3310,150 @@ impl Core {
                 // A thread that cannot start: no entry, the run goes on.
                 log::warn!("chart images: {e}");
                 self.free_slot(generation, slot, version);
+            }
+        }
+    }
+
+    /// Begins the fill's next read once nothing holds the worker and no
+    /// cursor request waits (design.md "Rendering and Skins", chart
+    /// images): the rows near the cursor, nearest first, skipping a row
+    /// with an entry (a resident one of the window kept for the rest, so
+    /// no farther row takes its slot) and one naming no image. The row is
+    /// admitted a slot no pin holds and this rest has not filled, shown or
+    /// kept ([`pool::Slots::admit_within`]), and read by a speculative job
+    /// of its own in Windows background mode, on the cursor's scope. With
+    /// no such slot, no speculative permit, no live pool, a refused
+    /// background mode earlier in the run, or a thread that cannot start,
+    /// the fill ends.
+    fn begin_fill(
+        &mut self,
+        coord: &Coordinator,
+        spawner: Spawner,
+        publish: Option<&crate::render_side::ChartPublisher>,
+    ) {
+        if self.held_back()
+            || self.cursor.is_some()
+            || self.ended
+            || self.rearm
+            || self.left_behind.is_some()
+        {
+            return;
+        }
+        let rest = self.cursor_generation;
+        if self.fill_off
+            || coord.caps().speculative == 0
+            || !self
+                .fill
+                .as_ref()
+                .is_some_and(|f| f.cursor_generation == rest)
+        {
+            self.fill = None;
+            return;
+        }
+        let (Some(publish), Some(generation)) =
+            (publish, self.slots.as_ref().map(|s| s.layout().generation))
+        else {
+            self.fill = None;
+            return;
+        };
+        let pins = pins(self.sent.as_ref(), generation, publish);
+        let slots = self.slots.as_ref();
+        if !self
+            .entries
+            .has_room(&|e| !protected(e, generation, rest, slots, pins))
+        {
+            self.fill = None;
+            return;
+        }
+        let (row, slot, evicted, cells) = loop {
+            let (Some(fill), Some(slots)) = (self.fill.as_mut(), self.slots.as_mut()) else {
+                return;
+            };
+            let Some(row) = fill.rows.pop_front() else {
+                self.fill = None;
+                return;
+            };
+            match self.entries.get(&row).map(|e| e.state) {
+                Some(pool::EntryState::Resident {
+                    generation: g,
+                    slot,
+                }) => {
+                    if g == generation {
+                        slots.touch(slot, rest);
+                    }
+                    continue;
+                }
+                Some(pool::EntryState::Absent) => continue,
+                None => {}
+            }
+            if row.names.iter().all(|n| *n == library::Name::None) {
+                continue;
+            }
+            let Some((slot, evicted)) = slots.admit_within(pins, rest) else {
+                self.fill = None;
+                return;
+            };
+            break (row, slot, evicted, slots.layout().cells);
+        };
+        self.versions += 1;
+        let version = self.versions;
+        if let Some(slots) = self.slots.as_mut() {
+            slots.set(slot, pool::SlotState::Writing { version }, rest);
+        }
+        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned()
+            && let Some(gone) = self.entries.remove(&row)
+        {
+            #[cfg(test)]
+            self.evictions.push((true, gone.version));
+            let _ = gone;
+        }
+        self.begun += 1;
+        let key = JobKey {
+            kind: JobKind::ChartImageFill,
+            path: row.dir.clone(),
+            speed: bms_model::Speed::NORMAL,
+        };
+        let mode =
+            crate::page_jobs::JobMode::new(Arc::clone(&self.fill_mode), "chart images: fill");
+        let epoch = self.fill_epoch;
+        let (hook, stop) = (Arc::clone(&mode), Arc::clone(&mode));
+        #[cfg(test)]
+        let gates = Arc::clone(&self.gates);
+        let read = row.clone();
+        let spawned = coord.spawn_owned(
+            spawner,
+            key,
+            (Class::Speculative, false, Owner::Speculative),
+            coord.subscriber(Scope::Cursor),
+            move |class| hook.on_class(class),
+            move |ctx| {
+                #[cfg(test)]
+                gates.wait(FillGate::Begun);
+                let out = run_cursor_job(&read, cells, &|| ctx.cancelled() || stop.refused());
+                #[cfg(test)]
+                gates.wait(FillGate::Read);
+                Arc::new(out)
+            },
+        );
+        match spawned {
+            Ok(job) => {
+                self.job = Some(Job {
+                    target: Target::Cursor {
+                        id: row,
+                        cursor_generation: rest,
+                        generation,
+                        slot,
+                        version,
+                        fill: Some(FillRead { epoch, mode }),
+                    },
+                    job,
+                });
+            }
+            Err(e) => {
+                // A thread that cannot start: the fill ends for this rest.
+                log::warn!("chart images: {e}");
+                self.free_slot(generation, slot, version);
+                self.fill = None;
             }
         }
     }
@@ -2808,6 +3515,50 @@ impl Core {
             }
         }
         total
+    }
+}
+
+/// The pins of pool generation `generation`'s slots: the slot the newest
+/// update `sent` names, and the one the render thread displayed last, read
+/// now from `publish`.
+fn pins(
+    sent: Option<&Sent>,
+    generation: u64,
+    publish: &crate::render_side::ChartPublisher,
+) -> [Option<u16>; 2] {
+    let in_pool =
+        |chart: Option<(u64, u16)>| chart.filter(|&(g, _)| g == generation).map(|(_, s)| s);
+    let sent = sent.and_then(|s| match s.chart {
+        crate::chart_currency::CursorChart::Resident { generation, slot } => {
+            Some((generation, slot))
+        }
+        _ => None,
+    });
+    let (_, displayed) = publish.pool_now();
+    [
+        in_pool(sent),
+        in_pool(crate::chart_currency::CursorChart::unpack(displayed)),
+    ]
+}
+
+/// Whether entry `e` holds a slot of live generation `generation` that
+/// rest `rest` filled, showed or kept, or that `pins` hold: a neighbour's
+/// entry never evicts it.
+fn protected(
+    e: &pool::Entry,
+    generation: u64,
+    rest: u64,
+    slots: Option<&pool::Slots>,
+    pins: [Option<u16>; 2],
+) -> bool {
+    match e.state {
+        pool::EntryState::Resident {
+            generation: g,
+            slot,
+        } if g == generation => {
+            pins.contains(&Some(slot)) || slots.and_then(|s| s.rest_of(slot)) == Some(rest)
+        }
+        _ => false,
     }
 }
 
@@ -3534,5 +4285,104 @@ mod tests {
         };
         assert_eq!(content(true), [432, 304]);
         assert_eq!(content(false), [432, 243]);
+    }
+
+    /// A row read asks its cancel before each image: one cancelled once
+    /// the stage image is resolved never resolves the banner, and both
+    /// come back cancelled.
+    #[test]
+    fn a_row_read_cancelled_between_its_images_reads_no_more() {
+        use std::sync::atomic::Ordering;
+
+        use skin_model::chart_image::{ChartCells, Slot};
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [64, 48], [10, 20, 30]);
+        png(d.path(), "n.png", [30, 8], [10, 20, 30]);
+        let id = super::CursorId {
+            dir: d.path().to_path_buf(),
+            names: [
+                library::Name::Named("s.png".to_owned()),
+                library::Name::Named("n.png".to_owned()),
+            ],
+        };
+        let cells = ChartCells {
+            stage: Slot::new([64, 48]),
+            banner: Slot::new([30, 8]),
+            ..ChartCells::NONE
+        };
+        let start = super::FS_READS.load(Ordering::Relaxed);
+        // The folder and the stage image's resolution, then cancelled.
+        let set = super::read_row(&id, cells, &|| {
+            super::FS_READS.load(Ordering::Relaxed) >= start + 2
+        });
+        assert_eq!(
+            super::FS_READS.load(Ordering::Relaxed) - start,
+            2,
+            "the banner was resolved after the cancel"
+        );
+        for which in [ChartImage::Stage, ChartImage::Banner] {
+            assert!(matches!(
+                set.read(which).image,
+                Err(super::Absent::Cancelled)
+            ));
+        }
+    }
+
+    /// A row read peaks within what a read left behind is counted at
+    /// (design.md "Memory Budget"): its stage file fitted to the largest
+    /// cell, 2 048² with its mips, is held while its banner, a 4 096×3 072
+    /// RGBA16 PNG (12 Mi texels, 96 MiB native), converts beside its RGBA8
+    /// copy (48 MiB). The test thread's heap reaches that combined peak and
+    /// stays within [`super::LEFT_BEHIND_BYTES`].
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_row_read_peaks_within_the_left_behind_bound_alloc() {
+        use skin_model::chart_image::{ChartCells, Slot};
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [2_048, 2_048], [10, 20, 30]);
+        {
+            let file = std::fs::File::create(d.path().join("n.png")).unwrap();
+            let mut e = png::Encoder::new(std::io::BufWriter::new(file), 4_096, 3_072);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Sixteen);
+            let texels = [1, 2, 3, 4, 5, 6, 255, 255].repeat(4_096 * 3_072);
+            e.write_header().unwrap().write_image_data(&texels).unwrap();
+        }
+        let id = super::CursorId {
+            dir: d.path().to_path_buf(),
+            names: [
+                library::Name::Named("s.png".to_owned()),
+                library::Name::Named("n.png".to_owned()),
+            ],
+        };
+        let cells = ChartCells {
+            stage: Slot::new([2_048, 2_048]),
+            banner: Slot::new([512, 128]),
+            ..ChartCells::NONE
+        };
+        crate::alloc_count::reset_peak();
+        let set = super::read_row(&id, cells, &|| false);
+        let peak = crate::alloc_count::peak_bytes();
+        let stage = set.read(ChartImage::Stage).image.as_ref().unwrap();
+        let banner = set.read(ChartImage::Banner).image.as_ref().unwrap();
+        assert_eq!(banner.native(), [4_096, 3_072]);
+        let fit: u64 = stage
+            .levels()
+            .iter()
+            .map(|l| u64::try_from(l.len()).unwrap())
+            .sum();
+        assert!(fit > 16 << 20, "{fit}");
+        // The native RGBA16 image beside its RGBA8 copy.
+        let converting = (8 + 4) * (12_u64 << 20);
+        assert!(
+            peak >= fit + converting,
+            "not the combined peak: {peak} < {fit} + {converting}"
+        );
+        assert!(
+            peak <= super::LEFT_BEHIND_BYTES,
+            "{peak} > {}",
+            super::LEFT_BEHIND_BYTES
+        );
     }
 }
