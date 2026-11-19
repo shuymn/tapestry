@@ -72,9 +72,10 @@ mod staging;
 pub mod text;
 mod text_cache;
 mod text_upload;
+mod upload;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
-pub use bga::{BGA_WRITE_BUDGET, BgaFault, BgaStep, UPLOAD_TIME_SLICE};
+pub use bga::{BgaFault, BgaStep};
 pub use chart_pool::{POOL_MAX_SLOTS, POOL_MAX_TEXELS, PoolLayout, PoolWriteError};
 pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
@@ -119,6 +120,7 @@ pub use sprite::{
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
+pub use upload::{UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE, UploadState, Uploaded};
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).
 #[cfg(feature = "dev-tools")]

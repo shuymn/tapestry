@@ -259,8 +259,14 @@ impl Screen for Noted {
     ) -> Result<(), render::BgaFault> {
         self.menu.stage_bga_cells(key, cells)
     }
-    fn bga_boundary(&mut self) -> render::BgaStep {
-        self.menu.bga_boundary()
+    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        self.menu.upload_boundary(past)
+    }
+    fn upload_state(&self) -> render::UploadState {
+        self.menu.upload_state()
+    }
+    fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+        self.menu.wait_step(timeout)
     }
     fn cancel_bga_upload(&mut self) {
         self.menu.cancel_bga_upload();

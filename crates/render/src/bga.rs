@@ -5,39 +5,16 @@
 //! bound, which no table describes.
 //!
 //! **A batch's upload** ([`BgaUpload`]): the render thread takes a batch of
-//! cells in hand and writes it at its frame boundaries, outside every
-//! frame, one step at a time: at most [`BGA_WRITE_BUDGET`] bytes (rows
-//! padded as the queue pads them, a cell split between steps by its
-//! rows), written and submitted inside one pair of error scopes, each
-//! cell's bytes dropped once written, and a flag-only completion
-//! registered for the step ([`completion`]). No step is written while the
-//! last one's completion is unseen, whichever batch it belonged to, so at
-//! most one step's staging is in flight. Within a boundary the steps go on
-//! while each completion is seen at once, until the boundary's steps have
-//! taken [`UPLOAD_TIME_SLICE`]; the batch is done at the round that sees its
-//! last step's completion. Nothing waits for the GPU (design.md "Memory
-//! Budget").
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+//! cells in hand and writes it at its frame boundaries through the
+//! uploader ([`crate::upload`]), one write of at most
+//! [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes a step (rows padded as the
+//! queue pads them, a cell split between steps by its rows), each cell's
+//! bytes dropped once written; the batch is done at the round that sees
+//! its last step's completion.
 
 use skin_model::bga::{BgaKey, CellPlace, PAGE_BUDGET, PAGE_SIDE};
 
 use crate::gpu::Gpu;
-
-/// The most bytes a step of the BGA array's upload writes, which the queue
-/// stages until the GPU completes it, rows padded as the queue pads them
-/// (design.md "Memory Budget"; a provisional limit: a 1 024² cell, so the
-/// six pages' 384 MiB go over in about 96 steps).
-pub const BGA_WRITE_BUDGET: u64 = 4 << 20;
-
-/// The render thread's time for upload steps at one frame boundary,
-/// outside every frame: a step after the boundary's first begins only
-/// while the boundary's steps so far took less (design.md "Memory
-/// Budget"; a provisional limit, a quarter of a 60 Hz frame). It is the
-/// frame boundary's upload time slice, for any upload made at frame
-/// boundaries; the BGA array's is the first.
-pub const UPLOAD_TIME_SLICE: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// What a frame boundary's step of a batch's upload came to
 /// ([`Renderer::bga_boundary`](crate::Renderer::bga_boundary)).
@@ -63,16 +40,6 @@ pub(crate) struct BgaUpload {
     /// The next cell to write and its next row.
     cell: usize,
     row: u32,
-}
-
-/// A flag set once the GPU completed every submission made so far,
-/// registered without submitting anything.
-pub(crate) fn completion(gpu: &Gpu) -> Arc<AtomicBool> {
-    let done = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&done);
-    gpu.queue()
-        .on_submitted_work_done(move || flag.store(true, Ordering::Release));
-    done
 }
 
 impl BgaUpload {
@@ -342,7 +309,7 @@ mod tests {
         let key = r.begin_bga(1).unwrap();
         // Each step takes the whole slice on the boundary's clock: one
         // step a boundary, unless a test says otherwise.
-        r.bga_step_cost.set(Some(UPLOAD_TIME_SLICE));
+        r.step_cost.set(Some(UPLOAD_TIME_SLICE));
         (r, key)
     }
 
@@ -368,7 +335,7 @@ mod tests {
     /// Steps `r`'s boundaries until `n` steps were submitted, within 30 s.
     fn until_submitted(r: &mut Renderer, n: usize) {
         let end = Instant::now() + Duration::from_secs(30);
-        while r.bga_submits.get() < n {
+        while r.step_submits.get() < n {
             assert_eq!(r.bga_boundary(), BgaStep::Pending);
             assert!(Instant::now() < end, "step {n} never went");
             std::thread::sleep(Duration::from_millis(1));
@@ -414,7 +381,11 @@ mod tests {
             assert_eq!(r.bga_upload_bytes(), left, "one cell a step");
         }
         assert_eq!(until_done(&mut r), Ok(()));
-        assert_eq!(r.bga_submits.get(), 4, "nothing submitted beside the steps");
+        assert_eq!(
+            r.step_submits.get(),
+            4,
+            "nothing submitted beside the steps"
+        );
     }
 
     /// One step is in flight at a time: while its completion is withheld,
@@ -425,14 +396,14 @@ mod tests {
         let (mut r, key) = renderer();
         r.stage_bga_cells(key, cells()).unwrap();
         until_submitted(&mut r, 1);
-        r.bga_seen.set(Some(false));
+        r.step_seen.set(Some(false));
         for _ in 0..5 {
             assert_eq!(r.bga_boundary(), BgaStep::Pending);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(r.bga_submits.get(), 1, "nothing written while in flight");
+        assert_eq!(r.step_submits.get(), 1, "nothing written while in flight");
         assert_eq!(r.bga_upload_bytes(), u64::try_from(3 * QUARTER).unwrap());
-        r.bga_seen.set(None);
+        r.step_seen.set(None);
         until_submitted(&mut r, 2);
         assert_eq!(r.bga_upload_bytes(), u64::try_from(2 * QUARTER).unwrap());
     }
@@ -445,7 +416,7 @@ mod tests {
         let (mut r, key) = renderer();
         r.stage_bga_cells(key, cells()).unwrap();
         until_submitted(&mut r, 1);
-        r.bga_seen.set(Some(false));
+        r.step_seen.set(Some(false));
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Pending);
         r.cancel_bga_upload();
@@ -453,8 +424,8 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(r.bga_boundary(), BgaStep::Pending);
         }
-        assert_eq!(r.bga_submits.get(), 1, "the new batch waited");
-        r.bga_seen.set(None);
+        assert_eq!(r.step_submits.get(), 1, "the new batch waited");
+        r.step_seen.set(None);
         until_submitted(&mut r, 2);
     }
 
@@ -465,12 +436,12 @@ mod tests {
     #[test]
     fn a_refused_submission_refuses_the_batch() {
         let (mut r, key) = renderer();
-        r.bga_submit_fault = Some(refuse);
+        r.step_submit_fault = Some(refuse);
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Done(Err(BgaFault::Refused)));
-        assert_eq!(r.bga_submits.get(), 1, "its writes submitted");
-        assert!(r.bga_in_flight.is_some(), "and in flight");
-        r.bga_submit_fault = None;
+        assert_eq!(r.step_submits.get(), 1, "its writes submitted");
+        assert!(r.step.is_some(), "and in flight");
+        r.step_submit_fault = None;
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(until_done(&mut r), Ok(()));
     }
@@ -479,10 +450,10 @@ mod tests {
     #[test]
     fn a_refused_write_refuses_the_batch() {
         let (mut r, key) = renderer();
-        r.bga_write_fault = Some(refuse);
+        r.step_write_fault = Some(refuse);
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Done(Err(BgaFault::Refused)));
-        r.bga_write_fault = None;
+        r.step_write_fault = None;
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(until_done(&mut r), Ok(()));
     }
@@ -497,14 +468,14 @@ mod tests {
     fn steps_go_on_within_a_boundary_until_its_time_slice() {
         assert_eq!(UPLOAD_TIME_SLICE, Duration::from_millis(4));
         let (mut r, key) = renderer();
-        r.bga_step_cost.set(Some(Duration::from_millis(1)));
-        r.bga_seen.set(Some(true));
+        r.step_cost.set(Some(Duration::from_millis(1)));
+        r.step_seen.set(Some(true));
         r.stage_bga_cells(key, quarters(8)).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Pending);
-        assert_eq!(r.bga_submits.get(), 4, "four steps in the slice");
+        assert_eq!(r.step_submits.get(), 4, "four steps in the slice");
         assert_eq!(r.bga_upload_bytes(), u64::try_from(4 * QUARTER).unwrap());
         assert_eq!(r.bga_boundary(), BgaStep::Done(Ok(())));
-        assert_eq!(r.bga_submits.get(), 8);
+        assert_eq!(r.step_submits.get(), 8);
     }
 
     /// Takes twice the time slice, inside a step's scopes before its
@@ -520,12 +491,12 @@ mod tests {
     #[test]
     fn a_step_past_the_slice_ends_the_boundary_on_the_real_clock() {
         let (mut r, key) = renderer();
-        r.bga_step_cost.set(None);
-        r.bga_seen.set(Some(true));
-        r.bga_submit_fault = Some(slow);
+        r.step_cost.set(None);
+        r.step_seen.set(Some(true));
+        r.step_submit_fault = Some(slow);
         r.stage_bga_cells(key, quarters(4)).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Pending);
-        assert_eq!(r.bga_submits.get(), 1, "no second step past the slice");
+        assert_eq!(r.step_submits.get(), 1, "no second step past the slice");
         assert_eq!(r.bga_upload_bytes(), u64::try_from(3 * QUARTER).unwrap());
     }
 
@@ -538,16 +509,16 @@ mod tests {
     #[test]
     fn a_step_in_flight_through_a_device_loss_ends_stale() {
         let (mut r, key) = renderer();
-        r.bga_seen.set(Some(false));
+        r.step_seen.set(Some(false));
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Pending);
-        assert!(r.bga_in_flight.is_some(), "a step outstanding");
+        assert!(r.step.is_some(), "a step outstanding");
         r.gpu().device().destroy();
         // The device reports its loss at its next poll.
         let _ = r.gpu().device().poll(wgpu::PollType::wait_indefinitely());
         assert!(r.gpu().lost());
         assert_eq!(r.bga_boundary(), BgaStep::Done(Err(BgaFault::Stale)));
-        assert_eq!(r.bga_submits.get(), 1, "nothing written after the loss");
+        assert_eq!(r.step_submits.get(), 1, "nothing written after the loss");
         assert_eq!(r.bga_key(), None);
         assert!(matches!(
             r.publish_bga(Some(key), Vec::new()),

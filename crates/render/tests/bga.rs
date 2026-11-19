@@ -227,14 +227,14 @@ fn large_cell() -> (CellPlace, Vec<u8>) {
     (place, texels)
 }
 
-/// A batch is written at frame boundaries, at most `BGA_WRITE_BUDGET`
+/// A batch is written at frame boundaries, at most `UPLOAD_WRITE`
 /// bytes at each (design.md "Memory Budget"): a 2 046² picture, whose
 /// cell's 16 MiB are four budgets, ends no sooner than its fourth boundary
 /// and draws whole, its last rows included; four cells of a budget each
 /// are written at most one a boundary, each dropped once written.
 #[test]
 fn a_batch_is_written_a_budget_at_a_boundary() {
-    assert_eq!(render::BGA_WRITE_BUDGET, 4 << 20);
+    assert_eq!(render::UPLOAD_WRITE, 4 << 20);
     let dir = tempfile::tempdir().unwrap();
     let c = chart(
         ChartBga::new(

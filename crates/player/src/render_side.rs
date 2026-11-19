@@ -218,10 +218,30 @@ pub trait Screen: Send {
         let _ = (key, cells);
         Err(render::BgaFault::Refused)
     }
-    /// One frame boundary's step of the batch in hand
-    /// ([`render::Renderer::bga_boundary`]); none in hand by default.
-    fn bga_boundary(&mut self) -> render::BgaStep {
-        render::BgaStep::Idle
+    /// One frame boundary's steps of the uploader
+    /// ([`render::Renderer::upload_boundary_within`]), `past` answering
+    /// whether the pass's hold's bound has passed; nothing in hand by
+    /// default.
+    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        let _ = past;
+        render::Uploaded {
+            bga: render::BgaStep::Idle,
+        }
+    }
+    /// What the uploader can do now ([`render::Renderer::upload_state`]);
+    /// nothing in hand by default.
+    fn upload_state(&self) -> render::UploadState {
+        render::UploadState::Idle
+    }
+    /// Waits for the uploader's step in flight at most `timeout`
+    /// ([`render::Renderer::wait_step`]): whether it was seen.
+    ///
+    /// # Errors
+    ///
+    /// The device's failure.
+    fn wait_step(&mut self, timeout: Duration) -> Result<bool, RenderError> {
+        let _ = timeout;
+        Ok(true)
     }
     /// Drops the batch in hand ([`render::Renderer::cancel_bga_upload`]).
     fn cancel_bga_upload(&mut self) {}
@@ -1903,6 +1923,17 @@ struct Shared {
     /// in µs; `i64::MIN` reads the clock (tests).
     #[cfg(test)]
     hold_elapsed: AtomicI64,
+    /// How far each write of a held pass's step after its first moves
+    /// `hold_elapsed`, in µs; 0 moves nothing (tests).
+    #[cfg(test)]
+    write_clock_step: AtomicI64,
+    /// The loop's passes that reached the boundary (tests).
+    #[cfg(test)]
+    passes: AtomicU64,
+    /// The loop's waits by kind ([`WaitKind`]), counted as each begins
+    /// (tests).
+    #[cfg(test)]
+    waits: [AtomicU64; 4],
     /// The lifetime whose first frame was visited last, and its showing
     /// (tests).
     #[cfg(test)]
@@ -2055,6 +2086,12 @@ impl Shared {
             frame_gates: Default::default(),
             #[cfg(test)]
             hold_elapsed: AtomicI64::new(i64::MIN),
+            #[cfg(test)]
+            write_clock_step: AtomicI64::new(0),
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Default::default(),
             #[cfg(test)]
             first_shown: Mutex::new(None),
             #[cfg(test)]
@@ -5898,6 +5935,28 @@ const fn held_wait(now: TimeUs, shown_at: TimeUs, bound: TimeUs) -> Option<TimeU
     }
 }
 
+/// A kind of the loop's wait (tests: the no-sleep rule's counters).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitKind {
+    /// A blocking wait for the next message.
+    Message = 0,
+    /// A message wait bounded by [`CANCEL_POLL`] or the clock's pace.
+    CancelPoll = 1,
+    /// A held pass's sleep.
+    HeldPace = 2,
+    /// A bounded wait for the uploader's step in flight.
+    Completion = 3,
+}
+
+/// Counts a wait of `kind` as it begins (tests).
+#[cfg(test)]
+fn count_wait(shared: &Shared, kind: WaitKind) {
+    if let Some(n) = shared.waits.get(kind as usize) {
+        n.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// A BGA operation held for a frame boundary ([`Run::bga`]), the one heavy
 /// operation of its interval (design.md "Load Pipeline").
 enum BgaOp {
@@ -6323,15 +6382,31 @@ impl Run {
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
             let msg = if idle {
                 match self.idle_wait() {
-                    // A heavy operation due and allowed: the boundary at
-                    // once.
+                    // A heavy operation due and allowed, or a step ready to
+                    // write: the boundary at once.
                     Some(wait) if wait.is_zero() => rx.try_recv(),
+                    // A step in flight: its completion, bounded, then the
+                    // message if one came (design.md "Memory Budget", the
+                    // uploader).
+                    Some(_) if self.step_in_flight() => {
+                        self.wait_step(Duration::from_micros(HELD_PACE.0.unsigned_abs()));
+                        rx.try_recv()
+                    }
                     // READY's cutoff is marked waiting around the wait, as
                     // around a frame's pacing, so the game's request taken
                     // meanwhile with no entry filled is acknowledged at
                     // once by its swap, with no message's turn.
                     wait => {
                         self.mark_waiting(self.screen.as_ref().map_or(0, |s| s.filled()));
+                        #[cfg(test)]
+                        count_wait(
+                            &self.shared,
+                            if wait.is_some() {
+                                WaitKind::CancelPoll
+                            } else {
+                                WaitKind::Message
+                            },
+                        );
                         let msg = match wait {
                             // A preparation not yet answered, or work of
                             // the boundary's, is looked at again between
@@ -6966,6 +7041,8 @@ impl Run {
             // hold ending later in the pass included.
             let held = self.held(&mode);
             let regrow = std::mem::take(&mut self.regrow_due);
+            #[cfg(test)]
+            self.shared.passes.fetch_add(1, Ordering::SeqCst);
             if self.boundary(&mode, held, regrow) {
                 mode = Mode::Idle;
                 continue;
@@ -7089,7 +7166,18 @@ impl Run {
                                 .store(crate::alloc_count::this_thread(), Ordering::SeqCst);
                             #[cfg(test)]
                             self.shared.held[0].fetch_add(1, Ordering::SeqCst);
-                            std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
+                            let wait = Duration::from_micros(wait.0.unsigned_abs());
+                            match self.screen.as_ref().map(|s| s.upload_state()) {
+                                // A step ready to write: the next pass at
+                                // once.
+                                Some(render::UploadState::Ready) => {}
+                                Some(render::UploadState::InFlight) => self.wait_step(wait),
+                                _ => {
+                                    #[cfg(test)]
+                                    count_wait(&self.shared, WaitKind::HeldPace);
+                                    std::thread::sleep(wait);
+                                }
+                            }
                             #[cfg(feature = "dev-tools")]
                             first.held(from, self.clock.now());
                             self.first_frame = Some(first);
@@ -8727,6 +8815,29 @@ impl Run {
         }
     }
 
+    /// Whether the uploader's step is in flight, its completion unseen.
+    fn step_in_flight(&self) -> bool {
+        self.screen
+            .as_ref()
+            .is_some_and(|s| s.upload_state() == render::UploadState::InFlight)
+    }
+
+    /// Waits for the uploader's step in flight at most `bound` (design.md
+    /// "Memory Budget", the uploader); a device failing its poll drops the
+    /// screen, as the boundary's poll does.
+    fn wait_step(&mut self, bound: Duration) {
+        #[cfg(test)]
+        count_wait(&self.shared, WaitKind::Completion);
+        if let Some(s) = &mut self.screen
+            && let Err(e) = s.wait_step(bound)
+        {
+            eprintln!("render: {}", Chain(&e));
+            self.drop_screen();
+            self.granted = false;
+            self.shared.failed.store(true, Ordering::Release);
+        }
+    }
+
     /// Whether a heavy operation is due at a boundary of `destroy_ok`:
     /// the BGA operation held, a filled entry's heavy part, or the pool
     /// owed once no filled entry stands in its way. None under READY's
@@ -8755,7 +8866,15 @@ impl Run {
         // Idle: no play, no loading frame; the allowance's clock is its
         // regime's.
         let destroy_ok = !self.cut_off && !self.result_unacked;
+        let upload = self
+            .screen
+            .as_ref()
+            .map_or(render::UploadState::Idle, |s| s.upload_state());
+        if upload == render::UploadState::Ready {
+            return Some(Duration::ZERO);
+        }
         let work = self.attempt.is_some()
+            || upload == render::UploadState::InFlight
             || self.decision_busy()
             || self.bga_reply.is_some()
             || self.bga_op.is_some()
@@ -8781,7 +8900,7 @@ impl Run {
     /// draws would be the pending presentation, its hold has not ended,
     /// the image held is valid and the bound has not passed. Changes
     /// nothing.
-    fn held(&self, mode: &Mode) -> bool {
+    fn held(&self, mode: &Mode) -> Option<TimeUs> {
         let (
             Mode::Menu {
                 loading: Some(lifetime),
@@ -8791,14 +8910,14 @@ impl Run {
             Some(screen),
         ) = (mode, &self.screen)
         else {
-            return false;
+            return None;
         };
         if !self.shared.loading_current(*lifetime) {
-            return false;
+            return None;
         }
         let now = self.clock.now();
         let shown_at = match self.first_frame {
-            Some(f) if f.lifetime == *lifetime && f.ended => return false,
+            Some(f) if f.lifetime == *lifetime && f.ended => return None,
             Some(f) if f.lifetime == *lifetime => f.shown_at,
             _ => update.as_deref().map_or(now, |u| u.origin),
         };
@@ -8812,9 +8931,43 @@ impl Run {
         ) == Presented::Placeholder;
         #[cfg(test)]
         let now = hold_now(&self.shared, now, shown_at);
-        pending
+        (pending
             && held_wait(now, shown_at, first_frame_bound(&self.shared)).is_some()
-            && self.image.valid(notices_of(self.extent.as_ref()))
+            && self.image.valid(notices_of(self.extent.as_ref())))
+        .then_some(shown_at)
+    }
+
+    /// Whether the loading hold shown at `shown_at` has reached its bound
+    /// on the hold's clock (design.md "The pending presentation's hold"),
+    /// read by the uploader before each write of a held pass. Tests: each
+    /// look after the first moves the hold's clock by the write step set.
+    fn hold_past(
+        clock: QpcClock,
+        shared: &Arc<Shared>,
+        shown_at: TimeUs,
+    ) -> impl FnMut() -> bool + use<'_> {
+        let bound = first_frame_bound(shared);
+        #[cfg(test)]
+        let mut looks = 0_u32;
+        move || {
+            #[cfg(test)]
+            {
+                let step = shared.write_clock_step.load(Ordering::SeqCst);
+                if looks > 0 && step > 0 {
+                    let _ =
+                        shared
+                            .hold_elapsed
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |e| {
+                                (e != i64::MIN).then(|| e.saturating_add(step))
+                            });
+                }
+                looks += 1;
+            }
+            let now = clock.now();
+            #[cfg(test)]
+            let now = hold_now(shared, now, shown_at);
+            held_wait(now, shown_at, bound).is_none()
+        }
     }
 
     /// How the boundary of `mode` admits a heavy operation, `held` its
@@ -8823,7 +8976,8 @@ impl Run {
     /// held) once [`CLOCK_PACE`] passed since the last one ended; a
     /// stalled boundary that draws may run one by that clock but keeps the
     /// field; a presenting one waits for a frame shown or invisible.
-    fn admit(&mut self, mode: &Mode, held: bool) -> Admit {
+    fn admit(&mut self, mode: &Mode, held: Option<TimeUs>) -> Admit {
+        let held = held.is_some();
         let Some(end) = self.allowance else {
             return Admit::Free;
         };
@@ -8868,7 +9022,7 @@ impl Run {
     /// when it changed; READY's cutoff given with no entry filled.
     /// `regrow` when the pass took a selection entry. Whether the screen
     /// was dropped (the device failed its poll).
-    fn boundary(&mut self, mode: &Mode, held: bool, regrow: bool) -> bool {
+    fn boundary(&mut self, mode: &Mode, held: Option<TimeUs>, regrow: bool) -> bool {
         #[cfg(test)]
         self.take_handoff_seed();
         let mut dropped = false;
@@ -8923,7 +9077,7 @@ impl Run {
             }
             self.heavy_op(mode, held, regrow, destroy_ok);
         }
-        self.bga_boundary();
+        self.upload_boundary(held);
         #[cfg(all(test, feature = "dev-tools"))]
         let published_from = crate::alloc_count::this_thread();
         if !self.cut_off {
@@ -8956,7 +9110,7 @@ impl Run {
     /// pool owed, then a filled entry's heavy part; the last two only
     /// where `destroy_ok`. The BGA operation held is answered stale, or
     /// run when light, first, whatever the allowance.
-    fn heavy_op(&mut self, mode: &Mode, held: bool, regrow: bool, destroy_ok: bool) {
+    fn heavy_op(&mut self, mode: &Mode, held: Option<TimeUs>, regrow: bool, destroy_ok: bool) {
         let bga = self.bga_op_boundary(false);
         let Some(s) = &self.screen else {
             return;
@@ -8978,7 +9132,7 @@ impl Run {
         let (start, refills, regime) = (
             Instant::now(),
             self.shared.refilling_frames.load(Ordering::SeqCst),
-            if self.screen.is_none() || matches!(mode, Mode::Idle) || held {
+            if self.screen.is_none() || matches!(mode, Mode::Idle) || held.is_some() {
                 Regime::Clock
             } else if self.stalled {
                 Regime::Stalled
@@ -9582,20 +9736,36 @@ impl Run {
     /// ([`render::Renderer::bga_boundary`]), its job answered once they
     /// end. A batch the screen no longer holds (a screen built again) is
     /// answered stale.
-    fn bga_boundary(&mut self) {
-        let Some((generation, _)) = &self.bga_reply else {
-            return;
-        };
-        let current = self.shared.bga_generation.load(Ordering::SeqCst) == *generation;
+    fn upload_boundary(&mut self, held: Option<TimeUs>) {
         let stale = render::BgaStep::Done(Err(render::BgaFault::Stale));
+        let current = self
+            .bga_reply
+            .as_ref()
+            .map(|(g, _)| self.shared.bga_generation.load(Ordering::SeqCst) == *g);
+        if current == Some(false)
+            && let Some(s) = self.screen.as_mut()
+        {
+            s.cancel_bga_upload();
+        }
         let step = match self.screen.as_mut() {
-            Some(s) if current => s.bga_boundary(),
             Some(s) => {
-                s.cancel_bga_upload();
-                stale
+                let up = match held {
+                    Some(shown_at) => {
+                        s.upload_boundary(&mut Self::hold_past(self.clock, &self.shared, shown_at))
+                    }
+                    None => s.upload_boundary(&mut || false),
+                };
+                if current == Some(false) {
+                    stale
+                } else {
+                    up.bga
+                }
             }
             None => stale,
         };
+        if self.bga_reply.is_none() {
+            return;
+        }
         let answer = match step {
             render::BgaStep::Pending => return,
             render::BgaStep::Idle => Err(render::BgaFault::Stale),
@@ -16982,24 +17152,34 @@ pub(crate) mod tests {
             b.pending = Some((key.array, cells.len(), bytes, boundaries));
             Ok(())
         }
-        fn bga_boundary(&mut self) -> render::BgaStep {
-            let mut b = self.shared.bga.lock().unwrap();
-            let Some((array, cells, bytes, left)) = b.pending else {
-                return render::BgaStep::Idle;
-            };
-            b.boundaries += 1;
-            if b.live != Some(array) {
+        fn upload_boundary(&mut self, _past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+            let bga = (|| {
+                let mut b = self.shared.bga.lock().unwrap();
+                let Some((array, cells, bytes, left)) = b.pending else {
+                    return render::BgaStep::Idle;
+                };
+                b.boundaries += 1;
+                if b.live != Some(array) {
+                    b.pending = None;
+                    return render::BgaStep::Done(Err(render::BgaFault::Stale));
+                }
+                if left > 0 {
+                    b.pending = Some((array, cells, bytes, left - 1));
+                    return render::BgaStep::Pending;
+                }
                 b.pending = None;
-                return render::BgaStep::Done(Err(render::BgaFault::Stale));
+                b.cells += u32::try_from(cells).unwrap();
+                b.batches.push((cells, bytes));
+                render::BgaStep::Done(Ok(()))
+            })();
+            render::Uploaded { bga }
+        }
+        fn upload_state(&self) -> render::UploadState {
+            if self.shared.bga.lock().unwrap().pending.is_some() {
+                render::UploadState::Ready
+            } else {
+                render::UploadState::Idle
             }
-            if left > 0 {
-                b.pending = Some((array, cells, bytes, left - 1));
-                return render::BgaStep::Pending;
-            }
-            b.pending = None;
-            b.cells += u32::try_from(cells).unwrap();
-            b.batches.push((cells, bytes));
-            render::BgaStep::Done(Ok(()))
         }
         fn cancel_bga_upload(&mut self) {
             let mut b = self.shared.bga.lock().unwrap();

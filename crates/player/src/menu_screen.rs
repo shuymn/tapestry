@@ -963,8 +963,17 @@ impl Screen for MenuScreen {
         self.renderer.stage_bga_cells(key, cells)
     }
 
-    fn bga_boundary(&mut self) -> render::BgaStep {
-        self.renderer.bga_boundary()
+    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        self.renderer
+            .upload_boundary_within(render::UPLOAD_TIME_SLICE, past)
+    }
+
+    fn upload_state(&self) -> render::UploadState {
+        self.renderer.upload_state()
+    }
+
+    fn wait_step(&mut self, timeout: Duration) -> Result<bool, RenderError> {
+        self.renderer.wait_step(timeout)
     }
 
     fn cancel_bga_upload(&mut self) {
