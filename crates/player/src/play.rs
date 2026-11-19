@@ -707,6 +707,11 @@ impl PlayerRig<'_> {
         if self.result_run_disabled() {
             return self.send_screen(prep, skin);
         }
+        // The kept probe only while the selection's and decision's
+        // charges leave room for any result atlas, decided before play.
+        let menus = self.render.result_status().menus;
+        self.result_skin
+            .set_kept_probe(crate::result_skin::kept_probe_fits(menus));
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
         match self.result_skin.begin_image_stage(chart, prep.class) {

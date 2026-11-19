@@ -2850,6 +2850,12 @@ pub fn result_staged(uploads: u64) {
     RESULT_UPLOADS.fetch_add(uploads, Ordering::SeqCst);
 }
 
+/// The texture arrays the result's stagings uploaded so far (tests).
+#[cfg(test)]
+pub fn result_uploads() -> u64 {
+    RESULT_UPLOADS.load(Ordering::SeqCst)
+}
+
 /// Prints the result's stagings and uploads so far, at `at` in the flow.
 pub fn print_result_work(at: &str) {
     println!(
