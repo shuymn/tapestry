@@ -255,10 +255,8 @@ fn launch<T>(
 #[cfg(feature = "dev-tools")]
 fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
     let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
-    let process = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .context("the game's own executable name is unknown")?;
+    // The capture is of this process alone, by its id.
+    let pid = std::process::id();
     let dir = data_root()?.path().join("measure");
     std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
     let stamp = SystemTime::now()
@@ -271,7 +269,7 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         exe.display(),
         csv.display()
     );
-    let capture = presentmon::Capture::start(&exe, &process, &csv, &log)?;
+    let capture = presentmon::Capture::start(&exe, pid, &csv, &log)?;
     dev::measure_screens();
     let ran = select(
         args::Select {
@@ -285,7 +283,7 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
     ran?;
     stopped?;
     let text = std::fs::read_to_string(&csv).with_context(|| csv.display().to_string())?;
-    let (frames, error) = presentmon::parse(&text, &process, |t| clock.from_qpc(t).0);
+    let (frames, error) = presentmon::parse(&text, pid, |t| clock.from_qpc(t).0);
     if let Some(e) = error {
         return Err(anyhow::Error::new(e).context(csv.display().to_string()));
     }
@@ -308,12 +306,24 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         .map(|f| format!("{} {}\n", f.present_us, f.display_us.unwrap_or(-1)))
         .collect();
     write_fresh(&pm, &text)?;
+    // Each lifetime's present modes, the captured presents placed on the
+    // game's clock as the spans are, at the shortest refresh measured.
+    let lifetimes: Vec<(String, (i64, i64))> = measured
+        .screens
+        .iter()
+        .map(|s| {
+            let label = format!("{} lifetime {}", s.screen, s.lifetime);
+            (label, dev::screen_span(s.presents, &measured.presents))
+        })
+        .collect();
+    let period = measured.screens.iter().filter_map(|s| s.period_ns).min();
     let fullscreen = window::opens_fullscreen();
+    print!(
+        "{}",
+        presentmon::mode_report(&frames, presents, period, &lifetimes, fullscreen)
+    );
     for s in &measured.screens {
         let span = dev::screen_span(s.presents, &measured.presents);
-        let modes = presentmon::summarize_modes(&frames, span);
-        let label = format!("{} lifetime {}", s.screen, s.lifetime);
-        print!("{}", presentmon::mode_lines(&label, &modes, fullscreen));
         let counted = s.period_ns.map(|period| {
             presentmon::count_capture(&frames, span, presents, s.presentation, period)
         });
@@ -343,10 +353,8 @@ fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
 #[cfg(feature = "dev-tools")]
 fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<()> {
     let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
-    let process = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .context("the game's own executable name is unknown")?;
+    // The capture is of this process alone, by its id.
+    let pid = std::process::id();
     let dir = data_root()?.path().join("measure");
     std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
     let stamp = SystemTime::now()
@@ -359,7 +367,7 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
         exe.display(),
         csv.display()
     );
-    let capture = presentmon::Capture::start(&exe, &process, &csv, &log)?;
+    let capture = presentmon::Capture::start(&exe, pid, &csv, &log)?;
     // The capture's start waits for PresentMon to settle: the first load
     // runs from after it.
     let load_start = bms_model::TimeSource::now(&clock);
@@ -380,7 +388,7 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     ran?;
     stopped?;
     let text = std::fs::read_to_string(&csv).with_context(|| csv.display().to_string())?;
-    let (frames, error) = presentmon::parse(&text, &process, |t| clock.from_qpc(t).0);
+    let (frames, error) = presentmon::parse(&text, pid, |t| clock.from_qpc(t).0);
     if let Some(e) = error {
         return Err(anyhow::Error::new(e).context(csv.display().to_string()));
     }
@@ -389,9 +397,17 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("the measured plays were lost"))?;
     let fullscreen = window::opens_fullscreen();
     for (record, fig) in plays.iter() {
-        let modes = presentmon::summarize_modes(&frames, (fig.span.0.0, fig.span.1.0));
-        let label = record.display().to_string();
-        print!("{}", presentmon::mode_lines(&label, &modes, fullscreen));
+        let lifetime = [(record.display().to_string(), (fig.span.0.0, fig.span.1.0))];
+        print!(
+            "{}",
+            presentmon::mode_report(
+                &frames,
+                fig.present_times.as_deref(),
+                fig.refresh_period_ns,
+                &lifetime,
+                fullscreen
+            )
+        );
         let Some(period) = fig.refresh_period_ns else {
             eprintln!("measure: no refresh rate for {}", record.display());
             continue;

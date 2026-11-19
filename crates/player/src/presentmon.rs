@@ -60,9 +60,10 @@ pub fn locate(setting: Option<OsString>, path: Option<OsString>) -> anyhow::Resu
         })
 }
 
-/// The capture's arguments (the stage 0 flags).
-pub fn args(process: &str, csv: &Path) -> Vec<OsString> {
-    let mut a: Vec<OsString> = ["--process_name", process, "--output_file"]
+/// The capture's arguments (the stage 0 flags), for the process `pid`
+/// alone: another program of the same name is not captured.
+pub fn args(pid: u32, csv: &Path) -> Vec<OsString> {
+    let mut a: Vec<OsString> = ["--process_id", &pid.to_string(), "--output_file"]
         .iter()
         .map(OsString::from)
         .collect();
@@ -90,7 +91,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Starts PresentMon capturing `process` into `csv`, its output into
+    /// Starts PresentMon capturing the process `pid` into `csv`, its output into
     /// `log`, and waits until its session runs. Both are in the data root,
     /// so neither is written through a link: the log is a new file, and a
     /// link at `csv` is removed before PresentMon, which opens its file
@@ -99,12 +100,12 @@ impl Capture {
     /// # Errors
     ///
     /// Why it did not start, or that it exited while starting.
-    pub fn start(exe: &Path, process: &str, csv: &Path, log: &Path) -> anyhow::Result<Self> {
+    pub fn start(exe: &Path, pid: u32, csv: &Path, log: &Path) -> anyhow::Result<Self> {
         game::clear_link(csv, link_count).with_context(|| csv.display().to_string())?;
         let out = game::create_fresh(log).with_context(|| log.display().to_string())?;
         let err = out.try_clone()?;
         let child = Command::new(exe)
-            .args(args(process, csv))
+            .args(args(pid, csv))
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -272,7 +273,7 @@ pub enum PmError {
 }
 
 const REQUIRED: [&str; 5] = [
-    "Application",
+    "ProcessID",
     "CPUStartQPC",
     "MsCPUBusy",
     "MsBetweenDisplayChange",
@@ -300,12 +301,12 @@ fn ms_to_us(ms: f64) -> i64 {
 }
 
 /// Parses a PresentMon 2 CSV (`--qpc_time`), keeping the rows whose
-/// `Application` is `app` (case-insensitive), sorted by present time.
+/// `ProcessID` is `pid`, sorted by present time.
 /// Columns are found by name. A row whose display change is `NA` is kept
 /// as never displayed. `to_us` puts a raw QPC value on the game's clock.
 ///
 /// On a bad row the rows read so far come back with the error.
-pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>, Option<PmError>) {
+pub fn parse(text: &str, pid: u32, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>, Option<PmError>) {
     // PresentMon 2.6 starts its file with a byte order mark.
     let mut lines = text.strip_prefix('\u{feff}').unwrap_or(text).lines();
     let Some(header) = lines.next() else {
@@ -330,7 +331,7 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
             if fields.len() != names.len() {
                 return Err(());
             }
-            let app_ok = fields[cols[0]].trim().eq_ignore_ascii_case(app);
+            let ours = fields[cols[0]].trim().parse::<u32>().map_err(|_| ())? == pid;
             let start: i64 = fields[cols[1]].trim().parse().map_err(|_| ())?;
             let busy = duration(fields[cols[2]])?;
             let change = duration(fields[cols[3]])?;
@@ -341,13 +342,13 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
             };
             let present = (flag(sync_col)?, flag(tearing_col)?.map(|t| t != 0));
             let mode = mode_col.map(|c| PresentMode::from_value(fields[c]));
-            Ok((app_ok, start, busy, change, until, present, mode))
+            Ok((ours, start, busy, change, until, present, mode))
         })();
-        let Ok((app_ok, start, busy, change, until, (sync_interval, tearing), mode)) = row else {
+        let Ok((ours, start, busy, change, until, (sync_interval, tearing), mode)) = row else {
             error = Some(PmError::BadRow(i + 2));
             break;
         };
-        if !app_ok {
+        if !ours {
             continue;
         }
         let present_us = to_us(start) + busy.map_or(0, ms_to_us);
@@ -368,6 +369,28 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
 /// submission of that present, µs: the present call and the read of the
 /// clock after it.
 pub const MATCH_TOLERANCE_US: i64 = 2_000;
+
+/// The pairing's tolerance at a refresh of `period_ns`:
+/// [`MATCH_TOLERANCE_US`], or half a refresh if shorter.
+const fn tolerance(period_ns: i64) -> i64 {
+    let half = period_ns / 2_000;
+    if half < MATCH_TOLERANCE_US {
+        half
+    } else {
+        MATCH_TOLERANCE_US
+    }
+}
+
+/// Whether the game's present at `g` (taken after its present call
+/// returned) pairs with the capture's present submitted at `c`, whose
+/// captured neighbours were submitted at `before` and `after`: at most
+/// `tol` after it, before the next one, and not within `tol` of the
+/// previous one.
+fn pairs(g: i64, c: i64, before: Option<i64>, after: Option<i64>, tol: i64) -> bool {
+    (0..=tol).contains(&(g - c))
+        && after.is_none_or(|n| n > g)
+        && before.is_none_or(|p| g - p > tol)
+}
 
 /// One play's figures from the capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,7 +469,7 @@ pub fn count_capture(
         .filter(|f| (from..=to).contains(&f.present_us))
         .collect();
     let presents = Some(window.len() as u64);
-    let tol = MATCH_TOLERANCE_US.min(period_ns / 2_000);
+    let tol = tolerance(period_ns);
     let next = frames
         .iter()
         .find(|f| f.present_us > to)
@@ -462,9 +485,7 @@ pub fn count_capture(
                 let c = window[i].present_us;
                 let after = window.get(i + 1).map(|f| f.present_us).or(next);
                 let before = i.checked_sub(1).map(|j| window[j].present_us);
-                (0..=tol).contains(&(g - c))
-                    && after.is_none_or(|n| n > g)
-                    && before.is_none_or(|p| g - p > tol)
+                pairs(g, c, before, after, tol)
             })
     });
     if !covered {
@@ -532,12 +553,46 @@ impl ModeSummary {
     }
 }
 
-/// The presents of `frames` in the span `[a, b)` (µs on the game's clock,
-/// by present time), by [`PresentMode`].
+/// Each of `frames`' presents (sorted by present time) on the game's
+/// side: the time in `times` (every present the game issued, in order,
+/// taken after each present call returned) of the game's present it pairs
+/// with by [`count_capture`]'s rule at a refresh of `period_ns` (unknown:
+/// [`MATCH_TOLERANCE_US`]), the only one within the tolerance; its own
+/// present time when it pairs with none, or without `times`.
 #[must_use]
-pub fn summarize_modes(frames: &[PmFrame], (a, b): (i64, i64)) -> ModeSummary {
+pub fn game_times(frames: &[PmFrame], times: Option<&[i64]>, period_ns: Option<i64>) -> Vec<i64> {
+    let tol = period_ns.map_or(MATCH_TOLERANCE_US, tolerance);
+    let at = |i: usize| frames.get(i).map(|f| f.present_us);
+    (0..frames.len())
+        .map(|i| {
+            let c = at(i).unwrap_or_default();
+            let Some(times) = times else { return c };
+            let first = times.partition_point(|&g| g < c);
+            let mut near = times
+                .get(first..)
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .take_while(|&g| g - c <= tol);
+            match (near.next(), near.next()) {
+                (Some(g), None) if pairs(g, c, i.checked_sub(1).and_then(at), at(i + 1), tol) => g,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// The presents of `frames` whose time in `owners` (theirs on the game's
+/// side, [`game_times`]) lies in the span `[a, b)`, by [`PresentMode`].
+#[must_use]
+pub fn summarize_modes(frames: &[PmFrame], owners: &[i64], (a, b): (i64, i64)) -> ModeSummary {
     let mut s = ModeSummary::default();
-    for f in frames.iter().filter(|f| (a..b).contains(&f.present_us)) {
+    let owned = frames
+        .iter()
+        .zip(owners)
+        .filter(|&(_, t)| (a..b).contains(t))
+        .map(|(f, _)| f);
+    for f in owned {
         if f.display_us.is_none() {
             s.not_displayed += 1;
             continue;
@@ -588,6 +643,27 @@ pub fn mode_lines(label: &str, s: &ModeSummary, fullscreen: bool) -> String {
     out
 }
 
+/// The lines of [`mode_lines`] for each of `lifetimes` (a label and a
+/// span on the game's clock) over `frames`, each captured present placed
+/// by its time on the game's side ([`game_times`] with `times`, the
+/// game's presents, and `period_ns`).
+#[must_use]
+pub fn mode_report(
+    frames: &[PmFrame],
+    times: Option<&[i64]>,
+    period_ns: Option<i64>,
+    lifetimes: &[(String, (i64, i64))],
+    fullscreen: bool,
+) -> String {
+    let owners = game_times(frames, times, period_ns);
+    lifetimes
+        .iter()
+        .map(|(label, span)| {
+            mode_lines(label, &summarize_modes(frames, &owners, *span), fullscreen)
+        })
+        .collect()
+}
+
 /// The capture's figures as a TOML table, numbers only (N/A left out),
 /// with the game's own present count in the span and the period counted
 /// at.
@@ -621,21 +697,28 @@ mod tests {
     use render::measure::Presentation;
 
     use super::{
-        Capture, ModeSummary, PlayCapture, PmError, PmFrame, PresentMode, count_play, locate,
-        mode_lines, parse, summarize_modes,
+        Capture, ModeSummary, PlayCapture, PmError, PmFrame, PresentMode, count_play, game_times,
+        locate, mode_lines, mode_report, parse, summarize_modes,
     };
     use crate::measure::Figures;
 
     const HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartQPC,MsBetweenSimulationStart,MsPCLatency,MsBetweenPresents,MsBetweenAppStart,MsCPUBusy,MsCPUWait,MsInPresentAPI,MsGPULatency,MsGPUTime,MsGPUBusy,MsGPUWait,MsVideoBusy,MsAnimationError,AnimationTime,MsFlipDelay,DisplayLatency,DisplayedTime,MsUntilDisplayed,MsBetweenDisplayChange";
 
+    /// The game's process id in these captures.
+    const PID: u32 = 1234;
+
     fn row(app: &str, qpc: i64, displayed: bool) -> String {
+        row_of(app, PID, qpc, displayed)
+    }
+
+    fn row_of(app: &str, pid: u32, qpc: i64, displayed: bool) -> String {
         let (until, change, shown) = if displayed {
             ("4.0000", "16.6667", "16.6667")
         } else {
             ("NA", "NA", "NA")
         };
         format!(
-            "{app},1234,0x0000000000000001,DXGI,1,0,0,Hardware: Independent Flip,{qpc},NA,NA,16.6667,16.6667,1.2000,15.0000,0.1000,0.5000,1.1000,1.0500,0.0000,0.0000,NA,NA,NA,NA,{shown},{until},{change}"
+            "{app},{pid},0x0000000000000001,DXGI,1,0,0,Hardware: Independent Flip,{qpc},NA,NA,16.6667,16.6667,1.2000,15.0000,0.1000,0.5000,1.1000,1.0500,0.0000,0.0000,NA,NA,NA,NA,{shown},{until},{change}"
         )
     }
 
@@ -667,7 +750,7 @@ mod tests {
             }
         }
         let missing = dir.path().join("no-presentmon.exe");
-        assert!(Capture::start(&missing, "tapestry.exe", &csv, &log).is_err());
+        assert!(Capture::start(&missing, PID, &csv, &log).is_err());
         for name in ["scratch.wav", "select.wav"] {
             let bytes = std::fs::read(dir.path().join(name)).unwrap();
             assert_eq!(bytes, name.as_bytes(), "{name} was written");
@@ -684,14 +767,14 @@ mod tests {
         let csv = format!(
             "{HEADER}\n{}\n{}\n{}\n",
             row("tapestry.exe", 1_000_166_667, true),
-            row("other.exe", 1_000_200_000, true),
+            row_of("other.exe", 4321, 1_000_200_000, true),
             row("TAPESTRY.EXE", 1_000_333_333, false),
         );
-        let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+        let (frames, err) = parse(&csv, PID, to_us);
         assert_eq!(err, None);
         // PresentMon 2.6 writes a byte order mark first.
         assert_eq!(
-            parse(&format!("\u{feff}{csv}"), "tapestry.exe", to_us),
+            parse(&format!("\u{feff}{csv}"), PID, to_us),
             (frames.clone(), None)
         );
         // 166 667 ticks = 16 666 µs, plus 1.2 ms of CPU work, then
@@ -721,16 +804,16 @@ mod tests {
     fn truncated_row_and_missing_column_are_errors() {
         let full = row("tapestry.exe", 1_000_166_667, true);
         let csv = format!("{HEADER}\n{full}\n{}\n", &full[..40]);
-        let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+        let (frames, err) = parse(&csv, PID, to_us);
         assert_eq!(frames.len(), 1);
         assert_eq!(err, Some(PmError::BadRow(3)));
         let csv = "Application,CPUStartQPC\ntapestry.exe,1\n";
         assert_eq!(
-            parse(csv, "x", to_us),
+            parse(csv, PID, to_us),
             (Vec::new(), Some(PmError::MissingColumn))
         );
         assert_eq!(
-            parse("", "x", to_us),
+            parse("", PID, to_us),
             (Vec::new(), Some(PmError::BadRow(1)))
         );
     }
@@ -750,19 +833,12 @@ mod tests {
         for bad in ["inf", "NaN", "-1.0"] {
             let r = row("tapestry.exe", 1_000_166_667, true).replace("1.2000", bad);
             let csv = format!("{HEADER}\n{r}\n");
-            assert_eq!(
-                parse(&csv, "tapestry.exe", to_us).1,
-                Some(PmError::BadRow(2)),
-                "{bad}"
-            );
+            assert_eq!(parse(&csv, PID, to_us).1, Some(PmError::BadRow(2)), "{bad}");
         }
         // An unreadable QPC value too.
         let r = row("tapestry.exe", 1, true).replace(",1,NA", ",x,NA");
         let csv = format!("{HEADER}\n{r}\n");
-        assert_eq!(
-            parse(&csv, "tapestry.exe", to_us).1,
-            Some(PmError::BadRow(2))
-        );
+        assert_eq!(parse(&csv, PID, to_us).1, Some(PmError::BadRow(2)));
     }
 
     /// A play over `span` whose game issued presents at `presents` (µs,
@@ -994,11 +1070,11 @@ mod tests {
         ];
         for (k, (value, mode, composed)) in (0_i64..).zip(modes) {
             let csv = format!("{HEADER}\n{}\n", row_as(value, 1_000_000_000 + k, true));
-            let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+            let (frames, err) = parse(&csv, PID, to_us);
             assert_eq!(err, None, "{value}");
             assert_eq!(frames[0].mode, Some(mode), "{value}");
             assert_eq!(mode.composed(), composed, "{value}");
-            let s = summarize_modes(&frames, (0, 1_000_000));
+            let s = summarize_modes(&frames, &game_times(&frames, None, None), (0, 1_000_000));
             assert_eq!(
                 (s.composed(), s.with_mode()),
                 (u64::from(composed), 1),
@@ -1015,9 +1091,9 @@ mod tests {
             HEADER.replace(",PresentMode", ""),
             row_as("Composed: Flip", 1_000_000_000, true).replace(",Composed: Flip", "")
         );
-        let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+        let (frames, err) = parse(&csv, PID, to_us);
         assert_eq!((frames[0].mode, err), (None, None));
-        let s = summarize_modes(&frames, (0, 1_000_000));
+        let s = summarize_modes(&frames, &game_times(&frames, None, None), (0, 1_000_000));
         assert_eq!((s.without_mode, s.with_mode()), (1, 0));
         assert_eq!(
             mode_lines("play", &s, true),
@@ -1035,12 +1111,12 @@ mod tests {
             row_as("Unknown", 1_000_010_000, true),
             row_as("Composed: Flip", 1_000_020_000, true),
         );
-        let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+        let (frames, err) = parse(&csv, PID, to_us);
         assert_eq!(err, None);
         let modes: Vec<_> = frames.iter().map(|f| f.mode).collect();
         let other = Some(PresentMode::Other);
         assert_eq!(modes, [other, other, Some(PresentMode::ComposedFlip)]);
-        let s = summarize_modes(&frames, (0, 1_000_000));
+        let s = summarize_modes(&frames, &game_times(&frames, None, None), (0, 1_000_000));
         // One composed of three: not most of the lifetime.
         assert_eq!((s.composed(), s.with_mode()), (1, 3));
         assert_eq!(
@@ -1075,7 +1151,7 @@ mod tests {
         frames.extend((0..5).map(|k| moded(160_000 + k * 4_000, true, IndependentFlip)));
         frames.push(moded(164_500, false, IndependentFlip));
         frames.sort_by_key(|f| f.present_us);
-        let select = summarize_modes(&frames, (0, 112_000));
+        let select = summarize_modes(&frames, &game_times(&frames, None, None), (0, 112_000));
         assert_eq!((select.composed(), select.with_mode()), (7, 7));
         assert_eq!(select.not_displayed, 1);
         assert_eq!(
@@ -1091,7 +1167,11 @@ mod tests {
                 .count(),
             1
         );
-        let play = summarize_modes(&frames, (112_000, 200_000));
+        let play = summarize_modes(
+            &frames,
+            &game_times(&frames, None, None),
+            (112_000, 200_000),
+        );
         assert_eq!((play.composed(), play.with_mode()), (3, 8));
         assert_eq!(play.not_displayed, 1);
         assert_eq!(
@@ -1130,15 +1210,115 @@ mod tests {
             moded(1_000, false, PresentMode::ComposedFlip),
             moded(2_000, false, PresentMode::ComposedFlip),
         ];
-        let s = summarize_modes(&frames, (0, 10_000));
+        let s = summarize_modes(&frames, &game_times(&frames, None, None), (0, 10_000));
         assert_eq!((s.with_mode(), s.not_displayed), (0, 2));
         assert_eq!(
             mode_lines("result lifetime 2", &s, true),
             "measure: result lifetime 2: displayed by present mode: none; 2 not displayed\n"
         );
         assert_eq!(
-            summarize_modes(&frames, (10_000, 20_000)),
+            summarize_modes(&frames, &game_times(&frames, None, None), (10_000, 20_000)),
             ModeSummary::default()
+        );
+    }
+
+    /// Two processes of one executable name, the game's and another
+    /// tapestry.exe: the capture asks for the game's process id, and only
+    /// its rows are read.
+    #[test]
+    fn another_process_of_the_same_name_is_not_read() {
+        let a = super::args(PID, std::path::Path::new("c.csv"));
+        let at = a
+            .iter()
+            .position(|x| x == "--process_id")
+            .expect("--process_id");
+        assert_eq!(a.get(at + 1).map(|x| x.to_str()), Some(Some("1234")));
+        assert!(!a.iter().any(|x| x == "--process_name"), "{a:?}");
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n{}\n",
+            row_of("tapestry.exe", PID, 1_000_000_000, true),
+            row_of("tapestry.exe", 5678, 1_000_010_000, true)
+                .replace("Hardware: Independent Flip", "Composed: Flip"),
+            row_of("tapestry.exe", PID, 1_000_020_000, false),
+        );
+        let (frames, err) = parse(&csv, PID, to_us);
+        assert_eq!(err, None);
+        assert_eq!(
+            frames.iter().map(|f| f.present_us).collect::<Vec<_>>(),
+            [1_200, 2_000 + 1_200]
+        );
+        let s = summarize_modes(&frames, &game_times(&frames, None, None), (0, 10_000));
+        assert_eq!((s.composed(), s.with_mode(), s.not_displayed), (0, 1, 1));
+        // An unreadable process id is a bad row, as any unreadable value.
+        let bad = row_of("tapestry.exe", PID, 1_000_000_000, true).replace(",1234,", ",x,");
+        assert_eq!(
+            parse(&format!("{HEADER}\n{bad}\n"), PID, to_us).1,
+            Some(PmError::BadRow(2))
+        );
+    }
+
+    /// A screen's span is taken after its present calls returned (the
+    /// game's clock), while the capture times each present at its
+    /// submission, a little earlier. The span [4 300, 16 300) of the
+    /// presents the game issued at 4 300 to 12 300 owns the captured
+    /// presents at 4 000, 8 000 and 12 000, never the next screen's at
+    /// 16 000, nor the one before at 0: each is placed by the game's
+    /// present it pairs with.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_screen_owns_the_captured_presents_its_game_presents_pair_with() {
+        use PresentMode::{ComposedFlip, IndependentFlip};
+        let modes = [
+            IndependentFlip,
+            ComposedFlip,
+            ComposedFlip,
+            ComposedFlip,
+            IndependentFlip,
+        ];
+        let frames: Vec<PmFrame> = (0_i64..)
+            .zip(modes)
+            .map(|(k, m)| moded(k * 4_000, true, m))
+            .collect();
+        let log = [300, 4_300, 8_300, 12_300, 16_300];
+        let span = crate::dev::screen_span((4_300, 12_300), &log);
+        assert_eq!(span, (4_300, 16_300));
+        let lifetimes = [("select lifetime 1".to_owned(), span)];
+        assert_eq!(
+            mode_report(&frames, Some(&log), Some(T), &lifetimes, true),
+            "measure: select lifetime 1: displayed by present mode: Composed: Flip 3; 0 not \
+             displayed\n\
+             measure: select lifetime 1: composed fullscreen lifetime: 3 of 3 displayed frames \
+             composed\n"
+        );
+        // By submission time alone it would own 8 000, 12 000 and 16 000.
+        let s = summarize_modes(&frames, &game_times(&frames, None, None), span);
+        assert_eq!((s.composed(), s.with_mode()), (2, 3));
+    }
+
+    /// A captured present that pairs with no game present (none within the
+    /// tolerance, or two) keeps its own submission time.
+    #[test]
+    fn an_unpaired_present_keeps_its_submission_time() {
+        let frames: Vec<PmFrame> = [0, 4_000, 8_000, 12_000]
+            .map(|p| frame(p, Some(p + 1_000)))
+            .to_vec();
+        // 4 000's game present came 2 500 µs later, past the tolerance;
+        // 8 000 has two within it.
+        let log = [300, 6_500, 8_100, 8_200, 12_300];
+        assert_eq!(
+            game_times(&frames, Some(&log), Some(T)),
+            [300, 4_000, 8_000, 12_300]
+        );
+        assert_eq!(
+            game_times(&frames, None, Some(T)),
+            [0, 4_000, 8_000, 12_000]
+        );
+        // Half a refresh is the tolerance when shorter: at 1 ms, 600 µs
+        // is too late for each.
+        let log = [600, 4_600, 8_600, 12_600];
+        assert_eq!(
+            game_times(&frames, Some(&log), Some(1_000_000)),
+            [0, 4_000, 8_000, 12_000]
         );
     }
 
