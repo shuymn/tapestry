@@ -8,6 +8,7 @@ use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Storage::FileSystem::GetFileSizeEx;
 use windows::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MEM_IMAGE, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
     MapViewOfFile, PAGE_PROTECTION_FLAGS, PAGE_READWRITE, UnmapViewOfFile, VirtualProtect,
@@ -43,6 +44,19 @@ impl Owned {
         // else closes it.
         unsafe { std::fs::File::from_raw_handle(this.0.0) }
     }
+}
+
+/// The size of `file`, asked of its handle. A read-only handle that may
+/// read the file's data and nothing else gives it too: `File::metadata`
+/// would also read the file's attributes, which Windows refuses that
+/// handle.
+pub fn file_size(file: &std::fs::File) -> Option<u64> {
+    use std::os::windows::io::AsRawHandle as _;
+    let mut size = 0i64;
+    // SAFETY: the file's own handle, open while `file` lives, and the size
+    // the call writes.
+    unsafe { GetFileSizeEx(HANDLE(file.as_raw_handle()), &raw mut size) }.ok()?;
+    u64::try_from(size).ok()
 }
 
 impl Drop for Owned {
@@ -305,4 +319,46 @@ pub unsafe fn redirect_import(
         }
     }
     Ok(held.map(|h| h as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Seek as _, Write as _};
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+
+    use windows::Win32::Foundation::{DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::FILE_READ_DATA;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    #[test]
+    fn a_file_size_is_read_through_a_handle_that_reads_data_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("video");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&[7; 5_000])
+            .unwrap();
+        let opened = std::fs::File::open(&path).unwrap();
+        let mut reading = HANDLE::default();
+        // SAFETY: a handle this test opened, duplicated within its own
+        // process to read the file's data and nothing else.
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                HANDLE(opened.as_raw_handle()),
+                GetCurrentProcess(),
+                &raw mut reading,
+                FILE_READ_DATA.0,
+                false,
+                DUPLICATE_HANDLE_OPTIONS(0),
+            )
+        }
+        .unwrap();
+        // SAFETY: the duplicate, which the file owns from here.
+        let mut file = unsafe { std::fs::File::from_raw_handle(reading.0) };
+        // The control: the file's metadata needs a right the handle lacks.
+        assert!(file.metadata().is_err());
+        assert_eq!(super::file_size(&file), Some(5_000));
+        assert_eq!(file.stream_position().unwrap(), 0);
+    }
 }

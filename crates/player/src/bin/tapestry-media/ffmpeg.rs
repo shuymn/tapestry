@@ -830,13 +830,11 @@ unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i6
 }
 
 /// Moves in `file` as FFmpeg asks a seek callback to, or gives its size,
-/// read from its metadata without moving: one call moves in the file once
-/// at most.
+/// asked of its handle without moving: one call moves in the file once at
+/// most.
 fn seek_in(file: &mut std::fs::File, offset: i64, whence: c_int) -> i64 {
     let at = if whence & ff::AVSEEK_SIZE != 0 {
-        file.metadata()
-            .ok()
-            .and_then(|m| i64::try_from(m.len()).ok())
+        crate::os::file_size(file).and_then(|size| i64::try_from(size).ok())
     } else {
         let to = match whence & !ff::AVSEEK_FORCE {
             0 => u64::try_from(offset).ok().map(SeekFrom::Start),
