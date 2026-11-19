@@ -4,7 +4,7 @@
 [package]
 name = "fuzz"
 version = "0.0.0"
-description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding, skin definition reading and import, Lua skins, bitmap font parsing, skin images decoded in bands, and a chart's BGA pictures read into cells."
+description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding, skin definition reading and import, Lua skins, bitmap font parsing, skin images decoded in bands, a chart's BGA pictures read into cells, and a video's frame ring read by the game."
 edition = "2024"
 # GPL because it links `input` (design.md "Licenses"). Tooling, never shipped.
 license = "GPL-3.0-or-later"
@@ -129,6 +129,13 @@ unimplemented = "deny"
 [[bin]]
 name = "bga_images"
 path = "fuzz_targets/bga_images.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ring_bytes"
+path = "fuzz_targets/ring_bytes.rs"
 test = false
 doc = false
 bench = false

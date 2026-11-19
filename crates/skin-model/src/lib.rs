@@ -82,6 +82,10 @@
 //! ([`Skin::install_loading_text`]) until they are cleared
 //! ([`Skin::clear_loading_text`]).
 //!
+//! [`media`] is the frame ring a video's frames cross from the media
+//! worker: the game sizes it and reads it, the worker writes it, and every
+//! slot the game takes is checked before and after its frame is copied.
+//!
 //! Expressions use integers only; floats appear only in a quad's geometry,
 //! after evaluation, and in the play presentation program ([`present`]),
 //! whose Lua numbers are presentation and never reach the evaluator. The cast lints below reject `as` casts that may
@@ -103,6 +107,7 @@ mod decision;
 mod expr;
 mod image;
 mod layout;
+pub mod media;
 #[cfg(feature = "dev-tools")]
 mod observation;
 pub mod output;
