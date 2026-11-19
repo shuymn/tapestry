@@ -82,8 +82,8 @@ use game::{Chain, Preparation, PreparationRefusal, RenderSide, ResultGraphs};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
 use render::{
-    AttemptInput, CommitError, FrameInput, FrameTiming, Installation, LoadingFrame, PreparedToken,
-    RenderError, SkinBundle,
+    AttemptInput, CommitError, FrameInput, FrameOutcome, FrameTiming, Installation, LoadingFrame,
+    PreparedToken, RenderError, SkinBundle,
 };
 use skin_model::{AtlasId, BuildError, PackedPages, PlayContext, ScreenKind};
 
@@ -428,6 +428,13 @@ pub trait Screen: Send {
         let _ = kind;
         [None; 3]
     }
+    /// The selection's and decision's committed charges against the
+    /// shared texel limit, the selection's with its pool's firm layer
+    /// whether the pool has it now or not (`render::Renderer::menu_charges`).
+    /// The default charges nothing.
+    fn menus(&self) -> u64 {
+        0
+    }
     /// Prepares a result view on `state`, a state of `skin`'s: the view
     /// and labels taken ([`skin_model::Skin::update_result`]) and its
     /// lines staged for the result bundle staged or committed, not drawn
@@ -663,15 +670,16 @@ pub trait Screen: Send {
     /// As [`draw`](Self::draw).
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError>;
     /// Draws the end screen's `page`, its lines and its graphs, as
-    /// [`draw`](Self::draw). A screen that draws no graphs draws the lines
-    /// as [`text`](Self::text).
+    /// [`draw`](Self::draw), and says what became of the frame. A screen
+    /// that draws no graphs draws the lines as [`text`](Self::text), a
+    /// frame not presented a [`FrameOutcome::Retry`].
     ///
     /// # Errors
     ///
     /// As [`draw`](Self::draw).
-    fn end(&mut self, page: &EndPage) -> Result<bool, RenderError> {
+    fn end(&mut self, page: &EndPage) -> Result<FrameOutcome, RenderError> {
         let lines: Vec<&str> = page.lines.iter().map(String::as_str).collect();
-        self.text(&lines)
+        self.text(&lines).map(shown_or_retry)
     }
     /// Draws the select screen's `page`, laid out again when `changed`
     /// (or when this screen has not laid it out yet). A screen that
@@ -686,7 +694,7 @@ pub trait Screen: Send {
             cpu: Duration::ZERO,
             sprites: 0,
             dropped: 0,
-            presented: true,
+            outcome: render::FrameOutcome::Shown,
             present_count: None,
         })
     }
@@ -1659,6 +1667,9 @@ struct Shared {
     /// The result's barrier, with the view presented, which the commit
     /// point writes under its lock.
     barrier: Mutex<ResultBarrier>,
+    /// The game's Result entries and the acknowledgement of their first
+    /// pictures.
+    result_entries: ResultEntries,
     /// What the render thread shows of the result kind.
     result_status: Mutex<ResultReport>,
     /// Result frames hold after their lifetime's check while set, and
@@ -1806,6 +1817,7 @@ impl Shared {
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
             barrier: Mutex::new(ResultBarrier::default()),
+            result_entries: ResultEntries::default(),
             result_status: Mutex::new(ResultReport::default()),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
@@ -2723,6 +2735,43 @@ impl RenderLink {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let b = self.shared.barrier();
         b.origin.filter(|_| b.lifetime == lifetime)
+    }
+
+    /// The game enters Result (design.md "State Model", system sounds,
+    /// Result): the entry's number, which the render thread acknowledges
+    /// at the entry's first result picture, then waking `wake`. Called
+    /// before anything of the entry is sent.
+    pub fn enter_result_entry(&self, wake: Option<std::thread::Thread>) -> u64 {
+        self.shared.result_entries.enter(wake)
+    }
+
+    /// Acknowledges a Result entry's first picture as the render thread
+    /// does, from any thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_acknowledger(&self) -> impl Fn(u64) + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move |entry| shared.result_entries.acknowledge(entry)
+    }
+
+    /// Runs `f` holding the result's status, as the render thread holds it
+    /// while it publishes, from any thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_status_hold(&self) -> impl Fn(&mut dyn FnMut()) + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move |f| {
+            let _held = shared.result_status();
+            f();
+        }
+    }
+
+    /// The last Result entry whose first result picture a frame
+    /// acknowledged, 0 before any.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn result_acknowledged(&self) -> u64 {
+        self.shared
+            .result_entries
+            .acknowledged
+            .load(Ordering::Acquire)
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -4257,6 +4306,8 @@ pub fn spawn(
                 frames,
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
+                #[cfg(feature = "dev-tools")]
+                rf_armed: 0,
                 granted: false,
                 image: Image::default(),
                 first_frame: None,
@@ -5515,6 +5566,11 @@ struct Run {
     shared: Arc<Shared>,
     /// The end screen's page last taken from the slot, and its number.
     end_page: (u64, EndPage),
+    /// The Result entry whose built-in page, with no result lifetime, last
+    /// armed the result's probed frames (`rf:*`, dev-tools): once per entry,
+    /// a frame tried again included.
+    #[cfg(feature = "dev-tools")]
+    rf_armed: u64,
     /// The screen's wait granted a frame that no draw has taken yet: the
     /// end screen was left or nothing was to be drawn. Only a presented
     /// frame gives the grant back (a swap chain's waitable object, one
@@ -5762,6 +5818,27 @@ impl Run {
         let mut mode = Mode::Splash { pending: None };
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
         loop {
+            // The mode this pass's work runs in (the probe reads no memory
+            // in play): a message that changed it and went on to the next
+            // is followed here.
+            #[cfg(feature = "dev-tools")]
+            if crate::dev::loop_probe::on() {
+                render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
+            }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark(
+                "loop",
+                match mode {
+                    Mode::Idle => 0,
+                    Mode::Splash { .. } => 1,
+                    Mode::Play { .. } => 2,
+                    Mode::End => 3,
+                    Mode::Menu { .. } => 4,
+                    Mode::Decision => 5,
+                    Mode::Selection => 6,
+                    Mode::Result => 7,
+                },
+            );
             self.sync_chart();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
             let msg = if idle
@@ -5785,6 +5862,20 @@ impl Run {
             } else {
                 rx.try_recv()
             };
+            #[cfg(feature = "dev-tools")]
+            if let Ok(m) = &msg {
+                crate::dev::loop_probe::mark(
+                    match m {
+                        RenderMsg::Decision { .. } => "msg:Decision",
+                        RenderMsg::SelectionChanged => "msg:SelectionChanged",
+                        RenderMsg::ResultChanged => "msg:ResultChanged",
+                        RenderMsg::Loading(_) => "msg:Loading",
+                        RenderMsg::ParkScripts(_) => "msg:ParkScripts",
+                        _ => "msg:other",
+                    },
+                    i64::from(idle),
+                );
+            }
             // The select screen is left: its frames are reported; and the
             // loading state's, once it is left.
             #[cfg(feature = "dev-tools")]
@@ -6171,12 +6262,27 @@ impl Run {
                     skin,
                     reply,
                 }) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark(
+                        "sel:recv",
+                        i64::from(matches!(skin, Selected::Pages(_))),
+                    );
                     let answer = match skin {
-                        Selected::Skin(skin, script) => self.select(request, kind, skin, script),
+                        Selected::Skin(skin, script) => {
+                            #[cfg(feature = "dev-tools")]
+                            let _caller =
+                                crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN);
+                            self.select(request, kind, skin, script)
+                        }
                         Selected::Pending => self.pend(request, kind),
                         Selected::Pages(pages) => self.select_pages(request, kind, &pages),
                     };
                     self.reconcile_result();
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark(
+                        "sel:reply",
+                        i64::from(matches!(answer, Ok(Preparation::Ready))),
+                    );
                     let _ = reply.send(answer);
                     mode = self.after_preparing(mode);
                     continue;
@@ -6307,19 +6413,28 @@ impl Run {
                 self.select_frames
                     .report("select", self.clock.frequency().hz());
             }
+            // The messages are taken: the mode the work below runs in (the
+            // probe reads no memory in play, as at the frame below).
+            #[cfg(feature = "dev-tools")]
+            if crate::dev::loop_probe::on() {
+                render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
+            }
             self.poll_attempt();
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
             if matches!(mode, Mode::Result) {
                 #[cfg(feature = "dev-tools")]
-                let prepared = Instant::now();
+                let (prepared, p_own) = (Instant::now(), render::probe::own_time());
                 self.prepare_result();
                 // Charged to the next frame only while the screen it was
-                // done on lives (dev-tools: the whole frames).
+                // done on lives (dev-tools: the whole frames), without the
+                // probe's own work.
                 #[cfg(feature = "dev-tools")]
                 if self.screen.is_some() {
-                    self.result_frames.before_wait(prepared);
+                    let p_own = render::probe::own_time().saturating_sub(p_own);
+                    self.result_frames
+                        .before_wait(prepared.checked_add(p_own).unwrap_or(prepared));
                 }
                 if self.screen.is_none() {
                     mode = Mode::Idle;
@@ -6476,14 +6591,24 @@ impl Run {
             // instead, and a frame granted before stays granted.
             let minimized = screen.minimized();
             if screen.paced() && !minimized {
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("wait0", i64::from(self.granted));
                 if !self.granted && !screen.wait() {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("wait-false", 0);
                     continue;
                 }
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("wait1", 0);
                 self.granted = true;
             } else {
                 #[cfg(test)]
                 self.shared.clock_paced.fetch_add(1, Ordering::SeqCst);
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("sleep0", 0);
                 std::thread::sleep(Duration::from_millis(16));
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("sleep1", 0);
             }
             // The end screen was left (its pages cleared): the page drawn
             // last goes, and nothing is drawn until what comes next, which
@@ -6535,6 +6660,8 @@ impl Run {
                     .as_ref()
                     .is_none_or(|s| !self.shared.selection_current(s.update.lifetime))
             {
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("sel-left-after-wait", 0);
                 self.selection = None;
                 mode = Mode::Idle;
                 // A pool write held is answered, never kept past the
@@ -6649,6 +6776,22 @@ impl Run {
             // scenario's transition record).
             #[cfg(feature = "dev-tools")]
             let mut selection_skinned: Option<bool> = None;
+            #[cfg(feature = "dev-tools")]
+            if crate::dev::loop_probe::on() {
+                crate::dev::loop_probe::mark("draw0", 0);
+                // The frame's mode is settled: in play the renderer's probe
+                // reads no memory and arms no callback (they allocate).
+                render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
+            }
+            // Whether this frame is one of the result's first frames
+            // probed (`rf:*`), decided at its commit point.
+            #[cfg(feature = "dev-tools")]
+            let mut p_rf = false;
+            // The Result entry the frame draws a result picture of, read
+            // before the frame fixes what it draws: its commit point holds
+            // a view, or it is the built-in page of an entry without a
+            // result lifetime.
+            let mut result_picture: Option<u64> = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -6669,13 +6812,7 @@ impl Run {
                         continue;
                     };
                     drawn.map(|presented| {
-                        let timing = FrameTiming {
-                            cpu: Duration::ZERO,
-                            sprites: 0,
-                            dropped: 0,
-                            presented,
-                            present_count: None,
-                        };
+                        let timing = timing_of(shown_or_retry(presented));
                         (timing, None)
                     })
                 }
@@ -6805,7 +6942,7 @@ impl Run {
                     }
                     let drawn = screen.draw().map(|timing| (timing, Some(now)));
                     // The first frame that reached the screen.
-                    if matches!(&drawn, Ok((t, _)) if t.presented) && *first {
+                    if matches!(&drawn, Ok((t, _)) if t.presented()) && *first {
                         *first = false;
                         self.shared
                             .first_frame
@@ -6893,7 +7030,7 @@ impl Run {
                     // The lifetime's first presented frame starts the
                     // loading state's minimum (design.md "Play Lifecycle").
                     if let (Some(lifetime), Ok((t, _))) = (loading_frame, &drawn)
-                        && t.presented
+                        && t.presented()
                     {
                         // The skin drawn declares; the pending presentation
                         // draws none and changes nothing.
@@ -6925,7 +7062,7 @@ impl Run {
                             &mut self.menu_stats
                         };
                         stats.frame(t.cpu, after - before, *changed);
-                        if loading_frame.is_some() && t.presented {
+                        if loading_frame.is_some() && t.presented() {
                             self.shared.loading_drawn.fetch_add(1, Ordering::Relaxed);
                         }
                         // What a refusal put on the screen, once drawn.
@@ -7080,7 +7217,7 @@ impl Run {
                         // "Shortening Launch-Based Checks").
                         let u = &shown.update;
                         if self.pool.print
-                            && d.timing.presented
+                            && d.timing.presented()
                             && self.pool.printed != Some((u.lifetime, u.revision))
                         {
                             self.pool.printed = Some((u.lifetime, u.revision));
@@ -7119,6 +7256,7 @@ impl Run {
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }
+                    let entry = self.shared.result_entries.drawing();
                     let fadeout = Self::result_commit(
                         screen.as_mut(),
                         self.result.as_mut(),
@@ -7126,6 +7264,16 @@ impl Run {
                         &self.scripts,
                         now,
                     );
+                    // The first frames after the first view committed.
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        p_rf = probe_result_frame();
+                    }
+                    result_picture = self
+                        .result
+                        .as_ref()
+                        .is_some_and(|s| s.presented.is_some())
+                        .then_some(entry);
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
@@ -7344,6 +7492,35 @@ impl Run {
                     }
                 }
                 Mode::End => {
+                    // An entry whose result lifetime began shows first at
+                    // its first committed view, not on this page.
+                    result_picture = (!self.shared.result_slot().open())
+                        .then(|| self.shared.result_entries.drawing());
+                    // The first frames of an entry's built-in page with no
+                    // result lifetime, as a lifetime's first view's are
+                    // (`rf:*`, dev-tools): armed once per entry, and only
+                    // while its first picture is not acknowledged, so a
+                    // frame tried again does not arm them again and a page
+                    // after a picture the entry already showed arms nothing.
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        if let Some(entry) = result_picture
+                            && entry != 0
+                            && entry != self.rf_armed
+                            && entry
+                                != self
+                                    .shared
+                                    .result_entries
+                                    .acknowledged
+                                    .load(Ordering::Acquire)
+                            && crate::dev::loop_probe::on()
+                        {
+                            self.rf_armed = entry;
+                            crate::dev::loop_probe::RESULT_FRAMES
+                                .store(3, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        p_rf = probe_result_frame();
+                    }
                     #[cfg(feature = "dev-tools")]
                     {
                         result_stamp = Some(crate::measure::ResultStamp {
@@ -7371,6 +7548,8 @@ impl Run {
             if decision_refused.is_some() {
                 self.shared.decision_cleanup_gate.pass();
             }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark("draw1", 0);
             // A result or end frame lost as a device loss (dev-tools: a
             // recovery while a result shows).
             #[cfg(feature = "dev-tools")]
@@ -7383,6 +7562,14 @@ impl Run {
                 }
                 other => other,
             };
+            // The entry's first result picture, once shown or deliberately
+            // not shown: the game thread starts the result's sound at its
+            // next look (design.md "State Model", system sounds, Result).
+            if let Some(entry) = result_picture
+                && drawn.as_ref().is_ok_and(|(t, _)| t.outcome.counts())
+            {
+                self.shared.result_entries.acknowledge(entry);
+            }
             // What the frame drew, fixed before a refused decision frame
             // hands the screen to its page (dev-tools: a scenario's
             // transition record).
@@ -7415,7 +7602,7 @@ impl Run {
                     .decision_faults_fired
                     .store(self.decision_faults.fired, Ordering::SeqCst);
                 if let (Some(r), Some(drew)) = (&mut self.decision_record, decision_as)
-                    && matches!(&drawn, Ok((t, _)) if t.presented)
+                    && matches!(&drawn, Ok((t, _)) if t.presented())
                 {
                     let n = match drew {
                         crate::measure::DecisionDrawnAs::Skin => &mut r.skin_frames,
@@ -7455,7 +7642,7 @@ impl Run {
             // The image's validity: a presented frame is valid only if
             // nothing changed since its token; any other result breaks it.
             match &drawn {
-                Ok((t, _)) if t.presented => self
+                Ok((t, _)) if t.presented() => self
                     .image
                     .presented(token, notices_of(self.extent.as_ref())),
                 _ => self.image.broken(),
@@ -7473,7 +7660,7 @@ impl Run {
             // Every screen's frame that reached the screen counts towards
             // the frames per second.
             if let Ok((timing, _)) = &drawn
-                && timing.presented
+                && timing.presented()
             {
                 self.app.presented(self.clock.now());
             }
@@ -7486,7 +7673,7 @@ impl Run {
                 _ => false,
             };
             if let Ok((timing, chart)) = &drawn
-                && timing.presented
+                && timing.presented()
                 && turns
             {
                 // A play frame's tick is the app's work, measured as its
@@ -7501,11 +7688,34 @@ impl Run {
                 #[cfg(feature = "dev-tools")]
                 drop(region);
             }
-            if matches!(mode, Mode::Result) && drawn.is_ok() {
+            #[cfg(feature = "dev-tools")]
+            if p_rf {
+                render::probe::arm_frame(false);
+                crate::dev::loop_probe::mark("rf:drawn_ok", i64::from(drawn.is_ok()));
+                crate::dev::loop_probe::mark(
+                    "rf:presented",
+                    i64::from(drawn.as_ref().is_ok_and(|(t, _)| t.presented())),
+                );
+            }
+            #[cfg(feature = "dev-tools")]
+            let p_t = render::probe::Span::start();
+            let p_after = matches!(mode, Mode::Result) && drawn.is_ok();
+            if p_after {
                 self.after_result_frame();
             }
             #[cfg(feature = "dev-tools")]
-            if skin_built && drawn.as_ref().is_ok_and(|(t, _)| t.presented) {
+            if p_rf {
+                if p_after {
+                    crate::dev::loop_probe::mark(
+                        "rf:after_result_frame_us",
+                        crate::dev::loop_probe::us(p_t.elapsed()),
+                    );
+                }
+                crate::dev::loop_probe::RF_ACTIVE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "dev-tools")]
+            if skin_built && drawn.as_ref().is_ok_and(|(t, _)| t.presented()) {
                 self.probe_result_frame();
             }
             #[cfg(feature = "dev-tools")]
@@ -7563,7 +7773,7 @@ impl Run {
                     // Every present, for `tapestry measure select`
                     // (dev-tools).
                     #[cfg(feature = "dev-tools")]
-                    if timing.presented {
+                    if timing.presented() {
                         self.present_log.present(presented_at.0);
                     }
                     // A select or result skin frame's spans and present
@@ -7603,7 +7813,7 @@ impl Run {
                             timing.cpu,
                         );
                         let presented = crate::dev::Presented {
-                            at: timing.presented.then_some(presented_at.0),
+                            at: timing.presented().then_some(presented_at.0),
                             statistics: d.statistics,
                             presentation: d.presentation,
                         };
@@ -7630,13 +7840,15 @@ impl Run {
                     self.measure.frame(&d);
                     #[cfg(feature = "dev-tools")]
                     drop(region);
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("present", d.presented_at.0);
                     self.frames.frame(screen.as_ref(), &d);
                     // The end page drawn, for a script waiting on it
                     // (dev-tools).
                     // A result's frame counts once nothing newer of it waits
                     // to be prepared or committed.
                     #[cfg(feature = "dev-tools")]
-                    if timing.presented
+                    if timing.presented()
                         && (matches!(mode, Mode::End)
                             || matches!(mode, Mode::Result)
                                 && self
@@ -7651,7 +7863,7 @@ impl Run {
                     // A select screen frame drawn, for a script waiting on
                     // one (dev-tools).
                     #[cfg(feature = "dev-tools")]
-                    if matches!(mode, Mode::Selection) && timing.presented {
+                    if matches!(mode, Mode::Selection) && timing.presented() {
                         self.shared.selection_drawn.fetch_add(1, Ordering::AcqRel);
                     }
                 }
@@ -8059,12 +8271,26 @@ impl Run {
             Some(set) => screen.publish_chart_images(target, set.fitted()),
             None => screen.publish_chart_absent(target),
         };
+        #[cfg(feature = "dev-tools")]
+        let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
+        #[cfg(feature = "dev-tools")]
+        let p_t = render::probe::Span::start();
         let mut answer = publish(screen, target);
         // The admitted staging draws from the committed installation when
         // it has no array of its own: its table is published there.
         let committed = request.is_none() || matches!(answer, Err(RenderError::NoChartLayer));
         if request.is_some() && committed {
             answer = publish(screen, render::ChartTarget::Committed);
+        }
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::loop_probe::mark(
+                "ci:att:publish_us",
+                crate::dev::loop_probe::us(p_t.elapsed()),
+            );
+            crate::dev::loop_probe::mark("ci:att:staged", i64::from(!committed));
+            crate::dev::loop_probe::mark("ci:att:ok", i64::from(answer.is_ok()));
+            drop(p_caller);
         }
         // What a publication left in its target: a table, or an all-absent
         // one; nothing for the other failures.
@@ -8667,9 +8893,13 @@ impl Run {
     /// choices); without the installation, the built-in presentation takes
     /// over at once.
     fn enter_skinned_decision(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("enter-skinned-decision", 0);
         match &self.decision_side {
             Some(side) => {
                 self.decision_screen = Some(side.bundle().skin().prepare_decision());
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("prepare-decision-done", 0);
             }
             None => {
                 #[cfg(feature = "dev-tools")]
@@ -9267,6 +9497,8 @@ impl Run {
     fn drop_result(&mut self) {
         #[cfg(feature = "dev-tools")]
         {
+            // No result frame left to probe past its result.
+            crate::dev::loop_probe::RESULT_FRAMES.store(0, std::sync::atomic::Ordering::Relaxed);
             self.result_frames
                 .report("result", self.clock.frequency().hz());
             self.frames_view = None;
@@ -9418,6 +9650,8 @@ impl Run {
     /// overlay alone only the strip's text. A screen built again has the
     /// view presented prepared again first. Allocates.
     fn prepare_result(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        let _caller = crate::dev::loop_probe::Caller::set(render::probe::RESULT);
         if self
             .result
             .as_ref()
@@ -9454,15 +9688,32 @@ impl Run {
                 // The layout presented is installed already: the screen
                 // built again restored what the result kind keeps, which
                 // follows each view's commit (`reconcile_result`).
-                match screen.prepare_result(bundle, state, &h.payload.view, &h.payload.labels) {
+                #[cfg(feature = "dev-tools")]
+                let p_t = render::probe::Span::start();
+                let p_prepared =
+                    screen.prepare_result(bundle, state, &h.payload.view, &h.payload.labels);
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark(
+                    "res:reapply_text_us",
+                    crate::dev::loop_probe::us(p_t.elapsed()),
+                );
+                match p_prepared {
                     Ok(Ok(())) => {
                         screen.install_result_text();
+                        #[cfg(feature = "dev-tools")]
+                        let p_t = render::probe::Span::start();
                         // The images again, into the restored array.
-                        match stage_result_chart(
+                        let p_chart = stage_result_chart(
                             screen.as_mut(),
                             render::ResultChartTarget::Committed,
                             h.payload.chart.as_deref(),
-                        ) {
+                        );
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::loop_probe::mark(
+                            "res:reapply_chart_us",
+                            crate::dev::loop_probe::us(p_t.elapsed()),
+                        );
+                        match p_chart {
                             Ok(table) => state.set_chart_images(table),
                             Err(e) => failed = Some(e),
                         }
@@ -9472,10 +9723,17 @@ impl Run {
                 }
             }
             let lines = strip_lines(&h.payload, &h.overlay, side.stop);
-            if let Err(e) = screen
+            #[cfg(feature = "dev-tools")]
+            let p_t = render::probe::Span::start();
+            let p_strip = screen
                 .prepare_result_strip(STRIP_PRESENTED, &lines)
-                .map(|()| screen.use_result_strip(STRIP_PRESENTED))
-            {
+                .map(|()| screen.use_result_strip(STRIP_PRESENTED));
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark(
+                "res:reapply_strip_us",
+                crate::dev::loop_probe::us(p_t.elapsed()),
+            );
+            if let Err(e) = p_strip {
                 failed = Some(e);
             }
         }
@@ -9518,7 +9776,29 @@ impl Run {
                 } else if let (Some(bundle), false) = (&p.payload.skin, disabled) {
                     #[cfg(feature = "dev-tools")]
                     let uploads = screen.atlas_uploads();
+                    #[cfg(feature = "dev-tools")]
+                    let p_t = render::probe::Span::start();
                     let installed = screen.install(ScreenKind::Result, bundle, request);
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        crate::dev::loop_probe::mark(
+                            "res:install_us",
+                            crate::dev::loop_probe::us(p_t.elapsed()),
+                        );
+                        crate::dev::loop_probe::mark(
+                            "res:first_view",
+                            i64::from(side.presented.is_none()),
+                        );
+                        let pages = bundle.atlas_pages();
+                        crate::dev::loop_probe::mark(
+                            "res:bundle_pages",
+                            i64::try_from(pages.pages().len()).unwrap_or(-1),
+                        );
+                        crate::dev::loop_probe::mark(
+                            "res:bundle_level_bytes",
+                            crate::dev::loop_probe::pages_level_bytes(pages),
+                        );
+                    }
                     #[cfg(feature = "dev-tools")]
                     crate::dev::result_staged(screen.atlas_uploads() - uploads);
                     // A refusal injected by a test of the real flow
@@ -9544,21 +9824,36 @@ impl Run {
                             };
                             token = Some(staged);
                             let mut state = bundle.skin().prepare_result();
+                            #[cfg(feature = "dev-tools")]
+                            let p_t = render::probe::Span::start();
                             // The view's images, into the array its
                             // staging uses, keyed to its installation.
-                            match stage_result_chart(
+                            let p_chart = stage_result_chart(
                                 screen.as_mut(),
                                 render::ResultChartTarget::Staged(staged),
                                 p.payload.chart.as_deref(),
-                            ) {
+                            );
+                            #[cfg(feature = "dev-tools")]
+                            crate::dev::loop_probe::mark(
+                                "res:chart_us",
+                                crate::dev::loop_probe::us(p_t.elapsed()),
+                            );
+                            match p_chart {
                                 Ok(table) => state.set_chart_images(table),
                                 Err(e) => failed = Some(e),
                             }
+                            #[cfg(feature = "dev-tools")]
+                            let p_t = render::probe::Span::start();
                             let prepared = screen.prepare_result(
                                 bundle,
                                 &mut state,
                                 &p.payload.view,
                                 &p.payload.labels,
+                            );
+                            #[cfg(feature = "dev-tools")]
+                            crate::dev::loop_probe::mark(
+                                "res:text_us",
+                                crate::dev::loop_probe::us(p_t.elapsed()),
                             );
                             // A refusal injected by a test of the real flow
                             // (dev-tools).
@@ -9773,6 +10068,14 @@ impl Run {
                         // runtime.
                         h.script.transfer_from(&mut old.script);
                     }
+                    // The result's first view committed, a skin's staging or
+                    // the built-in view: its first frames are probed
+                    // (`rf:*`, dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if side.presented.is_none() && crate::dev::loop_probe::on() {
+                        crate::dev::loop_probe::RESULT_FRAMES
+                            .store(3, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(old) = side.presented.replace(h) {
                         side.drop_later(old);
                     }
@@ -9911,7 +10214,16 @@ impl Run {
             return;
         };
         // What the commit point replaced: its slots park, outside it.
+        #[cfg(feature = "dev-tools")]
+        let p_t = render::probe::Span::start();
         side.drain();
+        #[cfg(feature = "dev-tools")]
+        if crate::dev::loop_probe::RF_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::dev::loop_probe::mark(
+                "rf:side_drain_us",
+                crate::dev::loop_probe::us(p_t.elapsed()),
+            );
+        }
         // A runtime stopped this frame: the presented strip is prepared
         // again with its notice, drawn from the next frame on.
         if std::mem::take(&mut side.restrip)
@@ -9927,7 +10239,16 @@ impl Run {
                 screen.discard_token(token);
             }
             if std::mem::take(&mut side.drain) {
+                #[cfg(feature = "dev-tools")]
+                let p_t = render::probe::Span::start();
                 let _ = screen.drain_retired();
+                #[cfg(feature = "dev-tools")]
+                if crate::dev::loop_probe::RF_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::dev::loop_probe::mark(
+                        "rf:drain_retired_us",
+                        crate::dev::loop_probe::us(p_t.elapsed()),
+                    );
+                }
             }
         }
         self.publish_result_status();
@@ -9976,7 +10297,10 @@ impl Run {
         };
         let installed = self.committed.atlas(ScreenKind::Result);
         let mut status = self.shared.result_status();
+        // With no screen, the charges it had.
+        let menus = self.screen.as_ref().map_or(status.menus, |s| s.menus());
         let same = status.installed == installed
+            && status.menus == menus
             && status.disabled == self.result_disabled
             && status.lifetime == lifetime
             && status.revision == revision
@@ -9992,9 +10316,11 @@ impl Run {
             return;
         }
         // What is shown, once it changes (dev-tools: tests of the real
-        // flow read it).
+        // flow read it), printed once the status is let go: the game
+        // thread's waits read it (design.md "State Model", system sounds,
+        // Result).
         #[cfg(feature = "dev-tools")]
-        if status.shown != shown
+        let announce = if status.shown != shown
             && let Some((_, skin)) = shown
         {
             let why = self.result_disabled.as_deref().or_else(|| {
@@ -10009,13 +10335,12 @@ impl Run {
                             .or_else(|| refused.map(|(_, w)| w.as_str()))
                     })
             });
-            match (skin, why) {
-                (true, _) => println!("dev: result shown: skin"),
-                (false, Some(why)) => println!("dev: result shown: built-in: {why}"),
-                (false, None) => println!("dev: result shown: built-in"),
-            }
-        }
+            Some((skin, why))
+        } else {
+            None
+        };
         status.installed = installed;
+        status.menus = menus;
         status.disabled.clone_from(&self.result_disabled);
         status.lifetime = lifetime;
         status.revision = revision;
@@ -10023,6 +10348,18 @@ impl Run {
         status.pinned = pinned;
         status.refused = refused.cloned();
         status.retained = ids().into_iter().flatten().collect();
+        drop(status);
+        #[cfg(feature = "dev-tools")]
+        if let Some((skin, why)) = announce {
+            // A test holds the print here, the status let go (tests).
+            #[cfg(test)]
+            shown_print_gate();
+            match (skin, why) {
+                (true, _) => println!("dev: result shown: skin"),
+                (false, Some(why)) => println!("dev: result shown: built-in: {why}"),
+                (false, None) => println!("dev: result shown: built-in"),
+            }
+        }
     }
 
     /// Selects the result kind's pages-only installation of `pages` for
@@ -10066,7 +10403,27 @@ impl Run {
         let _ = screen.take_upload_timing();
         #[cfg(feature = "dev-tools")]
         let uploads = screen.atlas_uploads();
+        #[cfg(feature = "dev-tools")]
+        let p_caller = crate::dev::loop_probe::Caller::set(render::probe::SELECT);
+        #[cfg(feature = "dev-tools")]
+        let p_t = render::probe::Span::start();
         let installed = screen.install_pages(kind, pages, request);
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::loop_probe::mark(
+                "sel:install_pages_us",
+                crate::dev::loop_probe::us(p_t.elapsed()),
+            );
+            crate::dev::loop_probe::mark(
+                "sel:pages",
+                i64::try_from(pages.pages().len()).unwrap_or(-1),
+            );
+            crate::dev::loop_probe::mark(
+                "sel:pages_level_bytes",
+                crate::dev::loop_probe::pages_level_bytes(pages),
+            );
+            drop(p_caller);
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::result_staged(screen.atlas_uploads() - uploads);
         #[cfg(feature = "dev-tools")]
@@ -10122,12 +10479,90 @@ impl Run {
 }
 
 /// A frame's timing for a page drawn with no measurement of its own.
-const fn timing_of(presented: bool) -> FrameTiming {
+/// The game's Result entries and the acknowledgement of their first
+/// result pictures (design.md "State Model", system sounds, Result): the
+/// game numbers each entry, the render thread acknowledges the entry's
+/// first picture in one atomic and wakes the game thread, and nothing of
+/// it allocates (design.md "Scope of No Allocation").
+#[derive(Debug, Default)]
+struct ResultEntries {
+    /// The entry the game is in, 0 before the first; only the game thread
+    /// writes it.
+    current: AtomicU64,
+    /// The last entry a frame acknowledged, 0 before any; only the render
+    /// thread writes it.
+    acknowledged: AtomicU64,
+    /// The game thread, unparked at an entry's acknowledgement.
+    wake: Mutex<Option<std::thread::Thread>>,
+    /// Writes of `acknowledged` (tests).
+    #[cfg(test)]
+    publications: std::sync::atomic::AtomicU32,
+}
+
+impl ResultEntries {
+    /// The game enters Result: the next entry's number, with the thread
+    /// its acknowledgement wakes.
+    fn enter(&self, wake: Option<std::thread::Thread>) -> u64 {
+        *self.wake.lock().unwrap_or_else(PoisonError::into_inner) = wake;
+        self.current.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// The entry a frame draws a picture of: the one entered before the
+    /// frame fixed what it draws, so an entry entered while the frame draws
+    /// is not taken for it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn drawing(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    /// A frame of `entry`'s first result picture ended shown or
+    /// deliberately not shown: the entry is acknowledged and the game
+    /// thread woken, once per entry, so its look comes at once.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn acknowledge(&self, entry: u64) {
+        if entry == 0 || self.acknowledged.load(Ordering::Acquire) == entry {
+            return;
+        }
+        self.acknowledged.store(entry, Ordering::Release);
+        #[cfg(test)]
+        self.publications.fetch_add(1, Ordering::Relaxed);
+        if let Some(game) = &*self.wake.lock().unwrap_or_else(PoisonError::into_inner) {
+            game.unpark();
+        }
+    }
+}
+
+/// A test holds the render thread's "result shown" print while set, and
+/// the print says it reached the hold (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+static SHOWN_PRINT_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "dev-tools"))]
+static SHOWN_PRINT_HELD: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, feature = "dev-tools"))]
+fn shown_print_gate() {
+    while SHOWN_PRINT_HOLD.load(Ordering::Acquire) {
+        SHOWN_PRINT_HELD.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A frame a screen said was presented, or not: shown, or to be tried
+/// again.
+const fn shown_or_retry(presented: bool) -> FrameOutcome {
+    if presented {
+        FrameOutcome::Shown
+    } else {
+        FrameOutcome::Retry
+    }
+}
+
+const fn timing_of(outcome: FrameOutcome) -> FrameTiming {
     FrameTiming {
         cpu: Duration::ZERO,
         sprites: 0,
         dropped: 0,
-        presented,
+        outcome,
         present_count: None,
     }
 }
@@ -10158,7 +10593,11 @@ pub(crate) mod tests {
             cpu: Duration::from_micros(50),
             sprites: 0,
             dropped: 0,
-            presented,
+            outcome: if presented {
+                render::FrameOutcome::Shown
+            } else {
+                render::FrameOutcome::Retry
+            },
             present_count: None,
         }
     }
@@ -12022,7 +12461,7 @@ pub(crate) mod tests {
         let drawn = |r: &mut render::Renderer| {
             let v = view(0, 0);
             let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-            assert!(timing.presented);
+            assert!(timing.presented());
             let pixels = crate::render_common::read_back(r);
             (
                 timing.sprites,
@@ -12463,6 +12902,37 @@ pub(crate) mod tests {
             assert_eq!(read.loadend, Some(TimeUs(1_500_000)));
         }
         assert_eq!(crate::alloc_count::this_thread() - before, 0);
+    }
+
+    /// V6b (design.md "Scope of No Allocation"; "State Model", system
+    /// sounds, Result): the render thread's acknowledgement of a Result
+    /// entry's first picture, its wake of the game thread, again for a
+    /// frame after it, and the game thread's read of it and its wake
+    /// allocate and free nothing; the entries are numbered outside the
+    /// count, as the game does at each hand-over. A vector made inside the
+    /// same window is counted (the control).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn result_acknowledgement_alloc() {
+        use crate::alloc_count::{this_thread, this_thread_frees};
+        let link = Installers::default().spawn_bare();
+        let counts = || (this_thread(), this_thread_frees());
+        let before = counts();
+        drop(std::hint::black_box(vec![0_u8; 16]));
+        let after = counts();
+        assert!(after.0 > before.0 && after.1 > before.1, "the control");
+        for _ in 0..3 {
+            let entry = link.enter_result_entry(Some(std::thread::current()));
+            let before = counts();
+            link.shared.result_entries.acknowledge(entry);
+            link.shared.result_entries.acknowledge(entry);
+            std::thread::park_timeout(Duration::ZERO);
+            let read = link.result_acknowledged();
+            let after = counts();
+            assert_eq!(read, entry);
+            assert_eq!(after, before, "allocations and frees, entry {entry}");
+        }
+        link.exit();
     }
 
     /// The loading text of chart `title`.
@@ -14021,13 +14491,13 @@ pub(crate) mod tests {
         fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             panic!("an end page is drawn with its graphs")
         }
-        fn end(&mut self, page: &super::EndPage) -> Result<bool, RenderError> {
+        fn end(&mut self, page: &super::EndPage) -> Result<render::FrameOutcome, RenderError> {
             let first = page.lines.first().cloned().unwrap_or_default();
             self.drew.lock().unwrap().push((first, page.graphs.clone()));
             if self.hold.swap(false, Ordering::SeqCst) {
                 let _ = self.release.recv_timeout(Duration::from_secs(10));
             }
-            Ok(true)
+            Ok(render::FrameOutcome::Shown)
         }
         fn menu(
             &mut self,
@@ -14424,9 +14894,9 @@ pub(crate) mod tests {
         fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             panic!("an end page is drawn with its graphs")
         }
-        fn end(&mut self, page: &super::EndPage) -> Result<bool, RenderError> {
+        fn end(&mut self, page: &super::EndPage) -> Result<render::FrameOutcome, RenderError> {
             self.drawn(page.lines.first().cloned().unwrap_or_default());
-            Ok(true)
+            Ok(render::FrameOutcome::Shown)
         }
         fn menu(
             &mut self,
@@ -15451,6 +15921,16 @@ pub(crate) mod tests {
         fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             Ok(true)
         }
+        fn end(&mut self, _page: &super::EndPage) -> Result<render::FrameOutcome, RenderError> {
+            self.shared.ends.fetch_add(1, Ordering::AcqRel);
+            Ok(self
+                .shared
+                .end_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(render::FrameOutcome::Shown))
+        }
         fn menu(
             &mut self,
             page: &crate::menu_screen::MenuPage,
@@ -15573,6 +16053,11 @@ pub(crate) mod tests {
     pub(crate) struct Installers {
         /// The screens built so far.
         pub(crate) builds: Arc<AtomicU32>,
+        /// What becomes of each end-screen frame, in order, then
+        /// [`render::FrameOutcome::Shown`]; and the end-screen frames drawn.
+        pub(crate) end_outcomes:
+            Arc<std::sync::Mutex<std::collections::VecDeque<render::FrameOutcome>>>,
+        pub(crate) ends: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
         /// Menu and loading frames return not presented while set, as on
         /// an outdated swap chain.
@@ -20381,6 +20866,24 @@ pub(crate) mod tests {
     // presentation, and the validity of the image it holds.
     #[cfg(feature = "dev-tools")]
     mod first_frame;
+}
+
+/// Whether this result frame is one of the first frames probed (`rf:*`,
+/// dev-tools): counts one down if any are left, marks the frames left and
+/// arms the renderer's frame marks.
+#[cfg(feature = "dev-tools")]
+fn probe_result_frame() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let probed = render::probe::count_down(&crate::dev::loop_probe::RESULT_FRAMES);
+    if probed {
+        crate::dev::loop_probe::mark(
+            "rf:frame_left",
+            i64::from(crate::dev::loop_probe::RESULT_FRAMES.load(Relaxed)),
+        );
+        crate::dev::loop_probe::RF_ACTIVE.store(true, Relaxed);
+        render::probe::arm_frame(true);
+    }
+    probed
 }
 
 /// Which screen each mode's frame is of (dev-tools).

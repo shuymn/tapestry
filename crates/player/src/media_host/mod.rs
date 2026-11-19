@@ -27,6 +27,7 @@
 pub mod handles;
 pub mod launch;
 pub mod players;
+pub mod stage;
 pub mod strikes;
 pub mod verdict;
 pub mod watch;
@@ -197,16 +198,22 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Launches the worker in `dir`, which holds `tapestry-media.exe` and
-    /// its FFmpeg DLLs, under `setup` (the recipe, [`Setup::recipe`]).
+    /// Launches the worker installed in `installation`, which holds
+    /// `tapestry-media.exe` and its FFmpeg DLLs, under `setup` (the recipe,
+    /// [`Setup::recipe`]), from copies of them staged under the game's data
+    /// folder `data` ([`stage`]).
     ///
     /// # Errors
     ///
     /// The step that failed, or that the check found differing from the
     /// setup, with the system's error; the process, if one was made, is
     /// terminated before it runs (or, at the handshake, as it runs).
-    pub fn launch(dir: &std::path::Path, setup: &Setup) -> Result<Self, LaunchError> {
-        launch::launch(dir, setup)
+    pub fn launch(
+        installation: &std::path::Path,
+        data: &std::path::Path,
+        setup: &Setup,
+    ) -> Result<Self, LaunchError> {
+        launch::launch(installation, data, setup)
     }
 
     /// The worker's hello.

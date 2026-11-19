@@ -539,13 +539,13 @@ fn loading_frames_follow_resize_and_minimize() {
     install(&mut r, &a, 1);
     r.resize(960, 540);
     let timing = r.loading_frame(&frame_at(1, 0), &text).unwrap().unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     let p = read_back(&r);
     assert_eq!(common::rgb_at(&p, 960, (25, 475)), RED);
     assert_eq!(common::rgb_at(&p, 960, (25, 425)), BLACK);
     r.resize(0, 0);
     let timing = r.loading_frame(&frame_at(1, 16), &text).unwrap().unwrap();
-    assert!(!timing.presented);
+    assert_eq!(timing.outcome, render::FrameOutcome::Invisible, "minimized");
     assert!(timing.sprites > 0, "built while minimized");
     r.resize(1_920, 1_080);
     let p = loading(&mut r, &text, &frame_at(1, 32));
@@ -580,7 +580,7 @@ fn a_staged_loading_frame_follows_a_resize() {
             .loading_frame_on(on, &frame_at(1, 0), &text)
             .unwrap()
             .unwrap();
-        assert!(t.presented);
+        assert!(t.presented());
         read_back(&r)
     };
     assert_eq!(
@@ -593,7 +593,7 @@ fn a_staged_loading_frame_follows_a_resize() {
         .loading_frame_on(on, &frame_at(1, 16), &text)
         .unwrap()
         .unwrap();
-    assert!(t.presented);
+    assert!(t.presented());
     let p = read_back(&r);
     assert_eq!(common::rgb_at(&p, 960, (25, 565)), RED);
     assert_eq!(common::rgb_at(&p, 960, (25, 45)), BLACK);

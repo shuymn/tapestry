@@ -3,8 +3,9 @@
 //! ffmpeg.toml pins into `target/ffmpeg/` (`FFMPEG_DIR`, .cargo/config.toml),
 //! where ffmpeg-sys-next finds its headers and import libraries. This script
 //! fails the build, naming that command, unless the release there is the
-//! pinned one, and copies its DLLs beside the binaries it builds, where
-//! `tapestry-media.exe` loads them. Cargo runs ffmpeg-sys-next's build script
+//! pinned one, copies its DLLs beside the binaries it builds, where
+//! `tapestry-media.exe` loads them, and names them to the launcher, which
+//! stages the worker with them (`media_host::stage`). Cargo runs ffmpeg-sys-next's build script
 //! before this one (its `links` metadata reaches this one), so with no
 //! release there at all the build fails first in ffmpeg-sys-next's header
 //! check, which finds no headers in `target/ffmpeg/include`, and this
@@ -73,6 +74,8 @@ fn run() -> Result<(), String> {
         .ancestors()
         .nth(3)
         .ok_or("OUT_DIR is not inside a profile directory")?;
+    // The launcher stages the worker with the same DLLs.
+    println!("cargo:rustc-env=TAPESTRY_FFMPEG_DLLS={}", dlls.join(","));
     for dll in dlls {
         let name = format!("{dll}.dll");
         let from = dir.join("bin").join(&name);

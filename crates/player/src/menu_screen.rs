@@ -33,9 +33,9 @@ use eval::Section;
 use game::Preparation;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
 use render::{
-    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingOn,
-    LoadingTextError, LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite,
-    solid_uv,
+    AttemptInput, Blend, CommitError, FrameOutcome, FrameTiming, Installation, LoadingFrame,
+    LoadingOn, LoadingTextError, LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle,
+    Sprite, solid_uv,
 };
 use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 
@@ -669,10 +669,19 @@ impl MenuScreen {
             subartist: field(&c.subartist),
             genre: field(&c.genre),
         };
-        match self
-            .renderer
-            .prepare_loading_text_on(on, lifetime, update.revision, which, &chart)
+        #[cfg(feature = "dev-tools")]
+        let p_c = crate::dev::loop_probe::Caller::set(render::probe::LOADING);
+        #[cfg(feature = "dev-tools")]
+        let p_t = render::probe::Span::start();
+        let p_prepared =
+            self.renderer
+                .prepare_loading_text_on(on, lifetime, update.revision, which, &chart);
+        #[cfg(feature = "dev-tools")]
         {
+            crate::dev::loop_probe::mark("ld:text_us", crate::dev::loop_probe::us(p_t.elapsed()));
+            drop(p_c);
+        }
+        match p_prepared {
             Ok(()) => self.chosen.staged = Some(asked),
             Err(e) if e.is_refusal() => {
                 eprintln!(
@@ -714,7 +723,7 @@ impl MenuScreen {
         };
         let timing = self.renderer.loading_frame_on(on, frame, text)?;
         if let Ok(t) = &timing {
-            self.shown(t.presented);
+            self.shown(t.presented());
         }
         Ok(timing)
     }
@@ -886,10 +895,21 @@ impl Screen for MenuScreen {
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
     ) -> Option<Result<Preparation, RenderError>> {
+        #[cfg(feature = "dev-tools")]
+        let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
+        #[cfg(feature = "dev-tools")]
+        let p_t = render::probe::Span::start();
         let done = match skin {
             Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
             None => self.renderer.prepare_attempt(a),
         };
+        #[cfg(feature = "dev-tools")]
+        {
+            let took = crate::dev::loop_probe::us(p_t.elapsed());
+            crate::dev::loop_probe::mark("att:staged", i64::from(skin.is_some()));
+            crate::dev::loop_probe::mark("att:stage_us", took);
+            drop(p_caller);
+        }
         Some(match done {
             Ok(()) => Ok(Preparation::Ready),
             // The whole chain: the skin's or the device's own reason too.
@@ -1086,6 +1106,10 @@ impl Screen for MenuScreen {
         self.renderer.retained_atlases(kind)
     }
 
+    fn menus(&self) -> u64 {
+        self.renderer.menu_charges()
+    }
+
     fn prepare_result(
         &mut self,
         skin: &Arc<SkinBundle>,
@@ -1165,7 +1189,7 @@ impl Screen for MenuScreen {
             Some(t) if lines > 0 => self.renderer.submit_result(&[t]),
             _ => self.renderer.submit_result(&[]),
         }?;
-        self.shown(timing.presented);
+        self.shown(timing.presented());
         Ok(timing)
     }
 
@@ -1220,7 +1244,7 @@ impl Screen for MenuScreen {
 
     fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
         let timing = self.renderer.submit_decision(&[])?;
-        self.shown(timing.presented);
+        self.shown(timing.presented());
         Ok(timing)
     }
 
@@ -1292,7 +1316,7 @@ impl Screen for MenuScreen {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
         let timing = self.renderer.submit()?;
-        self.shown(timing.presented);
+        self.shown(timing.presented());
         Ok(timing)
     }
 
@@ -1307,16 +1331,17 @@ impl Screen for MenuScreen {
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
-        let presented = self.renderer.text_frame(lines)?.presented;
+        let presented = self.renderer.text_frame(lines)?.presented();
         Ok(self.shown(presented))
     }
 
-    fn end(&mut self, page: &crate::render_side::EndPage) -> Result<bool, RenderError> {
-        let presented = self
+    fn end(&mut self, page: &crate::render_side::EndPage) -> Result<FrameOutcome, RenderError> {
+        let outcome = self
             .renderer
             .result_frame(&page.lines, page.graphs.as_deref())?
-            .presented;
-        Ok(self.shown(presented))
+            .outcome;
+        self.shown(outcome == FrameOutcome::Shown);
+        Ok(outcome)
     }
 
     fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
@@ -1382,13 +1407,13 @@ impl Screen for MenuScreen {
             return Err(RenderError::OtherRenderersText);
         };
         let timing = self.renderer.menu_frame(|_| {}, text)?;
-        self.shown(timing.presented);
+        self.shown(timing.presented());
         Ok(timing)
     }
 
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         let timing = self.menu_frame(page, changed)?;
-        self.shown(timing.presented);
+        self.shown(timing.presented());
         Ok(timing)
     }
 
@@ -1448,7 +1473,7 @@ impl Screen for MenuScreen {
             self.selection_key = None;
             self.send(self.page_caret);
             let timing = self.menu_frame(&u.page, false)?;
-            self.shown(timing.presented);
+            self.shown(timing.presented());
             return Ok(SelectionDrawn {
                 timing,
                 refused,
@@ -1464,7 +1489,7 @@ impl Screen for MenuScreen {
             Some(t) => self.renderer.submit_selection(&[t]),
             None => self.renderer.submit_selection(&[]),
         }?;
-        self.shown(timing.presented);
+        self.shown(timing.presented());
         Ok(SelectionDrawn {
             timing,
             refused: None,
@@ -1569,7 +1594,7 @@ impl MenuScreen {
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        let presented = self.renderer.menu_frame(|_| {}, text)?.presented;
+        let presented = self.renderer.menu_frame(|_| {}, text)?.presented();
         Ok(self.shown(presented))
     }
 

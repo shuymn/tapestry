@@ -113,6 +113,14 @@ pub(crate) fn device(adapter: &wgpu::Adapter) -> Result<Gpu, RenderError> {
     let lost = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&lost);
     device.set_device_lost_callback(move |_, _| flag.store(true, Ordering::Release));
+    // The transition probe's memory readings (`TAPESTRY_LOOP_PROBE`).
+    #[cfg(feature = "dev-tools")]
+    if crate::probe::on()
+        // SAFETY: the adapter outlives this call; the raw adapter is cloned (AddRef).
+        && let Some(a) = unsafe { adapter.as_hal::<wgpu_hal::api::Dx12>() }
+    {
+        crate::probe::set_dxgi(a.as_raw().clone());
+    }
     Ok(Gpu {
         device,
         queue,

@@ -385,6 +385,101 @@ impl PackedPages {
     }
 }
 
+/// Which of [`PackedPages::uvs_for`]'s checks refuses a sheet, in its
+/// order (dev-tools: the transition probe's `dev: probe-miss`).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotHeldWhy {
+    /// Its first check: the pages were packed for another variant, other
+    /// kept layers or another skin folder (`true` where each differs).
+    Header {
+        variant: bool,
+        kept: bool,
+        root: bool,
+    },
+    /// A cell's file, the version the variant reads, is not a held file:
+    /// its name.
+    File(String),
+    /// A cell is not a held cell: its file's name (or its colour) and its
+    /// rectangle in that version's texels.
+    Cell(String, [u32; 4]),
+    /// A cell names no file of the sheet, or a frame no cell of it.
+    Sheet,
+}
+
+#[cfg(feature = "dev-tools")]
+impl PackedPages {
+    /// The skin folder the files were read from.
+    #[must_use]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// Why [`Atlas::rebind_keeping`] refuses `sheet` under `variant` and
+    /// `kept` on these pages, or `None` when it rebinds: `uvs_for`'s
+    /// checks in its order, each refusal named.
+    #[must_use]
+    pub fn not_held_why(
+        &self,
+        sheet: &Sheet,
+        variant: Variant,
+        kept: KeptLayers,
+    ) -> Option<NotHeldWhy> {
+        let header = NotHeldWhy::Header {
+            variant: variant != self.variant,
+            kept: kept != self.kept(),
+            root: sheet.root() != self.root.as_path(),
+        };
+        if header
+            != (NotHeldWhy::Header {
+                variant: false,
+                kept: false,
+                root: false,
+            })
+        {
+            return Some(header);
+        }
+        let files = sheet.files();
+        let mut held = Vec::with_capacity(sheet.cells().len());
+        for cell in sheet.cells() {
+            let (key, name) = match cell.source {
+                CellSource::File(f) => {
+                    let Some(file) = usize::try_from(f).ok().and_then(|f| files.get(f)) else {
+                        return Some(NotHeldWhy::Sheet);
+                    };
+                    let (version, hi) = file.version(variant);
+                    let Some(at) = held_file(&self.files, version) else {
+                        return Some(NotHeldWhy::File(version.name.clone()));
+                    };
+                    let rect = if hi {
+                        cell.rect.map(|v| v * 2)
+                    } else {
+                        cell.rect
+                    };
+                    ((CellSource::File(at), rect), version.name.clone())
+                }
+                CellSource::Solid(rgba, g) => ((cell.source, cell.rect), format!("#{rgba:?}{g:?}")),
+            };
+            match self.cells.binary_search_by(|h| h.key().cmp(&key)) {
+                Ok(i) => held.push(i),
+                Err(_) => return Some(NotHeldWhy::Cell(name, key.1)),
+            }
+        }
+        let resolves = |cell: &u32| {
+            usize::try_from(*cell)
+                .ok()
+                .and_then(|c| held.get(c))
+                .and_then(|&h| self.cells.get(h))
+                .is_some()
+        };
+        if sheet.frames().iter().all(resolves) {
+            None
+        } else {
+            Some(NotHeldWhy::Sheet)
+        }
+    }
+}
+
 /// A sheet's atlas for one variant: its pages, shared, and the uv table of
 /// the sheet it was built from or rebound to.
 #[derive(Clone, Debug)]

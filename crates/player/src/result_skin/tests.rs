@@ -31,7 +31,9 @@ fn png(dir: &Path, name: &str, w: u32, h: u32) {
 
 /// A result skin `s.luaskin` reading 154 as `nr` while it loads, then
 /// running `pre`, with the image list `images` (a Lua expression) of
-/// `s.png`, its EX number and a status dot.
+/// `s.png`, its EX number and a status dot. `pre` may set `rt_draw`, a
+/// `draw` function placing the image `rt_id` (else the first), which then
+/// has no other destination.
 pub(crate) fn skin(pre: &str, images: &str) -> tempfile::TempDir {
     skin_reading("local nr = ms.number(154)", pre, images)
 }
@@ -46,7 +48,7 @@ fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
          if not skin_config then return skin end\n\
          local ms = require(\"main_state\")\n\
          {reads}\n\
-         local rt_draw\n\
+         local rt_draw, rt_id\n\
          {pre}\n\
          skin.source = {{ {{ id = \"s\", path = \"s.png\" }}, {{ id = \"b\", path = \"big.png\" }} }}\n\
          skin.image = {images}\n\
@@ -54,9 +56,11 @@ fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
                            digit = 4, ref = 71 }} }}\n\
          local d = {{ {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }} }}\n\
          for i, im in ipairs(skin.image) do\n\
-           d[#d + 1] = {{ id = im.id, op = {{ 90 }}, dst = {{ {{ x = 0, y = 300 + 20 * i, w = 8, h = 8 }} }} }}\n\
+           if im.id ~= rt_id then\n\
+             d[#d + 1] = {{ id = im.id, op = {{ 90 }}, dst = {{ {{ x = 0, y = 300 + 20 * i, w = 8, h = 8 }} }} }}\n\
+           end\n\
          end\n\
-         if rt_draw then d[#d + 1] = {{ id = skin.image[1].id, draw = rt_draw, dst = {{ {{ x = 100, y = 300, w = 8, h = 8 }} }} }} end\n\
+         if rt_draw then d[#d + 1] = {{ id = rt_id or skin.image[1].id, draw = rt_draw, dst = {{ {{ x = 100, y = 300, w = 8, h = 8 }} }} }} end\n\
          skin.destination = d\n\
          return skin\n"
     );
@@ -90,7 +94,7 @@ pub(crate) fn pending(dir: &Path, limits: AtlasLimits) -> Arc<super::PendingResu
     ))
 }
 
-fn chart() -> ResultChart {
+pub(crate) fn chart() -> ResultChart {
     ResultChart {
         level: Some(12),
         total: None,
@@ -856,6 +860,42 @@ fn chart_reads_are_decided_before_ready() {
     assert_eq!(builds(), b0);
     assert_eq!(p.source_counts(), read);
     assert!(Arc::ptr_eq(&shown(&rs), &every));
+}
+
+/// A reversal of the kept-probe decision keeps a bundle for every view
+/// (design.md "beatoraja Lua Skins", the result skin): a skin that reads
+/// only a chart fact builds the same bundle, with its own atlas, in either
+/// mode, so the next attempt reuses it with no job, no build and no file
+/// read.
+#[test]
+fn a_reversal_keeps_a_chart_only_bundle() {
+    let _s = serial();
+    let d = skin_reading(
+        "local lv = ms.number(96)",
+        "if lv ~= 12 then error(\"level\") end",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+    rs.set_kept_probe(true);
+    staged(&mut rs);
+    assert!(
+        rs.staged_line().starts_with("every view"),
+        "{}",
+        rs.staged_line()
+    );
+    rs.request(view(5));
+    let every = shown(&rs);
+    let (jobs, b0, read) = (jobs_started(), builds(), p.source_counts());
+    rs.set_kept_probe(false);
+    rs.next_attempt();
+    staged(&mut rs);
+    assert!(rs.staged_line().starts_with("every view"));
+    rs.request(view(7));
+    assert_eq!(jobs_started(), jobs, "no job");
+    assert_eq!(builds(), b0, "no build");
+    assert_eq!(p.source_counts(), read, "no file read");
+    assert!(Arc::ptr_eq(&shown(&rs), &every), "the same bundle");
 }
 
 /// A skin that reads the play's target (number 151) while it loads is
@@ -1635,6 +1675,143 @@ fn shown_script(rs: &ResultSkin) -> crate::screens::ScriptGen {
         Some(Published::Skin(_, _, Some(g))) => *g,
         other => panic!("{other:?}"),
     }
+}
+
+/// A pending result skin reading 154 whose image `jd` (a cell of its own)
+/// is drawn only by a `draw` function the runtime runs, as a skin draws
+/// its judgment details; its dot drawn as usual.
+fn runtime_drawn_skin() -> tempfile::TempDir {
+    skin(
+        "local calls = 0 rt_id = \"jd\" rt_draw = function() calls = calls + 1 return calls > 0 end",
+        "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 }, \
+           { id = \"jd\", src = \"s\", x = 8, y = 0, w = 8, h = 8 } }",
+    )
+}
+
+/// V4 (#611 S2, design.md "beatoraja Lua Skins", the result skin): the
+/// image stage of a skin that reads a result fact imports the probe once,
+/// with its runtime kept as a shown layout's is; by the pack the runtime is
+/// gone and the permit back. The atlas holds the cell only the runtime's
+/// callback draws, so a view rebinds it with no build.
+#[test]
+fn the_probe_packs_the_cells_a_runtime_draws() {
+    use skin_beatoraja::vm_hooks;
+    use std::sync::atomic::Ordering::SeqCst;
+    let _s = serial();
+    let d = runtime_drawn_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    rs.set_kept_probe(true);
+    let (live, passes, b0) = (vm_hooks::live(), vm_hooks::passes(), builds());
+    REACHED.store(false, SeqCst);
+    GATE.store(true, SeqCst);
+    let super::ImageStage::Running(mut job) =
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+    else {
+        GATE.store(false, SeqCst);
+        panic!("a job runs");
+    };
+    let end = Instant::now() + Duration::from_secs(20);
+    while !REACHED.load(SeqCst) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // At the pack: the VMs open, the passes run and the permits free.
+    let reached = REACHED.load(SeqCst);
+    let open = vm_hooks::live();
+    let ran = vm_hooks::passes() - passes;
+    let free = [
+        rs.scripts().result_permit(&[]),
+        rs.scripts().result_permit(&[]),
+    ];
+    GATE.store(false, SeqCst);
+    assert!(reached, "the probe did not reach its pack");
+    assert_eq!(ran, 1, "the probe imported once");
+    assert_eq!(open, live, "the probe's runtime dropped before the pack");
+    assert!(
+        free.iter().all(Option::is_some),
+        "the probe's permit released before the pack"
+    );
+    drop(free);
+    assert_eq!(
+        rs.poll_image_stage(&mut job, None, || false, || false),
+        Some(Staged::Ready)
+    );
+    assert_eq!(builds() - b0, 1, "the probe packed");
+    let pages = Arc::clone(rs.image().unwrap().pages());
+    rs.request(view(5));
+    settled(&mut rs);
+    assert!(
+        Arc::ptr_eq(shown(&rs).atlas_pages(), &pages),
+        "the view on the probe's pages"
+    );
+    assert_eq!(builds() - b0, 1, "no union at the view");
+}
+
+/// The kept probe's gate closed (design.md "beatoraja Lua Skins", the
+/// result skin): the probe is laid out from a second, plain import, so its
+/// atlas lacks the cell only the runtime's callback draws, and the view
+/// packs a union; opened, the probe's record and atlas go, and the next
+/// image stage packs the kept probe, which the view rebinds.
+#[test]
+fn a_closed_gate_packs_the_plain_probe() {
+    use skin_beatoraja::vm_hooks;
+    let _s = serial();
+    let d = runtime_drawn_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    rs.set_kept_probe(false);
+    let (passes, b0) = (vm_hooks::passes(), builds());
+    staged(&mut rs);
+    assert_eq!(vm_hooks::passes() - passes, 2, "the probe imported twice");
+    let plain = Arc::clone(rs.image().unwrap().pages());
+    rs.request(view(5));
+    settled(&mut rs);
+    assert!(
+        !Arc::ptr_eq(shown(&rs).atlas_pages(), &plain),
+        "the view on a union's pages"
+    );
+    assert_eq!(builds() - b0, 2, "one union at the view");
+    rs.set_kept_probe(true);
+    assert!(rs.image().is_none(), "the plain probe's atlas dropped");
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged(&mut rs);
+    assert_eq!(jobs_started() - jobs, 1, "the probe packed again");
+    let kept = Arc::clone(rs.image().unwrap().pages());
+    rs.request(view(5));
+    settled(&mut rs);
+    assert!(
+        Arc::ptr_eq(shown(&rs).atlas_pages(), &kept),
+        "the view on the kept probe's pages"
+    );
+}
+
+/// V4's fallback: with both result runtime permits held at the image
+/// stage, the probe is imported plain, so its atlas lacks the cell the
+/// runtime's callback draws, and the view packs a union.
+#[test]
+fn a_probe_without_a_permit_leaves_the_view_a_union() {
+    let _s = serial();
+    let d = runtime_drawn_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    rs.set_kept_probe(true);
+    let held = [
+        rs.scripts().result_permit(&[]).unwrap(),
+        rs.scripts().result_permit(&[]).unwrap(),
+    ];
+    let b0 = builds();
+    staged(&mut rs);
+    assert_eq!(builds() - b0, 1, "the probe packed");
+    let pages = Arc::clone(rs.image().unwrap().pages());
+    drop(held);
+    rs.request(view(5));
+    settled(&mut rs);
+    assert!(
+        !Arc::ptr_eq(shown(&rs).atlas_pages(), &pages),
+        "the view on a union's pages"
+    );
+    assert_eq!(builds() - b0, 2, "one union at the view");
 }
 
 /// s7-07-design §4 rule 4 (plan r2 MEDIUM): with both permits held, a

@@ -1,8 +1,9 @@
 //! What the media worker's tests share (design.md "Threat Model" T02): the
 //! game's host of the worker, compiled from its source as the game compiles
-//! it, the worker staged with its FFmpeg DLLs in a directory of its own,
-//! which the launch grants the worker's AppContainer as it grants the
-//! game's, and the results of the worker's `--dev-probe`.
+//! it, the worker put with its FFmpeg DLLs in a directory of its own, which
+//! stands for an installation, launched from the copies the launch stages
+//! in a data folder of the test's own, in an AppContainer profile of the
+//! test's own, and the results of the worker's `--dev-probe`.
 
 #![allow(
     dead_code,
@@ -68,9 +69,13 @@ pub fn recipe() -> Setup {
     Setup::recipe().waiting(PATIENT)
 }
 
-/// The worker and its DLLs, copied into a directory of their own.
+/// The worker and its DLLs, copied into a directory of their own (the
+/// installation), with a data folder and an AppContainer profile of their
+/// own: a test's launches touch nothing of the user's or another test's.
 pub struct Stage {
     dir: tempfile::TempDir,
+    data: tempfile::TempDir,
+    profile: String,
 }
 
 /// Copies the worker and its DLLs into `dir`, an installation of its own.
@@ -102,27 +107,54 @@ impl Stage {
             .tempdir()
             .unwrap();
         install(dir.path());
-        Self { dir }
+        let data = tempfile::Builder::new()
+            .prefix("media-data-")
+            .tempdir()
+            .unwrap();
+        // Lowercase, as Windows names the profile's folder.
+        let name = dir.path().file_name().unwrap().to_string_lossy();
+        let profile = format!("tapestry.media.test.{}", name.to_lowercase());
+        Self { dir, data, profile }
     }
 
+    /// The installation.
     pub fn dir(&self) -> &Path {
         self.dir.path()
     }
 
-    /// Launches the worker under `setup`.
+    /// The data folder the launches stage their copies in.
+    pub fn data(&self) -> &Path {
+        self.data.path()
+    }
+
+    /// The AppContainer profile the stage's workers run in.
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// The directory of the copies the launches stage: the only one in the
+    /// data folder's `media`.
+    pub fn copies(&self) -> PathBuf {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(self.data().join("media"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found.pop().unwrap()
+    }
+
+    /// Launches the worker under `setup`, in the stage's profile.
     pub fn launch(&self, setup: &Setup) -> Result<Launched, LaunchError> {
-        Worker::launch(self.dir(), setup).map(Launched::new)
+        let setup = setup.clone().in_profile(&self.profile);
+        Worker::launch(self.dir(), self.data(), &setup).map(Launched::new)
     }
 }
 
 impl Drop for Stage {
-    /// Deletes the AppContainer profile a launch made for the stage's
-    /// directory, which Windows would otherwise keep: each stage is an
-    /// installation of its own.
+    /// Deletes the stage's AppContainer profile, which Windows would
+    /// otherwise keep.
     fn drop(&mut self) {
-        if let Ok(name) = media_host::launch::profile_name(self.dir()) {
-            delete_profile(&name);
-        }
+        delete_profile(&self.profile);
     }
 }
 

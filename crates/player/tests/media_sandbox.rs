@@ -1,6 +1,6 @@
 //! The media worker's sandbox (design.md "Threat Model" T02): the real
 //! `tapestry-media.exe`, launched by the game's host as the game launches
-//! it, staged with its FFmpeg DLLs in a directory of its own. Each denial
+//! it, from the copies the launch stages of it and its FFmpeg DLLs. Each denial
 //! is asserted with the system's code under the recipe, beside a control
 //! that removes only the restriction that denies it (the test-only setup),
 //! so the boundary is measured rather than assumed; the worker's
@@ -21,11 +21,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use media_support::{
-    Kind, Launched, Made, REFUSED, Restrictions, Setup, Stage, Step, change_shared, granted_all,
-    media_host, policy, recipe, revoked, token_facts,
+    Kind, LaunchError, Launched, Made, REFUSED, Restrictions, Setup, Stage, Step, change_shared,
+    granted_all, media_host, policy, recipe, revoked, token_facts,
 };
 #[cfg(feature = "dev-tools")]
-use media_support::{Probe, delete_profile, install, probe, probes};
+use media_support::{Probe, probe, probes};
 use skin_model::media::control::{Command, FILE_ACCESS, Reply};
 #[cfg(feature = "dev-tools")]
 use skin_model::media::control::{EVENT_ACCESS, SECTION_ACCESS};
@@ -63,6 +63,49 @@ fn value(h: HANDLE) -> u64 {
 /// Launches the worker in `stage` under `setup`.
 fn launch(stage: &Stage, setup: Setup) -> Launched {
     stage.launch(&setup).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Waits up to `limit` for the process `process` to end: its exit code,
+/// once it has.
+fn exit_of(process: HANDLE, limit: Duration) -> Option<u32> {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    let ms = u32::try_from(limit.as_millis()).unwrap();
+    // SAFETY: a process handle with the right to wait on it.
+    if unsafe { WaitForSingleObject(process, ms) } != WAIT_OBJECT_0 {
+        return None;
+    }
+    let mut code = 0;
+    // SAFETY: as above, with the right to query it.
+    unsafe { GetExitCodeProcess(process, &raw mut code) }.unwrap();
+    Some(code)
+}
+
+/// Asserts that the process the failed launch `e` made ends with
+/// `REFUSED`: as the launch saw, or, when it stopped watching first, within
+/// a minute on the handle it kept. One that does not is terminated before
+/// the assertion fails, so it outlives no test.
+fn ends_refused(e: &LaunchError) {
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    match e.process {
+        Made::Ended(code) => assert_eq!((code, e.unended.is_none()), (Some(REFUSED), true), "{e}"),
+        Made::Pending => {
+            let kept = e
+                .unended
+                .as_ref()
+                .unwrap_or_else(|| panic!("no process kept: {e}"));
+            let process = HANDLE(kept.as_raw_handle());
+            let code = exit_of(process, Duration::from_secs(60));
+            if code.is_none() {
+                // SAFETY: the process the launch kept.
+                let _ = unsafe { TerminateProcess(process, 1) };
+            }
+            assert_eq!(code, Some(REFUSED), "it did not end: {e}");
+        }
+        other => panic!("{other:?}: {e}"),
+    }
 }
 
 // Covers: T02
@@ -508,18 +551,22 @@ fn worker_launch_fails_closed() {
             panic!("{step:?} failing, the launch succeeded");
         };
         assert_eq!(e.step, step, "{e}");
-        // A process made is terminated: before it ran, but at the
-        // handshake, which it runs for.
+        // A process made is terminated, and ends: before it ran, but at the
+        // handshake, which it runs for. At `Assign` it is in no job, so its
+        // termination alone ends it.
         let made = matches!(
             step,
             Step::Assign | Step::Check | Step::Watch | Step::Resume | Step::Handshake
         );
-        let process = if made {
-            Made::Ended(Some(REFUSED))
+        if made {
+            ends_refused(&e);
         } else {
-            Made::Nothing
-        };
-        assert_eq!(e.process, process, "{step:?}: {e}");
+            assert_eq!(
+                (e.process, e.unended.is_none()),
+                (Made::Nothing, true),
+                "{step:?}: {e}"
+            );
+        }
     }
     // The check refuses each restriction it reads when it is missing, and
     // names it: the job, each mitigation policy, the AppContainer, and the
@@ -545,11 +592,8 @@ fn worker_launch_fails_closed() {
         let Err(e) = stage.launch(&setup) else {
             panic!("{missing:?} left out, the launch succeeded");
         };
-        assert_eq!(
-            (e.step, e.process),
-            (Step::Check, Made::Ended(Some(REFUSED))),
-            "{missing:?}: {e}"
-        );
+        assert_eq!(e.step, Step::Check, "{missing:?}: {e}");
+        ends_refused(&e);
         assert!(e.what.contains(named), "{missing:?}: {e}");
     }
 }
@@ -559,17 +603,17 @@ fn worker_launch_fails_closed() {
 #[test]
 fn worker_launch_fails_closed_without_a_hello_in_time() {
     let stage = Stage::new();
+    // A launch first, so the one timed finds the profile and the copies
+    // made and spends its time at the handshake.
+    drop(launch(&stage, recipe()));
     let started = Instant::now();
     // The recipe's own limit, 2 s, not the other tests' patient one.
     let Err(e) = stage.launch(&Setup::recipe().args_of(&["--dev-silent", "10000"])) else {
         panic!("a silent worker launched");
     };
     let took = started.elapsed();
-    assert_eq!(
-        (e.step, e.code, e.process),
-        (Step::Handshake, 1460, Made::Ended(Some(REFUSED))),
-        "{e}"
-    );
+    assert_eq!((e.step, e.code), (Step::Handshake, 1460), "{e}");
+    ends_refused(&e);
     assert!(
         took >= Duration::from_secs(2) && took < Duration::from_secs(8),
         "{took:?}"
@@ -579,6 +623,28 @@ fn worker_launch_fails_closed_without_a_hello_in_time() {
         panic!("a worker without a hello launched");
     };
     assert_eq!(e.step, Step::Handshake, "{e}");
+}
+
+// Covers: T02
+#[test]
+fn a_launch_that_stops_watching_keeps_the_process() {
+    let stage = Stage::new();
+    // Watching for no time, a refused launch that made a process sees it
+    // end or keeps it, and a kept one ends; some are kept, since a process
+    // takes a moment to end once terminated.
+    let mut kept = 0;
+    for _ in 0..5 {
+        for step in [Step::Assign, Step::Check, Step::Resume, Step::Handshake] {
+            let setup = recipe().failing_at(step).observing(Duration::ZERO);
+            let Err(e) = stage.launch(&setup) else {
+                panic!("{step:?} failing, the launch succeeded");
+            };
+            assert_eq!(e.step, step, "{e}");
+            kept += usize::from(e.process == Made::Pending);
+            ends_refused(&e);
+        }
+    }
+    assert!(kept > 0, "every process had ended before the launch looked");
 }
 
 /// The game's host and the worker each compile a copy of the handle
@@ -653,9 +719,11 @@ fn named_event() -> (Own, String, String) {
 }
 
 /// A copy of a system DLL in `dir`, made with a low mandatory label (its
-/// maker may give a new file one no higher than its own).
+/// maker may give a new file one no higher than its own) and a DACL that
+/// grants the user full access and the stage's AppContainer read and
+/// execute, as the worker's copies do, so only the label can refuse it.
 #[cfg(feature = "dev-tools")]
-fn low_label_dll(dir: &std::path::Path) -> std::path::PathBuf {
+fn low_label_dll(dir: &std::path::Path, stage: &Stage) -> std::path::PathBuf {
     use std::io::Write as _;
     use std::os::windows::io::FromRawHandle as _;
 
@@ -669,13 +737,21 @@ fn low_label_dll(dir: &std::path::Path) -> std::path::PathBuf {
 
     let dll = dir.join("lowlabel.dll");
     let bytes = std::fs::read(r"C:\Windows\System32\version.dll").unwrap();
+    let sddl: Vec<u16> = format!(
+        // 0x1200a9: `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`.
+        "D:P(A;;FA;;;{})(A;;0x1200a9;;;{})S:(ML;;NW;;;LW)",
+        media_host::launch::user_sid().unwrap(),
+        sid_text(ContainerSid::of(stage).0)
+    )
+    .encode_utf16()
+    .chain([0])
+    .collect();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: an SDDL string of a low label that refuses writes from below
-    // (its DACL left to inheritance); the descriptor is left to the test's
-    // end.
+    // SAFETY: a nul-terminated SDDL string of that DACL and a low label that
+    // refuses writes from below; the descriptor is left to the test's end.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            windows::core::w!("S:(ML;;NW;;;LW)"),
+            PCWSTR(sddl.as_ptr()),
             SDDL_REVISION_1,
             &raw mut descriptor,
             None,
@@ -740,7 +816,8 @@ fn worker_denials_hold_with_their_codes() {
     let stage = Stage::new();
     let outside = tempfile::NamedTempFile::new().unwrap();
     let (_event, event_name, event_path) = named_event();
-    let dll = low_label_dll(stage.dir());
+    let dlls = tempfile::tempdir().unwrap();
+    let dll = low_label_dll(dlls.path(), &stage);
     let args = [
         format!("file={}", outside.path().display()),
         format!("event={event_name}"),
@@ -988,11 +1065,8 @@ fn worker_win32k_is_locked_from_creation() {
     else {
         panic!("a launch without the lockdown passed its check");
     };
-    assert_eq!(
-        (e.step, e.process),
-        (Step::Check, Made::Ended(Some(REFUSED))),
-        "{e}"
-    );
+    assert_eq!(e.step, Step::Check, "{e}");
+    ends_refused(&e);
     // Control of the calls: with the lockdown and its check removed, the
     // same loads and calls succeed.
     let (_worker, found, log) = probe_run(
@@ -1048,10 +1122,7 @@ fn worker_environment_is_only_the_block_the_launch_builds() {
         "{log}"
     );
     let folder = vars[0].1;
-    let own = format!(
-        "\\packages\\{}\\ac",
-        media_host::launch::profile_name(stage.dir()).unwrap()
-    );
+    let own = format!("\\packages\\{}\\ac", stage.profile());
     assert!(
         folder.ends_with(&own) && !folder[..folder.len() - own.len()].contains("\\packages\\"),
         "{log}"
@@ -1064,77 +1135,403 @@ fn worker_environment_is_only_the_block_the_launch_builds() {
     );
 }
 
-// Covers: T02
-#[cfg(feature = "dev-tools")]
-#[test]
-fn each_installation_runs_as_an_appcontainer_of_its_own() {
-    let (ours, theirs) = (Stage::new(), Stage::new());
-    assert_ne!(
-        media_host::launch::profile_name(ours.dir()).unwrap(),
-        media_host::launch::profile_name(theirs.dir()).unwrap()
-    );
-    // The other installation's launch grants its directory to its worker.
-    drop(launch(&theirs, recipe()));
-    for (stage, readable) in [(&ours, true), (&theirs, false)] {
-        let exe = stage.dir().join("tapestry-media.exe");
-        let arg = format!("file={}", exe.display());
-        let worker = launch(&ours, recipe().args_of(&["--dev-probe", &arg]));
-        let log = worker.probed(1);
-        let found = probes(&log);
-        let file = probe(&found, "file", &log);
-        let want = if readable { (true, 0) } else { (false, 5) };
-        assert_eq!((file.ok, file.code), want, "{}: {log}", exe.display());
-    }
+/// `path`, nul-terminated.
+fn wide_path(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// An installation moved aside: its directory removed and its profile
-/// deleted when dropped.
-#[cfg(feature = "dev-tools")]
-struct Moved {
-    dir: std::path::PathBuf,
-    profile: String,
-}
-
-#[cfg(feature = "dev-tools")]
-impl Drop for Moved {
-    fn drop(&mut self) {
-        delete_profile(&self.profile);
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-// Covers: T02
-#[cfg(feature = "dev-tools")]
-#[test]
-fn a_replaced_installation_gets_no_access_to_the_one_it_replaced() {
-    let stage = Stage::new();
-    // The installation runs, which grants its directory to its worker, and
-    // is moved aside on the same volume; a fresh one is put at its path.
-    drop(launch(&stage, recipe()));
-    let old = media_host::launch::profile_name(stage.dir()).unwrap();
-    let moved = Moved {
-        dir: stage.dir().with_extension("moved"),
-        profile: old.clone(),
+/// The DACL of the file or directory at `path`, as SDDL.
+fn dacl_of(path: &std::path::Path) -> String {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
     };
-    std::fs::rename(stage.dir(), &moved.dir).unwrap();
-    std::fs::create_dir(stage.dir()).unwrap();
-    install(stage.dir());
-    // The directory, not its path, names the profile: the fresh one has a
-    // profile of its own, and the moved one keeps its.
-    assert_ne!(media_host::launch::profile_name(stage.dir()).unwrap(), old);
-    assert_eq!(media_host::launch::profile_name(&moved.dir).unwrap(), old);
-    // The fresh installation's worker reads its own executable, and not the
-    // moved one's, whose directory still grants the old profile.
-    for (dir, readable) in [(stage.dir(), true), (moved.dir.as_path(), false)] {
-        let exe = dir.join("tapestry-media.exe");
-        let arg = format!("file={}", exe.display());
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows::core::PWSTR;
+
+    let name = wide_path(path);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a nul-terminated path; the descriptor returned is freed below.
+    let read = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &raw mut descriptor,
+        )
+    };
+    assert!(read.is_ok(), "{}: {read:?}", path.display());
+    let mut text = PWSTR::null();
+    // SAFETY: the descriptor just read; the string returned is freed below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &raw mut text,
+            None,
+        )
+    }
+    .unwrap();
+    // SAFETY: the nul-terminated string the call returned.
+    let sddl = unsafe { text.to_string() }.unwrap();
+    // SAFETY: the string and the descriptor the calls allocated, unused
+    // after this.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    sddl
+}
+
+/// Adds the ACE `ace` (SDDL) to the DACL of the file or directory at
+/// `path`, as the user may.
+fn widen(path: &std::path::Path, ace: &str) {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
+    };
+    use windows::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    let sddl: Vec<u16> = format!("{}{ace}", dacl_of(path))
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a nul-terminated SDDL string; the descriptor returned is freed
+    // below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+    }
+    .unwrap();
+    let (mut present, mut defaulted) = (false.into(), false.into());
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: the descriptor just made, whose DACL lies inside it.
+    unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut dacl,
+            &raw mut defaulted,
+        )
+    }
+    .unwrap();
+    let name = wide_path(path);
+    // SAFETY: a nul-terminated path and the DACL above.
+    let set = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    // SAFETY: the descriptor made above, unused after this.
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    assert!(set.is_ok(), "{}: {set:?}", path.display());
+}
+
+/// How many names the file at `path` has.
+fn links(path: &std::path::Path) -> u32 {
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(path).unwrap();
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: an open handle, and a struct the call fills.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }.unwrap();
+    info.nNumberOfLinks
+}
+
+/// `sid` as text.
+fn sid_text(sid: windows::Win32::Security::PSID) -> String {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::core::PWSTR;
+
+    let mut text = PWSTR::null();
+    // SAFETY: a valid SID; the string returned is freed below.
+    unsafe { ConvertSidToStringSidW(sid, &raw mut text) }.unwrap();
+    // SAFETY: the nul-terminated string the call returned.
+    let copy = unsafe { text.to_string() }.unwrap();
+    // SAFETY: as above, unused after this.
+    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    copy
+}
+
+// Covers: T02
+#[test]
+fn launch_writes_nothing_to_the_installation() {
+    let stage = Stage::new();
+    let installed: Vec<std::path::PathBuf> = std::iter::once(stage.dir().to_path_buf())
+        .chain(media_host::stage::files().map(|f| stage.dir().join(f)))
+        .collect();
+    let before: Vec<String> = installed.iter().map(|f| dacl_of(f)).collect();
+    let worker = launch(&stage, recipe());
+    let after: Vec<String> = installed.iter().map(|f| dacl_of(f)).collect();
+    drop(worker);
+    // The installation's DACLs are as they were, none naming the worker's
+    // AppContainer; its copies' directory is granted to it instead.
+    assert_eq!(after, before);
+    let sid = sid_text(ContainerSid::of(&stage).0);
+    assert!(before.iter().all(|d| !d.contains(&sid)), "{before:?}");
+    assert!(dacl_of(&stage.copies()).contains(&sid));
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_reads_its_copies_and_no_file_of_the_installation() {
+    let stage = Stage::new();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "the user's").unwrap();
+    // A name linked into the installation, and, once the copies are staged,
+    // one linked into their directory.
+    std::fs::hard_link(&secret, stage.dir().join("linked.txt")).unwrap();
+    drop(launch(&stage, recipe()));
+    let copies = stage.copies();
+    std::fs::hard_link(&secret, copies.join("linked.txt")).unwrap();
+    for (path, readable) in [
+        (copies.join("tapestry-media.exe"), true),
+        (stage.dir().join("tapestry-media.exe"), false),
+        (stage.dir().join("linked.txt"), false),
+        (copies.join("linked.txt"), false),
+        (secret.clone(), false),
+    ] {
+        let arg = format!("file={}", path.display());
         let worker = launch(&stage, recipe().args_of(&["--dev-probe", &arg]));
         let log = worker.probed(1);
         let found = probes(&log);
         let file = probe(&found, "file", &log);
         let want = if readable { (true, 0) } else { (false, 5) };
-        assert_eq!((file.ok, file.code), want, "{}: {log}", exe.display());
+        assert_eq!((file.ok, file.code), want, "{}: {log}", path.display());
     }
+}
+
+// Covers: T02
+#[test]
+fn a_changed_copy_is_written_again_before_the_launch() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let stage = Stage::new();
+    drop(launch(&stage, recipe()));
+    let copies = stage.copies();
+    let dlls = media_support::dlls();
+    let [first, second, third] = [0, 1, 2].map(|i| format!("{}.dll", dlls[i]));
+    let installed = |name: &str| std::fs::read(stage.dir().join(name)).unwrap();
+    let dacl = dacl_of(&copies.join(&third));
+    // One copy's bytes changed (one byte, so its size stays), another's DACL
+    // widened, and the executable's copy given a second name.
+    let mut bytes = std::fs::read(copies.join(&first)).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(copies.join(&first), &bytes).unwrap();
+    widen(&copies.join(&second), "(A;;FR;;;WD)");
+    let elsewhere = tempfile::tempdir_in(stage.data()).unwrap();
+    std::fs::hard_link(
+        copies.join("tapestry-media.exe"),
+        elsewhere.path().join("again.exe"),
+    )
+    .unwrap();
+    drop(launch(&stage, recipe()));
+    for name in [first.as_str(), second.as_str(), "tapestry-media.exe"] {
+        let copy = copies.join(name);
+        assert!(std::fs::read(&copy).unwrap() == installed(name), "{name}");
+        assert_eq!((dacl_of(&copy), links(&copy)), (dacl.clone(), 1), "{name}");
+    }
+    // A changed copy that cannot be written again, here held open, refuses
+    // the launch before it makes a process; released, it is written again.
+    std::fs::write(copies.join(&first), &bytes).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0)
+        .open(copies.join(&first))
+        .unwrap();
+    let Err(e) = stage.launch(&recipe()) else {
+        panic!("a launch ran over a copy it could not write again");
+    };
+    assert_eq!((e.step, e.process), (Step::Stage, Made::Nothing), "{e}");
+    drop(held);
+    drop(launch(&stage, recipe()));
+    assert!(std::fs::read(copies.join(&first)).unwrap() == installed(&first));
+}
+
+// Covers: T02
+#[test]
+fn a_copies_directory_with_another_dacl_refuses_the_launch() {
+    let stage = Stage::new();
+    drop(launch(&stage, recipe()));
+    widen(&stage.copies(), "(A;;FR;;;WD)");
+    let Err(e) = stage.launch(&recipe()) else {
+        panic!("a launch ran from a directory with another DACL");
+    };
+    assert_eq!((e.step, e.process), (Step::Stage, Made::Nothing), "{e}");
+    assert!(e.what.contains("another DACL"), "{e}");
+}
+
+// Covers: T02
+#[test]
+fn a_copies_directory_that_is_a_link_refuses_the_launch() {
+    let stage = Stage::new();
+    drop(launch(&stage, recipe()));
+    // The copies' directory moved aside, and a junction to it put at its
+    // path, as the user may.
+    let copies = stage.copies();
+    let aside = copies.with_extension("aside");
+    std::fs::rename(&copies, &aside).unwrap();
+    let status = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&copies)
+        .arg(&aside)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let Err(e) = stage.launch(&recipe()) else {
+        panic!("a launch ran from a link");
+    };
+    assert_eq!((e.step, e.process), (Step::Stage, Made::Nothing), "{e}");
+    assert!(e.what.contains("is a link"), "{e}");
+}
+
+// Covers: T02
+#[test]
+fn held_copies_cannot_be_written_or_renamed() {
+    let stage = Stage::new();
+    let sid = ContainerSid::of(&stage);
+    let staged = media_host::stage::stage(stage.dir(), stage.data(), sid.0).unwrap();
+    let copies = staged.dir().to_path_buf();
+    let exe = copies.join("tapestry-media.exe");
+    let media = stage.data().join("media");
+    // While the launch holds them, a copy cannot be written, renamed or
+    // deleted, nor its directory or the folder above renamed.
+    let refused = |what: &str, result: std::io::Result<()>| {
+        let code = result.err().and_then(|e| e.raw_os_error());
+        assert!(matches!(code, Some(5 | 32)), "{what}: {code:?}");
+    };
+    refused(
+        "writing a copy",
+        std::fs::OpenOptions::new().write(true).open(&exe).map(drop),
+    );
+    refused(
+        "renaming a copy",
+        std::fs::rename(&exe, copies.join("other.exe")),
+    );
+    refused("deleting a copy", std::fs::remove_file(&exe));
+    refused(
+        "renaming the directory",
+        std::fs::rename(&copies, copies.with_extension("moved")),
+    );
+    refused(
+        "renaming the folder above",
+        std::fs::rename(&media, media.with_extension("moved")),
+    );
+    // Released, they can.
+    drop(staged);
+    std::fs::rename(&media, media.with_extension("moved")).unwrap();
+}
+
+// Covers: T02
+#[test]
+fn launches_take_a_mutex_of_the_users_own() {
+    use std::os::windows::io::FromRawHandle as _;
+
+    use media_host::launch::Launches;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+
+    // A holder that ends without releasing it leaves it abandoned, and the
+    // next takes it all the same.
+    std::thread::spawn(|| std::mem::forget(Launches::hold().unwrap()))
+        .join()
+        .unwrap();
+    let held = Launches::hold().unwrap();
+    // It is the user's, in the global namespace, so the user's launches in
+    // every session take it, and its DACL, protected, grants the user alone.
+    let user = media_host::launch::user_sid().unwrap();
+    let name: Vec<u16> = format!("Global\\tapestry-media-{user}")
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    // SAFETY: a nul-terminated name; the handle is owned below.
+    let opened =
+        unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) }.unwrap();
+    // SAFETY: the handle just opened, closed when this drops.
+    drop(unsafe { OwnedHandle::from_raw_handle(opened.0) });
+    assert_eq!(
+        kernel_dacl(held.handle()),
+        format!("D:P(A;;0x1f0001;;;{user})")
+    );
+}
+
+/// The DACL of the kernel object `object`, as SDDL.
+fn kernel_dacl(object: HANDLE) -> String {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
+    };
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows::core::PWSTR;
+
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a handle with `READ_CONTROL`; the descriptor returned is freed
+    // below.
+    let read = unsafe {
+        GetSecurityInfo(
+            object,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            Some(&raw mut descriptor),
+        )
+    };
+    assert!(read.is_ok(), "{read:?}");
+    let mut text = PWSTR::null();
+    // SAFETY: the descriptor just read; the string returned is freed below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &raw mut text,
+            None,
+        )
+    }
+    .unwrap();
+    // SAFETY: the nul-terminated string the call returned.
+    let sddl = unsafe { text.to_string() }.unwrap();
+    // SAFETY: the string and the descriptor the calls allocated.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    sddl
 }
 
 // Covers: T02
@@ -1318,9 +1715,9 @@ impl ContainerSid {
         Self(sid)
     }
 
-    /// The SID the worker installed in `dir` runs as.
-    fn of(dir: &std::path::Path) -> Self {
-        Self::named(&media_host::launch::profile_name(dir).unwrap())
+    /// The SID the stage's workers run as.
+    fn of(stage: &Stage) -> Self {
+        Self::named(stage.profile())
     }
 }
 
@@ -1426,7 +1823,7 @@ fn station_name(station: HANDLE) -> String {
 #[test]
 fn launch_grants_its_desktop_and_leaves_the_shared_station_alone() {
     let stage = Stage::new();
-    let sid = ContainerSid::of(stage.dir());
+    let sid = ContainerSid::of(&stage);
     // Under the recipe the worker's AppContainer is granted its own desktop
     // and nothing on the window station, the session's alternate one, which
     // every launch and other programs' sandboxes share.

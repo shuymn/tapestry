@@ -88,6 +88,19 @@ pub fn leave_codec_list_unset() {
     NO_CODEC_LIST.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Each park of a decoder at a video's end records a refusal (dev-tools):
+/// the park seam.
+#[cfg(feature = "dev-tools")]
+static REFUSE_WHILE_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has each park of a decoder at a video's end record a refusal for its
+/// player from now on (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn refuse_while_parked() {
+    REFUSE_WHILE_PARKED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The codec whitelist, as the option an open sets.
 fn codec_list() -> &'static [(&'static CStr, &'static CStr)] {
     #[cfg(feature = "dev-tools")]
@@ -194,7 +207,16 @@ mod hooks {
 
     /// The functions besides `_beginthreadex` that start a thread, or run
     /// code on a thread of the system's: one FFmpeg started so would work
-    /// for no player, so FFmpeg's DLLs may import none of them.
+    /// for no player, so the four DLLs the worker loads may import none of
+    /// them by name. That is all the check reads: a function a DLL looks up
+    /// at run time, imports by ordinal or through its delay-load table, a
+    /// thread the C runtime starts inside its own functions, and the build's
+    /// fifth DLL, swresample, are outside it. The pinned build was read for
+    /// those once: none of its DLLs has a delay-load or by-ordinal import,
+    /// they look up `SetThreadDescription` and
+    /// `GetSystemTimePreciseAsFileTime` alone at run time, only avcodec and
+    /// avutil import a thread start (`_beginthreadex`), and nothing the
+    /// worker loads imports swresample.
     const OTHER_STARTS: [&CStr; 14] = [
         c"CreateThread",
         c"CreateRemoteThread",
@@ -311,6 +333,31 @@ mod hooks {
         record(|r| {
             r.refused.fetch_max(size, Ordering::SeqCst);
         });
+    }
+
+    /// Refuses an allocation for the player this thread works for, through
+    /// the worker's own allocator (dev-tools): the park seam, standing in
+    /// for a decoder's thread whose allocation is refused while the player
+    /// parks the decoder at the end, after its other thread gave the end.
+    #[cfg(feature = "dev-tools")]
+    pub fn refuse_now() {
+        // SAFETY: the worker's allocator, asked for more than its cap: it
+        // records the refusal and allocates nothing.
+        let p = unsafe { malloc(CAP.load(Ordering::Relaxed).saturating_add(1)) };
+        debug_assert!(p.is_null());
+    }
+
+    unsafe extern "C" {
+        /// The calling thread's `errno`, the C runtime's FFmpeg's DLLs share.
+        fn _errno() -> *mut c_int;
+    }
+
+    /// Sets the calling thread's `errno`, as the C runtime does when one of
+    /// its functions fails.
+    fn set_errno(code: c_int) {
+        // SAFETY: the runtime's pointer to this thread's `errno`, valid for
+        // the thread's life.
+        unsafe { *_errno() = code };
     }
 
     /// Whether `size` bytes may be allocated at once; a larger allocation is
@@ -451,14 +498,28 @@ mod hooks {
         flags: u32,
         id: *mut u32,
     ) -> usize {
-        let (Some(f), Some(start)) = (held(&BEGIN_THREAD), start) else {
+        let Some(f) = held(&BEGIN_THREAD) else {
+            // Not reached: the import points here only once the runtime's
+            // function is held. A failure as the runtime reports one.
+            set_errno(ff::EAGAIN);
             return 0;
+        };
+        // SAFETY: the runtime's `_beginthreadex`, which the import held.
+        let begin = unsafe { std::mem::transmute::<usize, BeginThread>(f) };
+        let Some(start) = start else {
+            // The runtime checks its arguments itself, as it would without
+            // the hook.
+            // SAFETY: FFmpeg's arguments, unchanged.
+            return unsafe { begin(security, stack, None, arg, flags, id) };
         };
         let layout = Layout::new::<Started>();
         // SAFETY: a layout of non-zero size. The memory comes from Rust's
         // allocator, not the runtime's the hooks stand in front of.
         let started = unsafe { std::alloc::alloc(layout) }.cast::<Started>();
         if started.is_null() {
+            // As the runtime fails when it cannot allocate what it hands
+            // the new thread.
+            set_errno(ff::ENOMEM);
             return 0;
         }
         let record = CURRENT.with(Cell::get);
@@ -468,11 +529,11 @@ mod hooks {
             unsafe { Arc::increment_strong_count(record) };
         }
         // SAFETY: memory of `Started`'s layout, allocated above; then the
-        // runtime's `_beginthreadex`, which the import held, given FFmpeg's
-        // arguments but the start routine and its argument.
+        // runtime's `_beginthreadex`, given FFmpeg's arguments but the start
+        // routine and its argument.
         let thread = unsafe {
             started.write(Started { start, arg, record });
-            std::mem::transmute::<usize, BeginThread>(f)(
+            begin(
                 security,
                 stack,
                 Some(run_started),
@@ -482,6 +543,7 @@ mod hooks {
             )
         };
         if thread == 0 {
+            // The runtime set `errno`, which freeing leaves as it is.
             // SAFETY: the `Started` written above, which no thread got.
             unsafe {
                 let Started { record, .. } = started.read();
@@ -1150,6 +1212,9 @@ impl Input {
     /// error.
     pub fn next(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
         let next = self.next_unchecked(out);
+        if matches!(next, Ok(None)) {
+            self.park();
+        }
         // A refusal made while the frame was decoded and converted, or while
         // the decoder drained, fails the player before the frame or the end
         // is taken.
@@ -1187,6 +1252,9 @@ impl Input {
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         self.budget(Some(BUDGET));
         let landed = self.seek_within_budget(target, out);
+        if matches!(landed, Ok(None)) {
+            self.park();
+        }
         // As in `next`, before the landing or the end is taken; a seek past
         // its budget fails for its reading.
         let checked = self.check();
@@ -1241,6 +1309,20 @@ impl Input {
             }
         }
         Ok(None)
+    }
+
+    /// Waits at the video's end until the decoder's threads have finished
+    /// their work: FFmpeg's flush parks each frame thread once the packet it
+    /// was handed is decoded, so a refusal that work makes is recorded before
+    /// the end is checked, though another thread gave the end first. The
+    /// decoder keeps nothing; a seek flushes it again.
+    fn park(&mut self) {
+        // SAFETY: this input's decoder.
+        unsafe { ff::avcodec_flush_buffers(self.dec) };
+        #[cfg(feature = "dev-tools")]
+        if REFUSE_WHILE_PARKED.load(std::sync::atomic::Ordering::Relaxed) {
+            hooks::refuse_now();
+        }
     }
 
     /// Fails the player when an allocation made for it was refused since

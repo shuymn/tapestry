@@ -1008,6 +1008,47 @@ fn a_display_offset_set_during_a_deferral_is_recorded() {
     });
 }
 
+/// With the transition probe on, an opening deferred by START held and
+/// then opened is marked once (`g:open`), by the call that opened, after
+/// the deferral: no mark for the deferred call.
+#[test]
+fn the_probe_marks_an_opening_once_across_a_deferral() {
+    crate::dev::loop_probe::tests::turn_on();
+    let opens = || -> Vec<(u64, i64)> {
+        crate::dev::loop_probe::tests::marks()
+            .iter()
+            .filter(|m| m.1 == "g:open")
+            .map(|m| (m.0, m.2))
+            .collect()
+    };
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        side.screens.hold_commits(true);
+        let mut deferred_at = 0;
+        let ended = open_with(loaded, rig, side, || {
+            until("the commit held", || side.screens.commit_held());
+            side.keys.key(super::START, 1);
+            side.screens.hold_commits(false);
+            until("the deferral", || {
+                side.loading_end.passed() == 1 && side.tuning.acceptance() == Acceptance::Open
+            });
+            deferred_at = crate::dev::loop_probe::tests::now();
+            assert!(
+                opens().is_empty(),
+                "the deferred call marked: {:?}",
+                opens()
+            );
+            side.keys.key(super::START, 0);
+            side.quit_the_play(2);
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        let opens = opens();
+        assert_eq!(opens.len(), 1, "{opens:?}");
+        assert_eq!(opens[0].1, 1, "a gated candidate's opening");
+        assert!(opens[0].0 > deferred_at, "{opens:?} {deferred_at}");
+    });
+}
+
 /// O-20, the player's half: settings keys pressed after the epoch's
 /// refresh (O5) and before the revalidation (O11) each send the opening
 /// back to the wait; the copy it finally opens with has both, and so do

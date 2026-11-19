@@ -23,15 +23,16 @@
 //! It checks, at every poll, that the reader faults nothing and stages the
 //! newest frame of its run due and published before its watermark read,
 //! whole, after every frame it staged before, leaving behind only frames of
-//! its run not due yet and frames above the watermark; and, at the end of
-//! the game's script, that once the worker has nothing left to publish the
-//! polls drain the ring and show the run's last frame. A loom model would
-//! also explore the atomics' weaker orderings, but it needs the ring built
-//! on loom's own atomics (`skin-model` has no such build) and its
-//! thread-by-thread exploration grows past what this test can afford at
-//! four slots and two runs; the orderings are the reader's acquire loads
-//! of each slot's state and of the watermark against the worker's release
-//! stores, the standard publication pattern, and are not explored here.
+//! its run not due yet and every frame above the watermark, published before
+//! the poll or during it; and, at the end of the game's script, that once
+//! the worker has nothing left to publish the polls drain the ring and show
+//! the run's last frame. A loom model would also explore the atomics'
+//! weaker orderings, but it needs the ring built on loom's own atomics
+//! (`skin-model` has no such build) and its thread-by-thread exploration
+//! grows past what this test can afford at four slots and two runs; the
+//! orderings are the reader's acquire loads of each slot's state and of the
+//! watermark against the worker's release stores, the standard publication
+//! pattern, and are not explored here.
 //!
 //! A control breaks the hand-over of runs: a worker that publishes a frame
 //! of an earlier run after one of a later run. The checker must find the
@@ -258,16 +259,15 @@ impl WorkerModel {
         steps
     }
 
-    /// Takes `step`; `scanned` is how many slots the poll in progress has
-    /// looked at. Returns whether it published into a slot the poll had
-    /// already passed.
+    /// Takes `step`; `loaded` is how many slots' states the poll in progress
+    /// has loaded. Returns whether it published into one of those slots.
     fn apply(
         &mut self,
         step: Step,
         ring: &[AtomicU64],
         g: Geometry,
         plan: &Plan,
-        scanned: usize,
+        loaded: usize,
     ) -> bool {
         match step {
             Step::Proceed => unreachable!("not a worker's step"),
@@ -307,7 +307,7 @@ impl WorkerModel {
                 self.seq = seq;
                 self.raise = true;
                 self.published.push((seq, run, stamp));
-                return index < scanned;
+                return index < loaded;
             }
             Step::Raise => {
                 ring[WATERMARK_WORD]
@@ -380,7 +380,8 @@ pub struct Reached {
     pub runs: u64,
     pub states: usize,
     pub polls: u64,
-    /// A frame published into a slot the poll had already passed.
+    /// A frame published into a slot whose state the poll had already
+    /// loaded.
     pub passed: u64,
     /// A frame left in the ring above the watermark a poll read.
     pub deferred: u64,
@@ -411,11 +412,11 @@ struct Exec<'a> {
     /// The drain after the script: no choices.
     draining: Cell<bool>,
     /// The poll in progress: its state before it, the words it read, how
-    /// many slots it has looked at, the watermark it read and the frames
-    /// in the ring at or below it then.
+    /// many slots' states it has loaded, the watermark it read and the
+    /// frames in the ring at or below it then.
     poll_key: Cell<u64>,
     trace: RefCell<Vec<u64>>,
-    scanned: Cell<usize>,
+    loaded: Cell<usize>,
     watermark: Cell<Option<u64>>,
     below: RefCell<Vec<(u64, u64, i64, usize)>>,
     /// The reader's state before the poll, as text.
@@ -429,13 +430,15 @@ impl Words for ReaderView<'_, '_> {
     fn words(&self, start: usize, len: usize) -> Option<&[AtomicU64]> {
         let e = self.0;
         let watermark = (start, len) == (WATERMARK_WORD, 1);
-        let scan = e.scanned.get();
+        let scan = e.loaded.get();
         let state = len == 1 && scan < SLOTS && start == state_word(e.g, scan);
-        if state {
-            e.scanned.set(scan + 1);
-        }
         if watermark || state {
             e.schedule(start, len);
+        }
+        // The reader loads the slot's state once the worker's steps here are
+        // done: a frame published into it now is one the poll sees.
+        if state {
+            e.loaded.set(scan + 1);
         }
         if watermark {
             let w = e.ring[WATERMARK_WORD].load(Ordering::Relaxed);
@@ -485,7 +488,7 @@ impl Exec<'_> {
                 self.ring,
                 self.g,
                 self.plan,
-                self.scanned.get(),
+                self.loaded.get(),
             );
             if passed {
                 self.reached.borrow_mut().passed += 1;
@@ -517,7 +520,7 @@ impl Exec<'_> {
         let mut h = DefaultHasher::new();
         self.poll_key.get().hash(&mut h);
         self.trace.borrow().hash(&mut h);
-        (start, len, self.scanned.get(), self.watermark.get()).hash(&mut h);
+        (start, len, self.loaded.get(), self.watermark.get()).hash(&mut h);
         self.below.borrow().hash(&mut h);
         self.ring[WATERMARK_WORD]
             .load(Ordering::Relaxed)
@@ -554,7 +557,7 @@ impl Exec<'_> {
         drop(debug);
         self.poll_key.set(h.finish());
         self.trace.borrow_mut().clear();
-        self.scanned.set(0);
+        self.loaded.set(0);
         self.watermark.set(None);
         self.below.borrow_mut().clear();
         let run = reader.run();
@@ -584,6 +587,15 @@ impl Exec<'_> {
             reached.staged += 1;
         }
         let left = ready(self.ring, self.g);
+        // Every frame published above the watermark the poll read, before
+        // the poll or during it, stays queued: the poll frees none of them,
+        // whatever else it frees.
+        for p in self.worker.borrow().published.iter().filter(|p| p.0 > w) {
+            assert!(
+                left.iter().any(|l| l.0 == p.0),
+                "frame {p:?} above the watermark {w} freed by the poll at {due} in run {run}"
+            );
+        }
         let mut freed = false;
         for f in below.iter() {
             if left.iter().any(|l| l.0 == f.0) {
@@ -650,7 +662,7 @@ fn execute(
         draining: Cell::new(false),
         poll_key: Cell::new(0),
         trace: RefCell::new(Vec::new()),
-        scanned: Cell::new(0),
+        loaded: Cell::new(0),
         watermark: Cell::new(None),
         below: RefCell::new(Vec::new()),
         debug: RefCell::new(String::new()),
