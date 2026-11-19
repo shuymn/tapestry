@@ -4,7 +4,14 @@
 //! A message travels as a frame: its length in two little-endian bytes,
 //! then that many bytes, at most [`MAX_FRAME`]: a tag byte and the
 //! message's fields, integers little-endian, a string as its length in two
-//! bytes and then its UTF-8 bytes. Decoding reads exactly one message's
+//! bytes and then its UTF-8 bytes. A command carries an id after its tag,
+//! which the game chooses, never 0, and each reply that answers a command
+//! echoes: the open's probe or refusal ([`Reply::Probed`],
+//! [`Reply::Refused`]) and its rejection ([`Reply::Rejected`]), the play's
+//! start, the seek's landing, the close's [`Reply::Closed`] and any
+//! command's rejection, so the game follows each player through the replies
+//! to its own commands. A player's failure ([`Reply::Failed`]) and the end
+//! of its video answer no command. Decoding reads exactly one message's
 //! bytes and refuses anything else ([`Malformed`]): an unknown tag, a field
 //! cut short, bytes left over, a string that is not UTF-8 or is longer than
 //! [`MAX_TEXT`], a reason the protocol does not have. The game reads the
@@ -62,6 +69,10 @@ pub enum Command {
     Quit,
 }
 
+/// The id of a reply that answers no command of the game's (a player's
+/// close at the worker's own end).
+pub const NO_COMMAND: u32 = 0;
+
 /// A reply from the worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
@@ -71,8 +82,10 @@ pub enum Reply {
         configuration: String,
     },
     /// `player`'s file holds a video of a listed container and codec, of
-    /// `width` × `height` pixels, lasting `duration` µs (0 when unknown).
+    /// `width` × `height` pixels, lasting `duration` µs (0 when unknown):
+    /// the answer to open `id`.
     Probed {
+        id: u32,
         player: u8,
         width: u32,
         height: u32,
@@ -80,14 +93,27 @@ pub enum Reply {
         codec: String,
         container: String,
     },
-    /// `player`'s file is refused at its probe; `code` is FFmpeg's error,
-    /// 0 when FFmpeg reported none.
-    Refused { player: u8, why: Refusal, code: i32 },
-    /// `player` decodes into its frame ring.
-    Playing { player: u8 },
+    /// `player`'s file is refused at its probe, the answer to open `id`,
+    /// and closed; `code` is FFmpeg's error, 0 when FFmpeg reported none.
+    /// The player holds nothing more and waits to be closed.
+    Refused {
+        id: u32,
+        player: u8,
+        why: Refusal,
+        code: i32,
+    },
+    /// Command `id` for `player` is not taken, its handles closed: an open
+    /// of a player that is open, past the players the worker holds, naming
+    /// a handle it does not take, or whose thread did not start (the player
+    /// is not opened); or a play, a seek or a close of a player that does
+    /// not take it. `code` is the system's error, 0 when there is none.
+    Rejected { id: u32, player: u8, code: i32 },
+    /// `player` decodes into its frame ring: the answer to play `id`.
+    Playing { id: u32, player: u8 },
     /// Run `run` of `player` starts at the frame stamped `landed`, found
-    /// after `attempts` seeks.
+    /// after `attempts` seeks: the answer to seek `id`.
     Sought {
+        id: u32,
         player: u8,
         run: u64,
         landed: i64,
@@ -95,11 +121,13 @@ pub enum Reply {
     },
     /// `player` published the last frame of run `run`.
     Ended { player: u8, run: u64 },
-    /// `player` failed and decodes nothing more; `code` is FFmpeg's or the
-    /// system's error, 0 when there is none.
+    /// `player` failed and decodes nothing more, its file and ring closed;
+    /// `code` is FFmpeg's or the system's error, 0 when there is none. It
+    /// waits to be closed.
     Failed { player: u8, why: Failure, code: i32 },
-    /// `player` is closed, its handles with it.
-    Closed { player: u8 },
+    /// `player` is closed, its handles with it: the answer to close `id`
+    /// ([`NO_COMMAND`] when the worker closes it at its own end).
+    Closed { id: u32, player: u8 },
     /// A line of the worker's or FFmpeg's diagnostics.
     Log { text: String },
 }
@@ -125,9 +153,6 @@ pub enum Refusal {
 /// Why a player failed (design.md "Threat Model" T02).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// A command for a player that cannot take it: none of that number is
-    /// open, it is already open, or it is not probed or not playing.
-    Command,
     /// Its frame ring could not be mapped or is not a ring.
     Ring,
     /// Its file could not be read.
@@ -178,6 +203,7 @@ const ENDED: u8 = 69;
 const FAILED: u8 = 70;
 const CLOSED: u8 = 71;
 const LOG: u8 = 72;
+const REJECTED: u8 = 73;
 
 /// The refusals by their code on the wire, their index.
 const REFUSALS: [Refusal; 6] = [
@@ -189,8 +215,7 @@ const REFUSALS: [Refusal; 6] = [
     Refusal::Decoder,
 ];
 /// The failures by their code on the wire, their index.
-const FAILURES: [Failure; 6] = [
-    Failure::Command,
+const FAILURES: [Failure; 5] = [
     Failure::Ring,
     Failure::Read,
     Failure::Memory,
@@ -207,32 +232,38 @@ fn code<T: PartialEq>(all: &[T], v: &T) -> u8 {
 }
 
 impl Command {
-    /// The message's bytes, without the frame's length.
+    /// The message's bytes as command `id`, without the frame's length.
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, id: u32) -> Vec<u8> {
         let mut b = Bytes::default();
         match *self {
-            Self::Open { player, file } => b.u8(OPEN).u8(player).u64(file),
+            Self::Open { player, file } => b.u8(OPEN).u32(id).u8(player).u64(file),
             Self::Play {
                 player,
                 section,
                 event,
-            } => b.u8(PLAY).u8(player).u64(section).u64(event),
-            Self::Seek { player, run, at } => b.u8(SEEK).u8(player).u64(run).i64(at),
-            Self::Close { player } => b.u8(CLOSE).u8(player),
-            Self::Quit => b.u8(QUIT),
+            } => b.u8(PLAY).u32(id).u8(player).u64(section).u64(event),
+            Self::Seek { player, run, at } => b.u8(SEEK).u32(id).u8(player).u64(run).i64(at),
+            Self::Close { player } => b.u8(CLOSE).u32(id).u8(player),
+            Self::Quit => b.u8(QUIT).u32(id),
         };
         b.0
     }
 
-    /// The command in `message`, a frame's bytes after its length.
+    /// The command in `message`, a frame's bytes after its length, and its
+    /// id.
     ///
     /// # Errors
     ///
     /// When `message` is not exactly one command.
-    pub fn decode(message: &[u8]) -> Result<Self, Malformed> {
+    pub fn decode(message: &[u8]) -> Result<(u32, Self), Malformed> {
         let mut r = Fields::new(message)?;
-        let command = match r.u8()? {
+        let tag = r.u8()?;
+        if !(OPEN..=QUIT).contains(&tag) {
+            return Err(Malformed::Tag(tag));
+        }
+        let id = r.u32()?;
+        let command = match tag {
             OPEN => Self::Open {
                 player: r.u8()?,
                 file: r.u64()?,
@@ -252,7 +283,7 @@ impl Command {
             tag => return Err(Malformed::Tag(tag)),
         };
         r.end()?;
-        Ok(command)
+        Ok((id, command))
     }
 }
 
@@ -269,6 +300,7 @@ impl Reply {
                 configuration,
             } => b.u8(HELLO).texts(&[version, configuration]),
             Self::Probed {
+                id,
                 player,
                 width,
                 height,
@@ -277,24 +309,38 @@ impl Reply {
                 container,
             } => b
                 .u8(PROBED)
+                .u32(*id)
                 .u8(*player)
                 .u32(*width)
                 .u32(*height)
                 .i64(*duration)
                 .texts(&[codec, container]),
             Self::Refused {
+                id,
                 player,
                 why,
                 code: err,
-            } => b.u8(REFUSED).u8(*player).u8(code(&REFUSALS, why)).i32(*err),
-            Self::Playing { player } => b.u8(PLAYING).u8(*player),
+            } => b
+                .u8(REFUSED)
+                .u32(*id)
+                .u8(*player)
+                .u8(code(&REFUSALS, why))
+                .i32(*err),
+            Self::Rejected {
+                id,
+                player,
+                code: err,
+            } => b.u8(REJECTED).u32(*id).u8(*player).i32(*err),
+            Self::Playing { id, player } => b.u8(PLAYING).u32(*id).u8(*player),
             Self::Sought {
+                id,
                 player,
                 run,
                 landed,
                 attempts,
             } => b
                 .u8(SOUGHT)
+                .u32(*id)
                 .u8(*player)
                 .u64(*run)
                 .i64(*landed)
@@ -305,7 +351,7 @@ impl Reply {
                 why,
                 code: err,
             } => b.u8(FAILED).u8(*player).u8(code(&FAILURES, why)).i32(*err),
-            Self::Closed { player } => b.u8(CLOSED).u8(*player),
+            Self::Closed { id, player } => b.u8(CLOSED).u32(*id).u8(*player),
             Self::Log { text } => b.u8(LOG).texts(&[text]),
         };
         b.0
@@ -324,6 +370,7 @@ impl Reply {
                 configuration: r.text()?,
             },
             PROBED => Self::Probed {
+                id: r.u32()?,
                 player: r.u8()?,
                 width: r.u32()?,
                 height: r.u32()?,
@@ -332,12 +379,22 @@ impl Reply {
                 container: r.text()?,
             },
             REFUSED => Self::Refused {
+                id: r.u32()?,
                 player: r.u8()?,
                 why: r.reason(&REFUSALS)?,
                 code: r.i32()?,
             },
-            PLAYING => Self::Playing { player: r.u8()? },
+            REJECTED => Self::Rejected {
+                id: r.u32()?,
+                player: r.u8()?,
+                code: r.i32()?,
+            },
+            PLAYING => Self::Playing {
+                id: r.u32()?,
+                player: r.u8()?,
+            },
             SOUGHT => Self::Sought {
+                id: r.u32()?,
                 player: r.u8()?,
                 run: r.u64()?,
                 landed: r.i64()?,
@@ -352,7 +409,10 @@ impl Reply {
                 why: r.reason(&FAILURES)?,
                 code: r.i32()?,
             },
-            CLOSED => Self::Closed { player: r.u8()? },
+            CLOSED => Self::Closed {
+                id: r.u32()?,
+                player: r.u8()?,
+            },
             LOG => Self::Log { text: r.text()? },
             tag => return Err(Malformed::Tag(tag)),
         };

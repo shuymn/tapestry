@@ -38,7 +38,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use skin_model::media::control::{self, Command, Failure, Reply};
+use skin_model::media::control::{self, Command, Reply};
 
 /// The most players the worker plays at once: four a screen, and those of a
 /// generation the game is closing.
@@ -98,17 +98,22 @@ impl Out {
     }
 }
 
-/// What the control loop tells a player's thread.
+/// What the control loop tells a player's thread, with the id of the
+/// command it carries out.
 pub enum ToPlayer {
     Play {
+        id: u32,
         section: os::Owned,
         event: os::Owned,
     },
     Seek {
+        id: u32,
         run: u64,
         at: i64,
     },
-    Close,
+    Close {
+        id: u32,
+    },
 }
 
 /// Answers the game's launch with the hello on the control pipe, to which
@@ -145,43 +150,36 @@ fn serve_on(out: &Out) -> ExitCode {
     let mut stdin = std::io::stdin().lock();
     let mut players: BTreeMap<u8, (Sender<ToPlayer>, JoinHandle<()>)> = BTreeMap::new();
     let mut closing: Vec<JoinHandle<()>> = Vec::new();
-    while let Some(command) = read_command(&mut stdin) {
+    let mut quit = control::NO_COMMAND;
+    while let Some((id, command)) = read_command(&mut stdin) {
         closing.retain(|t| !t.is_finished());
         match command {
             Command::Open { player, file } => {
                 let file = match os::Owned::take(file, os::Kind::File) {
                     Ok(file) => file,
                     Err(code) => {
-                        refuse_handle(out, player, code);
+                        refuse_handle(out, id, player, code);
                         continue;
                     }
                 };
                 if players.contains_key(&player) || players.len() >= MAX_PLAYERS {
                     drop(file);
-                    out.send(&Reply::Failed {
-                        player,
-                        why: Failure::Command,
-                        code: 0,
-                    });
+                    reject(out, id, player, 0);
                     continue;
                 }
                 let (tx, rx) = mpsc::channel();
                 let thread_out = out.clone();
                 // The thread owns the handle: one that does not start closes
-                // it with its closure.
+                // it with its closure, before the rejection is sent.
                 let source = os::Source::taken(file);
                 let spawned = std::thread::Builder::new()
                     .name(format!("player {player}"))
-                    .spawn(move || player::run(player, source, &rx, &thread_out));
+                    .spawn(move || player::run(player, id, source, &rx, &thread_out));
                 match spawned {
                     Ok(thread) => {
                         players.insert(player, (tx, thread));
                     }
-                    Err(_) => out.send(&Reply::Failed {
-                        player,
-                        why: Failure::Memory,
-                        code: 0,
-                    }),
+                    Err(e) => reject(out, id, player, e.raw_os_error().unwrap_or(0)),
                 }
             }
             Command::Play {
@@ -193,31 +191,34 @@ fn serve_on(out: &Out) -> ExitCode {
                     os::Owned::take(event, os::Kind::Event).map(|event| (section, event))
                 });
                 match taken {
-                    Ok((section, event)) => {
-                        to_player(&players, out, player, ToPlayer::Play { section, event });
-                    }
-                    Err(code) => refuse_handle(out, player, code),
+                    Ok((section, event)) => to_player(
+                        &players,
+                        out,
+                        id,
+                        player,
+                        ToPlayer::Play { id, section, event },
+                    ),
+                    Err(code) => refuse_handle(out, id, player, code),
                 }
             }
             Command::Seek { player, run, at } => {
-                to_player(&players, out, player, ToPlayer::Seek { run, at });
+                to_player(&players, out, id, player, ToPlayer::Seek { id, run, at });
             }
             Command::Close { player } => match players.remove(&player) {
                 Some((tx, thread)) => {
-                    let _ = tx.send(ToPlayer::Close);
+                    let _ = tx.send(ToPlayer::Close { id });
                     closing.push(thread);
                 }
-                None => out.send(&Reply::Failed {
-                    player,
-                    why: Failure::Command,
-                    code: 0,
-                }),
+                None => reject(out, id, player, 0),
             },
-            Command::Quit => break,
+            Command::Quit => {
+                quit = id;
+                break;
+            }
         }
     }
     for (_, (tx, thread)) in std::mem::take(&mut players) {
-        let _ = tx.send(ToPlayer::Close);
+        let _ = tx.send(ToPlayer::Close { id: quit });
         closing.push(thread);
     }
     for thread in closing {
@@ -226,11 +227,12 @@ fn serve_on(out: &Out) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Sends `message` to `player`'s thread, or answers that no such player
-/// takes it, the handles it carries closed.
+/// Sends `message`, command `id`'s, to `player`'s thread, or rejects the
+/// command when no such player takes it, the handles it carries closed.
 fn to_player(
     players: &BTreeMap<u8, (Sender<ToPlayer>, JoinHandle<()>)>,
     out: &Out,
+    id: u32,
     player: u8,
     message: ToPlayer,
 ) {
@@ -238,31 +240,29 @@ fn to_player(
         .get(&player)
         .is_some_and(|(tx, _)| tx.send(message).is_ok());
     if !sent {
-        out.send(&Reply::Failed {
-            player,
-            why: Failure::Command,
-            code: 0,
-        });
+        reject(out, id, player, 0);
     }
 }
 
-/// Answers a command naming a handle the worker does not take ([`os`]):
-/// `player` fails with the system's error `code`.
-fn refuse_handle(out: &Out, player: u8, code: u32) {
+/// Rejects command `id` for `player`, with the system's error `code` (0
+/// when there is none).
+pub fn reject(out: &Out, id: u32, player: u8, code: i32) {
+    out.send(&Reply::Rejected { id, player, code });
+}
+
+/// Rejects command `id`, which names a handle the worker does not take
+/// ([`os`]) for `player`, with the system's error `code`.
+fn refuse_handle(out: &Out, id: u32, player: u8, code: u32) {
     say(&format!(
         "tapestry-media: a command for player {player} names a handle the worker does not take (error {code})"
     ));
-    out.send(&Reply::Failed {
-        player,
-        why: Failure::Command,
-        code: code.cast_signed(),
-    });
+    reject(out, id, player, code.cast_signed());
 }
 
-/// The next command on `input`, or `None` once the pipe ends or carries a
-/// frame the protocol does not have (the game's commands are trusted; one
-/// that does not decode ends the worker).
-fn read_command(input: &mut impl std::io::Read) -> Option<Command> {
+/// The next command on `input` and its id, or `None` once the pipe ends or
+/// carries a frame the protocol does not have (the game's commands are
+/// trusted; one that does not decode ends the worker).
+fn read_command(input: &mut impl std::io::Read) -> Option<(u32, Command)> {
     let mut prefix = [0; 2];
     input.read_exact(&mut prefix).ok()?;
     let len = control::frame_len(prefix).ok()?;

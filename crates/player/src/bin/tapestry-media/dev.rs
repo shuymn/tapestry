@@ -88,7 +88,10 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
                     // After the launch has taken the hello.
                     let _ = crate::read_command(&mut std::io::stdin().lock());
                     for _ in 0..n {
-                        out.send(&skin_model::media::control::Reply::Closed { player: 0 });
+                        out.send(&skin_model::media::control::Reply::Closed {
+                            id: skin_model::media::control::NO_COMMAND,
+                            player: 0,
+                        });
                     }
                     wait_for_ever()
                 })
@@ -111,9 +114,10 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
 }
 
 /// `--dev-balloon`: the memory the job's cap and its watcher are tested
-/// with. A crafted stream cannot reach the cap, which the pixel cap and
-/// the allocation cap refuse long before (design.md "Threat Model" T02),
-/// so the worker commits it directly.
+/// with. The worker's own limits bound single operations, the pixel cap a
+/// frame and the allocation cap each of FFmpeg's allocations, while the
+/// job's cap bounds the worker's commit in all (design.md "Threat Model"
+/// T02); the tests reach that cap by committing memory directly.
 fn balloon(args: &[String]) -> ExitCode {
     let mib = |s: &String| s.parse::<usize>().map_err(|e| format!("{s}: {e}"));
     let parsed = match args {

@@ -26,7 +26,7 @@ use media_support::{
 };
 #[cfg(feature = "dev-tools")]
 use media_support::{Probe, delete_profile, install, probe, probes};
-use skin_model::media::control::{Command, FILE_ACCESS, Failure, Reply};
+use skin_model::media::control::{Command, FILE_ACCESS, Reply};
 #[cfg(feature = "dev-tools")]
 use skin_model::media::control::{EVENT_ACCESS, SECTION_ACCESS};
 use skin_model::media::{Geometry, Reader, Window};
@@ -239,78 +239,99 @@ fn worker_takes_a_handle_only_of_its_kind_and_access_unheld() {
     let file = || std::fs::File::open(video()).unwrap();
     let files = [file(), file(), file(), file()];
     let handle = |i: usize| HANDLE(files[i].as_raw_handle());
-    let open = |worker: &mut Launched, player: u8, value: u64| {
-        worker
+    // The open's reply, and the rejection that answers it with `code`.
+    let open = |worker: &mut Launched, player: u8, value: u64, code: u32| {
+        let id = worker
             .send(&Command::Open {
                 player,
                 file: value,
             })
             .unwrap();
-        reply(worker)
-    };
-    let refused = |player: u8, code: u32| Reply::Failed {
-        player,
-        why: Failure::Command,
-        code: code.cast_signed(),
+        let rejected = Reply::Rejected {
+            id,
+            player,
+            code: code.cast_signed(),
+        };
+        (reply(worker), rejected)
     };
     let first = worker.hand_in(handle(0), Kind::File).unwrap();
     assert!(
-        matches!(open(&mut worker, 1, first), Reply::Probed { player: 1, .. }),
+        matches!(
+            open(&mut worker, 1, first, 0).0,
+            Reply::Probed { player: 1, .. }
+        ),
         "the worker's log:\n{}",
         worker.log()
     );
     // Another player's file (`ERROR_BUSY`).
-    assert_eq!(open(&mut worker, 2, first), refused(2, 170));
+    let (got, rejected) = open(&mut worker, 2, first, 170);
+    assert_eq!(got, rejected);
     // A ring whose section another player holds.
     let ring = Ring::new(320, 240);
     let held_section = worker.hand_in(ring.section(), Kind::Section).unwrap();
     let held_event = worker.hand_in(ring.event(), Kind::Event).unwrap();
-    worker
+    let play = worker
         .send(&Command::Play {
             player: 1,
             section: held_section,
             event: held_event,
         })
         .unwrap();
-    assert_eq!(reply(&worker), Reply::Playing { player: 1 });
+    assert_eq!(
+        reply(&worker),
+        Reply::Playing {
+            id: play,
+            player: 1
+        }
+    );
     let second = worker.hand_in(handle(1), Kind::File).unwrap();
-    let probed = open(&mut worker, 3, second);
+    let probed = open(&mut worker, 3, second, 0).0;
     assert!(
         matches!(probed, Reply::Probed { player: 3, .. }),
         "{probed:?}; the worker's log:\n{}",
         worker.log()
     );
     let other_event = worker.hand_in(ring.event(), Kind::Event).unwrap();
-    worker
+    let play = worker
         .send(&Command::Play {
             player: 3,
             section: held_section,
             event: other_event,
         })
         .unwrap();
-    assert_eq!(reply(&worker), refused(3, 170));
+    assert_eq!(
+        reply(&worker),
+        Reply::Rejected {
+            id: play,
+            player: 3,
+            code: 170
+        }
+    );
     // A closed player's file: no handle of that value is left
     // (`ERROR_INVALID_HANDLE`).
     worker.send(&Command::Close { player: 1 }).unwrap();
     loop {
         match reply(&worker) {
-            Reply::Closed { player: 1 } => break,
+            Reply::Closed { player: 1, .. } => break,
             Reply::Ended { player: 1, .. } | Reply::Failed { player: 1, .. } => {}
             other => panic!("{other:?} while player 1 closes"),
         }
     }
-    assert_eq!(open(&mut worker, 4, first), refused(4, 6));
+    let (got, rejected) = open(&mut worker, 4, first, 6);
+    assert_eq!(got, rejected);
     // A file handed with more than read access (`ERROR_ACCESS_DENIED`).
     let wide = worker
         .hand_in_with(handle(2), FILE_ACCESS | 0x0080)
         .unwrap();
-    assert_eq!(open(&mut worker, 5, wide), refused(5, 5));
+    let (got, rejected) = open(&mut worker, 5, wide, 5);
+    assert_eq!(got, rejected);
     // An event named as a file.
     let event_value = worker.hand_in(ring.event(), Kind::Event).unwrap();
-    assert_eq!(open(&mut worker, 6, event_value), refused(6, 6));
+    let (got, rejected) = open(&mut worker, 6, event_value, 6);
+    assert_eq!(got, rejected);
     // Control: a file handed as the game hands one.
     let fresh = worker.hand_in(handle(3), Kind::File).unwrap();
-    let probed = open(&mut worker, 7, fresh);
+    let probed = open(&mut worker, 7, fresh, 0).0;
     assert!(
         matches!(probed, Reply::Probed { player: 7, .. }),
         "{probed:?}; the worker's log:\n{}",

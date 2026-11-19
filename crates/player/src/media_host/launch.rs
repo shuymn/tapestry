@@ -604,7 +604,8 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
         pid,
         job,
         watch,
-        open_files: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+        players: std::cell::RefCell::new(super::players::Players::default()),
+        next_id: 1,
         _desktop: desktop,
         #[cfg(test)]
         log,

@@ -14,11 +14,12 @@
 //! in it ([`port`]). Each launch makes its own job, so the peak read is that
 //! worker's alone. Each read also looks at the worker's process: an end the
 //! watcher did not cause is the worker's own, a crash or an exit the game
-//! did not ask for. An end the watcher asked for is recorded only once the
-//! worker's process has ended, by the exit code it ended with: a worker
-//! that ended by itself first, or whose job could not be ended, is never
-//! recorded as ended for its memory, and the watcher asks again at each
-//! read while the worker lives. The game never waits on the watcher: it
+//! did not ask for. A memory end is recorded only once the worker's process
+//! has ended, and only when a termination the watcher asked for was
+//! accepted and the process ended with that termination's code
+//! ([`super::verdict`]): a worker that ended by itself first, or whose job
+//! could not be ended, is recorded as its own end, and the watcher asks
+//! again at each read while the worker lives. The game never waits on the watcher: it
 //! reads the end the watcher recorded ([`Watch::end`]), and dropping the
 //! watch stops it, by a flag the watcher reads at every timed wake and a
 //! packet that wakes it at once.
@@ -45,6 +46,8 @@ use windows::Win32::System::Threading::{
 };
 
 use super::Owned;
+pub use super::verdict::End;
+use super::verdict::{Cause, Verdict};
 
 /// The line at which the game ends a worker: 64 MiB below its job's cap.
 pub const LINE: usize = super::launch::MEMORY_CAP - (64 << 20);
@@ -52,83 +55,16 @@ pub const LINE: usize = super::launch::MEMORY_CAP - (64 << 20);
 /// How often the watcher reads the job's accounting.
 const PERIOD: Duration = Duration::from_millis(100);
 
-/// The exit code of a worker the watcher ended on the job's message.
-pub const ENDED_BY_MESSAGE: u32 = 0xc0de_0002;
-
-/// The exit code of a worker the watcher ended at the line.
-pub const ENDED_AT_LINE: u32 = 0xc0de_0003;
-
 /// The completion key the job's messages carry.
 const JOB_KEY: usize = 1;
 
 /// The completion key of the packet that stops the watcher.
 const STOP_KEY: usize = 2;
 
-/// How a worker ended, as its watcher saw it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum End {
-    /// The watcher ended it on the job's message that it refused a commit.
-    Message,
-    /// The watcher ended it when its peak commit reached the line.
-    Line,
-    /// It ended by itself, with its exit code: a crash, or an exit the
-    /// game did not ask for.
-    Exited(u32),
-}
-
-/// A memory end the watcher asked for, pending until the worker's process
-/// ends.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Cause {
-    Message,
-    Line,
-}
-
-impl Cause {
-    /// The exit code the watcher ends the worker's job with.
-    const fn code(self) -> u32 {
-        match self {
-            Self::Message => ENDED_BY_MESSAGE,
-            Self::Line => ENDED_AT_LINE,
-        }
-    }
-
-    const fn end(self) -> End {
-        match self {
-            Self::Message => End::Message,
-            Self::Line => End::Line,
-        }
-    }
-}
-
-impl End {
-    /// How a worker that ended with exit `code` ended, the watcher having
-    /// asked for `requested`: the memory end it asked for only when the
-    /// worker ended with that end's code, else an end of its own.
-    fn of(requested: Option<Cause>, code: u32) -> Self {
-        match requested {
-            Some(cause) if code == cause.code() => cause.end(),
-            _ => Self::Exited(code),
-        }
-    }
-
-    const fn encode(self) -> u64 {
-        match self {
-            Self::Message => 1 << 32,
-            Self::Line => 2 << 32,
-            Self::Exited(code) => (3 << 32) | code as u64,
-        }
-    }
-
-    fn decode(v: u64) -> Option<Self> {
-        match v >> 32 {
-            1 => Some(Self::Message),
-            2 => Some(Self::Line),
-            3 => Some(Self::Exited(u32::try_from(v & 0xffff_ffff).ok()?)),
-            _ => None,
-        }
-    }
-}
+/// The completion key of a test's packet that makes the watcher read the
+/// job's accounting at once.
+#[cfg(test)]
+const READ_KEY: usize = 3;
 
 /// What a test changes in the watcher: nothing outside a test.
 #[derive(Clone, Copy, Debug, Default)]
@@ -201,9 +137,14 @@ impl Variation {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A scheduled read of the job's accounting: when, and the peak commit
-    /// it found.
-    Read { at: Duration, peak: usize },
+    /// A read of the job's accounting: when, the tick of the schedule it
+    /// was due at (the `tick`th period from the watcher's start; 0 for a
+    /// read a test asked for), and the peak commit it found.
+    Read {
+        at: Duration,
+        tick: u32,
+        peak: usize,
+    },
     /// The job's memory message: when, and whether the test discarded it.
     Message { at: Duration, discarded: bool },
     /// The worker's end: when, and how.
@@ -427,6 +368,13 @@ impl Watch {
         unsafe { PostQueuedCompletionStatus(port.0, message, JOB_KEY, Some(id)) }
     }
 
+    /// Makes the watcher read the job's accounting at once, outside its
+    /// schedule.
+    pub fn read_now(&self) -> windows::core::Result<()> {
+        // SAFETY: the watcher's port, which this value keeps open.
+        unsafe { PostQueuedCompletionStatus(self.port.0, 0, READ_KEY, None) }
+    }
+
     /// What the watcher did so far.
     pub fn events(&self) -> Vec<Event> {
         self.test
@@ -524,17 +472,41 @@ impl Watched<'_> {
             .compare_exchange(0, end.encode(), Ordering::AcqRel, Ordering::Acquire);
     }
 
-    /// Asks for the worker's job to be ended for `cause`. The end is
-    /// recorded only once the process has ended, by its exit code.
-    fn terminate(&self, cause: Cause) {
+    /// Asks for the worker's job to be ended for `cause`, and records in
+    /// `verdict` whether the system accepted it. Nothing is recorded as
+    /// ended until the process has ended.
+    fn terminate(&self, verdict: &mut Verdict, cause: Cause) {
         #[cfg(test)]
         if let Some(hook) = self.variation.before_terminate {
             hook(self.process.0);
         }
-        match self.terminate_job(cause.code()) {
-            Ok(()) => log::warn!("media worker: ended for its memory ({cause:?})"),
-            Err(e) => log::warn!("media worker: its job could not be ended ({e}); asking again"),
+        let result = self.terminate_job(cause.code());
+        if let Err(e) = &result {
+            log::warn!("media worker: its job could not be ended ({e}); asking again");
         }
+        verdict.terminated(cause, result.is_ok());
+    }
+
+    /// Records how the worker ended, its process having ended with exit
+    /// `code`, as `verdict` proves it, and logs it.
+    fn ended_with(&self, verdict: &Verdict, code: u32, start: Instant) {
+        let (end, ambiguous) = verdict.end(code);
+        match end {
+            End::Message | End::Line => log::warn!("media worker: ended for its memory ({end:?})"),
+            End::Exited(code) if ambiguous => log::warn!(
+                "media worker: ended with {code:#x}, the watcher's code, though no termination of the watcher's with it was accepted: recorded as its own end"
+            ),
+            End::Exited(code) => log::warn!("media worker: ended by itself ({code:#x})"),
+        }
+        self.ended(end, start);
+    }
+
+    /// Reads the job's accounting, due at `tick`: the cause to end the job
+    /// for, once the peak is at the line.
+    fn read(&self, verdict: &mut Verdict, tick: u32, start: Instant) -> Option<Cause> {
+        let peak = job_peak(self.job);
+        self.log(Err(Some((tick, peak.unwrap_or(0)))), start);
+        verdict.read(peak?, LINE)
     }
 
     /// `TerminateJobObject` on the worker's job.
@@ -571,14 +543,14 @@ impl Watched<'_> {
         Some(code)
     }
 
-    /// Logs a read's peak (`Err(Some)`), the job's memory message
+    /// Logs a read's tick and peak (`Err(Some)`), the job's memory message
     /// (`Err(None)`) or the worker's end, for a test.
     #[cfg(test)]
-    fn log(&self, what: Result<End, Option<usize>>, start: Instant) {
+    fn log(&self, what: Result<End, Option<(u32, usize)>>, start: Instant) {
         let at = start.elapsed();
         let event = match what {
             Ok(end) => Event::Ended { at, end },
-            Err(Some(peak)) => Event::Read { at, peak },
+            Err(Some((tick, peak))) => Event::Read { at, tick, peak },
             Err(None) => Event::Message {
                 at,
                 discarded: false,
@@ -594,7 +566,7 @@ impl Watched<'_> {
         clippy::unused_self,
         reason = "a test reads what the watcher did; the game does not"
     )]
-    const fn log(&self, _: Result<End, Option<usize>>, _: Instant) {}
+    const fn log(&self, _: Result<End, Option<(u32, usize)>>, _: Instant) {}
 }
 
 /// Whole milliseconds from `now` to `then`, rounded up.
@@ -608,13 +580,15 @@ fn ms_until(now: Instant, then: Instant) -> u32 {
 }
 
 /// The watcher's loop, from `start` until the worker ends or the watch is
-/// stopped. Once it has asked for the worker's job to be ended, it waits on
-/// the worker's process instead of the port, and asks again at each read
-/// while the worker lives.
+/// stopped, its decisions [`Verdict`]'s. Once it has asked for the worker's
+/// job to be ended, it waits on the worker's process instead of the port,
+/// and asks again at each read while the worker lives.
 fn watch(w: &Watched, start: Instant) {
     let period = w.variation.period();
     let mut next = start + period;
-    let mut requested: Option<Cause> = None;
+    // The tick `next` is due at.
+    let mut tick: u32 = 1;
+    let mut verdict = Verdict::default();
     loop {
         if w.stopped.load(Ordering::Acquire) {
             return;
@@ -623,31 +597,30 @@ fn watch(w: &Watched, start: Instant) {
         if now >= next {
             // A read late by more than a period skips the reads it missed:
             // the schedule stays on its own grid.
+            let due = tick;
             while next <= now {
                 next += period;
+                tick = tick.saturating_add(1);
             }
             if let Some(code) = w.exited(0) {
-                w.ended(End::of(requested, code), start);
+                w.ended_with(&verdict, code, start);
                 return;
             }
-            if let Some(cause) = requested {
-                w.terminate(cause);
+            if let Some(cause) = verdict.requested() {
+                w.terminate(&mut verdict, cause);
                 continue;
             }
-            if w.variation.accounting() {
-                let peak = job_peak(w.job);
-                w.log(Err(Some(peak.unwrap_or(0))), start);
-                if peak.is_some_and(|p| p >= LINE) {
-                    requested = Some(Cause::Line);
-                    w.terminate(Cause::Line);
-                }
+            if w.variation.accounting()
+                && let Some(cause) = w.read(&mut verdict, due, start)
+            {
+                w.terminate(&mut verdict, cause);
             }
             continue;
         }
         let wait = ms_until(now, next);
-        if requested.is_some() {
+        if verdict.requested().is_some() {
             if let Some(code) = w.exited(wait) {
-                w.ended(End::of(requested, code), start);
+                w.ended_with(&verdict, code, start);
                 return;
             }
             continue;
@@ -674,9 +647,16 @@ fn watch(w: &Watched, start: Instant) {
                     && overlapped.addr() == w.pid as usize =>
             {
                 w.log(Err(None), start);
-                if w.variation.message() {
-                    requested = Some(Cause::Message);
-                    w.terminate(Cause::Message);
+                if w.variation.message()
+                    && let Some(cause) = verdict.message()
+                {
+                    w.terminate(&mut verdict, cause);
+                }
+            }
+            #[cfg(test)]
+            Ok(()) if key == READ_KEY => {
+                if let Some(cause) = w.read(&mut verdict, 0, start) {
+                    w.terminate(&mut verdict, cause);
                 }
             }
             // Another of the job's messages: the next read sees what it
