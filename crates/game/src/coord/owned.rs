@@ -398,6 +398,14 @@ impl<T: Clone> OwnedJob<T> {
 }
 
 impl<T> OwnedJob<T> {
+    /// Stops it without waiting for its thread, cooperatively: its
+    /// admission and its next checkpoint see the owner's stop, and it ends
+    /// cancelled; a job past its last checkpoint can still publish what it
+    /// computed. The owner still settles it.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
     /// Whether its thread has ended, as the settle would see it: once it
     /// has, [`settle`](Self::settle) joins at once, so an owner that must
     /// not wait settles only a finished job.

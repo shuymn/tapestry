@@ -1599,6 +1599,20 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         eprintln!("{note}");
         log::warn!("{note}");
     }
+    // The speculative permits asked for (`--dev-speculative-permits`),
+    // within the machine's bounds, while speculation is on.
+    #[cfg(feature = "dev-tools")]
+    let caps = match s.dev.speculative_permits {
+        Some(n) if caps.speculative > 0 => {
+            let caps = game::coord::Caps::for_machine(
+                n,
+                <priority::System as priority::Machine>::cores(&priority::System),
+            );
+            println!("dev: speculative permits {}", caps.speculative);
+            caps
+        }
+        _ => caps,
+    };
     let coord = game::coord::Coordinator::new(caps);
     #[cfg_attr(
         not(feature = "dev-tools"),

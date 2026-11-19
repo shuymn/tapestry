@@ -823,6 +823,11 @@ pub struct SelectOptions {
     /// (`--dev-stop-timeout <seconds>`): a loaded machine can starve their
     /// background-mode threads for seconds.
     pub stop_timeout: Option<std::time::Duration>,
+    /// The speculative permits asked for in place of the setting's one
+    /// (`--dev-speculative-permits <n>`), within the machine's bounds and
+    /// only while speculation is on: the select screen measured at caps 1
+    /// and 2 (design.md "Load Pipeline", System friendliness).
+    pub speculative_permits: Option<usize>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -856,6 +861,12 @@ impl SelectOptions {
                     UsageError::Usage("--dev-stop-timeout takes seconds".to_owned())
                 })?;
                 self.stop_timeout = Some(std::time::Duration::from_secs(secs));
+            }
+            "dev-speculative-permits" => {
+                let n = p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-speculative-permits takes a count".to_owned())
+                })?;
+                self.speculative_permits = Some(n);
             }
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
@@ -3142,7 +3153,13 @@ pub fn job_stage(kind: game::coord::JobKind, start: bool) {
         (JobKind::Loudness | JobKind::Measure, true) => "loudness_start",
         (JobKind::Loudness | JobKind::Measure, false) => "loudness_end",
         // The BGA job stamps its own, on either path.
-        (JobKind::ChartImages | JobKind::ChartCheck | JobKind::BgaImages, _) => return,
+        (
+            JobKind::ChartImages
+            | JobKind::ChartImageFill
+            | JobKind::ChartCheck
+            | JobKind::BgaImages,
+            _,
+        ) => return,
     };
     stage(name);
 }

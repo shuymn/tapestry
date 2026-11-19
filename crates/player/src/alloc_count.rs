@@ -53,6 +53,10 @@ thread_local! {
     /// Whether this thread freed the watched address since it was set.
     #[cfg(test)]
     static WATCHED_FREED: Cell<bool> = const { Cell::new(false) };
+    /// The bytes this thread allocated less those it freed since
+    /// [`reset_peak`], and their largest value since (tests).
+    #[cfg(test)]
+    static HELD: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
 }
 
 /// Counts this thread's allocations under `t` from now on.
@@ -121,6 +125,35 @@ pub fn watched_freed() -> bool {
     WATCHED_FREED.with(Cell::get)
 }
 
+/// Starts this thread's byte peak again from now (tests).
+#[cfg(test)]
+pub fn reset_peak() {
+    HELD.set((0, 0));
+}
+
+/// The most bytes this thread held at once since [`reset_peak`], counting
+/// what it allocated less what it freed (tests).
+#[cfg(test)]
+pub fn peak_bytes() -> u64 {
+    u64::try_from(HELD.get().1).unwrap_or(0)
+}
+
+/// Adds `delta` bytes to this thread's held bytes (tests).
+#[cfg(test)]
+fn held(delta: i64) {
+    let _ = HELD.try_with(|h| {
+        let (now, peak) = h.get();
+        let now = now.saturating_add(delta);
+        h.set((now, peak.max(now)));
+    });
+}
+
+/// `n` bytes as a signed count (tests).
+#[cfg(test)]
+fn signed(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 fn note() {
     #[cfg(test)]
     let _ = MINE.try_with(|m| m.set(m.get() + 1));
@@ -148,6 +181,8 @@ unsafe impl GlobalAlloc for Counting {
             return std::ptr::null_mut();
         }
         note();
+        #[cfg(test)]
+        held(signed(layout.size()));
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc(layout) }
     }
@@ -158,6 +193,8 @@ unsafe impl GlobalAlloc for Counting {
             return std::ptr::null_mut();
         }
         note();
+        #[cfg(test)]
+        held(signed(layout.size()));
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -165,6 +202,8 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         #[cfg(test)]
         let _ = FREED.try_with(|f| f.set(f.get() + 1));
+        #[cfg(test)]
+        held(-signed(layout.size()));
         #[cfg(test)]
         if WATCHED
             .try_with(Cell::get)
@@ -182,6 +221,8 @@ unsafe impl GlobalAlloc for Counting {
             return std::ptr::null_mut();
         }
         note();
+        #[cfg(test)]
+        held(signed(new_size) - signed(layout.size()));
         // SAFETY: same contract as the caller's.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
