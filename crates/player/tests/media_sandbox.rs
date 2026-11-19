@@ -21,11 +21,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use media_support::{
-    Kind, Launched, REFUSED, Restrictions, Setup, Stage, Step, change_shared, granted_all,
+    Kind, Launched, Made, REFUSED, Restrictions, Setup, Stage, Step, change_shared, granted_all,
     media_host, policy, recipe, revoked, token_facts,
 };
 #[cfg(feature = "dev-tools")]
-use media_support::{Probe, probe, probes};
+use media_support::{Probe, delete_profile, install, probe, probes};
 use skin_model::media::control::{Command, FILE_ACCESS, Failure, Reply};
 #[cfg(feature = "dev-tools")]
 use skin_model::media::control::{EVENT_ACCESS, SECTION_ACCESS};
@@ -493,7 +493,12 @@ fn worker_launch_fails_closed() {
             step,
             Step::Assign | Step::Check | Step::Watch | Step::Resume | Step::Handshake
         );
-        assert_eq!(e.exit, made.then_some(REFUSED), "{step:?}: {e}");
+        let process = if made {
+            Made::Ended(Some(REFUSED))
+        } else {
+            Made::Nothing
+        };
+        assert_eq!(e.process, process, "{step:?}: {e}");
     }
     // The check refuses each restriction it reads when it is missing, and
     // names it: the job, each mitigation policy, the AppContainer, and the
@@ -520,8 +525,8 @@ fn worker_launch_fails_closed() {
             panic!("{missing:?} left out, the launch succeeded");
         };
         assert_eq!(
-            (e.step, e.exit),
-            (Step::Check, Some(REFUSED)),
+            (e.step, e.process),
+            (Step::Check, Made::Ended(Some(REFUSED))),
             "{missing:?}: {e}"
         );
         assert!(e.what.contains(named), "{missing:?}: {e}");
@@ -540,8 +545,8 @@ fn worker_launch_fails_closed_without_a_hello_in_time() {
     };
     let took = started.elapsed();
     assert_eq!(
-        (e.step, e.code, e.exit),
-        (Step::Handshake, 1460, Some(REFUSED)),
+        (e.step, e.code, e.process),
+        (Step::Handshake, 1460, Made::Ended(Some(REFUSED))),
         "{e}"
     );
     assert!(
@@ -962,7 +967,11 @@ fn worker_win32k_is_locked_from_creation() {
     else {
         panic!("a launch without the lockdown passed its check");
     };
-    assert_eq!((e.step, e.exit), (Step::Check, Some(REFUSED)), "{e}");
+    assert_eq!(
+        (e.step, e.process),
+        (Step::Check, Made::Ended(Some(REFUSED))),
+        "{e}"
+    );
     // Control of the calls: with the lockdown and its check removed, the
     // same loads and calls succeed.
     let (_worker, found, log) = probe_run(
@@ -1001,20 +1010,26 @@ fn worker_environment_is_only_the_block_the_launch_builds() {
     assert!(std::env::var_os("PATH").is_some());
     let windows = std::env::var("SystemRoot").unwrap().to_lowercase();
     let detail = environment.detail.to_lowercase();
-    let vars: Vec<(&str, &str)> = detail
+    let (allowed, listed) = detail.split_once(' ').unwrap_or((&detail, ""));
+    let vars: Vec<(&str, &str)> = listed
         .split(';')
         .map(|v| v.split_once('=').unwrap_or((v, "")))
         .collect();
     let names: Vec<&str> = vars.iter().map(|(name, _)| *name).collect();
     assert_eq!(
-        (environment.ok, environment.code, names),
-        (true, 4, vec!["localappdata", "systemroot", "temp", "tmp"]),
+        (environment.ok, environment.code, allowed, names),
+        (
+            true,
+            4,
+            "allowed=1",
+            vec!["localappdata", "systemroot", "temp", "tmp"]
+        ),
         "{log}"
     );
     let folder = vars[0].1;
     let own = format!(
         "\\packages\\{}\\ac",
-        media_host::launch::profile_name(stage.dir())
+        media_host::launch::profile_name(stage.dir()).unwrap()
     );
     assert!(
         folder.ends_with(&own) && !folder[..folder.len() - own.len()].contains("\\packages\\"),
@@ -1034,8 +1049,8 @@ fn worker_environment_is_only_the_block_the_launch_builds() {
 fn each_installation_runs_as_an_appcontainer_of_its_own() {
     let (ours, theirs) = (Stage::new(), Stage::new());
     assert_ne!(
-        media_host::launch::profile_name(ours.dir()),
-        media_host::launch::profile_name(theirs.dir())
+        media_host::launch::profile_name(ours.dir()).unwrap(),
+        media_host::launch::profile_name(theirs.dir()).unwrap()
     );
     // The other installation's launch grants its directory to its worker.
     drop(launch(&theirs, recipe()));
@@ -1043,6 +1058,56 @@ fn each_installation_runs_as_an_appcontainer_of_its_own() {
         let exe = stage.dir().join("tapestry-media.exe");
         let arg = format!("file={}", exe.display());
         let worker = launch(&ours, recipe().args_of(&["--dev-probe", &arg]));
+        let log = worker.probed(1);
+        let found = probes(&log);
+        let file = probe(&found, "file", &log);
+        let want = if readable { (true, 0) } else { (false, 5) };
+        assert_eq!((file.ok, file.code), want, "{}: {log}", exe.display());
+    }
+}
+
+/// An installation moved aside: its directory removed and its profile
+/// deleted when dropped.
+#[cfg(feature = "dev-tools")]
+struct Moved {
+    dir: std::path::PathBuf,
+    profile: String,
+}
+
+#[cfg(feature = "dev-tools")]
+impl Drop for Moved {
+    fn drop(&mut self) {
+        delete_profile(&self.profile);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_replaced_installation_gets_no_access_to_the_one_it_replaced() {
+    let stage = Stage::new();
+    // The installation runs, which grants its directory to its worker, and
+    // is moved aside on the same volume; a fresh one is put at its path.
+    drop(launch(&stage, recipe()));
+    let old = media_host::launch::profile_name(stage.dir()).unwrap();
+    let moved = Moved {
+        dir: stage.dir().with_extension("moved"),
+        profile: old.clone(),
+    };
+    std::fs::rename(stage.dir(), &moved.dir).unwrap();
+    std::fs::create_dir(stage.dir()).unwrap();
+    install(stage.dir());
+    // The directory, not its path, names the profile: the fresh one has a
+    // profile of its own, and the moved one keeps its.
+    assert_ne!(media_host::launch::profile_name(stage.dir()).unwrap(), old);
+    assert_eq!(media_host::launch::profile_name(&moved.dir).unwrap(), old);
+    // The fresh installation's worker reads its own executable, and not the
+    // moved one's, whose directory still grants the old profile.
+    for (dir, readable) in [(stage.dir(), true), (moved.dir.as_path(), false)] {
+        let exe = dir.join("tapestry-media.exe");
+        let arg = format!("file={}", exe.display());
+        let worker = launch(&stage, recipe().args_of(&["--dev-probe", &arg]));
         let log = worker.probed(1);
         let found = probes(&log);
         let file = probe(&found, "file", &log);
@@ -1234,7 +1299,7 @@ impl ContainerSid {
 
     /// The SID the worker installed in `dir` runs as.
     fn of(dir: &std::path::Path) -> Self {
-        Self::named(&media_host::launch::profile_name(dir))
+        Self::named(&media_host::launch::profile_name(dir).unwrap())
     }
 }
 
@@ -1355,8 +1420,8 @@ fn launch_grants_its_desktop_and_leaves_the_shared_station_alone() {
         "the recipe granted the shared window station"
     );
     // A test's setup without the lockdown, whose worker loads USER32 and so
-    // connects to the station, grants the station while its worker lives,
-    // and revokes the grant when the worker drops.
+    // connects to the station, grants the station while its workers live,
+    // and revokes the grant when the last of them drops.
     let unlocked = launch(&stage, recipe().without(Restrictions::NO_WIN32K));
     let station = unlocked.desktop().unwrap().station();
     assert_eq!(station_name(station), station_name(objects.station()));
@@ -1364,10 +1429,16 @@ fn launch_grants_its_desktop_and_leaves_the_shared_station_alone() {
         names(objects.station(), sid.0),
         "the setup without the lockdown did not grant the window station"
     );
+    let second = launch(&stage, recipe().without(Restrictions::NO_WIN32K));
     drop(unlocked);
     assert!(
+        names(objects.station(), sid.0),
+        "a worker's drop revoked the grant another worker of its AppContainer uses"
+    );
+    drop(second);
+    assert!(
         !names(objects.station(), sid.0),
-        "the setup's grant of the window station outlived its worker"
+        "the setup's grant of the window station outlived its workers"
     );
 }
 
