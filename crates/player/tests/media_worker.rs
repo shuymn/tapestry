@@ -2055,19 +2055,21 @@ fn a_file_with_two_strikes_is_not_reopened_that_run() {
     use media_host::OpenError;
     use windows::Win32::System::Threading::TerminateProcess;
 
+    // Each open opens its file anew, as the game does: duplicates of one
+    // handle share its position.
     let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
-    let file = std::fs::File::open(&fixture).unwrap();
-    let id = FileId::of(&file).unwrap();
-    let other =
-        std::fs::File::open(root().join("crates/player/tests/media/zlib/plain.mov")).unwrap();
+    let other_fixture = root().join("crates/player/tests/media/zlib/plain.mov");
+    let open = |path: &Path| std::fs::File::open(path).unwrap();
+    let id = FileId::of(&open(&fixture)).unwrap();
+    let other_id = FileId::of(&open(&other_fixture)).unwrap();
     let mut strikes = Strikes::default();
     let stage = Stage::new();
     // The file is open in two workers that crash: a strike each. Another,
     // which each closed before it crashed, gets none.
     for strike in 1..=2 {
         let mut worker = stage.launch(&recipe()).unwrap();
-        worker.open(1, &file, &strikes).unwrap();
-        worker.open(2, &other, &strikes).unwrap();
+        worker.open(1, &open(&fixture), &strikes).unwrap();
+        worker.open(2, &open(&other_fixture), &strikes).unwrap();
         worker.close(2).unwrap();
         loop {
             match worker.recv(REPLY).unwrap() {
@@ -2091,21 +2093,16 @@ fn a_file_with_two_strikes_is_not_reopened_that_run() {
         assert_eq!(end, End::Exited(CRASH));
         assert_eq!(failed, [1]);
         assert_eq!(strikes.of(id), strike);
-        assert_eq!(strikes.of(FileId::of(&other).unwrap()), 0);
+        assert_eq!(strikes.of(other_id), 0);
     }
-    // It is not opened again in the run, by this handle or another; the
-    // other file is.
+    // It is not opened again in the run, whatever handle opens it; the other
+    // file is.
     let mut worker = stage.launch(&recipe()).unwrap();
     assert!(matches!(
-        worker.open(1, &file, &strikes),
+        worker.open(1, &open(&fixture), &strikes),
         Err(OpenError::Struck)
     ));
-    let again = std::fs::File::open(&fixture).unwrap();
-    assert!(matches!(
-        worker.open(1, &again, &strikes),
-        Err(OpenError::Struck)
-    ));
-    worker.open(2, &other, &strikes).unwrap();
+    worker.open(2, &open(&other_fixture), &strikes).unwrap();
     let probe = worker.recv(REPLY).unwrap();
     assert!(
         matches!(probe, Reply::Probed { player: 2, .. }),
