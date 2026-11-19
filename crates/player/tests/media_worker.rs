@@ -4,13 +4,15 @@
 //! the game makes them and handed to the worker by handle, each with only
 //! the access it needs. The game does not launch the worker yet, so these
 //! tests run it without its sandbox and check what FFmpeg's layer holds:
-//! the pinned build, the codec and container allow-list with FFmpeg's codec
-//! whitelist, the pixel cap, the refused secondary open, the decoded
-//! frames' stamps, the seek's back-off and the zlib-compressed containers.
+//! the pinned build, the codec and container allow-list, the worker's open
+//! of the decoders FFmpeg's probe opens, the pixel cap on the size FFmpeg
+//! allocates, the probe's read budget, the refused allocations a demuxer
+//! goes on from, the refused secondary open, the decoded frames' stamps,
+//! the seek's back-off and the zlib-compressed containers.
 //!
 //! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), so
-//! those tests need dev-tools; the committed fixtures (`tests/media/`) and
-//! the handshake do not.
+//! those tests need dev-tools; the committed fixtures (`tests/media/`), the
+//! files built here and the handshake do not.
 
 #![cfg(windows)]
 
@@ -160,7 +162,6 @@ impl Worker {
     }
 
     /// The worker's peak commit so far, in bytes.
-    #[cfg(feature = "dev-tools")]
     fn peak_commit(&self) -> usize {
         use windows::Win32::System::ProcessStatus::{
             GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -681,11 +682,11 @@ fn worker_refuses_unlisted_codec_container_and_oversize() {
         worker.close(player);
     }
     // H.263 is built (MPEG-4's decoder is built on it) but off the list:
-    // FFmpeg refuses to open it while it probes.
+    // the worker's open refuses the decoder FFmpeg's probe would open.
     let log = worker.log();
     assert!(
-        log.contains("Codec (h263) not on whitelist"),
-        "FFmpeg's whitelist refusal of H.263 is missing; the worker's log:\n{log}"
+        log.contains("tapestry-media: refused a decoder for h263"),
+        "the worker's refusal of H.263's decoder is missing; the worker's log:\n{log}"
     );
     // The decoder FFmpeg opens while it probes the MPEG-PS stream has the
     // pixel cap too: it refuses the frame instead of decoding it.
@@ -1044,4 +1045,664 @@ fn worker_decodes_zlib_compressed_containers() {
             want_seek.0
         );
     }
+}
+
+/// Bits written most significant first, as H.264's syntax writes them.
+#[derive(Default)]
+struct Bits {
+    bytes: Vec<u8>,
+    used: u32,
+}
+
+impl Bits {
+    fn bit(&mut self, one: bool) -> &mut Self {
+        if self.used == 0 {
+            self.bytes.push(0);
+        }
+        if one {
+            *self.bytes.last_mut().unwrap() |= 0x80 >> self.used;
+        }
+        self.used = (self.used + 1) % 8;
+        self
+    }
+
+    fn u(&mut self, n: u32, v: u64) -> &mut Self {
+        for i in (0..n).rev() {
+            self.bit(v >> i & 1 == 1);
+        }
+        self
+    }
+
+    /// An unsigned Exp-Golomb code.
+    fn ue(&mut self, v: u64) -> &mut Self {
+        let x = v + 1;
+        let n = 64 - x.leading_zeros();
+        self.u(n - 1, 0).u(n, x)
+    }
+
+    /// A signed Exp-Golomb code.
+    fn se(&mut self, v: i64) -> &mut Self {
+        let m = v.unsigned_abs() * 2;
+        self.ue(if v > 0 { m - 1 } else { m })
+    }
+
+    /// The payload: the bits, a stop bit, and zeros to the byte.
+    fn rbsp(&mut self) -> Vec<u8> {
+        self.bit(true);
+        while self.used != 0 {
+            self.bit(false);
+        }
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+/// A NAL unit with `header` and `rbsp`, after a start code, with H.264's
+/// emulation prevention.
+fn nal(header: u8, rbsp: &[u8]) -> Vec<u8> {
+    let mut out = vec![0, 0, 0, 1, header];
+    let mut zeros = 0;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        out.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
+/// The parameter sets (their payloads) of an H.264 sequence that codes
+/// `coded` pixels and crops them to `shown`.
+fn h264_sets(coded: (u32, u32), shown: (u32, u32)) -> (Vec<u8>, Vec<u8>) {
+    // Baseline, level 5.1; frame numbers of 4 bits, picture order type 2,
+    // one reference; frames only, cropped on the right and at the bottom
+    // in units of two pixels; no VUI.
+    let sps = Bits::default()
+        .u(8, 66)
+        .u(8, 0)
+        .u(8, 51)
+        .ue(0)
+        .ue(0)
+        .ue(2)
+        .ue(1)
+        .bit(false)
+        .ue(u64::from(coded.0 / 16 - 1))
+        .ue(u64::from(coded.1 / 16 - 1))
+        .bit(true)
+        .bit(true)
+        .bit(true)
+        .ue(0)
+        .ue(u64::from((coded.0 - shown.0) / 2))
+        .ue(0)
+        .ue(u64::from((coded.1 - shown.1) / 2))
+        .bit(false)
+        .rbsp();
+    // CAVLC, one slice group, one reference, no weighting, QP 26, the
+    // deblocking control present.
+    let pps = Bits::default()
+        .ue(0)
+        .ue(0)
+        .bit(false)
+        .bit(false)
+        .ue(0)
+        .ue(0)
+        .ue(0)
+        .bit(false)
+        .u(2, 0)
+        .se(0)
+        .se(0)
+        .se(0)
+        .bit(true)
+        .bit(false)
+        .bit(false)
+        .rbsp();
+    (sps, pps)
+}
+
+/// The payload of IDR slice `i`: an I slice of the whole picture,
+/// deblocking off, then macroblock bits that do not decode, which the
+/// decoder allocates its frame for before it reads them.
+fn h264_idr(i: u64) -> Vec<u8> {
+    Bits::default()
+        .ue(0)
+        .ue(7)
+        .ue(0)
+        .u(4, 0)
+        .ue(i)
+        .bit(false)
+        .bit(false)
+        .se(0)
+        .ue(1)
+        .u(16, 0xa5c3)
+        .rbsp()
+}
+
+/// `frames` access units of an H.264 stream (Annex B) whose sequence codes
+/// `coded` pixels and crops them to `shown`: the parameter sets, then IDR
+/// slices.
+fn h264_cropped(coded: (u32, u32), shown: (u32, u32), frames: u64) -> Vec<Vec<u8>> {
+    let (sps, pps) = h264_sets(coded, shown);
+    (0..frames)
+        .map(|i| {
+            let mut unit = Vec::new();
+            if i == 0 {
+                unit.extend(nal(0x67, &sps));
+                unit.extend(nal(0x68, &pps));
+            }
+            unit.extend(nal(0x65, &h264_idr(i)));
+            unit
+        })
+        .collect()
+}
+
+/// An AVI file of one video stream of `fourcc` at `size` and `rate`
+/// frames a second, its frames `frames`, without an index.
+fn avi(size: (u32, u32), rate: u32, fourcc: &[u8; 4], frames: &[Vec<u8>]) -> Vec<u8> {
+    fn chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut c = id.to_vec();
+        c.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
+        c.extend(data);
+        if data.len() % 2 == 1 {
+            c.push(0);
+        }
+        c
+    }
+    fn list(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        chunk(b"LIST", &[kind.as_slice(), body].concat())
+    }
+    let count = u32::try_from(frames.len()).unwrap();
+    let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let avih = words(&[
+        1_000_000 / rate,
+        0,
+        0,
+        0,
+        count,
+        0,
+        1,
+        1 << 20,
+        size.0,
+        size.1,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    let strh = [
+        b"vids".as_slice(),
+        fourcc,
+        &words(&[0, 0, 0, 1, rate, 0, count, 1 << 20, u32::MAX, 0]),
+        &[0; 8],
+    ]
+    .concat();
+    let strf = [
+        words(&[40, size.0, size.1]),
+        vec![1, 0, 24, 0],
+        fourcc.to_vec(),
+        words(&[size.0 * size.1 * 3, 0, 0, 0, 0]),
+    ]
+    .concat();
+    let strl = list(
+        b"strl",
+        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+    );
+    let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
+    let movi: Vec<u8> = frames.iter().flat_map(|f| chunk(b"00dc", f)).collect();
+    chunk(
+        b"RIFF",
+        &[b"AVI ".as_slice(), &hdrl, &list(b"movi", &movi)].concat(),
+    )
+}
+
+/// A chunk of a [`mov`] file: the parameter sets of its sample
+/// description, and the frame numbers of its IDR slices.
+type Chunk = ((Vec<u8>, Vec<u8>), std::ops::Range<u64>);
+
+/// A QuickTime file of one H.264 video stream at `size`, its time scale
+/// `rate`, whose chunks each have a sample description of their own (the
+/// parameter sets given) and IDR slices of the frame numbers given, the
+/// first frame one tick long and the others two.
+fn mov(size: (u16, u16), rate: u32, chunks: &[Chunk]) -> Vec<u8> {
+    fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = u32::try_from(body.len() + 8)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        b.extend(kind);
+        b.extend(body);
+        b
+    }
+    // A box with a version (0) and flags.
+    fn full(kind: &[u8; 4], flags: u32, body: &[u8]) -> Vec<u8> {
+        boxed(kind, &[flags.to_be_bytes().as_slice(), body].concat())
+    }
+    fn be(v: usize) -> [u8; 4] {
+        u32::try_from(v).unwrap().to_be_bytes()
+    }
+    // A NAL unit without its start code.
+    let bare = |header: u8, rbsp: &[u8]| nal(header, rbsp)[4..].to_vec();
+    let samples: Vec<Vec<Vec<u8>>> = chunks
+        .iter()
+        .map(|(_, frames)| {
+            frames
+                .clone()
+                .map(|i| {
+                    let unit = bare(0x65, &h264_idr(i));
+                    [be(unit.len()).as_slice(), &unit].concat()
+                })
+                .collect()
+        })
+        .collect();
+    let all: Vec<&Vec<u8>> = samples.iter().flatten().collect();
+    let count = all.len();
+    let ftyp = boxed(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let mdat = boxed(
+        b"mdat",
+        &all.iter().copied().flatten().copied().collect::<Vec<u8>>(),
+    );
+    let mut offsets = Vec::new();
+    let mut at = ftyp.len() + 8;
+    for chunk in &samples {
+        offsets.extend(be(at));
+        at += chunk.iter().map(Vec::len).sum::<usize>();
+    }
+    let duration = 2 * count - 1;
+    let matrix: Vec<u8> = [0x0001_0000_u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect();
+    let rate = usize::try_from(rate).unwrap();
+    let mvhd = full(
+        b"mvhd",
+        0,
+        &[
+            [0_u8; 8].as_slice(),
+            &be(rate),
+            &be(duration),
+            &be(0x0001_0000),
+            &[1, 0],
+            &[0; 10],
+            &matrix,
+            &[0; 24],
+            &be(2),
+        ]
+        .concat(),
+    );
+    let (w, h) = (usize::from(size.0), usize::from(size.1));
+    let tkhd = full(
+        b"tkhd",
+        3,
+        &[
+            [0_u8; 8].as_slice(),
+            &be(1),
+            &[0; 4],
+            &be(duration),
+            &[0; 16],
+            &matrix,
+            &be(w << 16),
+            &be(h << 16),
+        ]
+        .concat(),
+    );
+    let mdhd = full(
+        b"mdhd",
+        0,
+        &[
+            [0_u8; 8].as_slice(),
+            &be(rate),
+            &be(duration),
+            &[0x55, 0xc4, 0, 0],
+        ]
+        .concat(),
+    );
+    let hdlr = full(
+        b"hdlr",
+        0,
+        &[[0_u8; 4].as_slice(), b"vide", &[0; 13]].concat(),
+    );
+    let entries: Vec<u8> = chunks
+        .iter()
+        .flat_map(|((sps, pps), _)| {
+            let (sps, pps) = (bare(0x67, sps), bare(0x68, pps));
+            let length = |unit: &[u8]| u16::try_from(unit.len()).unwrap().to_be_bytes();
+            let avcc = boxed(
+                b"avcC",
+                &[
+                    [1_u8, sps[1], sps[2], sps[3], 0xff, 0xe1].as_slice(),
+                    &length(&sps),
+                    &sps,
+                    &[1],
+                    &length(&pps),
+                    &pps,
+                ]
+                .concat(),
+            );
+            boxed(
+                b"avc1",
+                &[
+                    [0_u8, 0, 0, 0, 0, 0, 0, 1].as_slice(),
+                    &[0; 16],
+                    &size.0.to_be_bytes(),
+                    &size.1.to_be_bytes(),
+                    &be(0x0048_0000),
+                    &be(0x0048_0000),
+                    &[0; 4],
+                    &[0, 1],
+                    &[0; 32],
+                    &[0, 0x18, 0xff, 0xff],
+                    &avcc,
+                ]
+                .concat(),
+            )
+        })
+        .collect();
+    let stsd = full(
+        b"stsd",
+        0,
+        &[be(chunks.len()).as_slice(), &entries].concat(),
+    );
+    let stts = full(
+        b"stts",
+        0,
+        &[be(2), be(1), be(1), be(count - 1), be(2)].concat(),
+    );
+    let stsc: Vec<u8> = samples
+        .iter()
+        .enumerate()
+        .flat_map(|(i, chunk)| [be(i + 1), be(chunk.len()), be(i + 1)].concat())
+        .collect();
+    let stsc = full(b"stsc", 0, &[be(samples.len()).as_slice(), &stsc].concat());
+    let sizes: Vec<u8> = all.iter().flat_map(|s| be(s.len())).collect();
+    let stsz = full(
+        b"stsz",
+        0,
+        &[[0_u8; 4].as_slice(), &be(count), &sizes].concat(),
+    );
+    let stco = full(
+        b"stco",
+        0,
+        &[be(samples.len()).as_slice(), &offsets].concat(),
+    );
+    let stbl = boxed(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+    let dinf = boxed(
+        b"dinf",
+        &full(
+            b"dref",
+            0,
+            &[be(1).as_slice(), &full(b"url ", 1, &[])].concat(),
+        ),
+    );
+    let minf = boxed(b"minf", &[full(b"vmhd", 1, &[0; 8]), dinf, stbl].concat());
+    let mdia = boxed(b"mdia", &[mdhd, hdlr, minf].concat());
+    let trak = boxed(b"trak", &[tkhd, mdia].concat());
+    [ftyp, mdat, boxed(b"moov", &[mvhd, trak].concat())].concat()
+}
+
+// Covers: T02
+#[test]
+fn worker_refuses_a_coded_size_over_the_cap_behind_a_crop() {
+    use skin_model::media::control::Refusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Coded at 8 192 × 4 096 (32 Mi pixels, 48 MiB a frame), shown at
+    // 1 920 × 1 080: FFmpeg's own cap reads the shown size, and allocates
+    // the coded one.
+    let path = dir.path().join("cropped.avi");
+    let frames = h264_cropped((8192, 4096), (1920, 1080), 3);
+    std::fs::write(&path, avi((1920, 1080), 24, b"H264", &frames)).unwrap();
+
+    let mut worker = Worker::start(&[]);
+    let before = worker.peak_commit();
+    assert_eq!(
+        worker.open(1, &path),
+        Reply::Refused {
+            player: 1,
+            why: Refusal::Size,
+            code: 0,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    let log = worker.log();
+    assert!(log.contains("refused a frame of 8192 x 4096"), "{log}");
+    // Nothing of the frame was allocated: the peak rose by less than its
+    // luma plane.
+    let peak = worker.peak_commit();
+    assert!(
+        peak < before + (32 << 20),
+        "the worker's peak commit rose from {before} to {peak}"
+    );
+    worker.close(1);
+}
+
+// Covers: T02
+#[test]
+fn worker_caps_a_decoder_ffmpeg_opens_again_for_a_new_sample_description() {
+    use skin_model::media::control::Refusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Two frames under a sample description of 64 × 48, then four under
+    // one of 8 192 × 4 096 (32 Mi pixels, 48 MiB a frame). The frames'
+    // uneven durations keep FFmpeg's probe reading the whole file, and it
+    // decodes H.264's first frames to learn their delay: at the second
+    // description it closes its decoder, opens it again, and decodes on.
+    let path = dir.path().join("described.mov");
+    let chunks = [
+        (h264_sets((64, 48), (64, 48)), 0..2),
+        (h264_sets((8192, 4096), (8192, 4096)), 2..6),
+    ];
+    std::fs::write(&path, mov((64, 48), 24, &chunks)).unwrap();
+
+    let mut worker = Worker::start(&[]);
+    let before = worker.peak_commit();
+    let reply = worker.open(1, &path);
+    // Nothing of a large frame was allocated: the peak rose by less than
+    // its luma plane.
+    let peak = worker.peak_commit();
+    assert!(
+        peak < before + (32 << 20),
+        "the worker's peak commit rose from {before} to {peak}; the worker's log:\n{}",
+        worker.log()
+    );
+    // The stream's size is the second description's.
+    assert_eq!(
+        reply,
+        Reply::Refused {
+            player: 1,
+            why: Refusal::Size,
+            code: 0,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    worker.close(1);
+}
+
+/// `clip`, an MPEG-PS file, with a run of padding packets `bytes` long
+/// after its first pack: one read of the demuxer scans it whole.
+#[cfg(feature = "dev-tools")]
+fn padded(clip: &Path, bytes: usize) -> PathBuf {
+    let data = std::fs::read(clip).unwrap();
+    let second = (4..data.len() - 4)
+        .find(|&i| data[i..i + 4] == [0, 0, 1, 0xba])
+        .expect("a second pack");
+    let mut out = data[..second].to_vec();
+    let mut left = bytes;
+    while left > 0 {
+        let len = left.min(65_535 + 6) - 6;
+        out.extend([0, 0, 1, 0xbe]);
+        out.extend(u16::try_from(len).unwrap().to_be_bytes());
+        out.extend(std::iter::repeat_n(0xff, len));
+        left -= len + 6;
+    }
+    out.extend(&data[second..]);
+    let path = clip.with_extension(format!("{bytes}.mpg"));
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_refuses_a_probe_past_its_read_budget() {
+    use skin_model::media::control::Refusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let clip = gen_clip(dir.path(), "short.mpg", "mpeg1video mpeg 64x48 24 24 12");
+    // 65 MiB of padding after the first pack: more than the probe's 64 MiB.
+    let long = padded(&clip, 65 << 20);
+    let mut worker = Worker::start(&[]);
+    assert_eq!(
+        worker.open(1, &long),
+        Reply::Refused {
+            player: 1,
+            why: Refusal::Read,
+            code: -27,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    worker.close(1);
+    // The same clip padded within the budget is probed.
+    let short = padded(&clip, 1 << 20);
+    let probe = worker.open(2, &short);
+    assert!(
+        matches!(probe, Reply::Probed { player: 2, .. }),
+        "{probe:?}; the worker's log:\n{}",
+        worker.log()
+    );
+    worker.close(2);
+}
+
+/// `clip`, a Matroska file, with its segment's size made unknown and a
+/// cluster after its end whose one block claims 64 MiB and 1 byte, more
+/// than one allocation may take.
+#[cfg(feature = "dev-tools")]
+fn with_huge_block(clip: &Path) -> PathBuf {
+    let mut data = std::fs::read(clip).unwrap();
+    let segment = (0..data.len() - 4)
+        .find(|&i| data[i..i + 4] == [0x18, 0x53, 0x80, 0x67])
+        .expect("a segment");
+    // FFmpeg writes the segment's size in eight bytes.
+    assert_eq!(data[segment + 4], 0x01, "an eight-byte segment size");
+    data[segment + 4..segment + 12].copy_from_slice(&[1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    // A cluster of unknown size: its time code, then a simple block of
+    // 64 MiB and 1 byte (a four-byte size), of which a few bytes follow.
+    data.extend([
+        0x1f, 0x43, 0xb6, 0x75, 1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    ]);
+    data.extend([0xe7, 0x82, 0x7f, 0xff]);
+    data.extend([0xa3, 0x14, 0, 0, 1, 0x81, 0, 0, 0x80]);
+    data.extend([0x55; 16]);
+    let path = clip.with_extension("huge.mkv");
+    std::fs::write(&path, data).unwrap();
+    path
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
+    use skin_model::media::control::Failure;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Player 1 plays ten seconds of 64 × 48 (more than FFmpeg's probe
+    // reads) and then meets a block too large to allocate, which
+    // Matroska's demuxer would step over as damaged; player 2 plays
+    // 64 × 48 frames throughout.
+    let clip = gen_clip(dir.path(), "short.mkv", "mjpeg matroska 64x48 24 240 1");
+    let huge = with_huge_block(&clip);
+    let steady = gen_clip(dir.path(), "steady.mpg", "mpeg1video mpeg 64x48 24 1440 12");
+
+    let mut worker = Worker::start(&[]);
+    let mut rings = Vec::new();
+    for (player, path) in [(1, &huge), (2, &steady)] {
+        let probe = worker.open(player, path);
+        assert!(
+            matches!(
+                probe,
+                Reply::Probed {
+                    width: 64,
+                    height: 48,
+                    ..
+                }
+            ),
+            "{probe:?}; the worker's log:\n{}",
+            worker.log()
+        );
+        let ring = Ring::new(64, 48);
+        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        rings.push(ring);
+    }
+    let [one, two] = &mut rings[..] else {
+        unreachable!()
+    };
+    let deadline = Instant::now() + REPLY;
+    let mut frames = [0, 0];
+    let end = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the worker's log:\n{}",
+            worker.log()
+        );
+        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        if let Some(reply) = worker.try_reply() {
+            break reply;
+        }
+    };
+    assert_eq!(
+        end,
+        Reply::Failed {
+            player: 1,
+            why: Failure::Memory,
+            code: -12,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    assert!(frames[0] > 0, "player 1 showed no frame before it failed");
+    let before = frames[1];
+    while frames[1] < before + 24 {
+        assert!(
+            Instant::now() < deadline,
+            "the worker's log:\n{}",
+            worker.log()
+        );
+        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
+    }
+    for player in [1, 2] {
+        worker.close(player);
+    }
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_refuses_an_unlisted_decoder_without_the_codec_whitelist() {
+    use skin_model::media::control::Refusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    // H.263 is built (MPEG-4's decoder is built on it) but off the list.
+    let h263 = gen_clip(dir.path(), "h263.avi", "h263 avi 176x144 24 24 12");
+    // FFmpeg's codec whitelist unset, as a refused allocation while it is
+    // set would leave it: the worker's own open still refuses the decoder
+    // FFmpeg's probe would open.
+    let mut worker = Worker::start(&["--dev-no-codec-list"]);
+    assert_eq!(
+        worker.open(1, &h263),
+        Reply::Refused {
+            player: 1,
+            why: Refusal::Codec,
+            code: 0,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    let log = worker.log();
+    assert!(log.contains("refused a decoder for h263"), "{log}");
+    assert!(!log.contains("not on whitelist"), "{log}");
+    worker.close(1);
 }

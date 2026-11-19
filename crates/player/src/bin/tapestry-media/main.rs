@@ -63,10 +63,12 @@ fn main() -> ExitCode {
 pub struct Out(Arc<Mutex<std::io::Stdout>>);
 
 impl Out {
-    /// Writes `reply` as one frame. A pipe the game no longer reads ends
-    /// the worker: it has nobody to decode for.
+    /// Writes `reply` as one frame (every reply's encoding fits one). A
+    /// pipe the game no longer reads ends the worker: it has nobody to
+    /// decode for.
     pub fn send(&self, reply: &Reply) {
         let Some(bytes) = control::frame(&reply.encode()) else {
+            eprintln!("tapestry-media: a reply that does not fit a frame");
             return;
         };
         let written = match self.0.lock() {
@@ -89,7 +91,10 @@ pub enum ToPlayer {
 /// Reads commands until the game quits or closes the pipe, FFmpeg's largest
 /// allocation capped at `max_alloc` bytes.
 fn serve(max_alloc: usize) -> ExitCode {
-    ffmpeg::init(max_alloc);
+    if let Err(e) = ffmpeg::init(max_alloc) {
+        eprintln!("tapestry-media: FFmpeg's hooks: {e}");
+        return ExitCode::FAILURE;
+    }
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
     let (version, configuration) = ffmpeg::version();
     out.send(&Reply::Hello {
@@ -114,6 +119,9 @@ fn serve(max_alloc: usize) -> ExitCode {
                 }
                 let (tx, rx) = mpsc::channel();
                 let thread_out = out.clone();
+                // The thread owns the handle: one that does not start closes
+                // it with its closure.
+                let file = os::Owned::adopt(file);
                 let spawned = std::thread::Builder::new()
                     .name(format!("player {player}"))
                     .spawn(move || player::run(player, file, &rx, &thread_out));

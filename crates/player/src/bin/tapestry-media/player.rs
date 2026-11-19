@@ -27,8 +27,8 @@ const SLOT_WAIT_MS: u32 = 50;
 
 /// Plays the video whose file handle the game handed the worker as `file`,
 /// until the game closes it.
-pub fn run(player: u8, file: u64, rx: &Receiver<ToPlayer>, out: &Out) {
-    let (input, probe) = match Input::open(crate::os::file(file), IoOpen::Refuse) {
+pub fn run(player: u8, file: Owned, rx: &Receiver<ToPlayer>, out: &Out) {
+    let (input, probe) = match Input::open(file.into_file(), IoOpen::Refuse) {
         Ok(opened) => opened,
         Err((why, code)) => {
             out.send(&Reply::Refused { player, why, code });

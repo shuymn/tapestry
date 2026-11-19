@@ -6,17 +6,28 @@
 //! game handed the worker, never by a path or a URL: the context's
 //! `io_open` refuses every open FFmpeg would make itself, the protocol
 //! whitelist names no protocol, the format whitelist names the listed
-//! containers and the codec whitelist the listed decoders, inherited by
-//! every decoder FFmpeg opens while it probes. A video whose codec is not
-//! listed, or whose frames exceed 4 Mi pixels or 8 192 on a side, is
-//! refused at its probe, and its decoder keeps that cap for every later
-//! frame. No single allocation FFmpeg makes exceeds 63 MiB, and each
-//! decoder runs on at most two threads, so a healthy worker stays below
-//! the line at which the game ends it. Frames come out as I420 at the
-//! probed size, the size of the video's frame ring.
+//! containers and the codec whitelist the listed decoders. While a file is
+//! probed, and while it seeks, the context charges each byte read and each
+//! seek to a budget, and refuses both once the budget is spent.
+//!
+//! Before anything else runs, the worker points FFmpeg's DLLs at hooks of
+//! its own. Every allocation they ask their C runtime for passes the
+//! worker's allocator, which refuses one above 63 MiB and records each
+//! refusal, its own or the runtime's, on the thread that asked. Every
+//! decoder the format library opens while it probes passes the worker's
+//! open, which refuses a codec off the list and gives the decoder the pixel
+//! cap and the worker's frame allocation, as the worker gives its own
+//! decoder. That allocation refuses a frame whose coded size, the size
+//! FFmpeg allocates, is over 4 Mi pixels or 8 192 on a side, before
+//! anything is allocated. A probe that met such a frame refuses the file,
+//! and a player whose thread recorded a refused allocation fails, even
+//! where FFmpeg goes on as if the file had ended. Each decoder runs on at
+//! most two threads, so a healthy worker stays below the line at which the
+//! game ends it. Frames come out as I420 at the probed size, the size of
+//! the video's frame ring.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{Read as _, SeekFrom, Write as _};
 use std::ptr;
 
 use ffmpeg_sys_next as ff;
@@ -27,6 +38,14 @@ use skin_model::media::{MAX_PIXELS, MAX_SIDE};
 /// between the game's termination line and the job's cap
 /// (design.md "Threat Model" T02).
 pub const MAX_ALLOC: usize = 63 << 20;
+
+/// The bytes a probe or a seek may read, and the seeks it may make: well
+/// over what FFmpeg reads and seeks to probe a healthy video or to seek in
+/// one, whatever a file's layout makes it scan.
+const BUDGET: (u64, u32) = (64 << 20, 256);
+
+/// FFmpeg's error for a read or a seek past its budget.
+pub const SPENT: c_int = averror(ff::EFBIG);
 
 /// The threads a decoder runs on, at most.
 const THREADS: c_int = 2;
@@ -44,6 +63,27 @@ const CODECS: &CStr = c"mpeg1video,mpeg2video,h264,hevc,vc1,wmv1,wmv2,wmv3,msmpe
 
 /// A protocol whitelist no protocol is on.
 const PROTOCOLS: &CStr = c"none";
+
+/// FFmpeg's codec whitelist is left unset at every open (dev-tools): what
+/// an allocation refused while it is set would leave.
+#[cfg(feature = "dev-tools")]
+static NO_CODEC_LIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Leaves FFmpeg's codec whitelist unset at every open from now on
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn leave_codec_list_unset() {
+    NO_CODEC_LIST.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The codec whitelist, as the option an open sets.
+fn codec_list() -> &'static [(&'static CStr, &'static CStr)] {
+    #[cfg(feature = "dev-tools")]
+    if NO_CODEC_LIST.load(std::sync::atomic::Ordering::Relaxed) {
+        return &[];
+    }
+    &[(c"codec_whitelist", CODECS)]
+}
 
 /// The listed codecs, by FFmpeg's ids: the worker refuses a video of any
 /// other before a decoder opens.
@@ -65,6 +105,10 @@ const CODEC_IDS: [ff::AVCodecID; 15] = [
     ff::AVCodecID::AV_CODEC_ID_MJPEG,
 ];
 
+/// The damaged frames a decoder may give among those it holds when the
+/// file ends, more than any decoder holds: past them the video ends.
+const DAMAGED_AT_END: u32 = 64;
+
 /// The furthest a seek starts before its target, in µs.
 const MAX_BACK_OFF: i64 = 3_000_000;
 
@@ -73,21 +117,333 @@ const MAX_BACK_OFF: i64 = 3_000_000;
 /// already past it.
 const BACK_OFF: [i64; 4] = [0, 1_000_000, 2_000_000, MAX_BACK_OFF];
 
-/// The pixel cap as FFmpeg's `max_pixels` option.
-const MAX_PIXELS_OPTION: &CStr = c"4194304";
-
 /// The ring's pixel format.
 const I420: c_int = ff::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int;
 
-/// Sets FFmpeg up before any other call: the allocation cap ([`MAX_ALLOC`]
-/// but in a dev-tools test) and the log.
-pub fn init(max_alloc: usize) {
+/// Sets FFmpeg up before any other call: the worker's hooks, with the
+/// allocation cap at `max_alloc` ([`MAX_ALLOC`] but in a dev-tools test),
+/// and the log.
+///
+/// # Errors
+///
+/// When a DLL's imports cannot be pointed at the hooks: the worker then
+/// serves nothing.
+pub fn init(max_alloc: usize) -> Result<(), String> {
+    hooks::install(max_alloc)?;
     // SAFETY: process-wide settings made before any other FFmpeg call and
     // before any thread that makes one starts.
     unsafe {
-        ff::av_max_alloc(max_alloc);
         ff::av_log_set_level(ff::AV_LOG_WARNING);
         ff::av_log_set_callback(Some(log));
+    }
+    Ok(())
+}
+
+/// The worker's hooks in FFmpeg's DLLs, and what they record.
+mod hooks {
+    use std::cell::Cell;
+    use std::ffi::{CStr, c_int, c_void};
+    use std::io::Write as _;
+    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{CODEC_IDS, MAX_PIXELS, averror, ff, text, within_cap};
+
+    type Malloc = unsafe extern "C" fn(usize) -> *mut c_void;
+    type Calloc = unsafe extern "C" fn(usize, usize) -> *mut c_void;
+    type Realloc = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+    type AlignedMalloc = unsafe extern "C" fn(usize, usize) -> *mut c_void;
+    type AlignedRealloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut c_void;
+    type Open = unsafe extern "C" fn(
+        *mut ff::AVCodecContext,
+        *const ff::AVCodec,
+        *mut *mut ff::AVDictionary,
+    ) -> c_int;
+
+    /// The largest single allocation the worker's allocator makes.
+    static CAP: AtomicUsize = AtomicUsize::new(super::MAX_ALLOC);
+
+    // The functions the DLLs' imports held before the worker pointed them
+    // at its hooks, 0 until then: the C runtime's allocators, and the codec
+    // library's `avcodec_open2` as the format library imports it.
+    static MALLOC: AtomicUsize = AtomicUsize::new(0);
+    static CALLOC: AtomicUsize = AtomicUsize::new(0);
+    static REALLOC: AtomicUsize = AtomicUsize::new(0);
+    static ALIGNED_MALLOC: AtomicUsize = AtomicUsize::new(0);
+    static ALIGNED_REALLOC: AtomicUsize = AtomicUsize::new(0);
+    static OPEN: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        /// The largest allocation refused on this thread since its player
+        /// last looked, 0 when none was.
+        static REFUSED: Cell<usize> = const { Cell::new(0) };
+        /// A frame over the cap was refused on this thread since its player
+        /// last looked.
+        static OVERSIZE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The largest allocation refused on this thread since the last look,
+    /// forgotten now.
+    pub fn refused() -> Option<usize> {
+        Some(REFUSED.replace(0)).filter(|&size| size > 0)
+    }
+
+    /// Whether a frame over the cap was refused on this thread since the
+    /// last look, forgotten now.
+    pub fn oversize() -> bool {
+        OVERSIZE.replace(false)
+    }
+
+    /// Records an allocation of `size` bytes refused on this thread.
+    fn refuse(size: usize) {
+        REFUSED.set(REFUSED.get().max(size));
+    }
+
+    /// Whether `size` bytes may be allocated at once; a larger allocation is
+    /// refused and recorded.
+    fn allowed(size: usize) -> bool {
+        if size > CAP.load(Ordering::Relaxed) {
+            refuse(size.max(1));
+            return false;
+        }
+        true
+    }
+
+    /// The function an import held before the worker's hook, or `None`
+    /// before the hook is installed.
+    fn held(original: &AtomicUsize) -> Option<usize> {
+        Some(original.load(Ordering::Relaxed)).filter(|&f| f != 0)
+    }
+
+    /// Records a null the runtime returned for a request of `size` bytes:
+    /// a refusal unless nothing was asked for.
+    fn returned(p: *mut c_void, size: usize) -> *mut c_void {
+        if p.is_null() && size > 0 {
+            refuse(size);
+        }
+        p
+    }
+
+    unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+        let Some(f) = held(&MALLOC).filter(|_| allowed(size)) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: the runtime's `malloc`, which the import held.
+        returned(
+            unsafe { std::mem::transmute::<usize, Malloc>(f)(size) },
+            size,
+        )
+    }
+
+    unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
+        let Some(total) = count.checked_mul(size) else {
+            refuse(usize::MAX);
+            return ptr::null_mut();
+        };
+        let Some(f) = held(&CALLOC).filter(|_| allowed(total)) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: the runtime's `calloc`, which the import held.
+        returned(
+            unsafe { std::mem::transmute::<usize, Calloc>(f)(count, size) },
+            total,
+        )
+    }
+
+    unsafe extern "C" fn realloc(block: *mut c_void, size: usize) -> *mut c_void {
+        let Some(f) = held(&REALLOC).filter(|_| allowed(size)) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: the runtime's `realloc`, which the import held, on a
+        // block the runtime allocated. A refusal leaves the block as it was.
+        returned(
+            unsafe { std::mem::transmute::<usize, Realloc>(f)(block, size) },
+            size,
+        )
+    }
+
+    unsafe extern "C" fn aligned_malloc(size: usize, align: usize) -> *mut c_void {
+        let Some(f) = held(&ALIGNED_MALLOC).filter(|_| allowed(size)) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: the runtime's `_aligned_malloc`, which the import held.
+        returned(
+            unsafe { std::mem::transmute::<usize, AlignedMalloc>(f)(size, align) },
+            size,
+        )
+    }
+
+    unsafe extern "C" fn aligned_realloc(
+        block: *mut c_void,
+        size: usize,
+        align: usize,
+    ) -> *mut c_void {
+        let Some(f) = held(&ALIGNED_REALLOC).filter(|_| allowed(size)) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: the runtime's `_aligned_realloc`, which the import held,
+        // on a block the runtime allocated. A refusal leaves the block as
+        // it was.
+        returned(
+            unsafe { std::mem::transmute::<usize, AlignedRealloc>(f)(block, size, align) },
+            size,
+        )
+    }
+
+    /// Allocates a decoded frame's buffers through FFmpeg's own allocation,
+    /// unless the frame is video over the cap at the size the decoder asks
+    /// for (its coded size, which FFmpeg allocates): that one is refused,
+    /// and recorded, before anything is allocated.
+    pub unsafe extern "C" fn get_buffer(
+        ctx: *mut ff::AVCodecContext,
+        frame: *mut ff::AVFrame,
+        flags: c_int,
+    ) -> c_int {
+        // SAFETY: the context and frame FFmpeg hands a `get_buffer2`.
+        unsafe {
+            if (*ctx).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO {
+                let (width, height) = ((*frame).width, (*frame).height);
+                if !within_cap(width, height) {
+                    OVERSIZE.set(true);
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "tapestry-media: refused a frame of {width} x {height}"
+                    );
+                    return averror(ff::EINVAL);
+                }
+            }
+            ff::avcodec_default_get_buffer2(ctx, frame, flags)
+        }
+    }
+
+    /// Gives a decoder the pixel cap and the worker's frame allocation.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` is a codec context not yet open.
+    pub unsafe fn cap(ctx: *mut ff::AVCodecContext) {
+        // SAFETY: the caller's.
+        unsafe {
+            (*ctx).max_pixels = MAX_PIXELS.cast_signed();
+            (*ctx).get_buffer2 = Some(get_buffer);
+        }
+    }
+
+    /// Opens a decoder the format library opens itself, while it probes:
+    /// refused unless it decodes a listed codec, and given the pixel cap and
+    /// the worker's frame allocation first.
+    unsafe extern "C" fn open(
+        ctx: *mut ff::AVCodecContext,
+        codec: *const ff::AVCodec,
+        options: *mut *mut ff::AVDictionary,
+    ) -> c_int {
+        let Some(f) = held(&OPEN).filter(|_| !ctx.is_null()) else {
+            return averror(ff::EPERM);
+        };
+        // SAFETY: the context and codec FFmpeg passes `avcodec_open2`, the
+        // codec null when the context names its own.
+        unsafe {
+            let codec = if codec.is_null() { (*ctx).codec } else { codec };
+            let listed = !codec.is_null()
+                && ff::av_codec_is_decoder(codec) != 0
+                && CODEC_IDS.contains(&(*codec).id);
+            if !listed {
+                let id = if codec.is_null() {
+                    (*ctx).codec_id
+                } else {
+                    (*codec).id
+                };
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "tapestry-media: refused a decoder for {}",
+                    text(ff::avcodec_get_name(id))
+                );
+                return averror(ff::EPERM);
+            }
+            cap(ctx);
+            std::mem::transmute::<usize, Open>(f)(ctx, codec, options)
+        }
+    }
+
+    /// Points FFmpeg's DLLs at the hooks: their C runtime's allocators at
+    /// the worker's, which refuse an allocation above `max_alloc`, and the
+    /// format library's decoder opens at the worker's. FFmpeg's own cap is
+    /// lifted, so a request it would refuse reaches the worker's allocator.
+    pub fn install(max_alloc: usize) -> Result<(), String> {
+        CAP.store(max_alloc, Ordering::Relaxed);
+        // SAFETY: each returns a static string inside its own library.
+        let (util, codec, format, scale) = unsafe {
+            (
+                ff::av_version_info().cast::<c_void>(),
+                ff::avcodec_configuration().cast::<c_void>(),
+                ff::avformat_configuration().cast::<c_void>(),
+                ff::swscale_configuration().cast::<c_void>(),
+            )
+        };
+        let allocators: [(&CStr, &AtomicUsize, *const c_void); 5] = [
+            (c"malloc", &MALLOC, malloc as Malloc as *const c_void),
+            (c"calloc", &CALLOC, calloc as Calloc as *const c_void),
+            (c"realloc", &REALLOC, realloc as Realloc as *const c_void),
+            (
+                c"_aligned_malloc",
+                &ALIGNED_MALLOC,
+                aligned_malloc as AlignedMalloc as *const c_void,
+            ),
+            (
+                c"_aligned_realloc",
+                &ALIGNED_REALLOC,
+                aligned_realloc as AlignedRealloc as *const c_void,
+            ),
+        ];
+        for library in [util, codec, format, scale] {
+            for (name, original, hook) in allocators {
+                point(library, name, original, hook)?;
+            }
+        }
+        point(
+            format,
+            c"avcodec_open2",
+            &OPEN,
+            open as Open as *const c_void,
+        )?;
+        // `av_malloc` and `av_realloc` allocate through these two: without
+        // them the cap would not hold.
+        for (name, original) in [
+            ("_aligned_malloc", &ALIGNED_MALLOC),
+            ("_aligned_realloc", &ALIGNED_REALLOC),
+            ("avcodec_open2", &OPEN),
+        ] {
+            if held(original).is_none() {
+                return Err(format!("FFmpeg's DLLs import no {name}"));
+            }
+        }
+        // SAFETY: a process-wide setting made before any thread that calls
+        // FFmpeg starts.
+        unsafe { ff::av_max_alloc(usize::MAX) };
+        Ok(())
+    }
+
+    /// Points `library`'s imports of `name` at `hook`, keeping what they
+    /// held in `original`: the same function in every library.
+    fn point(
+        library: *const c_void,
+        name: &CStr,
+        original: &AtomicUsize,
+        hook: *const c_void,
+    ) -> Result<(), String> {
+        let what = name.to_string_lossy();
+        // SAFETY: no other thread runs yet, and each hook has the type of
+        // the function its name names.
+        let held = unsafe { crate::os::redirect_import(library, name, hook) }
+            .map_err(|e| format!("{what}: {e}"))?;
+        if let Some(held) = held {
+            let before = original.load(Ordering::Relaxed);
+            if before != 0 && before != held {
+                return Err(format!("{what}: FFmpeg's DLLs import more than one"));
+            }
+            original.store(held, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
@@ -185,37 +541,68 @@ unsafe extern "C" fn refuse_open(
     averror(ff::EPERM)
 }
 
-/// Reads the next bytes of the file for FFmpeg.
+/// What an input's I/O context reads through: the file, and the bytes and
+/// seeks left to the probe or the seek under way.
+struct Budgeted {
+    file: std::fs::File,
+    /// The bytes and seeks left, `None` while the player plays on.
+    left: Option<(u64, u32)>,
+    /// A read or a seek was refused for the budget.
+    spent: bool,
+}
+
+/// Reads the next bytes of the file for FFmpeg, charged to the budget.
 unsafe extern "C" fn read(opaque: *mut c_void, buf: *mut u8, size: c_int) -> c_int {
-    let Ok(len) = usize::try_from(size) else {
+    let Ok(mut len) = usize::try_from(size) else {
         return averror(ff::EINVAL);
     };
     if opaque.is_null() || buf.is_null() {
         return averror(ff::EINVAL);
     }
-    // SAFETY: `opaque` is the file this module boxed for this context,
-    // alive until the context is freed, and FFmpeg hands a buffer of
-    // `size` bytes.
-    let (file, buf) = unsafe {
-        (
-            &mut *opaque.cast::<std::fs::File>(),
-            std::slice::from_raw_parts_mut(buf, len),
-        )
-    };
-    match file.read(buf) {
+    // SAFETY: `opaque` is the source this module boxed for this context,
+    // alive until the context is freed and reached only through it while
+    // FFmpeg runs, and FFmpeg hands a buffer of `size` bytes.
+    let source = unsafe { &mut *opaque.cast::<Budgeted>() };
+    if let Some((bytes, _)) = source.left {
+        if bytes == 0 {
+            source.spent = true;
+            return SPENT;
+        }
+        len = len.min(usize::try_from(bytes).unwrap_or(usize::MAX));
+    }
+    // SAFETY: as above; `len` is at most `size`.
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+    match source.file.read(buf) {
         Ok(0) => ff::AVERROR_EOF,
-        Ok(n) => c_int::try_from(n).unwrap_or(size),
+        Ok(n) => {
+            if let Some((bytes, _)) = &mut source.left {
+                *bytes = bytes.saturating_sub(n as u64);
+            }
+            c_int::try_from(n).unwrap_or(size)
+        }
         Err(_) => averror(ff::EIO),
     }
 }
 
-/// Moves in the file for FFmpeg, or gives its size.
+/// Moves in the file for FFmpeg, or gives its size, charged to the budget.
 unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
     if opaque.is_null() {
         return i64::from(averror(ff::EINVAL));
     }
     // SAFETY: as in `read`.
-    let file = unsafe { &mut *opaque.cast::<std::fs::File>() };
+    let source = unsafe { &mut *opaque.cast::<Budgeted>() };
+    if let Some((_, seeks)) = &mut source.left {
+        if *seeks == 0 {
+            source.spent = true;
+            return i64::from(SPENT);
+        }
+        *seeks -= 1;
+    }
+    seek_in(&mut source.file, offset, whence)
+}
+
+/// Moves in `file` as FFmpeg asks a seek callback to, or gives its size.
+fn seek_in(file: &mut impl std::io::Seek, offset: i64, whence: c_int) -> i64 {
     let at = if whence & ff::AVSEEK_SIZE != 0 {
         size(file)
     } else {
@@ -232,7 +619,7 @@ unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i6
 }
 
 /// The file's length, its position kept.
-fn size(file: &mut std::fs::File) -> Option<i64> {
+fn size(file: &mut impl std::io::Seek) -> Option<i64> {
     let here = file.stream_position().ok()?;
     let end = file.seek(SeekFrom::End(0)).ok()?;
     file.seek(SeekFrom::Start(here)).ok()?;
@@ -248,6 +635,40 @@ pub struct Probe {
     pub duration: i64,
     pub codec: String,
     pub container: String,
+}
+
+/// A dictionary of FFmpeg options, freed when dropped.
+struct Options(*mut ff::AVDictionary);
+
+impl Options {
+    /// The options `pairs` name, or `None` when FFmpeg could not set one.
+    fn new(pairs: &[(&CStr, &CStr)]) -> Option<Self> {
+        let mut options = Self(ptr::null_mut());
+        for (key, value) in pairs {
+            // SAFETY: NUL-terminated strings, which FFmpeg copies into the
+            // dictionary.
+            let r = unsafe { ff::av_dict_set(&raw mut options.0, key.as_ptr(), value.as_ptr(), 0) };
+            if r < 0 {
+                return None;
+            }
+        }
+        Some(options)
+    }
+}
+
+impl Drop for Options {
+    fn drop(&mut self) {
+        // SAFETY: this dictionary, or what FFmpeg left of it; null is none.
+        unsafe { ff::av_dict_free(&raw mut self.0) };
+    }
+}
+
+/// Says that an allocation of `size` bytes was refused.
+fn refused_allocation(size: usize) {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "tapestry-media: an allocation of {size} bytes was refused"
+    );
 }
 
 /// Where a seek landed.
@@ -268,8 +689,9 @@ pub struct Input {
     frame: *mut ff::AVFrame,
     scaled: *mut ff::AVFrame,
     sws: *mut ff::SwsContext,
-    /// The file FFmpeg reads through `pb`: boxed so its address holds.
-    file: Box<std::fs::File>,
+    /// What FFmpeg reads through `pb`: a box of this input's, which the
+    /// context reaches through its pointer, freed after the context.
+    source: *mut Budgeted,
     stream: c_int,
     time_base: ff::AVRational,
     start: i64,
@@ -281,13 +703,22 @@ pub struct Input {
 
 impl Input {
     /// Opens and probes `file`: a listed container holding a video of a
-    /// listed codec within the pixel cap, whose decoder opens.
+    /// listed codec within the pixel cap, whose decoder opens, all read
+    /// within the probe's budget.
     ///
     /// # Errors
     ///
     /// Why the file is refused, with FFmpeg's error (0 when there is
-    /// none).
+    /// none). Whatever FFmpeg made of them, a frame the probe met over the
+    /// cap refuses the file for its size, an allocation refused while it
+    /// probed for its decoder (with `ENOMEM`), and a probe past its budget
+    /// for its reading (with [`SPENT`]).
     pub fn open(file: std::fs::File, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
+        let source = Box::new(Budgeted {
+            file,
+            left: Some(BUDGET),
+            spent: false,
+        });
         let mut input = Self {
             fc: ptr::null_mut(),
             pb: ptr::null_mut(),
@@ -296,7 +727,7 @@ impl Input {
             frame: ptr::null_mut(),
             scaled: ptr::null_mut(),
             sws: ptr::null_mut(),
-            file: Box::new(file),
+            source: Box::into_raw(source),
             stream: -1,
             time_base: ff::AVRational { num: 0, den: 1 },
             start: 0,
@@ -304,11 +735,42 @@ impl Input {
             height: 0,
             drained: false,
         };
+        // What an earlier open on this thread left recorded is not this
+        // file's.
+        let _ = (hooks::refused(), hooks::oversize());
         // SAFETY: each call gets the contexts this function allocated (or
         // FFmpeg's documented null), checked before use; `input` frees
         // whatever exists when it drops, on every return.
-        let probe = unsafe { input.probe(io) }?;
-        Ok((input, probe))
+        let probe = unsafe { input.probe(io) };
+        let spent = input.source().spent;
+        input.budget(None);
+        if hooks::oversize() {
+            return Err((Refusal::Size, 0));
+        }
+        if let Some(size) = hooks::refused() {
+            refused_allocation(size);
+            return Err((Refusal::Decoder, averror(ff::ENOMEM)));
+        }
+        if spent {
+            return Err((Refusal::Read, SPENT));
+        }
+        Ok((input, probe?))
+    }
+
+    /// The source FFmpeg reads through.
+    fn source(&mut self) -> &mut Budgeted {
+        // SAFETY: the box this input made, alive until it drops; FFmpeg
+        // reaches it only while one of this input's calls into FFmpeg runs,
+        // and none runs while this borrow lives.
+        unsafe { &mut *self.source }
+    }
+
+    /// Sets the bytes and seeks left to FFmpeg's reads, `None` for no
+    /// budget, and forgets a budget spent before.
+    fn budget(&mut self, left: Option<(u64, u32)>) {
+        let source = self.source();
+        source.left = left;
+        source.spent = false;
     }
 
     /// [`Input::open`]'s FFmpeg calls.
@@ -329,9 +791,15 @@ impl Input {
             if buf.is_null() {
                 return Err(no_memory);
             }
-            let opaque = ptr::from_mut::<std::fs::File>(&mut self.file).cast::<c_void>();
-            self.pb =
-                ff::avio_alloc_context(buf, IO_BUFFER, 0, opaque, Some(read), None, Some(seek));
+            self.pb = ff::avio_alloc_context(
+                buf,
+                IO_BUFFER,
+                0,
+                self.source.cast::<c_void>(),
+                Some(read),
+                None,
+                Some(seek),
+            );
             if self.pb.is_null() {
                 ff::av_free(buf.cast());
                 return Err(no_memory);
@@ -341,32 +809,22 @@ impl Input {
             if io == IoOpen::Refuse {
                 (*self.fc).io_open = Some(refuse_open);
             }
-            let mut options = ptr::null_mut();
-            ff::av_dict_set(
-                &raw mut options,
-                c"format_whitelist".as_ptr(),
-                FORMATS.as_ptr(),
-                0,
-            );
-            ff::av_dict_set(
-                &raw mut options,
-                c"protocol_whitelist".as_ptr(),
-                PROTOCOLS.as_ptr(),
-                0,
-            );
-            ff::av_dict_set(
-                &raw mut options,
-                c"codec_whitelist".as_ptr(),
-                CODECS.as_ptr(),
-                0,
-            );
+            let lists = [
+                [
+                    (c"format_whitelist", FORMATS),
+                    (c"protocol_whitelist", PROTOCOLS),
+                ]
+                .as_slice(),
+                codec_list(),
+            ]
+            .concat();
+            let mut options = Options::new(&lists).ok_or(no_memory)?;
             let r = ff::avformat_open_input(
                 &raw mut self.fc,
                 c"".as_ptr(),
                 ptr::null(),
-                &raw mut options,
+                &raw mut options.0,
             );
-            ff::av_dict_free(&raw mut options);
             if r < 0 {
                 let why = if r == averror(ff::EIO) {
                     Refusal::Read
@@ -376,25 +834,11 @@ impl Input {
                 return Err((why, r));
             }
 
-            // The decoders FFmpeg opens while it probes keep the pixel cap
-            // too (and the codec whitelist, which it passes on itself). It
-            // gives the per-stream options only to the streams that exist
-            // when its probe starts, and a demuxer without a header (MPEG-PS)
-            // adds streams as it reads them: such a file is read first as far
-            // as the probe reads, so every stream the probe can meet exists,
-            // and then from its first byte again.
-            if (*self.fc).ctx_flags & ff::AVFMTCTX_NOHEADER != 0 {
-                self.find_streams()?;
-            }
-            let streams = (*self.fc).nb_streams as usize;
-            let mut per_stream: Vec<*mut ff::AVDictionary> = vec![ptr::null_mut(); streams];
-            for d in &mut per_stream {
-                ff::av_dict_set(d, c"max_pixels".as_ptr(), MAX_PIXELS_OPTION.as_ptr(), 0);
-            }
-            let r = ff::avformat_find_stream_info(self.fc, per_stream.as_mut_ptr());
-            for d in &mut per_stream {
-                ff::av_dict_free(d);
-            }
+            // Every decoder FFmpeg opens while it probes passes the worker's
+            // open, which gives it the pixel cap: a stream's that a demuxer
+            // without a header (MPEG-PS) adds as it reads, and one FFmpeg
+            // opens again when a stream's parameters change, as well.
+            let r = ff::avformat_find_stream_info(self.fc, ptr::null_mut());
             if r < 0 {
                 return Err((Refusal::Container, r));
             }
@@ -432,17 +876,10 @@ impl Input {
                 return Err((Refusal::Decoder, r));
             }
             (*self.dec).thread_count = THREADS;
-            (*self.dec).max_pixels = MAX_PIXELS.cast_signed();
             (*self.dec).pkt_timebase = (*st).time_base;
-            let mut options = ptr::null_mut();
-            ff::av_dict_set(
-                &raw mut options,
-                c"codec_whitelist".as_ptr(),
-                CODECS.as_ptr(),
-                0,
-            );
-            let r = ff::avcodec_open2(self.dec, decoder, &raw mut options);
-            ff::av_dict_free(&raw mut options);
+            hooks::cap(self.dec);
+            let mut options = Options::new(codec_list()).ok_or(no_memory)?;
+            let r = ff::avcodec_open2(self.dec, decoder, &raw mut options.0);
             if r < 0 {
                 return Err((Refusal::Decoder, r));
             }
@@ -479,44 +916,15 @@ impl Input {
         }
     }
 
-    /// Reads the packets of the probe's budget (`probesize` bytes, all the
-    /// probe reads), which creates every stream a headerless demuxer meets
-    /// in them, and returns to the file's first byte. Nothing is decoded.
-    ///
-    /// # Safety
-    ///
-    /// The format context is open.
-    unsafe fn find_streams(&mut self) -> Result<(), (Refusal, c_int)> {
-        // SAFETY: this input's open context and a packet of its own, freed
-        // before returning.
-        unsafe {
-            let mut packet = ff::av_packet_alloc();
-            if packet.is_null() {
-                return Err((Refusal::Decoder, averror(ff::ENOMEM)));
-            }
-            let budget = (*self.fc).probesize;
-            let mut read: i64 = 0;
-            while read < budget && ff::av_read_frame(self.fc, packet) >= 0 {
-                read = read.saturating_add(i64::from((*packet).size));
-                ff::av_packet_unref(packet);
-            }
-            ff::av_packet_free(&raw mut packet);
-            let r = ff::av_seek_frame(self.fc, -1, 0, ff::AVSEEK_FLAG_BYTE);
-            if r < 0 {
-                return Err((Refusal::Container, r));
-            }
-        }
-        Ok(())
-    }
-
     /// Decodes the next frame into `out`, I420 at the probed size: its
     /// stamp, in µs from the stream's start, or `None` at the end. A frame
     /// with no time is decoded but not returned.
     ///
     /// # Errors
     ///
-    /// When the file cannot be read, an allocation is refused or the
-    /// decoder fails; a damaged packet FFmpeg skips is not an error.
+    /// When the file cannot be read, an allocation is refused on the
+    /// player's thread (one FFmpeg went on from as well) or the decoder
+    /// fails; a damaged packet FFmpeg skips is not an error.
     pub fn next(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
         loop {
             if !self.decode()? {
@@ -532,13 +940,30 @@ impl Input {
     /// Positions the video so its first frame at or after `target` µs is
     /// decoded into `out`: seeks to the target, and when the first frame
     /// decoded there is already past it (the demuxer overshot), seeks again
-    /// from a second further back, up to three times. `None` when no frame
-    /// at or after the target exists.
+    /// from a second further back, up to three times, all within one seek's
+    /// budget. `None` when no frame at or after the target exists.
     ///
     /// # Errors
     ///
-    /// As [`Input::next`], or when the demuxer cannot seek.
+    /// As [`Input::next`], when the demuxer cannot seek, or when the seek
+    /// reads past its budget (for reading, with [`SPENT`]).
     pub fn seek(
+        &mut self,
+        target: i64,
+        out: &mut [u8],
+    ) -> Result<Option<Landed>, (Failure, c_int)> {
+        self.budget(Some(BUDGET));
+        let landed = self.seek_within_budget(target, out);
+        let spent = self.source().spent;
+        self.budget(None);
+        if spent {
+            return Err((Failure::Read, SPENT));
+        }
+        landed
+    }
+
+    /// [`Input::seek`]'s seeks and decoding.
+    fn seek_within_budget(
         &mut self,
         target: i64,
         out: &mut [u8],
@@ -553,6 +978,7 @@ impl Input {
                 ff::avcodec_flush_buffers(self.dec);
                 r
             };
+            self.check()?;
             if r < 0 {
                 return Err((Failure::Seek, r));
             }
@@ -584,9 +1010,25 @@ impl Input {
         Ok(None)
     }
 
+    /// Fails the player when an allocation was refused on its thread since
+    /// the last look, FFmpeg's error or not, or when the seek under way has
+    /// spent its budget.
+    fn check(&mut self) -> Result<(), (Failure, c_int)> {
+        if let Some(size) = hooks::refused() {
+            refused_allocation(size);
+            return Err((Failure::Memory, averror(ff::ENOMEM)));
+        }
+        if self.source().spent {
+            return Err((Failure::Read, SPENT));
+        }
+        Ok(())
+    }
+
     /// Decodes the next frame into `self.frame`: whether there was one.
     fn decode(&mut self) -> Result<bool, (Failure, c_int)> {
+        let mut damaged = 0;
         loop {
+            self.check()?;
             // SAFETY: this input's contexts.
             unsafe {
                 let r = ff::avcodec_receive_frame(self.dec, self.frame);
@@ -599,6 +1041,15 @@ impl Input {
                 if r == averror(ff::ENOMEM) {
                     return Err((Failure::Memory, r));
                 }
+                if r == ff::AVERROR_INVALIDDATA && self.drained {
+                    // A damaged frame among those the decoder held when the
+                    // file ended: the ones after it still come.
+                    damaged += 1;
+                    if damaged > DAMAGED_AT_END {
+                        return Ok(false);
+                    }
+                    continue;
+                }
                 if r != averror(ff::EAGAIN) && r != ff::AVERROR_INVALIDDATA {
                     return Err((Failure::Decode, r));
                 }
@@ -606,6 +1057,10 @@ impl Input {
                     return Ok(false);
                 }
                 let r = ff::av_read_frame(self.fc, self.packet);
+                // A refusal the demuxer went on from, as if the block it
+                // could not allocate were damaged or the file had ended,
+                // fails the player here.
+                self.check()?;
                 if r == averror(ff::ENOMEM) {
                     return Err((Failure::Memory, r));
                 }
@@ -683,6 +1138,7 @@ impl Input {
                     }
                     let r = ff::sws_scale_frame(self.sws, self.scaled, f);
                     if r < 0 {
+                        self.check()?;
                         return Err((Failure::Decode, r));
                     }
                     self.scaled.cast_const()
@@ -739,6 +1195,11 @@ impl Drop for Input {
             if !self.pb.is_null() {
                 ff::av_freep((&raw mut (*self.pb).buffer).cast());
                 ff::avio_context_free(&raw mut self.pb);
+            }
+            // The context that read through the source is gone.
+            if !self.source.is_null() {
+                drop(Box::from_raw(self.source));
+                self.source = ptr::null_mut();
             }
         }
     }
@@ -824,7 +1285,7 @@ pub fn encode_clip(
         conv: ptr::null_mut(),
         sws: ptr::null_mut(),
         packet: ptr::null_mut(),
-        file: Box::new(file),
+        file: Box::into_raw(Box::new(file)),
     };
     // SAFETY: `enc` owns every context the encoding allocates and frees
     // them when it drops.
@@ -841,7 +1302,9 @@ struct Encoding {
     conv: *mut ff::AVFrame,
     sws: *mut ff::SwsContext,
     packet: *mut ff::AVPacket,
-    file: Box<std::fs::File>,
+    /// The clip's file, which the output context writes through: a box of
+    /// this encoding's, freed after the context.
+    file: *mut std::fs::File,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -918,9 +1381,16 @@ impl Encoding {
             if buf.is_null() {
                 return Err("out of memory".to_owned());
             }
-            let opaque = ptr::from_mut::<std::fs::File>(&mut self.file).cast::<c_void>();
-            self.pb =
-                ff::avio_alloc_context(buf, IO_BUFFER, 1, opaque, None, Some(write), Some(seek));
+            let opaque = self.file.cast::<c_void>();
+            self.pb = ff::avio_alloc_context(
+                buf,
+                IO_BUFFER,
+                1,
+                opaque,
+                None,
+                Some(write),
+                Some(seek_file),
+            );
             if self.pb.is_null() {
                 ff::av_free(buf.cast());
                 return Err("out of memory".to_owned());
@@ -993,7 +1463,11 @@ impl Encoding {
             }
             ff::avio_flush(self.pb);
         }
-        self.file.flush().map_err(|e| e.to_string())
+        // SAFETY: this encoding's file, which the output context reaches
+        // only while one of its calls runs, and none runs now.
+        unsafe { &mut *self.file }
+            .flush()
+            .map_err(|e| e.to_string())
     }
 
     /// Writes every packet the encoder has ready.
@@ -1042,6 +1516,11 @@ impl Drop for Encoding {
             if !self.pb.is_null() {
                 ff::av_freep((&raw mut (*self.pb).buffer).cast());
                 ff::avio_context_free(&raw mut self.pb);
+            }
+            // The context that wrote through the file is gone.
+            if !self.file.is_null() {
+                drop(Box::from_raw(self.file));
+                self.file = ptr::null_mut();
             }
         }
     }
@@ -1111,6 +1590,22 @@ unsafe fn fill_i420(frame: *mut ff::AVFrame, w: usize, h: usize, tight: &[u8]) {
             }
         }
     }
+}
+
+/// Moves in the clip's file for FFmpeg, or gives its size.
+#[cfg(feature = "dev-tools")]
+unsafe extern "C" fn seek_file(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
+    if opaque.is_null() {
+        return i64::from(averror(ff::EINVAL));
+    }
+    // SAFETY: `opaque` is the file this module boxed for this context,
+    // alive until the context is freed and reached only through it while
+    // FFmpeg runs.
+    seek_in(
+        unsafe { &mut *opaque.cast::<std::fs::File>() },
+        offset,
+        whence,
+    )
 }
 
 /// Writes bytes FFmpeg muxed to the clip's file.
