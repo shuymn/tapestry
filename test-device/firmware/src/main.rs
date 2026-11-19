@@ -6,7 +6,8 @@
 //! crate runs it on the USB controller, the timer and the watchdog.
 //!
 //! All work runs as futures joined in one executor task, so a future that
-//! stops yielding stops the watchdog's feeder too.
+//! stops yielding stops the watchdog's feeder too; the feeder feeds only
+//! while the lease's timer runs ([`State::feed_due`]).
 
 #![no_std]
 #![no_main]
@@ -15,13 +16,16 @@ mod device;
 
 use core::cell::RefCell;
 use core::fmt::Write as _;
+use core::future::poll_fn;
+use core::task::Poll;
 
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join5};
 use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::USB;
+use embassy_rp::peripherals::{TRNG, USB};
+use embassy_rp::trng::{self, Trng};
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_rp::watchdog::{ResetReason, Watchdog};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -36,7 +40,10 @@ use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Config, Handler};
 use static_cell::ConstStaticCell;
 use test_device::boot::{self, Action, Cause};
-use test_device::device::{Hardware as _, Kind, Link, Next, Outcome, State};
+use test_device::device::{
+    Connection, FEED_EVERY_US, Hardware as _, Kind, Link, Next, Outcome, SLOW_WATCHDOG_US, State,
+    WATCHDOG_US,
+};
 use test_device::faults::Fault;
 use test_device::lease::Reason;
 use test_device::mode::Mode;
@@ -50,16 +57,19 @@ use crate::device::Pico;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
+    TRNG_IRQ => trng::InterruptHandler<TRNG>;
 });
 
 static STATE: ConstStaticCell<RefCell<State>> = ConstStaticCell::new(RefCell::new(State::new()));
 
-/// The watchdog's timeout, and how often the feeder feeds it.
-const WATCHDOG: Duration = Duration::from_secs(2);
-const SLOW_WATCHDOG: Duration = Duration::from_secs(8);
-const FEED_EVERY: Duration = Duration::from_millis(250);
+/// The watchdog's timeout, and how often the feeder asks to feed it.
+const WATCHDOG: Duration = Duration::from_micros(WATCHDOG_US);
+const SLOW_WATCHDOG: Duration = Duration::from_micros(SLOW_WATCHDOG_US);
+const FEED_EVERY: Duration = Duration::from_micros(FEED_EVERY_US);
 /// How often the lease's own timer checks the deadline.
 const LEASE_TICK: Duration = Duration::from_micros(500);
+/// How long the boot waits for the TRNG's draw before it counts as failed.
+const DRAW_TIMEOUT: Duration = Duration::from_millis(50);
 /// The longest `detach`.
 const MAX_DETACH_MS: u32 = 10_000;
 /// The interfaces: the keyboard's, the pad's, and the link's CDC
@@ -68,8 +78,10 @@ const KEYBOARD_INTERFACE: u8 = 0;
 const PAD_INTERFACE: u8 = 1;
 const LINK_INTERFACE: u16 = 2;
 
-type Line = heapless::String<{ protocol::MAX_LINE }>;
-type Answers = Channel<NoopRawMutex, Line, 8>;
+/// An answer or a trace record with its line feed.
+type Line = heapless::String<{ protocol::MAX_ANSWER }>;
+/// Answers with the connection of the command they answer.
+type Answers = Channel<NoopRawMutex, (Connection, Line), 8>;
 
 /// The µs since boot.
 fn now() -> u64 {
@@ -86,6 +98,18 @@ fn enter_bootsel(watchdog: &mut Watchdog) -> ! {
     embassy_rp::rom_data::reboot(0x0002 | 0x0100, 10, 0, 0);
     loop {
         cortex_m::asm::wfi();
+    }
+}
+
+/// The boot's 64 bits from the TRNG, the first half of every session
+/// token of this boot (docs/test-device.md "Lease and Disarm"); `None` when
+/// the draw does not complete in [`DRAW_TIMEOUT`] or reads a stuck value
+/// (all zeros or all ones), which leaves the boot without a token.
+async fn draw(mut rng: Trng<'_, TRNG>) -> Option<u64> {
+    let mut bytes = [0_u8; 8];
+    match select(rng.fill_bytes(&mut bytes), Timer::after(DRAW_TIMEOUT)).await {
+        Either::First(()) => Some(u64::from_le_bytes(bytes)).filter(|&d| d != 0 && d != u64::MAX),
+        Either::Second(()) => None,
     }
 }
 
@@ -108,8 +132,11 @@ async fn main(_spawner: Spawner) {
     device::boot_hang(&mut watchdog, cause);
     let mode = Mode::from_scratch(watchdog.get_scratch(0));
 
+    let draw = draw(Trng::new(p.TRNG, Irqs, trng::Config::default())).await;
+
     let state: &'static RefCell<State> = STATE.take();
     state.borrow_mut().set_boot(mode, cause, count);
+    state.borrow_mut().set_draw(draw);
     let watchdog = RefCell::new(watchdog);
 
     let driver = Driver::new(p.USB, Irqs);
@@ -160,16 +187,20 @@ async fn main(_spawner: Spawner) {
     let mut pad =
         HidWriter::<_, PAD_REPORT>::new(&mut builder, &mut pad_state, hid_config(PAD_DESCRIPTOR));
     let cdc = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
-    let (mut tx, mut rx) = cdc.split();
+    let (tx, mut rx) = cdc.split();
     let mut usb = builder.build();
     let answers = Answers::new();
 
+    // Each writer stages the report the logic decides, waits until the
+    // endpoint's buffer is free, then commits it (the deadline checked with
+    // the guard band, the report built, copied and handed) in one critical
+    // section ([`device::commit`]).
     let keyboard_loop = async {
         loop {
             keyboard.ready().await;
             let kind = wait_for_send(state, Ep::Keyboard).await;
-            let report = state.borrow_mut().keyboard_report(&Pico, kind);
-            if keyboard.write(&report).await.is_ok() {
+            buffer_free(Ep::Keyboard).await;
+            if device::commit(state, Ep::Keyboard, kind) {
                 state.borrow_mut().handed(&Pico, Ep::Keyboard);
             }
             complete(state, Ep::Keyboard).await;
@@ -179,8 +210,8 @@ async fn main(_spawner: Spawner) {
         loop {
             pad.ready().await;
             let kind = wait_for_send(state, Ep::Pad).await;
-            let report = state.borrow_mut().pad_report(&Pico, kind);
-            if pad.write(&report).await.is_ok() {
+            buffer_free(Ep::Pad).await;
+            if device::commit(state, Ep::Pad, kind) {
                 state.borrow_mut().handed(&Pico, Ep::Pad);
             }
             complete(state, Ep::Pad).await;
@@ -192,12 +223,12 @@ async fn main(_spawner: Spawner) {
         }
     };
     let link_in = receive(&mut rx, state, &answers, &watchdog);
-    let link_out = send(&mut tx, state, &answers);
+    let link_out = send(&tx, state, &answers);
     let lease_timer = async {
         loop {
             Timer::after(LEASE_TICK).await;
             let mut s = state.borrow_mut();
-            s.expire(&Pico);
+            s.timer(&Pico);
             let t = now();
             if s.clear_counter_due(t) {
                 watchdog.borrow_mut().set_scratch(1, boot::word(0));
@@ -214,10 +245,15 @@ async fn main(_spawner: Spawner) {
     };
     let feeder = async {
         loop {
-            let slow = state.borrow().fault(&Pico, Fault::SlowWatchdog).is_some();
-            watchdog
-                .borrow_mut()
-                .feed(if slow { SLOW_WATCHDOG } else { WATCHDOG });
+            {
+                let mut s = state.borrow_mut();
+                if s.feed_due() {
+                    let slow = s.fault(&Pico, Fault::SlowWatchdog).is_some();
+                    watchdog
+                        .borrow_mut()
+                        .feed(if slow { SLOW_WATCHDOG } else { WATCHDOG });
+                }
+            }
             Timer::after(FEED_EVERY).await;
         }
     };
@@ -296,6 +332,14 @@ async fn wait_for_send(state: &RefCell<State>, ep: Ep) -> Kind {
     }
 }
 
+/// Waits until `ep`'s buffer is free (AVAILABLE clear), polling it and
+/// yielding between polls.
+async fn buffer_free(ep: Ep) {
+    while Pico.buffer(ep).available {
+        yield_now().await;
+    }
+}
+
 /// Waits until the host takes `ep`'s pending report (or it is revoked),
 /// polling the buffer's AVAILABLE bit and yielding between polls.
 async fn complete(state: &RefCell<State>, ep: Ep) {
@@ -304,16 +348,20 @@ async fn complete(state: &RefCell<State>, ep: Ep) {
     }
 }
 
-fn answer(answers: &Answers, a: &Answer<'_>) {
+/// Queues `a` with its line feed for the connection of the command it
+/// answers; an answer longer than [`protocol::MAX_ANSWER`] is not sent.
+fn answer(answers: &Answers, connection: Connection, a: &Answer<'_>) {
     let mut line = Line::new();
-    if write!(line, "{a}").is_ok() {
-        let _ = answers.try_send(line);
+    if writeln!(line, "{a}").is_ok() {
+        let _ = answers.try_send((connection, line));
     }
 }
 
 /// Reads command lines in packets through [`Link`], which keeps them
-/// within one connection of the link; [`Bus`] takes the control requests
-/// that end one. A failed read (a disconnect) ends one too.
+/// within one connection of the link and holds a packet while the output
+/// of the connection before it is not retired
+/// ([`State::end_connection`]); [`Bus`] takes the control requests that
+/// end one. A failed read (a disconnect) ends one too.
 async fn receive<'d, D: embassy_usb::driver::Driver<'d>>(
     rx: &mut Receiver<'d, D>,
     state: &RefCell<State>,
@@ -330,90 +378,128 @@ async fn receive<'d, D: embassy_usb::driver::Driver<'d>>(
                 loop {
                     // Not borrowed across the outcome's await.
                     let outcome = link.next(&mut state.borrow_mut(), &Pico, bytes, &mut at);
-                    let Some(outcome) = outcome else { break };
-                    run(outcome, state, answers, watchdog).await;
+                    match outcome {
+                        None => break,
+                        Some(Outcome::Hold) => yield_now().await,
+                        Some(outcome) => {
+                            run(outcome, link.connection(), state, answers, watchdog).await;
+                        }
+                    }
                 }
             }
             Err(_) => {
-                state.borrow_mut().link_lost();
+                state.borrow_mut().read_failed(&Pico);
                 rx.wait_connection().await;
             }
         }
     }
 }
 
-/// Writes one line in packets, ending a full last packet with a short one
-/// so the host completes the transfer. Gives up on a host that stops
-/// reading.
-async fn write_line<'d, D: embassy_usb::driver::Driver<'d>>(tx: &mut Sender<'d, D>, line: &[u8]) {
+/// Writes one packet of `connection`: false when its connection ended
+/// first or the host took nothing for 100 ms. Each poll asks the
+/// connection and reads the IN buffer, and writes the packet in that same
+/// poll ([`device::poll_link_write`]), so a connection that ended before
+/// the poll is never written to; output already handed is retired at the
+/// end itself ([`State::end_connection`]).
+async fn write_packet(state: &RefCell<State>, connection: Connection, packet: &[u8]) -> bool {
+    let write = poll_fn(
+        |cx| match device::poll_link_write(state, connection, packet) {
+            Some(written) => Poll::Ready(written),
+            None => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        },
+    );
+    matches!(
+        select(write, Timer::after_millis(100)).await,
+        Either::First(true)
+    )
+}
+
+/// Writes one line of `connection` in packets, ending a full last packet
+/// with a short one so the host completes the transfer. A packet whose
+/// connection ended is not written ([`write_packet`]), and the rest of
+/// the line is abandoned with it, so no byte of it reaches the next
+/// connection. Gives up on a host that stops reading.
+async fn write_line<'d, D: embassy_usb::driver::Driver<'d>>(
+    tx: &Sender<'d, D>,
+    state: &RefCell<State>,
+    connection: Connection,
+    line: &[u8],
+) {
     if !tx.dtr() {
         return;
     }
     let mut chunks = line.chunks(64).peekable();
     let mut last_full = false;
     while let Some(chunk) = chunks.next() {
-        let sent = select(tx.write_packet(chunk), Timer::after_millis(100)).await;
-        if !matches!(sent, Either::First(Ok(()))) {
+        if !write_packet(state, connection, chunk).await {
             return;
         }
         last_full = chunks.peek().is_none() && chunk.len() == 64;
     }
     if last_full {
-        let _ = select(tx.write_packet(&[]), Timer::after_millis(100)).await;
+        write_packet(state, connection, &[]).await;
     }
 }
 
-/// Sends answers and trace records in the order made.
+/// Sends answers and trace records in the order made, each only within
+/// its connection.
 async fn send<'d, D: embassy_usb::driver::Driver<'d>>(
-    tx: &mut Sender<'d, D>,
+    tx: &Sender<'d, D>,
     state: &RefCell<State>,
     answers: &Answers,
 ) {
     loop {
-        if let Either::First(mut line) = select(answers.receive(), device::KICK_TRACE.wait()).await
+        if let Either::First((connection, line)) =
+            select(answers.receive(), device::KICK_TRACE.wait()).await
         {
-            let _ = line.push('\n');
-            write_line(tx, line.as_bytes()).await;
+            write_line(tx, state, connection, line.as_bytes()).await;
         }
         loop {
             let record = state.borrow_mut().next_record();
-            let Some(r) = record else { break };
+            let Some((connection, r)) = record else { break };
             let mut line = Line::new();
             if writeln!(line, "{r}").is_ok() {
-                write_line(tx, line.as_bytes()).await;
+                write_line(tx, state, connection, line.as_bytes()).await;
             }
         }
     }
 }
 
-/// Finishes what the device logic hands back for one command.
+/// Finishes what the device logic hands back for one command read in
+/// `connection`.
 async fn run(
     outcome: Outcome,
+    connection: Connection,
     state: &RefCell<State>,
     answers: &Answers,
     watchdog: &RefCell<Watchdog>,
 ) {
     match outcome {
-        Outcome::Answer(a) => answer(answers, &a),
+        Outcome::Answer(a) => answer(answers, connection, &a),
         Outcome::Hello => {
             let hello = state.borrow_mut().hello(env!("TEST_DEVICE_BUILD"));
-            answer(answers, &Answer::Hello(hello));
+            answer(answers, connection, &Answer::Hello(hello));
         }
         Outcome::Mode(mode) => {
             watchdog.borrow_mut().set_scratch(0, mode.scratch());
-            answer(answers, &Answer::Ok);
+            answer(answers, connection, &Answer::Ok);
             Timer::after_millis(50).await;
             watchdog.borrow_mut().trigger_reset();
         }
-        Outcome::Flush => flush(state).await,
+        Outcome::Flush => flush(state, connection).await,
         Outcome::Bootsel => {
-            answer(answers, &Answer::Ok);
+            answer(answers, connection, &Answer::Ok);
             Timer::after_millis(20).await;
             enter_bootsel(&mut watchdog.borrow_mut());
         }
         Outcome::Detach(ms) => {
-            answer(answers, &Answer::Ok);
+            answer(answers, connection, &Answer::Ok);
             Timer::after_millis(20).await;
+            // Leaving the bus ends the connection.
+            state.borrow_mut().end_connection(&Pico, Reason::Detached);
             embassy_rp::pac::USB
                 .sie_ctrl()
                 .modify(|w| w.set_pullup_en(false));
@@ -424,25 +510,38 @@ async fn run(
         }
         Outcome::Fault { fault, arg } => {
             let a = fault_command(state, watchdog, fault, arg);
-            answer(answers, &a);
+            answer(answers, connection, &a);
         }
+        // [`receive`] waits on it and never runs it.
+        Outcome::Hold => {}
+        // A grant past the connection's last number: leaving the bus by a
+        // reboot ends the connection and every input the host holds from
+        // this device, with nothing answered.
+        Outcome::Reboot => watchdog.borrow_mut().trigger_reset(),
     }
 }
 
 /// Waits until every endpoint's pending report completes, bounded by two
 /// intervals plus 10 ms; then records each still pending as `P` and ends
-/// with `F`, after every buffered record.
-async fn flush(state: &RefCell<State>) {
+/// with `F`, after every buffered record. A `flush` whose connection ends
+/// while it waits is abandoned.
+async fn flush(state: &RefCell<State>, connection: Connection) {
     let interval = u64::from(state.borrow().mode().rate.interval_us());
     let deadline = now() + 2 * interval + 10_000;
     loop {
-        let clear = state.borrow_mut().flush_poll(&Pico);
+        let clear = {
+            let mut s = state.borrow_mut();
+            if !s.is_current(connection) {
+                return;
+            }
+            s.flush_poll(&Pico)
+        };
         if clear || now() >= deadline {
             break;
         }
         yield_now().await;
     }
-    state.borrow_mut().flush_end(&Pico);
+    state.borrow_mut().flush_end(&Pico, connection);
 }
 
 #[cfg(feature = "debug-faults")]

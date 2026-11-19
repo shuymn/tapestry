@@ -10,11 +10,13 @@ use crate::faults::Fault;
 use crate::faults::Faults;
 use crate::lease::{Lease, Reason, Refusal};
 use crate::mode::{Mode, Rate, Reporting};
-use crate::protocol::{Answer, Change, Command, Control, Error, Hello, Item, MAX_LINE, VERSION};
+use crate::protocol::{
+    Answer, Change, Command, Control, Error, Hello, Item, LeaseId, MAX_LINE, Token, VERSION,
+};
 use crate::report::{KEYBOARD_REPORT, KeyboardReport, PAD_REPORT, PadReport};
 use crate::revoke::{self, DISARM_AFTER_C0, K1_AFTER_C0, PROBE_AFTER_K1};
 use crate::schedule::{Refused, Schedule};
-use crate::trace::{Association, Body, Done, Ep, Ring, TrialRun};
+use crate::trace::{Association, Body, Done, Ep, Record, Ring, TrialRun};
 
 /// Trace records the device buffers.
 pub const RING: usize = 1024;
@@ -37,6 +39,27 @@ pub const SET_LINE_CODING: u8 = 0x20;
 pub const SET_CONTROL_LINE_STATE: u8 = 0x22;
 /// The line coding that asks for BOOTSEL.
 pub const BOOTSEL_BAUD: u32 = 1200;
+/// The watchdog's timeout, µs, and its timeout under the `watchdog-8s`
+/// fault.
+pub const WATCHDOG_US: u64 = 2_000_000;
+pub const SLOW_WATCHDOG_US: u64 = 8_000_000;
+/// How often the feeder asks whether to feed the watchdog
+/// ([`State::feed_due`]), µs.
+pub const FEED_EVERY_US: u64 = 250_000;
+/// The guard band before a lease's deadline at a report's commit, µs: a
+/// commit whose clock sample lies within it ends the lease
+/// ([`State::commit`]). It covers what follows the sample in the commit's
+/// critical section: building the report, copying it to the controller's
+/// buffer and the AVAILABLE write, measured on the board at 31.8 µs at most
+/// (instructions fetched through a cold flash cache), with about three
+/// times that as headroom (docs/test-device.md "Lease and Disarm").
+pub const COMMIT_MARGIN_US: u64 = 100;
+/// The longest report.
+pub const MAX_REPORT: usize = if KEYBOARD_REPORT > PAD_REPORT {
+    KEYBOARD_REPORT
+} else {
+    PAD_REPORT
+};
 
 /// An IN endpoint's buffer control in the controller's DPRAM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -69,6 +92,10 @@ pub trait Hardware {
     fn kick(&self, ep: Ep);
     /// Wakes the link's sender: trace records wait.
     fn kick_trace(&self);
+    /// Withdraws output an ended connection left in the link's IN buffer,
+    /// as a disarm revokes a report: false when the controller never
+    /// acknowledged the abort, which then touched nothing.
+    fn retire_link_output(&self) -> bool;
 }
 
 /// The report length of `ep`.
@@ -190,6 +217,41 @@ pub enum Kind {
     Neutral,
 }
 
+/// A report's bytes as [`State::commit`] fixed them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Report {
+    bytes: [u8; MAX_REPORT],
+    len: usize,
+}
+
+impl Report {
+    fn new(report: &[u8]) -> Self {
+        let mut bytes = [0; MAX_REPORT];
+        let len = report.len().min(MAX_REPORT);
+        if let (Some(to), Some(from)) = (bytes.get_mut(..len), report.get(..len)) {
+            to.copy_from_slice(from);
+        }
+        Self { bytes, len }
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// What the link's sender does in one poll of a packet's write
+/// ([`State::link_write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkWrite {
+    /// Hand the packet to the link's IN buffer in this poll.
+    Write,
+    /// The packet's connection ended: abandon it.
+    Cancel,
+    /// The IN buffer still holds the last packet: poll again.
+    Wait,
+}
+
 /// What an endpoint's writer does next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Next {
@@ -256,6 +318,15 @@ pub enum Outcome {
     Detach(u32),
     /// A debug fault ([`State::set_fault`] in a `debug-faults` build).
     Fault { fault: Fault, arg: i64 },
+    /// The packet waits, unread: the ended connection's output was not
+    /// retired, and the device recovers by rebooting
+    /// ([`State::end_connection`]).
+    Hold,
+    /// Reboot now, answering nothing: a grant past the connection's last
+    /// number. Leaving the bus ends the connection, and with it everything
+    /// the host holds from the device, so no reply of the connection can
+    /// reach a later read.
+    Reboot,
 }
 
 /// The control link's line framing: bytes in, lines out.
@@ -285,13 +356,15 @@ impl Framer {
         }
     }
 
-    /// Takes one byte: a frame at its line's end (empty lines give none),
-    /// or [`Frame::Overlong`] once per line past [`MAX_LINE`].
+    /// Takes one byte: a frame at its line's end, a line feed and nothing
+    /// else (an empty line is a frame too, and a carriage return is a byte
+    /// of the line), or [`Frame::Overlong`] once per line past
+    /// [`MAX_LINE`].
     fn push(&mut self, b: u8) -> Option<Frame<'_>> {
-        if b == b'\n' || b == b'\r' {
+        if b == b'\n' {
             let was_overlong = core::mem::take(&mut self.overlong);
             let n = core::mem::take(&mut self.len);
-            if was_overlong || n == 0 {
+            if was_overlong {
                 return None;
             }
             return Some(Frame::Line(self.buf.get(..n).unwrap_or(&[])));
@@ -320,15 +393,25 @@ impl Framer {
     }
 }
 
+/// One connection of the control link within a boot: what an answer, a
+/// trace record or a `flush` carries to the USB handoff, where the sender
+/// writes it only while it is current ([`State::is_current`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Connection(u64);
+
 /// The control link's receive side. A command acts only within the link
-/// connection that sent it: when the connection ends ([`State::session`]
+/// connection that sent it: when the connection ends ([`State::connection`]
 /// changes), the partial line goes, and so does the rest of a packet the
 /// device was still running when it ended. A packet counts as the
-/// connection in which the device reads it.
+/// connection in which the device reads it, and waits, unread, while the
+/// output of the connection before it is not retired ([`Outcome::Hold`]);
+/// a packet held while its own connection ends goes with it.
 #[derive(Debug)]
 pub struct Link {
     framer: Framer,
-    session: u32,
+    session: u64,
+    /// The packet being read waits for a retirement.
+    held: bool,
 }
 
 impl Default for Link {
@@ -343,12 +426,21 @@ impl Link {
         Self {
             framer: Framer::new(),
             session: 0,
+            held: false,
         }
+    }
+
+    /// The connection of the last outcome [`Link::next`] gave: its answer
+    /// and its `flush` belong to it.
+    #[must_use]
+    pub const fn connection(&self) -> Connection {
+        Connection(self.session)
     }
 
     /// The next outcome of `packet` from `*at` on, advancing `*at` past
     /// the bytes taken; `None` when the packet is done. Call it with `*at`
-    /// 0 for each packet read, and again after finishing each outcome.
+    /// 0 for each packet read, and again after finishing each outcome
+    /// ([`Outcome::Hold`] included, with the same `*at`).
     pub fn next(
         &mut self,
         state: &mut State,
@@ -356,15 +448,19 @@ impl Link {
         packet: &[u8],
         at: &mut usize,
     ) -> Option<Outcome> {
-        let session = state.session();
+        let session = state.session;
         if session != self.session {
             self.framer.reset();
             self.session = session;
-            if *at > 0 {
+            if *at > 0 || core::mem::take(&mut self.held) {
                 // Read in the connection that ended.
                 *at = packet.len();
                 return None;
             }
+        }
+        self.held = state.retire_due();
+        if self.held {
+            return Some(Outcome::Hold);
         }
         while let Some(&b) = packet.get(*at) {
             *at += 1;
@@ -402,8 +498,20 @@ pub struct State {
     /// When an abort went unacknowledged (µs since boot): nothing is sent
     /// any more and the device reboots [`RECOVERY_US`] later.
     recovery: Option<u64>,
-    /// The link's connection, counted up at each end of one.
-    session: u32,
+    /// The link's connection, counted up at each end of one and never
+    /// reused: the second half of its token while it fits 32 bits, and no
+    /// token after.
+    session: u64,
+    /// Every connection number is spent: no output goes any more.
+    spent: bool,
+    /// Output of an ended connection may still sit in the link's IN
+    /// buffer: its retirement was not acknowledged ([`State::retire_due`]).
+    retire: bool,
+    /// The lease's timer ran since the watchdog was last fed.
+    timer_ran: bool,
+    /// The 64 bits drawn from the TRNG at boot, the first half of every
+    /// token of this boot; `None` when the draw failed.
+    draw: Option<u64>,
     /// A line coding of [`BOOTSEL_BAUD`] arrived.
     bootsel: bool,
     /// The host configured the device and has not reset or unconfigured
@@ -444,6 +552,10 @@ impl State {
             trial: None,
             recovery: None,
             session: 0,
+            spent: false,
+            retire: false,
+            timer_ran: false,
+            draw: None,
             bootsel: false,
             configured: false,
             #[cfg(feature = "debug-faults")]
@@ -456,6 +568,20 @@ impl State {
         self.mode = mode;
         self.boot = cause;
         self.count = count;
+    }
+
+    /// The boot's TRNG draw, the first half of its tokens; `None` when it
+    /// failed, which refuses every grant `err session`.
+    pub const fn set_draw(&mut self, draw: Option<u64>) {
+        self.draw = draw;
+    }
+
+    /// The current connection's token; `None` when the boot has none: its
+    /// draw failed, or it spent the 32-bit connection count.
+    #[must_use]
+    pub fn token(&self) -> Option<Token> {
+        let count = u32::try_from(self.session).ok()?;
+        self.draw.map(|boot| Token { boot, count })
     }
 
     #[must_use]
@@ -551,9 +677,11 @@ impl State {
         }
     }
 
-    /// The oldest buffered trace record.
-    pub fn next_record(&mut self) -> Option<crate::trace::Record> {
-        self.ring.pop()
+    /// The oldest buffered trace record and the connection it belongs to,
+    /// which the sender compares before each packet of its line
+    /// ([`State::is_current`]).
+    pub fn next_record(&mut self) -> Option<(Connection, Record)> {
+        self.ring.pop().map(|r| (self.connection(), r))
     }
 
     /// The mode byte the pad reports.
@@ -604,12 +732,14 @@ impl State {
     }
 
     /// The host unconfigured the device (`SET_CONFIGURATION 0`), which
-    /// disables and reinitialises each endpoint.
+    /// disables and reinitialises each endpoint and ends the link's
+    /// connection and the lease ([`State::end_connection`]).
     pub fn unconfigured(&mut self, hw: &impl Hardware) {
         self.configured = false;
         for ep in [Ep::Keyboard, Ep::Pad] {
             self.reinitialised(hw, ep);
         }
+        self.end_connection(hw, Reason::Unconfigured);
     }
 
     /// The host selected an alternate setting of `ep`'s interface
@@ -661,7 +791,10 @@ impl State {
         if self.recovering() {
             return Next::Idle;
         }
+        // Before a report that may not be neutral: a lease past its
+        // deadline ends here, whether or not its timer has run.
         let t = hw.now();
+        self.check_deadline(hw, t);
         let e = self.ep_ref(ep);
         if e.owed > 0 {
             return if e.neutral_seq.is_none() {
@@ -738,10 +871,33 @@ impl State {
         Some(next)
     }
 
-    /// The pad report to send now, fixing its R. It carries report k−1's H
-    /// and C only when k−1 is the last report the host took.
-    pub fn pad_report(&mut self, hw: &impl Hardware, kind: Kind) -> [u8; PAD_REPORT] {
-        let ready = self.out(hw.now());
+    /// The report `ep` hands now, of the `kind` [`State::next_report`]
+    /// decided (staged before the endpoint's buffer was free), committed at
+    /// `now`: the clock sample the firmware takes inside the critical
+    /// section that then copies the report to the controller's buffer and
+    /// sets AVAILABLE, so nothing runs between the check and the handoff.
+    /// A lease whose deadline lies within [`COMMIT_MARGIN_US`] of `now` ends
+    /// here (`expired`): a pressed report commits only while `now` plus the
+    /// margin is before the deadline. A report committed while a release
+    /// is owed on `ep`, by that end or by anything since it was staged, is
+    /// the owed neutral report. Fixes the report's R at `now`.
+    pub fn commit(&mut self, hw: &impl Hardware, ep: Ep, kind: Kind, now: u64) -> Report {
+        self.check_deadline(hw, now.saturating_add(COMMIT_MARGIN_US));
+        let kind = if self.ep_ref(ep).owed > 0 {
+            Kind::Neutral
+        } else {
+            kind
+        };
+        match ep {
+            Ep::Keyboard => Report::new(&self.keyboard_report(kind, now)),
+            Ep::Pad => Report::new(&self.pad_report(hw, kind, now)),
+        }
+    }
+
+    /// The pad report of `kind` committed at `t`. It carries report k−1's
+    /// H and C only when k−1 is the last report the host took.
+    fn pad_report(&mut self, hw: &impl Hardware, kind: Kind, t: u64) -> [u8; PAD_REPORT] {
+        let ready = self.out(t);
         let mode = self.mode_byte(hw);
         let buttons = match kind {
             Kind::Current => self.buttons,
@@ -771,9 +927,9 @@ impl State {
         report.encode()
     }
 
-    /// The keyboard report to send now, fixing its R.
-    pub fn keyboard_report(&mut self, hw: &impl Hardware, kind: Kind) -> [u8; KEYBOARD_REPORT] {
-        let ready = self.out(hw.now());
+    /// The keyboard report of `kind` committed at `t`.
+    fn keyboard_report(&mut self, kind: Kind, t: u64) -> [u8; KEYBOARD_REPORT] {
+        let ready = self.out(t);
         let keys = match kind {
             Kind::Current => self.keys,
             Kind::Neutral => KeyboardReport::NEUTRAL,
@@ -1002,16 +1158,60 @@ impl State {
         }
     }
 
-    /// The lease's own timer: disarms at the deadline.
-    pub fn expire(&mut self, hw: &impl Hardware) {
-        if self.lease.expired(hw.now()) {
+    /// One run of the lease's own timer: disarms at the deadline, and
+    /// records the run for the watchdog's feeder ([`State::feed_due`]).
+    pub fn timer(&mut self, hw: &impl Hardware) {
+        let t = hw.now();
+        self.check_deadline(hw, t);
+        self.timer_ran = true;
+    }
+
+    /// Whether the feeder may feed the watchdog now: only when the lease's
+    /// timer ran since the last feed, so a stalled timer, the deadline's
+    /// last resort, ends in the watchdog's reset.
+    pub const fn feed_due(&mut self) -> bool {
+        core::mem::replace(&mut self.timer_ran, false)
+    }
+
+    /// The deadline checked where authority is used, at `t`, the one clock
+    /// sample the decision it guards reads: before a renewal or a held
+    /// change is accepted, as a writer asks for its next report, and at a
+    /// report's commit (with the guard band, [`State::commit`]), a lease
+    /// whose deadline has passed ends, whether or not its timer has run.
+    fn check_deadline(&mut self, hw: &impl Hardware, t: u64) {
+        if self.lease.expired(t) {
             self.disarm(hw, Reason::Expired);
         }
     }
 
-    /// One frame from the control link. A frame that is not a command ends
-    /// the lease ([`Reason::Protocol`]) and is answered with its error.
-    /// `None`: the parser-off fault drops it.
+    /// Whether output of an ended connection may still sit in the link's
+    /// IN buffer, its retirement unacknowledged: the next connection's
+    /// input is not acted on ([`Outcome::Hold`]) until the device reboots.
+    const fn retire_due(&self) -> bool {
+        self.retire
+    }
+
+    /// The link's IN buffer was aborted at a connection's end. Without the
+    /// controller's acknowledgement the output stays unretired and the
+    /// device recovers by rebooting ([`RECOVERY_US`]).
+    fn retired(&mut self, hw: &impl Hardware, acknowledged: bool) {
+        if acknowledged {
+            self.retire = false;
+        } else {
+            self.recovery.get_or_insert(hw.now());
+        }
+    }
+
+    /// Starts the connection count at `count`.
+    #[cfg(test)]
+    pub(crate) fn set_count(&mut self, count: u32) {
+        self.session = u64::from(count);
+    }
+
+    /// One frame from the control link. A frame that is not a command in
+    /// its one form ([`Command::parse_canonical`]) ends the lease
+    /// ([`Reason::Protocol`]) and is answered with its error. `None`: the
+    /// parser-off fault drops it.
     pub fn frame(&mut self, hw: &impl Hardware, frame: Frame<'_>) -> Option<Outcome> {
         if self.fault(hw, Fault::ParserOff).is_some() {
             return None;
@@ -1019,7 +1219,7 @@ impl State {
         let parsed = match frame {
             Frame::Line(bytes) => core::str::from_utf8(bytes)
                 .ok()
-                .and_then(Command::parse)
+                .and_then(Command::parse_canonical)
                 .ok_or(Error::Syntax),
             Frame::Overlong => Err(Error::Overlong),
         };
@@ -1032,16 +1232,68 @@ impl State {
         })
     }
 
-    /// The link's connection, which [`Link`] keeps its lines within.
+    /// The link's current connection.
     #[must_use]
-    pub const fn session(&self) -> u32 {
-        self.session
+    pub const fn connection(&self) -> Connection {
+        Connection(self.session)
     }
 
-    /// The link's connection ended without a request saying so: a read
-    /// error or a disconnect. The bus events disarm.
-    pub const fn link_lost(&mut self) {
-        self.session = self.session.wrapping_add(1);
+    /// Whether output of `connection` (an answer, a trace record, a
+    /// `flush`) may still go to the host: only while that connection is
+    /// the current one.
+    #[must_use]
+    pub fn is_current(&self, connection: Connection) -> bool {
+        connection == self.connection() && !self.spent
+    }
+
+    /// The link's sender in one poll of a packet's write for `connection`,
+    /// `buffer_free` read from the link's IN buffer in that poll: the
+    /// connection is asked first, so a packet whose connection ended is
+    /// abandoned even when the buffer came free in the same instant, and a
+    /// [`LinkWrite::Write`] hands the packet in that poll. With the
+    /// retirement at the connection's end ([`State::end_connection`]), no
+    /// byte of an ended connection reaches the next.
+    #[must_use]
+    pub fn link_write(&self, connection: Connection, buffer_free: bool) -> LinkWrite {
+        if !self.is_current(connection) {
+            LinkWrite::Cancel
+        } else if buffer_free {
+            LinkWrite::Write
+        } else {
+            LinkWrite::Wait
+        }
+    }
+
+    /// Ends the link's connection: every path that ends one in place comes
+    /// here (DTR dropped or the port closed and a failed read,
+    /// [`Reason::Closed`]; a bus reset; an unconfiguration; `detach`). A
+    /// grant past the connection's last number reboots the device instead
+    /// ([`Outcome::Reboot`]). The lease ends for `reason`, the next
+    /// connection's grants are numbered from 1 under its own token, the
+    /// trace turns off and its buffered records are dropped; output still
+    /// queued for the ended connection is no longer current. Output already
+    /// in the link's IN buffer is retired here, before anything else, so
+    /// the host cannot take it after the end; without the controller's
+    /// acknowledgement the next connection's input waits until the device
+    /// reboots.
+    pub fn end_connection(&mut self, hw: &impl Hardware, reason: Reason) {
+        match self.session.checked_add(1) {
+            Some(next) => self.session = next,
+            None => self.spent = true,
+        }
+        self.retire = true;
+        let acknowledged = hw.retire_link_output();
+        self.retired(hw, acknowledged);
+        self.disarm(hw, reason);
+        self.lease.new_connection();
+        self.tracing = false;
+        self.ring.clear();
+    }
+
+    /// The link's read failed (a disconnect): the connection ends as when
+    /// the port closes.
+    pub fn read_failed(&mut self, hw: &impl Hardware) {
+        self.end_connection(hw, Reason::Closed);
     }
 
     /// The bus reset: the link's connection ends and the lease with it.
@@ -1050,8 +1302,7 @@ impl State {
     /// them.
     pub fn bus_reset(&mut self, hw: &impl Hardware) {
         self.configured = false;
-        self.link_lost();
-        self.disarm(hw, Reason::Reset);
+        self.end_connection(hw, Reason::Reset);
     }
 
     /// A class request to the link's control interface, taken as the
@@ -1062,8 +1313,7 @@ impl State {
     pub fn cdc_request(&mut self, hw: &impl Hardware, request: u8, value: u16, data: &[u8]) {
         match request {
             SET_CONTROL_LINE_STATE if value & 1 == 0 => {
-                self.link_lost();
-                self.disarm(hw, Reason::Closed);
+                self.end_connection(hw, Reason::Closed);
             }
             SET_LINE_CODING => {
                 let rate = data.first_chunk::<4>().map(|b| u32::from_le_bytes(*b));
@@ -1086,6 +1336,18 @@ impl State {
         self.schedule.armed() || self.trial.is_some()
     }
 
+    /// The held lease's number when `id` names it: a held change acts only
+    /// under the lease it names, after the deadline is checked.
+    fn named(&mut self, hw: &impl Hardware, id: LeaseId) -> Result<u32, Refusal> {
+        let t = hw.now();
+        self.check_deadline(hw, t);
+        let held = self.lease.held().ok_or(Refusal::NoLease)?;
+        if Some(id.token) != self.token() || id.n != held {
+            return Err(Refusal::WrongId);
+        }
+        Ok(held)
+    }
+
     /// Runs `cmd`, or says what the firmware does with it.
     pub fn command(&mut self, hw: &impl Hardware, cmd: Command) -> Outcome {
         let answer = match cmd {
@@ -1098,28 +1360,51 @@ impl State {
                 self.disarm(hw, Reason::Detached);
                 return Outcome::Detach(ms);
             }
-            Command::Lease { ms } => {
-                let granted = self.lease.grant(hw.now(), ms);
-                hw.kick(Ep::Pad);
-                match granted {
-                    Ok((id, deadline)) => Answer::Leased {
-                        id,
-                        deadline: self.out(deadline),
-                    },
-                    Err(r) => Answer::Err(Error::Lease(r)),
+            Command::Lease {
+                token,
+                ms,
+                deadline,
+            } => {
+                if self.token() == Some(token) {
+                    match self.lease.grant(hw.now(), ms, self.inward(deadline)) {
+                        Ok((n, deadline)) => {
+                            hw.kick(Ep::Pad);
+                            Answer::Leased {
+                                id: LeaseId { token, n },
+                                deadline: self.out(deadline),
+                            }
+                        }
+                        // The connection's grant numbers are spent: the
+                        // device reboots, answering nothing, rather than
+                        // end the connection in place. No lease is held.
+                        Err(Refusal::Session) => return Outcome::Reboot,
+                        Err(r) => Answer::Err(Error::Lease(r)),
+                    }
+                } else {
+                    Answer::Err(Error::Lease(Refusal::Session))
                 }
             }
-            Command::Renew { id } => match self.lease.renew(id, hw.now()) {
-                Ok(deadline) => Answer::Leased {
-                    id,
-                    deadline: self.out(deadline),
-                },
-                Err(r) => Answer::Err(Error::Lease(r)),
-            },
-            Command::Set(change) => {
+            Command::Renew { id, deadline } => {
+                if self.token() == Some(id.token) {
+                    // Before the renewal, at the instant it is judged at: a
+                    // lease past its deadline has ended.
+                    let t = hw.now();
+                    self.check_deadline(hw, t);
+                    match self.lease.renew(id.n, t, self.inward(deadline)) {
+                        Ok(deadline) => Answer::Leased {
+                            id,
+                            deadline: self.out(deadline),
+                        },
+                        Err(r) => Answer::Err(Error::Lease(r)),
+                    }
+                } else {
+                    Answer::Err(Error::Lease(Refusal::Session))
+                }
+            }
+            Command::Set { id, change } => {
                 let ep = change.control.ep();
-                if self.lease.held().is_none() {
-                    Answer::Err(Error::Lease(Refusal::NoLease))
+                if let Err(r) = self.named(hw, id) {
+                    Answer::Err(Error::Lease(r))
                 } else if self.busy() {
                     Answer::Err(Error::Playing)
                 } else if self.ep(ep).changes.push_back(change) {
@@ -1149,7 +1434,7 @@ impl State {
                 } else if self.trial.is_some() {
                     Answer::Err(Error::Playing)
                 } else {
-                    match self.lease.arm(id) {
+                    match self.named(hw, id).and_then(|n| self.lease.arm(n)) {
                         Ok(()) => {
                             let start = self.inward(at);
                             self.schedule.arm(start);
@@ -1180,14 +1465,20 @@ impl State {
                 self.disarm(hw, Reason::Released);
                 Answer::Ok
             }
-            Command::RevokeTest { ep, trial } => self.start_trial(hw, ep, trial),
+            Command::RevokeTest { id, ep, trial } => self.start_trial(hw, id, ep, trial),
         };
         Outcome::Answer(answer)
     }
 
-    /// Starts revocation trial `number` on `ep` under the held lease, which
-    /// the trial ends: 125 Hz on change, nothing armed, held or owed.
-    fn start_trial(&mut self, hw: &impl Hardware, ep: Ep, number: u32) -> Answer<'static> {
+    /// Starts revocation trial `number` on `ep` under the lease `id` names,
+    /// which the trial ends: 125 Hz on change, nothing armed, held or owed.
+    fn start_trial(
+        &mut self,
+        hw: &impl Hardware,
+        id: LeaseId,
+        ep: Ep,
+        number: u32,
+    ) -> Answer<'static> {
         let wanted = Mode {
             rate: Rate::Hz125,
             reporting: Reporting::OnChange,
@@ -1198,8 +1489,8 @@ impl State {
         if self.mode != wanted {
             return Answer::Err(Error::Mode);
         }
-        if self.lease.held().is_none() {
-            return Answer::Err(Error::Lease(Refusal::NoLease));
+        if let Err(r) = self.named(hw, id) {
+            return Answer::Err(Error::Lease(r));
         }
         let e = self.ep_ref(ep);
         let idle = e.changes.is_empty() && e.owed == 0 && e.assoc.pending().is_none();
@@ -1215,6 +1506,24 @@ impl State {
         Answer::Ok
     }
 
+    /// Whether the device holds nothing the host could still see pressed:
+    /// no lease, nothing armed or playing, and on each endpoint nothing
+    /// held, queued, pending or owed, with the last report the host took
+    /// neutral. The axis keeps its position and does not count.
+    #[must_use]
+    pub fn quiet(&self) -> bool {
+        self.lease.held().is_none()
+            && !self.busy()
+            && [Ep::Keyboard, Ep::Pad].into_iter().all(|ep| {
+                let e = self.ep_ref(ep);
+                self.held_neutral(ep)
+                    && e.changes.is_empty()
+                    && e.assoc.pending().is_none()
+                    && e.owed == 0
+                    && e.delivered_neutral
+            })
+    }
+
     /// The `hello` answer; a `hello` answered counts toward a healthy run.
     pub fn hello<'a>(&mut self, build: &'a str) -> Hello<'a> {
         self.hello_answered = true;
@@ -1228,6 +1537,9 @@ impl State {
             boot: self.boot,
             count: self.count,
             identified: self.identified(),
+            faults: cfg!(feature = "debug-faults"),
+            quiet: self.quiet(),
+            session: self.token(),
         }
     }
 
@@ -1238,9 +1550,13 @@ impl State {
         keyboard && pad
     }
 
-    /// `flush`'s end: `P` for each report still pending, after every
-    /// buffered record, then `F`.
-    pub fn flush_end(&mut self, hw: &impl Hardware) {
+    /// `flush`'s end for the `flush` of `connection`: `P` for each report
+    /// still pending, after every buffered record, then `F`. A `flush`
+    /// whose connection ended is abandoned: nothing, and false.
+    pub fn flush_end(&mut self, hw: &impl Hardware, connection: Connection) -> bool {
+        if !self.is_current(connection) {
+            return false;
+        }
         for ep in [Ep::Keyboard, Ep::Pad] {
             if let Some(seq) = self.ep_ref(ep).assoc.pending() {
                 self.ring.push(Body::Pending { ep, seq });
@@ -1248,6 +1564,7 @@ impl State {
         }
         self.ring.push(Body::Flushed);
         hw.kick_trace();
+        true
     }
 }
 
