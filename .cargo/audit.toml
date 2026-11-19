@@ -12,6 +12,18 @@ ignore = [
     # the Windows font file under fontdb. Remove when a cosmic-text release
     # under glyphon drops ttf-parser 0.25.
     "RUSTSEC-2026-0192",
+    # `heapless` 0.8 soundness advisories (fixed in 0.9.4): only through
+    # usb-device 0.3.2 in the test device firmware, whose code it never runs.
+    # Remove when usb-device moves to heapless >= 0.9.4.
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
     # `bare-metal` 0.2 deprecated (no advisory against its code), through
     # cortex-m 0.7 in the test device firmware. Remove when the firmware's
     # cortex-m drops bare-metal.
