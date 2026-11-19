@@ -69,7 +69,7 @@ impl PlaySkin for Scene {
 fn frame(r: &mut Renderer) -> Vec<u8> {
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     assert_eq!(timing.dropped, 0);
     r.read_back()
 }
@@ -638,7 +638,7 @@ fn one_renderer_resized_minimized_and_restored() {
     assert!(
         r.frame(&input(&v, now, TimeUs(0), &[judged]))
             .unwrap()
-            .presented
+            .presented()
     );
     // An offscreen frame waits at most 100 ms for the one before and is
     // skipped past it; the first frame on WARP can take longer, so it is
@@ -649,7 +649,7 @@ fn one_renderer_resized_minimized_and_restored() {
         assert!(!r.is_minimized());
         assert_eq!(r.target(), [w, h]);
         let timing = r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
-        assert!(timing.presented);
+        assert!(timing.presented());
         let p = r.read_back();
         let got = note_center_in(&p, r.size(), l5);
         assert!(
@@ -670,7 +670,7 @@ fn one_renderer_resized_minimized_and_restored() {
     assert!(r.is_minimized());
     assert_eq!(r.target(), [1_920, 1_200]);
     let timing = r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
-    assert!(!timing.presented);
+    assert_eq!(timing.outcome, render::FrameOutcome::Invisible, "minimized");
     shown(&mut r, (1_920, 1_200), (544, 672, 673.33));
     shown(&mut r, (1_280, 1_024), (362, 448, 560.89));
 }
@@ -764,7 +764,7 @@ fn a_refused_frame_submits_nothing_until_the_next_preparation() {
     assert_eq!(r.refused(), Some(BuildError::InconsistentTally));
     let not_submitted = |r: &mut Renderer| {
         let timing = r.submit().unwrap();
-        assert!(!timing.presented);
+        assert_eq!(timing.outcome, render::FrameOutcome::NotBuilt);
         assert_eq!((timing.sprites, timing.dropped), (0, 0));
         let p = r.read_back();
         page_1(r, &p);
@@ -820,7 +820,7 @@ fn the_overlay_is_drawn_over_a_skin_that_fills_its_batch() {
         ..input(&v, TimeUs(0), TimeUs(0), &[])
     };
     let timing = r.frame(&f).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     assert_eq!(timing.sprites, MAX_SPRITES + 1);
     assert_eq!(timing.dropped, 8);
     let p = r.read_back();

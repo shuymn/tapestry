@@ -176,6 +176,14 @@ pub(crate) fn prepare(
     requests: &[TextRequest],
     slots: usize,
 ) -> Result<(TextTable, Holder, TextReport), RenderError> {
+    #[cfg(feature = "dev-tools")]
+    let p_began = crate::probe::Span::start();
+    #[cfg(feature = "dev-tools")]
+    let mut p_raster = std::time::Duration::ZERO;
+    #[cfg(feature = "dev-tools")]
+    let mut p_write = std::time::Duration::ZERO;
+    #[cfg(feature = "dev-tools")]
+    let mut p_submit = std::time::Duration::ZERO;
     let side = p.cache.side();
     let bounds = LineBounds::for_side(side);
     let producer = p.producer;
@@ -191,6 +199,8 @@ pub(crate) fn prepare(
     if !placement.new.is_empty() {
         p.scratch.reserve();
     }
+    #[cfg(feature = "dev-tools")]
+    let p_placed = p_began.elapsed();
     let device = p.gpu.device();
     let queue = p.gpu.queue();
     let texture = p.atlas.texture();
@@ -208,11 +218,19 @@ pub(crate) fn prepare(
                 raster = Err(RenderError::Atlas(UploadError::Side { side, max: 0 }));
                 break;
             };
+            #[cfg(feature = "dev-tools")]
+            let p_r = crate::probe::Span::start();
             if let Err(e) = rasterize(producer, &n.layout, scratch) {
                 raster = Err(RenderError::Skin(e));
                 break;
             }
             expand(scratch, n.rect, n.layout.size);
+            #[cfg(feature = "dev-tools")]
+            let p_w = crate::probe::Span::start();
+            #[cfg(feature = "dev-tools")]
+            {
+                p_raster += p_r.until(p_w);
+            }
             for k in 0..MIP_LEVELS {
                 let [x, y, w, h] = n.rect.map(|v| v >> k);
                 if let Some(level) = scratch.rgba.get(k) {
@@ -230,16 +248,28 @@ pub(crate) fn prepare(
                     }
                 }
             }
+            #[cfg(feature = "dev-tools")]
+            {
+                p_write += p_w.elapsed();
+            }
         }
         // Inside the scopes: the queued writes reach the device only at a
         // submission.
+        #[cfg(feature = "dev-tools")]
+        let p_s = crate::probe::Span::start();
         let submission = (written > 0).then(|| queue.submit([]));
+        #[cfg(feature = "dev-tools")]
+        {
+            p_submit = p_s.elapsed();
+        }
         #[cfg(test)]
         if submission.is_some() {
             hooks.step(p.gpu, cache, Step::Submitted);
         }
         (raster, submission)
     });
+    #[cfg(feature = "dev-tools")]
+    let p_scoped = p_began.elapsed();
     report.upload_bytes = bytes;
     report.submission = submission.clone();
     // A device lost while its writes are queued is not detected here: on
@@ -248,6 +278,8 @@ pub(crate) fn prepare(
     // callback is registered (`Gpu::lost`), but this path does not read
     // it after its wait, a gap left open here. Only a failing wait is
     // treated as the device's failure below.
+    #[cfg(feature = "dev-tools")]
+    let p_wait = crate::probe::Span::start();
     let waited = if submission.is_some() {
         // A unit test, or a development build, may make the wait fail in
         // place of waiting.
@@ -270,6 +302,50 @@ pub(crate) fn prepare(
     } else {
         Ok(())
     };
+    // The wait's end, before any mark: none when every line was cached.
+    #[cfg(feature = "dev-tools")]
+    let p_waited = if submission.is_some() {
+        p_wait.elapsed()
+    } else {
+        std::time::Duration::ZERO
+    };
+    #[cfg(feature = "dev-tools")]
+    if crate::probe::caller() != crate::probe::OTHER {
+        use crate::probe::{cmark, us};
+        cmark!("tx", "begin", 0);
+        cmark!(
+            "tx",
+            "requests",
+            i64::try_from(requests.len()).unwrap_or(-1)
+        );
+        cmark!(
+            "tx",
+            "new_lines",
+            i64::try_from(placement.new.len()).unwrap_or(-1)
+        );
+        cmark!("tx", "bytes", i64::try_from(bytes).unwrap_or(-1));
+        cmark!("tx", "place_us", us(p_placed));
+        cmark!("tx", "raster_us", us(p_raster));
+        cmark!("tx", "write_us", us(p_write));
+        cmark!("tx", "submit_us", us(p_submit));
+        cmark!(
+            "tx",
+            "scope_pop_us",
+            crate::probe::POP_US.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        cmark!("tx", "to_scoped_us", us(p_scoped));
+        cmark!("tx", "gpu_wait_us", us(p_waited));
+        cmark!(
+            "tx",
+            "max_rect_w",
+            placement
+                .new
+                .iter()
+                .map(|n| i64::from(n.rect[2]))
+                .max()
+                .unwrap_or(0)
+        );
+    }
     if let Err(e) = waited {
         // The device failed: the writes may still be pending, so their
         // rectangles stay taken and unpublished, and the cache is closed

@@ -103,15 +103,35 @@ fn on_warp<R>(
     coord: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
 ) -> R {
+    on_warp_charged(chart, coord, bundle(), Vec::new(), 0, f)
+}
+
+/// [`on_warp`] with `play` chosen, each bundle of `stated` charged its
+/// level-0 texels once committed (`Renderer::state_charge`), so the shared
+/// limit leaves the other kinds only what is past it, and the first
+/// `pools_refused` chart-image pool arrays refused
+/// (`Renderer::refuse_next_pools`).
+fn on_warp_charged<R>(
+    chart: &bms_model::Chart,
+    coord: bool,
+    play: Arc<render::SkinBundle>,
+    stated: Vec<(Arc<render::SkinBundle>, u64)>,
+    pools_refused: u32,
+    f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
+) -> R {
     let seen = Seen::default();
-    let make: MakeScreen = Box::new(|| {
-        let r = render::Renderer::new(
+    let make: MakeScreen = Box::new(move || {
+        let mut r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,
                 height: 1_080,
             },
             render::AdapterChoice::Warp,
         )?;
+        for (b, texels) in &stated {
+            r.state_charge(b, *texels);
+        }
+        r.refuse_next_pools(pools_refused);
         Ok(Box::new(MenuScreen::new(r, Some(render::text::Fonts::runtime()?))) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
@@ -127,10 +147,7 @@ fn on_warp<R>(
     .unwrap();
     render.load(Arc::new(chart.clone()), None).unwrap();
     assert_eq!(
-        render
-            .select(ScreenKind::Play, Some(bundle()))
-            .wait()
-            .unwrap(),
+        render.select(ScreenKind::Play, Some(play)).wait().unwrap(),
         Preparation::Ready
     );
     // A failing body's panic is taken and raised again once the rig shut
@@ -159,6 +176,17 @@ impl Drop for LetImagesGo {
 }
 
 /// `dir/name`, a 64×48 PNG of `rgb`.
+/// `dir/name`, a `side`×`side` PNG of `rgb`.
+fn png_sized(dir: &Path, name: &str, rgb: [u8; 3], side: u32) {
+    let file = std::fs::File::create(dir.join(name)).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), side, side);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let [r, g, b] = rgb;
+    let texels = [r, g, b, 255].repeat(usize::try_from(side * side).unwrap());
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+}
+
 fn png(dir: &Path, name: &str, rgb: [u8; 3]) {
     let file = std::fs::File::create(dir.join(name)).unwrap();
     let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 48);
@@ -424,6 +452,260 @@ fn a_skin_reading_191_lays_out_each_charts_availability() {
     });
 }
 
+/// V4 (#611 S2, design.md "beatoraja Lua Skins", the result skin): a
+/// pending result skin that reads a result fact (154) and draws an image
+/// of its own only through a `draw` function the runtime runs, at the
+/// mark's place. The attempt's image stage packs that image's cell, so the
+/// result shows it drawn with no atlas built and no texture array
+/// uploaded after the commit's.
+#[test]
+fn a_result_drawn_by_its_runtime_builds_and_uploads_nothing() {
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    let skin = lua_result(
+        "local nr = ms.number(154)\n\
+         local calls = 0\n\
+         local function rt() calls = calls + 1 return calls > 0 end\n\
+         skin.image[#skin.image + 1] = { id = \"jd\", src = \"m\", x = 8, y = 0, w = 8, h = 8 }",
+        "d[#d + 1] = { id = \"jd\", draw = rt, dst = { { x = 1200, y = 520, w = 40, h = 40 } } }",
+    );
+    let p = result::pending(skin.path(), result::LIMITS);
+    on_warp(l.chart(), false, |rig, seen| {
+        // The render thread's runtime cell, as the player gives it, so the
+        // layout's runtime draws.
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))))
+            .with_scripts(rig.render.scripts().clone());
+        prepared(rig, &l);
+        assert!(
+            matches!(rig.result_skin.upload(), Some(Upload::Pages(_))),
+            "the probe's pages uploaded at the commit"
+        );
+        let (b0, u0) = (crate::result_skin::builds(), crate::dev::result_uploads());
+        let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+        assert!(
+            drawn.is_some_and(|[_, m]| near(m, MARK)),
+            "the runtime's image drawn: {drawn:?}"
+        );
+        assert_eq!(crate::result_skin::builds() - b0, 0, "no atlas built");
+        assert_eq!(
+            crate::dev::result_uploads() - u0,
+            0,
+            "no texture array uploaded"
+        );
+    });
+}
+
+/// A pending skin reading 154 that adds a 2048-texel image drawn only by a
+/// `draw` function the runtime runs while it reads 1, the probe's value:
+/// the kept probe holds that image, the plain one does not, and the view
+/// (154 is 0 in the view shown) draws the mark. With the level-0 texels of
+/// its kept and its plain probe.
+fn kept_only_skin() -> (
+    tempfile::TempDir,
+    Arc<crate::result_skin::PendingResult>,
+    u64,
+    u64,
+) {
+    let skin = lua_result(
+        "local nr = ms.number(154)\n\
+         if nr == 1 then\n\
+           local calls = 0\n\
+           local function rt() calls = calls + 1 return calls > 0 end\n\
+           skin.source[#skin.source + 1] = { id = \"b\", path = \"b.png\" }\n\
+           skin.image[#skin.image + 1] = { id = \"big\", src = \"b\", x = 0, y = 0, w = 2048, h = 2048 }\n\
+           d[#d + 1] = { id = \"big\", draw = rt, dst = { { x = 0, y = 600, w = 8, h = 8 } } }\n\
+         end",
+        &format!("d[#d + 1] = {MARK_DST}"),
+    );
+    png_sized(skin.path(), "b.png", BLUE, 2_048);
+    let p = result::pending(skin.path(), result::LIMITS);
+    let probe = |kept: bool| {
+        let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+        rs.set_kept_probe(kept);
+        let _ = rs.image_stage(result::chart(), None, || false, || false);
+        render::pages_texels(rs.image().expect("prepared").pages())
+    };
+    let (kept, plain) = (probe(true), probe(false));
+    assert!(plain < kept, "the kept probe {kept}, the plain one {plain}");
+    (skin, p, kept, plain)
+}
+
+/// A selection installation charged so the kept probe's gate closes: past
+/// what leaves room beside it for the largest play and result charges.
+const MENUS: u64 = 400 << 20;
+
+/// The pages the attempt's result uploads, and their level-0 texels.
+fn uploaded(rig: &PlayerRig<'_>) -> (skin_model::AtlasId, u64) {
+    match rig.result_skin.upload() {
+        Some(Upload::Pages(pages)) => (pages.id(), render::pages_texels(&pages)),
+        other => panic!("not pages: {other:?}"),
+    }
+}
+
+/// The kept probe is used only where the shared limit cannot refuse it
+/// (#611 PR 3a; design.md "beatoraja Lua Skins", the result skin): a
+/// selection charged so the gate closes, and the play skin charged so the
+/// room left fits the plain probe but is one texel short of the kept one,
+/// whose cell only the runtime draws. The probe is plain, admitted at the
+/// commit, and the view draws with its skin; the kept probe would be
+/// refused and the attempt shown built-in.
+#[test]
+fn a_kept_probe_past_the_room_leaves_the_plain_one() {
+    let _serial = imports::serial();
+    assert!(!crate::result_skin::kept_probe_fits(MENUS));
+    let (dir, l) = chart(Some(RED));
+    let (_skin, p, kept, plain) = kept_only_skin();
+    let play = bundle();
+    let sel = bundle();
+    let charge = render::SHARED_TEXELS - MENUS - (kept - 1);
+    on_warp_charged(
+        l.chart(),
+        false,
+        Arc::clone(&play),
+        vec![(play, charge), (Arc::clone(&sel), MENUS)],
+        0,
+        |rig, seen| {
+            assert_eq!(
+                rig.render
+                    .select(ScreenKind::Selection, Some(sel))
+                    .wait()
+                    .unwrap(),
+                Preparation::Ready
+            );
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+            let mut h = begin(rig, &l);
+            readied(rig, &mut h);
+            assert_eq!(uploaded(rig).1, plain, "the plain probe's pages");
+            rig.commit_attempt().unwrap();
+            assert!(
+                rig.presenter.attempt_fallen().is_none(),
+                "the probe's pages refused"
+            );
+            let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+            assert!(
+                drawn.is_some_and(|[_, m]| near(m, MARK)),
+                "the view drawn with its skin: {drawn:?}"
+            );
+        },
+    );
+}
+
+/// The gate counts the selection's pool firm layer whether the pool has
+/// it at the report or not (design.md "beatoraja Lua Skins", the result
+/// skin): a chart-image selection committed with its pool refused, charged
+/// so the gate opens without the firm layer and closes with it, then a
+/// selection entry that makes the pool again with no new report. With the
+/// play skin charged so the room left fits the plain probe but is one
+/// texel short of the kept one, the probe is plain and the view draws
+/// with its skin; a gate that left the layer out would pack the kept
+/// probe, which the commit refuses.
+#[test]
+fn a_pool_made_again_after_the_report_leaves_the_plain_probe() {
+    use crate::result_skin::kept_probe_fits;
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    let (_skin, p, kept, plain) = kept_only_skin();
+    let fixture = crate::selection_skin::chart_fixture();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let (sel, script) =
+        crate::selection_skin::fixture_scripted(limits, fixture.path(), "chart.luaskin");
+    let side = u64::from(sel.side().max(skin_model::MIN_TEXT_SIDE));
+    let firm = side * side;
+    let room = render::SHARED_TEXELS - 2 * (skin_model::MAX_ATLAS_TEXELS + render::VM_TEXELS);
+    let menus = room - firm / 2;
+    assert!(kept_probe_fits(menus) && !kept_probe_fits(menus + firm));
+    let play = bundle();
+    let charge = render::SHARED_TEXELS - menus - firm - (kept - 1);
+    on_warp_charged(
+        l.chart(),
+        false,
+        Arc::clone(&play),
+        vec![(play, charge), (Arc::clone(&sel), menus)],
+        2,
+        |rig, seen| {
+            assert_eq!(
+                rig.render
+                    .select_with(ScreenKind::Selection, Some(sel), script)
+                    .wait()
+                    .unwrap(),
+                Preparation::Ready
+            );
+            assert!(rig.render.pool_now().0.is_none(), "the pool refused");
+            assert_eq!(
+                rig.render.result_status().menus,
+                menus + firm,
+                "the firm layer counted without the pool"
+            );
+            rig.render.enter_selection(1);
+            rig.render
+                .show_selection(crate::render_side::tests::selection_update(1, 1));
+            assert!(
+                crate::render_side::tests::wait_until(|| rig
+                    .render
+                    .pool_now()
+                    .0
+                    .is_some_and(|pool| u64::from(pool.side) == side)),
+                "the pool made again at the entry"
+            );
+            rig.render.leave_selection();
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+            let mut h = begin(rig, &l);
+            readied(rig, &mut h);
+            assert_eq!(uploaded(rig).1, plain, "the plain probe's pages");
+            rig.commit_attempt().unwrap();
+            assert!(
+                rig.presenter.attempt_fallen().is_none(),
+                "the probe's pages refused"
+            );
+            let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+            assert!(
+                drawn.is_some_and(|[_, m]| near(m, MARK)),
+                "the view drawn with its skin: {drawn:?}"
+            );
+        },
+    );
+}
+
+/// The gate is decided again at an installation change (design.md
+/// "beatoraja Lua Skins", the result skin): attempt 1, with nothing charged
+/// beside play, packs the kept probe; a selection then committed past the
+/// gate's room closes it, and attempt 2 drops the kept probe and packs the
+/// plain one rather than reuse it.
+#[test]
+fn a_selection_past_the_room_closes_the_gate() {
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    let (_skin, p, kept, plain) = kept_only_skin();
+    let sel = bundle();
+    on_warp_charged(
+        l.chart(),
+        false,
+        bundle(),
+        vec![(Arc::clone(&sel), MENUS)],
+        0,
+        |rig, seen| {
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+            prepared(rig, &l);
+            let (first, texels) = uploaded(rig);
+            assert_eq!(texels, kept, "attempt 1's kept probe");
+            let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+            assert!(drawn.is_some_and(|[_, m]| near(m, MARK)), "{drawn:?}");
+            assert_eq!(
+                rig.render
+                    .select(ScreenKind::Selection, Some(sel))
+                    .wait()
+                    .unwrap(),
+                Preparation::Ready
+            );
+            assert_eq!(rig.render.result_status().menus, MENUS);
+            prepared(rig, &l);
+            let (second, texels) = uploaded(rig);
+            assert_eq!(texels, plain, "attempt 2's plain probe");
+            assert_ne!(second, first, "the kept probe not reused");
+        },
+    );
+}
+
 /// A pending skin reading 191 with the
 /// layout specialized on 191 cached; a retry after deleting the stage
 /// file, and one after writing it again, each hold their facts
@@ -473,4 +755,224 @@ fn a_retry_resolves_the_stage_file_again_for_the_cached_layout() {
             "the stage file written again: {added:?}"
         );
     });
+}
+
+/// The transition probe (`TAPESTRY_LOOP_PROBE`) on, over two attempts
+/// whose result layouts differ (chart A's 190 branch, chart B's stage
+/// file): each of its marks at its event.
+#[test]
+fn the_transition_probe_marks_each_event() {
+    let _serial = imports::serial();
+    crate::dev::loop_probe::tests::turn_on();
+    let (a_dir, a) = chart(None);
+    let (b_dir, b) = chart(Some(GREEN));
+    let (_skin, p) = skin_on_191();
+    on_warp(a.chart(), true, |rig, seen| {
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+        prepared(rig, &a);
+        let first = shown(rig, seen, a_dir.path(), |_, m| near(m, MARK));
+        assert!(first.is_some_and(|[_, m]| near(m, MARK)), "{first:?}");
+        prepared(rig, &b);
+        // Frames of another picture between B's upload and its result's
+        // first frame, each drawing a sprite (a built-in page's cursor bar)
+        // of another array: the first use is the result's, not theirs.
+        let at = probe_now();
+        rig.render.show_decision(
+            crate::menu_screen::MenuPage {
+                lines: vec![crate::menu_screen::MenuLine {
+                    text: "between".to_owned(),
+                    style: crate::menu_screen::LineStyle::Cursor,
+                }],
+                caret: None,
+            },
+            None,
+        );
+        let end = Instant::now() + Duration::from_secs(10);
+        while presents_after(at) < 3 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(presents_after(at) >= 3, "no frame between");
+        let second = shown(rig, seen, b_dir.path(), |c, _| near(c, GREEN));
+        assert!(second.is_some_and(|[c, _]| near(c, GREEN)), "{second:?}");
+    });
+    let marks = crate::dev::loop_probe::tests::marks();
+    assert_marks(&marks);
+}
+
+/// The probe's time of its last mark so far.
+fn probe_now() -> u64 {
+    crate::dev::loop_probe::tests::marks()
+        .last()
+        .map_or(0, |m| m.0)
+}
+
+/// The frames presented after the probe's time `at`.
+fn presents_after(at: u64) -> usize {
+    crate::dev::loop_probe::tests::marks()
+        .iter()
+        .filter(|m| m.1 == "present" && m.0 > at)
+        .count()
+}
+
+/// [`the_transition_probe_marks_each_event`]'s marks, each at its event.
+fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
+    // Each mark's times and values, by tag.
+    let times =
+        |tag: &str| -> Vec<u64> { marks.iter().filter(|m| m.1 == tag).map(|m| m.0).collect() };
+    let values =
+        |tag: &str| -> Vec<i64> { marks.iter().filter(|m| m.1 == tag).map(|m| m.2).collect() };
+    let one = |tag: &str, k: usize| -> u64 {
+        *times(tag)
+            .get(k)
+            .unwrap_or_else(|| panic!("{tag} #{k}: {:?}", times(tag)))
+    };
+    // The values of `tag` marked in (from, to).
+    let within = |tag: &str, from: u64, to: u64| -> Vec<i64> {
+        marks
+            .iter()
+            .filter(|m| m.1 == tag && m.0 > from && m.0 < to)
+            .map(|m| m.2)
+            .collect()
+    };
+    // Two attempts: each one's steps in order, from its preparation to the
+    // first draw of its result's array.
+    let steps = [
+        "prep:begin",
+        "img:begin",
+        "img:import_end",
+        "img:stage_end",
+        "att:send",
+        "att:stage_us",
+        "att:committed",
+        "res:select_sent",
+        "res:select_ready",
+        "res:install_us",
+        "fu:submit_us",
+    ];
+    for tag in steps {
+        assert_eq!(times(tag).len(), 2, "{tag}: {:?}", times(tag));
+    }
+    for k in 0..2 {
+        for w in steps.windows(2) {
+            assert!(
+                one(w[0], k) <= one(w[1], k),
+                "attempt {k}: {} after {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+    // The preparations' numbers, and both image stages ended Ready.
+    assert_eq!(values("prep:begin"), [0, 1]);
+    assert_eq!(values("img:stage_end"), [1, 1]);
+    // Each attempt's result upload: inside its select (the play skin's own
+    // select, at the rig's start, is upload 0), its levels' writes summing
+    // to its pages' bytes with the built-in layer's 128² texels, its pages
+    // the bundle's; none refused.
+    let begins = times("up:selskin:begin");
+    assert_eq!(begins.len(), 3, "{begins:?}");
+    for k in 0..2 {
+        let (sent, ready) = (one("res:select_sent", k), one("res:select_ready", k));
+        let t0 = one("up:selskin:t0", k + 1);
+        let begin = one("up:selskin:begin", k + 1);
+        assert!(sent < t0 && begin < ready, "upload {k} outside its select");
+        let written: i64 = within("wt:selskin:bytes", t0, begin).iter().sum();
+        let raw = values("up:selskin:raw_bytes")[k + 1];
+        assert_eq!(written + 128 * 128 * 4, raw, "upload {k}'s writes");
+        assert_eq!(values("res:bundle_level_bytes")[k] + 128 * 128 * 4, raw);
+        assert_eq!(
+            values("up:selskin:pages")[k + 1],
+            values("res:bundle_pages")[k]
+        );
+        assert_eq!(values("up:selskin:refused")[k + 1], 0);
+        assert!(
+            within("up:selskin:create_us", t0, ready)
+                .iter()
+                .all(|&v| v >= 0)
+        );
+    }
+    // Each upload's figures are marked once it was waited for, so no probe
+    // work overlaps the GPU's copy its wait times: the first of them comes
+    // after the wait began (for the waits long enough to tell).
+    let waits: Vec<(u64, i64)> = marks
+        .iter()
+        .filter(|m| m.1 == "up:selskin:gpu_wait_us")
+        .map(|m| (m.0, m.2))
+        .collect();
+    assert_eq!(waits.len(), begins.len(), "{waits:?}");
+    let long: Vec<_> = begins
+        .iter()
+        .zip(&waits)
+        .filter(|(_, (_, w))| *w >= 1_000)
+        .collect();
+    assert!(!long.is_empty(), "no upload waited 1 ms: {waits:?}");
+    for (&begin, &(at, wait)) in long {
+        let began = at.saturating_sub(u64::try_from(wait).unwrap_or(0));
+        assert!(
+            begin >= began,
+            "an upload's figures marked before its wait: {begin} < {began}"
+        );
+    }
+    // The first result's installation: none before (0); the second's: one
+    // installed, another asked for (2).
+    assert_eq!(values("res:installed"), [0, 2]);
+    // B's layout replaces A's installation: dropped once, a slot, by the
+    // drain inside B's select, with the memory read around it.
+    assert_eq!(values("dr:site"), [1]);
+    assert_eq!(values("dr:kind"), [2]);
+    let drop = one("dr:site", 0);
+    assert!(one("up:selskin:begin", 2) < drop && drop < one("res:select_ready", 1));
+    assert!(values("dr:l0")[0] > 0 && values("dr:l1")[0] > 0);
+    // The first use: one per result upload, in its first result frame, with
+    // its frames' submits marked after it (the drop's included).
+    for k in 0..2 {
+        let fu = one("fu:submit_us", k);
+        let frame = within("rf:frame_left", one("res:install_us", k), fu);
+        assert_eq!(frame, [2], "attempt {k}'s first result frame");
+        assert_eq!(
+            within("pd:submit_us", fu - 1, fu + 1_000_000).first(),
+            values("fu:submit_us").get(k)
+        );
+    }
+    assert_eq!(times("fu:gpu_done_us").len(), 2);
+    // Each first use credited to the result's upload (the selection skin
+    // caller), and its frame the first probed: the result's frames are
+    // counted from the view's commit, not from its installation.
+    assert_eq!(
+        values("fu:caller"),
+        [i64::from(render::probe::SELECT_SKIN); 2]
+    );
+    for k in 0..2 {
+        let fu = one("fu:submit_us", k);
+        let (at, left) = marks
+            .iter()
+            .find(|m| m.1 == "rf:frame_left" && m.0 > one("res:install_us", k))
+            .map(|m| (m.0, m.2))
+            .unwrap();
+        assert_eq!(left, 2, "attempt {k}'s first probed frame");
+        assert!(
+            within("present", at, fu).is_empty(),
+            "attempt {k}: a frame presented between the first probed and the first use"
+        );
+    }
+    // Frames were presented between B's upload and its result: none of
+    // them was the first use.
+    let between = within(
+        "present",
+        one("res:select_ready", 1),
+        one("res:install_us", 1),
+    );
+    assert!(between.len() >= 3, "{between:?}");
+    // The result frames probed are presented.
+    assert!(values("rf:presented").iter().all(|&v| v == 1));
+    // B's chart images, written for the result's view inside its staging.
+    let (install, chart) = (one("res:install_us", 1), one("res:chart_us", 1));
+    assert_eq!(within("ci:result:image", install, chart), [0]);
+    assert!(
+        within("ci:result:bytes", install, chart)
+            .iter()
+            .all(|&b| b > 0)
+    );
+    // Nothing lost for want of room.
+    assert_eq!(crate::dev::loop_probe::tests::dropped(), 0);
 }

@@ -47,7 +47,7 @@ fn draw(r: &mut Renderer, now_us: i64, offset_ms: i64) -> Vec<u8> {
     let timing = r
         .frame(&input(&v, TimeUs(now_us), TimeUs(offset_ms * MS), &[]))
         .unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     assert_eq!(timing.dropped, 0);
     r.read_back()
 }
@@ -163,7 +163,7 @@ fn a_note_travels_500_ms_at_3_2() {
             ..input(&v, TimeUs(now_ms * MS), TimeUs(0), &[])
         };
         let timing = r.frame(&f).unwrap();
-        assert!(timing.presented);
+        assert!(timing.presented());
         r.read_back()
     };
     let open = game::Covers::default();
@@ -501,7 +501,7 @@ fn endpoints_meet_the_line_at_fractional_us() {
             ..input(&v, TimeUs(now), TimeUs(offset), &[])
         };
         let timing = r.frame(&f).unwrap();
-        assert!(timing.presented);
+        assert!(timing.presented());
         r.read_back()
     };
     let notes = |p: &[u8], x| runs(p, x, white);
@@ -601,7 +601,7 @@ fn zero_size_target_is_one_pixel() {
     .expect("WARP renderer");
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     assert_eq!(r.read_back().len(), 4);
 }
 
@@ -669,7 +669,7 @@ fn offscreen_pacing_indicator() {
             .frame(&input(&v, TimeUs(k * 1_000), TimeUs(0), &[]))
             .unwrap();
         slowest = slowest.max(at.elapsed());
-        skipped += usize::from(!timing.presented);
+        skipped += usize::from(!timing.presented());
     }
     let frames = began.elapsed();
     let at = std::time::Instant::now();
@@ -702,7 +702,7 @@ fn sprites_frame(push: impl FnOnce(&mut SpriteBatch)) -> Vec<u8> {
     .expect("WARP renderer");
     let text = MenuText::new(&r);
     let timing = r.menu_frame(push, &text).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     assert_eq!(timing.dropped, 0);
     r.read_back()
 }

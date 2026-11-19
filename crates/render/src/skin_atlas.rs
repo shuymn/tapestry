@@ -122,9 +122,16 @@ pub(crate) fn scoped<T>(
     let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let out = work();
+    #[cfg(feature = "dev-tools")]
+    let popping = crate::probe::Span::start();
     // Popped in the reverse order of their pushes.
     let refused = pollster::block_on(invalid.pop());
     let refused = refused.or(pollster::block_on(out_of_memory.pop()));
+    #[cfg(feature = "dev-tools")]
+    crate::probe::POP_US.store(
+        crate::probe::us(popping.elapsed()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     (out, refused)
 }
 
@@ -203,6 +210,19 @@ pub(crate) struct AtlasTexture {
 /// The next [`AtlasTexture::serial`].
 static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// An array dropped before any frame sampled it, whatever drops it (a
+/// staging replaced or refused after its upload, a release, a drain), ends
+/// its first use's wait (`fu:discarded`, dev-tools); one drawn or replaced
+/// by a newer upload is no longer awaited, and nothing is marked.
+#[cfg(feature = "dev-tools")]
+impl Drop for AtlasTexture {
+    fn drop(&mut self) {
+        if crate::probe::on() {
+            crate::probe::discard_first_use(crate::probe::array_key(&self.texture));
+        }
+    }
+}
+
 impl AtlasTexture {
     /// The built-in atlas alone: one 128-texel layer without mips.
     pub(crate) fn builtin(gpu: &Gpu) -> Self {
@@ -219,13 +239,32 @@ impl AtlasTexture {
         let device = gpu.device();
         let side = pages.side;
         let levels = u32::try_from(MIP_LEVELS).unwrap_or(1);
+        #[cfg(feature = "dev-tools")]
+        let creating = crate::probe::Span::start();
         let texture = create(device, side, layers, levels);
+        #[cfg(feature = "dev-tools")]
+        let writing = {
+            crate::probe::CREATE_US.store(
+                crate::probe::us(creating.elapsed()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            crate::probe::Span::start()
+        };
         // The built-in atlas at the top left of layer 0's level 0; the
         // shader samples nothing else of layer 0.
         write(gpu.queue(), &texture, 0, 0, ATLAS_SIZE, &build_atlas());
         for (layer, page) in (RESERVED_LAYERS..).zip(pages.pages) {
             for (level, bytes) in (0..).zip(page) {
+                #[cfg(feature = "dev-tools")]
+                let p_w = crate::probe::Span::start();
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
+                #[cfg(feature = "dev-tools")]
+                {
+                    use crate::probe::{cmark, us};
+                    cmark!("wt", "bytes", i64::try_from(bytes.len()).unwrap_or(-1));
+                    cmark!("wt", "level", i64::from(level));
+                    cmark!("wt", "call_us", us(p_w.elapsed()));
+                }
             }
         }
         // The kept layers, after the pages: one zero texel written to each
@@ -242,6 +281,11 @@ impl AtlasTexture {
                 write(gpu.queue(), &texture, layer, level, 1, &[0; 4]);
             }
         }
+        #[cfg(feature = "dev-tools")]
+        crate::probe::WRITE_US.store(
+            crate::probe::us(writing.elapsed()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut atlas = Self::of(&texture, side, layers, levels);
         atlas.text_layer = text_layer;
         atlas.chart_layer = chart_layer;
