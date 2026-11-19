@@ -176,6 +176,8 @@ fn main() -> ExitCode {
         Command::MeasureSelect => report(measure_select(clock)),
         #[cfg(feature = "dev-tools")]
         Command::Scenario(s) => report(dev::scenario::run(s, clock)),
+        #[cfg(feature = "dev-tools")]
+        Command::TestDevice(t) => report(dev::test_device::run(t)),
     }
 }
 
@@ -185,7 +187,7 @@ fn logged(command: &Command) -> Option<&'static str> {
     match command {
         Command::Version => None,
         #[cfg(feature = "dev-tools")]
-        Command::DevToolsProbe => None,
+        Command::DevToolsProbe | Command::TestDevice(_) => None,
         Command::Keys(_) => Some("keys"),
         Command::Play(_) => Some("play"),
         Command::Select(_) => Some("select"),
