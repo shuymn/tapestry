@@ -410,15 +410,37 @@ impl<K: PartialEq> AskedText<K> {
     }
 }
 
-/// Where the chosen chart's text stands on this screen: the request whose
-/// text every slot holds, the one staged for the next frame, and the last
-/// one refused, which is not asked again.
+/// Where the chosen chart's text stands on this screen (design.md
+/// "Rendering and Skins"): the request asked last, the request whose text
+/// every slot holds, the one in the uploader's hand, and the last one
+/// refused, which is not asked again.
 #[derive(Debug, Default)]
 struct ChosenTextState {
-    /// What every slot holds; `None` when unknown, after a refusal.
+    /// The request asked last: its installation, the target applied, its
+    /// lifetime and newest revision.
+    current: Option<AskedText>,
+    /// What every slot holds; `None` when unknown: after a clear, or a
+    /// refusal.
     installed: Option<AskedText>,
-    staged: Option<AskedText>,
+    /// The preparation in the uploader's hand, its steps waiting or in
+    /// flight; always the current request's.
+    in_hand: Option<AskedText>,
     refused: Option<AskedText>,
+    /// The device failed under the text in hand: the next loading frame
+    /// fails, and the screen is built again.
+    failed: bool,
+}
+
+impl ChosenTextState {
+    /// Whether the current request's text is settled: installed in every
+    /// slot, or refused. No request (no installation keeping loading text)
+    /// is settled too.
+    fn settled(&self) -> bool {
+        self.current.as_ref().is_none_or(|c| {
+            self.installed.as_ref().is_some_and(|i| i.same_request(c))
+                || self.refused.as_ref().is_some_and(|r| r.same_request(c))
+        })
+    }
 }
 
 /// What the chosen chart's text needs before a loading frame.
@@ -490,9 +512,11 @@ impl MenuScreen {
             splash: None,
             stale: false,
             chosen: ChosenTextState {
+                current: None,
                 installed: None,
-                staged: None,
+                in_hand: None,
                 refused: None,
+                failed: false,
             },
             strip: None,
             strip_lines: 0,
@@ -599,53 +623,28 @@ impl MenuScreen {
             .build_selection(&mut logic.sel, &frame, sprites.get(..n).unwrap_or_default())
     }
 
-    /// Brings the loading presentation's chosen-chart text to `update`.
-    /// It runs inside [`loading`](Screen::loading), before the loading
-    /// frame is built, on the render thread before recording opens: the
-    /// presentation enters the update's lifetime, the text staged by the
-    /// previous loading frame is installed (dropped if its installation,
-    /// lifetime or revision has passed), and the text the update needs
-    /// ([`text_plan`]) is cleared and prepared through the installation's
-    /// producer, staged for the next loading frame. A request refused,
-    /// by the producer or by its table, is not asked again until text
-    /// installs after it; what the slots hold is then unknown, so the next
-    /// request prepares every slot. Preparing allocates: it runs only when
-    /// the update needs new text, never in a frame's build.
-    ///
-    /// # Errors
-    ///
-    /// The device failing while the text is prepared (not a refusal,
-    /// [`RenderError::is_refusal`]): the screen is dropped and built again.
+    /// Brings the loading presentation's chosen-chart text to `update` on
+    /// the installation `on` names (design.md "Rendering and Skins"): the
+    /// presentation enters the update's lifetime, and the request it asks
+    /// (the installation's key, the target applied, the lifetime and the
+    /// newest revision) becomes the current one. Settled (its text
+    /// installed, or refused) or in progress (its preparation in the
+    /// uploader's hand), nothing more is done, and a preparation in hand
+    /// for another request is dropped. Otherwise the slots [`text_plan`]
+    /// names are cleared, what every slot holds becomes unknown, and their
+    /// text is prepared through the installation's producer into the
+    /// uploader's hand, replacing one there; the boundary that sees its
+    /// last step complete installs it ([`text_done`](Self::text_done)). A
+    /// request refused is not asked again until text installs after it.
+    /// Preparing allocates: it runs only when the update needs new text,
+    /// never in a frame's build.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn chosen_text(
-        &mut self,
-        update: &LoadingUpdate,
-        lifetime: u64,
-        on: LoadingOn,
-    ) -> Result<(), RenderError> {
+    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64, on: LoadingOn) {
         self.renderer.enter_loading_on(on, lifetime);
-        if let Some(staged) = self.chosen.staged.take() {
-            match self.renderer.install_staged_loading_text_on(on) {
-                // Every slot holds what was asked: a refusal before it no
-                // longer describes them, so it is forgotten.
-                Ok(true) => {
-                    self.chosen.installed = Some(staged);
-                    self.chosen.refused = None;
-                }
-                Ok(false) => {}
-                Err(e @ LoadingTextError::Table(_)) => {
-                    eprintln!("render: the chosen chart's text was not installed: {e}");
-                    self.chosen.installed = None;
-                    self.chosen.refused = Some(staged);
-                }
-                // Its installation, lifetime or revision has passed: what
-                // the update needs is planned below.
-                Err(_) => {}
-            }
-        }
         let Some(key) = self.renderer.loading_text_key_on(on) else {
+            self.renderer.cancel_loading_text();
             self.chosen = ChosenTextState::default();
-            return Ok(());
+            return;
         };
         let asked = AskedText {
             key,
@@ -654,13 +653,29 @@ impl MenuScreen {
             revision: update.revision,
             chart: Arc::clone(&update.chart),
         };
+        self.chosen.current = Some(asked.clone());
+        let in_progress = self
+            .chosen
+            .in_hand
+            .as_ref()
+            .is_some_and(|h| h.same_request(&asked));
+        if self.chosen.settled() || in_progress {
+            // A preparation in hand for another request never installs.
+            if !in_progress && self.chosen.in_hand.take().is_some() {
+                self.renderer.cancel_loading_text();
+            }
+            return;
+        }
         let TextPlan::Prepare(which) = text_plan(
             self.chosen.installed.as_ref(),
             self.chosen.refused.as_ref(),
             &asked,
         ) else {
-            return Ok(());
+            return;
         };
+        // A clear forgets what the slots hold: the next request that is
+        // not this one prepares every slot.
+        self.chosen.installed = None;
         self.renderer.clear_loading_text_on(on, which);
         let c = &update.chart;
         fn field(f: &Option<String>) -> &str {
@@ -677,28 +692,55 @@ impl MenuScreen {
         let p_c = crate::dev::loop_probe::Caller::set(render::probe::LOADING);
         #[cfg(feature = "dev-tools")]
         let p_t = render::probe::Span::start();
-        let p_prepared =
-            self.renderer
-                .prepare_loading_text_on(on, lifetime, update.revision, which, &chart);
+        self.renderer
+            .prepare_loading_text_on(on, lifetime, update.revision, which, &chart);
         #[cfg(feature = "dev-tools")]
         {
             crate::dev::loop_probe::mark("ld:text_us", crate::dev::loop_probe::us(p_t.elapsed()));
             drop(p_c);
         }
-        match p_prepared {
-            Ok(()) => self.chosen.staged = Some(asked),
-            Err(e) if e.is_refusal() => {
+        self.chosen.in_hand = Some(asked);
+    }
+
+    /// The loading text in the uploader's hand ended at a boundary
+    /// (`done`): installed, it is what every slot holds; refused (by its
+    /// producer, the device or its table), the request is not asked again;
+    /// a device failure fails the next loading frame. Text for a request no
+    /// longer in hand is ignored, as is text dropped as stale.
+    fn text_done(&mut self, done: &render::TextDone) {
+        let Some(hand) = self
+            .chosen
+            .in_hand
+            .take_if(|h| h.lifetime == done.lifetime && h.revision == done.revision)
+        else {
+            return;
+        };
+        match &done.result {
+            Ok(()) => {
+                // Every slot holds what was asked: a refusal before it no
+                // longer describes them, so it is forgotten.
+                self.chosen.installed = Some(hand);
+                self.chosen.refused = None;
+            }
+            Err(render::TextFault::Install(e @ LoadingTextError::Table(_))) => {
+                eprintln!("render: the chosen chart's text was not installed: {e}");
+                self.chosen.installed = None;
+                self.chosen.refused = Some(hand);
+            }
+            // Its installation, lifetime or revision has passed: the next
+            // pass asks again.
+            Err(render::TextFault::Install(_)) => {}
+            Err(render::TextFault::Prepare(e)) if e.is_refusal() => {
                 eprintln!(
                     "render: the chosen chart's text was not prepared: {}",
-                    game::Chain(&e)
+                    game::Chain(e)
                 );
                 self.chosen.installed = None;
-                self.chosen.refused = Some(asked);
+                self.chosen.refused = Some(hand);
             }
             // The device failed: the screen is dropped and built again.
-            Err(e) => return Err(e),
+            Err(render::TextFault::Prepare(_)) => self.chosen.failed = true,
         }
-        Ok(())
     }
 
     /// The skin's loading frame `frame` of the installation `on` names, the
@@ -716,8 +758,13 @@ impl MenuScreen {
         changed: bool,
         frame: &LoadingFrame<'_>,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        // The device failed under the loading text in hand at an earlier
+        // boundary: the screen is dropped and built again.
+        if std::mem::take(&mut self.chosen.failed) {
+            return Err(RenderError::DeviceLost);
+        }
         if let Some(update) = update {
-            self.chosen_text(update, frame.lifetime, on)?;
+            self.chosen_text(update, frame.lifetime, on);
         }
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
@@ -980,6 +1027,9 @@ impl Screen for MenuScreen {
             .upload_boundary_within(render::UPLOAD_TIME_SLICE, past, chart);
         if up.chart.is_some() {
             self.chart = None;
+        }
+        if let Some(done) = &up.text {
+            self.text_done(done);
         }
         up
     }

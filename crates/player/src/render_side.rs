@@ -247,6 +247,7 @@ pub trait Screen: Send {
         render::Uploaded {
             bga: render::BgaStep::Idle,
             staged: None,
+            text: None,
             chart: None,
         }
     }
@@ -17376,6 +17377,7 @@ pub(crate) mod tests {
             render::Uploaded {
                 bga,
                 staged: None,
+                text: None,
                 chart: None,
             }
         }
@@ -21814,15 +21816,23 @@ pub(crate) mod tests {
         assert!(all[first_hard..].iter().all(|s| s.gauge == hard), "{all:?}");
         assert!(all[..first_hard].iter().all(|s| !s.red.unwrap().gauge));
         assert!(all[first_hard..].iter().all(|s| s.red.unwrap().gauge));
-        // Revision 2: the artist's slot cleared on its first frame, the
-        // title kept; from the next frame on its replacement.
+        // Revision 2: the artist's slot cleared from its first frame, the
+        // title kept, while its text is in the uploader's hand; from the
+        // frame after the boundary that installed it, its replacement.
         let r2: Vec<&Shot> = all.iter().filter(|s| s.text == 2).collect();
+        let installed = r2
+            .iter()
+            .position(|s| s.red.unwrap().artist)
+            .expect("the replacement drawn");
+        assert!(installed >= 1, "{r2:?}");
         assert!(
-            !r2[0].red.unwrap().artist && r2[0].red.unwrap().title,
+            r2[..installed].iter().all(|s| {
+                let r = s.red.unwrap();
+                !r.artist && r.title && s.staged > 0
+            }),
             "{r2:?}"
         );
-        assert!(r2[0].staged > 0, "{r2:?}");
-        assert!(r2[1..].iter().all(|s| {
+        assert!(r2[installed..].iter().all(|s| {
             let r = s.red.unwrap();
             r.artist && r.title && s.staged == 0
         }));

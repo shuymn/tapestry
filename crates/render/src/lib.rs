@@ -105,7 +105,7 @@ pub use renderer::{
     Destruction, FrameOutcome, FrameTiming, Handoff, HeavyOps, LoadingOn, LoadingTextError,
     LoadingTextKey, MAX_SPRITES, MemoryWitness, Part, PreparedToken, RESULT_STRIP_SPRITES,
     RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError, Renderer, ResultChartTarget, SHARED_TEXELS,
-    STRIP_SPRITES, Target, VM_TEXELS, letterbox,
+    STRIP_SPRITES, Target, TextDone, TextFault, VM_TEXELS, letterbox,
 };
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::{DestroyRecord, RECORD_LEN};
@@ -122,6 +122,8 @@ pub use sprite::{
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
+#[cfg(feature = "dev-tools")]
+pub use upload::TextCount;
 pub use upload::{ChartBands, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE, UploadState, Uploaded};
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).

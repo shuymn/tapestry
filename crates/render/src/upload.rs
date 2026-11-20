@@ -61,6 +61,21 @@ pub type ChartBands<'a> = (
     [Option<&'a skin_model::chart_image::Fitted>; 3],
 );
 
+/// Development builds: what one loading lifetime's text did on a renderer
+/// (design.md "Rendering and Skins"): its preparations by cause (the
+/// lifetime's first, another target, key or revision), its installs and
+/// its drops.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextCount {
+    pub first: u32,
+    pub target: u32,
+    pub key: u32,
+    pub revision: u32,
+    pub installs: u32,
+    pub drops: u32,
+}
+
 /// What one boundary's steps came to, per payload.
 #[derive(Debug)]
 pub struct Uploaded {
@@ -69,6 +84,9 @@ pub struct Uploaded {
     /// The staging whose last step's completion this boundary saw: it
     /// answers ready from now on.
     pub staged: Option<crate::PreparedToken>,
+    /// The loading text in hand's end in this boundary: installed at its
+    /// last step's completion, or why not.
+    pub text: Option<crate::TextDone>,
     /// The chart-image publication's end in this boundary: its table,
     /// published at the completion that passed its checks, or why it
     /// ended (a check failed, nothing more written; a band refused, the

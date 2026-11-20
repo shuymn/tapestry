@@ -308,35 +308,64 @@ pub struct LoadingTextKey {
     resources: u64,
 }
 
-/// The chosen chart's loading text prepared for one loading lifetime and
-/// text revision on the installation its key names, waiting for the next
-/// frame's start to install it.
-struct StagedText {
+/// The chosen chart's loading text for one loading lifetime and text
+/// revision on the installation its key names, in the uploader's hand
+/// (design.md "Memory Budget", the uploader): its rasterized lines placed
+/// and written in steps, installed into the installation's presentation
+/// at the boundary that sees its last step complete
+/// ([`Renderer::prepare_loading_text_on`]).
+struct LoadingUpload {
+    on: LoadingOn,
     key: LoadingTextKey,
     lifetime: u64,
     revision: u64,
     which: TextSlots,
-    /// The producer's lines; `None` clears the rasterized slots.
-    table: Option<TextTable>,
+    /// The producer's lines in steps; `None` clears the rasterized slots.
+    upload: Option<text_upload::TextUpload>,
     /// The bitmap-font slots' lines, laid out by the skin.
     bitmap: BitmapLines,
-    /// The text layer's lines its table draws, held until it is installed
-    /// or dropped.
-    holder: Holder,
 }
 
-impl StagedText {
-    /// The bytes it holds: itself, its rasterized lines with their
-    /// holder's list, and its bitmap lines with their glyphs.
+impl LoadingUpload {
+    /// The bytes it holds: itself, its placement's lists, and its bitmap
+    /// lines with their glyphs.
     fn bytes(&self) -> u64 {
-        let lines = self
-            .table
+        let placed = self
+            .upload
             .as_ref()
-            .map_or(0, |t| t.len() * size_of::<Option<skin_model::TextImage>>());
-        let held = self.holder.bytes();
-        u64::try_from(size_of::<Self>() + lines + held + self.bitmap.heap_bytes())
+            .map_or(0, text_upload::TextUpload::bytes);
+        u64::try_from(size_of::<Self>() + self.bitmap.heap_bytes())
             .unwrap_or(u64::MAX)
+            .saturating_add(placed)
     }
+
+    /// Whether nothing is left to write.
+    fn written(&self) -> bool {
+        self.upload
+            .as_ref()
+            .is_none_or(text_upload::TextUpload::written)
+    }
+}
+
+/// How the loading text in the uploader's hand ended at a boundary
+/// ([`Uploaded::text`](crate::Uploaded::text)): the lifetime and revision
+/// it was prepared for, and whether it was installed.
+#[derive(Debug)]
+pub struct TextDone {
+    pub lifetime: u64,
+    pub revision: u64,
+    pub result: Result<(), TextFault>,
+}
+
+/// Why the loading text in hand was not installed.
+#[derive(Debug)]
+pub enum TextFault {
+    /// Its preparation failed: the producer refused a line or the device
+    /// a step ([`RenderError::is_refusal`]), or the device was lost.
+    Prepare(RenderError),
+    /// Its installation refused it ([`LoadingTextError::Table`]), or it no
+    /// longer belongs to the installation, lifetime or revision there.
+    Install(LoadingTextError),
 }
 
 /// Why loading text was not installed: nothing changes.
@@ -1095,8 +1124,8 @@ pub struct MemoryWitness {
     pub loading: u64,
     /// The staged installation's, when it is another installation's.
     pub staged_loading: u64,
-    /// The chosen chart's loading text prepared and waiting to install
-    /// ([`Renderer::prepare_loading_text`]), with its holder's list.
+    /// The chosen chart's loading text in the uploader's hand
+    /// ([`Renderer::prepare_loading_text`]), with its bitmap lines.
     pub staged_text: u64,
     /// The default font, shared by every text producer: counted once, in
     /// no bundle.
@@ -1484,6 +1513,13 @@ pub struct Renderer {
     /// ([`chart_bands`](Self::chart_bands)).
     #[cfg(feature = "dev-tools")]
     chart_bands: u64,
+    /// Development builds: each loading lifetime's text count, and the
+    /// last preparation's key, target, lifetime and revision
+    /// ([`text_count`](Self::text_count)).
+    #[cfg(feature = "dev-tools")]
+    text_counts: Vec<(u64, crate::TextCount)>,
+    #[cfg(feature = "dev-tools")]
+    text_last: Option<(LoadingTextKey, [u32; 2], u64, u64)>,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -1600,7 +1636,11 @@ pub struct Renderer {
     loading_refused: Option<(u64, BuildError)>,
     /// The chosen chart's loading text prepared and not yet installed:
     /// at most one ([`prepare_loading_text`](Self::prepare_loading_text)).
-    staged_text: Option<StagedText>,
+    loading_upload: Option<LoadingUpload>,
+    /// How the loading text in hand ended outside a boundary, on the
+    /// renderer's own account (finished before an attempt's text on its
+    /// resources, dropped with a staging): the next boundary answers it.
+    loading_report: Option<crate::TextDone>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -1819,6 +1859,10 @@ impl Renderer {
             step_delay: None,
             #[cfg(feature = "dev-tools")]
             chart_bands: 0,
+            #[cfg(feature = "dev-tools")]
+            text_counts: Vec::new(),
+            #[cfg(feature = "dev-tools")]
+            text_last: None,
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -1864,7 +1908,8 @@ impl Renderer {
             started: None,
             refused: None,
             loading_refused: None,
-            staged_text: None,
+            loading_upload: None,
+            loading_report: None,
             pacer: Pacer::default(),
             #[cfg(feature = "dev-tools")]
             offscreen_wait: Some(OFFSCREEN_FRAME_WAIT),
@@ -3320,26 +3365,20 @@ impl Renderer {
             p_text();
             return Ok(Holder::default());
         };
-        let key = self.loading_text_key();
         // The staging's own resources, or the installed ones, whose
-        // installed attempt's lines stay, with the installed loading lines
-        // and the loading text staged for them.
+        // installed attempt's lines stay, with the installed loading lines.
+        // The loading text in hand there is finished first: its lines are
+        // unwritten until it completes, and this placement would find them.
+        if !matches!(res, PendingRes::Own(_)) {
+            self.finish_loading_now();
+        }
         let (atlas, cache, held) = match res {
             PendingRes::Own(r) => (&r.atlas, &mut r.text_cache, Vec::<&Holder>::new()),
-            _ => {
-                let staged = self
-                    .staged_text
-                    .as_ref()
-                    .filter(|t| key == Some(t.key))
-                    .map(|t| &t.holder);
-                let held = [
-                    Some(&self.installed_text),
-                    Some(&self.installed_loading),
-                    staged,
-                ];
-                let held = held.into_iter().flatten().collect();
-                (&self.atlas, &mut self.text_cache, held)
-            }
+            _ => (
+                &self.atlas,
+                &mut self.text_cache,
+                vec![&self.installed_text, &self.installed_loading],
+            ),
         };
         let prepared = text_upload::prepare(
             text_upload::Prepare {
@@ -4526,14 +4565,7 @@ impl Renderer {
         if let Some(p) = self.pending.take() {
             self.retire_candidate(p);
         }
-        let installed = self.loading_text_key();
-        if self
-            .staged_text
-            .as_ref()
-            .is_some_and(|t| Some(t.key) != installed)
-        {
-            self.staged_text = None;
-        }
+        self.drop_loading_upload(true);
     }
 
     /// A number for resources made now, never given before.
@@ -5573,8 +5605,14 @@ impl Renderer {
         let mut out = crate::Uploaded {
             bga: crate::BgaStep::Idle,
             staged: None,
+            text: None,
             chart: None,
         };
+        // The loading text that ended on the renderer's own account since
+        // the last boundary.
+        if !staging_only {
+            out.text = self.loading_report.take();
+        }
         let started = Instant::now();
         let mut steps = 0_u32;
         loop {
@@ -5583,6 +5621,11 @@ impl Renderer {
             {
                 self.bga_upload = None;
                 out.bga = crate::BgaStep::Done(Err(crate::BgaFault::Stale));
+            }
+            // The loading text's installation checked before each step and
+            // at its completion.
+            if let Some(done) = self.stale_loading_text() {
+                out.text = Some(done);
             }
             // The chart publication's device and target checked before
             // each band and at its completion.
@@ -5641,6 +5684,41 @@ impl Renderer {
             }
             if staging_only {
                 break;
+            }
+            // The loading text, before the chart images.
+            if self.loading_upload.is_some() {
+                if self
+                    .loading_upload
+                    .as_ref()
+                    .is_some_and(LoadingUpload::written)
+                {
+                    out.text = self.finish_loading_text();
+                    continue;
+                }
+                if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                    break;
+                }
+                if past() {
+                    break;
+                }
+                if !self.write_text_step()
+                    && !self
+                        .loading_upload
+                        .as_ref()
+                        .is_some_and(LoadingUpload::written)
+                {
+                    // Nothing it can write here: it ends as stale.
+                    let at = self.loading_text_in_hand();
+                    self.cancel_loading_text();
+                    out.text = at.map(|(lifetime, revision)| crate::TextDone {
+                        lifetime,
+                        revision,
+                        result: Err(crate::TextFault::Install(LoadingTextError::Stale)),
+                    });
+                    break;
+                }
+                steps += 1;
+                continue;
             }
             // The attempt's chart images, before the BGA batch.
             if let Some((up, images)) = chart.as_mut() {
@@ -5722,7 +5800,7 @@ impl Renderer {
 
     /// Whether a payload is in hand: the staging's pages, or a BGA batch.
     fn uploading(&self) -> bool {
-        self.staging_steps() || self.bga_upload.is_some()
+        self.staging_steps() || self.loading_upload.is_some() || self.bga_upload.is_some()
     }
 
     /// Whether the staging has pages to write or its last step's
@@ -6440,7 +6518,7 @@ impl Renderer {
             staged_cpu: staged_cpu.map_or(0, |s| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
             staged_loading: staged_loading.map_or(0, |s| s.loading().bytes()),
-            staged_text: self.staged_text.as_ref().map_or(0, StagedText::bytes),
+            staged_text: self.loading_upload.as_ref().map_or(0, LoadingUpload::bytes),
             atlas: self.atlas.bytes(),
             staged_atlas,
             upload,
@@ -6922,47 +7000,37 @@ impl Renderer {
         Ok(())
     }
 
-    /// Prepares the chosen chart's text `chart` of `revision` for loading
-    /// lifetime `lifetime`, the slots `which` names, held staged until
-    /// [`install_staged_loading_text`](Self::install_staged_loading_text),
-    /// replacing text staged before: at most one preparation waits. The
-    /// rasterized slots' lines are placed in the installed resources' text
-    /// layer and uploaded through the bundle's producer, as an attempt's
-    /// are ([`stage`](Self::stage)), never writing to or freeing a line the
-    /// installed attempt, the attempt staged on these resources or the
-    /// installed loading lines hold; the staged text holds its own until
-    /// it is installed or dropped. The bitmap-font lines are laid out by
-    /// the installation's skin. Before recording opens and outside a
-    /// frame's build, such as in a loading frame's call before it builds:
-    /// it allocates and waits for the GPU. Nothing is staged without a
-    /// declarative installation; without a producer the staged text clears
-    /// the rasterized slots.
-    ///
-    /// # Errors
-    ///
-    /// As an attempt's text ([`stage`](Self::stage)): the producer's
-    /// refusal of a line ([`RenderError::Skin`]), the device's refusal of
-    /// a write ([`RenderError::Atlas`]), both refusals
-    /// ([`RenderError::is_refusal`]), or the device failing while it is
-    /// waited for. Nothing is staged, and what was installed stays.
+    /// Takes the chosen chart's text `chart` of `revision` for loading
+    /// lifetime `lifetime`, the slots `which` names, on the installed play
+    /// skin into the uploader's hand
+    /// ([`prepare_loading_text_on`](Self::prepare_loading_text_on)).
     pub fn prepare_loading_text(
         &mut self,
         lifetime: u64,
         revision: u64,
         which: TextSlots,
         chart: &ChartText<'_>,
-    ) -> Result<(), RenderError> {
-        self.prepare_loading_text_on(LoadingOn::Installed, lifetime, revision, which, chart)
+    ) {
+        self.prepare_loading_text_on(LoadingOn::Installed, lifetime, revision, which, chart);
     }
 
-    /// [`prepare_loading_text`](Self::prepare_loading_text) for the
-    /// installation `on` names: for a staging on its own resources, the
-    /// lines are placed in its own cache, holding its attempt's and its
-    /// loading lines, and staged under its key.
-    ///
-    /// # Errors
-    ///
-    /// As [`prepare_loading_text`](Self::prepare_loading_text).
+    /// Takes the chosen chart's text `chart` of `revision` for loading
+    /// lifetime `lifetime`, the slots `which` names, on the installation
+    /// `on` names into the uploader's hand (design.md "Rendering and
+    /// Skins"; "Memory Budget", the uploader), replacing one in hand, whose
+    /// lines are released. The rasterized slots' lines are placed in that
+    /// installation's text layer through its bundle's producer, as an
+    /// attempt's are ([`stage`](Self::stage)), never writing to or freeing
+    /// a line the installed attempt, the attempt staged on those resources
+    /// or the installed loading lines hold; they are written in steps at
+    /// the boundaries ([`upload_boundary_within`](Self::upload_boundary_within)),
+    /// and the boundary that sees its last step complete installs the text
+    /// into the installation's presentation and answers how it ended
+    /// ([`crate::Uploaded::text`]). The bitmap-font lines are laid out by
+    /// the installation's skin. Nothing is taken without a declarative
+    /// installation; without a producer the text clears the rasterized
+    /// slots. Preparation work, outside a frame's build: it allocates and
+    /// writes nothing.
     pub fn prepare_loading_text_on(
         &mut self,
         on: LoadingOn,
@@ -6970,26 +7038,298 @@ impl Renderer {
         revision: u64,
         which: TextSlots,
         chart: &ChartText<'_>,
-    ) -> Result<(), RenderError> {
-        if let LoadingOn::Staged(token) = on
-            && self.staged_own(token)
-        {
-            return self.prepare_staged_own_text(token, lifetime, revision, which, chart);
-        }
-        self.staged_text = None;
-        let (Some(key), Some(installed)) = (self.loading_text_key(), self.installed.as_ref())
-        else {
-            return Ok(());
+    ) {
+        self.cancel_loading_text();
+        let Some(key) = self.loading_text_key_on(on) else {
+            return;
         };
-        let bundle = Arc::clone(installed.bundle());
+        let own = matches!(on, LoadingOn::Staged(token) if self.staged_own(token));
+        let target = self.target();
+        let bundle = if own {
+            let Some(Pending { skin: Some(s), .. }) = self.pending.as_ref() else {
+                return;
+            };
+            Arc::clone(s.installation().bundle())
+        } else {
+            let Some(installed) = self.installed.as_ref() else {
+                return;
+            };
+            Arc::clone(installed.bundle())
+        };
         let skin = bundle.skin();
-        let (table, holder) = match bundle.text_producer() {
+        #[cfg(feature = "dev-tools")]
+        self.count_preparation(key, target, lifetime, revision);
+        let upload = match bundle.text_producer() {
             Some(producer) => {
                 // A failure leaves no earlier preparation's report.
                 self.text_report = TextReport::default();
-                let mut requests = skin.text_requests(chart, self.target(), &Layout::AUTHOR);
+                let mut requests = skin.text_requests(chart, target, &Layout::AUTHOR);
                 requests.retain(|r| skin.names_text_slot(which, r.slot));
-                // The attempt staged on these resources keeps its lines.
+                let scope = bundle.text_scope();
+                if own {
+                    let Some(Pending {
+                        res: PendingRes::Own(r),
+                        text,
+                        loading,
+                        ..
+                    }) = self.pending.as_mut()
+                    else {
+                        return;
+                    };
+                    Some(text_upload::TextUpload::begin(
+                        &mut r.text_cache,
+                        &mut self.text_scratch,
+                        producer.as_ref(),
+                        scope,
+                        &[&*text, &*loading],
+                        &requests,
+                        skin.text_slots(),
+                    ))
+                } else {
+                    // The attempt staged on these resources keeps its lines.
+                    let pending = self
+                        .pending
+                        .as_ref()
+                        .filter(|p| {
+                            p.token.kind == ScreenKind::Play
+                                && matches!(p.res, PendingRes::Installed)
+                        })
+                        .map(|p| &p.text);
+                    let held = [
+                        Some(&self.installed_text),
+                        pending,
+                        Some(&self.installed_loading),
+                    ];
+                    let held: Vec<&Holder> = held.into_iter().flatten().collect();
+                    Some(text_upload::TextUpload::begin(
+                        &mut self.text_cache,
+                        &mut self.text_scratch,
+                        producer.as_ref(),
+                        scope,
+                        &held,
+                        &requests,
+                        skin.text_slots(),
+                    ))
+                }
+            }
+            None => None,
+        };
+        if let Some(up) = &upload {
+            self.text_report = up.report().clone();
+        }
+        let bitmap = skin.loading_bitmap_lines(which, chart);
+        self.loading_upload = Some(LoadingUpload {
+            on,
+            key,
+            lifetime,
+            revision,
+            which,
+            upload,
+            bitmap,
+        });
+    }
+
+    /// Drops the loading text in the uploader's hand, if any, its new
+    /// lines released: it is no longer the one asked.
+    pub fn cancel_loading_text(&mut self) {
+        self.drop_loading_upload(false);
+        self.loading_report = None;
+    }
+
+    /// Writes the loading text in hand to its end and installs it, waiting
+    /// for the GPU, before another preparation places in its cache (an
+    /// attempt's text staged on the installed resources), so it keeps the
+    /// precedence it was asked with; the next boundary answers how it
+    /// ended.
+    fn finish_loading_now(&mut self) {
+        let installed = self.loading_text_key();
+        if self
+            .loading_upload
+            .as_ref()
+            .is_none_or(|t| Some(t.key) != installed)
+        {
+            return;
+        }
+        while self.loading_upload.as_ref().is_some_and(|t| !t.written()) {
+            if !self.write_text_step() {
+                break;
+            }
+        }
+        if self.loading_upload.is_none() {
+            return;
+        }
+        if let Err(e) = wait_for_gpu(&self.gpu) {
+            let t = self.loading_upload.take();
+            self.loading_report = t.map(|t| crate::TextDone {
+                lifetime: t.lifetime,
+                revision: t.revision,
+                result: Err(crate::TextFault::Prepare(e)),
+            });
+            return;
+        }
+        if self
+            .loading_upload
+            .as_ref()
+            .is_some_and(LoadingUpload::written)
+        {
+            self.loading_report = self.finish_loading_text();
+        } else {
+            self.drop_loading_upload(false);
+        }
+    }
+
+    /// The loading lifetime and revision of the text in the uploader's
+    /// hand, if any.
+    #[must_use]
+    pub fn loading_text_in_hand(&self) -> Option<(u64, u64)> {
+        self.loading_upload
+            .as_ref()
+            .map(|t| (t.lifetime, t.revision))
+    }
+
+    /// Drops the loading text in hand, its new lines released in their
+    /// cache: with `own_only`, only one not on the installed resources
+    /// (a staging's own, whose cache goes with the staging). A step of it
+    /// still in flight writes them before any later write reuses them.
+    fn drop_loading_upload(&mut self, own_only: bool) {
+        let Some(t) = self.loading_upload.take() else {
+            return;
+        };
+        let installed = self.loading_text_key() == Some(t.key);
+        if own_only && installed {
+            self.loading_upload = Some(t);
+            return;
+        }
+        self.loading_report = Some(crate::TextDone {
+            lifetime: t.lifetime,
+            revision: t.revision,
+            result: Err(crate::TextFault::Install(LoadingTextError::Stale)),
+        });
+        #[cfg(feature = "dev-tools")]
+        self.count_text(t.lifetime, |c| c.drops += 1);
+        let Some(up) = t.upload else {
+            return;
+        };
+        if installed {
+            up.abort(&mut self.text_cache);
+        } else if self.loading_text_key_on(t.on) == Some(t.key)
+            && let Some(Pending {
+                res: PendingRes::Own(r),
+                ..
+            }) = self.pending.as_mut()
+        {
+            up.abort(&mut r.text_cache);
+        }
+    }
+
+    /// Whether the loading text in hand is no longer its installation's
+    /// (another installation, replaced resources or a lost device): it is
+    /// dropped, and how it ended.
+    fn stale_loading_text(&mut self) -> Option<crate::TextDone> {
+        let t = self.loading_upload.as_ref()?;
+        let lost = self.gpu.lost();
+        if !lost && self.loading_text_key_on(t.on) == Some(t.key) {
+            return None;
+        }
+        let (lifetime, revision) = (t.lifetime, t.revision);
+        self.cancel_loading_text();
+        Some(crate::TextDone {
+            lifetime,
+            revision,
+            result: Err(if lost {
+                crate::TextFault::Prepare(RenderError::DeviceLost)
+            } else {
+                crate::TextFault::Install(LoadingTextError::Stale)
+            }),
+        })
+    }
+
+    /// One step of the loading text in hand: its next lines written and
+    /// submitted, the step's completion registered. Whether it wrote one.
+    fn write_text_step(&mut self) -> bool {
+        let installed = self.loading_text_key();
+        let Some(t) = self.loading_upload.as_mut() else {
+            return false;
+        };
+        let Some(up) = t.upload.as_mut() else {
+            return false;
+        };
+        let (atlas, bundle) = if Some(t.key) == installed {
+            let Some(i) = self.installed.as_ref() else {
+                return false;
+            };
+            (&self.atlas, Arc::clone(i.bundle()))
+        } else {
+            let Some(Pending {
+                res: PendingRes::Own(r),
+                skin: Some(s),
+                ..
+            }) = self.pending.as_ref()
+            else {
+                return false;
+            };
+            (&r.atlas, Arc::clone(s.installation().bundle()))
+        };
+        let Some(producer) = bundle.text_producer() else {
+            return false;
+        };
+        let step = up.write_step(
+            &self.gpu,
+            atlas,
+            &mut self.text_scratch,
+            producer.as_ref(),
+            crate::UPLOAD_WRITE,
+        );
+        self.text_report.upload_bytes = up.report().upload_bytes;
+        self.text_report
+            .submission
+            .clone_from(&up.report().submission);
+        let Some(index) = step else {
+            return false;
+        };
+        self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
+        true
+    }
+
+    /// The loading text in hand, its last step's completion seen: its
+    /// lines published in their cache and the text installed into its
+    /// installation's presentation, or why not.
+    fn finish_loading_text(&mut self) -> Option<crate::TextDone> {
+        let t = self.loading_upload.take()?;
+        let (lifetime, revision) = (t.lifetime, t.revision);
+        let done = |result| {
+            Some(crate::TextDone {
+                lifetime,
+                revision,
+                result,
+            })
+        };
+        let installed = self.loading_text_key() == Some(t.key);
+        // Development builds: its completion fails as a failing device's
+        // would, the cache it wrote closed until the renderer is built
+        // again ([`fail_next_text_wait`](Self::fail_next_text_wait)).
+        #[cfg(feature = "dev-tools")]
+        if t.upload
+            .as_ref()
+            .is_some_and(|u| u.report().submission.is_some())
+            && std::mem::take(&mut self.text_wait_fault)
+        {
+            if installed {
+                self.text_cache.abandon();
+            } else if let Some(Pending {
+                res: PendingRes::Own(r),
+                ..
+            }) = self.pending.as_mut()
+            {
+                r.text_cache.abandon();
+            }
+            return done(Err(crate::TextFault::Prepare(RenderError::Poll(
+                wgpu::PollError::Timeout,
+            ))));
+        }
+        let settled = match t.upload {
+            None => Ok((None, Holder::default())),
+            Some(up) if installed => {
                 let pending = self
                     .pending
                     .as_ref()
@@ -7003,97 +7343,82 @@ impl Renderer {
                     Some(&self.installed_loading),
                 ];
                 let held: Vec<&Holder> = held.into_iter().flatten().collect();
-                let (table, holder, report) = text_upload::prepare(
-                    text_upload::Prepare {
-                        gpu: &self.gpu,
-                        atlas: &self.atlas,
-                        cache: &mut self.text_cache,
-                        scratch: &mut self.text_scratch,
-                        producer: producer.as_ref(),
-                        scope: bundle.text_scope(),
-                        held: &held,
-                        #[cfg(test)]
-                        hooks: &mut self.text_hooks,
-                        #[cfg(feature = "dev-tools")]
-                        wait_fault: &mut self.text_wait_fault,
-                    },
-                    &requests,
-                    skin.text_slots(),
-                )?;
-                self.text_report = report;
-                (Some(table), holder)
+                up.finish(&mut self.text_cache, &held)
+                    .map(|(table, holder, report)| (Some(table), holder, report))
+                    .map(|(table, holder, report)| {
+                        self.text_report = report;
+                        (table, holder)
+                    })
             }
-            None => (None, Holder::default()),
+            Some(up) => {
+                if self.loading_text_key_on(t.on) != Some(t.key) {
+                    return done(Err(crate::TextFault::Install(LoadingTextError::Stale)));
+                }
+                let Some(Pending {
+                    res: PendingRes::Own(r),
+                    text,
+                    loading,
+                    ..
+                }) = self.pending.as_mut()
+                else {
+                    return done(Err(crate::TextFault::Install(LoadingTextError::Stale)));
+                };
+                match up.finish(&mut r.text_cache, &[&*text, &*loading]) {
+                    Ok((table, holder, report)) => {
+                        self.text_report = report;
+                        Ok((Some(table), holder))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         };
-        let bitmap = skin.loading_bitmap_lines(which, chart);
-        self.staged_text = Some(StagedText {
-            key,
-            lifetime,
-            revision,
-            which,
-            table,
-            bitmap,
+        let (table, holder) = match settled {
+            Ok(s) => s,
+            Err(e) => {
+                #[cfg(feature = "dev-tools")]
+                self.count_text(lifetime, |c| c.drops += 1);
+                return done(Err(crate::TextFault::Prepare(e)));
+            }
+        };
+        let installed = self.install_loading_text_on(
+            t.on,
+            t.key,
+            (lifetime, revision, t.which),
+            table.as_ref(),
+            t.bitmap,
             holder,
+        );
+        #[cfg(feature = "dev-tools")]
+        self.count_text(lifetime, |c| {
+            if installed.is_ok() {
+                c.installs += 1;
+            } else {
+                c.drops += 1;
+            }
         });
-        Ok(())
+        done(installed.map_err(crate::TextFault::Install))
     }
 
-    /// Development builds: the last frame's list, if its skin keeps one.
-    #[cfg(feature = "dev-tools")]
-    #[must_use]
-    pub fn display_list(&self) -> Option<skin_model::DisplayList> {
-        self.skin
-            .display_list(self.staging.batch().quads(), self.staging.clips())
-    }
-
-    /// Development builds: the next preparation of rasterized text that
-    /// uploads fails waiting for the GPU as a failing device does
-    /// ([`RenderError::Poll`], not a refusal), its cache closed until the
-    /// renderer is built again.
-    #[cfg(feature = "dev-tools")]
-    pub fn fail_next_text_wait(&mut self) {
-        self.text_wait_fault = true;
-    }
-
-    /// The loading lifetime and revision of the text staged, if any.
-    #[must_use]
-    pub fn staged_loading_text(&self) -> Option<(u64, u64)> {
-        self.staged_text.as_ref().map(|t| (t.lifetime, t.revision))
-    }
-
-    /// Installs the text staged, taking it, from the next loading frame
-    /// on, if it is still the installation's (its key), of the lifetime
-    /// its presentation is in, and no older than the revision installed:
-    /// text of another bundle, renderer, resources, lifetime or an older
-    /// revision is dropped. `Ok(false)` with nothing staged.
-    ///
-    /// # Errors
-    ///
-    /// Why the staged text was dropped.
-    pub fn install_staged_loading_text(&mut self) -> Result<bool, LoadingTextError> {
-        self.install_staged_loading_text_on(LoadingOn::Installed)
-    }
-
-    /// [`install_staged_loading_text`](Self::install_staged_loading_text)
-    /// into the installation `on` names: a staging on its own resources
-    /// takes the lines into its presentation and its own loading holder.
-    ///
-    /// # Errors
-    ///
-    /// Why the staged text was dropped.
-    pub fn install_staged_loading_text_on(
+    /// Installs `table`'s lines and `bitmap` into the presentation of the
+    /// installation `on` names, its slots `which` names, for `lifetime`
+    /// and `revision`, if `key` is still that installation's: its slots
+    /// draw them from its next loading frame on, the lines `holder` holds
+    /// in place of the ones they drew.
+    fn install_loading_text_on(
         &mut self,
         on: LoadingOn,
-    ) -> Result<bool, LoadingTextError> {
+        key: LoadingTextKey,
+        (lifetime, revision, which): (u64, u64, TextSlots),
+        table: Option<&TextTable>,
+        bitmap: BitmapLines,
+        holder: Holder,
+    ) -> Result<(), LoadingTextError> {
+        if self.loading_text_key_on(on) != Some(key) {
+            return Err(LoadingTextError::Stale);
+        }
         if let LoadingOn::Staged(token) = on
             && self.staged_own(token)
         {
-            let Some(staged) = self.staged_text.take() else {
-                return Ok(false);
-            };
-            if self.loading_text_key_on(on) != Some(staged.key) {
-                return Err(LoadingTextError::Stale);
-            }
             let Some(Pending {
                 skin: Some(skin),
                 loading,
@@ -7105,102 +7430,98 @@ impl Renderer {
             let installation = skin.installation();
             installation.loading().install_revision(
                 installation.bundle(),
-                staged.lifetime,
-                staged.revision,
-                staged.which,
-                staged.table.as_ref(),
-                staged.bitmap,
+                lifetime,
+                revision,
+                which,
+                table,
+                bitmap,
             )?;
-            loading.release_named(installation.bundle().skin(), staged.which);
-            loading.extend(staged.holder);
-            return Ok(true);
-        }
-        let Some(staged) = self.staged_text.take() else {
-            return Ok(false);
-        };
-        if self.loading_text_key() != Some(staged.key) {
-            return Err(LoadingTextError::Stale);
+            loading.release_named(installation.bundle().skin(), which);
+            loading.extend(holder);
+            return Ok(());
         }
         let Some(installed) = self.installed.as_ref() else {
             return Err(LoadingTextError::Stale);
         };
         installed.loading().install_revision(
             installed.bundle(),
-            staged.lifetime,
-            staged.revision,
-            staged.which,
-            staged.table.as_ref(),
-            staged.bitmap,
-        )?;
-        // Its slots draw its lines now, and no longer the ones before.
-        self.installed_loading
-            .release_named(installed.bundle().skin(), staged.which);
-        self.installed_loading.extend(staged.holder);
-        Ok(true)
-    }
-
-    /// The staged loading text of a staging on its own resources
-    /// ([`prepare_loading_text_on`](Self::prepare_loading_text_on)).
-    fn prepare_staged_own_text(
-        &mut self,
-        token: PreparedToken,
-        lifetime: u64,
-        revision: u64,
-        which: TextSlots,
-        chart: &ChartText<'_>,
-    ) -> Result<(), RenderError> {
-        self.staged_text = None;
-        let Some(key) = self.loading_text_key_on(LoadingOn::Staged(token)) else {
-            return Ok(());
-        };
-        let target = self.target();
-        let Some(p) = self.pending.as_mut() else {
-            return Ok(());
-        };
-        let (Some(skin), PendingRes::Own(r)) = (&p.skin, &mut p.res) else {
-            return Ok(());
-        };
-        let bundle = Arc::clone(skin.installation().bundle());
-        let sk = bundle.skin();
-        let (table, holder) = match bundle.text_producer() {
-            Some(producer) => {
-                self.text_report = TextReport::default();
-                let mut requests = sk.text_requests(chart, target, &Layout::AUTHOR);
-                requests.retain(|q| sk.names_text_slot(which, q.slot));
-                let held = [&p.text, &p.loading];
-                let (table, holder, report) = text_upload::prepare(
-                    text_upload::Prepare {
-                        gpu: &self.gpu,
-                        atlas: &r.atlas,
-                        cache: &mut r.text_cache,
-                        scratch: &mut self.text_scratch,
-                        producer: producer.as_ref(),
-                        scope: bundle.text_scope(),
-                        held: &held,
-                        #[cfg(test)]
-                        hooks: &mut self.text_hooks,
-                        #[cfg(feature = "dev-tools")]
-                        wait_fault: &mut self.text_wait_fault,
-                    },
-                    &requests,
-                    sk.text_slots(),
-                )?;
-                self.text_report = report;
-                (Some(table), holder)
-            }
-            None => (None, Holder::default()),
-        };
-        let bitmap = sk.loading_bitmap_lines(which, chart);
-        self.staged_text = Some(StagedText {
-            key,
             lifetime,
             revision,
             which,
             table,
             bitmap,
-            holder,
-        });
+        )?;
+        // Its slots draw its lines now, and no longer the ones before.
+        self.installed_loading
+            .release_named(installed.bundle().skin(), which);
+        self.installed_loading.extend(holder);
         Ok(())
+    }
+
+    /// Development builds: what loading lifetime `lifetime`'s text did on
+    /// this renderer ([`TextCount`](crate::TextCount)).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn text_count(&self, lifetime: u64) -> crate::TextCount {
+        self.text_counts
+            .iter()
+            .find(|(l, _)| *l == lifetime)
+            .map_or_else(crate::TextCount::default, |(_, c)| *c)
+    }
+
+    /// Development builds: counts into lifetime `lifetime`'s entry.
+    #[cfg(feature = "dev-tools")]
+    fn count_text(&mut self, lifetime: u64, f: impl FnOnce(&mut crate::TextCount)) {
+        let i = match self.text_counts.iter().position(|(l, _)| *l == lifetime) {
+            Some(i) => i,
+            None => {
+                self.text_counts
+                    .push((lifetime, crate::TextCount::default()));
+                self.text_counts.len() - 1
+            }
+        };
+        if let Some((_, c)) = self.text_counts.get_mut(i) {
+            f(c);
+        }
+    }
+
+    /// Development builds: counts a preparation by its cause against the
+    /// last one: the lifetime's first, another key, another target, or
+    /// another revision.
+    #[cfg(feature = "dev-tools")]
+    fn count_preparation(
+        &mut self,
+        key: LoadingTextKey,
+        target: [u32; 2],
+        lifetime: u64,
+        revision: u64,
+    ) {
+        let last = self.text_last.replace((key, target, lifetime, revision));
+        self.count_text(lifetime, |c| match last {
+            Some((_, _, l, _)) if l != lifetime => c.first += 1,
+            None => c.first += 1,
+            Some((k, _, _, _)) if k != key => c.key += 1,
+            Some((_, t, _, _)) if t != target => c.target += 1,
+            Some(_) => c.revision += 1,
+        });
+    }
+
+    /// Development builds: the last frame's list, if its skin keeps one.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn display_list(&self) -> Option<skin_model::DisplayList> {
+        self.skin
+            .display_list(self.staging.batch().quads(), self.staging.clips())
+    }
+
+    /// Development builds: the next preparation of rasterized text that
+    /// uploads fails waiting for the GPU, or the loading text in hand that
+    /// wrote a step fails at its completion, as a failing device does
+    /// ([`RenderError::Poll`], not a refusal), its cache closed until the
+    /// renderer is built again.
+    #[cfg(feature = "dev-tools")]
+    pub fn fail_next_text_wait(&mut self) {
+        self.text_wait_fault = true;
     }
 
     /// Clears the installed presentation's slots `which` names, so they

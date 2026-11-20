@@ -421,8 +421,7 @@ fn loading_frame(r: &mut Renderer, menu: &MenuText) -> Vec<u8> {
 /// The loading text of `text` prepared for lifetime 1 at `revision`, every
 /// slot.
 fn prepare_loading(r: &mut Renderer, revision: u64, text: &ChartText<'_>) {
-    r.prepare_loading_text(1, revision, TextSlots::ALL, text)
-        .unwrap();
+    r.prepare_loading_text(1, revision, TextSlots::ALL, text);
 }
 
 /// The attempt staged on the installed resources keeps its lines while
@@ -486,9 +485,8 @@ fn staged_loading_lines_move_with_the_commit() {
     };
     // The first staged frame enters the lifetime.
     staged_frame(&mut r);
-    r.prepare_loading_text_on(on, 1, 1, TextSlots::ALL, &labels("A", "B"))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text_on(on), Ok(true));
+    r.prepare_loading_text_on(on, 1, 1, TextSlots::ALL, &labels("A", "B"));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let drawn = staged_frame(&mut r);
     assert!(
         lit(&drawn).is_some(),
@@ -499,7 +497,7 @@ fn staged_loading_lines_move_with_the_commit() {
 
     r.commit(staged).unwrap();
     assert_eq!(r.loading_text_key(), key);
-    assert_eq!(r.install_staged_loading_text(), Ok(false));
+    assert_eq!(common::settle_text(&mut r), Ok(false));
     assert_eq!(loading_frame(&mut r, &menu), drawn);
 
     // Under pressure: the attempt's and the loading lines fill the layer.
@@ -535,9 +533,8 @@ fn a_reused_specialization_draws_with_no_upload() {
         read_back(r)
     };
     let before = staged(&mut r);
-    r.prepare_loading_text_on(on, 2, 1, TextSlots::ALL, &labels("Beta", ""))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text_on(on), Ok(true));
+    r.prepare_loading_text_on(on, 2, 1, TextSlots::ALL, &labels("Beta", ""));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let drawn = staged(&mut r);
     assert!(lit(&drawn).is_some());
     assert_ne!(drawn, before, "the lifetime's own text drawn");
@@ -549,11 +546,12 @@ fn a_reused_specialization_draws_with_no_upload() {
     );
 }
 
-/// The staged loading text and then the installed loading lines keep
-/// their lines while an attempt is staged under pressure: with the
-/// loading lines filling the layer, the attempt's lines evict none of
-/// them and are set smaller, and the loading frame draws the loading
-/// lines as it does where no attempt was staged.
+/// The loading text in the uploader's hand, finished and installed before
+/// an attempt's text is placed on the same resources, and then the
+/// installed loading lines keep their lines while an attempt is staged
+/// under pressure: with the loading lines filling the layer, the attempt's
+/// lines evict none of them and are set smaller, and the loading frame
+/// draws the loading lines as it does where no attempt was staged.
 #[test]
 fn loading_pins_survive_attempt() {
     let dir = step_skin();
@@ -565,13 +563,15 @@ fn loading_pins_survive_attempt() {
     prepare_loading(&mut r, 1, &labels("A", "B"));
     assert_eq!(r.text_report().counts.rounds, 1);
 
-    // Staged: held by the staged text.
+    // In hand: finished and installed before the attempt's text.
     stage(&mut r, &b, &labels("C", "D"), 2);
+    assert_eq!(r.loading_text_in_hand(), None);
     let report = r.text_report();
     assert!(report.notes.is_empty(), "{:?}", report.notes);
     assert_eq!(report.counts.evictions, 0, "{:?}", report.counts);
     assert!(report.counts.rounds > 1, "{:?}", report.counts);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let done = r.upload_boundary().text.expect("answered at the boundary");
+    assert_eq!(done.result.ok(), Some(()));
     let drawn = loading_frame(&mut r, &menu);
     assert!(lit(&drawn).is_some(), "the loading lines drew nothing");
 
@@ -589,7 +589,7 @@ fn loading_pins_survive_attempt() {
     common::install(&mut q, &qb, 1);
     q.enter_loading(1);
     prepare_loading(&mut q, 1, &labels("A", "B"));
-    assert_eq!(q.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut q), Ok(true));
     assert_eq!(drawn, loading_frame(&mut q, &qmenu));
 }
 
@@ -608,7 +608,7 @@ fn loading_to_attempt_reuse_after_refit() {
     let refit = r.text_report().counts;
     assert!(refit.rounds > 1, "{refit:?}");
     assert_eq!(refit.placements, 2);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let (layouts, rasters) = (
         c.layouts.load(Ordering::SeqCst),
         c.rasters.load(Ordering::SeqCst),
@@ -641,7 +641,7 @@ fn cleared_loading_slots_release_their_lines() {
     common::install(&mut r, &b, 1);
     r.enter_loading(1);
     prepare_loading(&mut r, 1, &labels("A", "B"));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     r.clear_loading_text(TextSlots::field(skin_model::TextField::Title));
     stage(&mut r, &b, &labels("C", "D"), 2);
     let counts = r.text_report().counts;
@@ -669,12 +669,11 @@ fn replaced_loading_slots_release_their_lines() {
     common::install(&mut r, &b, 1);
     r.enter_loading(1);
     prepare_loading(&mut r, 1, &labels("A", "B"));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let title = TextSlots::field(skin_model::TextField::Title);
-    r.prepare_loading_text(1, 2, title, &labels("C", "B"))
-        .unwrap();
+    r.prepare_loading_text(1, 2, title, &labels("C", "B"));
     assert_eq!(r.text_report().counts.evictions, 0);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let drawn = loading_frame(&mut r, &menu);
     assert!(lit(&drawn).is_some());
 

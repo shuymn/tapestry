@@ -697,13 +697,12 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     let all = TextSlots::field(TextField::Title)
         .with(TextSlots::field(TextField::Artist))
         .with(TextSlots::field(TextField::Genre));
-    r.prepare_loading_text(1, 1, all, &chosen("B", "", ""))
-        .unwrap();
-    assert_eq!(r.staged_loading_text(), Some((1, 1)));
+    r.prepare_loading_text(1, 1, all, &chosen("B", "", ""));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
     assert!(r.memory().staged_text > 0);
     // Staged, nothing of it draws yet.
     assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 0))), [BLACK; 4]);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(r.memory().staged_text, 0);
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 16))),
@@ -717,9 +716,8 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     // The title cleared: its slot and the full title's draw nothing.
     r.clear_loading_text(TextSlots::field(TextField::Title));
     assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 32))), [BLACK; 4]);
-    r.prepare_loading_text(1, 2, all, &chosen("B", "b", ""))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 2, all, &chosen("B", "b", ""));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 48))),
         [RED, RED, BLACK, RED]
@@ -732,39 +730,29 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     );
 
     // Prepared on A, then B committed within the lifetime: dropped.
-    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"))
-        .unwrap();
+    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"));
     install(&mut r, &b, 2);
     r.enter_loading(1);
-    assert_eq!(
-        r.install_staged_loading_text(),
-        Err(LoadingTextError::Stale)
-    );
-    assert_eq!(r.staged_loading_text(), None);
+    assert_eq!(common::settle_text(&mut r), Err(LoadingTextError::Stale));
+    assert_eq!(r.loading_text_in_hand(), None);
     assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 80))), [BLACK; 4]);
-    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 96))),
         [GREEN, GREEN, GREEN, GREEN]
     );
     // An older revision and another lifetime are dropped.
-    r.prepare_loading_text(1, 2, all, &chosen("", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 2, all, &chosen("", "", ""));
     assert_eq!(
-        r.install_staged_loading_text(),
+        common::settle_text(&mut r),
         Err(LoadingTextError::Older {
             installed: 3,
             revision: 2
         })
     );
-    r.prepare_loading_text(2, 4, all, &chosen("", "", ""))
-        .unwrap();
-    assert_eq!(
-        r.install_staged_loading_text(),
-        Err(LoadingTextError::Lifetime)
-    );
+    r.prepare_loading_text(2, 4, all, &chosen("", "", ""));
+    assert_eq!(common::settle_text(&mut r), Err(LoadingTextError::Lifetime));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 112))),
         [GREEN, GREEN, GREEN, GREEN]
@@ -782,27 +770,24 @@ fn staged_chart_text_is_bounded() {
     let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
     install(&mut r, &a, 1);
     r.enter_loading(1);
-    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("B", "b", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("B", "b", ""));
     let first = r.memory().staged_text;
     assert!(first > 0);
-    r.prepare_loading_text(1, 2, TextSlots::ALL, &chosen("A", "a", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 2, TextSlots::ALL, &chosen("A", "a", ""));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert!(r.text_report().upload_bytes > 0);
-    r.prepare_loading_text(1, 3, TextSlots::ALL, &chosen("A", "a", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 3, TextSlots::ALL, &chosen("A", "a", ""));
     let one = r.memory();
     assert_eq!(one.staged_text, first);
     assert_eq!(one.text_upload, 0, "hits upload nothing");
     for revision in 4..20 {
-        r.prepare_loading_text(1, revision, TextSlots::ALL, &chosen("A", "a", ""))
-            .unwrap();
+        r.prepare_loading_text(1, revision, TextSlots::ALL, &chosen("A", "a", ""));
         assert_eq!(r.memory(), one, "revision {revision}");
     }
-    assert_eq!(r.staged_loading_text(), Some((1, 19)));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 19)));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(r.memory().staged_text, 0);
-    assert_eq!(r.install_staged_loading_text(), Ok(false));
+    assert_eq!(common::settle_text(&mut r), Ok(false));
 }
 
 /// Only the slots asked for are laid out: with the title asked, the
@@ -818,20 +803,20 @@ fn only_the_named_slots_are_laid_out() {
     install(&mut r, &a, 1);
     r.enter_loading(1);
     let title = TextSlots::field(TextField::Title);
-    r.prepare_loading_text(1, 1, title, &chosen("B", "b", "g"))
-        .unwrap();
+    r.prepare_loading_text(1, 1, title, &chosen("B", "b", "g"));
     assert_eq!(*producer.strings.lock().unwrap(), ["B"]);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 0))),
         [RED, BLACK, BLACK, RED]
     );
 }
 
-/// The witness counts the staged loading text's holder with that text,
-/// its strings included, and the installed loading lines' holder with the
-/// text cache once installed; replacing the skin with `set_skin` lets go
-/// of the installed lines' holder, the cache staying.
+/// The witness counts the slots of the loading text in the uploader's
+/// hand with that text, their strings included, and the installed loading
+/// lines' holder with the text cache once installed; replacing the skin
+/// with `set_skin` lets go of the installed lines' holder, the cache with
+/// its published lines staying.
 #[test]
 fn loading_text_holders_are_witnessed() {
     let dir = tempfile::tempdir().unwrap();
@@ -841,24 +826,21 @@ fn loading_text_holders_are_witnessed() {
     r.enter_loading(1);
     let title = TextSlots::field(TextField::Title);
     // No title: no line, an empty holder.
-    r.prepare_loading_text(1, 1, title, &chosen("", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 1, title, &chosen("", "", ""));
     let empty = r.memory().staged_text;
-    r.prepare_loading_text(1, 1, title, &chosen("B", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 1, title, &chosen("B", "", ""));
     let short = r.memory().staged_text;
     // Two held lines (the title and the full title): their strings, 4
     // bytes, and the list's own storage, each element holding two keys
     // with a string header each.
     let headers = 2 * 2 * size_of::<String>();
     assert!(short - empty >= 4 + headers as u64, "{empty} {short}");
-    r.prepare_loading_text(1, 2, title, &chosen("BBBB", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 2, title, &chosen("BBBB", "", ""));
     let staged = r.memory();
     // Two slots (the title and the full title), each holding its alias's
     // and its line's string, 3 bytes longer.
     assert_eq!(staged.staged_text - short, 2 * 2 * 3);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let installed = r.memory();
     assert_eq!(installed.staged_text, 0);
     assert!(
@@ -866,5 +848,7 @@ fn loading_text_holders_are_witnessed() {
         "{installed:?} {staged:?}"
     );
     r.set_skin(Box::new(render::SimpleSkin::new())).unwrap();
-    assert_eq!(r.memory().text_cache, staged.text_cache);
+    let kept = r.memory().text_cache;
+    assert!(kept < installed.text_cache, "the holder kept: {kept}");
+    assert!(kept >= staged.text_cache, "the cache shrank: {kept}");
 }

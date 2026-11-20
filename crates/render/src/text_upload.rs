@@ -11,6 +11,12 @@
 //! writes inside the scopes, pops them, waits for the GPU, and only then
 //! publishes the new lines or releases them: a rectangle is never freed
 //! while a write to it may still be pending.
+//!
+//! The loading text goes through the uploader instead ([`TextUpload`]):
+//! placed when it is taken, then written in steps of at most
+//! [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes, each in its own pair of
+//! scopes and submission, and published or released only once its last
+//! step's completion is seen, with no wait.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -21,7 +27,7 @@ use crate::gpu::Gpu;
 use crate::outline::{LineBounds, MAX_LINE_H, MAX_LINE_W, TextNote};
 use crate::renderer::{RenderError, wait_for_gpu};
 use crate::skin_atlas::{self, AtlasTexture, UploadError};
-use crate::text_cache::{Holder, TextCache, TextCounts};
+use crate::text_cache::{Holder, Placement, TextCache, TextCounts};
 
 /// The tallest rectangle `etagere` returns for a line: [`MAX_LINE_H`] with
 /// its gutter, 1 040, on a shelf rounded to 1 088, plus its split
@@ -376,6 +382,175 @@ pub(crate) fn prepare(
     hooks.step(p.gpu, cache, Step::Published);
     report.notes = notes;
     Ok((TextTable::new(lines), holder, report))
+}
+
+/// A preparation of rasterized lines taken by the uploader in steps
+/// (design.md "Memory Budget", the uploader; a loading text): placed when
+/// it begins, its new lines rasterized and written a step at a time, each
+/// step at most [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes as the queue
+/// stages them (at least one line) inside one pair of error scopes, and
+/// published, or rolled back after a failure, once its last step's
+/// completion is seen. Its new lines are unpublished until then, so no
+/// other preparation may place in its cache meanwhile: the cache would
+/// find them as hits, unwritten.
+#[derive(Debug)]
+pub(crate) struct TextUpload {
+    placement: Placement,
+    slots: usize,
+    /// The next new line to write.
+    next: usize,
+    report: TextReport,
+    /// Why it failed: a line refused by its producer or a step by the
+    /// device; nothing more is written.
+    failed: Option<RenderError>,
+}
+
+impl TextUpload {
+    /// Places `requests` (in slot order) for a table of `slots` slots in
+    /// `cache`, never writing to or freeing a line a holder of `held`
+    /// holds; nothing is written.
+    pub(crate) fn begin(
+        cache: &mut TextCache,
+        scratch: &mut TextScratch,
+        producer: &dyn AttemptText,
+        scope: u64,
+        held: &[&Holder],
+        requests: &[TextRequest],
+        slots: usize,
+    ) -> Self {
+        let bounds = LineBounds::for_side(cache.side());
+        let placement = cache.place(requests, bounds, held, scope, |r, em, b| {
+            producer.layout(r, em, b)
+        });
+        if !placement.new.is_empty() {
+            scratch.reserve();
+        }
+        Self {
+            report: TextReport {
+                counts: placement.counts,
+                ..TextReport::default()
+            },
+            placement,
+            slots,
+            next: 0,
+            failed: None,
+        }
+    }
+
+    /// What it has done so far: its placement's counts, and the bytes its
+    /// steps staged.
+    pub(crate) const fn report(&self) -> &TextReport {
+        &self.report
+    }
+
+    /// The bytes its placement holds.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.placement.bytes()
+    }
+
+    /// Whether nothing is left to write: every new line written, or it
+    /// failed.
+    pub(crate) fn written(&self) -> bool {
+        self.failed.is_some() || self.next >= self.placement.new.len()
+    }
+
+    /// Writes its next step into `atlas`'s text layer: lines rasterized
+    /// through `producer` and written, until the step's bytes reach
+    /// `budget`, then submitted, inside one pair of error scopes. The
+    /// step's submission, if it wrote anything. A line its producer
+    /// refuses, or a write the device refuses, fails it: nothing more is
+    /// written, and its lines are rolled back at
+    /// [`finish`](Self::finish).
+    pub(crate) fn write_step(
+        &mut self,
+        gpu: &Gpu,
+        atlas: &AtlasTexture,
+        scratch: &mut TextScratch,
+        producer: &dyn AttemptText,
+        budget: u64,
+    ) -> Option<wgpu::SubmissionIndex> {
+        let Some(z) = atlas.text_layer() else {
+            self.failed = Some(RenderError::Atlas(UploadError::Side {
+                side: atlas.side(),
+                max: 0,
+            }));
+            return None;
+        };
+        let queue = gpu.queue();
+        let texture = atlas.texture();
+        let (new, next) = (&self.placement.new, &mut self.next);
+        let mut bytes = 0_u64;
+        let ((raster, submission), refused) = skin_atlas::scoped(gpu.device(), || {
+            let mut raster = Ok(());
+            let mut written = false;
+            while let Some(n) = new.get(*next) {
+                if written && bytes >= budget {
+                    break;
+                }
+                if let Err(e) = rasterize(producer, &n.layout, scratch) {
+                    raster = Err(RenderError::Skin(e));
+                    break;
+                }
+                expand(scratch, n.rect, n.layout.size);
+                for k in 0..MIP_LEVELS {
+                    let [x, y, w, h] = n.rect.map(|v| v >> k);
+                    if let Some(level) = scratch.rgba.get(k) {
+                        write(queue, texture, z, k, [x, y, w, h], level);
+                        bytes += padded(w) * u64::from(h);
+                    }
+                }
+                written = true;
+                *next += 1;
+            }
+            // Inside the scopes: the queued writes reach the device only at
+            // a submission, the array's last use for its retirement.
+            let submission = written.then(|| {
+                let (n, index) = gpu.submit([]);
+                atlas.mark(n);
+                index
+            });
+            (raster, submission)
+        });
+        self.report.upload_bytes += bytes;
+        if submission.is_some() {
+            self.report.submission = submission.clone();
+        }
+        self.failed = match (raster, refused) {
+            (Err(e), _) => Some(e),
+            (Ok(()), Some(e)) => Some(RenderError::Atlas(UploadError::Device(e))),
+            (Ok(()), None) => None,
+        };
+        submission
+    }
+
+    /// Settles it once its last step's completion was seen: its table, the
+    /// holder of its lines and its report, its lines published in `cache`
+    /// (never touching a line a holder of `held` holds).
+    ///
+    /// # Errors
+    ///
+    /// Why it failed ([`write_step`](Self::write_step)): its new lines are
+    /// rolled back, and the lines placed before stay.
+    pub(crate) fn finish(
+        self,
+        cache: &mut TextCache,
+        held: &[&Holder],
+    ) -> Result<(TextTable, Holder, TextReport), RenderError> {
+        if let Some(e) = self.failed {
+            cache.rollback(&self.placement);
+            return Err(e);
+        }
+        let mut report = self.report;
+        let (lines, holder, notes) = cache.publish(self.placement, self.slots, held);
+        report.notes = notes;
+        Ok((TextTable::new(lines), holder, report))
+    }
+
+    /// Drops it unpublished: its new lines are released in `cache`. A step
+    /// still in flight writes them before any later write reuses them.
+    pub(crate) fn abort(self, cache: &mut TextCache) {
+        cache.rollback(&self.placement);
+    }
 }
 
 /// One line's RGBA levels for a fixed place of exactly its padded size
