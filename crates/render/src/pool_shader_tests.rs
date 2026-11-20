@@ -115,12 +115,12 @@ fn fs_multiply(v: VOut) -> @location(0) vec4f {
 
 /// The target the quads are drawn on: a row per blend, a column per
 /// filter and source.
-const W: u32 = 576;
-const H: u32 = 144;
+pub(super) const W: u32 = 576;
+pub(super) const H: u32 = 144;
 /// Each quad's side, and the step between quads.
 const QUAD: f32 = 40.0;
 const STEP: f32 = 48.0;
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub(super) const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// The atlas's side and the pool's: unequal.
 const ATLAS_SIDE: u32 = 256;
 const POOL_SIDE: u32 = 512;
@@ -154,12 +154,12 @@ fn level(side: u32, z: u32, k: u32) -> Vec<u8> {
 }
 
 /// Every level of image `z` at `side`.
-fn image(side: u32, z: u32) -> Vec<Vec<u8>> {
+pub(super) fn image(side: u32, z: u32) -> Vec<Vec<u8>> {
     (0..4).map(|k| level(side, z, k)).collect()
 }
 
 /// An atlas array of `images` at `side` after the built-in layer.
-fn atlas_of(gpu: &crate::Gpu, side: u32, images: &[Vec<Vec<u8>>]) -> AtlasTexture {
+pub(super) fn atlas_of(gpu: &crate::Gpu, side: u32, images: &[Vec<Vec<u8>>]) -> AtlasTexture {
     let pages: Vec<PageLevels<'_>> = images
         .iter()
         .map(|i| [&i[0][..], &i[1][..], &i[2][..], &i[3][..]])
@@ -208,7 +208,7 @@ fn quads(sources: &[([f32; 4], u32, u32)]) -> Vec<(usize, Instance)> {
 
 /// `quads` drawn with `pipes` (by blend), `bind`, the BGA group `bga`
 /// and the video group `video` over a cleared target, read back: RGBA8 rows tightly packed.
-fn draw(
+pub(super) fn draw(
     gpu: &crate::Gpu,
     pipes: [&wgpu::RenderPipeline; 3],
     bind: &wgpu::BindGroup,

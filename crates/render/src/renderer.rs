@@ -8264,6 +8264,10 @@ const PROJECTION_BYTES: u64 = 16;
 mod pool_shader_tests;
 
 #[cfg(test)]
+#[path = "video_shader_tests.rs"]
+mod video_shader_tests;
+
+#[cfg(test)]
 #[path = "pool_tests.rs"]
 pub(crate) mod pool_tests;
 

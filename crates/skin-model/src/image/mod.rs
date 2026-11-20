@@ -978,6 +978,15 @@ impl Sheet {
         &self.root
     }
 
+    /// This sheet with `movies` as its skin movies' file names, by slot,
+    /// the first [`MAX_MOVIES`](crate::movie::MAX_MOVIES) kept: a sheet
+    /// made with [`Sheet::new`] has none.
+    #[must_use]
+    pub fn with_movies(mut self, movies: impl IntoIterator<Item = String>) -> Self {
+        self.movies = movies.into_iter().take(crate::movie::MAX_MOVIES).collect();
+        self
+    }
+
     /// Opens skin movie `slot`'s file inside the skin folder
     /// ([`Root::open`](crate::Root::open)): the handle and the canonical
     /// path it was opened by, which the caller checks the handle's final

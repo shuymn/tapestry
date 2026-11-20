@@ -521,3 +521,36 @@ fn a_listing_of_links_does_not_depend_on_what_lies_outside() {
     }
     assert_eq!(listings.first(), listings.last());
 }
+
+/// A skin movie's file is opened as a read checks a name (design.md
+/// "Rendering and Skins", skin movies): inside the folder after its links,
+/// a regular file, never `..`, an absolute name or a link out; the handle
+/// reads the file and the identity is its canonical path.
+#[test]
+fn a_movie_is_opened_inside_the_folder_as_a_read_checks_it() {
+    use std::io::Read as _;
+    let outer = dir();
+    let skin = outer.path().join("skin");
+    let away = outer.path().join("away");
+    write(&skin, "mv/a.mp4", b"clip");
+    write(&away, "b.mp4", b"out");
+    write(outer.path(), "c.mp4", b"up");
+    link_dir(&skin.join("out"), &away);
+    fs::create_dir(skin.join("dir.mp4")).unwrap();
+    let root = Root::new(&skin).unwrap();
+    let (mut file, id) = root.open("mv/a.mp4").unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"clip");
+    assert_eq!(
+        id.canonical(),
+        fs::canonicalize(skin.join("mv/a.mp4")).unwrap()
+    );
+    assert!(matches!(root.open("out/b.mp4"), Err(RootError::Escapes)));
+    assert!(root.open("../c.mp4").is_err());
+    let absolute = outer.path().join("c.mp4");
+    assert!(root.open(absolute.to_str().unwrap()).is_err());
+    assert!(matches!(root.open("dir.mp4"), Err(RootError::NotAFile)));
+    assert!(matches!(root.open("none.mp4"), Err(RootError::Missing)));
+    assert!(root.open("").is_err(), "the folder itself");
+}
