@@ -18,8 +18,9 @@ use std::thread;
 use std::time::Duration;
 
 use skin_model::media::{
-    CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, Poll, Reader, Refused, SLOT_HEADER_WORDS,
-    SLOTS, WATERMARK_WORD, Window, Words, Writer,
+    CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Poll, Reader, Refused,
+    SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window, Words, Writer,
+    supervision, watermark,
 };
 
 /// Run 1's window: the first minute.
@@ -273,6 +274,51 @@ fn assert_bounded(log: &[(usize, usize)], g: Geometry, slot: usize) {
 }
 
 // Covers: T02
+// Covers: T02
+#[test]
+fn ring_supervision_words_read_back_what_the_worker_wrote() {
+    let g = Geometry::new(64, 48).unwrap();
+    let ring = section(g);
+    // A new ring starts its supervision words at zero, whatever the
+    // section held.
+    ring[PROGRESS_WORD].store(99, Ordering::Relaxed);
+    ring[STATE_WORD].store(2, Ordering::Relaxed);
+    let mut reader = Reader::new(&ring[..], g, WINDOW).unwrap();
+    assert_eq!(supervision(&ring[..]), Some((0, None)));
+    assert_eq!(ring[1].load(Ordering::Relaxed), VERSION);
+    // The decoder's progress and the player's state, as the worker writes
+    // them.
+    let w = Writer::attach(&ring[..]).unwrap();
+    for _ in 0..3 {
+        w.progress(&ring[..]);
+    }
+    for state in [State::Waiting, State::Decoding, State::Ended] {
+        w.state(&ring[..], state);
+        assert_eq!(supervision(&ring[..]), Some((3, Some(state))));
+    }
+    // A word no state has reads as none.
+    ring[STATE_WORD].store(9, Ordering::Relaxed);
+    assert_eq!(supervision(&ring[..]), Some((3, None)));
+    // The reader counts the slots it frees, the game's own count beside
+    // the worker's watermark.
+    for seq in 1..=3 {
+        publish(&ring, seq, 1, stamp(seq - 1));
+    }
+    assert_eq!(watermark(&ring[..]), Some(3));
+    assert_eq!(reader.freed(), 0);
+    let poll = reader.poll(&ring[..], stamp(1)).unwrap();
+    assert_eq!((poll.staged.map(|f| f.seq), poll.freed), (Some(2), true));
+    assert_eq!(reader.freed(), 2);
+    reader.poll(&ring[..], stamp(2)).unwrap();
+    assert_eq!(reader.freed(), 3);
+    // A ring of the version before is not this layout.
+    ring[1].store(VERSION - 1, Ordering::Relaxed);
+    assert_eq!(Writer::attach(&ring[..]).err(), Some(Refused::Layout));
+    // A section too short for the header has no supervision words.
+    assert_eq!(supervision(&ring[..STATE_WORD]), None);
+    assert_eq!(watermark(&ring[..WATERMARK_WORD]), None);
+}
+
 #[test]
 fn ring_round_trip_writer_to_reader() {
     let g = Geometry::new(37, 21).unwrap();

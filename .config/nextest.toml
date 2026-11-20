@@ -1,0 +1,8 @@
+# The tests that time a screen's preparation from a cold launch, and the
+# ones that hold the launches' mutex, run alone: every launch of the media
+# worker stages its copies under one mutex of the user's own, so another
+# test's launch adds its wait to a measured deadline, and a held mutex adds
+# its hold to every other test's launch (design.md "Testing Strategy").
+[[profile.default.overrides]]
+filter = 'package(player) & binary(media_session) & (test(=cold_entry_meets_the_preparation_deadline) | test(=held_launch_expires_preparation_and_the_screen_commits) | test(=departure_during_a_held_launch_opens_nothing) | test(=a_decoder_with_no_first_frame_is_lost_from_its_play))'
+threads-required = "num-test-threads"

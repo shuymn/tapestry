@@ -4,7 +4,8 @@
 //! T02).
 
 use skin_model::media::control::{
-    Command, Failure, MAX_FRAME, MAX_TEXT, Malformed, Refusal, Reply, frame, frame_len,
+    Command, Failure, MAX_FRAME, MAX_TEXT, Malformed, Matrix, PROTOCOL, Range, Refusal, Reply,
+    frame, frame_len,
 };
 
 /// Commands, each with an id of its own.
@@ -18,6 +19,13 @@ fn commands() -> Vec<(u32, Command)> {
             player: 250,
             section: 0x1f4,
             event: u64::MAX - 7,
+            looping: false,
+        },
+        Command::Play {
+            player: 251,
+            section: 0x2f4,
+            event: 0x88,
+            looping: true,
         },
         Command::Seek {
             player: 1,
@@ -36,6 +44,7 @@ fn commands() -> Vec<(u32, Command)> {
 fn replies() -> Vec<Reply> {
     let mut all = vec![
         Reply::Hello {
+            protocol: PROTOCOL,
             version: "n9.0.2-39-g7adfbe40dc-2".to_owned(),
             configuration: "--enable-shared --disable-static ÿ".to_owned(),
         },
@@ -45,9 +54,23 @@ fn replies() -> Vec<Reply> {
             width: 2_560,
             height: 1_080,
             duration: 15_000_000,
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
             codec: "h264".to_owned(),
             container: "mov,mp4,m4a,3gp,3g2,mj2".to_owned(),
         },
+        Reply::Probed {
+            id: 0xbeef,
+            player: 3,
+            width: 640,
+            height: 480,
+            duration: 0,
+            matrix: Matrix::Bt601,
+            range: Range::Full,
+            codec: "mjpeg".to_owned(),
+            container: "avi".to_owned(),
+        },
+        Reply::Beat,
         Reply::Playing { id: 5, player: 5 },
         Reply::Sought {
             id: u32::MAX,
@@ -123,15 +146,19 @@ fn control_messages_round_trip() {
         match r {
             Reply::Refused { .. } => codes.insert((bytes[0], bytes[6])),
             Reply::Failed { .. } => codes.insert((bytes[0], bytes[2])),
+            // The matrix and the range, after the tag, id, player, sizes
+            // and duration.
+            Reply::Probed { .. } => codes.insert((bytes[22], bytes[23])),
             _ => false,
         };
     }
-    // Each reason has a code of its own.
-    assert_eq!(codes.len(), 11);
+    // Each reason, and each colour pair, has a code of its own.
+    assert_eq!(codes.len(), 13);
     // A string longer than the cap is cut at the character boundary before
     // the cap, which falls inside the two bytes of an "é".
     let long = format!("a{}", "é".repeat(MAX_TEXT));
     let bytes = Reply::Hello {
+        protocol: PROTOCOL,
         version: long.clone(),
         configuration: String::new(),
     }
@@ -146,6 +173,7 @@ fn control_messages_round_trip() {
     let (first, second) = ("v".repeat(MAX_TEXT), "c".repeat(MAX_TEXT));
     for reply in [
         Reply::Hello {
+            protocol: PROTOCOL,
             version: first.clone(),
             configuration: second.clone(),
         },
@@ -155,6 +183,8 @@ fn control_messages_round_trip() {
             width: 2,
             height: 3,
             duration: 4,
+            matrix: Matrix::Bt709,
+            range: Range::Full,
             codec: first.clone(),
             container: second.clone(),
         },
@@ -166,6 +196,7 @@ fn control_messages_round_trip() {
             Ok(Reply::Hello {
                 version,
                 configuration,
+                ..
             }) => (version, configuration),
             Ok(Reply::Probed {
                 codec, container, ..
@@ -243,16 +274,46 @@ fn control_refuses_malformed_messages() {
     assert_eq!(Reply::decode(&failed), Err(Malformed::Reason(5)));
     failed[2] = 200;
     assert_eq!(Reply::decode(&failed), Err(Malformed::Reason(200)));
+    // A colour and a loop flag the protocol does not have.
+    let probed = Reply::Probed {
+        id: 1,
+        player: 1,
+        width: 2,
+        height: 2,
+        duration: 0,
+        matrix: Matrix::Bt601,
+        range: Range::Full,
+        codec: String::new(),
+        container: String::new(),
+    }
+    .encode();
+    for (at, v) in [(22, 2), (23, 2)] {
+        let mut bad = probed.clone();
+        bad[at] = v;
+        assert_eq!(Reply::decode(&bad), Err(Malformed::Reason(v)), "byte {at}");
+    }
+    let mut play = Command::Play {
+        player: 1,
+        section: 2,
+        event: 3,
+        looping: true,
+    }
+    .encode(1);
+    let last = play.len() - 1;
+    play[last] = 2;
+    assert_eq!(Command::decode(&play), Err(Malformed::Reason(2)));
     // A string that is not UTF-8, and one longer than the cap though it
     // fits in a frame.
     let mut hello = Reply::Hello {
+        protocol: PROTOCOL,
         version: "ab".to_owned(),
         configuration: String::new(),
     }
     .encode();
-    hello[3] = 0xff;
+    hello[7] = 0xff;
     assert_eq!(Reply::decode(&hello), Err(Malformed::Text));
     let mut over = vec![64];
+    over.extend_from_slice(&PROTOCOL.to_le_bytes());
     let len = u16::try_from(MAX_TEXT + 1).unwrap();
     over.extend_from_slice(&len.to_le_bytes());
     over.extend(std::iter::repeat_n(b'a', MAX_TEXT + 1));

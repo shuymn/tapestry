@@ -24,6 +24,10 @@
 //! handle of that kind with exactly that access that no other player
 //! holds, and closes a player's handles when the player closes.
 
+/// The protocol's version, the first field of [`Reply::Hello`]: the game
+/// refuses a worker that names another before it hands it anything.
+pub const PROTOCOL: u32 = 2;
+
 /// The most bytes a frame holds after its length.
 pub const MAX_FRAME: usize = 8_192;
 
@@ -55,11 +59,13 @@ pub enum Command {
     Open { player: u8, file: u64 },
     /// Decode `player`'s probed file from its start into the frame ring in
     /// `section`, as run 1, waiting on `event` while every slot holds a
-    /// frame.
+    /// frame; `looping`, from the start again at each end, in the same
+    /// run, the stamps rising on (it then never ends).
     Play {
         player: u8,
         section: u64,
         event: u64,
+        looping: bool,
     },
     /// Start run `run` of `player` at media time `at`, in µs.
     Seek { player: u8, run: u64, at: i64 },
@@ -76,20 +82,25 @@ pub const NO_COMMAND: u32 = 0;
 /// A reply from the worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
-    /// The worker is ready: its FFmpeg's version and configure line.
+    /// The worker is ready: the version of the protocol it speaks
+    /// ([`PROTOCOL`]), its FFmpeg's version and configure line.
     Hello {
+        protocol: u32,
         version: String,
         configuration: String,
     },
     /// `player`'s file holds a video of a listed container and codec, of
-    /// `width` × `height` pixels, lasting `duration` µs (0 when unknown):
-    /// the answer to open `id`.
+    /// `width` × `height` pixels, lasting `duration` µs (0 when unknown),
+    /// whose published frames are in `matrix` and `range`: the answer to
+    /// open `id`.
     Probed {
         id: u32,
         player: u8,
         width: u32,
         height: u32,
         duration: i64,
+        matrix: Matrix,
+        range: Range,
         codec: String,
         container: String,
     },
@@ -130,6 +141,30 @@ pub enum Reply {
     Closed { id: u32, player: u8 },
     /// A line of the worker's or FFmpeg's diagnostics.
     Log { text: String },
+    /// The worker's control loop runs: sent at least every
+    /// [`BEAT_INTERVAL_MS`], whether or not it holds players.
+    Beat,
+}
+
+/// The longest the worker's control loop goes without a [`Reply::Beat`].
+pub const BEAT_INTERVAL_MS: u64 = 500;
+
+/// The colour matrix of a player's published frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matrix {
+    /// ITU-R BT.709.
+    Bt709,
+    /// ITU-R BT.601 (also SMPTE 170M and BT.470BG).
+    Bt601,
+}
+
+/// The range of a player's published frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Range {
+    /// Limited: luma 16-235, chroma 16-240.
+    Limited,
+    /// Full: 0-255.
+    Full,
 }
 
 /// Why a file is refused at its probe: an absent picture
@@ -204,7 +239,12 @@ const FAILED: u8 = 70;
 const CLOSED: u8 = 71;
 const LOG: u8 = 72;
 const REJECTED: u8 = 73;
+const BEAT: u8 = 74;
 
+/// The matrices by their code on the wire, their index.
+const MATRICES: [Matrix; 2] = [Matrix::Bt709, Matrix::Bt601];
+/// The ranges by their code on the wire, their index.
+const RANGES: [Range; 2] = [Range::Limited, Range::Full];
 /// The refusals by their code on the wire, their index.
 const REFUSALS: [Refusal; 6] = [
     Refusal::Read,
@@ -242,7 +282,14 @@ impl Command {
                 player,
                 section,
                 event,
-            } => b.u8(PLAY).u32(id).u8(player).u64(section).u64(event),
+                looping,
+            } => b
+                .u8(PLAY)
+                .u32(id)
+                .u8(player)
+                .u64(section)
+                .u64(event)
+                .u8(u8::from(looping)),
             Self::Seek { player, run, at } => b.u8(SEEK).u32(id).u8(player).u64(run).i64(at),
             Self::Close { player } => b.u8(CLOSE).u32(id).u8(player),
             Self::Quit => b.u8(QUIT).u32(id),
@@ -272,6 +319,7 @@ impl Command {
                 player: r.u8()?,
                 section: r.u64()?,
                 event: r.u64()?,
+                looping: r.flag()?,
             },
             SEEK => Self::Seek {
                 player: r.u8()?,
@@ -296,15 +344,18 @@ impl Reply {
         let mut b = Bytes::default();
         match self {
             Self::Hello {
+                protocol,
                 version,
                 configuration,
-            } => b.u8(HELLO).texts(&[version, configuration]),
+            } => b.u8(HELLO).u32(*protocol).texts(&[version, configuration]),
             Self::Probed {
                 id,
                 player,
                 width,
                 height,
                 duration,
+                matrix,
+                range,
                 codec,
                 container,
             } => b
@@ -314,6 +365,8 @@ impl Reply {
                 .u32(*width)
                 .u32(*height)
                 .i64(*duration)
+                .u8(code(&MATRICES, matrix))
+                .u8(code(&RANGES, range))
                 .texts(&[codec, container]),
             Self::Refused {
                 id,
@@ -353,6 +406,7 @@ impl Reply {
             } => b.u8(FAILED).u8(*player).u8(code(&FAILURES, why)).i32(*err),
             Self::Closed { id, player } => b.u8(CLOSED).u32(*id).u8(*player),
             Self::Log { text } => b.u8(LOG).texts(&[text]),
+            Self::Beat => b.u8(BEAT),
         };
         b.0
     }
@@ -366,6 +420,7 @@ impl Reply {
         let mut r = Fields::new(message)?;
         let reply = match r.u8()? {
             HELLO => Self::Hello {
+                protocol: r.u32()?,
                 version: r.text()?,
                 configuration: r.text()?,
             },
@@ -375,6 +430,8 @@ impl Reply {
                 width: r.u32()?,
                 height: r.u32()?,
                 duration: r.i64()?,
+                matrix: r.reason(&MATRICES)?,
+                range: r.reason(&RANGES)?,
                 codec: r.text()?,
                 container: r.text()?,
             },
@@ -414,6 +471,7 @@ impl Reply {
                 player: r.u8()?,
             },
             LOG => Self::Log { text: r.text()? },
+            BEAT => Self::Beat,
             tag => return Err(Malformed::Tag(tag)),
         };
         r.end()?;
@@ -549,6 +607,14 @@ impl<'a> Fields<'a> {
         let (bytes, rest) = self.0.split_at_checked(len).ok_or(Malformed::Short)?;
         self.0 = rest;
         String::from_utf8(bytes.to_vec()).map_err(|_| Malformed::Text)
+    }
+
+    fn flag(&mut self) -> Result<bool, Malformed> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            v => Err(Malformed::Reason(v)),
+        }
     }
 
     fn reason<T: Copy>(&mut self, all: &[T]) -> Result<T, Malformed> {

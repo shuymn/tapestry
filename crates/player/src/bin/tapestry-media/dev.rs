@@ -27,6 +27,13 @@
 //! - `--dev-flood <n>`: answers the hello and, at the game's first
 //!   command, sends `n` replies the game never asked for, as fast as the
 //!   pipe takes them, then waits.
+//! - `--dev-serve <option>…`: serves the control pipe changed by each
+//!   option: `protocol=<n>` names protocol version `n` in the hello;
+//!   `deaf[=<n>]` reads no command after the hello's first `n` (none
+//!   without) while the control loop still beats; `freeze=<player>:<play|decoding|waiting>` freezes that player
+//!   for good before it answers its play, or once it has published a frame
+//!   while it says it decodes, or while it says it waits for a free slot;
+//!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion.
 //! - `--dev-balloon <step> <total> [<last> [free]]`: answers the hello and
 //!   serves the control pipe while a thread commits memory the worker never
 //!   frees, `step` MiB at a time about 10 ms apart up to `total` MiB and
@@ -41,6 +48,64 @@ use std::process::ExitCode;
 
 use crate::ffmpeg::{self, Clip, Input, IoOpen};
 use crate::os::Source;
+
+/// The protocol version a `--dev-serve protocol=<n>` names, else none.
+static PROTOCOL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The commands the reader reads before it reads no more (`--dev-serve
+/// deaf[=<n>]`).
+static DEAF: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The protocol version the hello names instead of the worker's own.
+pub fn protocol() -> Option<u32> {
+    PROTOCOL.get().copied()
+}
+
+/// Whether the command reader, having read `read` commands, reads no
+/// more.
+pub fn deaf(read: u32) -> bool {
+    DEAF.get().is_some_and(|n| read >= *n)
+}
+
+/// Applies `--dev-serve`'s options.
+fn serve_options(options: &[String]) -> Result<(), String> {
+    for option in options {
+        let (key, value) = option.split_once('=').unwrap_or((option, ""));
+        match key {
+            "protocol" => {
+                let n = value.parse().map_err(|e| format!("{option}: {e}"))?;
+                let _ = PROTOCOL.set(n);
+            }
+            "deaf" => {
+                let n = match value {
+                    "" => 0,
+                    n => n.parse().map_err(|e| format!("{option}: {e}"))?,
+                };
+                let _ = DEAF.set(n);
+            }
+            "freeze" => {
+                let (player, at) = value
+                    .split_once(':')
+                    .ok_or_else(|| format!("{option}: freeze=<player>:<where>"))?;
+                let player = player.parse().map_err(|e| format!("{option}: {e}"))?;
+                let at = match at {
+                    "play" => crate::player::Freeze::Play,
+                    "start" => crate::player::Freeze::Start,
+                    "decoding" => crate::player::Freeze::Decoding,
+                    "waiting" => crate::player::Freeze::Waiting,
+                    _ => return Err(format!("{option}: play, start, decoding or waiting")),
+                };
+                crate::player::freeze(player, at);
+            }
+            "slow-convert" => {
+                let ms = value.parse().map_err(|e| format!("{option}: {e}"))?;
+                ffmpeg::slow_convert(ms);
+            }
+            _ => return Err(format!("--dev-serve: unknown option {option}")),
+        }
+    }
+    Ok(())
+}
 
 /// The marker a dev-tools build prints and holds.
 const MARKER: &str = "tapestry dev-tools enabled";
@@ -88,6 +153,12 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
             });
         }
         "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-serve" => {
+            return Some(match serve_options(rest) {
+                Ok(()) => crate::serve(ffmpeg::MAX_ALLOC),
+                Err(e) => usage(&e),
+            });
+        }
         "--dev-balloon" => return Some(balloon(rest)),
         "--dev-deaf" => {
             let _ = crate::hello(ffmpeg::MAX_ALLOC);
