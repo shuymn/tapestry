@@ -910,9 +910,12 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         );
     }
     // Each upload's figures are marked once it was waited for, so no probe
-    // work overlaps the GPU's copy its wait times: in the marks' order (one
-    // thread's marks keep its order), each upload's wait begins, then its
-    // figures, then its wait's time, before the next upload's wait.
+    // work overlaps the GPU's copy its wait times. The result uploads are
+    // written in the uploader's steps, which add no wait (design.md "Load
+    // Pipeline"): they record a wait of none and no wait marks. Only the
+    // play skin's (upload 0) waits for the GPU: in the marks' order (one
+    // thread's marks keep its order), its wait begins and ends, then its
+    // figures and its wait's time are marked, before the next upload's.
     let order = |tag: &str| -> Vec<usize> {
         marks
             .iter()
@@ -921,28 +924,27 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
             .map(|(i, _)| i)
             .collect()
     };
-    let [starts, figures, waited] = [
+    let [starts, ends, figures, waited] = [
         "up:selskin:wait_begin",
+        "up:selskin:wait_end",
         "up:selskin:begin",
         "up:selskin:gpu_wait_us",
     ]
     .map(order);
-    for o in [&starts, &figures, &waited] {
+    assert_eq!((starts.len(), ends.len()), (1, 1), "{starts:?} {ends:?}");
+    for o in [&figures, &waited] {
         assert_eq!(o.len(), begins.len(), "{o:?}");
     }
     let chain: Vec<usize> = starts
         .iter()
-        .zip(&figures)
-        .zip(&waited)
-        .flat_map(|((&s, &f), &w)| [s, f, w])
+        .chain(&ends)
+        .copied()
+        .chain(figures.iter().zip(&waited).flat_map(|(&f, &w)| [f, w]))
         .collect();
     assert!(
         chain.is_sorted(),
         "an upload's figures outside its wait: {chain:?}"
     );
-    // The result uploads are written in the uploader's steps, which add no
-    // wait (design.md "Load Pipeline"); only the play skin's (upload 0)
-    // waits for the GPU.
     let waits = values("up:selskin:gpu_wait_us");
     assert_eq!(waits.get(1..), Some(&[0, 0][..]), "{waits:?}");
     // The first result's installation: none before (0); the second's: one
