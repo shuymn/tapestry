@@ -264,7 +264,20 @@ fn sink_kill() -> Expectation {
                 &[rec],
                 &[ev(SINGLE, RECORDER, "pad"), ev(SINGLE, RECORDER, "key")],
             ),
-            pass("n2.quiet", &[link], &[ev(SINGLE, LINK, "ans")]),
+            pass(
+                "n2.quiet",
+                &[run, link, inner_link],
+                &[
+                    ev(SINGLE, RUN, "kill"),
+                    ev(SINGLE, LINK, "ans"),
+                    ev(INNER, LINK, "cmd"),
+                ],
+            ),
+            pass(
+                "n2.no-foreign",
+                &[run, rec, inner_run],
+                &[ev(INNER, RUN, "call"), ev(SINGLE, RUN, "kill")],
+            ),
             pass("n2.children-gone", &[run], &[ev(SINGLE, RUN, "exit")]),
         ],
         negative: None,

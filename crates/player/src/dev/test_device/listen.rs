@@ -265,7 +265,7 @@ pub fn records(p: &Packet, q: i64, fg: Fg, binding: &Binding) -> Vec<Value> {
 /// is one of the runner's recorded calls'. The handle says nothing:
 /// injected input and a precision touchpad's both come with a null one.
 pub fn a_runner_s(extra: u32, calls: &[u32]) -> bool {
-    calls.contains(&extra)
+    extra != 0 && calls.contains(&extra)
 }
 
 /// What the recorder reads, one at a time.
@@ -768,6 +768,9 @@ mod tests {
         assert!(a_runner_s(0xBEEF_0001, &calls));
         assert!(!a_runner_s(0, &calls));
         assert!(!a_runner_s(0xBEEF_0003, &calls));
+        // An untagged edge carries 0: never a runner's, even beside a
+        // call recorded with tag 0.
+        assert!(!a_runner_s(0, &[0]));
         // The recorder keeps the handle and the tag of every edge.
         let recs = run(
             vec![

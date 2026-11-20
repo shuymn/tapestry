@@ -12,7 +12,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 use test_device::clock::{self, Ping, ticks_to_us};
 use test_device::contract::{INNER, LINK, RECORDER, RUN, SINGLE};
-use test_device::evidence::Outcome;
+use test_device::evidence::{self, Kinds, Outcome};
 use test_device::lease::Reason;
 use test_device::protocol::{Answer, Command, Token};
 use test_device::provenance;
@@ -41,7 +41,11 @@ impl Stream {
         }
     }
 
-    fn read(path: &Path) -> Self {
+    /// Reads the stream at `path` with the contract's strict reader for
+    /// its type (`R`), so the judge reads exactly what `check` reads: a
+    /// cut writer's unterminated last line is dropped, any other fault
+    /// leaves no records.
+    fn read<R: Kinds>(path: &Path) -> Self {
         let Ok(bytes) = std::fs::read(path) else {
             return Self {
                 records: Err(format!("{} is missing", path.display())),
@@ -49,10 +53,16 @@ impl Stream {
             };
         };
         let sha = test_device::contract::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
-        let records = std::str::from_utf8(&bytes)
+        let records = evidence::read::<R>(&bytes)
             .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|t| {
-                t.lines()
+            .and_then(|_| {
+                let whole = bytes
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(&bytes[..0], |i| &bytes[..=i]);
+                std::str::from_utf8(whole)
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                    .lines()
                     .map(|l| {
                         serde_json::from_str(l).map_err(|e| format!("{}: {e}", path.display()))
                     })
@@ -73,9 +83,9 @@ pub struct Files {
 impl Files {
     fn read(dir: &Path) -> Self {
         Self {
-            run: Stream::read(&dir.join(RUN)),
-            link: Stream::read(&dir.join(LINK)),
-            recorder: Stream::read(&dir.join(RECORDER)),
+            run: Stream::read::<evidence::Run>(&dir.join(RUN)),
+            link: Stream::read::<evidence::Link>(&dir.join(LINK)),
+            recorder: Stream::read::<evidence::Recorder>(&dir.join(RECORDER)),
         }
     }
 }
@@ -119,6 +129,12 @@ fn q(v: &Value) -> i64 {
 /// The recorder's errors covering any of `[from, to]`: the check reading
 /// that stretch is incomplete.
 fn covered(rec: &[Value], from: i64, to: i64) -> Result<(), String> {
+    let last = rec.iter().map(q).max().unwrap_or(i64::MIN);
+    if last < to {
+        return Err(format!(
+            "the recorder's stream ends at {last}, before the stretch the check reads ends ({to})"
+        ));
+    }
     match rec.iter().find(|v| {
         v["t"] == "error"
             && v["from"].as_i64().unwrap_or(i64::MIN) <= to
@@ -450,7 +466,7 @@ pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
     let calls: Vec<u32> = recs(&f.run)
         .map(|r| {
             r.iter()
-                .filter(|v| v["t"] == "call")
+                .filter(|v| v["t"] == "call" && v["what"] == "click")
                 .filter_map(|v| v["tag"].as_u64().and_then(|t| u32::try_from(t).ok()))
                 .collect()
         })
@@ -495,7 +511,9 @@ pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
             &[RUN_RUN, RUN_REC],
             (|| {
                 let rec = recs(&f.recorder)?;
-                let (from, to) = (span("call")?, span("close")?);
+                // Until the release evidence: no input is held after it,
+                // and the recorder ends before the sink closes.
+                let (from, to) = (span("call")?, span("quiet")?);
                 covered(rec, from, to)?;
                 Ok(no_foreign(rec, &calls, from, to))
             })(),
@@ -534,14 +552,73 @@ pub fn n2(build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
                 v["t"] == "ans" && v["line"].as_str().is_some_and(|l| l.starts_with("hello "))
             })
             .ok_or("the outer read no `hello`")?;
+        let run = recs(&outer.run)?;
+        let inner_link = recs(&inner.link)?;
+        let kill = run
+            .iter()
+            .find(|v| v["t"] == "kill" && v["name"] == "inner")
+            .map(q)
+            .ok_or("the outer recorded no kill of the inner")?;
+        let freq = inner_link
+            .first()
+            .and_then(|v| v["freq"].as_i64())
+            .ok_or("the inner's link has no `open`")?;
+        // The inner's lease was live at the kill: its last grant or renewal
+        // written within a slice before it.
+        let renewed = inner_link
+            .iter()
+            .filter(|v| {
+                v["t"] == "cmd"
+                    && q(v) <= kill
+                    && matches!(
+                        Command::parse_canonical(v["line"].as_str().unwrap_or_default()),
+                        Some(Command::Lease { .. } | Command::Renew { .. })
+                    )
+            })
+            .map(q)
+            .max()
+            .ok_or("the inner wrote no grant before the kill")?;
+        let age = ticks_to_us(kill - renewed, freq);
+        if age > i64::from(SLICE_MS) * 1000 {
+            return Ok(Err(format!(
+                "the inner's last grant or renewal was {age} µs before the kill: no live lease"
+            )));
+        }
         Ok(
             match Answer::parse_canonical(first["line"].as_str().unwrap_or_default()) {
-                Some(Answer::Hello(h)) if h.lease.is_none() && h.quiet => Ok(()),
+                Some(Answer::Hello(h))
+                    if h.lease.is_none() && h.quiet && h.reason == Reason::Closed =>
+                {
+                    Ok(())
+                }
                 _ => Err(format!(
-                    "the outer's first `hello` is not quiet with no lease: {first}"
+                    "the outer's first `hello` is not quiet with no lease, its lease ended by the close: {first}"
                 )),
             },
         )
+    };
+    // No foreign input while the inner held: from its first call to the
+    // outer's kill, on the outer's recorder, live throughout.
+    let no_foreign_inner = || -> Result<Result<(), String>, String> {
+        let rec = recs(&outer.recorder)?;
+        let inner_run = recs(&inner.run)?;
+        let from = inner_run
+            .iter()
+            .find(|v| v["t"] == "call")
+            .map(q)
+            .ok_or("the inner recorded no call")?;
+        let to = recs(&outer.run)?
+            .iter()
+            .find(|v| v["t"] == "kill" && v["name"] == "inner")
+            .map(q)
+            .ok_or("the outer recorded no kill of the inner")?;
+        let calls: Vec<u32> = inner_run
+            .iter()
+            .filter(|v| v["t"] == "call" && v["what"] == "click")
+            .filter_map(|v| v["tag"].as_u64().and_then(|t| u32::try_from(t).ok()))
+            .collect();
+        covered(rec, from, to)?;
+        Ok(no_foreign(rec, &calls, from, to))
     };
     let gone = || -> Result<Result<(), String>, String> {
         let run = recs(&outer.run)?;
@@ -584,7 +661,12 @@ pub fn n2(build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
         ),
         verdict("n2.abnormal", &[INNER_RUN, INNER_LINK], abnormal()),
         verdict("n2.neutral", &[RUN_REC], neutral_after()),
-        verdict("n2.quiet", &[RUN_LINK], quiet()),
+        verdict("n2.quiet", &[RUN_RUN, RUN_LINK, INNER_LINK], quiet()),
+        verdict(
+            "n2.no-foreign",
+            &[RUN_RUN, RUN_REC, INNER_RUN],
+            no_foreign_inner(),
+        ),
         verdict("n2.children-gone", &[RUN_RUN], gone()),
     ]
 }
@@ -854,6 +936,22 @@ pub mod tests {
         assert_eq!(outcome(&f, "n1.quiet-before-close").0, Outcome::Fail);
     }
 
+    /// The judge reads a stream as `check` does: a cut writer's
+    /// unterminated last line is dropped, a record the strict reader
+    /// refuses (an unknown field) leaves the stream unread.
+    #[test]
+    fn the_judge_reads_streams_strictly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RECORDER);
+        let ready = r#"{"t":"ready","q":1,"run":"r","process":{"pid":1,"created":2},"window":3,"location":"L","keyboard":null,"pad":null}"#;
+        std::fs::write(&path, format!("{ready}\n{{\"t\":\"pad\",\"q\":")).unwrap();
+        let s = Stream::read::<evidence::Recorder>(&path);
+        assert_eq!(s.records.unwrap().len(), 1);
+        let extra = ready.replace(r#""q":1,"#, r#""q":1,"x":0,"#);
+        std::fs::write(&path, format!("{extra}\n")).unwrap();
+        assert!(Stream::read::<evidence::Recorder>(&path).records.is_err());
+    }
+
     #[test]
     fn a_grant_or_renewal_before_its_check_fails() {
         // The renewal's check after its write.
@@ -964,6 +1062,8 @@ pub mod tests {
     fn a_foreign_edge_fails() {
         for foreign in [
             json!({"t": "mouse", "q": 3000, "h": 0, "buttons": 1, "extra": 0, "fg": {}}),
+            // The tag of a move call: a button edge is only a click's.
+            json!({"t": "mouse", "q": 3000, "h": 0, "buttons": 1, "extra": 0xABCD_0000_u32, "fg": {}}),
             json!({"t": "key", "q": 3000, "h": 5, "ours": false, "code": 30, "down": true, "fg": {}}),
             pad(3000, 0, false),
         ] {
@@ -980,6 +1080,17 @@ pub mod tests {
             );
         });
         assert_eq!(outcome(&f, "n1.no-foreign").0, Outcome::Pass);
+    }
+
+    /// A recorder stream that ends before the stretch a check reads
+    /// cannot vouch for its end.
+    #[test]
+    fn a_recorder_that_ended_early_leaves_its_stretch_incomplete() {
+        let mut f = good();
+        edit(&mut f.recorder, |r| r.retain(|v| q(v) < 5300));
+        assert_eq!(outcome(&f, "n1.no-foreign").0, Outcome::Incomplete);
+        // The control: the whole stream.
+        assert_eq!(outcome(&good(), "n1.no-foreign").0, Outcome::Pass);
     }
 
     #[test]
@@ -1003,7 +1114,12 @@ pub mod tests {
     fn n2_good() -> (Files, Files) {
         let n1 = good();
         let inner = Files {
-            run: Stream::of(vec![json!({"t": "start"}), json!({"t": "held", "q": 2000})]),
+            run: Stream::of(vec![
+                json!({"t": "start"}),
+                json!({"t": "call", "q": 200, "tag": 0xABCD_0000_u32, "what": "move"}),
+                json!({"t": "call", "q": 210, "tag": 0xABCD_0001_u32, "what": "click"}),
+                json!({"t": "held", "q": 2000}),
+            ]),
             link: Stream::of(recs(&n1.link).unwrap()[..9].to_vec()),
             recorder: Stream::of(Vec::new()),
         };
@@ -1045,6 +1161,32 @@ pub mod tests {
             .map(|j| j.outcome)
             .collect();
         assert!(all.iter().all(|x| *x == Outcome::Pass), "{all:?}");
+        // The lease had expired by itself: not ended by the close.
+        let (mut o, i) = n2_good();
+        edit(&mut o.link, |l| {
+            l[1]["line"] = json!(hello(true, "expired", "-"))
+        });
+        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Fail);
+        // The inner's last grant more than a slice before the kill.
+        let (mut o, i) = n2_good();
+        edit(&mut o.run, |r| r[1]["q"] = json!(1010 + 2_510_000));
+        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Fail);
+        // A foreign edge while the inner held, and one with tag 0 though a
+        // move call had it.
+        for (extra, h) in [(0_u32, 0), (0xABCD_0000, 0)] {
+            let (mut o, i) = n2_good();
+            edit(&mut o.recorder, |r| {
+                r.insert(
+                    0,
+                    json!({"t": "mouse", "q": 1000, "h": h, "buttons": 1, "extra": extra, "fg": {}}),
+                );
+            });
+            assert_eq!(
+                n2_outcome(&o, &i, "n2.no-foreign"),
+                Outcome::Fail,
+                "{extra}"
+            );
+        }
         // The recorder ended by itself, not with the inner's job.
         let (mut o, i) = n2_good();
         edit(&mut o.run, |r| r[3]["code"] = json!(0));

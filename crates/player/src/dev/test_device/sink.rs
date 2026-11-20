@@ -25,6 +25,9 @@ use windows::core::w;
 use super::click::Win;
 use super::desktop::{hwnd, win};
 
+/// How long the sink's thread may take to make its window, or to end.
+const SINK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The runner's own close: a message only the sink's thread acts on.
 const CLOSE: u32 = WM_USER + 1;
 
@@ -81,8 +84,8 @@ impl Sink {
             }
         });
         let window = rx
-            .recv()
-            .context("the sink's thread ended")?
+            .recv_timeout(SINK_WAIT)
+            .with_context(|| format!("the sink was not made within {SINK_WAIT:?}"))?
             .context("making the sink")?;
         Ok(Self {
             window,
@@ -90,11 +93,11 @@ impl Sink {
         })
     }
 
-    /// Closes the sink and waits for its thread.
+    /// Closes the sink and waits for its thread, at most [`SINK_WAIT`].
     ///
     /// # Errors
     ///
-    /// The close cannot be sent.
+    /// The close cannot be sent, or the thread did not end in time.
     pub fn close(&mut self) -> anyhow::Result<()> {
         let Some(t) = self.thread.take() else {
             return Ok(());
@@ -102,8 +105,7 @@ impl Sink {
         // SAFETY: a message to the sink's window, which its thread handles.
         unsafe { PostMessageW(Some(hwnd(self.window)), CLOSE, WPARAM(0), LPARAM(0)) }
             .context("PostMessage")?;
-        let _ = t.join();
-        Ok(())
+        super::owner::join_within(t, "the sink's thread", SINK_WAIT).map_err(anyhow::Error::msg)
     }
 }
 

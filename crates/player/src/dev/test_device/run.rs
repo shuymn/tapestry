@@ -68,16 +68,6 @@ pub enum Step {
     Wait {
         ms: u64,
     },
-    /// A step that blocks the step thread (a link's start, a rediscovery,
-    /// a flash): refused under a lease.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the sink rows block before their lease only; B3's rows take it"
-        )
-    )]
-    Blocking(&'static str),
 }
 
 /// F24's keyboard usage: a key that types nothing.
@@ -144,21 +134,18 @@ pub fn may_hold(build: &str, line: &str) -> Result<(), String> {
 
 /// What the steps act through.
 pub trait Exec {
-    /// Whether the row's lease lasts.
-    fn leased(&self) -> bool;
     fn focus(&mut self) -> Result<(), String>;
     fn lease(&mut self, ms: u32) -> Result<(), String>;
     fn hold(&mut self, change: Change) -> Result<(), String>;
     fn await_held(&mut self) -> Result<(), String>;
     fn wait(&mut self, ms: u64) -> Result<(), String>;
-    fn blocking(&mut self, what: &str) -> Result<(), String>;
 }
 
 /// Runs `steps`: the first error ends them.
 ///
 /// # Errors
 ///
-/// A step's error, or a blocking step under a lease.
+/// A step's error.
 pub fn perform(steps: &[Step], x: &mut dyn Exec) -> Result<(), String> {
     for s in steps {
         match *s {
@@ -167,10 +154,6 @@ pub fn perform(steps: &[Step], x: &mut dyn Exec) -> Result<(), String> {
             Step::Hold(c) => x.hold(c),
             Step::AwaitHeld => x.await_held(),
             Step::Wait { ms } => x.wait(ms),
-            Step::Blocking(what) if x.leased() => Err(format!(
-                "`{what}` blocks the step thread, which a lease forbids: it goes before the lease"
-            )),
-            Step::Blocking(what) => x.blocking(what),
         }?;
     }
     Ok(())
@@ -299,10 +282,6 @@ impl Live {
 }
 
 impl Exec for Live {
-    fn leased(&self) -> bool {
-        self.guard.wanted(qpc())
-    }
-
     fn focus(&mut self) -> Result<(), String> {
         let log = self.log.clone();
         let mut note = |tag: u32, what: &str| {
@@ -413,10 +392,6 @@ impl Exec for Live {
         }
         Ok(())
     }
-
-    fn blocking(&mut self, what: &str) -> Result<(), String> {
-        Err(format!("no B2b row has the blocking step `{what}`"))
-    }
 }
 
 /// The guard's real look at the run.
@@ -452,6 +427,9 @@ impl Watch for Looks {
         }
     }
 }
+
+/// How long the guard's thread may take to end once asked.
+const GUARD_WAIT: Duration = Duration::from_secs(2);
 
 /// How long a terminated process may take to end.
 const KILL_WAIT: Duration = Duration::from_secs(5);
@@ -651,14 +629,7 @@ impl end::Link for EndLink<'_> {
         let Some(t) = self.thread.take() else {
             return Ok(());
         };
-        let end = Instant::now() + deadline;
-        while !t.is_finished() {
-            if Instant::now() >= end {
-                return Err(format!("the link did not end within {deadline:?}"));
-            }
-            std::thread::sleep(LOOK);
-        }
-        let _ = t.join();
+        owner::join_within(t, "the link", deadline)?;
         match self.writer.state().lost {
             Some(why) => Err(why),
             None => Ok(()),
@@ -746,8 +717,8 @@ fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
     let job: &'static Job = Box::leak(Box::new(Job::join()?));
     let stream = Stream::create(&dir.join(test_device::contract::RUN))?;
     let log = Log(stream.clone());
-    let prefix_hex = owner::random_hex(2)?;
-    let prefix = u16::from_str_radix(&prefix_hex, 16).context("the tag prefix")?;
+    // Never 0: an untagged input's extra information is 0.
+    let prefix = u16::from_str_radix(&owner::random_hex(2)?, 16).context("the tag prefix")? | 1;
     let me = job::this_process()?;
     let bits = u32::from_str_radix(&owner::random_hex(4)?, 16).context("the cut code")?;
     let cut = (0x4000_0000 | (bits & 0x3FFF_FFFF)).cast_signed();
@@ -895,7 +866,9 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         cause: "end",
     }));
     guard.end();
-    let _ = guard_thread.join();
+    if let Err(e) = owner::join_within(guard_thread, "the guard's thread", GUARD_WAIT) {
+        errors.push(e);
+    }
     if let Some(e) = link_log.close() {
         errors.push(e);
     }
@@ -1081,10 +1054,14 @@ mod tests {
         at: i64,
     }
 
-    impl Exec for Steps {
+    impl Steps {
+        /// Whether the row's lease lasts.
         fn leased(&self) -> bool {
             self.guard.as_ref().is_some_and(|g| g.wanted(self.at))
         }
+    }
+
+    impl Exec for Steps {
         fn focus(&mut self) -> Result<(), String> {
             self.did.push("focus".into());
             Ok(())
@@ -1143,10 +1120,6 @@ mod tests {
             }
             Ok(())
         }
-        fn blocking(&mut self, what: &str) -> Result<(), String> {
-            self.did.push(format!("blocking {what}"));
-            Ok(())
-        }
     }
 
     /// The row's 3 s lease goes out as slices of 250 ms, renewed until the
@@ -1192,36 +1165,6 @@ mod tests {
         }
         // Another bare id than the run's, with `faults 0`.
         assert!(may_hold(BUILD, &hello("ba9876543210", false)).is_err());
-    }
-
-    #[test]
-    fn a_blocking_step_is_refused_under_a_lease() {
-        let mut x = Steps::default();
-        perform(&[Step::Blocking("rediscovery")], &mut x).unwrap();
-        assert_eq!(x.did, ["blocking rediscovery"]);
-        let mut x = Steps::default();
-        let e = perform(
-            &[
-                Step::Lease { ms: 3000 },
-                Step::Blocking("rediscovery"),
-                Step::Focus,
-            ],
-            &mut x,
-        )
-        .unwrap_err();
-        assert!(e.contains("before the lease"), "{e}");
-        assert_eq!(x.did, ["lease 3000"]);
-        // After the lease has run out, it is taken again.
-        let mut x = Steps::default();
-        perform(
-            &[
-                Step::Lease { ms: 100 },
-                Step::Wait { ms: 200 },
-                Step::Blocking("rediscovery"),
-            ],
-            &mut x,
-        )
-        .unwrap();
     }
 
     /// No row step writes a `release`, or any command but a held change

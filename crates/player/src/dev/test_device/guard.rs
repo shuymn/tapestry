@@ -129,7 +129,9 @@ impl Guard {
         self.until = Some(until);
     }
 
-    /// Whether the row's lease still lasts at `at`.
+    /// Whether the row's lease still lasts at `at` (the tests' stand-ins
+    /// read it).
+    #[cfg(test)]
     pub fn wanted(&self, at: i64) -> bool {
         !self.lost && self.until.is_some_and(|u| at < u)
     }
@@ -233,10 +235,6 @@ impl Handle {
     /// The row asks for a lease lasting until `until` (host counter ticks).
     pub fn want(&self, until: i64) {
         self.lock().want(until);
-    }
-
-    pub fn wanted(&self, at: i64) -> bool {
-        self.lock().wanted(at)
     }
 
     pub fn end(&self) {

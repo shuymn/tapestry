@@ -143,6 +143,28 @@ pub fn seal(dir: &Path, path: &Path, run: &str, role: &str) -> anyhow::Result<Va
     }))
 }
 
+/// Joins `t` once it has ended, waiting at most `wait`: a thread that does
+/// not end in time is left running and named in the error, so no wait of
+/// the runner's is unbounded.
+///
+/// # Errors
+///
+/// It did not end within `wait`.
+pub fn join_within(
+    t: std::thread::JoinHandle<()>,
+    what: &str,
+    wait: std::time::Duration,
+) -> Result<(), String> {
+    let end = std::time::Instant::now() + wait;
+    while !t.is_finished() {
+        if std::time::Instant::now() >= end {
+            return Err(format!("{what} did not end within {wait:?}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    t.join().map_err(|_| format!("{what} panicked"))
+}
+
 /// The run an outer run in `set` reserved for `role` running `row`: the
 /// outer's run id (the inner's set), the inner's run id and its folder,
 /// which is made here (`create_dir`, so a role runs once). The reservation
@@ -363,6 +385,24 @@ mod tests {
         // No reservation at all.
         outer_start(set, &serde_json::Value::Null);
         assert!(reserved(set, "inner", "sink").is_err());
+    }
+
+    /// A join gives up after its wait, naming the thread, and succeeds once
+    /// the thread ends in time.
+    #[test]
+    fn a_join_waits_no_longer_than_its_bound() {
+        use std::time::{Duration, Instant};
+        let slow = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(300)));
+        let begun = Instant::now();
+        let e = join_within(slow, "the slow thread", Duration::from_millis(20)).unwrap_err();
+        assert!(
+            begun.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert!(e.contains("the slow thread"), "{e}");
+        let quick = std::thread::spawn(|| {});
+        assert_eq!(join_within(quick, "quick", Duration::from_secs(5)), Ok(()));
     }
 
     fn trash_dir(dir: &Path) {
