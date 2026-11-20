@@ -216,6 +216,12 @@ impl Grant {
         self.id
     }
 
+    /// A grant for the guard's tests, which never reach a connection.
+    #[cfg(test)]
+    pub const fn test(id: LeaseId, deadline: u64) -> Self {
+        Self { id, deadline }
+    }
+
     /// The lease's deadline on the device's clock, as last answered.
     #[cfg_attr(
         not(test),
@@ -403,19 +409,27 @@ impl Connection {
         &self.com
     }
 
+    /// Names the run and the process that write this link's journal in its
+    /// `open` record, before the journal is taken (docs/test-device.md
+    /// "Verdicts": a stream's first record names its run and writer).
+    pub fn identify(&mut self, run: &str, process: test_device::evidence::Process) {
+        if let Some(open) = self.journal.first_mut().filter(|o| o["t"] == "open") {
+            open["run"] = json!(run);
+            open["process"] = json!({ "pid": process.pid, "created": process.created });
+        }
+    }
+
+    /// What its checked `hello` said.
+    pub const fn facts(&self) -> Option<&Facts> {
+        self.hello.as_ref()
+    }
+
     /// The connection's token, from its checked `hello`.
     pub fn token(&self) -> Option<Token> {
         self.hello.as_ref().and_then(|h| h.session)
     }
 
     /// The grant read on this connection, while it holds.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the runner's guard reads it; tests only until it lands"
-        )
-    )]
     pub const fn grant(&self) -> Option<&Grant> {
         self.grant.as_ref()
     }
@@ -428,6 +442,11 @@ impl Connection {
     /// The pings whose pong never came (a later ping was answered first).
     pub const fn unanswered_pings(&self) -> u32 {
         self.unanswered_pings
+    }
+
+    /// The connection's newest round trips.
+    pub fn pings(&self) -> Vec<clock::Ping> {
+        self.pings.iter().copied().collect()
     }
 
     /// The clock bounds of the connection's newest round trips.
@@ -833,6 +852,8 @@ pub mod fake {
         pub held: Vec<String>,
         /// Reads lines with the lenient parse.
         pub lenient: bool,
+        /// Lines starting with one of these are refused `err stale`.
+        pub refuse: Vec<String>,
         /// The number its next grant gets.
         pub lease_n: u32,
         pub touched: bool,
@@ -876,6 +897,9 @@ pub mod fake {
                     Command::parse_canonical(t)
                 }
             });
+            if text.is_some_and(|t| self.refuse.iter().any(|r| t.starts_with(r.as_str()))) {
+                return "err stale".to_owned();
+            }
             let Some(cmd) = cmd else {
                 return if line.len() > MAX_LINE {
                     "err overlong".to_owned()
@@ -1209,6 +1233,31 @@ mod tests {
         poll_until(&mut c, |c| c.outstanding().next().is_none());
         assert!(c.bounds().is_ok());
         assert_eq!(c.unanswered_pings(), 0);
+    }
+
+    /// A new connection to the same device (a reconnect, a rediscovery)
+    /// starts with no clock samples, no token until its own `hello` and no
+    /// grant: nothing of the earlier connection carries over.
+    #[test]
+    fn a_reconnect_starts_with_no_samples_no_token_and_no_grant() {
+        let dev = Dev::new(HERE, "COM5", hello("abc", false));
+        let mut c = connected(&dev);
+        c.send(Command::Ping(0)).unwrap();
+        c.lease(250, 5_000_000).unwrap();
+        poll_until(&mut c, |c| c.outstanding().next().is_none());
+        // Positive control: the first connection has all three.
+        assert!(c.bounds().is_ok() && c.token().is_some() && c.grant().is_some());
+        let host = Host {
+            devs: vec![dev.clone()],
+            ..Host::default()
+        };
+        let mut again = Connection::bind(&host, Some(HERE)).unwrap();
+        assert!(again.pings().is_empty());
+        assert!(again.bounds().is_err());
+        assert_eq!(again.token(), None);
+        assert!(again.grant().is_none());
+        again.check_hello(Some("abc")).unwrap();
+        assert!(again.pings().is_empty() && again.grant().is_none());
     }
 
     #[test]
