@@ -44,7 +44,7 @@ fn planes(y: u8, u: u8, v: u8, edge: [u8; 3]) -> [Vec<Vec<u8>>; 3] {
 /// Writes `frame` into layer 0 through the upload buffer, row by row at
 /// the pitch it is given, and copies it into the planes.
 fn upload(gpu: &crate::Gpu, video: &mut Video, frame: &[Vec<Vec<u8>>; 3]) {
-    let whole = video.write_with(gpu.queue(), 0, FW, FH, |sink, [luma, chroma]| {
+    let whole = video.write_with(gpu, 0, FW, FH, |sink, [luma, chroma]| {
         let mut at = 0;
         for (p, plane) in frame.iter().enumerate() {
             let pitch = if p == 0 { luma } else { chroma };

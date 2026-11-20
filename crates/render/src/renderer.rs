@@ -6491,8 +6491,7 @@ impl Renderer {
         height: u32,
         fill: impl FnOnce(&mut dyn FnMut(usize, &[u8]) -> bool, [usize; 2]) -> bool,
     ) -> bool {
-        self.video
-            .write_with(self.gpu.queue(), layer, width, height, fill)
+        self.video.write_with(&self.gpu, layer, width, height, fill)
     }
 
     /// The uv a quad of a movie of `width` × `height` samples in the

@@ -9,8 +9,8 @@
 //! its clip.
 //!
 //! The render thread copies a due frame from its ring straight into the
-//! movie's region of an upload buffer (`Queue::write_buffer_with`'s mapped
-//! view), each plane's rows at the texture copy's 256-byte row pitch; when
+//! movie's region of an upload buffer (the queue's mapped view, through
+//! the `upload` module's one write function), each plane's rows at the texture copy's 256-byte row pitch; when
 //! the copy proves whole, the frame's encoder copies the region into the
 //! planes before the pass that samples them. A copy that fails leaves the
 //! planes as they were and records no copy.
@@ -184,7 +184,7 @@ impl Video {
     /// no, and nothing is copied.
     pub(crate) fn write_with(
         &mut self,
-        queue: &wgpu::Queue,
+        gpu: &Gpu,
         layer: u32,
         width: u32,
         height: u32,
@@ -196,22 +196,12 @@ impl Video {
         if !self.fits(layer, width, height) {
             return false;
         }
-        let whole = {
-            let Some(mut view) =
-                queue.write_buffer_with(&self.upload, self.region * u64::from(layer), size)
-            else {
-                return false;
-            };
-            let len = view.len();
-            let mut put = |at: usize, bytes: &[u8]| {
-                let Some(end) = at.checked_add(bytes.len()).filter(|&e| e <= len) else {
-                    return false;
-                };
-                view.slice(at..end).copy_from_slice(bytes);
-                true
-            };
-            fill(&mut put, [self.pitch[0] as usize, self.pitch[1] as usize])
-        };
+        let pitch = [self.pitch[0] as usize, self.pitch[1] as usize];
+        let offset = self.region * u64::from(layer);
+        let whole =
+            crate::upload::write_buffer_with_unpaced(gpu, &self.upload, offset, size, |sink| {
+                fill(sink, pitch)
+            });
         if whole {
             let copy = Copy {
                 layer,

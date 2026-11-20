@@ -185,6 +185,36 @@ pub(crate) fn write_buffer_unpaced(gpu: &Gpu, buffer: &wgpu::Buffer, offset: u64
     gpu.queue().write_buffer(buffer, offset, bytes);
 }
 
+/// A skin movie's frame, written at once into `buffer` at `offset` through
+/// the queue's mapped view of `size` bytes (no uploader payload's: a
+/// frame's due movie frame, bounded by the screen's pixel total). `fill`
+/// takes a sink (a byte offset in the view and the bytes, `false` past its
+/// end) and says whether the frame is whole; `false` too when the view
+/// cannot be had. Only the functions `cargo xtask check-arch` lists call
+/// it.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) fn write_buffer_with_unpaced(
+    gpu: &Gpu,
+    buffer: &wgpu::Buffer,
+    offset: u64,
+    size: wgpu::BufferSize,
+    fill: impl FnOnce(&mut dyn FnMut(usize, &[u8]) -> bool) -> bool,
+) -> bool {
+    let Some(mut view) = gpu.queue().write_buffer_with(buffer, offset, size) else {
+        return false;
+    };
+    gpu.count_write();
+    let len = view.len();
+    let mut put = |at: usize, bytes: &[u8]| {
+        let Some(end) = at.checked_add(bytes.len()).filter(|&e| e <= len) else {
+            return false;
+        };
+        view.slice(at..end).copy_from_slice(bytes);
+        true
+    };
+    fill(&mut put)
+}
+
 /// Development builds: a validation error raised in the error scopes
 /// open, as a device refusing a step's write would raise one (a texture of
 /// no texels).
