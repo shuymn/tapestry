@@ -325,6 +325,9 @@ struct LoadingUpload {
     which: TextSlots,
     /// The producer's lines in steps; `None` clears the rasterized slots.
     upload: Option<text_upload::TextUpload>,
+    /// Its requests and slots while its placement is owed: the staging's
+    /// attempt text holds its cache, unpublished.
+    owed: Option<(Vec<skin_model::TextRequest>, usize)>,
     /// The bitmap-font slots' lines, laid out by the skin.
     bitmap: BitmapLines,
 }
@@ -344,9 +347,11 @@ impl LoadingUpload {
 
     /// Whether nothing is left to write.
     fn written(&self) -> bool {
-        self.upload
-            .as_ref()
-            .is_none_or(text_upload::TextUpload::written)
+        self.owed.is_none()
+            && self
+                .upload
+                .as_ref()
+                .is_none_or(text_upload::TextUpload::written)
     }
 }
 
@@ -991,6 +996,38 @@ struct Pending {
     /// completion not seen yet (design.md "Memory Budget", the uploader):
     /// it answers ready, draws and commits only once this is `None`.
     writes: Option<skin_atlas::AtlasWrites>,
+    /// Its attempt's text still to place, write or publish, after its
+    /// pages: it answers ready only once this is `None` too.
+    text_up: Option<StagingText>,
+}
+
+impl Pending {
+    /// Whether it still steps: pages to write or text to publish.
+    const fn stepping(&self) -> bool {
+        self.writes.is_some() || self.text_up.is_some()
+    }
+}
+
+/// A stepped staging's attempt text (design.md "Memory Budget", the
+/// uploader): its requests, placed in its cache only once no loading text
+/// is in hand there, then written by the uploader's steps.
+struct StagingText {
+    requests: Vec<skin_model::TextRequest>,
+    slots: usize,
+    /// Placed and stepping; `None` before its placement.
+    upload: Option<text_upload::TextUpload>,
+}
+
+/// How a stepped staging's text step went.
+enum StagingTextStep {
+    /// A step was written and is in flight.
+    Stepped,
+    /// Its text was published and attached: the staging is ready.
+    Finished,
+    /// It failed: the staging is retired and its refusal answered.
+    Failed,
+    /// It waits for the loading text in hand on its cache.
+    Waiting,
 }
 
 /// The chart-image pool a selection staging installs: its grid (`None`
@@ -2330,7 +2367,7 @@ impl Renderer {
     pub fn staged_ready(&self) -> Option<PreparedToken> {
         self.pending
             .as_ref()
-            .filter(|p| p.writes.is_none())
+            .filter(|p| !p.stepping())
             .map(|p| p.token)
     }
 
@@ -2401,6 +2438,23 @@ impl Renderer {
     ) -> Result<PreparedToken, RenderError> {
         let staged = self.stage_with(kind, bundle, None, request, false)?;
         self.finish_staging(staged, request)
+    }
+
+    /// [`install`](Self::install) in steps (design.md "Memory Budget", the
+    /// uploader), as [`stage_stepped`](Self::stage_stepped) stages an
+    /// attempt: `None` until its last step's completion is seen; asked
+    /// again with the same request it answers that staging.
+    ///
+    /// # Errors
+    ///
+    /// As [`install`](Self::install).
+    pub fn install_stepped(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Option<PreparedToken>, RenderError> {
+        self.stage_with(kind, bundle, None, request, true)
     }
 
     /// Writes the staging of `request` to its end, waiting for each step,
@@ -3252,7 +3306,7 @@ impl Renderer {
             return Err(e);
         }
         match &self.pending {
-            Some(p) if p.token.request == request => Ok(p.writes.is_none().then_some(p.token)),
+            Some(p) if p.token.request == request => Ok((!p.stepping()).then_some(p.token)),
             _ => Err(RenderError::Superseded {
                 request,
                 newer: self.requested,
@@ -3330,8 +3384,8 @@ impl Renderer {
             kind,
         };
         let mut skin = DeclSkin::of(&installation);
-        let text = match a {
-            Some(a) => match self.prepare_staged(&mut skin, &mut res, bundle, a) {
+        let (text, text_up) = match a {
+            Some(a) => match self.prepare_staged(&mut skin, &mut res, bundle, a, stepped) {
                 Ok(text) => text,
                 Err(e) => {
                     // Its array, its pool and what it prepared fill its
@@ -3347,11 +3401,12 @@ impl Renderer {
                         pool,
                         entry,
                         writes: None,
+                        text_up: None,
                     });
                     return Err(e);
                 }
             },
-            None => Holder::default(),
+            None => (Holder::default(), None),
         };
         self.pending = Some(Pending {
             token,
@@ -3364,6 +3419,7 @@ impl Renderer {
             pool,
             entry,
             writes,
+            text_up,
         });
         #[cfg(test)]
         self.text_hooks.steps.push(text_upload::Step::StageReturned);
@@ -3379,7 +3435,8 @@ impl Renderer {
         res: &mut PendingRes,
         bundle: &Arc<SkinBundle>,
         a: &AttemptInput<'_>,
-    ) -> Result<Holder, RenderError> {
+        stepped: bool,
+    ) -> Result<(Holder, Option<StagingText>), RenderError> {
         let a = AttemptInput {
             target: self.target(),
             ..*a
@@ -3405,8 +3462,24 @@ impl Renderer {
         let Some(producer) = bundle.text_producer() else {
             #[cfg(feature = "dev-tools")]
             p_text();
-            return Ok(Holder::default());
+            return Ok((Holder::default(), None));
         };
+        // Stepped: placed, written and attached by the uploader's steps
+        // (design.md "Memory Budget", the uploader), never here.
+        if stepped {
+            #[cfg(feature = "dev-tools")]
+            p_text();
+            return Ok((
+                Holder::default(),
+                Some(StagingText {
+                    requests: bundle
+                        .skin()
+                        .text_requests(a.text, a.target, &Layout::AUTHOR),
+                    slots: bundle.skin().text_slots(),
+                    upload: None,
+                }),
+            ));
+        }
         // The staging's own resources, or the installed ones, whose
         // installed attempt's lines stay, with the installed loading lines.
         // The loading text in hand there is finished first: its lines are
@@ -3446,7 +3519,7 @@ impl Renderer {
         skin.attach_text(table).map_err(RenderError::Skin)?;
         #[cfg(feature = "dev-tools")]
         p_text();
-        Ok(holder)
+        Ok((holder, None))
     }
 
     /// The chart-image pool a selection staging of `bundle` on `res` (its
@@ -3947,6 +4020,7 @@ impl Renderer {
             pool: None,
             entry,
             writes: None,
+            text_up: None,
         });
         Ok(token)
     }
@@ -4286,7 +4360,7 @@ impl Renderer {
         let Some(staged) = self
             .pending
             .as_ref()
-            .filter(|p| p.writes.is_none())
+            .filter(|p| !p.stepping())
             .map(|p| p.token)
         else {
             return Err(CommitError::NothingStaged);
@@ -5707,14 +5781,17 @@ impl Renderer {
                 break;
             }
             self.step = None;
-            // The staging's last step completed: it answers ready.
+            // The staging's last page step completed: it answers ready,
+            // or once its text is published.
             if let Some(p) = self.pending.as_mut()
                 && p.writes
                     .as_ref()
                     .is_some_and(skin_atlas::AtlasWrites::written)
             {
                 p.writes = None;
-                out.staged = Some(p.token);
+                if p.text_up.is_none() {
+                    out.staged = Some(p.token);
+                }
                 continue;
             }
             // The result pages' last step completed: reported written.
@@ -5726,20 +5803,36 @@ impl Renderer {
                 if steps > 0 && self.step_elapsed(started, steps) >= slice {
                     break;
                 }
-                if past() {
+                if past.past() {
                     break;
                 }
-                if self.write_staging_step(started, steps, slice, past) {
-                    steps += 1;
-                    continue;
+                if self.pending.as_ref().is_some_and(|p| p.writes.is_some()) {
+                    if self.write_staging_step(started, steps, slice, past) {
+                        steps += 1;
+                        continue;
+                    }
+                    break;
                 }
-                break;
+                match self.staging_text_step(past) {
+                    StagingTextStep::Stepped => {
+                        steps += 1;
+                        continue;
+                    }
+                    StagingTextStep::Finished => {
+                        out.staged = self.pending.as_ref().map(|p| p.token);
+                        continue;
+                    }
+                    StagingTextStep::Failed => continue,
+                    // The loading text in hand on its cache steps first.
+                    StagingTextStep::Waiting => {}
+                }
             }
             if staging_only {
                 break;
             }
-            // The loading text, before the chart images.
-            if self.loading_upload.is_some() {
+            // The loading text, before the chart images; one owed while
+            // the staging's text holds its cache waits.
+            if self.loading_upload.is_some() && !self.loading_text_owed() {
                 if self
                     .loading_upload
                     .as_ref()
@@ -5751,10 +5844,10 @@ impl Renderer {
                 if steps > 0 && self.step_elapsed(started, steps) >= slice {
                     break;
                 }
-                if past() {
+                if past.past() {
                     break;
                 }
-                if !self.write_text_step()
+                if !self.write_text_step(past)
                     && !self
                         .loading_upload
                         .as_ref()
@@ -5879,7 +5972,7 @@ impl Renderer {
     /// Whether the staging has pages to write or its last step's
     /// completion to see.
     fn staging_steps(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.writes.is_some())
+        self.pending.as_ref().is_some_and(Pending::stepping)
     }
 
     /// One step of the staging's pages (design.md "Memory Budget", the
@@ -7208,57 +7301,20 @@ impl Renderer {
         let skin = bundle.skin();
         #[cfg(feature = "dev-tools")]
         self.count_preparation(key, target, lifetime, revision);
+        let mut owed = None;
         let upload = match bundle.text_producer() {
-            Some(producer) => {
+            Some(_) => {
                 // A failure leaves no earlier preparation's report.
                 self.text_report = TextReport::default();
                 let mut requests = skin.text_requests(chart, target, &Layout::AUTHOR);
                 requests.retain(|r| skin.names_text_slot(which, r.slot));
-                let scope = bundle.text_scope();
-                if own {
-                    let Some(Pending {
-                        res: PendingRes::Own(r),
-                        text,
-                        loading,
-                        ..
-                    }) = self.pending.as_mut()
-                    else {
-                        return;
-                    };
-                    Some(text_upload::TextUpload::begin(
-                        &mut r.text_cache,
-                        &mut self.text_scratch,
-                        producer.as_ref(),
-                        scope,
-                        &[&*text, &*loading],
-                        &requests,
-                        skin.text_slots(),
-                    ))
+                // The staging's attempt text holds that cache, unpublished:
+                // the placement is owed until it settles.
+                if self.staging_text_on(own) {
+                    owed = Some((requests, skin.text_slots()));
+                    None
                 } else {
-                    // The attempt staged on these resources keeps its lines.
-                    let pending = self
-                        .pending
-                        .as_ref()
-                        .filter(|p| {
-                            p.token.kind == ScreenKind::Play
-                                && matches!(p.res, PendingRes::Installed)
-                        })
-                        .map(|p| &p.text);
-                    let held = [
-                        Some(&self.installed_text),
-                        pending,
-                        Some(&self.installed_loading),
-                    ];
-                    let held: Vec<&Holder> = held.into_iter().flatten().collect();
-                    Some(text_upload::TextUpload::begin(
-                        &mut self.text_cache,
-                        &mut self.text_scratch,
-                        producer.as_ref(),
-                        scope,
-                        &held,
-                        &requests,
-                        skin.text_slots(),
-                    ))
+                    self.place_loading_text(own, &bundle, &requests, skin.text_slots())
                 }
             }
             None => None,
@@ -7274,8 +7330,64 @@ impl Renderer {
             revision,
             which,
             upload,
+            owed,
             bitmap,
         });
+    }
+
+    /// Places the loading text's `requests` in the cache `own` names (the
+    /// staging's own resources', or the installed ones'), nothing written,
+    /// never touching a line its holders keep.
+    fn place_loading_text(
+        &mut self,
+        own: bool,
+        bundle: &Arc<SkinBundle>,
+        requests: &[skin_model::TextRequest],
+        slots: usize,
+    ) -> Option<text_upload::TextUpload> {
+        let producer = bundle.text_producer()?;
+        let scope = bundle.text_scope();
+        if own {
+            let Some(Pending {
+                res: PendingRes::Own(r),
+                text,
+                loading,
+                ..
+            }) = self.pending.as_mut()
+            else {
+                return None;
+            };
+            return Some(text_upload::TextUpload::begin(
+                &mut r.text_cache,
+                &mut self.text_scratch,
+                producer.as_ref(),
+                scope,
+                &[&*text, &*loading],
+                requests,
+                slots,
+            ));
+        }
+        // The attempt staged on these resources keeps its lines.
+        let pending = self
+            .pending
+            .as_ref()
+            .filter(|p| p.token.kind == ScreenKind::Play && matches!(p.res, PendingRes::Installed))
+            .map(|p| &p.text);
+        let held = [
+            Some(&self.installed_text),
+            pending,
+            Some(&self.installed_loading),
+        ];
+        let held: Vec<&Holder> = held.into_iter().flatten().collect();
+        Some(text_upload::TextUpload::begin(
+            &mut self.text_cache,
+            &mut self.text_scratch,
+            producer.as_ref(),
+            scope,
+            &held,
+            requests,
+            slots,
+        ))
     }
 
     /// Drops the loading text in the uploader's hand, if any, its new
@@ -7324,6 +7436,136 @@ impl Renderer {
             self.loading_report = self.finish_loading_text();
         } else {
             self.drop_loading_upload(false);
+        }
+    }
+
+    /// Whether the staging's text is placed in the cache `own` names (its
+    /// own resources', or the installed ones'), not yet published.
+    fn staging_text_on(&self, own: bool) -> bool {
+        self.pending.as_ref().is_some_and(|p| {
+            p.text_up.as_ref().is_some_and(|t| t.upload.is_some())
+                && matches!(p.res, PendingRes::Own(_)) == own
+        })
+    }
+
+    /// Whether the loading text in hand is placed in the cache `own` names,
+    /// not yet published.
+    fn loading_text_on(&self, own: bool) -> bool {
+        let installed = self.loading_text_key();
+        self.loading_upload.as_ref().is_some_and(|t| {
+            t.upload.is_some() && t.owed.is_none() && (Some(t.key) != installed) == own
+        })
+    }
+
+    /// Whether the loading text in hand is owed its placement and the
+    /// staging's text still holds its cache.
+    fn loading_text_owed(&self) -> bool {
+        let installed = self.loading_text_key();
+        self.loading_upload
+            .as_ref()
+            .is_some_and(|t| t.owed.is_some() && self.staging_text_on(Some(t.key) != installed))
+    }
+
+    /// One step of the stepped staging's attempt text: placed once no
+    /// loading text is in hand on its cache, then written; published and
+    /// attached once its last step's completion is seen.
+    fn staging_text_step(&mut self, gate: &mut dyn crate::UploadGate) -> StagingTextStep {
+        let own = self
+            .pending
+            .as_ref()
+            .is_some_and(|p| matches!(p.res, PendingRes::Own(_)));
+        let placed = self
+            .pending
+            .as_ref()
+            .and_then(|p| p.text_up.as_ref())
+            .is_some_and(|t| t.upload.is_some());
+        if !placed && self.loading_text_on(own) {
+            return StagingTextStep::Waiting;
+        }
+        let Some(p) = self.pending.as_mut() else {
+            return StagingTextStep::Waiting;
+        };
+        let Some(bundle) = p
+            .skin
+            .as_ref()
+            .map(|s| Arc::clone(s.installation().bundle()))
+        else {
+            return StagingTextStep::Waiting;
+        };
+        let Some(producer) = bundle.text_producer() else {
+            return StagingTextStep::Waiting;
+        };
+        let Some(st) = p.text_up.as_mut() else {
+            return StagingTextStep::Waiting;
+        };
+        // Its cache, its array and the holders whose lines must stay.
+        let (atlas, cache, held) = match &mut p.res {
+            PendingRes::Own(r) => (&r.atlas, &mut r.text_cache, vec![&p.loading]),
+            _ => (
+                &self.atlas,
+                &mut self.text_cache,
+                vec![&self.installed_text, &self.installed_loading],
+            ),
+        };
+        if st.upload.is_none() {
+            st.upload = Some(text_upload::TextUpload::begin(
+                cache,
+                &mut self.text_scratch,
+                producer.as_ref(),
+                bundle.text_scope(),
+                &held,
+                &st.requests,
+                st.slots,
+            ));
+        }
+        let Some(up) = st.upload.as_mut() else {
+            return StagingTextStep::Waiting;
+        };
+        if !up.written() {
+            let step = up.write_step(
+                &self.gpu,
+                atlas,
+                &mut self.text_scratch,
+                producer.as_ref(),
+                crate::UPLOAD_WRITE,
+                gate,
+            );
+            self.text_report.clone_from(up.report());
+            if let Some(index) = step {
+                self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
+                return StagingTextStep::Stepped;
+            }
+            if !up.written() {
+                return StagingTextStep::Waiting;
+            }
+        }
+        // Written, its last step's completion seen (the boundary's round):
+        // published and attached.
+        let Some(up) = st.upload.take() else {
+            return StagingTextStep::Waiting;
+        };
+        let finished = up.finish(cache, &held).and_then(|(table, holder, report)| {
+            self.text_report = report;
+            let Some(skin) = p.skin.as_mut() else {
+                return Ok(holder);
+            };
+            skin.attach_text(table).map_err(RenderError::Skin)?;
+            Ok(holder)
+        });
+        p.text_up = None;
+        match finished {
+            Ok(holder) => {
+                p.text = holder;
+                StagingTextStep::Finished
+            }
+            Err(e) => {
+                let request = p.token.request;
+                if let Some(p) = self.pending.take() {
+                    self.retire_candidate(p);
+                }
+                self.stage_failed = Some((request, e));
+                StagingTextStep::Failed
+            }
         }
     }
 
@@ -7395,7 +7637,28 @@ impl Renderer {
 
     /// One step of the loading text in hand: its next lines written and
     /// submitted, the step's completion registered. Whether it wrote one.
-    fn write_text_step(&mut self) -> bool {
+    fn write_text_step(&mut self, gate: &mut dyn crate::UploadGate) -> bool {
+        // Its owed placement, the staging's text settled.
+        if let Some(t) = self.loading_upload.as_ref()
+            && t.owed.is_some()
+        {
+            let own = Some(t.key) != self.loading_text_key();
+            let bundle = if own {
+                self.pending
+                    .as_ref()
+                    .and_then(|p| p.skin.as_ref())
+                    .map(|s| Arc::clone(s.installation().bundle()))
+            } else {
+                self.installed.as_ref().map(|i| Arc::clone(i.bundle()))
+            };
+            let owed = self.loading_upload.as_mut().and_then(|t| t.owed.take());
+            if let (Some(bundle), Some((requests, slots))) = (bundle, owed) {
+                let up = self.place_loading_text(own, &bundle, &requests, slots);
+                if let Some(t) = self.loading_upload.as_mut() {
+                    t.upload = up;
+                }
+            }
+        }
         let installed = self.loading_text_key();
         let Some(t) = self.loading_upload.as_mut() else {
             return false;

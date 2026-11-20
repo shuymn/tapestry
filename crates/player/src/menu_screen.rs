@@ -1174,6 +1174,20 @@ impl Screen for MenuScreen {
         }
     }
 
+    fn install_stepped(
+        &mut self,
+        kind: ScreenKind,
+        skin: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Option<Result<Preparation, RenderError>> {
+        match self.renderer.install_stepped(kind, skin, request) {
+            Ok(Some(_)) => Some(Ok(Preparation::Ready)),
+            Ok(None) => None,
+            Err(e) if e.is_refusal() => Some(Ok(refusal(game::Chain(&e).to_string()))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     fn installation(&self, kind: ScreenKind) -> Option<Installation> {
         self.renderer.installation(kind)
     }

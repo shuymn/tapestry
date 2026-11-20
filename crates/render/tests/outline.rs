@@ -687,3 +687,93 @@ fn replaced_loading_slots_release_their_lines() {
     assert_eq!((counts.hits, counts.placements), (2, 0), "{counts:?}");
     assert_eq!(c.layouts.load(Ordering::SeqCst), layouts);
 }
+
+/// Boundaries until the staging in hand answers, each step's completion
+/// waited for: its token, and the loading text's ends seen meanwhile.
+fn step_to_staged(r: &mut Renderer) -> (render::PreparedToken, Vec<render::TextDone>) {
+    let mut texts = Vec::new();
+    for _ in 0..1_000 {
+        let up = r.upload_boundary();
+        texts.extend(up.text);
+        if let Some(t) = up.staged {
+            return (t, texts);
+        }
+        if r.upload_state() == render::UploadState::InFlight {
+            r.wait_step(Duration::from_secs(10)).unwrap();
+        }
+    }
+    panic!("never staged");
+}
+
+/// H3: an attempt's text staged in steps is not rasterized in the
+/// staging's call: the uploader's steps write it after the atlas, the
+/// staging answering only once it is published, and it draws as the
+/// whole staging's does.
+// Revert: `prepare_staged` writing the text in the staging's call when
+// stepped -> "rasterized in the staging's call".
+#[test]
+fn an_attempt_text_is_written_in_the_uploaders_steps() {
+    let dir = title_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let (b, counting) = counted(&r, dir.path());
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    let text = labels("AB", "");
+    let a = AttemptInput {
+        chart: &chart,
+        context: &ctx,
+        text: &text,
+        target: r.target(),
+    };
+    assert_eq!(r.stage_stepped(&b, &a, 1).unwrap(), None);
+    assert_eq!(
+        counting.rasters.load(Ordering::SeqCst),
+        0,
+        "rasterized in the staging's call"
+    );
+    let (token, _) = step_to_staged(&mut r);
+    assert!(counting.rasters.load(Ordering::SeqCst) > 0);
+    r.commit(token).unwrap();
+    let stepped = frame(&mut r);
+    let mut q = offscreen(1_920, 1_080);
+    let qb = outline_support::bundle_in(&q, dir.path(), &default_font());
+    let token = stage(&mut q, &qb, &labels("AB", ""), 1);
+    q.commit(token).unwrap();
+    assert_eq!(stepped, frame(&mut q));
+}
+
+/// H3: a staging on the installed resources with a loading text in hand
+/// on their cache drains nothing in its call: the loading text is still
+/// in hand after it, ends installed at a boundary, and the attempt's
+/// text follows, the staging answering after both.
+// Revert: the staging's call finishing the loading text in hand
+// (`finish_loading_now`) -> "drained in the staging's call".
+#[test]
+fn a_shared_cache_staging_leaves_the_loading_text_to_the_steps() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let token = stage(&mut r, &b, &labels("A", "B"), 1);
+    r.commit(token).unwrap();
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("E", "F"));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    let text = labels("C", "D");
+    let a = AttemptInput {
+        chart: &chart,
+        context: &ctx,
+        text: &text,
+        target: r.target(),
+    };
+    assert_eq!(r.stage_stepped(&b, &a, 2).unwrap(), None);
+    assert_eq!(
+        r.loading_text_in_hand(),
+        Some((1, 1)),
+        "drained in the staging's call"
+    );
+    let (_, texts) = step_to_staged(&mut r);
+    assert_eq!(texts.len(), 1, "the loading text's end");
+    assert!(texts[0].result.is_ok(), "{:?}", texts[0].result);
+}

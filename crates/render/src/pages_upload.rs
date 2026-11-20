@@ -188,6 +188,7 @@ impl Renderer {
             pool: None,
             entry: up.entry,
             writes: None,
+            text_up: None,
         });
     }
 

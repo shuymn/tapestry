@@ -883,9 +883,10 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     assert_eq!(values("prep:begin"), [0, 1]);
     assert_eq!(values("img:stage_end"), [1, 1]);
     // Each attempt's result upload: inside its select (the play skin's own
-    // select, at the rig's start, is upload 0), its levels' writes summing
-    // to its pages' bytes with the built-in layer's 128² texels, its pages
-    // the bundle's; none refused.
+    // select, at the rig's start, is upload 0), its levels' writes, made in
+    // the uploader's steps after its creation and before its answer
+    // (design.md "Load Pipeline"), summing to its pages' bytes with the
+    // built-in layer's 128² texels, its pages the bundle's; none refused.
     let begins = times("up:selskin:begin");
     assert_eq!(begins.len(), 3, "{begins:?}");
     for k in 0..2 {
@@ -893,7 +894,7 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         let t0 = one("up:selskin:t0", k + 1);
         let begin = one("up:selskin:begin", k + 1);
         assert!(sent < t0 && begin < ready, "upload {k} outside its select");
-        let written: i64 = within("wt:selskin:bytes", t0, begin).iter().sum();
+        let written: i64 = within("wt:selskin:bytes", t0, ready).iter().sum();
         let raw = values("up:selskin:raw_bytes")[k + 1];
         assert_eq!(written + 128 * 128 * 4, raw, "upload {k}'s writes");
         assert_eq!(values("res:bundle_level_bytes")[k] + 128 * 128 * 4, raw);

@@ -7431,6 +7431,17 @@ impl Run {
                         i64::from(matches!(skin, Selected::Pages(_))),
                     );
                     let answer = match skin {
+                        Selected::Skin(Some(skin), script) if kind == ScreenKind::Result => {
+                            // Stepped by the uploader's boundaries, answered
+                            // when staged (design.md "Memory Budget").
+                            if let Some(answer) =
+                                self.begin_select(request, kind, skin, script, reply.clone())
+                            {
+                                let _ = reply.send(answer);
+                            }
+                            mode = self.after_preparing(mode);
+                            continue;
+                        }
                         Selected::Skin(skin, script) => {
                             #[cfg(feature = "dev-tools")]
                             let _caller =
@@ -11047,6 +11058,22 @@ impl Run {
         if kind == ScreenKind::Result {
             crate::dev::result_staged(screen.atlas_uploads() - uploads);
         }
+        self.select_installed(request, kind, bundle, script, installed)
+    }
+
+    /// The rest of a selection once its staging answered `installed`:
+    /// committed unless withdrawn, its runtime parked, or refused.
+    fn select_installed(
+        &mut self,
+        request: u64,
+        kind: ScreenKind,
+        bundle: Arc<SkinBundle>,
+        script: ScriptSlot,
+        installed: Result<Preparation, RenderError>,
+    ) -> Result<Preparation, RenderError> {
+        let Some(screen) = &mut self.screen else {
+            return Err(RenderError::SurfaceLost);
+        };
         match installed {
             Ok(Preparation::Ready) => {
                 // Held through the commit: a withdrawal waits for it, or
@@ -11111,6 +11138,16 @@ impl Run {
     /// is discarded with whatever the screen staged for it, whether or not
     /// it answered: one still preparing is answered refused, for `why`.
     fn supersede_attempts(&mut self, why: &str) {
+        if let Some(h) = self.select_hand.take() {
+            if let Some(screen) = &mut self.screen {
+                screen.discard_token(PreparedToken {
+                    request: h.request,
+                    device: screen.device(),
+                    kind: h.kind,
+                });
+            }
+            let _ = h.reply.send(Ok(refusal(why)));
+        }
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(Ok(self.answered(refusal(why))));
             if let Some(screen) = &mut self.screen {
@@ -11155,6 +11192,105 @@ impl Run {
         self.specialized_in = None;
         commits.committed = commits.committed.max(request);
         Ok(Preparation::Ready)
+    }
+
+    /// A result skin's selection, stepped (design.md "Memory Budget", the
+    /// uploader): refused or superseded as [`select`](Self::select) would
+    /// be, answered at once (`Some`); else in hand, its staging taken at a
+    /// boundary whose allowance admits its creation, after play's and the
+    /// pages'.
+    fn begin_select(
+        &mut self,
+        request: u64,
+        kind: ScreenKind,
+        bundle: Arc<SkinBundle>,
+        script: ScriptSlot,
+        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    ) -> Option<Result<Preparation, RenderError>> {
+        if !self.newest(request) {
+            return Some(Ok(refusal("a newer request superseded it")));
+        }
+        self.supersede_attempts("a newer skin selection superseded it");
+        if let Err(e) = self.recover() {
+            self.shared.failed.store(true, Ordering::Release);
+            return Some(Err(e));
+        }
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::hold_result_upload();
+            if crate::dev::refuse_result_select() {
+                return Some(Ok(refusal("dev: the result's selection was refused")));
+            }
+        }
+        self.select_hand = Some(SelectHand {
+            request,
+            kind,
+            bundle,
+            script,
+            reply,
+            taken: false,
+            #[cfg(feature = "dev-tools")]
+            uploads: 0,
+        });
+        None
+    }
+
+    /// The stepped selection in hand asked again: answered, committed and
+    /// replied once its staging answers; withdrawn, discarded and
+    /// answered cancelled.
+    fn poll_select(&mut self) {
+        let Some(h) = self.select_hand.as_ref().filter(|h| h.taken) else {
+            return;
+        };
+        let request = h.request;
+        if self.shared.commits().withdrawn >= request {
+            if let Some(h) = self.select_hand.take() {
+                if let Some(s) = &mut self.screen {
+                    s.discard_token(PreparedToken {
+                        request,
+                        device: s.device(),
+                        kind: h.kind,
+                    });
+                }
+                let _ = h.reply.send(Ok(Preparation::Cancelled));
+            }
+            return;
+        }
+        if self.screen.is_none()
+            && let Err(e) = self.recover()
+        {
+            if let Some(h) = self.select_hand.take() {
+                let _ = h.reply.send(Err(e));
+            }
+            return;
+        }
+        let (Some(h), Some(screen)) = (self.select_hand.as_mut(), self.screen.as_mut()) else {
+            return;
+        };
+        #[cfg(feature = "dev-tools")]
+        let before = screen.atlas_uploads();
+        #[cfg(feature = "dev-tools")]
+        let caller = crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN);
+        let installed = screen.install_stepped(h.kind, &h.bundle, h.request);
+        #[cfg(feature = "dev-tools")]
+        drop(caller);
+        #[cfg(feature = "dev-tools")]
+        {
+            h.uploads += screen.atlas_uploads() - before;
+        }
+        let Some(installed) = installed else {
+            return;
+        };
+        let Some(h) = self.select_hand.take() else {
+            return;
+        };
+        #[cfg(feature = "dev-tools")]
+        if h.kind == ScreenKind::Result {
+            crate::dev::result_staged(h.uploads);
+        }
+        let answer = self.select_installed(h.request, h.kind, h.bundle, h.script, installed);
+        self.reconcile_result();
+        let _ = h.reply.send(answer);
     }
 
     /// Removes `kind`'s installation for request `request`, recovering
@@ -22329,6 +22465,19 @@ pub(crate) mod tests {
             }
             answer
         }
+        fn install_stepped(
+            &mut self,
+            kind: ScreenKind,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            let answer = self.menu.install_stepped(kind, skin, request);
+            if matches!(answer, Some(Ok(Preparation::Ready))) {
+                let staged = self.menu.renderer_mut().memory().staged_atlas;
+                self.probed().installs.push(staged);
+            }
+            answer
+        }
         fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
             self.menu.installation(kind)
         }
@@ -22779,6 +22928,14 @@ pub(crate) mod tests {
             request: u64,
         ) -> Result<Preparation, RenderError> {
             self.menu.install(kind, skin, request)
+        }
+        fn install_stepped(
+            &mut self,
+            kind: ScreenKind,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            self.menu.install_stepped(kind, skin, request)
         }
         fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
             self.menu.installation(kind)
