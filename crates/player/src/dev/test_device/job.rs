@@ -446,7 +446,7 @@ mod tests {
     use std::time::Instant;
 
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
     use super::*;
@@ -567,7 +567,7 @@ mod tests {
         let sleeper = Owned(
             unsafe {
                 OpenProcess(
-                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
                     false,
                     pid,
                 )
@@ -581,7 +581,13 @@ mod tests {
         let end = Instant::now() + Duration::from_secs(2);
         // SAFETY: an open handle.
         while unsafe { WaitForSingleObject(sleeper.0, 10) } != WAIT_OBJECT_0 {
-            assert!(Instant::now() < end, "the sleeper outlived its runner");
+            if Instant::now() >= end {
+                // Not left running: a copy of this binary would keep it
+                // locked for the next build.
+                // SAFETY: an open handle with terminate access.
+                let _ = unsafe { TerminateProcess(sleeper.0, 1) };
+                panic!("the sleeper outlived its runner");
+            }
         }
         let _ = runner.wait();
     }
