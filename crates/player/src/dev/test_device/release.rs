@@ -13,8 +13,9 @@
 //! timeout): the gate cannot close between the admission and the write,
 //! and nothing writes a file between them, its records written before the
 //! admission and after the write.
-//! Only a `hello` written after the fence counts as release evidence. A device refusal of a hold-bearing command
-//! stops holds as a lost check does.
+//! Only a `hello` written after the `release`'s `ok` was read, itself
+//! after the fence, counts as release evidence. A device refusal of a
+//! hold-bearing command stops holds as a lost check does.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,8 +68,8 @@ pub struct State {
     pub fenced: bool,
     /// The `release` was answered `ok`.
     pub released: bool,
-    /// The `hello` answers to hellos written after the fence: when each
-    /// was read, and its line.
+    /// The `hello` answers to hellos written after the `release`'s `ok`
+    /// was read: when each was read, and its line.
     pub hellos: Vec<(i64, String)>,
     /// The `F` after a `flush`.
     pub flushed: bool,
@@ -235,6 +236,8 @@ struct Thread {
     conn: Connection,
     shared: Arc<Shared>,
     released: bool,
+    /// When the `release`'s `ok` was read (host counter).
+    release_ok: Option<i64>,
     next_ping: Instant,
     ping: u32,
     flushing: Option<Instant>,
@@ -247,6 +250,7 @@ impl Thread {
             conn,
             shared,
             released: false,
+            release_ok: None,
             next_ping: Instant::now(),
             ping: 0,
             flushing: None,
@@ -404,10 +408,12 @@ impl Thread {
     fn see(&mut self, e: &Event) {
         let grant = self.conn.grant().copied();
         let pings = self.conn.pings();
-        let fenced = self.released;
         match e {
             Event::Answer { q, line, to } => {
                 let What::Command(cmd) = to.what else { return };
+                if self.released && cmd == Command::Release && line == "ok" {
+                    self.release_ok.get_or_insert(*q);
+                }
                 let refused = line.starts_with("err ") && cmd.holds_input();
                 if refused {
                     stop_holds(
@@ -415,7 +421,9 @@ impl Thread {
                         &format!("the device refused `{cmd}`: `{line}`"),
                     );
                 }
-                let after_fence = fenced
+                // Written after the release took effect, by the order of
+                // the host's counter.
+                let after_fence = self.release_ok.is_some_and(|ok| to.q > ok)
                     && matches!(cmd, Command::Hello)
                     && matches!(Answer::parse_canonical(line), Some(Answer::Hello(_)));
                 self.update(|s| {
@@ -663,6 +671,39 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert!(hellos[0] < fence && fence < hellos[1], "{recs:?}");
+    }
+
+    /// A `hello` written after the fence but before the `release`'s `ok`
+    /// was read does not count, though answered after it; one written
+    /// after that read does (the control).
+    #[test]
+    fn a_hello_counts_only_once_the_release_is_answered() {
+        let mut r = Run::new();
+        r.dev.device.with(|d| d.hold_answers = true);
+        r.w.stop_holds("end");
+        wait_for(&r.w, |s| s.fenced);
+        r.w.enqueue(Command::Hello, None).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while !r
+            .lines()
+            .iter()
+            .skip_while(|l| *l != "release")
+            .any(|l| l == "hello")
+        {
+            assert!(Instant::now() < end, "{:?}", r.lines());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        r.dev
+            .device
+            .with(super::super::link::fake::Device::release_answers);
+        wait_for(&r.w, |s| {
+            s.released && s.answers.iter().any(|(c, _)| *c == Command::Hello)
+        });
+        assert!(r.w.state().hellos.is_empty(), "{:?}", r.w.state());
+        r.w.enqueue(Command::Hello, None).unwrap();
+        wait_for(&r.w, |s| !s.hellos.is_empty());
+        r.finish();
+        assert_eq!(r.w.state().hellos.len(), 1);
     }
 
     /// The device's refusal of a hold-bearing command stops holds.

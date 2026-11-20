@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
-use test_device::clock::{Bounds, Ping, ticks_to_us};
+use test_device::clock::{self, Ping, ticks_to_us};
 use test_device::contract::{INNER, LINK, RECORDER, RUN, SINGLE};
 use test_device::evidence::Outcome;
 use test_device::lease::Reason;
@@ -167,9 +167,11 @@ fn token(link: &[Value]) -> Option<Token> {
 }
 
 /// Every grant and renewal written follows the guard's good check of the
-/// same line, names the connection's token, and has a deadline the device
-/// reaches no later than a slice after that check, by the round trips
-/// read before it was written; none without a round trip.
+/// same line, names the connection's token, a grant's length is the
+/// slice, and its deadline is no later than the guard's own bound from
+/// that check ([`clock::deadline`]: the least device time the check may
+/// be, plus the slice shortened by the clocks' rate bound) over the round
+/// trips read before it was written; none without a round trip.
 pub fn grants(link: &[Value]) -> Result<(), String> {
     let tok = token(link).ok_or("the link read no token")?;
     let freq = link
@@ -195,8 +197,15 @@ pub fn grants(link: &[Value]) -> Result<(), String> {
                 let line = v["line"].as_str().unwrap_or_default();
                 let (named, deadline) = match Command::parse_canonical(line) {
                     Some(Command::Lease {
-                        token, deadline, ..
-                    }) => (token, deadline),
+                        token,
+                        ms,
+                        deadline,
+                    }) => {
+                        if ms != SLICE_MS {
+                            return Err(format!("`{line}` grants {ms} ms, not a slice"));
+                        }
+                        (token, deadline)
+                    }
                     Some(Command::Renew { id, deadline }) => (id.token, deadline),
                     _ => continue,
                 };
@@ -215,11 +224,10 @@ pub fn grants(link: &[Value]) -> Result<(), String> {
                     .filter(|(recv, _)| *recv <= q(v))
                     .map(|(_, p)| *p)
                     .collect();
-                let bounds = Bounds::fit(&seen).map_err(|e| {
-                    format!("`{line}` was written with no round trip that bounds the clock: {e:?}")
-                })?;
-                let (_, most) = bounds.unmap(ticks_to_us(q(check), freq));
-                let bound = most + u64::from(SLICE_MS) * 1000;
+                let bound = clock::deadline(&seen, ticks_to_us(q(check), freq), SLICE_MS.into())
+                    .ok_or_else(|| {
+                        format!("`{line}` was written with no round trip that bounds the clock")
+                    })?;
                 if deadline > bound {
                     return Err(format!(
                         "`{line}`'s deadline {deadline} is past a slice after its check ({bound})"
@@ -351,17 +359,49 @@ fn quiet_before_close(run: &[Value], link: &[Value]) -> Result<(), String> {
             ));
         }
     }
+    evidence_order(link, line)
+}
+
+/// The order the release evidence needs in the link's stream, which its
+/// one writer keeps in the order of the events, each later record also
+/// later on the host's counter, and each answer matched to its command by
+/// the counter of its write (`sent`): the fence, then `release` written,
+/// then its `ok` read, then the `hello` written, then `line` read as that
+/// `hello`'s answer.
+fn evidence_order(link: &[Value], line: &str) -> Result<(), String> {
+    let after = |from: usize, pick: &dyn Fn(&Value) -> bool| {
+        link.iter()
+            .enumerate()
+            .skip(from + 1)
+            .filter(|(_, v)| q(v) > q(&link[from]))
+            .find(|(_, v)| pick(v))
+            .map(|(i, _)| i)
+    };
+    let answer = |cmd: usize, want: &dyn Fn(&Value) -> bool| {
+        after(cmd, &|a| {
+            a["t"] == "ans" && a["sent"] == link[cmd]["q"] && a["cmd"] == link[cmd]["line"]
+        })
+        .filter(|&a| want(&link[a]))
+    };
     let fence = link
         .iter()
         .position(|v| v["t"] == "fence")
         .ok_or("the link recorded no fence")?;
-    if !link[fence..]
-        .iter()
-        .any(|v| v["t"] == "ans" && v["cmd"] == "hello" && v["line"] == line)
-    {
-        return Err("the evidence is not a `hello` the link read after its fence".into());
+    let release = after(fence, &|v| v["t"] == "cmd" && v["line"] == "release")
+        .ok_or("no `release` written after the fence")?;
+    let ok = answer(release, &|a| a["line"] == "ok")
+        .ok_or("the `release` after the fence was not answered `ok`")?;
+    let mut from = ok;
+    while let Some(hello) = after(from, &|v| v["t"] == "cmd" && v["line"] == "hello") {
+        if answer(hello, &|a| a["line"] == line).is_some() {
+            return Ok(());
+        }
+        from = hello;
     }
-    Ok(())
+    Err(
+        "the evidence is not the answer to a `hello` written after the `release`'s `ok` was read"
+            .into(),
+    )
 }
 
 /// The end's `release`: the end stopped holds, and the link wrote
@@ -668,7 +708,7 @@ pub mod tests {
         let mut link = vec![
             json!({"t": "open", "q": 10, "freq": FREQ}),
             json!({"t": "cmd", "q": 20, "line": "hello"}),
-            json!({"t": "ans", "q": 30, "cmd": "hello", "line": hello(true, "none", "-")}),
+            json!({"t": "ans", "q": 30, "sent": 20, "cmd": "hello", "line": hello(true, "none", "-")}),
         ];
         for k in 0..4 {
             let (sent, recv) = (40 + k * 100, 60 + k * 100);
@@ -679,14 +719,14 @@ pub mod tests {
         link.extend([
             json!({"t": "check", "q": 1000, "line": lease}),
             json!({"t": "cmd", "q": 1010, "line": lease}),
-            json!({"t": "ans", "q": 1020, "cmd": lease, "line": format!("lease {TOKEN}:1 {}", deadline(1000))}),
+            json!({"t": "ans", "q": 1020, "sent": 1010, "cmd": lease, "line": format!("lease {TOKEN}:1 {}", deadline(1000))}),
             json!({"t": "check", "q": 1800, "line": renew}),
             json!({"t": "cmd", "q": 1810, "line": renew}),
             json!({"t": "fence", "q": 5100}),
             json!({"t": "cmd", "q": 5110, "line": "release"}),
-            json!({"t": "ans", "q": 5120, "cmd": "release", "line": "ok"}),
+            json!({"t": "ans", "q": 5120, "sent": 5110, "cmd": "release", "line": "ok"}),
             json!({"t": "cmd", "q": 5500, "line": "hello"}),
-            json!({"t": "ans", "q": 5510, "cmd": "hello", "line": hello(true, "released", "-")}),
+            json!({"t": "ans", "q": 5510, "sent": 5500, "cmd": "hello", "line": hello(true, "released", "-")}),
         ]);
         let recorder = vec![
             json!({"t": "ready", "q": 50}),
@@ -756,6 +796,64 @@ pub mod tests {
         assert_eq!(outcome(&f, "n1.quiet-before-close").0, Outcome::Fail);
     }
 
+    /// Every order, on the host's counter and in the stream, of the five
+    /// records the release evidence rests on: the fence, the `release`
+    /// written, its `ok` read, the `hello` written, and the evidence read
+    /// as its answer (each answer naming its command's write by `sent`).
+    /// The evidence stands exactly in the order fence, `release`, `ok`,
+    /// `hello`, answer, which is the positive control.
+    #[test]
+    fn the_evidence_stands_only_in_the_release_order() {
+        fn permutations(n: usize) -> Vec<Vec<usize>> {
+            if n == 0 {
+                return vec![Vec::new()];
+            }
+            let mut out = Vec::new();
+            for p in permutations(n - 1) {
+                for at in 0..=p.len() {
+                    let mut q = p.clone();
+                    q.insert(at, n - 1);
+                    out.push(q);
+                }
+            }
+            out
+        }
+        let quiet = hello(true, "released", "-");
+        let mut passed = 0;
+        for order in permutations(5) {
+            // order[k]: the rank of record k (fence, release, ok, hello,
+            // answer) among the five.
+            let at = |k: usize| 5100 + i64::try_from(order[k]).unwrap() * 10;
+            let mut five = vec![
+                json!({"t": "fence", "q": at(0)}),
+                json!({"t": "cmd", "q": at(1), "line": "release"}),
+                json!({"t": "ans", "q": at(2), "sent": at(1), "cmd": "release", "line": "ok"}),
+                json!({"t": "cmd", "q": at(3), "line": "hello"}),
+                json!({"t": "ans", "q": at(4), "sent": at(3), "cmd": "hello", "line": quiet}),
+            ];
+            five.sort_by_key(q);
+            let mut f = good();
+            edit(&mut f.link, |l| {
+                let from = l.iter().position(|v| v["t"] == "fence").unwrap();
+                l.truncate(from);
+                l.extend(five);
+            });
+            let got = outcome(&f, "n1.quiet-before-close").0;
+            let ordered = order == [0, 1, 2, 3, 4];
+            assert_eq!(got == Outcome::Pass, ordered, "{order:?}: {f:?}");
+            passed += usize::from(got == Outcome::Pass);
+        }
+        assert_eq!(passed, 1, "the positive control");
+        // An answer bound to another write does not count: the `hello`
+        // answered names an earlier `hello`'s write.
+        let mut f = good();
+        edit(&mut f.link, |l| {
+            let at = l.iter().position(|v| v["q"] == 5510).unwrap();
+            l[at]["sent"] = json!(20);
+        });
+        assert_eq!(outcome(&f, "n1.quiet-before-close").0, Outcome::Fail);
+    }
+
     #[test]
     fn a_grant_or_renewal_before_its_check_fails() {
         // The renewal's check after its write.
@@ -772,6 +870,15 @@ pub mod tests {
         let mut f = good();
         edit(&mut f.link, |l| {
             l.retain(|v| !(v["t"] == "check" && v["q"] == 1000))
+        });
+        assert_eq!(outcome(&f, "n1.grants").0, Outcome::Fail);
+        // A grant of more than a slice.
+        let mut f = good();
+        edit(&mut f.link, |l| {
+            let long = format!("lease {TOKEN} 300 {}", deadline(1000));
+            for v in l.iter_mut().filter(|v| v["q"] == 1000 || v["q"] == 1010) {
+                v["line"] = json!(long);
+            }
         });
         assert_eq!(outcome(&f, "n1.grants").0, Outcome::Fail);
         // A deadline from a later instant than its check.
