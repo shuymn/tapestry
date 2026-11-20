@@ -4,10 +4,11 @@
 //! The game creates one shared section a video, sizes it from the probed
 //! frame ([`Geometry`]) and writes its header once ([`Reader::new`]); the
 //! worker writes frames into its [`SLOTS`] slots ([`Writer`]); the render
-//! thread copies the newest frame that is due ([`Reader::poll`]). Both
-//! sides see the section as 64-bit words through [`AtomicU64`]s
-//! ([`Words`]), so neither holds a plain reference into memory the other
-//! may write.
+//! thread finds the newest frame that is due ([`Reader::peek`]) and copies
+//! it straight into its upload buffer, each plane's rows at the pitch the
+//! texture copy asks ([`Reader::take`]). Both sides see the section as
+//! 64-bit words through [`AtomicU64`]s ([`Words`]), so neither holds a
+//! plain reference into memory the other may write.
 //!
 //! The reader trusts nothing it reads back. It keeps the geometry and the
 //! run it started itself and never reads back the header words it wrote. A
@@ -18,12 +19,14 @@
 //! copied, must be what they were before the copy (a change undone before
 //! that second read goes unseen). Anything else is a [`Fault`], which fails
 //! the video's player: the reader keeps it and reads nothing more. A copy
-//! reads exactly the slot's frame, at the size the game gave it.
+//! reads exactly the slot's frame, at the size the game gave it, and hands
+//! each of its bytes once to the caller's sink, at an offset inside
+//! [`Reader::pitched_bytes`].
 //!
 //! The worker publishes frames in sequence order and, after each, raises
 //! the ring's watermark, the highest sequence it has published. The reader
 //! reads the watermark before it looks at any slot and leaves a frame above
-//! it for the next poll, so a frame published while it looks, perhaps into
+//! it for the next peek, so a frame published while it looks, perhaps into
 //! a slot it has already passed, waits instead of overtaking an earlier one.
 //! The watermark only defers: whatever value it holds, the slots' checks
 //! still apply.
@@ -43,8 +46,8 @@
 //! claimed free, published once whole, in sequence order, and runs handed
 //! over as above) always yields whole frames, in order, and never fails its
 //! player, however its writes interleave with the game's reads. One that
-//! does not cannot make the game read outside the ring or write outside its
-//! staging buffer, and what it shows stays inside its own panel: frames
+//! does not cannot make the game read outside the ring or write outside the
+//! region its sink takes, and what it shows stays inside its own panel: frames
 //! with plausible words are shown, and the first slot that breaks a check
 //! fails its player.
 //!
@@ -63,7 +66,6 @@
 
 pub mod control;
 
-use std::collections::TryReserveError;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 /// The slots of a ring: the frames the worker may publish ahead of the
@@ -299,14 +301,36 @@ pub struct Frame {
     pub stamp: i64,
 }
 
-/// What a poll did.
+/// What a peek found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Poll {
-    /// The frame it copied into the staging buffer, if any.
-    pub staged: Option<Frame>,
-    /// Whether it freed slots: the game then signals the worker, which may
-    /// be waiting for one.
+pub struct Peek {
+    /// The frame due, if any, for [`Reader::take`].
+    pub due: Option<Due>,
+    /// Whether it freed slots of earlier runs: the game then signals the
+    /// worker, which may be waiting for one.
     pub freed: bool,
+}
+
+/// A frame [`Reader::peek`] found due, which [`Reader::take`] copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Due {
+    chosen: Found,
+    /// The current run's frames up to it, freed once it is taken.
+    up_to: [Option<Found>; SLOTS],
+}
+
+impl Due {
+    /// The frame's stamp.
+    #[must_use]
+    pub const fn stamp(&self) -> i64 {
+        self.chosen.stamp
+    }
+
+    /// The frame's sequence.
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.chosen.seq
+    }
 }
 
 /// What failed a video's player: a slot that breaks the protocol, named by
@@ -347,13 +371,10 @@ pub enum Setup {
     /// The section holds fewer words than the geometry's ring.
     #[error("the section holds fewer than the ring's {needs} words")]
     Section { needs: usize },
-    /// The staging buffer could not be allocated.
-    #[error("the staging buffer: {0}")]
-    Memory(#[from] TryReserveError),
 }
 
 /// A published frame as the reader found it in its slot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Found {
     slot: usize,
     seq: u64,
@@ -367,8 +388,22 @@ impl Found {
     }
 }
 
-/// The game's side of a ring: its geometry, the run it started last, what
-/// it has taken, and the staging buffer the render thread uploads from.
+/// The ring words a take loads at a time into its stack buffer, before it
+/// hands their bytes to the sink.
+const COPY_WORDS: usize = 512;
+
+/// A plane of a frame as a take lays it out: its first byte in the frame
+/// and in the sink, its rows' bytes and the sink's pitch between them.
+#[derive(Clone, Copy)]
+struct Plane {
+    frame: usize,
+    sink: usize,
+    row: usize,
+    pitch: usize,
+}
+
+/// The game's side of a ring: its geometry, the run it started last and
+/// what it has taken.
 #[derive(Debug)]
 pub struct Reader {
     geometry: Geometry,
@@ -378,24 +413,24 @@ pub struct Reader {
     taken: u64,
     /// The slots it has freed, over the ring's life.
     freed: u64,
-    /// The stamp of the last frame staged in the current run.
+    /// The stamp of the last frame taken in the current run.
     last_stamp: Option<i64>,
-    staged: Option<Frame>,
-    staging: Box<[u64]>,
+    /// The frame the last peek found due, until it is taken or a run
+    /// starts: the only one a take copies.
+    peeked: Option<Found>,
     fault: Option<Fault>,
 }
 
 impl Reader {
     /// Sets up a ring of `geometry` in `ring`: writes its header, every
-    /// slot free and a watermark of 0, starts run 1, whose frames are
-    /// stamped inside `window`, and allocates the staging buffer. The game
-    /// does this at preparation, before it hands the section to the worker,
-    /// whose frames are run 1's until a seek names another run.
+    /// slot free and a watermark of 0, and starts run 1, whose frames are
+    /// stamped inside `window`. The game does this at preparation, before it
+    /// hands the section to the worker, whose frames are run 1's until a
+    /// seek names another run.
     ///
     /// # Errors
     ///
-    /// When `ring` holds fewer words than the geometry needs, or the
-    /// staging buffer cannot be allocated.
+    /// When `ring` holds fewer words than the geometry needs.
     pub fn new<W: Words + ?Sized>(
         ring: &W,
         geometry: Geometry,
@@ -405,9 +440,6 @@ impl Reader {
         if ring.words(0, needs).is_none() {
             return Err(Setup::Section { needs });
         }
-        let mut staging = Vec::new();
-        staging.try_reserve_exact(geometry.frame_words())?;
-        staging.resize(geometry.frame_words(), 0);
         let header = [
             (H_MAGIC, MAGIC),
             (H_VERSION, VERSION),
@@ -437,8 +469,7 @@ impl Reader {
             taken: 0,
             freed: 0,
             last_stamp: None,
-            staged: None,
-            staging: staging.into_boxed_slice(),
+            peeked: None,
             fault: None,
         })
     }
@@ -470,48 +501,111 @@ impl Reader {
     }
 
     /// Starts the next run, whose frames are stamped inside `window`, and
-    /// returns its id for the seek that hands it to the worker. The staged
-    /// frame and every frame of an earlier run are no longer shown; the
-    /// next poll frees those still in the ring unread.
+    /// returns its id for the seek that hands it to the worker. No frame of
+    /// an earlier run is taken any more, a [`Due`] peeked before included:
+    /// the next peek frees those still in the ring unread.
     pub fn start_run(&mut self, window: Window) -> u64 {
         self.run = self.run.saturating_add(1);
         self.window = window;
         self.last_stamp = None;
-        self.staged = None;
+        self.peeked = None;
         self.run
     }
 
-    /// The staged frame and its words, while it belongs to the current run
-    /// and no fault has failed the player.
+    /// The bytes a take at `pitch` writes through its sink: the luma rows at
+    /// `pitch[0]`, then each chroma plane's rows at `pitch[1]`.
     #[must_use]
-    pub fn staged(&self) -> Option<(Frame, &[u64])> {
-        self.staged.map(|f| (f, &*self.staging))
+    pub fn pitched_bytes(&self, pitch: [usize; 2]) -> usize {
+        let [luma, chroma] = pitch;
+        let h = self.geometry.height as usize;
+        luma.saturating_mul(h)
+            .saturating_add(chroma.saturating_mul(h.div_ceil(2)).saturating_mul(2))
     }
 
     /// Reads the ring at `due`, the media time the screen shows: frees the
-    /// frames of earlier runs unread, copies the newest frame of the run
-    /// stamped at or before `due` into the staging buffer, and frees it with
-    /// the frames before it. A frame not due yet stays in its slot, and so
-    /// does one above the watermark read before the scan, until a later
-    /// poll.
+    /// frames of earlier runs unread and finds the newest frame of the run
+    /// stamped at or before `due`, which [`Self::take`] then copies. A frame
+    /// not due yet stays in its slot, and so does one above the watermark
+    /// read before the scan, until a later peek.
     ///
     /// # Errors
     ///
     /// The [`Fault`] that fails the player. The reader keeps it: every later
-    /// poll returns it without reading the ring, and nothing is staged.
-    pub fn poll<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Poll, Fault> {
+    /// peek or take returns it without reading the ring.
+    pub fn peek<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Peek, Fault> {
         if let Some(f) = self.fault {
             return Err(f);
         }
-        let read = self.read(ring, due);
-        if let Err(f) = read {
-            self.fault = Some(f);
-            self.staged = None;
+        let peeked = self.scan(ring, due);
+        match peeked {
+            Ok(p) => self.peeked = p.due.map(|d| d.chosen),
+            Err(f) => {
+                self.peeked = None;
+                self.fault = Some(f);
+            }
         }
-        read
+        peeked
     }
 
-    fn read<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Poll, Fault> {
+    /// Copies the frame `due` names into `sink`, each plane's rows at its
+    /// pitch, then frees it with the run's frames before it. The luma rows
+    /// go at `pitch[0]`, then the two chroma planes' rows at `pitch[1]`, the
+    /// planes back to back from offset 0. `sink(offset, bytes)` takes a run
+    /// of bytes, never past the end of a row, and returns whether it wrote
+    /// them; it is asked for nothing at or past
+    /// [`Self::pitched_bytes`]`(pitch)` and never for a row's padding. The
+    /// ring's words are loaded [`CHUNK_WORDS`] at a time, and the slot's
+    /// words are read again after the copy, as the module says: what the
+    /// sink took is the frame only when this returns `Ok`. A take frees at
+    /// least the frame's slot, so the game then signals the worker.
+    ///
+    /// # Errors
+    ///
+    /// The [`Fault`] that fails the player, which the reader keeps as
+    /// [`Self::peek`] does. [`Fault::Section`] when a pitch is below its
+    /// plane's width or `sink` refuses bytes, and [`Fault::Changed`] when
+    /// `due` is not the frame the last peek found due, or a run started or
+    /// a take took it since.
+    pub fn take<W: Words + ?Sized>(
+        &mut self,
+        ring: &W,
+        due: Due,
+        pitch: [usize; 2],
+        sink: &mut dyn FnMut(usize, &[u8]) -> bool,
+    ) -> Result<Frame, Fault> {
+        if let Some(f) = self.fault {
+            return Err(f);
+        }
+        let taken = self.take_due(ring, &due, pitch, sink);
+        if let Err(f) = taken {
+            self.fault = Some(f);
+        }
+        taken
+    }
+
+    fn take_due<W: Words + ?Sized>(
+        &mut self,
+        ring: &W,
+        due: &Due,
+        pitch: [usize; 2],
+        sink: &mut dyn FnMut(usize, &[u8]) -> bool,
+    ) -> Result<Frame, Fault> {
+        let c = &due.chosen;
+        if self.peeked.take() != Some(*c) {
+            return Err(Fault::Changed { slot: c.index() });
+        }
+        self.copy(ring, c, pitch, sink)?;
+        for a in due.up_to.iter().flatten() {
+            self.free(ring, a)?;
+        }
+        self.last_stamp = Some(c.stamp);
+        Ok(Frame {
+            seq: c.seq,
+            stamp: c.stamp,
+        })
+    }
+
+    fn scan<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Peek, Fault> {
         // Every frame at or below it was published before this load, so the
         // scan finds each one still in its slot: none is passed over while a
         // later one is taken.
@@ -541,9 +635,9 @@ impl Reader {
                     value: a.stamp,
                 });
             }
-            let after_staged = self.last_stamp.is_none_or(|s| a.stamp > s);
+            let after_taken = self.last_stamp.is_none_or(|s| a.stamp > s);
             let rises = current().all(|b| b.seq <= a.seq || b.stamp > a.stamp);
-            if !after_staged || !rises {
+            if !after_taken || !rises {
                 return Err(Fault::Sequence {
                     slot: a.index(),
                     value: a.seq,
@@ -559,30 +653,18 @@ impl Reader {
             self.free(ring, a)?;
             freed = true;
         }
-        let chosen = current()
+        let due = current()
             .filter(|a| a.seq <= committed && a.stamp <= due)
             .max_by_key(|a| a.seq)
-            .copied();
-        let Some(c) = chosen else {
-            return Ok(Poll {
-                staged: None,
-                freed,
+            .copied()
+            .map(|chosen| {
+                let mut up_to = [None; SLOTS];
+                for (u, a) in up_to.iter_mut().zip(&found) {
+                    *u = a.filter(|a| a.run == run && a.seq <= chosen.seq);
+                }
+                Due { chosen, up_to }
             });
-        };
-        self.copy(ring, &c)?;
-        for a in current().filter(|a| a.seq <= c.seq) {
-            self.free(ring, a)?;
-        }
-        let frame = Frame {
-            seq: c.seq,
-            stamp: c.stamp,
-        };
-        self.staged = Some(frame);
-        self.last_stamp = Some(c.stamp);
-        Ok(Poll {
-            staged: Some(frame),
-            freed: true,
-        })
+        Ok(Peek { due, freed })
     }
 
     /// Slot `slot`'s published frame, checked, or `None` while it holds
@@ -626,21 +708,73 @@ impl Reader {
         }))
     }
 
-    /// Copies `c`'s frame into the staging buffer, then reads its slot's
-    /// words again and checks they still name that frame: the same state,
-    /// sequence, run, stamp, index and frame size. A change undone before
-    /// this second read goes unseen.
-    fn copy<W: Words + ?Sized>(&mut self, ring: &W, c: &Found) -> Result<(), Fault> {
+    /// Copies `c`'s frame into `sink` at `pitch`, word by word through a
+    /// stack buffer, then reads its slot's words again and checks they still
+    /// name that frame: the same state, sequence, run, stamp, index and frame
+    /// size. A change undone before this second read goes unseen.
+    fn copy<W: Words + ?Sized>(
+        &self,
+        ring: &W,
+        c: &Found,
+        pitch: [usize; 2],
+        sink: &mut dyn FnMut(usize, &[u8]) -> bool,
+    ) -> Result<(), Fault> {
+        let (w, h) = (self.geometry.width as usize, self.geometry.height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let [luma, chroma] = pitch;
+        if luma < w || chroma < cw {
+            return Err(Fault::Section);
+        }
+        // Every offset the sink is given lies below the last plane's end,
+        // which must not overflow.
+        let u = luma.checked_mul(h).ok_or(Fault::Section)?;
+        let plane = chroma.checked_mul(ch).ok_or(Fault::Section)?;
+        let v = u.checked_add(plane).ok_or(Fault::Section)?;
+        v.checked_add(plane).ok_or(Fault::Section)?;
+        let planes = [
+            Plane {
+                frame: 0,
+                sink: 0,
+                row: w,
+                pitch: luma,
+            },
+            Plane {
+                frame: w * h,
+                sink: u,
+                row: cw,
+                pitch: chroma,
+            },
+            Plane {
+                frame: w * h + cw * ch,
+                sink: v,
+                row: cw,
+                pitch: chroma,
+            },
+        ];
+        let total = self.geometry.frame_bytes();
+        let mut buffer = [[0_u8; 8]; COPY_WORDS];
         let mut at = self.geometry.frame_start(c.slot);
-        for dst in self.staging.chunks_mut(CHUNK_WORDS) {
-            let src = ring.words(at, dst.len()).ok_or(Fault::Section)?;
-            if src.len() != dst.len() {
+        let mut left = self.geometry.frame_words();
+        // The frame's bytes handed to the sink so far.
+        let mut done = 0;
+        while left > 0 {
+            let len = left.min(CHUNK_WORDS);
+            let src = ring.words(at, len).ok_or(Fault::Section)?;
+            if src.len() != len {
                 return Err(Fault::Section);
             }
-            for (d, s) in dst.iter_mut().zip(src) {
-                *d = s.load(Ordering::Relaxed);
+            for words in src.chunks(COPY_WORDS) {
+                for (d, s) in buffer.iter_mut().zip(words) {
+                    *d = s.load(Ordering::Relaxed).to_le_bytes();
+                }
+                // The last word's spare bytes are not the frame's.
+                let n = (words.len() * 8).min(total - done);
+                let bytes = buffer.as_flattened().get(..n).ok_or(Fault::Section)?;
+                scatter(&planes, done, bytes, sink)?;
+                done += n;
             }
-            at += dst.len();
+            at += len;
+            left -= len;
         }
         fence(Ordering::Acquire);
         let base = self.geometry.slot_start(c.slot);
@@ -667,6 +801,34 @@ impl Reader {
         self.freed = self.freed.saturating_add(1);
         Ok(())
     }
+}
+
+/// Hands `bytes`, the frame's from byte `from`, to `sink`, one run per row
+/// they cross, each at its offset in `planes`' layout.
+fn scatter(
+    planes: &[Plane; 3],
+    from: usize,
+    bytes: &[u8],
+    sink: &mut dyn FnMut(usize, &[u8]) -> bool,
+) -> Result<(), Fault> {
+    let mut rest = bytes;
+    let mut b = from;
+    while !rest.is_empty() {
+        let p = planes
+            .iter()
+            .rev()
+            .find(|p| p.frame <= b)
+            .ok_or(Fault::Section)?;
+        let i = b - p.frame;
+        let (row, x) = (i / p.row, i % p.row);
+        let (run, after) = rest.split_at(rest.len().min(p.row - x));
+        if !sink(p.sink + row * p.pitch + x, run) {
+            return Err(Fault::Section);
+        }
+        b += run.len();
+        rest = after;
+    }
+    Ok(())
 }
 
 /// Why a worker refused a ring.

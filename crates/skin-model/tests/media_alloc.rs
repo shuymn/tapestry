@@ -1,9 +1,9 @@
 //! Reading a video's frame ring allocates nothing (design.md "Scope of No
-//! Allocation"; "Rendering and Skins", video frames): a poll that finds
-//! nothing due, one that copies a frame of two chunks, one that frees the
-//! frames of an earlier run unread, starting a run, a poll that fails the
-//! player and the polls after it, and reading the staged frame. Only setting
-//! the ring up allocates, its staging buffer, at preparation.
+//! Allocation"; "Rendering and Skins", video frames): setting the ring up, a
+//! peek that finds nothing due, a peek and the take that copies a frame of
+//! two chunks into a sink at a pitch, one that frees the frames of an
+//! earlier run unread, starting a run, a peek that fails the player and the
+//! peeks and takes after it.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -78,8 +78,13 @@ fn ring_reads_do_not_allocate() {
         last: 60_000_000,
     };
     let (n, reader) = counted(|| Reader::new(ring, g, window).unwrap());
-    assert!(n > 0, "setting the ring up allocates its staging buffer");
+    assert_eq!(n, 0, "setting the ring up");
     let mut reader = reader;
+    // The sink: a buffer at a pitch wider than the rows, as an upload
+    // buffer's, allocated before.
+    let pitch = [256, 128];
+    let mut out = vec![0_u8; reader.pitched_bytes(pitch)];
+    let mut written = 0;
     let writer = Writer::attach(ring).unwrap();
     let frame: Vec<u8> = (0..g.frame_bytes()).map(|i| (i % 253) as u8).collect();
     let publish = |seq: u64, run: u64, stamp: i64| {
@@ -89,31 +94,36 @@ fn ring_reads_do_not_allocate() {
     publish(1, 1, 1_000);
     publish(2, 1, 2_000);
 
-    let (n, polled) = counted(|| reader.poll(ring, 500));
-    assert_eq!((n, polled.unwrap().staged), (0, None), "nothing due");
-    let (n, polled) = counted(|| reader.poll(ring, 1_500));
-    assert_eq!(n, 0, "a copy");
-    assert_eq!(polled.unwrap().staged.unwrap().seq, 1);
-    let (n, staged) = counted(|| reader.staged().map(|(f, w)| (f.seq, w.len())));
-    assert_eq!(
-        (n, staged),
-        (0, Some((1, g.frame_words()))),
-        "the staged frame"
-    );
+    let (n, peeked) = counted(|| reader.peek(ring, 500));
+    assert_eq!((n, peeked.unwrap().due), (0, None), "nothing due");
+    let (n, taken) = counted(|| {
+        let due = reader.peek(ring, 1_500)?.due.ok_or(Fault::Section)?;
+        let mut sink = |at: usize, bytes: &[u8]| {
+            written += bytes.len();
+            out.get_mut(at..at + bytes.len())
+                .map(|d| d.copy_from_slice(bytes))
+                .is_some()
+        };
+        reader.take(ring, due, pitch, &mut sink)
+    });
+    assert_eq!(n, 0, "a peek and a take");
+    assert_eq!(taken.unwrap().seq, 1);
+    assert_eq!(written, g.frame_bytes(), "the whole frame taken");
+    assert_eq!(out[256], frame[255], "the second row at the pitch");
     let (n, run) = counted(|| reader.start_run(window));
     assert_eq!((n, run), (0, 2), "a new run");
-    let (n, polled) = counted(|| reader.poll(ring, 5_000));
+    let (n, peeked) = counted(|| reader.peek(ring, 5_000));
     assert_eq!(n, 0, "frame 2 of run 1 freed unread");
-    assert!(polled.unwrap().freed);
+    assert!(peeked.unwrap().freed);
 
     publish(3, 2, 3_000);
     mem[g.frame_start(0) - SLOT_HEADER_WORDS + 4].store(9, Ordering::Relaxed);
-    let (n, polled) = counted(|| reader.poll(ring, 5_000));
+    let (n, peeked) = counted(|| reader.peek(ring, 5_000));
     assert_eq!(n, 0, "a fault");
-    assert_eq!(polled, Err(Fault::Index { slot: 0, value: 9 }));
-    let (n, polled) = counted(|| reader.poll(ring, 6_000));
+    assert_eq!(peeked, Err(Fault::Index { slot: 0, value: 9 }));
+    let (n, peeked) = counted(|| reader.peek(ring, 6_000));
     assert_eq!(
-        (n, polled),
+        (n, peeked),
         (0, Err(Fault::Index { slot: 0, value: 9 })),
         "a kept fault"
     );

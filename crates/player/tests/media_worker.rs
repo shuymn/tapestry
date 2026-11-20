@@ -42,7 +42,7 @@ use media_support::WORKER;
 use media_support::media_host::strikes::{FileId, Strikes};
 use media_support::media_host::verdict;
 use media_support::media_host::watch::{self, End, Event, LINE};
-use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
+use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe, root};
 use skin_model::media::control::{Command as Order, Matrix, Range, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
@@ -182,6 +182,8 @@ struct Ring {
     len: usize,
     event: OwnedHandle,
     reader: Reader,
+    /// The last frame taken, I420.
+    frame: Vec<u8>,
 }
 
 impl Ring {
@@ -221,6 +223,7 @@ impl Ring {
             len,
             event,
             reader,
+            frame: Vec::new(),
         }
     }
 
@@ -230,18 +233,16 @@ impl Ring {
     }
 
     /// Polls the ring at `due`, signalling the worker when slots were
-    /// freed: the frame staged, if any.
+    /// freed: the frame taken, if any.
     fn poll(&mut self, due: i64) -> Option<Frame> {
         let words = Self::words(self.view, self.len);
-        let poll = self
-            .reader
-            .poll(words, due)
+        let (taken, freed) = read_tight(&mut self.reader, words, due, &mut self.frame)
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
-        if poll.freed {
+        if freed {
             // SAFETY: the ring's event.
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
-        poll.staged
+        taken
     }
 
     /// The ring's section's size in bytes.
@@ -269,12 +270,10 @@ impl Ring {
             .collect()
     }
 
-    /// The staged frame's bytes, I420.
+    /// The last frame taken's bytes, I420.
     fn staged(&self) -> Vec<u8> {
-        let (_, words) = self.reader.staged().unwrap();
-        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        bytes.truncate(self.reader.geometry().frame_bytes());
-        bytes
+        assert_eq!(self.frame.len(), self.reader.geometry().frame_bytes());
+        self.frame.clone()
     }
 }
 

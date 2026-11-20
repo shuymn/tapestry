@@ -29,7 +29,7 @@ use media_support::media_host::launch::Launches;
 use media_support::media_host::session::{
     Deadlines, Event, Launching, Loss, Movie, PREPARATION, Session, Status,
 };
-use media_support::{Made, Stage, Step, WORKER, recipe};
+use media_support::{Made, Stage, Step, WORKER, read_tight, recipe};
 use skin_model::media::{self, Reader, State};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
@@ -227,14 +227,14 @@ struct Drawn {
     stop: AtomicBool,
     /// It reads nothing of the ring while set.
     hold: AtomicBool,
-    /// The frames it staged.
+    /// The frames it took.
     staged: AtomicU64,
     /// When it first freed a slot.
     first_free: Mutex<Option<Instant>>,
 }
 
 /// The render side's stand-in for one movie: a reader polling its ring
-/// every 4 ms (240 Hz) at the media time since its first poll, staging the
+/// every 4 ms (240 Hz) at the media time since its first poll, taking the
 /// frame due, telling the session the slots it freed and the movie its
 /// first frame; a fault loses the movie, a lost movie is no more read.
 struct Render {
@@ -289,6 +289,7 @@ impl Drop for Render {
 fn draw(movie: &Movie, drawn: &Drawn) {
     let mut reader: Option<Reader> = None;
     let mut origin = None;
+    let mut frame = Vec::new();
     while !drawn.stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(4));
         if drawn.hold.load(Ordering::Acquire) || movie.status() == Status::Lost {
@@ -301,13 +302,13 @@ fn draw(movie: &Movie, drawn: &Drawn) {
         let Some(r) = reader.as_mut() else { continue };
         let origin = *origin.get_or_insert_with(Instant::now);
         let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
-        match r.poll(live.ring.words(), due) {
-            Ok(p) => {
-                if p.staged.is_some() {
+        match read_tight(r, live.ring.words(), due, &mut frame) {
+            Ok((taken, freed)) => {
+                if taken.is_some() {
                     drawn.staged.fetch_add(1, Ordering::AcqRel);
                     movie.staged_first();
                 }
-                if p.freed {
+                if freed {
                     drawn
                         .first_free
                         .lock()
