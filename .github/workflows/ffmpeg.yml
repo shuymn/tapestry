@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   rebuild:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # The cross toolchain is built once per run when the binary cache lacks it
     # (about 15 min), then the build (about 5 min).
     timeout-minutes: 90

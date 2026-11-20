@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   compare:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # The two suites take up to about 19 minutes and the confirmation stops
     # at 15, which leaves the summary time.
     timeout-minutes: 40
