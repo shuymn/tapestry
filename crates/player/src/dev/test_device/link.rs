@@ -409,19 +409,17 @@ impl Connection {
         &self.com
     }
 
+    /// What its checked `hello` said.
+    pub const fn facts(&self) -> Option<&Facts> {
+        self.hello.as_ref()
+    }
+
     /// The connection's token, from its checked `hello`.
     pub fn token(&self) -> Option<Token> {
         self.hello.as_ref().and_then(|h| h.session)
     }
 
     /// The grant read on this connection, while it holds.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the runner's guard reads it; tests only until it lands"
-        )
-    )]
     pub const fn grant(&self) -> Option<&Grant> {
         self.grant.as_ref()
     }

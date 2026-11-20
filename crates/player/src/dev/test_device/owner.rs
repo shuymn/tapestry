@@ -14,6 +14,9 @@ use anyhow::Context as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use test_device::contract::hex;
+use test_device::evidence::{Process, RecorderReady, Run};
+
+use super::link::{Connection, Endpoints};
 
 /// Reserves the run's folder: it must not exist, its parent must.
 ///
@@ -140,6 +143,78 @@ pub fn seal(dir: &Path, path: &Path, run: &str, role: &str) -> anyhow::Result<Va
     }))
 }
 
+/// The run an outer run in `set` reserved for `role` running `row`: its run
+/// id and its folder, which is made here (`create_dir`, so a role runs
+/// once). The reservation is the outer's `start` record, the first line of
+/// its `run.jsonl`.
+///
+/// # Errors
+///
+/// No such reservation, or the folder exists.
+pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, PathBuf)> {
+    let text = std::fs::read_to_string(set.join(test_device::contract::RUN))
+        .with_context(|| format!("the reserving run in {}", set.display()))?;
+    let first = text.lines().next().unwrap_or_default();
+    let Ok(Run::Start(start)) = serde_json::from_str::<Run>(first) else {
+        anyhow::bail!("{}'s first record is not a `start`", set.display());
+    };
+    let Some(inner) = start.inner.filter(|r| r.role == role) else {
+        anyhow::bail!("the run in {} reserved no role `{role}`", set.display());
+    };
+    if inner.row != row {
+        anyhow::bail!(
+            "role `{role}` is reserved for row `{}`, not `{row}`",
+            inner.row
+        );
+    }
+    let dir = set.join(&inner.dir);
+    reserve(&dir)?;
+    Ok((inner.run, dir))
+}
+
+/// Checks the recorder's `ready` against the child the runner spawned: its
+/// process, and its window, which must be that process's.
+///
+/// # Errors
+///
+/// Another process's record or window.
+pub fn ready_is_the_child_s(
+    ready: &RecorderReady,
+    spawned: Process,
+    window_pid: u32,
+) -> Result<(), String> {
+    if ready.process != spawned {
+        return Err(format!(
+            "the recorder's `ready` names process {:?}, not the child spawned, {spawned:?}",
+            ready.process
+        ));
+    }
+    if window_pid != spawned.pid {
+        return Err(format!(
+            "the recorder's window {} is process {window_pid}'s, not the child's ({})",
+            ready.window, spawned.pid
+        ));
+    }
+    Ok(())
+}
+
+/// A new connection to the device at the bound location, its `hello`
+/// checked against `build`: after a reboot or a reconnect, the device must
+/// come back at the same location.
+///
+/// # Errors
+///
+/// The device is absent or elsewhere, or its `hello` is refused.
+pub fn rediscover<E: Endpoints + ?Sized>(
+    ep: &E,
+    bound: &str,
+    build: &str,
+) -> anyhow::Result<Connection> {
+    let mut c = Connection::bind(ep, Some(bound))?;
+    c.check_hello(Some(build))?;
+    Ok(c)
+}
+
 /// `n` random bytes from the system's source, as lowercase hex.
 ///
 /// # Errors
@@ -194,5 +269,90 @@ mod tests {
         let seal = seal(root.path(), &s.path, "r", "run").unwrap();
         assert_eq!(seal["path"], "run.jsonl");
         assert_eq!(random_hex(16).unwrap().len(), 32);
+    }
+
+    fn ready(pid: u32, window: u64) -> RecorderReady {
+        RecorderReady {
+            q: 1,
+            process: Process {
+                pid,
+                created: u64::from(pid) * 10,
+            },
+            window,
+            location: "L".into(),
+            keyboard: None,
+            pad: None,
+        }
+    }
+
+    #[test]
+    fn a_ready_window_of_another_process_is_refused() {
+        let child = Process {
+            pid: 40,
+            created: 400,
+        };
+        assert_eq!(ready_is_the_child_s(&ready(40, 9), child, 40), Ok(()));
+        // Its window is another process's.
+        assert!(ready_is_the_child_s(&ready(40, 9), child, 41).is_err());
+        // Another process's record (a reused id: another creation time).
+        assert!(ready_is_the_child_s(&ready(41, 9), child, 41).is_err());
+        let reused = Process {
+            pid: 40,
+            created: 401,
+        };
+        assert!(ready_is_the_child_s(&ready(40, 9), reused, 40).is_err());
+    }
+
+    #[test]
+    fn a_device_back_on_another_port_is_refused() {
+        use super::super::link::fake::{Dev, Host, hello};
+        const HERE: &str = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(3)";
+        const ELSEWHERE: &str = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(4)";
+        let at = |loc: &str| Host {
+            devs: vec![Dev::new(loc, "COM5", hello("abc", false))],
+            ..Host::default()
+        };
+        assert!(rediscover(&at(HERE), HERE, "abc").is_ok());
+        let e = rediscover(&at(ELSEWHERE), HERE, "abc").err().unwrap();
+        assert!(format!("{e:#}").contains(HERE), "{e:#}");
+        // Back at the location, but another build.
+        assert!(rediscover(&at(HERE), HERE, "abd").is_err());
+    }
+
+    fn outer_start(dir: &Path, inner: &serde_json::Value) {
+        let start = json!({
+            "t": "start", "run": "a".repeat(32), "row": "sink-kill", "role": "run",
+            "build": "0123456789ab", "process": {"pid": 1, "created": 2},
+            "commit": "0123456789ab", "tag": 7, "args": [], "set": null, "inner": inner,
+        });
+        std::fs::write(dir.join("run.jsonl"), format!("{start}\n")).unwrap();
+    }
+
+    #[test]
+    fn an_inner_runs_under_the_outer_s_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let set = root.path();
+        let id = "b".repeat(32);
+        outer_start(
+            set,
+            &json!({"role": "inner", "row": "sink", "run": id, "dir": "inner"}),
+        );
+        let (run, dir) = reserved(set, "inner", "sink").unwrap();
+        assert_eq!(run, id);
+        assert_eq!(dir, set.join("inner"));
+        assert!(dir.is_dir());
+        // A role runs once.
+        assert!(reserved(set, "inner", "sink").is_err());
+        // Another role or row is not reserved.
+        trash_dir(&dir);
+        assert!(reserved(set, "other", "sink").is_err());
+        assert!(reserved(set, "inner", "p1").is_err());
+        // No reservation at all.
+        outer_start(set, &serde_json::Value::Null);
+        assert!(reserved(set, "inner", "sink").is_err());
+    }
+
+    fn trash_dir(dir: &Path) {
+        std::fs::remove_dir(dir).unwrap();
     }
 }

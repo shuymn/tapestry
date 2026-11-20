@@ -44,6 +44,7 @@ dev-tools = [
     "windows/Win32_System_Registry",
     "windows/Win32_UI_HiDpi",
     "windows/Win32_UI_Input",
+    "windows/Win32_UI_Input_Ime",
     "windows/Win32_UI_Input_KeyboardAndMouse",
 ]
 

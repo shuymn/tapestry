@@ -240,7 +240,9 @@ pub fn to_abs(p: i32, origin: i32, size: i32) -> u16 {
     u16::try_from(a.min(65535)).unwrap_or(u16::MAX)
 }
 
-/// The pixel the system's mapping takes absolute coordinate `a` to.
+/// The pixel the system's mapping takes absolute coordinate `a` to: the
+/// tests' inverse of [`to_abs`].
+#[cfg(test)]
 #[must_use]
 pub fn from_abs(a: u16, origin: i32, size: i32) -> i32 {
     origin + i32::try_from(i64::from(a) * i64::from(size) / 65536).unwrap_or(0)
@@ -704,7 +706,8 @@ mod tests {
     #[test]
     fn each_broken_rule_refuses_the_click() {
         assert_eq!(check(&scene()), Ok(POINT));
-        let cases: [(fn(&mut Scene), fn(&Refusal) -> bool); 10] = [
+        type Case = (fn(&mut Scene), fn(&Refusal) -> bool);
+        let cases: [Case; 10] = [
             (|s| s.monitor_now = None, |r| *r == Refusal::MonitorGone),
             (
                 |s| s.monitor_now = Some([0, 0, 1920, 1080]),

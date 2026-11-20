@@ -162,9 +162,6 @@ const RI_KEY_E0: u16 = 2;
 /// `RAWMOUSE.usButtonFlags`' button edges (buttons 1-5 down and up); the
 /// wheel's flags are left out.
 pub const BUTTON_EDGES: u16 = 0x03FF;
-/// `RI_MOUSE_LEFT_BUTTON_DOWN`, `RI_MOUSE_LEFT_BUTTON_UP`.
-pub const LEFT_DOWN: u16 = 0x0001;
-pub const LEFT_UP: u16 = 0x0002;
 
 /// The header's size, and where the data starts, on this target.
 const HEADER: usize = size_of::<RAWINPUTHEADER>();
@@ -418,7 +415,7 @@ fn message(msg: &MSG, buf: &mut [u64]) -> Option<Msg> {
         }),
         WM_INPUT_DEVICE_CHANGE => {
             let change = u32::try_from(msg.wParam.0).unwrap_or(0);
-            (change == GIDC_ARRIVAL || change == GIDC_REMOVAL).then(|| Msg::Change {
+            (change == GIDC_ARRIVAL || change == GIDC_REMOVAL).then_some(Msg::Change {
                 q,
                 h: msg.lParam.0 as u64,
                 arrival: change == GIDC_ARRIVAL,
@@ -580,6 +577,9 @@ mod tests {
 
     use super::*;
 
+    /// `RI_MOUSE_LEFT_BUTTON_DOWN`, `RI_MOUSE_LEFT_BUTTON_UP`.
+    const LEFT_DOWN: u16 = 0x0001;
+    const LEFT_UP: u16 = 0x0002;
     const HERE: &str = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(3)";
     const ELSEWHERE: &str = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(4)";
 

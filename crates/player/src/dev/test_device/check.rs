@@ -5,14 +5,249 @@
 use std::path::Path;
 
 use anyhow::bail;
-use test_device::contract::{self, Expectation};
+use test_device::contract::{
+    self, Binding, CheckRule, Count, Event, Exit, ExitRule, Expectation, File, INNER, LINK,
+    Negative, RECORDER, RUN, RUNNER, RecordRule, Role, SINGLE,
+};
+use test_device::evidence::Outcome;
+
+use super::judge::PRODUCER;
 
 /// A row's name and its expectation.
 type Row = (&'static str, fn() -> Expectation);
 
-/// Each row's expectation, by the row's name. The rows arrive with their
-/// runner.
-const ROWS: &[Row] = &[];
+/// Each row's expectation, by the row's name.
+const ROWS: &[Row] = &[
+    ("sink", sink),
+    ("sink-early-close", sink_early_close),
+    ("sink-kill", sink_kill),
+];
+
+const fn file(role: &'static str, path: &'static str) -> File {
+    File { role, path }
+}
+
+const fn ev(role: &'static str, stream: &'static str, kind: &'static str) -> Event {
+    Event { role, stream, kind }
+}
+
+const fn rule(
+    role: &'static str,
+    stream: &'static str,
+    kind: &'static str,
+    count: Count,
+) -> RecordRule {
+    RecordRule {
+        role,
+        stream,
+        kind,
+        count,
+    }
+}
+
+fn check_rule(id: &'static str, outcome: Outcome, inputs: &[File], events: &[Event]) -> CheckRule {
+    CheckRule {
+        id,
+        producer: PRODUCER,
+        outcome,
+        inputs: inputs.to_vec(),
+        events: events.to_vec(),
+    }
+}
+
+/// What a runner of a row with a sink writes, in role `role`.
+fn sink_records(role: &'static str) -> Vec<RecordRule> {
+    use Count::{AtLeast, Exactly};
+    vec![
+        rule(role, RUN, "spawn", Exactly(1)),
+        rule(role, RUN, "sink", Exactly(1)),
+        rule(role, RUN, "call", AtLeast(2)),
+        rule(role, RUN, "held", Exactly(1)),
+        rule(role, RUN, "stop", Exactly(1)),
+        rule(role, RUN, "quiet", Exactly(1)),
+        rule(role, RUN, "close", Exactly(1)),
+        rule(role, RUN, "exit", Exactly(1)),
+        rule(role, RUN, "seal", Exactly(2)),
+        rule(role, LINK, "open", Exactly(1)),
+        rule(role, LINK, "fence", Exactly(1)),
+        rule(role, LINK, "check", AtLeast(1)),
+    ]
+}
+
+/// N1 (`sink`), and with `trigger` its negative's failing check.
+fn n1(row: &'static str, failing: Option<&'static str>) -> Expectation {
+    let (run, link, rec) = (
+        file(SINGLE, RUN),
+        file(SINGLE, LINK),
+        file(SINGLE, RECORDER),
+    );
+    let outcome = |id| {
+        if failing == Some(id) {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        }
+    };
+    let check = |id, inputs: &[File], events: &[Event]| check_rule(id, outcome(id), inputs, events);
+    Expectation {
+        row,
+        binding: Binding::Run,
+        roles: vec![Role { name: SINGLE, row }],
+        exits: vec![
+            ExitRule {
+                role: SINGLE,
+                process: RUNNER,
+                writes: None,
+                exit: Exit::Code(0),
+            },
+            ExitRule {
+                role: SINGLE,
+                process: "recorder",
+                writes: Some(rec),
+                exit: Exit::Code(0),
+            },
+        ],
+        records: sink_records(SINGLE),
+        checks: vec![
+            check("provenance", &[link], &[ev(SINGLE, LINK, "ans")]),
+            check(
+                "n1.grants",
+                &[link],
+                &[ev(SINGLE, LINK, "check"), ev(SINGLE, LINK, "ping")],
+            ),
+            check(
+                "n1.press",
+                &[run, rec],
+                &[
+                    ev(SINGLE, RUN, "held"),
+                    ev(SINGLE, RECORDER, "pad"),
+                    ev(SINGLE, RECORDER, "key"),
+                ],
+            ),
+            check(
+                "n1.release-requested",
+                &[run, link],
+                &[ev(SINGLE, RUN, "stop"), ev(SINGLE, LINK, "ans")],
+            ),
+            check(
+                "n1.neutral",
+                &[run, rec],
+                &[ev(SINGLE, RECORDER, "pad"), ev(SINGLE, RECORDER, "key")],
+            ),
+            check(
+                "n1.quiet-before-close",
+                &[run, link],
+                &[ev(SINGLE, RUN, "close"), ev(SINGLE, LINK, "fence")],
+            ),
+            check(
+                "n1.no-foreign",
+                &[run, rec],
+                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RUN, "close")],
+            ),
+        ],
+        negative: failing.map(|trigger| Negative {
+            mutation: "the end closes the sink straight after the release request",
+            trigger,
+        }),
+    }
+}
+
+fn sink() -> Expectation {
+    n1("sink", None)
+}
+
+/// N1's negative: exit 0 (the end still reads `quiet 1` after the close),
+/// failing exactly `n1.quiet-before-close`.
+fn sink_early_close() -> Expectation {
+    n1("sink-early-close", Some("n1.quiet-before-close"))
+}
+
+/// N2 (`sink-kill`): the outer reserves and kills the inner `sink`.
+fn sink_kill() -> Expectation {
+    use Count::{AtLeast, Exactly};
+    let (run, link, rec) = (
+        file(SINGLE, RUN),
+        file(SINGLE, LINK),
+        file(SINGLE, RECORDER),
+    );
+    let (inner_run, inner_link) = (file(INNER, RUN), file(INNER, LINK));
+    let pass =
+        |id, inputs: &[File], events: &[Event]| check_rule(id, Outcome::Pass, inputs, events);
+    let mut records = vec![
+        rule(SINGLE, RUN, "spawn", Exactly(2)),
+        rule(SINGLE, RUN, "exit", Exactly(3)),
+        rule(SINGLE, RUN, "seal", Exactly(4)),
+        rule(SINGLE, LINK, "open", Exactly(1)),
+        rule(INNER, RUN, "held", Exactly(1)),
+        rule(INNER, RUN, "spawn", Exactly(1)),
+        rule(INNER, LINK, "open", Exactly(1)),
+        rule(INNER, LINK, "check", AtLeast(1)),
+    ];
+    records.push(rule(SINGLE, RUN, "quiet", Exactly(1)));
+    Expectation {
+        row: "sink-kill",
+        binding: Binding::Run,
+        roles: vec![
+            Role {
+                name: SINGLE,
+                row: "sink-kill",
+            },
+            Role {
+                name: INNER,
+                row: "sink",
+            },
+        ],
+        exits: vec![
+            ExitRule {
+                role: SINGLE,
+                process: RUNNER,
+                writes: None,
+                exit: Exit::Code(0),
+            },
+            ExitRule {
+                role: SINGLE,
+                process: "recorder",
+                writes: Some(rec),
+                exit: Exit::Code(0),
+            },
+            ExitRule {
+                role: INNER,
+                process: RUNNER,
+                writes: None,
+                exit: Exit::Killed,
+            },
+            // The inner's recorder ends with its input or with the inner's
+            // job, either way with code 0 (a job's kill-on-close gives 0).
+            ExitRule {
+                role: SINGLE,
+                process: "inner-recorder",
+                writes: Some(file(INNER, RECORDER)),
+                exit: Exit::Code(0),
+            },
+        ],
+        records,
+        checks: vec![
+            pass(
+                "provenance",
+                &[link, inner_link],
+                &[ev(SINGLE, LINK, "ans"), ev(INNER, LINK, "ans")],
+            ),
+            pass(
+                "n2.abnormal",
+                &[inner_run, inner_link],
+                &[ev(INNER, RUN, "held")],
+            ),
+            pass(
+                "n2.neutral",
+                &[rec],
+                &[ev(SINGLE, RECORDER, "pad"), ev(SINGLE, RECORDER, "key")],
+            ),
+            pass("n2.quiet", &[link], &[ev(SINGLE, LINK, "ans")]),
+            pass("n2.children-gone", &[run], &[ev(SINGLE, RUN, "exit")]),
+        ],
+        negative: None,
+    }
+}
 
 /// The expectation of `row` among `rows`.
 fn expectation(rows: &[Row], row: &str) -> Option<Expectation> {
@@ -51,9 +286,6 @@ fn run(rows: &[Row], row: &str, dir: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use test_device::contract::{Binding, CheckRule, Exit, ExitRule, RUNNER, Role, SINGLE};
-    use test_device::evidence::Outcome;
-
     use super::*;
 
     fn bare() -> Expectation {
@@ -85,8 +317,30 @@ mod tests {
     #[test]
     fn an_unknown_row_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let e = check("sink", dir.path()).unwrap_err().to_string();
-        assert!(e.contains("no row `sink`"), "{e}");
+        let e = check("p9", dir.path()).unwrap_err().to_string();
+        assert!(e.contains("no row `p9`"), "{e}");
+    }
+
+    /// Every row's expectation is usable, and the negative fails exactly
+    /// its trigger.
+    #[test]
+    fn every_row_s_expectation_is_usable() {
+        for (name, e) in ROWS {
+            let e = e();
+            assert_eq!(e.row, *name);
+            assert!(e.problems().is_empty(), "{name}: {:?}", e.problems());
+        }
+        let neg = sink_early_close();
+        let failing: Vec<&str> = neg
+            .checks
+            .iter()
+            .filter(|c| c.outcome == Outcome::Fail)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(failing, ["n1.quiet-before-close"]);
+        // The negative's checks are the row's, in the same order.
+        let ids = |e: Expectation| e.checks.iter().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(ids(neg), ids(sink()));
     }
 
     #[test]

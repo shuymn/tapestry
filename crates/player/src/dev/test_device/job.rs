@@ -189,6 +189,33 @@ impl Child {
     }
 }
 
+/// Opens the process its id and creation time name, to wait for it and end
+/// it: a process the id now names that was created at another time is
+/// another process, and refused.
+///
+/// # Errors
+///
+/// It cannot be opened, or it is another process.
+pub fn open(p: Process) -> anyhow::Result<Child> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    // SAFETY: no pointers.
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            false,
+            p.pid,
+        )
+    }
+    .with_context(|| format!("opening process {}", p.pid))?;
+    let handle = Owned(h);
+    if created(handle.0)? != p.created {
+        bail!("process {} is another process than the one recorded", p.pid);
+    }
+    Ok(Child { handle, process: p })
+}
+
 /// A process's creation time (the system's FILETIME), which with its id
 /// names it: an id the system reuses names another process.
 ///
@@ -544,11 +571,8 @@ mod tests {
             .unwrap(),
         );
         // SAFETY: an open handle.
-        assert_ne!(
-            unsafe { WaitForSingleObject(sleeper.0, 0) },
-            WAIT_OBJECT_0,
-            "the sleeper ended early"
-        );
+        let early = unsafe { WaitForSingleObject(sleeper.0, 0) };
+        assert_ne!(early, WAIT_OBJECT_0, "the sleeper ended early");
         runner.kill().unwrap();
         let end = Instant::now() + Duration::from_secs(2);
         // SAFETY: an open handle.
