@@ -235,13 +235,16 @@ impl Video {
         }
     }
 
-    /// The GPU bytes the slots hold: their planes' texels and their upload
-    /// buffers.
+    /// The GPU bytes the slots hold, as their resources were made: their
+    /// planes' texels and their upload buffers.
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> (u64, u64) {
+        let texels = |t: &wgpu::Texture| u64::from(t.width()) * u64::from(t.height());
         self.movies.iter().fold((0, 0), |(t, u), m| {
-            let (mt, mu) = movie_bytes(m.width, m.height);
-            (t + mt, u + mu)
+            (
+                t + texels(&m.y) + texels(&m.u) + texels(&m.v),
+                u + m.upload.size(),
+            )
         })
     }
 }
