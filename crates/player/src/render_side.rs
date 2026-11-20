@@ -249,6 +249,7 @@ pub trait Screen: Send {
             staged: None,
             text: None,
             chart: None,
+            pages: None,
         }
     }
     /// What the uploader can do now ([`render::Renderer::upload_state`]);
@@ -17458,6 +17459,7 @@ pub(crate) mod tests {
                 staged: None,
                 text: None,
                 chart: None,
+                pages: None,
             }
         }
         fn upload_state(&self) -> render::UploadState {
@@ -21525,6 +21527,7 @@ pub(crate) mod tests {
                     staged: None,
                     text: None,
                     chart: None,
+                    pages: None,
                 };
             }
             self.menu.upload_boundary(past)

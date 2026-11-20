@@ -103,9 +103,10 @@ pub use renderer::take_build_start;
 pub use renderer::{
     Admission, ChartOutcome, ChartTarget, ChartUpload, Class, CommitError, CpuParts, Destroyed,
     Destruction, FrameOutcome, FrameTiming, Handoff, HeavyOps, LoadingOn, LoadingTextError,
-    LoadingTextKey, MAX_SPRITES, MemoryWitness, Part, PreparedToken, RESULT_STRIP_SPRITES,
-    RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError, Renderer, ResultChartTarget, SHARED_TEXELS,
-    STRIP_SPRITES, Target, TextDone, TextFault, VM_TEXELS, letterbox,
+    LoadingTextKey, MAX_SPRITES, MemoryWitness, PagesBegun, PagesStep, Part, PreparedToken,
+    RESULT_STRIP_SPRITES, RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError, Renderer,
+    ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, TextDone, TextFault, VM_TEXELS,
+    letterbox,
 };
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::{DestroyRecord, RECORD_LEN};

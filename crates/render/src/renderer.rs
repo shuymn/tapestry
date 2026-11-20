@@ -1641,6 +1641,12 @@ pub struct Renderer {
     /// renderer's own account (finished before an attempt's text on its
     /// resources, dropped with a staging): the next boundary answers it.
     loading_report: Option<crate::TextDone>,
+    /// The result pages upload in hand, beside the staging and never
+    /// dropped with it.
+    pages_upload: Option<pages_upload::PagesUpload>,
+    /// How the result pages upload ended on the renderer's own account
+    /// since the last boundary (a refused step, or a withdrawal).
+    pages_report: Option<PagesStep>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -1910,6 +1916,8 @@ impl Renderer {
             loading_refused: None,
             loading_upload: None,
             loading_report: None,
+            pages_upload: None,
+            pages_report: None,
             pacer: Pacer::default(),
             #[cfg(feature = "dev-tools")]
             offscreen_wait: Some(OFFSCREEN_FRAME_WAIT),
@@ -2692,9 +2700,17 @@ impl Renderer {
             None if kind == ScreenKind::Result => self
                 .result_pages
                 .as_ref()
-                .map_or(0, |p| pages_texels(&p.pages)),
+                .map_or(0, |p| pages_texels(&p.pages))
+                .saturating_add(self.pages_charge()),
             None => 0,
         }
+    }
+
+    /// The result pages upload in hand's charge, from its begin.
+    fn pages_charge(&self) -> u64 {
+        self.pages_upload
+            .as_ref()
+            .map_or(0, |u| pages_texels(&u.res.pages))
     }
 
     /// The pages `kind`'s committed atlas array holds, if any: its
@@ -3158,6 +3174,9 @@ impl Renderer {
     ) -> Result<Option<PreparedToken>, RenderError> {
         if kind == ScreenKind::Result && self.result_disabled {
             return Err(RenderError::ResultDisabled);
+        }
+        if kind == ScreenKind::Result {
+            self.end_pages_upload();
         }
         // Asked again: the staging in progress answers, taking no request.
         if self
@@ -3857,6 +3876,7 @@ impl Renderer {
         if self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
+        self.end_pages_upload();
         let installed = self.committed_atlas(kind) == Some(pages.id());
         #[cfg(feature = "dev-tools")]
         crate::probe::mark("pg:already", i64::from(installed));
@@ -4663,6 +4683,9 @@ impl Renderer {
         if Self::screen(kind).is_none() {
             return;
         }
+        if kind == ScreenKind::Result {
+            self.end_pages_upload();
+        }
         self.release(kind);
         if self.pending.as_ref().is_some_and(|p| p.token.kind == kind) {
             self.drop_pending();
@@ -4689,6 +4712,7 @@ impl Renderer {
         if self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
+        self.end_pages_upload();
         self.release(kind);
         self.admit_reclaiming(kind, pages_texels(pages))?;
         self.result_pages = Some(self.pages_for(pages)?);
@@ -5607,6 +5631,7 @@ impl Renderer {
             staged: None,
             text: None,
             chart: None,
+            pages: None,
         };
         // The loading text that ended on the renderer's own account since
         // the last boundary.
@@ -5667,6 +5692,11 @@ impl Renderer {
             {
                 p.writes = None;
                 out.staged = Some(p.token);
+                continue;
+            }
+            // The result pages' last step completed: reported written.
+            if !staging_only && let Some(ticket) = self.pages_completed() {
+                out.pages = Some(crate::PagesStep::Written(ticket));
                 continue;
             }
             if self.staging_steps() {
@@ -5756,6 +5786,11 @@ impl Renderer {
                 break;
             }
             let Some(up) = self.bga_upload.as_mut() else {
+                // The result pages, after the BGA batch.
+                if self.write_pages_step(started, steps, slice, past) {
+                    steps += 1;
+                    continue;
+                }
                 break;
             };
             let (array, gpu) = (&self.bga, &self.gpu);
@@ -5795,12 +5830,19 @@ impl Renderer {
         if matches!(out.bga, crate::BgaStep::Idle) && self.bga_upload.is_some() {
             out.bga = crate::BgaStep::Pending;
         }
+        if !staging_only && let Some(r) = self.pages_report.take() {
+            out.pages = Some(r);
+        }
         out
     }
 
     /// Whether a payload is in hand: the staging's pages, or a BGA batch.
     fn uploading(&self) -> bool {
-        self.staging_steps() || self.loading_upload.is_some() || self.bga_upload.is_some()
+        self.staging_steps()
+            || self.loading_upload.is_some()
+            || self.bga_upload.is_some()
+            || self.pages_steps()
+            || self.pages_report.is_some()
     }
 
     /// Whether the staging has pages to write or its last step's
@@ -6270,7 +6312,9 @@ impl Renderer {
         let [committed, staging, upload, entries @ ..] = &mut out;
         *committed = self.committed_atlas(kind);
         *staging = staged;
-        *upload = None;
+        *upload = (kind == ScreenKind::Result)
+            .then(|| self.pages_upload.as_ref().map(|u| u.res.pages.id()))
+            .flatten();
         for (o, id) in entries.iter_mut().zip(self.retire.ids(kind)) {
             *o = id;
         }
@@ -9254,6 +9298,14 @@ mod decision_label_tests;
 #[cfg(test)]
 #[path = "chart_upload_tests.rs"]
 mod chart_upload_tests;
+
+#[path = "pages_upload.rs"]
+mod pages_upload;
+pub use pages_upload::{PagesBegun, PagesStep};
+
+#[cfg(test)]
+#[path = "pages_upload_tests.rs"]
+mod pages_upload_tests;
 
 #[cfg(test)]
 mod tests {

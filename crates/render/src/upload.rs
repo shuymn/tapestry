@@ -92,6 +92,9 @@ pub struct Uploaded {
     /// ended (a check failed, nothing more written; a band refused, the
     /// all-absent table published).
     pub chart: Option<Result<skin_model::chart_image::ChartTable, crate::RenderError>>,
+    /// The result pages upload's end in this boundary: written (its owner
+    /// publishes or withdraws it), refused, or withdrawn by the renderer.
+    pub pages: Option<crate::PagesStep>,
 }
 
 /// The step in flight: its completion's flag and its submission.
