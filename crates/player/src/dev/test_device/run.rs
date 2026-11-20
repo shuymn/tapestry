@@ -1191,9 +1191,13 @@ mod tests {
     /// anything: no run closes its sink before the release evidence.
     #[test]
     fn the_runner_refuses_the_early_close_negative() {
+        // A temporary folder: a runner that took the row would reserve it
+        // there, not in the checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("run");
         let args = |row: &str| Args {
             row: row.into(),
-            out: Some(PathBuf::from("unused")),
+            out: Some(out.clone()),
             set: None,
             role: None,
             build: BUILD.into(),
@@ -1204,7 +1208,7 @@ mod tests {
         assert_eq!(format!("{e:#}"), "no row `sink-early-close`");
         // The row it negates is one.
         assert!(row("sink").is_some());
-        assert!(!Path::new("unused").exists());
+        assert!(!out.exists());
     }
 
     #[test]
