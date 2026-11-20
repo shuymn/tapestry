@@ -181,6 +181,23 @@ pub(crate) struct Placement {
     pub(crate) counts: TextCounts,
 }
 
+impl Placement {
+    /// The bytes its slots hold, as the holder it publishes will: their
+    /// list's storage and their keys' strings.
+    pub(crate) fn bytes(&self) -> u64 {
+        let lists = self.slots.capacity() * size_of::<(u16, Slot)>();
+        let strings: usize = self
+            .slots
+            .iter()
+            .map(|(_, s)| match s {
+                Slot::Line { alias, line } => alias.text.capacity() + line.text.capacity(),
+                Slot::None(_) => 0,
+            })
+            .sum();
+        u64::try_from(lists + strings).unwrap_or(u64::MAX)
+    }
+}
+
 /// A new entry to upload: its returned rectangle and its layout.
 #[derive(Debug)]
 pub(crate) struct NewLine {

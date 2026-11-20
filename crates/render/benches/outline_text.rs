@@ -15,7 +15,7 @@
 //!    literals, Japanese where the font has it), each attempt cold with
 //!    new labels, warm with the same ones; then the loading text's
 //!    preparation of the same lines, cold and warm, median and p95 of 30,
-//!    each the whole `Renderer::prepare_loading_text` with its wait.
+//!    each `Renderer::prepare_loading_text` and its steps to the install.
 //! 3. The atlas side with and without the text layer, the layer's bytes
 //!    with its mips, the bytes the last cold preparation staged, the
 //!    largest line, and the preparation's buffers.
@@ -235,7 +235,7 @@ fn main() {
         );
         // The loading text's preparation of the same labels, cold on an
         // empty cache and warm with every line a hit, each the whole
-        // `Renderer::prepare_loading_text` with its wait for the GPU.
+        // `Renderer::prepare_loading_text` and its steps to the install.
         let mut revision = 0;
         let mut loading = |r: &mut render::Renderer, title: &str| {
             revision += 1;
@@ -248,8 +248,8 @@ fn main() {
             };
             r.enter_loading(1);
             let t = Instant::now();
-            r.prepare_loading_text(1, revision, TextSlots::ALL, &labels)
-                .unwrap();
+            r.prepare_loading_text(1, revision, TextSlots::ALL, &labels);
+            assert_eq!(common::settle_text(r), Ok(true));
             t.elapsed()
         };
         let cold: Vec<Duration> = (0..30)

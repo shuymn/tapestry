@@ -697,6 +697,7 @@ fn a_hold_mark_spans_its_waits() {
         lifetime,
         shown_at: TimeUs(1_000),
         ended: false,
+        skinned: false,
         hold: None,
     };
     let mut held = frame(7);

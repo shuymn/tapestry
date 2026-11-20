@@ -103,16 +103,17 @@ fn loading_at(lifetime: u64, now: i64, lift: u16, text: u64) -> LoadingFrame<'st
 }
 
 /// The chosen chart's bitmap text, with no rasterized-text producer: laid
-/// out when prepared and held staged, drawing nothing until the next
-/// frame's start installs it; counted in the renderer's memory while
-/// staged, its glyphs included, and no longer once installed. A chart
+/// out when prepared and held in the uploader's hand, drawing nothing
+/// until the boundary that ends it installs it; counted in the renderer's
+/// memory while in hand, its glyphs included, and no longer once
+/// installed. A chart
 /// lacking its genre leaves that slot empty. A changed artist clears its
 /// slot at once, the other slots kept, and draws its replacement once
 /// installed; the animation goes on and the `screen` timer keeps its
 /// start throughout. A preparation replaced before its install never
 /// draws. Without the staged bitmap lines no square ever paints.
 #[test]
-fn bitmap_loading_text_installs_on_the_next_frame() {
+fn bitmap_loading_text_installs_at_its_boundary() {
     let mut r = offscreen(1_920, 1_080);
     let text = MenuText::new(&r);
     let (_dir, b) = bundle(&r);
@@ -120,8 +121,7 @@ fn bitmap_loading_text_installs_on_the_next_frame() {
     r.enter_loading(1);
 
     let first = labels("A", "D", "");
-    r.prepare_loading_text(1, 1, TextSlots::ALL, &first)
-        .unwrap();
+    r.prepare_loading_text(1, 1, TextSlots::ALL, &first);
     let staged = r.memory().staged_text;
     let glyphs = b
         .skin()
@@ -130,12 +130,12 @@ fn bitmap_loading_text_installs_on_the_next_frame() {
     assert!(glyphs >= 3 * 64, "three glyphs laid out: {glyphs}");
     assert!(staged >= u64::try_from(glyphs).unwrap(), "{staged}");
     let p = loading(&mut r, &text, &loading_at(1, 0, 0, 0));
-    assert_eq!(text_at(&p), [BLACK; 4], "staged, not installed");
+    assert_eq!(text_at(&p), [BLACK; 4], "in hand, not installed");
     assert_eq!(centre(&p, BACKGROUND), RED);
     let started = screen(&r);
     assert!(started.is_some());
 
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(r.memory().staged_text, 0);
     let p = loading(&mut r, &text, &loading_at(1, 100, 0, 1));
     assert_eq!(
@@ -150,12 +150,10 @@ fn bitmap_loading_text_installs_on_the_next_frame() {
     let p = loading(&mut r, &text, &loading_at(1, 200, 0, 1));
     assert_eq!(text_at(&p), [colour('A'), BLACK, BLACK, colour('A')]);
     // A preparation replaced before its install never draws.
-    r.prepare_loading_text(1, 2, artist, &labels("A", "B", ""))
-        .unwrap();
-    r.prepare_loading_text(1, 3, artist, &labels("A", "E", ""))
-        .unwrap();
-    assert_eq!(r.staged_loading_text(), Some((1, 3)));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 2, artist, &labels("A", "B", ""));
+    r.prepare_loading_text(1, 3, artist, &labels("A", "E", ""));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 3)));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let p = loading(&mut r, &text, &loading_at(1, 300, 0, 3));
     assert_eq!(text_at(&p), [colour('A'), colour('E'), BLACK, colour('A')]);
     // The animation moved 300 canvas pixels; the timer kept its start.
@@ -176,14 +174,12 @@ fn stale_bitmap_text_installs_nothing() {
     let (_dir, b) = bundle(&r);
     install(&mut r, &b, 1);
     r.enter_loading(1);
-    r.prepare_loading_text(1, 2, TextSlots::ALL, &labels("A", "D", "C"))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 2, TextSlots::ALL, &labels("A", "D", "C"));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     // Older.
-    r.prepare_loading_text(1, 1, TextSlots::ALL, &labels("B", "B", "B"))
-        .unwrap();
+    r.prepare_loading_text(1, 1, TextSlots::ALL, &labels("B", "B", "B"));
     assert_eq!(
-        r.install_staged_loading_text(),
+        common::settle_text(&mut r),
         Err(LoadingTextError::Older {
             installed: 2,
             revision: 1
@@ -195,24 +191,16 @@ fn stale_bitmap_text_installs_nothing() {
         [colour('A'), colour('D'), colour('C'), colour('A')]
     );
     // Another lifetime: entered after the text was prepared for the last.
-    r.prepare_loading_text(1, 3, TextSlots::ALL, &labels("B", "B", "B"))
-        .unwrap();
+    r.prepare_loading_text(1, 3, TextSlots::ALL, &labels("B", "B", "B"));
     r.enter_loading(2);
-    assert_eq!(
-        r.install_staged_loading_text(),
-        Err(LoadingTextError::Lifetime)
-    );
+    assert_eq!(common::settle_text(&mut r), Err(LoadingTextError::Lifetime));
     let p = loading(&mut r, &text, &loading_at(2, 100, 0, 0));
     assert_eq!(text_at(&p), [BLACK; 4]);
     // Another bundle committed within the lifetime.
-    r.prepare_loading_text(2, 1, TextSlots::ALL, &labels("B", "B", "B"))
-        .unwrap();
+    r.prepare_loading_text(2, 1, TextSlots::ALL, &labels("B", "B", "B"));
     let (_other_dir, other) = bundle(&r);
     install(&mut r, &other, 2);
-    assert_eq!(
-        r.install_staged_loading_text(),
-        Err(LoadingTextError::Stale)
-    );
+    assert_eq!(common::settle_text(&mut r), Err(LoadingTextError::Stale));
     let p = loading(&mut r, &text, &loading_at(2, 200, 0, 0));
     assert_eq!(text_at(&p), [BLACK; 4]);
     assert_eq!(centre(&p, BACKGROUND), RED);

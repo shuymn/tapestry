@@ -21,6 +21,7 @@ mod lints;
 mod media;
 mod portable;
 mod privacy;
+mod queue_writes;
 mod test_device;
 
 use std::ffi::OsString;

@@ -22,6 +22,9 @@ struct Submissions {
     queued: AtomicBool,
     /// The last submission's number and the queue's index for it.
     latest: Mutex<Option<(u64, wgpu::SubmissionIndex)>>,
+    /// The writes queued so far, every one through the uploader's write
+    /// function (`upload`).
+    writes: AtomicU64,
 }
 
 /// What a non-blocking look at a watched submission found.
@@ -85,6 +88,19 @@ impl Gpu {
         let s = &self.submissions;
         s.queued.store(true, Ordering::Release);
         s.count.load(Ordering::Acquire) + 1
+    }
+
+    /// Counts a write queued ([`crate::upload`]'s write function alone).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn count_write(&self) {
+        self.submissions.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The writes queued on this device so far.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn writes(&self) -> u64 {
+        self.submissions.writes.load(Ordering::Relaxed)
     }
 
     /// Whether a write is queued that no submission has carried yet.
