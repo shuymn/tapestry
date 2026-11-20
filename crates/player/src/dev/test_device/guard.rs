@@ -210,7 +210,8 @@ impl Sink for Writer {
         Self::stop_holds(self, cause);
     }
     fn view(&self) -> View {
-        View::of(&self.state(), self.stopped().is_some())
+        let stopped = self.stopped().is_some();
+        self.with_state(|s| View::of(s, stopped))
     }
 }
 

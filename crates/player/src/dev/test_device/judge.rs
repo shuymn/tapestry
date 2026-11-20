@@ -19,12 +19,10 @@ use test_device::provenance;
 
 use super::guard::SLICE_MS;
 use super::listen::{BUTTON_EDGES, a_runner_s};
-use super::run::pad_buttons;
+use super::run::{F24_SCAN, pad_buttons};
 
 /// The producer's name.
 pub const PRODUCER: &str = "judge";
-/// F24's scan code, as the recorder reads it.
-const F24_SCAN: u64 = 0x76;
 
 /// One stream as read: its records, or why it could not be read, and the
 /// sha256 of its bytes.

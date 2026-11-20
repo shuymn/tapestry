@@ -55,9 +55,10 @@ fn check_rule(id: &'static str, outcome: Outcome, inputs: &[File], events: &[Eve
     }
 }
 
-/// What a runner of a row with a sink writes, in role `role`.
-fn sink_records(role: &'static str) -> Vec<RecordRule> {
+/// What the runner of a row with a sink writes.
+fn sink_records() -> Vec<RecordRule> {
     use Count::{AtLeast, Exactly};
+    let role = SINGLE;
     vec![
         rule(role, RUN, "spawn", Exactly(1)),
         rule(role, RUN, "sink", Exactly(1)),
@@ -74,7 +75,8 @@ fn sink_records(role: &'static str) -> Vec<RecordRule> {
     ]
 }
 
-/// N1 (`sink`), and with `trigger` its negative's failing check.
+/// N1 (`sink`), and with `failing` its negative's trigger, the one check
+/// that fails.
 fn n1(row: &'static str, failing: Option<&'static str>) -> Expectation {
     let (run, link, rec) = (
         file(SINGLE, RUN),
@@ -107,7 +109,7 @@ fn n1(row: &'static str, failing: Option<&'static str>) -> Expectation {
                 exit: Exit::Code(0),
             },
         ],
-        records: sink_records(SINGLE),
+        records: sink_records(),
         checks: vec![
             check("provenance", &[link], &[ev(SINGLE, LINK, "ans")]),
             check(
@@ -173,7 +175,7 @@ fn sink_kill() -> Expectation {
     let (inner_run, inner_link) = (file(INNER, RUN), file(INNER, LINK));
     let pass =
         |id, inputs: &[File], events: &[Event]| check_rule(id, Outcome::Pass, inputs, events);
-    let mut records = vec![
+    let records = vec![
         rule(SINGLE, RUN, "spawn", Exactly(2)),
         rule(SINGLE, RUN, "exit", Exactly(3)),
         rule(SINGLE, RUN, "seal", Exactly(4)),
@@ -182,8 +184,8 @@ fn sink_kill() -> Expectation {
         rule(INNER, RUN, "spawn", Exactly(1)),
         rule(INNER, LINK, "open", Exactly(1)),
         rule(INNER, LINK, "check", AtLeast(1)),
+        rule(SINGLE, RUN, "quiet", Exactly(1)),
     ];
-    records.push(rule(SINGLE, RUN, "quiet", Exactly(1)));
     Expectation {
         row: "sink-kill",
         binding: Binding::Run,

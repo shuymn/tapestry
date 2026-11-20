@@ -84,7 +84,7 @@ pub enum Step {
 /// F24's keyboard usage: a key that types nothing.
 pub const F24: u8 = 0x73;
 /// F24's scan code, as the recorder reads it.
-const F24_SCAN: u64 = 0x76;
+pub const F24_SCAN: u64 = 0x76;
 
 /// The steps of row `sink`.
 pub fn sink_steps() -> Vec<Step> {
@@ -314,7 +314,7 @@ impl Exec for Live {
     fn lease(&mut self, ms: u32) -> Result<(), String> {
         self.beat();
         self.guard.want(qpc() + i64::from(ms) * self.freq / 1000);
-        let beat = || self.beat.store(qpc(), Ordering::Release);
+        let beat = || self.beat();
         if !self
             .writer
             .wait(GRANT_WAIT, &beat, |s| s.grant.is_some() || s.lost.is_some())
@@ -431,6 +431,26 @@ impl Watch for Looks {
     }
 }
 
+/// Writes the `exit` record of `name`, process `p`.
+fn exit_record(log: &Log, name: &str, p: Process, code: i32, killed: bool) {
+    log.put(json!({
+        "t": "exit", "name": name, "code": code, "killed": killed,
+        "process": { "pid": p.pid, "created": p.created },
+    }));
+}
+
+/// Waits up to `wait` for `c` to end, else ends it: its exit code (-1 when
+/// none could be read), and whether it was ended.
+fn wait_or_kill(c: &Child, wait: Duration) -> (i32, bool) {
+    match c.wait(wait) {
+        Some(code) => (code, false),
+        None => {
+            let _ = c.kill(1);
+            (c.wait(Duration::from_secs(5)).unwrap_or(-1), true)
+        }
+    }
+}
+
 /// The recorder child: its process, its input (whose end ends it), and
 /// its stream.
 struct RecChild {
@@ -513,18 +533,8 @@ impl end::Recorder for RecChild {
 
     fn stop(&mut self) -> Result<(), String> {
         drop(self.input.take());
-        let code = self.child.wait(Duration::from_secs(5));
-        let (code, killed) = match code {
-            Some(c) => (c, false),
-            None => {
-                let _ = self.child.kill(1);
-                (self.child.wait(Duration::from_secs(5)).unwrap_or(-1), true)
-            }
-        };
-        self.log.put(json!({
-            "t": "exit", "name": self.name, "code": code, "killed": killed,
-            "process": { "pid": self.child.process.pid, "created": self.child.process.created },
-        }));
+        let (code, killed) = wait_or_kill(&self.child, Duration::from_secs(5));
+        exit_record(&self.log, self.name, self.child.process, code, killed);
         match (code, killed) {
             (0, false) => Ok(()),
             (_, true) => Err("it did not end within 5 s of its input's end, and was killed".into()),
@@ -818,23 +828,9 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     if let Some(e) = link_log.close() {
         errors.push(e);
     }
-    let (run_id, role) = (b.run.clone(), b.role.clone());
-    seal(
-        &b,
-        &b.dir,
-        test_device::contract::LINK,
-        &run_id,
-        &role,
-        &mut errors,
-    );
-    seal(
-        &b,
-        &b.dir,
-        test_device::contract::RECORDER,
-        &run_id,
-        &role,
-        &mut errors,
-    );
+    for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
+        seal(&b, &b.dir, name, &b.run, &b.role, &mut errors);
+    }
     Ok(finish(&b, errors))
 }
 
@@ -895,17 +891,12 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
         error: Stdio::file(owner::create(&b.dir.join("inner-stderr.txt"))?),
     };
     let child = job::spawn(&b.job, &exe, &args, &[], &stdio)?;
-    let put_exit = |name: &str, p: Process, code: i32, killed: bool| {
-        b.log.put(json!({
-            "t": "exit", "name": name, "code": code, "killed": killed,
-            "process": { "pid": p.pid, "created": p.created },
-        }));
-    };
     b.log.put(json!({
         "t": "spawn", "name": "inner",
         "process": { "pid": child.process.pid, "created": child.process.created },
     }));
-    let inner_run = b.dir.join(&inner.dir).join(test_device::contract::RUN);
+    let inner_dir = b.dir.join(&inner.dir);
+    let inner_run = inner_dir.join(test_device::contract::RUN);
     // The inner's recorder, by the inner's spawn record.
     let recorder = await_record(&inner_run, READY_WAIT * 2, |v| {
         (v["t"] == "spawn" && v["name"] == "recorder")
@@ -923,22 +914,15 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
     }
     child.kill(1).context("ending the inner")?;
     let code = child.wait(Duration::from_secs(5)).unwrap_or(-1);
-    put_exit("inner", child.process, code, true);
+    exit_record(&b.log, "inner", child.process, code, true);
     match survivor {
         Some(Ok(s)) => {
-            let (code, killed) = match s.wait(SURVIVOR_WAIT) {
-                Some(c) => (c, false),
-                None => {
-                    let _ = s.kill(1);
-                    (s.wait(Duration::from_secs(5)).unwrap_or(-1), true)
-                }
-            };
-            put_exit("inner-recorder", s.process, code, killed);
+            let (code, killed) = wait_or_kill(&s, SURVIVOR_WAIT);
+            exit_record(&b.log, "inner-recorder", s.process, code, killed);
         }
         Some(Err(e)) => errors.push(format!("opening the inner's recorder: {e:#}")),
         None => errors.push("the inner recorded no recorder".into()),
     }
-    let inner_dir = b.dir.join(&inner.dir);
     for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
         seal(&b, &inner_dir, name, &inner.run, &inner.role, &mut errors);
     }
@@ -975,23 +959,9 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
     if let Some(e) = link_log.close() {
         errors.push(e);
     }
-    let (run_id, role) = (b.run.clone(), b.role.clone());
-    seal(
-        &b,
-        &b.dir,
-        test_device::contract::LINK,
-        &run_id,
-        &role,
-        &mut errors,
-    );
-    seal(
-        &b,
-        &b.dir,
-        test_device::contract::RECORDER,
-        &run_id,
-        &role,
-        &mut errors,
-    );
+    for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
+        seal(&b, &b.dir, name, &b.run, &b.role, &mut errors);
+    }
     Ok(finish(&b, errors))
 }
 

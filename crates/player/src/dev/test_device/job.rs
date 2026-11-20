@@ -27,11 +27,11 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -380,13 +380,12 @@ fn start_listed(
         si.StartupInfo.hStdOutput = stdio.output.0;
         si.StartupInfo.hStdError = stdio.error.0;
         si.lpAttributeList = list;
-        let mut line = std::iter::once(exe.display().to_string())
+        let line = std::iter::once(exe.display().to_string())
             .chain(args.iter().cloned())
             .map(|a| quote(&a))
             .collect::<Vec<_>>()
             .join(" ");
-        line.push('\0');
-        let mut line: Vec<u16> = line.encode_utf16().collect();
+        let mut line = wide(&line);
         let block = env_block(env);
         let exe_w = wide(&exe.display().to_string());
         let mut pi = PROCESS_INFORMATION::default();
@@ -398,9 +397,7 @@ fn start_listed(
                 None,
                 None,
                 true,
-                EXTENDED_STARTUPINFO_PRESENT
-                    | CREATE_NO_WINDOW
-                    | PROCESS_CREATION_FLAGS(0x0000_0400),
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                 Some(block.as_ptr().cast()),
                 None,
                 &raw const si.StartupInfo,

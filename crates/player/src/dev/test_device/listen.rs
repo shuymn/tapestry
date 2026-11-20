@@ -39,6 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+use test_device::contract::hex;
+
 use super::desktop::{foreground, process_of};
 use super::devices::{device_name, raw_location};
 use super::job::this_process;
@@ -216,14 +218,6 @@ pub type Fg = (u64, u32);
 
 fn fg_json(fg: Fg) -> Value {
     json!({ "window": fg.0, "pid": fg.1 })
-}
-
-fn hex(b: &[u8]) -> String {
-    use std::fmt::Write as _;
-    b.iter().fold(String::new(), |mut s, x| {
-        let _ = write!(s, "{x:02x}");
-        s
-    })
 }
 
 /// The records of one packet read at `q` with `fg` in front: every

@@ -75,17 +75,9 @@ pub struct State {
     pub ended: bool,
 }
 
-/// The gate: whether holds have stopped, and whether a hold-bearing write
-/// is in progress.
-#[derive(Debug, Default)]
-struct Gate {
-    closed: bool,
-    writing: bool,
-    cause: Option<String>,
-}
-
 struct Shared {
-    gate: Mutex<Gate>,
+    /// The gate: why holds stopped, once they have.
+    gate: Mutex<Option<String>>,
     queue: Mutex<VecDeque<Item>>,
     state: Mutex<State>,
     changed: Condvar,
@@ -110,7 +102,7 @@ impl Writer {
     /// to `log` (the link's stream) and `run` (the runner's, for `stop`).
     pub fn start(conn: Connection, log: Stream, run: Stream) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Shared {
-            gate: Mutex::new(Gate::default()),
+            gate: Mutex::new(None),
             queue: Mutex::new(VecDeque::new()),
             state: Mutex::new(State {
                 token: conn.token(),
@@ -135,7 +127,7 @@ impl Writer {
     ///
     /// The queue is full, or holds have stopped and `cmd` holds input.
     pub fn enqueue(&self, cmd: Command, check: Option<i64>) -> Result<(), Refused> {
-        if cmd.holds_input() && lock(&self.shared.gate).closed {
+        if cmd.holds_input() && lock(&self.shared.gate).is_some() {
             return Err(Refused::Closed);
         }
         let mut q = lock(&self.shared.queue);
@@ -159,13 +151,17 @@ impl Writer {
 
     /// Whether holds have stopped, and why.
     pub fn stopped(&self) -> Option<String> {
-        let g = lock(&self.shared.gate);
-        g.closed.then(|| g.cause.clone().unwrap_or_default())
+        lock(&self.shared.gate).clone()
     }
 
     /// A copy of what the link thread has seen.
     pub fn state(&self) -> State {
         lock(&self.shared.state).clone()
+    }
+
+    /// `f` of what the link thread has seen, without a copy.
+    pub fn with_state<T>(&self, f: impl FnOnce(&State) -> T) -> T {
+        f(&lock(&self.shared.state))
     }
 
     /// Waits until `done` holds of the state or `wait` passes, calling
@@ -202,11 +198,10 @@ impl Writer {
 fn stop_holds(shared: &Shared, cause: &str) {
     {
         let mut g = lock(&shared.gate);
-        if g.closed {
+        if g.is_some() {
             return;
         }
-        g.closed = true;
-        g.cause = Some(cause.to_owned());
+        *g = Some(cause.to_owned());
     }
     shared
         .run
@@ -288,7 +283,7 @@ impl Thread {
         loop {
             // The fence and the one release: no hold-bearing write is in
             // progress at the loop's top, the writes being this thread's.
-            if !self.released && lock(&self.shared.gate).closed {
+            if !self.released && lock(&self.shared.gate).is_some() {
                 let dropped: Vec<Item> = {
                     let mut q = lock(&self.shared.queue);
                     let (hold, keep): (Vec<Item>, Vec<Item>) =
@@ -341,30 +336,20 @@ impl Thread {
     }
 
     /// Writes one queued command: a hold-bearing one only while the gate
-    /// is open, marked in progress under the gate's lock.
+    /// is open.
     fn write(&mut self, item: Item) -> anyhow::Result<()> {
-        let holds = item.cmd.holds_input();
-        if holds {
-            let mut g = lock(&self.shared.gate);
-            if g.closed {
-                drop(g);
-                self.record(Some(
-                    json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
-                ));
-                return Ok(());
-            }
-            g.writing = true;
+        if item.cmd.holds_input() && lock(&self.shared.gate).is_some() {
+            self.record(Some(
+                json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
+            ));
+            return Ok(());
         }
         if let Some(check) = item.check {
             self.record(Some(
                 json!({ "t": "check", "q": check, "line": item.cmd.to_string() }),
             ));
         }
-        let sent = self.send(item.cmd, item.queued);
-        if holds {
-            lock(&self.shared.gate).writing = false;
-        }
-        sent
+        self.send(item.cmd, item.queued)
     }
 
     /// What one line from the device changes.
