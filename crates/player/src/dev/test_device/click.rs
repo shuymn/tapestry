@@ -286,6 +286,11 @@ pub fn click<D: Desk>(
     if got != 1 {
         return Err(Refusal::Inserted { got, of: 1 });
     }
+    // The click's tag, noted before the final checks: nothing writes a
+    // file between them and the insertion.
+    let t = tag(prefix, *call);
+    *call = call.wrapping_add(1);
+    desk.note(t, "click");
     let scene = Scene {
         monitor_then,
         monitor_now: desk.monitor(),
@@ -301,9 +306,6 @@ pub fn click<D: Desk>(
     };
     check(&scene)?;
     // The click: the move pins the press to the checked pixel.
-    let t = tag(prefix, *call);
-    *call = call.wrapping_add(1);
-    desk.note(t, "click");
     let got = desk.send(&[to, Input::Down, Input::Up], t);
     match got {
         3 => {}
@@ -357,6 +359,8 @@ pub mod fake {
         Note(u32, String),
         Send(Vec<Input>, u32),
         Sleep(u64),
+        /// A read of the desktop's state.
+        Read(&'static str),
     }
 
     #[derive(Clone, Debug)]
@@ -419,6 +423,7 @@ pub mod fake {
 
     impl Desk for Fake {
         fn cursor(&mut self) -> Option<(i32, i32)> {
+            self.did.push(Did::Read("cursor"));
             if self.clicked {
                 self.cursor_after
             } else {
@@ -426,15 +431,19 @@ pub mod fake {
             }
         }
         fn buttons_down(&mut self) -> bool {
+            self.did.push(Did::Read("buttons"));
             self.buttons_down
         }
         fn monitor(&mut self) -> Option<[i32; 4]> {
+            self.did.push(Did::Read("monitor"));
             self.monitor
         }
         fn client(&mut self, _: Win) -> Option<[i32; 4]> {
+            self.did.push(Did::Read("client"));
             self.client
         }
         fn root_at(&mut self, _: i32, _: i32) -> Win {
+            self.did.push(Did::Read("root"));
             if self.clicked {
                 self.root_after
             } else {
@@ -442,6 +451,7 @@ pub mod fake {
             }
         }
         fn foreground(&mut self) -> Win {
+            self.did.push(Did::Read("foreground"));
             if self.clicked
                 && let Some(n) = self.front_after
             {
@@ -453,6 +463,7 @@ pub mod fake {
             self.foreground
         }
         fn gui(&mut self) -> Gui {
+            self.did.push(Did::Read("gui"));
             self.gui
         }
         fn virtual_screen(&mut self) -> [i32; 4] {
@@ -658,11 +669,40 @@ mod tests {
             match d {
                 Did::Note(t, _) => noted = Some(*t),
                 Did::Send(_, t) => assert_eq!(Some(*t), noted, "{:?}", f.did),
-                Did::Sleep(_) => {}
+                Did::Sleep(_) | Did::Read(_) => {}
             }
         }
         assert_eq!(tag(0x8000, 0xFFFF), 0x8000_FFFF);
         assert_eq!(tag(0, 1), 1);
+    }
+
+    /// Between the scene's final checks and the click's insertion only
+    /// reads of the desktop come: the click's tag is noted (a file write)
+    /// before them.
+    #[test]
+    fn nothing_is_written_between_the_final_checks_and_the_click() {
+        let mut f = Fake::new();
+        run(&mut f, false).unwrap();
+        let click = f
+            .did
+            .iter()
+            .position(|d| matches!(d, Did::Send(i, _) if i.contains(&Input::Down)))
+            .unwrap();
+        let note = f.did[..click]
+            .iter()
+            .rposition(|d| !matches!(d, Did::Read(_)))
+            .unwrap();
+        assert!(
+            matches!(&f.did[note], Did::Note(_, what) if what == "click"),
+            "{:?}",
+            f.did
+        );
+        // The checks themselves come after the note.
+        assert!(
+            f.did[note + 1..click].contains(&Did::Read("foreground")),
+            "{:?}",
+            f.did
+        );
     }
 
     /// The runner's inverse of the system's absolute mapping hits every
