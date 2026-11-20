@@ -81,6 +81,7 @@ allow = [
     "Zlib",       # foldhash, under hashbrown in the wgpu graph, and slotmap under fontdb (render)
     "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
     "NCSA",       # libfuzzer-sys (LLVM libFuzzer), fuzz/ only
+    "WTFPL",      # ffmpeg-sys-next, the media worker's FFmpeg bindings (player)
 ]
 
 [licenses.private]
