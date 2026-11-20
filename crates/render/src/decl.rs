@@ -652,11 +652,13 @@ impl LoadingPresentation {
         f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
         live: Option<skin_model::chart_image::ChartKey>,
+        movies: skin_model::movie::MovieShows,
     ) -> Result<(), BuildError> {
         let mut p = self.lock();
         // The chart table shared with other holders draws only against
         // this frame's own array, checked under the same lock.
         p.loading.set_chart_live(live);
+        p.loading.set_movies(movies);
         if p.lifetime != Some(f.lifetime) {
             if p.built {
                 return Ok(());
@@ -957,7 +959,8 @@ impl PlaySkin for DeclSkin {
         f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
     ) -> Result<(), BuildError> {
-        self.loading.build(&self.bundle, f, out, self.chart_live)
+        self.loading
+            .build(&self.bundle, f, out, self.chart_live, self.movies)
     }
 
     fn capacity(&self) -> u32 {

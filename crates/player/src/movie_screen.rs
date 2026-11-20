@@ -95,8 +95,6 @@ pub struct MovieSet {
     /// The screen's clock at its opening (µs), from which a selection
     /// frame's movie time counts.
     pub origin: i64,
-    /// When its preparation started, on the monotonic clock.
-    pub start: Instant,
     pub movies: Movies,
 }
 
@@ -162,8 +160,13 @@ impl MovieSet {
             bundle: Arc::clone(bundle),
             lifetime,
             origin,
-            start,
-            movies: Movies::new(movies, start),
+            // A play's READY opens at least the skin's loading minimum
+            // into its screen clock (design.md "Timers").
+            movies: match kind {
+                ScreenKind::Play => Movies::new(movies, start)
+                    .floored(game::loading_minimum(bundle.skin().loadend()).0),
+                _ => Movies::new(movies, start),
+            },
         })
     }
 

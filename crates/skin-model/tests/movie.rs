@@ -2,8 +2,9 @@
 //! a movie element draws what the frame's table shows for its slot (its
 //! frame, sampled from the movies' planes by its matrix and range and met
 //! by its stretch against the movie's size; nothing; or opaque black over
-//! the destination whatever its blend and colour once lost), and only the
-//! play and selection skins may draw one.
+//! the destination whatever its blend and colour once lost), in play and
+//! loading frames alike, and only the play and selection skins may draw
+//! one.
 
 mod lanes_support;
 mod play_support;
@@ -17,7 +18,7 @@ use skin_model::{
 };
 
 use lanes_support::rect;
-use play_support::{Harness, def, full, white_sheet};
+use play_support::{Harness, VIEW, def, full, readouts_for, uvs, white_sheet};
 use widget_support::chart;
 
 const DST: [i32; 4] = [100, 100, 512, 512];
@@ -192,4 +193,64 @@ fn only_play_and_selection_skins_draw_a_movie_of_a_slot_they_have() {
         matches!(none, Some(LoadError::UnknownWidget { element: 0 })),
         "{none:?}"
     );
+}
+
+/// The loading frame's quads of a play skin with `elements`, its movies
+/// showing `movies`.
+fn loading_quads(elements: Vec<ElementDef>, movies: MovieShows) -> Vec<Quad> {
+    use skin_model::{Layout, LoadState, LoadingFrame, QuadBatch};
+    let skin = Skin::new(def(Vec::new(), sheet(), elements)).unwrap();
+    let mut loading = skin.prepare_loading(skin_model::Side::Left);
+    loading.set_movies(movies);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let layout = Layout::AUTHOR;
+    let frame = LoadingFrame {
+        app: skin_model::AppReadouts::LAUNCH,
+        display_offset: bms_model::TimeUs(0),
+        fix_hispeed: 0,
+        difficulty: None,
+        bga: None,
+        length: None,
+        autoplay: false,
+        now: bms_model::TimeUs(16_000),
+        load: LoadState {
+            since: bms_model::TimeUs(0),
+            percent: 0,
+        },
+        target: [1_920, 1_080],
+        layout: &layout,
+        turntable: 0,
+        lanes: VIEW,
+        covers: readouts_for(VIEW).covers,
+        gauge: None,
+        play_level: None,
+    };
+    skin.build_loading(&mut loading, &frame, &uvs(&skin), &mut batch)
+        .unwrap();
+    batch.quads().to_vec()
+}
+
+/// A loading frame draws the movies as a play frame does: a ready
+/// movie's frame, and opaque black for a lost one; nothing for one with
+/// nothing to show.
+#[test]
+fn a_loading_frame_draws_a_ready_movie_and_a_lost_one_black() {
+    let elements = vec![
+        movie_element(0, FILL, Blend::Add),
+        movie_element(1, FILL, Blend::Add),
+    ];
+    let q = loading_quads(elements.clone(), shows(FRAME, MovieShow::Lost));
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert_eq!(
+        q[0].filter,
+        Filter::Movie {
+            bt601: false,
+            full: true
+        }
+    );
+    assert_eq!((q[0].uv, q[0].layer), ([0.0, 0.0, 0.5, 0.25], 1));
+    assert_eq!((q[1].uv, q[1].layer), (SOLID.uv, SOLID.layer));
+    assert_eq!(q[1].color, [0.0, 0.0, 0.0, 1.0]);
+    let none = loading_quads(elements, shows(MovieShow::Nothing, MovieShow::Nothing));
+    assert!(none.is_empty(), "{none:?}");
 }

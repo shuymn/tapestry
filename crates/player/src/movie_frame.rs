@@ -13,7 +13,17 @@
 //! the screen's time and, when a frame is due, takes it straight into the
 //! renderer's upload buffer ([`Planes::write`]); a fault loses it in the
 //! same frame. It shows its newest frame once one was taken on the screen,
-//! and nothing before. Anything else shows nothing.
+//! and nothing before. A first frame whose take ends past the preparation
+//! deadline loses its movie (L5): it is judged when the frame is accepted,
+//! not when the poll began. Anything else shows nothing.
+//!
+//! A play's preparation polls ([`Movies::prepare`]) select frames at the
+//! time since the movies opened, bounded by the earliest screen time READY
+//! can open at (the play skin's loading minimum, `floor`): the screen
+//! clock's origin is not known before READY (with no loading lifetime it
+//! is anchored the loading minimum before READY), so a bound below every
+//! screen time READY can start at keeps the frame held at READY from ever
+//! being ahead of the screen clock.
 //!
 //! A movie's planes are reserved at its slot's size when it is admitted,
 //! never otherwise and never another slot's: that is the movie's
@@ -233,6 +243,11 @@ pub struct Movies<S = Movie> {
     reserved: [[u32; 2]; MAX_MOVIES],
     /// The screen's preparation deadline (L5).
     deadline: Instant,
+    /// When its preparation started.
+    start: Instant,
+    /// The latest movie time a preparation poll selects at (µs): the
+    /// earliest screen time READY can open at.
+    floor: i64,
 }
 
 impl<S: Source> Movies<S> {
@@ -244,7 +259,29 @@ impl<S: Source> Movies<S> {
             slots: [Slot::new(a), Slot::new(b)],
             reserved: [[0; 2]; MAX_MOVIES],
             deadline: preparation_deadline(start),
+            start,
+            floor: i64::MAX,
         }
+    }
+
+    /// These movies with a preparation whose polls select frames at most
+    /// `floor` µs into the movie: the earliest screen time READY can open
+    /// at.
+    #[must_use]
+    pub const fn floored(mut self, floor: i64) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// A preparation poll at `now`: the frame's hook at the time since the
+    /// movies opened, bounded by the floor, then whether every movie is
+    /// settled; and what each slot's destinations show (for the loading
+    /// frames).
+    pub fn prepare(&mut self, planes: &mut dyn Planes, now: Instant) -> (bool, MovieShows) {
+        let since = i64::try_from(now.saturating_duration_since(self.start).as_micros())
+            .unwrap_or(i64::MAX);
+        let shows = self.frame(planes, since.min(self.floor), now);
+        (self.settle(now), shows)
     }
 
     /// Past the preparation deadline at `now`, every movie not settled is
@@ -339,6 +376,7 @@ impl<S: Source> Movies<S> {
             return MovieShow::Nothing;
         };
         let [width, height] = slot.size;
+        let deadline = self.deadline;
         let peeked = {
             #[cfg(feature = "dev-tools")]
             let _region = crate::alloc_count::AppRegion::enter();
@@ -375,6 +413,12 @@ impl<S: Source> Movies<S> {
                     if written {
                         slot.shown = true;
                         if !slot.staged {
+                            // Accepted past the deadline: lost, never
+                            // ready, however early the poll began.
+                            if Instant::now() >= deadline {
+                                movie.expire();
+                                return MovieShow::Lost;
+                            }
                             slot.staged = true;
                             movie.staged_first();
                         }

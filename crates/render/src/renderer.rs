@@ -1699,6 +1699,9 @@ pub struct Renderer {
     text_last: Option<(LoadingTextKey, [u32; 2], u64, u64)>,
     /// The movies' planes and upload buffers, by slot.
     video: crate::video::Video,
+    /// What the play skin's movie destinations show in loading frames
+    /// ([`set_loading_movies`](Self::set_loading_movies)).
+    loading_movies: skin_model::movie::MovieShows,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -2069,6 +2072,7 @@ impl Renderer {
             #[cfg(feature = "dev-tools")]
             text_last: None,
             video,
+            loading_movies: skin_model::movie::MovieShows::default(),
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -6489,6 +6493,14 @@ impl Renderer {
         self.skin.set_movies(movies);
     }
 
+    /// What the play skin's movie destinations show in the loading frames
+    /// that follow, whichever installation draws them (the skin in use or
+    /// the one staged): the movies' preparation sets it at each of its
+    /// polls.
+    pub fn set_loading_movies(&mut self, movies: skin_model::movie::MovieShows) {
+        self.loading_movies = movies;
+    }
+
     /// Replaces movie slot `slot`'s planes and upload buffer with ones of
     /// a movie of `width` × `height`: its admission, never a frame's
     /// upload. The other slot keeps its planes, frame and queued copy.
@@ -7438,6 +7450,7 @@ impl Renderer {
         }
         let f = LoadingFrame { target, ..*f };
         skin.set_chart_live(live);
+        skin.set_movies(self.loading_movies);
         if let Err(e) = staging.build_loading(skin, &f) {
             self.loading_refused = Some((f.lifetime, e));
             return Ok(Err(e));
@@ -7531,6 +7544,7 @@ impl Renderer {
         };
         let live = self.chart_key();
         self.skin.set_chart_live(live);
+        self.skin.set_movies(self.loading_movies);
         if let Err(e) = self.staging.build_loading(self.skin.as_mut(), &f) {
             self.loading_refused = Some((f.lifetime, e));
             return Err(e);

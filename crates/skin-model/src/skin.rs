@@ -624,6 +624,8 @@ enum Phase<'a> {
     Loading {
         gauge: Option<LoadingGauge>,
         chosen: u8,
+        /// What each skin movie's destinations show while loading.
+        movies: &'a crate::movie::MovieShows,
     },
     /// A selection frame: its rows, ratios and pointer targets, and the
     /// pointer in target pixels.
@@ -3833,6 +3835,7 @@ impl Skin {
             phase: Phase::Loading {
                 gauge: frame.gauge,
                 chosen: loading.chosen(frame),
+                movies: loading.movies(),
             },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
@@ -4848,7 +4851,7 @@ impl Skin {
             // While loading, an element reading what loading lacks draws
             // nothing: its condition is false, its value or selector
             // unread.
-            if let Phase::Loading { gauge, chosen } = scene.phase
+            if let Phase::Loading { gauge, chosen, .. } = scene.phase
                 && !e.loading.met(gauge.is_some(), chosen)
             {
                 continue;
@@ -5167,10 +5170,11 @@ impl Skin {
                     parts.draw(out, &brush, rect, trim);
                 }
                 Kind::Movie(slot, stretch) => {
-                    let shows = match (play, sel) {
-                        (Some((play, _)), _) => Some(play.movies()),
-                        (None, Some(sel)) => Some(sel.movies()),
-                        (None, None) => None,
+                    let shows = match (play, sel, scene.phase) {
+                        (Some((play, _)), _, _) => Some(play.movies()),
+                        (None, Some(sel), _) => Some(sel.movies()),
+                        (None, None, Phase::Loading { movies, .. }) => Some(movies),
+                        (None, None, _) => None,
                     };
                     match shows.and_then(|m| m.get(usize::from(slot))) {
                         Some(&crate::movie::MovieShow::Frame {

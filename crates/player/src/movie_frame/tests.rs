@@ -105,12 +105,14 @@ impl Source for Fake {
 }
 
 /// Planes that keep the luma rows each write took, by slot; a slot's
-/// reservation empties that slot's.
+/// reservation empties that slot's. With `slow`, each take sleeps that
+/// long inside the write.
 #[derive(Default)]
 struct Kept {
     reserved: Vec<[u32; 3]>,
     luma: [Vec<u8>; 2],
     refuse: bool,
+    slow: Option<Duration>,
 }
 
 impl Planes for Kept {
@@ -126,6 +128,9 @@ impl Planes for Kept {
         let pitch = [width as usize, width.div_ceil(2) as usize];
         let len = pitch[0] * height as usize + 2 * pitch[1] * height.div_ceil(2) as usize;
         let mut bytes = vec![0; len];
+        if let Some(d) = self.slow {
+            std::thread::sleep(d);
+        }
         let whole = fill(
             &mut |at, b| {
                 bytes[at..at + b.len()].copy_from_slice(b);
@@ -333,6 +338,67 @@ fn a_peer_s_admission_leaves_a_movie_s_planes_and_frame() {
         m.frame(&mut planes, 20, start)[0],
         MovieShow::Frame { .. }
     ));
+}
+
+/// L5 at the frame's acceptance: a first frame whose take begins before
+/// the preparation deadline and ends after it loses its movie, never
+/// ready; the control, the same take ending before the deadline, is
+/// ready.
+#[test]
+fn a_take_crossing_the_preparation_deadline_is_lost() {
+    for crosses in [true, false] {
+        let a = Fake::new(16, 8);
+        a.set(Status::Live);
+        a.publish(1, 0, 5);
+        let left = Duration::from_millis(200);
+        let now = Instant::now();
+        let start = now - (preparation_deadline(now) - now) + left;
+        let mut m = movies(Some(&a), None, start);
+        let mut planes = Kept {
+            slow: Some(if crosses { left * 2 } else { Duration::ZERO }),
+            ..Kept::default()
+        };
+        let (settled, shows) = m.prepare(&mut planes, now);
+        if crosses {
+            assert_eq!(shows[0], MovieShow::Lost, "crossing");
+            assert_eq!(a.loss(), Some(Loss::Preparation));
+            assert!(!a.staged.load(Ordering::SeqCst), "never ready");
+        } else {
+            assert!(matches!(shows[0], MovieShow::Frame { .. }), "control");
+            assert!(a.staged.load(Ordering::SeqCst));
+            assert_eq!(a.loss(), None);
+        }
+        assert!(settled, "{crosses}");
+    }
+}
+
+/// A play's preparation selects frames at most the floor into the movie,
+/// the earliest screen time READY opens at: a preparation polled 2.5 s
+/// after the movies opened, with a 1 s floor, takes the frame stamped 1 s,
+/// and READY at screen time 1 s shows that frame, never one ahead of it.
+#[test]
+fn a_preparation_never_holds_a_frame_ahead_of_the_screen_clock() {
+    let a = Fake::new(16, 8);
+    a.set(Status::Live);
+    for (seq, stamp, id) in [(1, 0, 1), (2, 1_000_000, 2), (3, 2_000_000, 3)] {
+        a.publish(seq, stamp, id);
+    }
+    let now = Instant::now();
+    let start = now - Duration::from_millis(2_500);
+    let mut m = movies(Some(&a), None, start).floored(1_000_000);
+    let mut planes = Kept::default();
+    let (settled, shows) = m.prepare(&mut planes, now);
+    assert!(settled);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }));
+    assert!(planes.luma[0].iter().all(|&v| v == 2), "the frame at 1 s");
+    // READY at screen time 1 s: nothing newer is due, and the frame held
+    // is the one stamped 1 s.
+    let shows = m.frame(&mut planes, 1_000_000, now);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }));
+    assert!(
+        planes.luma[0].iter().all(|&v| v == 2),
+        "still the frame at 1 s"
+    );
 }
 
 #[test]

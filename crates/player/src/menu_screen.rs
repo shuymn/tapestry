@@ -1090,10 +1090,13 @@ impl Screen for MenuScreen {
             .as_mut()
             .filter(|m| m.kind() == ScreenKind::Play)
         {
-            let now = std::time::Instant::now();
-            let due = i64::try_from(now.duration_since(m.start).as_micros()).unwrap_or(i64::MAX);
-            let _ = m.movies.frame(&mut self.renderer, due, now);
-            if !m.movies.settle(now) {
+            let (settled, shows) = m
+                .movies
+                .prepare(&mut self.renderer, std::time::Instant::now());
+            // The loading frames draw them too, whichever installation
+            // draws those.
+            self.renderer.set_loading_movies(shows);
+            if !settled {
                 return None;
             }
         }
