@@ -579,10 +579,10 @@ pub struct RecorderPad {
     pub q: i64,
     pub h: u64,
     pub ours: bool,
-    pub seq: u16,
-    /// Buttons 1-16, button n at bit n − 1.
-    pub buttons: u16,
-    pub x: u8,
+    /// The report's bytes as read, without a report id, in lowercase hex:
+    /// the bound pad's decode as `report::PadReport`; another
+    /// controller's are kept as they came.
+    pub bytes: String,
     pub fg: Foreground,
 }
 

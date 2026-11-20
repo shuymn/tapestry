@@ -216,6 +216,12 @@ impl Grant {
         self.id
     }
 
+    /// A grant for the guard's tests, which never reach a connection.
+    #[cfg(test)]
+    pub const fn test(id: LeaseId, deadline: u64) -> Self {
+        Self { id, deadline }
+    }
+
     /// The lease's deadline on the device's clock, as last answered.
     #[cfg_attr(
         not(test),
@@ -1219,6 +1225,31 @@ mod tests {
         poll_until(&mut c, |c| c.outstanding().next().is_none());
         assert!(c.bounds().is_ok());
         assert_eq!(c.unanswered_pings(), 0);
+    }
+
+    /// A new connection to the same device (a reconnect, a rediscovery)
+    /// starts with no clock samples, no token until its own `hello` and no
+    /// grant: nothing of the earlier connection carries over.
+    #[test]
+    fn a_reconnect_starts_with_no_samples_no_token_and_no_grant() {
+        let dev = Dev::new(HERE, "COM5", hello("abc", false));
+        let mut c = connected(&dev);
+        c.send(Command::Ping(0)).unwrap();
+        c.lease(250, 5_000_000).unwrap();
+        poll_until(&mut c, |c| c.outstanding().next().is_none());
+        // Positive control: the first connection has all three.
+        assert!(c.bounds().is_ok() && c.token().is_some() && c.grant().is_some());
+        let host = Host {
+            devs: vec![dev.clone()],
+            ..Host::default()
+        };
+        let mut again = Connection::bind(&host, Some(HERE)).unwrap();
+        assert!(again.pings().is_empty());
+        assert!(again.bounds().is_err());
+        assert_eq!(again.token(), None);
+        assert!(again.grant().is_none());
+        again.check_hello(Some("abc")).unwrap();
+        assert!(again.pings().is_empty() && again.grant().is_none());
     }
 
     #[test]

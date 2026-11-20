@@ -1026,6 +1026,23 @@ pub fn raw_sources() -> Vec<RawSource> {
         .collect()
 }
 
+/// The test device's interface and location of the Raw Input device whose
+/// interface path is `path`: its HID collection's function (`MI_xx`) and
+/// that function's composite parent's location. `None` when it is not an
+/// interface of a test device or the location cannot be read.
+pub fn raw_location(path: &str) -> Option<(u8, String)> {
+    let collection = locate(&instance_of_path(path))?;
+    let function = parent_of(collection)?;
+    let mi = mi_of(&device_id(function)?)?;
+    let parent = parent_of(function)?;
+    let is_device =
+        device_id(parent).is_some_and(|id| id.to_ascii_uppercase().starts_with(&parent_prefix()));
+    if !is_device {
+        return None;
+    }
+    Some((mi, port_path(parent)?))
+}
+
 /// The interface path of Raw Input device `handle`.
 pub fn device_name(handle: HANDLE) -> Option<String> {
     let mut buf = [0_u16; 512];
