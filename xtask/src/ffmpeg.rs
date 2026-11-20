@@ -1664,7 +1664,20 @@ sha256 = "z"
             "a refused claim touches nothing"
         );
         drop(first);
-        let _second = claim_build_dir(&dir).unwrap();
+        // On Unix the lock is a `flock` on the open file description, which a
+        // child forked by another test thread shares until it execs; the
+        // release can therefore land a moment after the drop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let _second = loop {
+            match claim_build_dir(&dir) {
+                Ok(claim) => break claim,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    assert!(e.to_string().contains("another build holds"), "{e}");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("the released claim was never freed: {e}"),
+            }
+        };
         let names: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
