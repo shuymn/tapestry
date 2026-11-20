@@ -48,6 +48,8 @@ mod test_common;
 #[cfg(test)]
 #[path = "../tests/decl_support/mod.rs"]
 mod test_decl;
+#[cfg(test)]
+mod upload_tests;
 
 mod atlas;
 mod bga;

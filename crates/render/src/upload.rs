@@ -59,6 +59,9 @@ pub enum UploadState {
 pub struct Uploaded {
     /// The BGA batch's: answered once it is [`BgaStep::Done`](crate::BgaStep::Done).
     pub bga: crate::BgaStep,
+    /// The staging whose last step's completion this boundary saw: it
+    /// answers ready from now on.
+    pub staged: Option<crate::PreparedToken>,
 }
 
 /// The step in flight: its completion's flag and its submission.

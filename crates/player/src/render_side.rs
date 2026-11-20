@@ -226,6 +226,7 @@ pub trait Screen: Send {
         let _ = past;
         render::Uploaded {
             bga: render::BgaStep::Idle,
+            staged: None,
         }
     }
     /// What the uploader can do now ([`render::Renderer::upload_state`]);
@@ -1934,6 +1935,16 @@ struct Shared {
     /// (tests).
     #[cfg(test)]
     waits: [AtomicU64; 4],
+    /// The pass whose boundary last saw a staging's last step complete,
+    /// and the pass that last answered an attempt, by `passes` (tests).
+    #[cfg(test)]
+    staged_pass: AtomicU64,
+    #[cfg(test)]
+    answered_pass: AtomicU64,
+    /// The loop's waits by kind when the last attempt was taken and when
+    /// it was answered (tests).
+    #[cfg(test)]
+    attempt_waits: [[AtomicU64; 4]; 2],
     /// The lifetime whose first frame was visited last, and its showing
     /// (tests).
     #[cfg(test)]
@@ -2092,6 +2103,12 @@ impl Shared {
             passes: AtomicU64::new(0),
             #[cfg(test)]
             waits: Default::default(),
+            #[cfg(test)]
+            staged_pass: AtomicU64::new(0),
+            #[cfg(test)]
+            answered_pass: AtomicU64::new(0),
+            #[cfg(test)]
+            attempt_waits: Default::default(),
             #[cfg(test)]
             first_shown: Mutex::new(None),
             #[cfg(test)]
@@ -4681,6 +4698,7 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 rf_armed: 0,
                 granted: false,
+                staged_seen: false,
                 image: Image::default(),
                 first_frame: None,
                 extent: None,
@@ -5949,6 +5967,16 @@ enum WaitKind {
     Completion = 3,
 }
 
+/// Copies the loop's waits into `attempt_waits[at]` (tests).
+#[cfg(test)]
+fn snapshot_waits(shared: &Shared, at: usize) {
+    if let Some(to) = shared.attempt_waits.get(at) {
+        for (to, from) in to.iter().zip(&shared.waits) {
+            to.store(from.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+}
+
 /// Counts a wait of `kind` as it begins (tests).
 #[cfg(test)]
 fn count_wait(shared: &Shared, kind: WaitKind) {
@@ -6070,6 +6098,9 @@ struct Run {
     /// frame of latency), so the next frame takes it instead of waiting
     /// again, which would never end; until a new screen is built.
     granted: bool,
+    /// The uploader's boundary saw a staging's last step complete: the
+    /// attempt is asked again in that pass.
+    staged_seen: bool,
     /// The image on the screen and its validity.
     image: Image,
     /// The current loading lifetime's first frame, once visited.
@@ -7046,6 +7077,11 @@ impl Run {
             if self.boundary(&mode, held, regrow) {
                 mode = Mode::Idle;
                 continue;
+            }
+            // A staging whose last step this boundary saw complete answers
+            // in this pass (design.md "Memory Budget", the uploader).
+            if std::mem::take(&mut self.staged_seen) {
+                self.poll_attempt();
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -9277,6 +9313,8 @@ impl Run {
         skin: AttemptSkin,
         reply: mpsc::SyncSender<Result<Answered, RenderError>>,
     ) {
+        #[cfg(test)]
+        snapshot_waits(&self.shared, 0);
         // An older request than one asked already changes nothing.
         if !self.newest(request) {
             let _ = reply.send(Ok(self.answered(refusal("a newer request superseded it"))));
@@ -9389,6 +9427,13 @@ impl Run {
 
     /// Sends the preparation in progress its `answer`, and ends it.
     fn answer(&mut self, answer: Result<Preparation, RenderError>) {
+        #[cfg(test)]
+        {
+            self.shared
+                .answered_pass
+                .store(self.shared.passes.load(Ordering::SeqCst), Ordering::SeqCst);
+            snapshot_waits(&self.shared, 1);
+        }
         let answer = answer.map(|preparation| self.answered(preparation));
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(answer);
@@ -9755,6 +9800,13 @@ impl Run {
                     }
                     None => s.upload_boundary(&mut || false),
                 };
+                self.staged_seen |= up.staged.is_some();
+                #[cfg(test)]
+                if up.staged.is_some() {
+                    self.shared
+                        .staged_pass
+                        .store(self.shared.passes.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
                 if current == Some(false) {
                     stale
                 } else {
@@ -17172,7 +17224,7 @@ pub(crate) mod tests {
                 b.batches.push((cells, bytes));
                 render::BgaStep::Done(Ok(()))
             })();
-            render::Uploaded { bga }
+            render::Uploaded { bga, staged: None }
         }
         fn upload_state(&self) -> render::UploadState {
             if self.shared.bga.lock().unwrap().pending.is_some() {
@@ -20812,6 +20864,15 @@ pub(crate) mod tests {
             }
             answer
         }
+        fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+            self.menu.upload_boundary(past)
+        }
+        fn upload_state(&self) -> render::UploadState {
+            self.menu.upload_state()
+        }
+        fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+            self.menu.wait_step(timeout)
+        }
         fn device(&self) -> u64 {
             self.menu.device()
         }
@@ -21207,6 +21268,15 @@ pub(crate) mod tests {
             request: u64,
         ) -> Option<Result<Preparation, RenderError>> {
             self.menu.prepare_attempt(a, skin, request)
+        }
+        fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+            self.menu.upload_boundary(past)
+        }
+        fn upload_state(&self) -> render::UploadState {
+            self.menu.upload_state()
+        }
+        fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+            self.menu.wait_step(timeout)
         }
         fn device(&self) -> u64 {
             self.menu.device()
@@ -22361,6 +22431,10 @@ pub(crate) mod tests {
     // operation held, the Idle loop's wait.
     #[cfg(feature = "dev-tools")]
     mod allowance;
+    // The uploader's steps on a real screen: a staging stepped by the
+    // passes that present nothing, with no sleep while it can act.
+    #[cfg(feature = "dev-tools")]
+    mod upload;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,

@@ -237,10 +237,23 @@ impl AtlasTexture {
     }
 
     /// The array of `pages`, of `layers` layers as [`check_pages`] gave
-    /// them, with the built-in atlas in layer 0. The uploads are queued,
-    /// not yet submitted; what the device refuses is reported to its error
+    /// them, with the built-in atlas in layer 0 and a zero texel at each
+    /// level of each kept layer; the pages themselves are not written
+    /// ([`AtlasWrites`] writes them in steps). The writes are queued, not
+    /// yet submitted; what the device refuses is reported to its error
     /// scopes ([`scoped`]).
+    pub(crate) fn create(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
+        Self::make(gpu, pages, layers, false)
+    }
+
+    /// [`create`](Self::create) with every page written too, whole, in
+    /// the same queued writes: an upload not made in steps (a renderer
+    /// built again restoring its installations inline).
     pub(crate) fn upload(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
+        Self::make(gpu, pages, layers, true)
+    }
+
+    fn make(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32, whole: bool) -> Self {
         let device = gpu.device();
         let side = pages.side;
         let levels = u32::try_from(MIP_LEVELS).unwrap_or(1);
@@ -258,17 +271,19 @@ impl AtlasTexture {
         // The built-in atlas at the top left of layer 0's level 0; the
         // shader samples nothing else of layer 0.
         write(gpu.queue(), &texture, 0, 0, ATLAS_SIZE, &build_atlas());
-        for (layer, page) in (RESERVED_LAYERS..).zip(pages.pages) {
-            for (level, bytes) in (0..).zip(page) {
-                #[cfg(feature = "dev-tools")]
-                let p_w = crate::probe::Span::start();
-                write(gpu.queue(), &texture, layer, level, side >> level, bytes);
-                #[cfg(feature = "dev-tools")]
-                {
-                    use crate::probe::{cmark, us};
-                    cmark!("wt", "bytes", i64::try_from(bytes.len()).unwrap_or(-1));
-                    cmark!("wt", "level", i64::from(level));
-                    cmark!("wt", "call_us", us(p_w.elapsed()));
+        if whole {
+            for (layer, page) in (RESERVED_LAYERS..).zip(pages.pages) {
+                for (level, bytes) in (0..).zip(page) {
+                    #[cfg(feature = "dev-tools")]
+                    let p_w = crate::probe::Span::start();
+                    write(gpu.queue(), &texture, layer, level, side >> level, bytes);
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        use crate::probe::{cmark, us};
+                        cmark!("wt", "bytes", i64::try_from(bytes.len()).unwrap_or(-1));
+                        cmark!("wt", "level", i64::from(level));
+                        cmark!("wt", "call_us", us(p_w.elapsed()));
+                    }
                 }
             }
         }
@@ -407,6 +422,98 @@ impl AtlasTexture {
             .saturating_sub(u32::from(self.text_layer.is_some()))
             .saturating_sub(u32::from(self.chart_layer.is_some()));
         padded(ATLAS_SIZE) + u64::from(pages) * skin
+    }
+}
+
+/// The pages of an atlas array still to write, a level's rows at a time
+/// (design.md "Memory Budget", the uploader): the next page, level and
+/// row. The array's layer of page `n` is `RESERVED_LAYERS + n`.
+pub(crate) struct AtlasWrites {
+    pages: std::sync::Arc<skin_model::PackedPages>,
+    page: usize,
+    level: usize,
+    row: u32,
+}
+
+impl AtlasWrites {
+    /// Every page of `pages` still to write.
+    pub(crate) const fn new(pages: std::sync::Arc<skin_model::PackedPages>) -> Self {
+        Self {
+            pages,
+            page: 0,
+            level: 0,
+            row: 0,
+        }
+    }
+
+    /// Whether every level of every page is written.
+    pub(crate) fn written(&self) -> bool {
+        self.page >= self.pages.pages().len()
+    }
+
+    /// Queues the next rows of the current level into `atlas`, at most
+    /// `budget` bytes as the queue stages them (rows padded to
+    /// `COPY_BYTES_PER_ROW_ALIGNMENT`), at least one row, and moves on;
+    /// returns the bytes staged, 0 once every page is written.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn write_one(&mut self, gpu: &Gpu, atlas: &AtlasTexture, budget: u64) -> u64 {
+        let side = self.pages.side();
+        while let Some(page) = self.pages.pages().get(self.page) {
+            let Some(bytes) = page.level(self.level).filter(|_| self.level < MIP_LEVELS) else {
+                self.page += 1;
+                self.level = 0;
+                self.row = 0;
+                continue;
+            };
+            let s = side >> self.level;
+            if self.row >= s {
+                self.level += 1;
+                self.row = 0;
+                continue;
+            }
+            let padded = crate::text_upload::padded(s).max(1);
+            let rows = u32::try_from((budget / padded).max(1))
+                .unwrap_or(u32::MAX)
+                .min(s - self.row);
+            let stride = usize::try_from(s).unwrap_or(0) * 4;
+            let from = usize::try_from(self.row).unwrap_or(0) * stride;
+            let to = from + usize::try_from(rows).unwrap_or(0) * stride;
+            let layer =
+                RESERVED_LAYERS.saturating_add(u32::try_from(self.page).unwrap_or(u32::MAX));
+            let level = u32::try_from(self.level).unwrap_or(0);
+            if let Some(texels) = bytes.get(from..to) {
+                #[cfg(feature = "dev-tools")]
+                let p_w = crate::probe::Span::start();
+                write_region(
+                    gpu.queue(),
+                    atlas.texture(),
+                    (layer, level),
+                    [0, self.row],
+                    [s, rows],
+                    texels,
+                );
+                #[cfg(feature = "dev-tools")]
+                {
+                    use crate::probe::{cmark, us};
+                    cmark!("wt", "bytes", i64::try_from(texels.len()).unwrap_or(-1));
+                    cmark!("wt", "level", i64::from(level));
+                    cmark!("wt", "call_us", us(p_w.elapsed()));
+                }
+            }
+            self.row += rows;
+            // Moved on past a level, and a page, it finished, so
+            // `written` holds once the last row is queued.
+            if self.row >= s {
+                self.row = 0;
+                self.level += 1;
+                if self.level >= MIP_LEVELS {
+                    self.level = 0;
+                    self.page += 1;
+                }
+            }
+            return padded * u64::from(rows);
+        }
+        0
     }
 }
 

@@ -850,6 +850,10 @@ struct Pending {
     /// with nothing of its own (the committed bundle, or the pages
     /// installed).
     entry: Option<usize>,
+    /// Its own array's pages still to write, or its last step's
+    /// completion not seen yet (design.md "Memory Budget", the uploader):
+    /// it answers ready, draws and commits only once this is `None`.
+    writes: Option<skin_atlas::AtlasWrites>,
 }
 
 /// The chart-image pool a selection staging installs: its grid (`None`
@@ -1360,6 +1364,9 @@ pub struct Renderer {
     /// The batch of BGA cells in hand, written at frame boundaries
     /// ([`bga_boundary`](Self::bga_boundary)).
     bga_upload: Option<crate::bga::BgaUpload>,
+    /// A staging whose step the device refused, by its request, with the
+    /// refusal: answered when that request is asked again.
+    stage_failed: Option<(u64, RenderError)>,
     /// The uploader's step in flight, until a boundary saw its completion:
     /// no step of any payload is written while it is unseen (one step's
     /// staging in flight, design.md "Memory Budget", the uploader).
@@ -1581,6 +1588,10 @@ pub struct Renderer {
     /// Unit tests: the submissions of BGA steps made at frame boundaries.
     #[cfg(test)]
     pub(crate) step_submits: std::cell::Cell<usize>,
+    /// Unit tests: the writes of the staging's atlas steps, each step's
+    /// count in order.
+    #[cfg(test)]
+    pub(crate) step_writes: std::cell::RefCell<Vec<u64>>,
     /// Unit tests: a BGA step in flight taken as complete (`Some(true)`)
     /// or not yet (`Some(false)`, its completion withheld) instead of
     /// read from its flag.
@@ -1694,6 +1705,7 @@ impl Renderer {
             bga_table: Arc::new(skin_model::bga::BgaTable::ABSENT),
             bga_upload: None,
             step: None,
+            stage_failed: None,
             #[cfg(feature = "dev-tools")]
             step_delay: None,
             instances,
@@ -1787,6 +1799,8 @@ impl Renderer {
             decision_scope_pairs: std::cell::Cell::new(0),
             #[cfg(test)]
             step_submits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            step_writes: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             step_seen: std::cell::Cell::new(None),
             #[cfg(test)]
@@ -2121,10 +2135,21 @@ impl Renderer {
         self.staging.clips()
     }
 
-    /// The installation staged and not yet committed, if any.
+    /// The installation staged and not yet committed, if any, ready or
+    /// still stepping.
     #[must_use]
     pub fn staged(&self) -> Option<PreparedToken> {
         self.pending.as_ref().map(|p| p.token)
+    }
+
+    /// The installation staged and not yet committed whose every step
+    /// completed, if any: the one its loading frames may draw.
+    #[must_use]
+    pub fn staged_ready(&self) -> Option<PreparedToken> {
+        self.pending
+            .as_ref()
+            .filter(|p| p.writes.is_none())
+            .map(|p| p.token)
     }
 
     /// Stages the installation of `bundle` with a fresh attempt `a` for
@@ -2150,7 +2175,28 @@ impl Renderer {
         a: &AttemptInput<'_>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        self.stage_with(ScreenKind::Play, bundle, Some(a), request)
+        let staged = self.stage_with(ScreenKind::Play, bundle, Some(a), request, false)?;
+        self.finish_staging(staged, request)
+    }
+
+    /// [`stage`](Self::stage) in steps (design.md "Memory Budget", the
+    /// uploader): the first call takes `request` and makes the staging,
+    /// its array created and nothing of its pages written; the uploader's
+    /// boundaries write them ([`upload_boundary`](Self::upload_boundary)).
+    /// `None` until its last step's completion is seen, and asked again
+    /// with the same request it answers that staging, taking no request:
+    /// the token once ready, the refusal of a step once refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`stage`](Self::stage).
+    pub fn stage_stepped(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        a: &AttemptInput<'_>,
+        request: u64,
+    ) -> Result<Option<PreparedToken>, RenderError> {
+        self.stage_with(ScreenKind::Play, bundle, Some(a), request, true)
     }
 
     /// Stages `bundle`'s chart-independent installation of `kind` for
@@ -2171,7 +2217,29 @@ impl Renderer {
         bundle: &Arc<SkinBundle>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        self.stage_with(kind, bundle, None, request)
+        let staged = self.stage_with(kind, bundle, None, request, false)?;
+        self.finish_staging(staged, request)
+    }
+
+    /// Writes the staging of `request` to its end, waiting for each step,
+    /// for a caller that answers at once ([`stage`](Self::stage),
+    /// [`install`](Self::install)): only the staging's steps, never
+    /// another payload's.
+    fn finish_staging(
+        &mut self,
+        mut staged: Option<PreparedToken>,
+        request: u64,
+    ) -> Result<PreparedToken, RenderError> {
+        loop {
+            if let Some(token) = staged {
+                return Ok(token);
+            }
+            self.step_staging();
+            if self.step.is_some() && !self.step_completed() {
+                wait_for_gpu(&self.gpu)?;
+            }
+            staged = self.staging_answer(request)?;
+        }
     }
 
     /// Whether `bundle` as `kind`'s installation fits the texels the
@@ -2930,9 +2998,22 @@ impl Renderer {
         bundle: &Arc<SkinBundle>,
         a: Option<&AttemptInput<'_>>,
         request: u64,
-    ) -> Result<PreparedToken, RenderError> {
+        stepped: bool,
+    ) -> Result<Option<PreparedToken>, RenderError> {
         if kind == ScreenKind::Result && self.result_disabled {
             return Err(RenderError::ResultDisabled);
+        }
+        // Asked again: the staging in progress answers, taking no request.
+        if self
+            .stage_failed
+            .as_ref()
+            .is_some_and(|(r, _)| *r == request)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.token.request == request && p.token.kind == kind)
+        {
+            return self.staging_answer(request);
         }
         // The committed bundle keeps its resources: nothing of its own,
         // and no entry.
@@ -2940,8 +3021,9 @@ impl Renderer {
             .committed_installation(kind)
             .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle));
         let entry = self.begin_staging(request, kind, own)?;
+        self.stage_failed = None;
         self.staging_entry = entry;
-        let staged = self.stage_on(kind, bundle, a, request, entry);
+        let staged = self.stage_on(kind, bundle, a, request, entry, stepped);
         self.staging_entry = None;
         // Withdrawn before it made anything: its entry frees, and one its
         // array filled stays.
@@ -2950,7 +3032,34 @@ impl Renderer {
         {
             self.retire.release(i);
         }
-        staged
+        staged?;
+        self.staging_answer(request)
+    }
+
+    /// The staging of `request` as it stands: its token once its last
+    /// step's completion was seen, `None` while it steps, or the refusal
+    /// of one of its steps, answered once.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of its step; [`RenderError::Superseded`] when it is
+    /// neither staged nor refused (discarded or replaced since).
+    fn staging_answer(&mut self, request: u64) -> Result<Option<PreparedToken>, RenderError> {
+        if self
+            .stage_failed
+            .as_ref()
+            .is_some_and(|(r, _)| *r == request)
+            && let Some((_, e)) = self.stage_failed.take()
+        {
+            return Err(e);
+        }
+        match &self.pending {
+            Some(p) if p.token.request == request => Ok(p.writes.is_none().then_some(p.token)),
+            _ => Err(RenderError::Superseded {
+                request,
+                newer: self.requested,
+            }),
+        }
     }
 
     /// [`stage_with`](Self::stage_with) once its request is taken, with
@@ -2963,6 +3072,7 @@ impl Renderer {
         a: Option<&AttemptInput<'_>>,
         request: u64,
         entry: Option<usize>,
+        stepped: bool,
     ) -> Result<PreparedToken, RenderError> {
         // An attempt's staging that fails, at any step, leaves no earlier
         // preparation's text report.
@@ -2993,9 +3103,12 @@ impl Renderer {
             }
             None => (
                 Installation::new(Arc::clone(bundle)),
-                PendingRes::Own(Box::new(self.resources_for(kind, bundle)?)),
+                PendingRes::Own(Box::new(self.resources_for(kind, bundle, stepped)?)),
             ),
         };
+        // Its own array's pages, written by the uploader's steps.
+        let writes = (stepped && matches!(res, PendingRes::Own(_)))
+            .then(|| skin_atlas::AtlasWrites::new(Arc::clone(bundle.atlas_pages())));
         let pool = (kind == ScreenKind::Selection && !matches!(res, PendingRes::Installed))
             .then(|| self.stage_pool(bundle, &mut res));
         #[cfg(feature = "dev-tools")]
@@ -3035,6 +3148,7 @@ impl Renderer {
                         chart: None,
                         pool,
                         entry,
+                        writes: None,
                     });
                     return Err(e);
                 }
@@ -3051,6 +3165,7 @@ impl Renderer {
             chart: None,
             pool,
             entry,
+            writes,
         });
         #[cfg(test)]
         self.text_hooks.steps.push(text_upload::Step::StageReturned);
@@ -3222,10 +3337,14 @@ impl Renderer {
         &mut self,
         kind: ScreenKind,
         bundle: &Arc<SkinBundle>,
+        stepped: bool,
     ) -> Result<Resources, RenderError> {
         let staging = self.staging_for(bundle)?;
-        let (atlas, atlas_bind, buffer, text_cache) =
-            self.upload_array(bundle.atlas_pages(), Some(staging.instance_capacity()))?;
+        let (atlas, atlas_bind, buffer, text_cache) = self.upload_array(
+            bundle.atlas_pages(),
+            Some(staging.instance_capacity()),
+            stepped,
+        )?;
         let (text_cache, labels) = if kind == ScreenKind::Decision {
             let region = atlas
                 .text_layer()
@@ -3260,6 +3379,7 @@ impl Renderer {
         &mut self,
         pages: &PackedPages,
         instances: Option<usize>,
+        stepped: bool,
     ) -> Result<
         (
             AtlasTexture,
@@ -3302,7 +3422,11 @@ impl Renderer {
         #[cfg(feature = "dev-tools")]
         let p_scope0 = crate::probe::Span::start();
         let ((atlas, atlas_bind, buffer), refused) = skin_atlas::scoped(device, || {
-            let atlas = AtlasTexture::upload(&self.gpu, &upload, layers);
+            let atlas = if stepped {
+                AtlasTexture::create(&self.gpu, &upload, layers)
+            } else {
+                AtlasTexture::upload(&self.gpu, &upload, layers)
+            };
             #[cfg(feature = "dev-tools")]
             let p_b = crate::probe::Span::start();
             let bind = self.bindings.bind(device, &atlas, None);
@@ -3397,7 +3521,13 @@ impl Renderer {
         }
         #[cfg(feature = "dev-tools")]
         let p_wait = crate::probe::Span::start();
-        let p_waited = wait_for_gpu(&self.gpu);
+        // In steps, its pages are written by the uploader, which never
+        // waits for the GPU; its creation's writes complete with them.
+        let p_waited = if stepped {
+            Ok(())
+        } else {
+            wait_for_gpu(&self.gpu)
+        };
         #[cfg(feature = "dev-tools")]
         {
             use crate::probe::{cmark, us};
@@ -3512,7 +3642,7 @@ impl Renderer {
     /// `pages` uploaded as an atlas array with the built-in layer and its
     /// bind group, inside error scopes, finished on the GPU.
     fn pages_for(&mut self, pages: &Arc<PackedPages>) -> Result<PagesRes, RenderError> {
-        let (atlas, atlas_bind, _, text_cache) = self.upload_array(pages, None)?;
+        let (atlas, atlas_bind, _, text_cache) = self.upload_array(pages, None, false)?;
         Ok(PagesRes {
             pages: Arc::clone(pages),
             atlas,
@@ -3623,6 +3753,7 @@ impl Renderer {
             chart: None,
             pool: None,
             entry,
+            writes: None,
         });
         Ok(token)
     }
@@ -3959,7 +4090,12 @@ impl Renderer {
                 asked: token.request,
             });
         }
-        let Some(staged) = self.pending.as_ref().map(|p| p.token) else {
+        let Some(staged) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.writes.is_none())
+            .map(|p| p.token)
+        else {
             return Err(CommitError::NothingStaged);
         };
         if staged.request != token.request {
@@ -4327,7 +4463,7 @@ impl Renderer {
             return Err(RenderError::ResultDisabled);
         }
         self.admit_bundle(kind, installation.bundle())?;
-        let mut r = self.resources_for(kind, installation.bundle())?;
+        let mut r = self.resources_for(kind, installation.bundle(), false)?;
         // The selection's pool is made again with its firm layer alone, a
         // new generation; it regrows once every kind is restored
         // ([`regrow_pool`](Self::regrow_pool)).
@@ -5088,8 +5224,28 @@ impl Renderer {
         slice: Duration,
         past: &mut dyn FnMut() -> bool,
     ) -> crate::Uploaded {
+        self.upload_steps(slice, past, false)
+    }
+
+    /// The staging's steps alone, within [`UPLOAD_TIME_SLICE`]
+    /// (crate::UPLOAD_TIME_SLICE): a caller that answers at once drives
+    /// them, leaving every other payload to the boundaries.
+    fn step_staging(&mut self) {
+        let _ = self.upload_steps(crate::UPLOAD_TIME_SLICE, &mut || false, true);
+    }
+
+    /// The uploader's steps of one boundary (see
+    /// [`upload_boundary_within`](Self::upload_boundary_within)); with
+    /// `staging_only`, the staging's payload alone.
+    fn upload_steps(
+        &mut self,
+        slice: Duration,
+        past: &mut dyn FnMut() -> bool,
+        staging_only: bool,
+    ) -> crate::Uploaded {
         let mut out = crate::Uploaded {
             bga: crate::BgaStep::Idle,
+            staged: None,
         };
         let started = Instant::now();
         let mut steps = 0_u32;
@@ -5100,7 +5256,7 @@ impl Renderer {
                 self.bga_upload = None;
                 out.bga = crate::BgaStep::Done(Err(crate::BgaFault::Stale));
             }
-            if !self.uploading() {
+            if !self.uploading() || (staging_only && !self.staging_steps()) {
                 break;
             }
             if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
@@ -5116,6 +5272,32 @@ impl Renderer {
                 break;
             }
             self.step = None;
+            // The staging's last step completed: it answers ready.
+            if let Some(p) = self.pending.as_mut()
+                && p.writes
+                    .as_ref()
+                    .is_some_and(skin_atlas::AtlasWrites::written)
+            {
+                p.writes = None;
+                out.staged = Some(p.token);
+                continue;
+            }
+            if self.staging_steps() {
+                if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                    break;
+                }
+                if past() {
+                    break;
+                }
+                if self.write_staging_step(started, steps, slice, past) {
+                    steps += 1;
+                    continue;
+                }
+                break;
+            }
+            if staging_only {
+                break;
+            }
             if self
                 .bga_upload
                 .as_ref()
@@ -5174,9 +5356,98 @@ impl Renderer {
         out
     }
 
-    /// Whether a payload is in hand.
+    /// Whether a payload is in hand: the staging's pages, or a BGA batch.
     fn uploading(&self) -> bool {
-        self.bga_upload.is_some()
+        self.staging_steps() || self.bga_upload.is_some()
+    }
+
+    /// Whether the staging has pages to write or its last step's
+    /// completion to see.
+    fn staging_steps(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.writes.is_some())
+    }
+
+    /// One step of the staging's pages (design.md "Memory Budget", the
+    /// uploader): up to [`UPLOAD_STEP`](crate::UPLOAD_STEP) /
+    /// [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) writes under one submission,
+    /// inside one pair of error scopes, a write after the step's first
+    /// only while the boundary's slice has time left and `past` answers
+    /// that the hold's bound has not passed; then a flag-only completion
+    /// registered for its submission. Whether a step was written. A
+    /// refusal retires the staging, its array filling the entry it
+    /// reserved, and is answered when its request is asked again.
+    fn write_staging_step(
+        &mut self,
+        started: Instant,
+        steps: u32,
+        slice: Duration,
+        past: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        const WRITES: u64 = crate::UPLOAD_STEP / crate::UPLOAD_WRITE;
+        #[cfg(not(test))]
+        let _ = steps;
+        #[cfg(test)]
+        let cost = self.step_cost.get();
+        #[cfg(test)]
+        let (write_fault, submit_fault, submits, counts) = (
+            self.step_write_fault,
+            self.step_submit_fault,
+            &self.step_submits,
+            &self.step_writes,
+        );
+        let gpu = &self.gpu;
+        let Some(p) = self.pending.as_mut() else {
+            return false;
+        };
+        let request = p.token.request;
+        let (PendingRes::Own(r), Some(writes)) = (&p.res, p.writes.as_mut()) else {
+            return false;
+        };
+        if writes.written() {
+            return false;
+        }
+        let atlas = &r.atlas;
+        let elapsed = || {
+            #[cfg(test)]
+            if let Some(each) = cost {
+                return each.saturating_mul(steps);
+            }
+            started.elapsed()
+        };
+        let ((number, index), refused) = skin_atlas::scoped(gpu.device(), || {
+            #[cfg(test)]
+            if let Some(f) = write_fault {
+                f(gpu);
+            }
+            let mut n = 0_u64;
+            loop {
+                writes.write_one(gpu, atlas, crate::UPLOAD_WRITE);
+                n += 1;
+                if n >= WRITES || writes.written() || elapsed() >= slice || past() {
+                    break;
+                }
+            }
+            // The step's submission, in the same scopes as its writes.
+            #[cfg(test)]
+            {
+                counts.borrow_mut().push(n);
+                if let Some(f) = submit_fault {
+                    f(gpu);
+                }
+                submits.set(submits.get() + 1);
+            }
+            gpu.submit([])
+        });
+        // Its last use, for its retirement.
+        atlas.mark(number);
+        self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
+        if let Some(e) = refused {
+            if let Some(p) = self.pending.take() {
+                self.retire_candidate(p);
+            }
+            self.stage_failed = Some((request, RenderError::Atlas(UploadError::Device(e))));
+        }
+        true
     }
 
     /// What the uploader can do now (design.md "Memory Budget", the

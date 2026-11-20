@@ -152,6 +152,9 @@ pub(super) struct Faults {
     pub(super) cancel_install: AtomicBool,
     /// The next result chart write fails as a lost device.
     pub(super) lose_chart: AtomicBool,
+    /// Each uploader step's completion is held unseen this long after its
+    /// submission, µs; 0 as the device answers.
+    pub(crate) step_delay_us: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for Recorded {
@@ -229,6 +232,10 @@ impl Screen for Recorded {
         // A specialization stages on the menu screen; an attempt with the
         // skin in use loads through this screen's faults, as before.
         if skin.is_some() {
+            let delay = self.faults.step_delay_us.load(Ordering::Acquire);
+            self.menu
+                .renderer_mut()
+                .delay_steps((delay > 0).then(|| Duration::from_micros(delay)));
             return self.menu.prepare_attempt(a, skin, request);
         }
         Some(match self.load(a.chart, a.section()) {
@@ -236,6 +243,15 @@ impl Screen for Recorded {
             Err(render::RenderError::Skin(e)) => Ok(super::super::refusal(e.reason)),
             Err(e) => Err(e),
         })
+    }
+    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        self.menu.upload_boundary(past)
+    }
+    fn upload_state(&self) -> render::UploadState {
+        self.menu.upload_state()
+    }
+    fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+        self.menu.wait_step(timeout)
     }
     fn write_result_chart(
         &mut self,

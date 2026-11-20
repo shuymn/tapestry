@@ -885,8 +885,10 @@ impl Screen for MenuScreen {
         self.renderer.load(chart, section)
     }
 
-    /// Stages `skin` with the attempt's fresh state, or readies the skin
-    /// in use in place, answering at once; a refusal on a healthy device
+    /// Stages `skin` with the attempt's fresh state in the uploader's steps
+    /// (`None` until its last step completed, asked again with the same
+    /// request), or readies the skin in use in place, answering at once;
+    /// a refusal on a healthy device
     /// ([`RenderError::is_refusal`]) refuses the attempt and keeps the
     /// installation in use.
     fn prepare_attempt(
@@ -900,7 +902,11 @@ impl Screen for MenuScreen {
         #[cfg(feature = "dev-tools")]
         let p_t = render::probe::Span::start();
         let done = match skin {
-            Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
+            Some(bundle) => match self.renderer.stage_stepped(bundle, a, request) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => return None,
+                Err(e) => Err(e),
+            },
             None => self.renderer.prepare_attempt(a),
         };
         #[cfg(feature = "dev-tools")]
@@ -1474,7 +1480,7 @@ impl Screen for MenuScreen {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn staged_token(&self) -> Option<PreparedToken> {
-        self.renderer.staged()
+        self.renderer.staged_ready()
     }
 
     fn discard_token(&mut self, token: PreparedToken) {
