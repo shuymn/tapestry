@@ -1,6 +1,6 @@
 use super::*;
 
-const START: &str = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"sink","role":"run","build":"0123456789ab","process":{"pid":7,"created":11},"cut":1073741831,"args":["--build","0123456789ab"],"set":null}"#;
+const START: &str = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"sink","role":"run","build":"0123456789ab","process":{"pid":7,"created":11},"commit":"fedcba987654","tag":7,"cut":1073741831,"args":["--build","0123456789ab"],"set":null}"#;
 const SEAL: &str = r#"{"t":"seal","run":"0123456789abcdef0123456789abcdef","role":"run","path":"link.jsonl","sha256":"00"}"#;
 const END: &str = r#"{"t":"end","exit":0,"errors":[]}"#;
 
@@ -257,7 +257,7 @@ fn the_runner_s_children_read() {
 /// Every stream's first record names its run and its writer.
 #[test]
 fn a_stream_s_first_record_names_its_run_and_writer() {
-    let ready = r#"{"t":"ready","q":1,"run":"0123456789abcdef0123456789abcdef","process":{"pid":8,"created":12}}"#;
+    let ready = r#"{"t":"ready","q":1,"run":"0123456789abcdef0123456789abcdef","process":{"pid":8,"created":12},"window":5,"location":"L","keyboard":null,"pad":null}"#;
     let end = r#"{"t":"end","q":2}"#;
     assert!(read::<Recorder>(&file(&[ready, end])).is_ok());
     let anonymous = ready.replace(r#""run":"0123456789abcdef0123456789abcdef","#, "");

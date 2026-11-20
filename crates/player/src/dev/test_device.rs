@@ -7,9 +7,20 @@
 //! files.
 
 mod check;
+mod click;
+mod desktop;
 mod devices;
+mod end;
 mod flash;
+mod guard;
+mod job;
+mod judge;
 mod link;
+mod listen;
+mod owner;
+mod release;
+mod run;
+mod sink;
 mod trace;
 mod win;
 
@@ -19,10 +30,16 @@ use lexopt::Arg;
 
 use crate::args::{Command, UsageError};
 
+/// The commit this build of the runner was made from (the crate's `build.rs`).
+pub const COMMIT: &str = env!("TAPESTRY_COMMIT");
+
 const USAGE: &str = "usage: tapestry test-device devices [--out <json>] \
 | flash <uf2> --build <id> --port <location> \
 | bootsel --port <location> \
-| trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe] | check <row> <dir>";
+| trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe] \
+| listen --out <jsonl> --port <location> [--run <id>] [--for <ms>] \
+| run <row> (--out <dir> | --set <dir> --role <role>) --build <id> --port <location> --monitor <name> \
+| judge <row> <dir> | check <row> <dir>";
 
 /// A `test-device` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +57,13 @@ pub enum TestDevice {
         port: String,
     },
     Trace(trace::Args),
+    Listen(listen::Args),
+    Run(run::Args),
+    /// The repository's verdicts for the run in `dir`.
+    Judge {
+        row: String,
+        dir: PathBuf,
+    },
     /// The contract for the run, set or outer run in `dir`.
     Check {
         row: String,
@@ -72,12 +96,32 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     let mut ping_ms = 100;
     let mut trace_on = true;
     let mut framing_probe = false;
+    let mut for_ms = None;
+    let mut run_id = None;
+    let mut set = None;
+    let mut role = None;
+    let mut monitor = None;
     while let Some(arg) = p.next()? {
         match (cmd.as_str(), arg) {
-            ("flash" | "check", Arg::Value(v)) => values.push(PathBuf::from(v)),
-            ("devices" | "trace", Arg::Long("out")) => out = Some(PathBuf::from(p.value()?)),
-            ("flash" | "trace", Arg::Long("build")) => build = Some(text(p)?),
-            ("flash" | "bootsel" | "trace", Arg::Long("port")) => port = Some(text(p)?),
+            ("flash" | "check" | "judge" | "run", Arg::Value(v)) => values.push(PathBuf::from(v)),
+            ("run", Arg::Long("set")) => set = Some(PathBuf::from(p.value()?)),
+            ("run", Arg::Long("role")) => role = Some(text(p)?),
+            ("run", Arg::Long("monitor")) => monitor = Some(text(p)?),
+            ("devices" | "trace" | "listen" | "run", Arg::Long("out")) => {
+                out = Some(PathBuf::from(p.value()?));
+            }
+            ("flash" | "trace" | "run", Arg::Long("build")) => build = Some(text(p)?),
+            ("flash" | "bootsel" | "trace" | "listen" | "run", Arg::Long("port")) => {
+                port = Some(text(p)?);
+            }
+            ("listen", Arg::Long("run")) => run_id = Some(text(p)?),
+            ("listen", Arg::Long("for")) => {
+                for_ms = Some(
+                    text(p)?
+                        .parse()
+                        .map_err(|_| UsageError::Usage("--for takes milliseconds".to_owned()))?,
+                );
+            }
             ("trace", Arg::Long("ping-ms")) => {
                 ping_ms = text(p)?
                     .parse()
@@ -99,6 +143,14 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
         "bootsel" => TestDevice::Bootsel {
             port: port.ok_or_else(usage)?,
         },
+        "judge" => TestDevice::Judge {
+            row: values
+                .next()
+                .ok_or_else(usage)?
+                .to_string_lossy()
+                .into_owned(),
+            dir: values.next().ok_or_else(usage)?,
+        },
         "check" => TestDevice::Check {
             row: values
                 .next()
@@ -114,6 +166,25 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
             ping_ms,
             trace: trace_on,
             framing_probe,
+        }),
+        "run" => TestDevice::Run(run::Args {
+            row: values
+                .next()
+                .ok_or_else(usage)?
+                .to_string_lossy()
+                .into_owned(),
+            out,
+            set,
+            role,
+            build: build.ok_or_else(usage)?,
+            port: port.ok_or_else(usage)?,
+            monitor: monitor.ok_or_else(usage)?,
+        }),
+        "listen" => TestDevice::Listen(listen::Args {
+            out: out.ok_or_else(usage)?,
+            port: port.ok_or_else(usage)?,
+            run: run_id,
+            for_ms,
         }),
         _ => return Err(usage()),
     };
@@ -134,6 +205,14 @@ pub fn run(t: TestDevice) -> anyhow::Result<()> {
         TestDevice::Flash { uf2, build, port } => flash::flash(&uf2, &build, &port),
         TestDevice::Bootsel { port } => flash::bootsel(&port),
         TestDevice::Trace(a) => trace::trace(&a),
+        TestDevice::Listen(a) => listen::listen(&a),
+        TestDevice::Run(a) => match run::run(&a)? {
+            0 => Ok(()),
+            code => {
+                anyhow::bail!("the run failed (exit {code}); its errors are in its `end` record")
+            }
+        },
+        TestDevice::Judge { row, dir } => judge::judge(&row, &dir),
         TestDevice::Check { row, dir } => check::check(&row, &dir),
     }
 }
@@ -195,6 +274,23 @@ mod tests {
                 trace: false,
                 framing_probe: true,
             })
+        );
+        assert_eq!(
+            parsed(&[
+                "listen", "--out", "l.jsonl", "--port", "L", "--run", "r", "--for", "500"
+            ])
+            .unwrap(),
+            TestDevice::Listen(listen::Args {
+                out: PathBuf::from("l.jsonl"),
+                port: "L".to_owned(),
+                run: Some("r".to_owned()),
+                for_ms: Some(500),
+            })
+        );
+        // The recorder binds by a location: it needs one.
+        assert_eq!(
+            parsed(&["listen", "--out", "l.jsonl"]).unwrap_err(),
+            usage()
         );
         // The trace needs its build; an option of another command, a
         // value it does not take, an unknown command.
