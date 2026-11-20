@@ -276,22 +276,34 @@ fn a_movie_past_the_total_is_refused_and_draws_nothing() {
 }
 
 #[test]
-fn a_ring_fault_loses_the_movie_in_that_frame() {
+fn a_ring_fault_loses_the_movie_in_that_frame_and_it_stays_black() {
     let start = Instant::now();
-    let a = Fake::new(16, 8);
+    let (a, b) = (Fake::new(16, 8), Fake::new(16, 8));
     a.set(Status::Live);
+    b.set(Status::Live);
     a.publish(1, 0, 1);
-    let mut m = movies(Some(&a), None, start);
+    b.publish(1, 0, 1);
+    let mut m = movies(Some(&a), Some(&b), start);
     let mut planes = Kept::default();
     assert!(matches!(
-        m.frame(&mut planes, 0, start)[0],
-        MovieShow::Frame { .. }
+        m.frame(&mut planes, 0, start),
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
     ));
     // Slot 1's state word set to one the protocol has not.
     let state = a.geometry.frame_start(1) - SLOT_HEADER_WORDS;
     a.words[state].store(99, Ordering::SeqCst);
-    assert_eq!(m.frame(&mut planes, 10, start)[0], MovieShow::Lost);
+    // The fault frame and the next 120 are black; the peer keeps
+    // taking its frames.
+    for k in 1..=121_u8 {
+        let due = i64::from(k) * 1_000;
+        b.publish(u64::from(k) + 1, due, k);
+        let shows = m.frame(&mut planes, due, start);
+        assert_eq!(shows[0], MovieShow::Lost, "frame {k} after the fault");
+        assert!(matches!(shows[1], MovieShow::Frame { .. }));
+        assert!(planes.luma[1].iter().all(|&v| v == k), "peer frame {k}");
+    }
     assert_eq!(a.loss(), Some(Loss::Fault));
+    assert_eq!(b.loss(), None);
 }
 
 #[test]
