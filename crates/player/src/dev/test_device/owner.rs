@@ -275,6 +275,7 @@ mod tests {
     fn ready(pid: u32, window: u64) -> RecorderReady {
         RecorderReady {
             q: 1,
+            run: "r".into(),
             process: Process {
                 pid,
                 created: u64::from(pid) * 10,
@@ -324,7 +325,7 @@ mod tests {
         let start = json!({
             "t": "start", "run": "a".repeat(32), "row": "sink-kill", "role": "run",
             "build": "0123456789ab", "process": {"pid": 1, "created": 2},
-            "commit": "0123456789ab", "tag": 7, "args": [], "set": null, "inner": inner,
+            "commit": "0123456789ab", "tag": 7, "cut": 1_073_741_825, "args": [], "set": null, "inner": inner,
         });
         std::fs::write(dir.join("run.jsonl"), format!("{start}\n")).unwrap();
     }

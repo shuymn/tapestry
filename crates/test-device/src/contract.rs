@@ -13,11 +13,18 @@
 //!
 //! Evidence counts only through one gate, [`Usable`]: a stream other than a
 //! role's `run.jsonl` is read once, and its records count (for a record
-//! rule, an event a check reads, a check's input) only when the digest of
+//! rule, an event a check reads, a check's input) only when its first
+//! record names the role's run and the stream's writer, and the digest of
 //! the bytes that were parsed equals a seal bound to the role's run (its
-//! own runner's, or a survivor's after it observed the writer end). A
-//! `run.jsonl` holds the seals, so its digest is that of the bytes it was
-//! parsed from, and its `start` binds it to the reservation.
+//! own runner's, or, for a writer cut short, the runner's that cut it,
+//! after it observed the end). A `run.jsonl` holds the seals, so its digest
+//! is that of the bytes it was parsed from, and its `start` binds it to the
+//! reservation.
+//!
+//! What ended a process is read from its exit code: a runner terminates
+//! with its own cut code, so an exit that reads its observer's cut code,
+//! after that observer's kill, is a cut, and any other is the process
+//! ending by itself ([`ending`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -81,23 +88,33 @@ pub struct Role {
 
 /// A process's exit: the role whose runner observes it, its name
 /// ([`RUNNER`] for the role's runner, else the name the observer's `exit`
-/// record gives), the process it must be, and how it ends.
+/// record gives), the child it must be, and how it ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExitRule {
     pub role: &'static str,
     pub process: &'static str,
-    /// The stream whose writer the process is: its first record names it
-    /// (a recorder's `ready`, a runner's `start`). Required for every
-    /// process but a role's runner, which is its own `run.jsonl`'s writer.
-    pub writes: Option<File>,
+    /// The child the process is, by the `spawn` record that started it.
+    /// Required for every process but a role's runner, whose process its
+    /// own `start` names.
+    pub spawn: Option<Spawned>,
     pub exit: Exit,
+}
+
+/// A child by its `spawn` record: the role whose runner started it and the
+/// name that record gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spawned {
+    pub role: &'static str,
+    pub name: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// It ends by itself with this code (a runner: its `end` record's).
     Code(i32),
-    /// It is killed, which the process that killed it observed.
+    /// The observing role's runner ends it: the exit it observed carries
+    /// that runner's cut code, after its `kill` of the process or of the
+    /// child whose job holds it. For a role's runner: another runner's.
     Killed,
 }
 
@@ -178,7 +195,7 @@ impl Expectation {
             out.push(format!("a single run's roles are `{SINGLE}` and `{INNER}`"));
         }
         let mut named: Vec<&str> = self.exits.iter().map(|e| e.role).collect();
-        named.extend(self.exits.iter().filter_map(|e| e.writes.map(|f| f.role)));
+        named.extend(self.exits.iter().filter_map(|e| e.spawn.map(|s| s.role)));
         named.extend(self.records.iter().map(|r| r.role));
         for c in &self.checks {
             named.extend(c.inputs.iter().map(|f| f.role));
@@ -201,9 +218,9 @@ impl Expectation {
             }
         }
         for e in &self.exits {
-            if (e.process == RUNNER) == e.writes.is_some() {
+            if (e.process == RUNNER) == e.spawn.is_some() {
                 out.push(format!(
-                    "role `{}`'s `{}` must name the stream it writes, and only a process other than the role's runner does",
+                    "role `{}`'s `{}` must name the `spawn` that started it, and only a process other than the role's runner does",
                     e.role, e.process
                 ));
             }
@@ -282,8 +299,9 @@ struct Bound {
 /// [`Usable::Sealed`].
 #[derive(Debug)]
 enum Usable<R> {
-    /// Read once, and the digest of the parsed bytes equals the seal bound
-    /// to the role's run.
+    /// Read once, its first record names the role's run and the stream's
+    /// writer, and the digest of the parsed bytes equals the seal bound to
+    /// the role's run.
     Sealed(Stream<R>),
     /// Not there.
     Missing,
@@ -324,30 +342,79 @@ struct Seen {
     run_sha: String,
     link: Option<Raw<evidence::Link>>,
     recorder: Option<Raw<evidence::Recorder>>,
-    /// The seals bound to this run, by path: its runner's own, and a
-    /// survivor's (see [`seals`]).
+    /// The seals bound to this run, by path (see [`seals`]).
     seals: BTreeMap<String, String>,
 }
 
 impl Seen {
-    /// The process that wrote `path`: a recorder's `ready` names it; the
-    /// role's runner writes everything else.
-    fn writer(&self, path: &str) -> Option<Process> {
-        if path == RECORDER {
-            let rec = self.recorder.as_ref()?.parsed.as_ref().ok()?;
-            match rec.records.first()? {
-                evidence::Recorder::Ready(r) => Some(r.process),
-                _ => None,
-            }
-        } else {
-            Some(self.start.process)
+    /// The process the run's one `spawn` record named `name` started.
+    fn spawned(&self, name: &str) -> Result<Process, String> {
+        let mut of = self.run.records.iter().filter_map(|r| match r {
+            Run::Spawn(c) if c.name == name => Some(c.process),
+            _ => None,
+        });
+        match (of.next(), of.next()) {
+            (Some(p), None) => Ok(p),
+            (None, _) => Err(format!("records no `spawn` of `{name}`")),
+            (Some(_), Some(_)) => Err(format!("records `{name}` spawned twice")),
         }
     }
 
-    /// The host counter of the last record of the stream at `path`.
+    /// The process that writes `path`: the recorder the runner spawned
+    /// writes the recorder's stream, the runner everything else.
+    fn writer(&self, path: &str) -> Result<Process, String> {
+        if path == RECORDER {
+            self.spawned("recorder")
+        } else {
+            Ok(self.start.process)
+        }
+    }
+
+    /// Why the stream at `path` is not this run's: its first record must
+    /// name the run and the stream's writer, as the runner set them.
+    fn foreign(&self, path: &str) -> Option<String> {
+        let (run, process) = match path {
+            LINK => match self.link.as_ref()?.parsed.as_ref().ok()?.records.first()? {
+                evidence::Link::Open(o) => (o.run.clone(), o.process),
+                _ => return None,
+            },
+            RECORDER => match self
+                .recorder
+                .as_ref()?
+                .parsed
+                .as_ref()
+                .ok()?
+                .records
+                .first()?
+            {
+                evidence::Recorder::Ready(r) => (r.run.clone(), r.process),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if run != self.start.run {
+            return Some(format!(
+                "its first record names run `{run}`, not `{}`",
+                self.start.run
+            ));
+        }
+        match self.writer(path) {
+            Ok(w) if w == process => None,
+            Ok(w) => Some(format!(
+                "its first record names process {process:?}, not its writer {w:?}"
+            )),
+            Err(why) => Some(format!("its writer is not known: the run {why}")),
+        }
+    }
+
+    /// The host counter of the last record of the stream at `path`, when
+    /// it is read and this run's.
     fn last_q(&self, path: &str) -> Option<i64> {
         fn last<R: Kinds>(s: &Stream<R>) -> Option<i64> {
-            s.records.iter().rev().find_map(Kinds::q)
+            s.records.iter().filter_map(Kinds::q).max()
+        }
+        if self.foreign(path).is_some() {
+            return None;
         }
         match path {
             RUN => last(&self.run),
@@ -358,11 +425,11 @@ impl Seen {
     }
 }
 
-/// An `exit` record: the role whose runner observed it, that runner, the
-/// record's place in that runner's stream, and the exit.
+/// An `exit` record: the role whose runner observed it, that runner's cut
+/// code, the record's place in that runner's stream, and the exit.
 struct Observed<'a> {
     role: &'a str,
-    by: Process,
+    cut: i32,
     at: usize,
     exit: &'a evidence::Exit,
 }
@@ -378,7 +445,7 @@ fn observed<'a>(seen: &'a BTreeMap<&str, Seen>) -> Vec<Observed<'a>> {
                 .filter_map(move |(at, r)| match r {
                     Run::Exit(exit) => Some(Observed {
                         role,
-                        by: s.start.process,
+                        cut: s.start.cut,
                         at,
                         exit,
                     }),
@@ -388,59 +455,142 @@ fn observed<'a>(seen: &'a BTreeMap<&str, Seen>) -> Vec<Observed<'a>> {
         .collect()
 }
 
-/// How a writer's stream may end, from the exits observed.
+/// Whether process `w` was in the job of `child`, a process a runner
+/// started: it is `child`, or a process the run whose runner is `child`
+/// started (and so on down).
+fn holds(seen: &BTreeMap<&str, Seen>, child: Process, w: Process) -> bool {
+    let mut open = vec![child];
+    let mut done: Vec<Process> = Vec::new();
+    while let Some(p) = open.pop() {
+        if p == w {
+            return true;
+        }
+        if done.contains(&p) {
+            continue;
+        }
+        done.push(p);
+        for s in seen.values().filter(|s| s.start.process == p) {
+            for r in &s.run.records {
+                if let Run::Spawn(c) = r {
+                    open.push(c.process);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// How a writer ended, from the exits observed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Ending {
-    /// Nothing excuses a stream cut short.
+    /// Nothing cut it short: its stream must be whole.
     Whole,
-    /// It was cut short: killed by another process, or ended with its
-    /// role's killed runner and observed by that runner's killer.
-    Cut,
-    /// The records name the writer's end in ways that disagree, or an exit
-    /// that precedes the writer's last record: why.
+    /// Role `by`'s runner cut it short: its `exit` record at `at` in that
+    /// runner's stream observed it end with the runner's cut code.
+    Cut { by: String, at: usize },
+    /// The records of its end disagree, or contradict its own records:
+    /// why.
     Ambiguous(String),
 }
 
-/// Whether process `w`, the writer of a stream of the role whose runner is
-/// `runner`, ended so that its stream may stop short. An exit counts only
-/// for the process its record names by id and creation time, and only when
-/// it is not before the writer's last record (`last_q`).
-fn ending(exits: &[Observed], w: Process, runner: Process, last_q: Option<i64>) -> Ending {
+/// How process `w`, whose last record is at `last`, ended. Every exit
+/// observed of it must read the same code. An exit carrying its observing
+/// runner's cut code is that runner's cut, and counts only after that
+/// runner's `kill` of `w` or of the child whose job held it, at a counter
+/// not before that kill nor before `w`'s last record (the end is observed
+/// once `w` has ended, so after everything it wrote); otherwise the end is
+/// ambiguous. Any other exit is `w` ending by itself, and an exit an
+/// observer saw only once it had already happened is one.
+fn ending(
+    seen: &BTreeMap<&str, Seen>,
+    exits: &[Observed],
+    w: Process,
+    last: Option<i64>,
+) -> Ending {
     let of: Vec<&Observed> = exits.iter().filter(|o| o.exit.process == w).collect();
     if let Some(first) = of.first()
-        && of
-            .iter()
-            .any(|o| (o.exit.code, o.exit.killed) != (first.exit.code, first.exit.killed))
+        && of.iter().any(|o| o.exit.code != first.exit.code)
     {
-        return Ending::Ambiguous(format!("the exits recorded for process {} disagree", w.pid));
+        return Ending::Ambiguous(format!(
+            "the exit codes recorded for process {} disagree",
+            w.pid
+        ));
     }
-    if let Some(last) = last_q
+    if let Some(last) = last
         && let Some(o) = of.iter().find(|o| o.exit.q < last)
     {
         return Ending::Ambiguous(format!(
-            "process {}'s exit is recorded at {}, before its stream's last record at {last}",
+            "process {}'s end is observed at {}, before its last record at {last}",
             w.pid, o.exit.q
         ));
     }
-    if of.iter().any(|o| o.exit.killed && o.by != w) {
-        return Ending::Cut;
-    }
-    if w == runner {
+    let Some(o) = of.iter().find(|o| o.exit.code == o.cut) else {
         return Ending::Whole;
-    }
-    // Its role's runner saw it end by itself: nothing cut it.
-    if of.iter().any(|o| o.by == runner) {
+    };
+    let Some(s) = seen.get(o.role) else {
         return Ending::Whole;
-    }
-    // Ended with its runner's tree: observed, after the kill, by the
-    // process that killed the runner.
-    let tree = exits.iter().any(|kill| {
-        kill.exit.process == runner
-            && kill.exit.killed
-            && kill.by != runner
-            && of.iter().any(|o| o.by == kill.by && o.at > kill.at)
+    };
+    let kill = s.run.records[..o.at].iter().find_map(|r| match r {
+        Run::Kill(k) if holds(seen, k.process, w) => Some(k),
+        _ => None,
     });
-    if tree { Ending::Cut } else { Ending::Whole }
+    let Some(kill) = kill else {
+        return Ending::Ambiguous(format!(
+            "role `{}` observed process {} end with its cut code, without its kill before",
+            o.role, w.pid
+        ));
+    };
+    if o.exit.q < kill.q {
+        return Ending::Ambiguous(format!(
+            "role `{}` observed process {} end at {}, before its kill at {}",
+            o.role, w.pid, o.exit.q, kill.q
+        ));
+    }
+    Ending::Cut {
+        by: o.role.to_owned(),
+        at: o.at,
+    }
+}
+
+/// Every writer's ending, by process.
+type Endings = Vec<(Process, Ending)>;
+
+fn ending_of(endings: &Endings, w: Process) -> Ending {
+    endings
+        .iter()
+        .find(|(p, _)| *p == w)
+        .map_or(Ending::Whole, |(_, e)| e.clone())
+}
+
+/// The ending of every process a run names: each role's runner and every
+/// child it spawned, against the last record of every stream it wrote.
+fn endings(seen: &BTreeMap<&str, Seen>, exits: &[Observed]) -> Endings {
+    let mut processes: Vec<Process> = Vec::new();
+    for s in seen.values() {
+        processes.push(s.start.process);
+        for r in &s.run.records {
+            if let Run::Spawn(c) = r {
+                processes.push(c.process);
+            }
+        }
+    }
+    let mut out = Endings::new();
+    for w in processes {
+        if out.iter().any(|(p, _)| *p == w) {
+            continue;
+        }
+        let last = seen
+            .values()
+            .flat_map(|s| {
+                [RUN, LINK, RECORDER]
+                    .into_iter()
+                    .filter(move |path| s.writer(path) == Ok(w))
+                    .filter_map(move |path| s.last_q(path))
+            })
+            .max();
+        out.push((w, ending(seen, exits, w, last)));
+    }
+    out
 }
 
 /// Compares the run, set or outer run in `dir` with `e`, the expectation
@@ -455,28 +605,27 @@ pub fn check(e: &Expectation, dir: &Path, runner: &str) -> Report {
     if !report.ok() {
         return report;
     }
-    let Some((bound, id)) = bind(e, dir, &mut report) else {
+    let Some((bound, id, mut root)) = bind(e, dir, &mut report) else {
         return report;
     };
     let mut seen: BTreeMap<&str, Seen> = BTreeMap::new();
     for b in &bound {
-        if let Some(s) = read_role(b, dir, runner, &mut report) {
+        let raw = if b.dir.is_empty() { root.take() } else { None };
+        if let Some(s) = read_role(b, dir, raw, runner, &mut report) {
             seen.insert(b.name, s);
         }
     }
-    seals(&mut seen, &mut report);
+    check_runs(&seen, &mut report);
+    let endings = endings(&seen, &observed(&seen));
+    seals(&mut seen, &endings, &mut report);
     let exits = observed(&seen);
     let mut usable: BTreeMap<&str, Streams> = BTreeMap::new();
     for (role, s) in &seen {
-        let runner = s.start.process;
-        let end_of = |path: &str| {
-            s.writer(path).map_or_else(
-                || Ending::Ambiguous(format!("{path} names no writer")),
-                |w| ending(&exits, w, runner, s.last_q(path)),
-            )
+        let end_of = |path: &str| match s.writer(path) {
+            Ok(w) => ending_of(&endings, w),
+            Err(why) => Ending::Ambiguous(format!("its writer is not known: the run {why}")),
         };
-        let run_end = end_of(RUN);
-        finished(role, RUN, &s.run, &run_end, &mut report);
+        finished(role, RUN, &s.run, &end_of(RUN), &mut report);
         let link = s.link.as_ref().map_or(Usable::Missing, |raw| {
             usable_of(role, LINK, raw, s, &end_of(LINK), &mut report)
         });
@@ -514,7 +663,7 @@ pub fn check(e: &Expectation, dir: &Path, runner: &str) -> Report {
         seen: &seen,
         usable: &usable,
     };
-    check_exits(e, &seen, &exits, &mut report);
+    check_exits(e, &seen, &exits, &endings, &mut report);
     check_records(e, &view, &mut report);
     check_verdicts(e, dir, &id, &view, &mut report);
     report
@@ -550,10 +699,14 @@ impl View<'_> {
     }
 }
 
+/// What [`bind`] found: the roles' runs, the id the verdicts must name,
+/// and the root `run.jsonl` as read for a single run's binding.
+type Binds = (Vec<Bound>, String, Option<Raw<Run>>);
+
 /// The roles' runs from the reservation and the id the verdicts must name
 /// (a single run's, or the set's), or `None` (with the mismatch) when it
 /// cannot be read or does not reserve the row's roles.
-fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<(Vec<Bound>, String)> {
+fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<Binds> {
     let role_row = |name: &str| e.roles.iter().find(|r| r.name == name).map(|r| r.row);
     match e.binding {
         Binding::Set => {
@@ -614,12 +767,19 @@ fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<(Vec<Bound>,
                     ));
                 }
             }
-            Some((out, set.set))
+            Some((out, set.set, None))
         }
         Binding::Run => {
-            let run = read_file::<Run>(dir, RUN, report)?;
-            let Some(Run::Start(start)) = run.records.first() else {
-                return None;
+            let raw = read_raw::<Run>(dir, RUN, report)?;
+            let start = match &raw.parsed {
+                Ok(run) => match run.records.first() {
+                    Some(Run::Start(start)) => start.clone(),
+                    _ => return None,
+                },
+                Err(err) => {
+                    report.add(format!("{}: {err}", dir.join(RUN).display()));
+                    return None;
+                }
             };
             let mut out = vec![Bound {
                 name: SINGLE,
@@ -635,7 +795,7 @@ fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<(Vec<Bound>,
                         report.add(format!(
                             "the run's `start` reserves {inner:?}, not role `{INNER}` of row `{row}` in a folder of its own"
                         ));
-                        return Some((out, start.run.clone()));
+                        return Some((out, start.run.clone(), Some(raw)));
                     }
                     out.push(Bound {
                         name: INNER,
@@ -654,14 +814,21 @@ fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<(Vec<Bound>,
                 )),
                 (None, None) => {}
             }
-            Some((out, start.run.clone()))
+            Some((out, start.run.clone(), Some(raw)))
         }
     }
 }
 
-/// A role's `run.jsonl`, read strictly once, its `start` against its
-/// reservation, and its other streams read once (not yet judged).
-fn read_role(b: &Bound, dir: &Path, runner: &str, report: &mut Report) -> Option<Seen> {
+/// A role's `run.jsonl`, read strictly once (`raw` when [`bind`] read it),
+/// its `start` against its reservation, and its other streams read once
+/// (not yet judged).
+fn read_role(
+    b: &Bound,
+    dir: &Path,
+    raw: Option<Raw<Run>>,
+    runner: &str,
+    report: &mut Report,
+) -> Option<Seen> {
     let folder = dir.join(&b.dir);
     let at = |name: &str| {
         if b.dir.is_empty() {
@@ -670,7 +837,7 @@ fn read_role(b: &Bound, dir: &Path, runner: &str, report: &mut Report) -> Option
             format!("{}/{name}", b.dir)
         }
     };
-    let Some(raw) = read_raw::<Run>(&folder, RUN, report) else {
+    let Some(raw) = raw.or_else(|| read_raw::<Run>(&folder, RUN, report)) else {
         report.add(format!("role `{}` has no readable {}", b.name, at(RUN)));
         return None;
     };
@@ -712,6 +879,12 @@ fn read_role(b: &Bound, dir: &Path, runner: &str, report: &mut Report) -> Option
             b.name, start.run
         ));
     }
+    if !(0x4000_0000..=0x7FFF_FFFF).contains(&start.cut) {
+        report.add(format!(
+            "role `{}`: the cut code {:#x} is not 0x40000000 plus 30 bits",
+            b.name, start.cut
+        ));
+    }
     let link = folder
         .join(LINK)
         .exists()
@@ -733,48 +906,69 @@ fn read_role(b: &Bound, dir: &Path, runner: &str, report: &mut Report) -> Option
     })
 }
 
-/// Each role's seals: those its own runner recorded for its own run, and
-/// those a survivor recorded for it. A survivor's seal is the role's when
-/// the role's runner was killed by another process, and the survivor
-/// recorded the exit of the sealed file's writer before the seal, so the
-/// file it sealed could no longer grow. Any other seal is named.
-fn seals(seen: &mut BTreeMap<&str, Seen>, report: &mut Report) {
+/// What binds the roles' runs to each other: an inner run's runner is the
+/// process its outer spawned as `inner`, every kill names a child its run
+/// spawned under that name, and no two runners share a cut code.
+fn check_runs(seen: &BTreeMap<&str, Seen>, report: &mut Report) {
+    if let (Some(outer), Some(inner)) = (seen.get(SINGLE), seen.get(INNER)) {
+        match outer.spawned(INNER) {
+            Ok(p) if p == inner.start.process => {}
+            Ok(p) => report.add(format!(
+                "role `{INNER}`'s runner is process {:?}, not the process role `{SINGLE}` spawned as `{INNER}`, {p:?}",
+                inner.start.process
+            )),
+            Err(why) => report.add(format!("role `{SINGLE}` {why}")),
+        }
+    }
+    for (role, s) in seen {
+        for r in &s.run.records {
+            if let Run::Kill(k) = r
+                && s.spawned(&k.name) != Ok(k.process)
+            {
+                report.add(format!(
+                    "role `{role}` kills `{}` as process {:?}, not a child it spawned under that name",
+                    k.name, k.process
+                ));
+            }
+        }
+        if seen
+            .iter()
+            .any(|(other, t)| other != role && t.start.cut == s.start.cut)
+        {
+            report.add(format!(
+                "role `{role}`'s cut code {:#x} is another runner's too",
+                s.start.cut
+            ));
+        }
+    }
+}
+
+/// Each role's seals. A seal names a role's run and a path in its folder;
+/// it is bound to that run when the stream's writer was cut short and the
+/// runner that cut it recorded the seal after its observation of the end,
+/// or when nothing cut the writer and the role's own runner recorded it.
+/// Any other seal is named.
+fn seals(seen: &mut BTreeMap<&str, Seen>, endings: &Endings, report: &mut Report) {
     let mut found: Vec<(&str, String, String)> = Vec::new();
-    {
-        let exits = observed(seen);
-        for (role, s) in seen.iter() {
-            for (at, r) in s.run.records.iter().enumerate() {
-                let Run::Seal(seal) = r else { continue };
-                let well_formed = is_path(&seal.path) && is_hex(&seal.sha256, 64);
-                if seal.role == *role && seal.run == s.start.run && well_formed {
-                    found.push((role, seal.path.clone(), seal.sha256.clone()));
-                    continue;
-                }
-                let survivor = seen.get_key_value(seal.role.as_str()).filter(|(_, t)| {
-                    let killed = exits.iter().any(|o| {
-                        o.exit.process == t.start.process
-                            && o.exit.killed
-                            && o.by != t.start.process
-                    });
-                    let writer_ended_before = t.writer(&seal.path).is_some_and(|w| {
-                        exits
-                            .iter()
-                            .any(|o| o.exit.process == w && o.by == s.start.process && o.at < at)
-                    });
-                    seal.role != *role
-                        && seal.run == t.start.run
-                        && well_formed
-                        && killed
-                        && writer_ended_before
-                });
-                match survivor {
-                    Some((target, _)) => {
-                        found.push((target, seal.path.clone(), seal.sha256.clone()));
-                    }
-                    None => report.add(format!(
-                        "role `{role}`: a seal not of this run's files, nor of a killed run's file whose writer this runner saw end before it: {seal:?}"
-                    )),
-                }
+    for (role, s) in seen.iter() {
+        for (at, r) in s.run.records.iter().enumerate() {
+            let Run::Seal(seal) = r else { continue };
+            let well_formed = is_path(&seal.path) && is_hex(&seal.sha256, 64);
+            let target = seen
+                .get_key_value(seal.role.as_str())
+                .filter(|(_, t)| t.start.run == seal.run && well_formed);
+            let bound = target.filter(|(name, t)| match t.writer(&seal.path) {
+                Ok(w) => match ending_of(endings, w) {
+                    Ending::Cut { by, at: seen_at } => by == *role && seen_at < at,
+                    Ending::Whole | Ending::Ambiguous(_) => **name == *role,
+                },
+                Err(_) => false,
+            });
+            match bound {
+                Some((name, _)) => found.push((name, seal.path.clone(), seal.sha256.clone())),
+                None => report.add(format!(
+                    "role `{role}`: a seal not of this run's own files, nor by the runner that cut the file's writer short after it observed the end: {seal:?}"
+                )),
             }
         }
     }
@@ -789,8 +983,9 @@ fn seals(seen: &mut BTreeMap<&str, Seen>, report: &mut Report) {
 }
 
 /// Whether a role's stream other than `run.jsonl` is evidence: it parsed,
-/// it ended or its writer was cut short, and the digest of the bytes it
-/// was parsed from equals its seal.
+/// its first record names the run and its writer, it ended or its writer
+/// was cut short, and the digest of the bytes it was parsed from equals its
+/// seal.
 fn usable_of<R: Kinds + Clone>(
     role: &str,
     name: &str,
@@ -806,6 +1001,10 @@ fn usable_of<R: Kinds + Clone>(
             return Usable::Not(format!("unreadable: {err}"));
         }
     };
+    if let Some(why) = s.foreign(name) {
+        report.add(format!("role `{role}`: {name} is not this run's: {why}"));
+        return Usable::Not(format!("not this run's: {why}"));
+    }
     if !finished(role, name, stream, ending, report) {
         return Usable::Not("unfinished".to_owned());
     }
@@ -869,7 +1068,7 @@ fn finished<R: Kinds>(
         ));
         return false;
     }
-    match s.finished(*ending == Ending::Cut) {
+    match s.finished(matches!(ending, Ending::Cut { .. })) {
         Ok(()) => true,
         Err(e) => {
             report.add(format!("role `{role}`: {name}: {e}"));
@@ -882,6 +1081,7 @@ fn check_exits(
     e: &Expectation,
     seen: &BTreeMap<&str, Seen>,
     exits: &[Observed],
+    endings: &Endings,
     report: &mut Report,
 ) {
     for rule in &e.exits {
@@ -896,47 +1096,58 @@ fn check_exits(
             });
             // A kill that came after the runner wrote its end is a kill
             // all the same.
-            let killed = exits.iter().any(|o| {
-                o.exit.process == s.start.process && o.exit.killed && o.by != s.start.process
-            });
-            match (rule.exit, end, killed) {
-                (Exit::Code(c), Some(got), false) if got == c => {}
-                (Exit::Killed, _, true) => {}
-                (Exit::Killed, _, false) => report.add(format!(
-                    "{name} must be killed, and no other process observed its exit as a kill"
+            match (rule.exit, end, ending_of(endings, s.start.process)) {
+                (Exit::Code(c), Some(got), Ending::Whole) if got == c => {}
+                (Exit::Killed, _, Ending::Cut { by, .. }) if by != rule.role => {}
+                (Exit::Killed, _, _) => report.add(format!(
+                    "{name} must be killed, and no other runner observed it end with that runner's cut code after its kill"
                 )),
-                (want, got, killed) => report.add(format!(
-                    "{name} exits {want:?}, the run shows end {got:?} and killed {killed}"
+                (want, got, ending) => report.add(format!(
+                    "{name} exits {want:?}, the run shows end {got:?} and {ending:?}"
                 )),
             }
             continue;
         }
-        let records: Vec<&evidence::Exit> = exits
+        let Some(spawn) = rule.spawn else {
+            continue;
+        };
+        let child = match seen.get(spawn.role).map(|t| t.spawned(spawn.name)) {
+            Some(Ok(p)) => p,
+            Some(Err(why)) => {
+                report.add(format!("{name}: role `{}` {why}", spawn.role));
+                continue;
+            }
+            None => continue,
+        };
+        let records: Vec<&Observed> = exits
             .iter()
             .filter(|o| o.role == rule.role && o.exit.name == rule.process)
-            .map(|o| o.exit)
             .collect();
-        // The process must be the writer of the stream the rule names.
-        let writer = rule
-            .writes
-            .and_then(|f| Some((f, seen.get(f.role)?.writer(f.path))));
         for x in &records {
-            match writer {
-                Some((_, Some(w))) if w == x.process => {}
-                Some((f, w)) => report.add(format!(
-                    "{name}'s exit names process {:?}, not {}/{}'s writer {w:?}",
-                    x.process, f.role, f.path
-                )),
-                None => {}
+            if x.exit.process != child {
+                report.add(format!(
+                    "{name}'s exit names process {:?}, not the process role `{}` spawned as `{}`, {child:?}",
+                    x.exit.process, spawn.role, spawn.name
+                ));
             }
         }
+        let ending = ending_of(endings, child);
+        let cut_by_observer = matches!(&ending, Ending::Cut { by, .. } if by == rule.role);
         match (rule.exit, records.as_slice()) {
-            (Exit::Code(c), [x]) if !x.killed && x.code == c => {}
-            (Exit::Killed, [x]) if x.killed => {}
+            (Exit::Code(c), [x])
+                if x.exit.process == child
+                    && x.exit.code == c
+                    && c != x.cut
+                    && !matches!(ending, Ending::Ambiguous(_)) => {}
+            (Exit::Killed, [x]) if x.exit.process == child && cut_by_observer => {}
             (Exit::Killed, []) => report.add(format!(
-                "{name} must be killed, and no runner observed its exit"
+                "{name} must be killed, and its runner observed no exit of it"
             )),
-            (want, got) => report.add(format!("{name} exits {want:?}, the run observed {got:?}")),
+            (want, got) => report.add(format!(
+                "{name} exits {want:?}, the run observed {:?} and {:?}",
+                got.iter().map(|o| o.exit).collect::<Vec<_>>(),
+                ending_of(endings, child)
+            )),
         }
     }
     for o in exits {
@@ -950,7 +1161,10 @@ fn check_exits(
                 o.role, o.exit.name
             ));
         }
-        if o.exit.process == o.by {
+        if seen
+            .get(o.role)
+            .is_some_and(|s| o.exit.process == s.start.process)
+        {
             report.add(format!(
                 "role `{}`'s runner records its own exit as `{}`",
                 o.role, o.exit.name
@@ -1157,6 +1371,11 @@ fn seal_of(f: &File, view: &View, dir: &Path, report: &mut Report) -> Option<Str
         report.add(format!("{}/{} has no seal", f.role, f.path));
         return None;
     };
+    // A stream's digest is that of the bytes it was parsed from, which its
+    // standing as evidence already holds to its seal.
+    if matches!(f.path, LINK | RECORDER) {
+        return Some(sealed.clone());
+    }
     let actual = fs::read(dir.join(&s.dir).join(f.path)).map(|b| hex(&Sha256::digest(b)));
     match actual {
         Ok(a) if a == *sealed => {}

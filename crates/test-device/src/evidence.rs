@@ -121,9 +121,9 @@ pub fn read<R: Kinds>(bytes: &[u8]) -> Result<Stream<R>, Error> {
             return Err(Error::Framing { line });
         }
         let text = std::str::from_utf8(raw).map_err(|_| Error::Utf8 { line })?;
-        // A record is an object: serde would also take a struct's fields
-        // as a positional array.
-        if !text.starts_with('{') {
+        // A record is an object (after any JSON whitespace): serde would
+        // also take a struct's fields as a positional array.
+        if !text.trim_start_matches([' ', '\t']).starts_with('{') {
             return Err(Error::Record {
                 line,
                 error: "the line is not a JSON object".into(),
@@ -219,7 +219,10 @@ pub enum Run {
     Start(Start),
     Seal(Seal),
     /// A child the runner started: its name in the row and its process.
-    Spawn(Spawn),
+    Spawn(Child),
+    /// The runner terminated a child it started, and every process in the
+    /// job it started that child in, with its cut code.
+    Kill(Child),
     /// The runner's sink window, once it shows.
     Sink(RunWindow),
     /// The runner's recorder shows every press the row holds, from the
@@ -258,6 +261,9 @@ pub struct Start {
     pub commit: String,
     /// The 16-bit prefix of every injected input's 32-bit tag.
     pub tag: u16,
+    /// The exit code this runner gives every process it terminates:
+    /// `0x40000000` plus 30 random bits, a code no process gives itself.
+    pub cut: i32,
     pub args: Vec<String>,
     /// The set whose role this run is, if any.
     pub set: Option<String>,
@@ -276,12 +282,12 @@ pub struct Seal {
     pub sha256: String,
 }
 
-/// A child the runner started.
+/// A child of the runner, by its name in the row (`recorder`, `player`,
+/// `inner`) and its process, at the host counter of the record.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Spawn {
+pub struct Child {
     pub q: i64,
-    /// The child's name in the row (`recorder`, `inner`).
     pub name: String,
     pub process: Process,
 }
@@ -326,8 +332,9 @@ pub struct RunNote {
     pub what: String,
 }
 
-/// A process's exit as the runner observed it: the process its first
-/// record named, its exit code, and whether this runner killed it.
+/// A process's end as the runner observed it, once the process had ended:
+/// the process and its exit code (the observing runner's cut code when
+/// that runner's termination ended it).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exit {
@@ -337,7 +344,6 @@ pub struct Exit {
     pub name: String,
     pub process: Process,
     pub code: i32,
-    pub killed: bool,
 }
 
 /// The runner's last record: the code it exits with and every error it
@@ -365,6 +371,7 @@ impl Kinds for Run {
             Self::Call(_) => "call",
             Self::Quiet(_) => "quiet",
             Self::Close(_) => "close",
+            Self::Kill(_) => "kill",
             Self::Exit(_) => "exit",
             Self::End(_) => "end",
         }
@@ -372,7 +379,7 @@ impl Kinds for Run {
 
     fn q(&self) -> Option<i64> {
         match self {
-            Self::Spawn(r) => Some(r.q),
+            Self::Spawn(c) | Self::Kill(c) => Some(c.q),
             Self::Sink(r) | Self::Close(r) => Some(r.q),
             Self::Call(r) => Some(r.q),
             Self::Quiet(r) => Some(r.q),
@@ -384,13 +391,13 @@ impl Kinds for Run {
     }
 }
 
-/// The link's stream, `link.jsonl` (and `trace --out`), on the host's
-/// counter `q`.
+/// The link's stream, `link.jsonl`, on the host's counter `q`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Link {
-    /// The port opened: the bound location, the COM port, the interface
-    /// path it was opened by, and the counter's frequency.
+    /// The port opened: the run and the process writing the stream, the
+    /// bound location, the COM port, the interface path it was opened by,
+    /// and the counter's frequency.
     Open(LinkOpen),
     /// A command written: the host counter just before its write, and in
     /// the runner's link also when it was queued and when its write ended.
@@ -425,6 +432,8 @@ pub enum Link {
 #[serde(deny_unknown_fields)]
 pub struct LinkOpen {
     pub q: i64,
+    pub run: String,
+    pub process: Process,
     pub freq: i64,
     pub location: String,
     pub com: String,
@@ -532,8 +541,8 @@ impl Kinds for Link {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Recorder {
-    /// The recorder's first record: its process, its window and the
-    /// device's handles it bound.
+    /// The recorder's first record: the run its runner gave it, its own
+    /// process, its window and the device's handles it bound.
     Ready(RecorderReady),
     /// A pad report, from the bound pad (`ours`) or another handle.
     Pad(RecorderPad),
@@ -554,6 +563,7 @@ pub enum Recorder {
 #[serde(deny_unknown_fields)]
 pub struct RecorderReady {
     pub q: i64,
+    pub run: String,
     pub process: Process,
     /// Its message-only window.
     pub window: u64,

@@ -47,14 +47,18 @@ impl Event {
     }
 }
 
-/// Two events at one host time, at least one a flash, recorded in two
-/// files: their order is not known.
+/// Two events at one host time, recorded in two files, where the group of
+/// events at that time holds a flash: their order, and so the order of the
+/// flash against some event of the group, is not known.
 fn unordered_tie<'a>(sorted: &[&'a Event]) -> Option<(&'a Event, &'a Event)> {
-    sorted.windows(2).find_map(|w| {
-        let [a, b] = w else { return None };
-        let flash = matches!(a, Event::Flashed { .. }) || matches!(b, Event::Flashed { .. });
-        (a.at() == b.at() && flash && a.place().0 != b.place().0).then_some((*a, *b))
-    })
+    sorted
+        .chunk_by(|a, b| a.at() == b.at())
+        .filter(|group| group.iter().any(|e| matches!(e, Event::Flashed { .. })))
+        .find_map(|group| {
+            let first = group.first()?;
+            let other = group.iter().find(|e| e.place().0 != first.place().0)?;
+            Some((*first, *other))
+        })
 }
 
 /// The provenance check of a run whose build is `build`, from `events` in
@@ -255,6 +259,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A flash and two hellos at one host time, the flash and one hello in
+    /// one file and the other hello in another: whatever order they sort
+    /// in, the other file's hello is unordered against the flash.
+    #[test]
+    fn a_tie_of_three_is_unordered_as_a_group() {
+        let hello_in = |source: &str, index| {
+            let Event::Hello { at, line, .. } = hello(1, "new", false) else {
+                unreachable!()
+            };
+            Event::Hello {
+                at,
+                line,
+                source: source.into(),
+                index,
+            }
+        };
+        for (flash_index, a_index) in [(0, 1), (1, 0)] {
+            for other in ["b.jsonl", "0.jsonl"] {
+                let events = [
+                    flashed(1, "new", "a.jsonl", flash_index),
+                    hello_in("a.jsonl", a_index),
+                    hello_in(other, 0),
+                ];
+                assert_eq!(
+                    check(Some("old"), &events).0,
+                    Outcome::Incomplete,
+                    "flash line {flash_index}, other file {other}"
+                );
+            }
+        }
+        // The control: all three in one file are ordered by line.
+        let events = [
+            flashed(1, "new", "a.jsonl", 0),
+            hello_in("a.jsonl", 1),
+            hello_in("a.jsonl", 2),
+        ];
+        assert_eq!(check(Some("old"), &events).0, Outcome::Pass);
     }
 
     #[test]

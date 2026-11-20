@@ -29,13 +29,22 @@ fn write(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
-/// One run's folder: its files (each sealed), its children's exits, and
-/// its end (none when it is killed).
+/// A runner's cut code: `0x40000000` plus bits of its run id.
+fn cut(run: &str) -> i32 {
+    0x4000_0000 + i32::from_str_radix(&run[..6], 16).unwrap()
+}
+
+/// One run's folder: its children, its files (each sealed), its children's
+/// exits, and its end (none when it is killed).
 struct RunSpec {
     run: &'static str,
     row: &'static str,
     role: &'static str,
     process: (u32, u64),
+    /// Its children's `spawn` records: name and process.
+    spawns: Vec<(&'static str, (u32, u64))>,
+    /// Its cut code.
+    cut: i32,
     set: Option<&'static str>,
     inner: Option<Value>,
     files: Vec<(&'static str, Vec<u8>)>,
@@ -54,15 +63,17 @@ impl RunSpec {
             row,
             role,
             process: (100, 1000),
+            spawns: vec![("recorder", (200, 2000))],
+            cut: cut(run),
             set: None,
             inner: None,
             files: vec![
-                ("link.jsonl", link()),
-                ("recorder.jsonl", recorder(200, &[])),
+                ("link.jsonl", link(run, (100, 1000))),
+                ("recorder.jsonl", recorder(run, 200, &[])),
                 ("shot-a.png", format!("png of {run}").into_bytes()),
             ],
             unsealed: vec![],
-            exits: vec![exit("recorder", (200, 2000), 0, false)],
+            exits: vec![exit("recorder", (200, 2000), 0)],
             after: vec![],
             end: Some(json!({"t": "end", "exit": 0, "errors": []})),
         }
@@ -71,9 +82,12 @@ impl RunSpec {
     fn write(&self, folder: &Path) {
         let mut out = line(&json!({
             "t": "start", "run": self.run, "row": self.row, "role": self.role, "build": BUILD, "commit": COMMIT, "tag": 7,
-            "process": {"pid": self.process.0, "created": self.process.1},
+            "process": {"pid": self.process.0, "created": self.process.1}, "cut": self.cut,
             "args": ["--build", BUILD], "set": self.set, "inner": self.inner,
         }));
+        for (name, process) in &self.spawns {
+            out += &line(&spawn(name, *process));
+        }
         for (path, bytes) in &self.files {
             write(&folder.join(path), bytes);
             out += &line(&json!({
@@ -93,9 +107,14 @@ impl RunSpec {
     }
 }
 
-fn link() -> Vec<u8> {
+/// A link's `open`, naming its run and its writer.
+fn open(run: &str, (pid, created): (u32, u64)) -> Value {
+    json!({"t": "open", "q": 1, "run": run, "process": {"pid": pid, "created": created}, "freq": 10_000_000, "location": "L", "com": "COM4", "path": "P"})
+}
+
+fn link(run: &str, writer: (u32, u64)) -> Vec<u8> {
     [
-        json!({"t": "open", "q": 1, "freq": 10_000_000, "location": "L", "com": "COM4", "path": "P"}),
+        open(run, writer),
         json!({"t": "ans", "q": 2, "line": HELLO}),
         json!({"t": "end", "q": 3, "problems": []}),
     ]
@@ -105,10 +124,13 @@ fn link() -> Vec<u8> {
     .into_bytes()
 }
 
-fn recorder(pid: u32, errors: &[(i64, i64)]) -> Vec<u8> {
-    let mut out = line(
-        &json!({"t": "ready", "q": 1, "process": {"pid": pid, "created": u64::from(pid) * 10}, "window": 5, "location": "L", "keyboard": 1, "pad": 2}),
-    );
+/// A recorder's `ready`, naming its run and itself.
+fn ready(run: &str, pid: u32) -> Value {
+    json!({"t": "ready", "q": 1, "run": run, "process": {"pid": pid, "created": u64::from(pid) * 10}, "window": 5, "location": "L", "keyboard": 1, "pad": 2})
+}
+
+fn recorder(run: &str, pid: u32, errors: &[(i64, i64)]) -> Vec<u8> {
+    let mut out = line(&ready(run, pid));
     for (from, to) in errors {
         out +=
             &line(&json!({"t": "error", "from": from, "to": to, "what": "GetRawInputData failed"}));
@@ -121,8 +143,20 @@ fn survivor_seal(run: &str, role: &str, path: &str, bytes: &[u8]) -> Value {
     json!({"t": "seal", "run": run, "role": role, "path": path, "sha256": sha(bytes)})
 }
 
-fn exit(name: &str, (pid, created): (u32, u64), code: i32, killed: bool) -> Value {
-    json!({"t": "exit", "q": 100, "name": name, "process": {"pid": pid, "created": created}, "code": code, "killed": killed})
+fn exit(name: &str, (pid, created): (u32, u64), code: i32) -> Value {
+    json!({"t": "exit", "q": 100, "name": name, "process": {"pid": pid, "created": created}, "code": code})
+}
+
+fn kill(name: &str, (pid, created): (u32, u64)) -> Value {
+    json!({"t": "kill", "q": 90, "name": name, "process": {"pid": pid, "created": created}})
+}
+
+fn spawn(name: &str, (pid, created): (u32, u64)) -> Value {
+    json!({"t": "spawn", "q": 0, "name": name, "process": {"pid": pid, "created": created}})
+}
+
+const fn spawned(role: &'static str, name: &'static str) -> Option<Spawned> {
+    Some(Spawned { role, name })
 }
 
 /// A verdict line reading `inputs` (role, path, file) with the files'
@@ -183,13 +217,13 @@ impl Single {
                 ExitRule {
                     role: SINGLE,
                     process: RUNNER,
-                    writes: None,
+                    spawn: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: SINGLE,
                     process: "recorder",
-                    writes: Some(file(SINGLE, RECORDER)),
+                    spawn: spawned(SINGLE, "recorder"),
                     exit: Exit::Code(0),
                 },
             ],
@@ -352,10 +386,10 @@ fn another_exit_fails() {
     s.write();
     mismatch(&s.check(), "role `run`'s runner exits Code(0)");
     s.spec.end = Some(json!({"t": "end", "exit": 0, "errors": []}));
-    s.spec.exits = vec![exit("recorder", (200, 2000), 3, false)];
+    s.spec.exits = vec![exit("recorder", (200, 2000), 3)];
     s.write();
     mismatch(&s.check(), "role `run`'s recorder exits Code(0)");
-    s.spec.exits.push(exit("player", (300, 3000), 0, false));
+    s.spec.exits.push(exit("player", (300, 3000), 0));
     s.write();
     mismatch(
         &s.check(),
@@ -366,9 +400,8 @@ fn another_exit_fails() {
 #[test]
 fn a_missing_record_fails() {
     let mut s = Single::new();
-    let open = json!({"t": "open", "q": 1, "freq": 1, "location": "L", "com": "COM4", "path": "P"});
     let end = json!({"t": "end", "q": 3, "problems": []});
-    s.spec.files[0].1 = format!("{}{}", line(&open), line(&end)).into_bytes();
+    s.spec.files[0].1 = format!("{}{}", line(&open(RUN_A, (100, 1000))), line(&end)).into_bytes();
     s.write();
     mismatch(
         &s.check(),
@@ -379,7 +412,7 @@ fn a_missing_record_fails() {
 #[test]
 fn a_check_reading_an_errored_stretch_is_incomplete() {
     let mut s = Single::new();
-    s.spec.files[1].1 = recorder(200, &[(5, 7)]);
+    s.spec.files[1].1 = recorder(RUN_A, 200, &[(5, 7)]);
     s.write();
     mismatch(
         &s.check(),
@@ -493,8 +526,16 @@ fn an_unsealed_file_fails() {
     mismatch(&s.check(), "run/shot-a.png has no seal");
 }
 
-/// An outer run of row `sink-kill` that reserved and killed its inner
-/// `sink`.
+/// The inner runner's process.
+const INNER_PROCESS: (u32, u64) = (500, 5000);
+
+/// The inner's link, as its runner wrote it.
+fn inner_link() -> Vec<u8> {
+    link(RUN_B, INNER_PROCESS)
+}
+
+/// An outer run of row `sink-kill` that spawned, then killed (its job
+/// terminated), its inner `sink`.
 struct Outer {
     dir: tempfile::TempDir,
     outer: RunSpec,
@@ -520,25 +561,25 @@ impl Outer {
                 ExitRule {
                     role: SINGLE,
                     process: RUNNER,
-                    writes: None,
+                    spawn: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: SINGLE,
                     process: "recorder",
-                    writes: Some(file(SINGLE, RECORDER)),
+                    spawn: spawned(SINGLE, "recorder"),
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: SINGLE,
                     process: "inner",
-                    writes: Some(file(INNER, RUN)),
+                    spawn: spawned(SINGLE, "inner"),
                     exit: Exit::Killed,
                 },
                 ExitRule {
                     role: INNER,
                     process: RUNNER,
-                    writes: None,
+                    spawn: None,
                     exit: Exit::Killed,
                 },
             ],
@@ -564,17 +605,22 @@ impl Outer {
     fn new() -> Self {
         let mut outer = RunSpec::new(RUN_A, "sink-kill", SINGLE);
         outer.inner = Some(json!({"role": INNER, "row": "sink", "run": RUN_B, "dir": INNER}));
-        outer.exits.push(exit("inner", (500, 5000), 1, true));
+        outer.spawns.push((INNER, INNER_PROCESS));
+        outer.exits.push(kill("inner", INNER_PROCESS));
+        outer.exits.push(exit("inner", INNER_PROCESS, cut(RUN_A)));
         let mut inner = RunSpec::new(RUN_B, "sink", INNER);
-        inner.process = (500, 5000);
+        inner.process = INNER_PROCESS;
+        inner.spawns = vec![("recorder", (600, 6000))];
         inner.set = Some(RUN_A);
         // Killed, the inner seals nothing: the outer seals its link after
         // it saw it end.
-        inner.unsealed = vec![("link.jsonl", link())];
+        inner.unsealed = vec![("link.jsonl", inner_link())];
         inner.files.clear();
         inner.exits.clear();
         inner.end = None;
-        outer.after.push(survivor_seal(RUN_B, INNER, LINK, &link()));
+        outer
+            .after
+            .push(survivor_seal(RUN_B, INNER, LINK, &inner_link()));
         let o = Self {
             dir: tempfile::tempdir().unwrap(),
             outer,
@@ -628,18 +674,33 @@ fn a_killed_exit_needs_its_observer() {
     let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
     mismatch(
         &report,
-        "role `inner`'s runner must be killed, and no other process observed its exit as a kill",
+        "role `inner`'s runner must be killed, and no other runner observed it end with that runner's cut code after its kill",
     );
     mismatch(
         &report,
         "role `inner`: run.jsonl: the stream has no end record, and its writer was not cut short",
     );
-    // An exit observed but not as a kill does not stand for one.
-    o.outer.exits.push(exit("inner", (500, 5000), 1, false));
+    // An exit observed with another code than the observer's cut code is
+    // the process ending by itself, after the kill or not.
+    o.outer.exits.push(kill("inner", INNER_PROCESS));
+    o.outer.exits.push(exit("inner", INNER_PROCESS, 1));
     o.write();
     mismatch(
         &check(&Outer::expectation(), o.dir.path(), COMMIT),
         "role `inner`'s runner must be killed",
+    );
+    // Nor does an exit with the observer's cut code stand for a code the
+    // process ended with by itself.
+    let o = Outer::new();
+    let mut e = Outer::expectation();
+    for r in &mut e.exits {
+        if r.role == SINGLE && r.process == "inner" {
+            r.exit = Exit::Code(cut(RUN_A));
+        }
+    }
+    mismatch(
+        &check(&e, o.dir.path(), COMMIT),
+        "role `run`'s inner exits Code(",
     );
 }
 
@@ -748,25 +809,25 @@ impl SetDir {
                 ExitRule {
                     role: "A1",
                     process: RUNNER,
-                    writes: None,
+                    spawn: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: "A1",
                     process: "recorder",
-                    writes: Some(file("A1", RECORDER)),
+                    spawn: spawned("A1", "recorder"),
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: "R1",
                     process: RUNNER,
-                    writes: None,
+                    spawn: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: "R1",
                     process: "recorder",
-                    writes: Some(file("R1", RECORDER)),
+                    spawn: spawned("R1", "recorder"),
                     exit: Exit::Code(0),
                 },
             ],
@@ -974,22 +1035,24 @@ fn an_unusable_expectation_is_named() {
 fn a_stream_cut_short_by_a_process_nobody_killed_fails() {
     let mut s = Single::new();
     // The recorder exited by itself, observed, without its end.
-    let ready = line(
-        &json!({"t": "ready", "q": 1, "process": {"pid": 200, "created": 2000}, "window": 5, "location": "L", "keyboard": 1, "pad": 2}),
-    );
-    s.spec.files[1].1 = ready.into_bytes();
+    s.spec.files[1].1 = line(&ready(RUN_A, 200)).into_bytes();
     s.write();
     mismatch(
         &s.check(),
         "role `run`: recorder.jsonl: the stream has no end record, and its writer was not cut short",
     );
     // Killed by its runner, it may stop short; the dropped line is noted.
-    let mut cut = line(
-        &json!({"t": "ready", "q": 1, "process": {"pid": 200, "created": 2000}, "window": 5, "location": "L", "keyboard": 1, "pad": 2}),
-    );
-    cut += r#"{"t":"end""#;
-    s.spec.files[1].1 = cut.into_bytes();
-    s.spec.exits = vec![exit("recorder", (200, 2000), 1, true)];
+    // The runner seals it after it observed the end.
+    let mut cut_short = line(&ready(RUN_A, 200));
+    cut_short += r#"{"t":"end""#;
+    let bytes = cut_short.into_bytes();
+    s.spec.files.remove(1);
+    s.spec.unsealed = vec![(RECORDER, bytes.clone())];
+    s.spec.exits = vec![
+        kill("recorder", (200, 2000)),
+        exit("recorder", (200, 2000), cut(RUN_A)),
+    ];
+    s.spec.after = vec![survivor_seal(RUN_A, SINGLE, RECORDER, &bytes)];
     s.write();
     let mut e = Single::expectation();
     e.exits[1].exit = Exit::Killed;
@@ -1005,7 +1068,7 @@ fn a_stream_cut_short_by_a_process_nobody_killed_fails() {
 fn a_process_cannot_observe_its_own_kill() {
     let mut o = Outer::new();
     o.outer.exits.retain(|x| x["name"] != "inner");
-    o.inner.exits = vec![exit("inner", (500, 5000), 1, true)];
+    o.inner.exits = vec![exit("inner", INNER_PROCESS, cut(RUN_B))];
     o.write();
     let mut e = Outer::expectation();
     e.exits
@@ -1013,13 +1076,13 @@ fn a_process_cannot_observe_its_own_kill() {
     e.exits.push(ExitRule {
         role: INNER,
         process: "inner",
-        writes: Some(file(INNER, RUN)),
+        spawn: spawned(SINGLE, "inner"),
         exit: Exit::Killed,
     });
     let report = check(&e, o.dir.path(), COMMIT);
     mismatch(
         &report,
-        "role `inner`'s runner must be killed, and no other process observed its exit as a kill",
+        "role `inner`'s runner must be killed, and no other runner observed it end with that runner's cut code after its kill",
     );
     mismatch(
         &report,
@@ -1027,7 +1090,7 @@ fn a_process_cannot_observe_its_own_kill() {
     );
     mismatch(
         &report,
-        "role `inner`: run.jsonl: the stream has no end record",
+        "role `inner`: run.jsonl: the stream stops short and its writer's end is ambiguous",
     );
 }
 
@@ -1043,7 +1106,7 @@ fn a_runner_killed_after_its_end_counts_as_killed() {
 #[test]
 fn a_recorder_event_read_from_an_errored_stream_is_incomplete() {
     let mut s = Single::new();
-    s.spec.files[1].1 = recorder(200, &[(5, 7)]);
+    s.spec.files[1].1 = recorder(RUN_A, 200, &[(5, 7)]);
     s.write();
     let mut e = Single::expectation();
     // `n1.shot` reads the recorder's `ready` without reading its file.
@@ -1140,7 +1203,7 @@ fn a_survivor_seals_only_what_it_saw_end() {
             for role_right in [true, false] {
                 let mut o = Outer::new();
                 let bytes = if digest_right {
-                    link()
+                    inner_link()
                 } else {
                     b"other".to_vec()
                 };
@@ -1150,7 +1213,8 @@ fn a_survivor_seals_only_what_it_saw_end() {
                 if seal_after_kill {
                     o.outer.after.push(seal);
                 } else {
-                    o.outer.exits.insert(0, seal);
+                    // Before its observation of the inner's end.
+                    o.outer.exits.insert(1, seal);
                 }
                 o.write();
                 let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
@@ -1166,7 +1230,7 @@ fn a_survivor_seals_only_what_it_saw_end() {
                             .mismatches
                             .iter()
                             .any(|m| m.contains("inner/link.jsonl is not evidence")
-                                || m.contains("a seal not of this run's files")),
+                                || m.contains("a seal not of this run's own files")),
                         "{report:#?}"
                     );
                 }
@@ -1176,17 +1240,17 @@ fn a_survivor_seals_only_what_it_saw_end() {
     // Nor does a survivor seal the file of a run nobody killed.
     let mut o = Outer::new();
     o.outer.exits.retain(|x| x["name"] != "inner");
-    o.outer.exits.push(exit("inner", (500, 5000), 0, false));
+    o.outer.exits.push(exit("inner", INNER_PROCESS, 0));
     o.write();
     mismatch(
         &check(&Outer::expectation(), o.dir.path(), COMMIT),
-        "a seal not of this run's files",
+        "a seal not of this run's own files",
     );
 }
 
 /// The inner's recorder writes `ready` as process 600 and no `end`.
 fn cut_recorder() -> Vec<u8> {
-    line(&json!({"t": "ready", "q": 1, "process": {"pid": 600, "created": 6000}, "window": 5, "location": "L", "keyboard": 1, "pad": 2})).into_bytes()
+    line(&ready(RUN_B, 600)).into_bytes()
 }
 
 /// A recorder its own runner saw end by itself, without its `end`, is not
@@ -1195,10 +1259,8 @@ fn cut_recorder() -> Vec<u8> {
 fn a_recorder_its_runner_saw_end_is_not_excused_by_a_later_kill() {
     let mut o = Outer::new();
     o.inner.unsealed.push((RECORDER, cut_recorder()));
-    o.inner.exits = vec![exit("recorder", (600, 6000), 0, false)];
-    o.outer
-        .exits
-        .push(exit("inner-recorder", (600, 6000), 0, false));
+    o.inner.exits = vec![exit("recorder", (600, 6000), 0)];
+    o.outer.exits.push(exit("inner-recorder", (600, 6000), 0));
     o.write();
     mismatch(
         &check(&Outer::expectation(), o.dir.path(), COMMIT),
@@ -1211,83 +1273,19 @@ fn a_recorder_its_runner_saw_end_is_not_excused_by_a_later_kill() {
 #[test]
 fn an_exit_of_another_process_does_not_match() {
     let mut s = Single::new();
-    s.spec.exits = vec![exit("recorder", (201, 2010), 0, false)];
+    s.spec.exits = vec![exit("recorder", (201, 2010), 0)];
     s.write();
     mismatch(
         &s.check(),
-        "role `run`'s recorder's exit names process Process { pid: 201, created: 2010 }, not run/recorder.jsonl's writer",
+        "role `run`'s recorder's exit names process Process { pid: 201, created: 2010 }, not the process role `run` spawned as `recorder`",
     );
-}
-
-/// Every arrangement of the observations of the inner's recorder (cut
-/// short, no `end`): by its own runner (none, ended, killed), by the outer
-/// (none, before or after its kill of the inner, ended or killed), at a
-/// counter before or after the recorder's last record; the stream is
-/// excused exactly when an oracle says so. The canonical arrangement (the
-/// outer sees it end after the kill) is the positive control.
-#[test]
-fn a_cut_stream_is_excused_only_by_its_writer_s_bound_end() {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum By {
-        None,
-        Ended,
-        Killed,
-    }
-    let mut excused_seen = false;
-    for own in [By::None, By::Ended, By::Killed] {
-        for outer in [By::None, By::Ended, By::Killed] {
-            for outer_after_kill in [true, false] {
-                for late in [true, false] {
-                    let mut o = Outer::new();
-                    o.inner.unsealed.push((RECORDER, cut_recorder()));
-                    let q = if late { 100 } else { 0 };
-                    let obs = |by: By| {
-                        let mut x = exit("inner-recorder", (600, 6000), 0, by == By::Killed);
-                        x["q"] = json!(q);
-                        x
-                    };
-                    if own != By::None {
-                        let mut x = obs(own);
-                        x["name"] = json!("recorder");
-                        o.inner.exits = vec![x];
-                    }
-                    if outer != By::None {
-                        if outer_after_kill {
-                            o.outer.exits.push(obs(outer));
-                        } else {
-                            o.outer.exits.insert(0, obs(outer));
-                        }
-                    }
-                    o.write();
-                    let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
-                    let flagged = report
-                        .mismatches
-                        .iter()
-                        .any(|m| m.starts_with("role `inner`: recorder.jsonl:"));
-                    // The oracle.
-                    let killed_obs = own == By::Killed || outer == By::Killed;
-                    let disagree = own != By::None && outer != By::None && own != outer;
-                    let excused = late
-                        && !disagree
-                        && (killed_obs
-                            || (own == By::None && outer == By::Ended && outer_after_kill));
-                    assert_eq!(
-                        flagged, !excused,
-                        "own {own:?}, outer {outer:?}, after kill {outer_after_kill}, late {late}: {report:#?}"
-                    );
-                    excused_seen |= excused && !killed_obs;
-                }
-            }
-        }
-    }
-    assert!(excused_seen, "the positive control never matched");
 }
 
 /// A sealed link that recorded an error fails the run though the runner's
 /// `end` names none: each kind of error, and none as the control.
 #[test]
 fn a_link_error_fails_the_run() {
-    let open = json!({"t": "open", "q": 1, "freq": 1, "location": "L", "com": "COM4", "path": "P"});
+    let open = open(RUN_A, (100, 1000));
     let ans = json!({"t": "ans", "q": 2, "line": HELLO});
     let cases = [
         (None, json!({"t": "end", "q": 3, "problems": []}), None),
@@ -1325,6 +1323,397 @@ fn a_link_error_fails_the_run() {
             ),
         }
     }
+}
+
+/// A stream counts only as its own run's: its first record names the run
+/// and the writer its runner set. A complete link of the same build left by
+/// another run, or written by another process, is not the inner's, though
+/// the outer seals it after the kill.
+#[test]
+fn a_stream_of_another_run_or_writer_is_not_evidence() {
+    for (run, writer, want) in [
+        (RUN_C, INNER_PROCESS, "names run"),
+        (RUN_B, (501, 5010), "names process"),
+    ] {
+        let mut o = Outer::new();
+        let bytes = link(run, writer);
+        o.inner.unsealed = vec![(LINK, bytes.clone())];
+        o.outer.after = vec![survivor_seal(RUN_B, INNER, LINK, &bytes)];
+        o.write();
+        let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
+        mismatch(
+            &report,
+            &format!("role `inner`: link.jsonl is not this run's: its first record {want}"),
+        );
+        mismatch(&report, "inner/link.jsonl is not evidence");
+    }
+    // The control: the inner's own link, sealed by the outer.
+    let o = Outer::new();
+    let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
+    assert!(report.ok(), "{report:#?}");
+}
+
+/// Only the runner that cut a writer short seals what that writer wrote,
+/// after it observed the end: not the killed run itself, nor another
+/// runner than the one that cut it.
+#[test]
+fn only_the_runner_that_cut_a_writer_seals_its_stream() {
+    // The inner sealed its own link, then the outer killed it.
+    let mut o = Outer::new();
+    o.inner.unsealed.clear();
+    o.inner.files = vec![(LINK, inner_link())];
+    o.outer.after.clear();
+    o.write();
+    let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
+    mismatch(&report, "role `inner`: a seal not of this run's own files");
+    mismatch(&report, "inner/link.jsonl is not evidence");
+    // The inner cut its recorder short; the outer seals the recorder's
+    // stream.
+    let mut o = Outer::new();
+    let bytes = cut_recorder();
+    o.inner.unsealed.push((RECORDER, bytes.clone()));
+    o.inner.exits = vec![
+        kill("recorder", (600, 6000)),
+        exit("recorder", (600, 6000), cut(RUN_B)),
+    ];
+    o.outer
+        .after
+        .push(survivor_seal(RUN_B, INNER, RECORDER, &bytes));
+    o.write();
+    let mut e = Outer::expectation();
+    e.exits.push(ExitRule {
+        role: INNER,
+        process: "recorder",
+        spawn: spawned(INNER, "recorder"),
+        exit: Exit::Killed,
+    });
+    mismatch(
+        &check(&e, o.dir.path(), COMMIT),
+        "role `run`: a seal not of this run's own files",
+    );
+}
+
+/// An end observed before its writer's last record cannot be: the outer's
+/// exit of the inner at counter 0, before the inner's link opened at 1,
+/// leaves the inner's end ambiguous, so neither its kill nor its cut
+/// stream stands.
+#[test]
+fn an_end_observed_before_the_writer_s_last_record_does_not_stand() {
+    let mut o = Outer::new();
+    for x in &mut o.outer.exits {
+        if x["name"] == "inner" {
+            x["q"] = json!(0);
+        }
+    }
+    o.write();
+    let report = check(&Outer::expectation(), o.dir.path(), COMMIT);
+    mismatch(&report, "role `inner`'s runner must be killed");
+    mismatch(
+        &report,
+        "role `inner`: run.jsonl: the stream stops short and its writer's end is ambiguous: process 500's end is observed at 0, before its last record at 3",
+    );
+    // After the writer's last record, but before the kill it follows.
+    let mut o = Outer::new();
+    for x in &mut o.outer.exits {
+        if x["t"] == "exit" && x["name"] == "inner" {
+            x["q"] = json!(50);
+        }
+    }
+    o.write();
+    mismatch(
+        &check(&Outer::expectation(), o.dir.path(), COMMIT),
+        "role `run` observed process 500 end at 50, before its kill at 90",
+    );
+}
+
+/// The roles' runs are bound to each other: the inner's runner is the
+/// process its outer spawned as `inner`, and a runner kills only a child it
+/// spawned, by the name it spawned it under.
+#[test]
+fn a_run_kills_and_hosts_only_its_own_children() {
+    let mut o = Outer::new();
+    o.outer.spawns = vec![("recorder", (200, 2000)), (INNER, (501, 5010))];
+    o.write();
+    mismatch(
+        &check(&Outer::expectation(), o.dir.path(), COMMIT),
+        "role `inner`'s runner is process Process { pid: 500, created: 5000 }, not the process role `run` spawned as `inner`",
+    );
+    let mut o = Outer::new();
+    o.outer.exits.insert(0, kill("recorder", INNER_PROCESS));
+    o.write();
+    mismatch(
+        &check(&Outer::expectation(), o.dir.path(), COMMIT),
+        "role `run` kills `recorder` as process Process { pid: 500, created: 5000 }, not a child it spawned under that name",
+    );
+}
+
+/// Each runner has a cut code of its own form, and no two runners share
+/// one, so a cut code names the runner that cut.
+#[test]
+fn runners_have_cut_codes_of_their_own() {
+    let mut s = SetDir::new("set-1", RUN_A, RUN_B);
+    s.r1.cut = s.a1.cut;
+    s.write();
+    mismatch(
+        &s.check(),
+        "role `R1`'s cut code 0x40012345 is another runner's too",
+    );
+    s.r1.cut = 1;
+    s.write();
+    mismatch(
+        &s.check(),
+        "role `R1`: the cut code 0x1 is not 0x40000000 plus 30 bits",
+    );
+}
+
+/// A stream whose first record names another run supplies nothing, its
+/// writer's exit included: the exit binds to the run's `spawn` record.
+#[test]
+fn a_stream_header_of_another_run_supplies_nothing() {
+    let mut s = Single::new();
+    s.spec.files[1].1 = recorder(RUN_C, 200, &[]);
+    s.write();
+    let report = s.check();
+    mismatch(
+        &report,
+        "role `run`: recorder.jsonl is not this run's: its first record names run",
+    );
+    // Its exit is still the spawned recorder's, and matches.
+    assert!(
+        !report
+            .mismatches
+            .iter()
+            .any(|m| m.contains("recorder exits")),
+        "{report:#?}"
+    );
+}
+
+/// A child that writes no stream (the player) binds by its `spawn` record.
+#[test]
+fn a_child_without_a_stream_binds_by_its_spawn() {
+    let mut s = Single::new();
+    s.spec.spawns.push(("player", (300, 3000)));
+    s.spec.exits.push(exit("player", (300, 3000), 0));
+    s.write();
+    let mut e = Single::expectation();
+    e.exits.push(ExitRule {
+        role: SINGLE,
+        process: "player",
+        spawn: spawned(SINGLE, "player"),
+        exit: Exit::Code(0),
+    });
+    let report = check(&e, s.dir.path(), COMMIT);
+    assert!(report.ok(), "{report:#?}");
+    s.spec.exits.pop();
+    s.spec.exits.push(exit("player", (301, 3010), 0));
+    s.write();
+    mismatch(
+        &check(&e, s.dir.path(), COMMIT),
+        "not the process role `run` spawned as `player`",
+    );
+}
+
+/// Two runners observe one end: the inner terminated its recorder (its
+/// cut code), and the outer, after it killed the inner, saw the same code.
+/// They agree by the code, and the end is the inner's cut; a code that
+/// differs leaves the end ambiguous.
+#[test]
+fn observers_agree_by_the_exit_code() {
+    for other in [false, true] {
+        let mut o = Outer::new();
+        let bytes = cut_recorder();
+        o.inner.unsealed.push((RECORDER, bytes.clone()));
+        o.inner.exits = vec![
+            kill("recorder", (600, 6000)),
+            exit("recorder", (600, 6000), cut(RUN_B)),
+            survivor_seal(RUN_B, INNER, RECORDER, &bytes),
+        ];
+        let seen_by_outer = if other { 1 } else { cut(RUN_B) };
+        o.outer
+            .exits
+            .push(exit("inner-recorder", (600, 6000), seen_by_outer));
+        o.write();
+        let mut e = Outer::expectation();
+        e.exits.push(ExitRule {
+            role: INNER,
+            process: "recorder",
+            spawn: spawned(INNER, "recorder"),
+            exit: Exit::Killed,
+        });
+        e.exits.push(ExitRule {
+            role: SINGLE,
+            process: "inner-recorder",
+            spawn: spawned(INNER, "recorder"),
+            exit: Exit::Code(cut(RUN_B)),
+        });
+        e.records.push(RecordRule {
+            role: INNER,
+            stream: RECORDER,
+            kind: "ready",
+            count: Count::Exactly(1),
+        });
+        let report = check(&e, o.dir.path(), COMMIT);
+        if other {
+            mismatch(&report, "the exit codes recorded for process 600 disagree");
+        } else {
+            assert!(report.ok(), "{report:#?}");
+            // The outer did not cut it: its observation is not its kill.
+            let last = e.exits.len() - 1;
+            e.exits[last].exit = Exit::Killed;
+            mismatch(
+                &check(&e, o.dir.path(), COMMIT),
+                "role `run`'s inner-recorder exits Killed",
+            );
+        }
+    }
+}
+
+/// Every way the inner's recorder may truly have ended (its `end` written
+/// and exit 0, exit 3 without `end`, or still running when the outer
+/// terminated the inner's job), against every way that end may be
+/// recorded: the outer's observation before or after its kill, at a
+/// counter after or (impossibly) before the recorder's last record; the
+/// inner's own observation (none, the same code, another code); the seal
+/// (by the outer after its observation, by the outer before it, by the
+/// inner, none); and the stream's first record naming this run or another.
+/// The observations follow from the true end: a runner reads its own cut
+/// code only when its termination ended the process, and nobody sees a
+/// running process end before the termination. The oracle judges from the
+/// true end and order alone; the full contract (the recorder's exit
+/// declared as the truth makes it, and a rule reading the stream) matches
+/// exactly when the oracle accepts. Its positive controls: the recorder
+/// cut short by the job, and the recorder that ended by itself.
+#[test]
+fn a_stream_cut_short_is_excused_only_by_the_runner_that_ended_it() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Fate {
+        Ended,
+        Crashed,
+        Running,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Sealer {
+        OuterAfter,
+        OuterBefore,
+        Inner,
+        Nobody,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InnerSaw {
+        Nothing,
+        Same,
+        Other,
+    }
+    const REC: (u32, u64) = (600, 6000);
+    let mut controls = (false, false);
+    for fate in [Fate::Ended, Fate::Crashed, Fate::Running] {
+        for before_kill in [false, true] {
+            for late in [true, false] {
+                for sealer in [
+                    Sealer::OuterAfter,
+                    Sealer::OuterBefore,
+                    Sealer::Inner,
+                    Sealer::Nobody,
+                ] {
+                    for inner_saw in [InnerSaw::Nothing, InnerSaw::Same, InnerSaw::Other] {
+                        for own_run in [true, false] {
+                            // Nobody sees a running process end before the
+                            // termination that ends it.
+                            if fate == Fate::Running && inner_saw != InnerSaw::Nothing {
+                                continue;
+                            }
+                            let code = match fate {
+                                Fate::Ended => 0,
+                                Fate::Crashed => 3,
+                                Fate::Running => cut(RUN_A),
+                            };
+                            let run = if own_run { RUN_B } else { RUN_C };
+                            let mut text = line(
+                                &json!({"t": "ready", "q": 5, "run": run, "process": {"pid": 600, "created": 6000}, "window": 5, "location": "L", "keyboard": 1, "pad": 2}),
+                            );
+                            if fate == Fate::Ended {
+                                text += &line(&json!({"t": "end", "q": 9}));
+                            }
+                            let bytes = text.into_bytes();
+                            let mut o = Outer::new();
+                            let mut seen = exit("inner-recorder", REC, code);
+                            seen["q"] = json!(if late { 100 } else { 4 });
+                            // The outer's exits: its recorder, its kill of
+                            // the inner, the inner's end.
+                            let at = if before_kill { 1 } else { 3 };
+                            o.outer.exits.insert(at, seen);
+                            let seal = survivor_seal(RUN_B, INNER, RECORDER, &bytes);
+                            match sealer {
+                                Sealer::OuterAfter => o.outer.after.push(seal),
+                                Sealer::OuterBefore => o.outer.exits.insert(at, seal),
+                                Sealer::Inner => o.inner.files.push((RECORDER, bytes.clone())),
+                                Sealer::Nobody => {}
+                            }
+                            if sealer != Sealer::Inner {
+                                o.inner.unsealed.push((RECORDER, bytes.clone()));
+                            }
+                            let mut e = Outer::expectation();
+                            if inner_saw != InnerSaw::Nothing {
+                                let mut x = exit(
+                                    "recorder",
+                                    REC,
+                                    if inner_saw == InnerSaw::Same { code } else { 7 },
+                                );
+                                x["q"] = json!(20);
+                                o.inner.exits = vec![x];
+                                e.exits.push(ExitRule {
+                                    role: INNER,
+                                    process: "recorder",
+                                    spawn: spawned(INNER, "recorder"),
+                                    exit: Exit::Code(code),
+                                });
+                            }
+                            e.exits.push(ExitRule {
+                                role: SINGLE,
+                                process: "inner-recorder",
+                                spawn: spawned(INNER, "recorder"),
+                                exit: if fate == Fate::Running {
+                                    Exit::Killed
+                                } else {
+                                    Exit::Code(code)
+                                },
+                            });
+                            e.records.push(RecordRule {
+                                role: INNER,
+                                stream: RECORDER,
+                                kind: "ready",
+                                count: Count::Exactly(1),
+                            });
+                            o.write();
+                            let report = check(&e, o.dir.path(), COMMIT);
+                            // The oracle, from the true end and order.
+                            let accepted = own_run
+                                && late
+                                && match fate {
+                                    Fate::Running => !before_kill && sealer == Sealer::OuterAfter,
+                                    Fate::Ended => {
+                                        sealer == Sealer::Inner && inner_saw != InnerSaw::Other
+                                    }
+                                    Fate::Crashed => false,
+                                };
+                            assert_eq!(
+                                report.ok(),
+                                accepted,
+                                "{fate:?}, seen before the kill {before_kill}, late {late}, sealed {sealer:?}, inner saw {inner_saw:?}, own run {own_run}: {report:#?}"
+                            );
+                            if accepted {
+                                match fate {
+                                    Fate::Running => controls.0 = true,
+                                    _ => controls.1 = true,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(controls, (true, true), "a positive control never matched");
 }
 
 /// A run is judged against the expectation compiled into its runner: a

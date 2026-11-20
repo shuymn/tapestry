@@ -2,12 +2,13 @@
 //! "Verdicts"): the contract for the run, set or outer run in `<dir>`,
 //! against the row's expectation compiled into this build.
 
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::bail;
 use test_device::contract::{
     self, Binding, CheckRule, Count, Event, Exit, ExitRule, Expectation, File, INNER, LINK,
-    Negative, RECORDER, RUN, RUNNER, RecordRule, Role, SINGLE,
+    Negative, RECORDER, RUN, RUNNER, RecordRule, Role, SINGLE, Spawned,
 };
 use test_device::evidence::Outcome;
 
@@ -99,13 +100,16 @@ fn n1(row: &'static str, failing: Option<&'static str>) -> Expectation {
             ExitRule {
                 role: SINGLE,
                 process: RUNNER,
-                writes: None,
+                spawn: None,
                 exit: Exit::Code(0),
             },
             ExitRule {
                 role: SINGLE,
                 process: "recorder",
-                writes: Some(rec),
+                spawn: Some(Spawned {
+                    role: SINGLE,
+                    name: "recorder",
+                }),
                 exit: Exit::Code(0),
             },
         ],
@@ -203,26 +207,32 @@ fn sink_kill() -> Expectation {
             ExitRule {
                 role: SINGLE,
                 process: RUNNER,
-                writes: None,
+                spawn: None,
                 exit: Exit::Code(0),
             },
             ExitRule {
                 role: SINGLE,
                 process: "recorder",
-                writes: Some(rec),
+                spawn: Some(Spawned {
+                    role: SINGLE,
+                    name: "recorder",
+                }),
                 exit: Exit::Code(0),
             },
             ExitRule {
                 role: INNER,
                 process: RUNNER,
-                writes: None,
+                spawn: None,
                 exit: Exit::Killed,
             },
             // The outer's record of that kill.
             ExitRule {
                 role: SINGLE,
                 process: "inner",
-                writes: Some(file(INNER, RUN)),
+                spawn: Some(Spawned {
+                    role: SINGLE,
+                    name: INNER,
+                }),
                 exit: Exit::Killed,
             },
             // The inner's recorder ends with its input or with the inner's
@@ -230,7 +240,10 @@ fn sink_kill() -> Expectation {
             ExitRule {
                 role: SINGLE,
                 process: "inner-recorder",
-                writes: Some(file(INNER, RECORDER)),
+                spawn: Some(Spawned {
+                    role: INNER,
+                    name: "recorder",
+                }),
                 exit: Exit::Code(0),
             },
         ],
@@ -270,22 +283,22 @@ fn expectation(rows: &[Row], row: &str) -> Option<Expectation> {
 ///
 /// An unknown row, or any mismatch.
 pub fn check(row: &str, dir: &Path) -> anyhow::Result<()> {
-    run(ROWS, row, dir)
+    run(ROWS, row, dir, &mut std::io::stdout().lock())
 }
 
-fn run(rows: &[Row], row: &str, dir: &Path) -> anyhow::Result<()> {
+/// As [`check`], printing to `out`.
+fn run(rows: &[Row], row: &str, dir: &Path, out: &mut dyn Write) -> anyhow::Result<()> {
     let Some(e) = expectation(rows, row) else {
         bail!("no row `{row}`: this build compiles no expectation for it");
     };
     let report = contract::check(&e, dir, super::COMMIT);
     for n in &report.notes {
-        println!("note: {n}");
+        writeln!(out, "note: {n}")?;
     }
     for m in &report.mismatches {
-        println!("{m}");
+        writeln!(out, "{m}")?;
     }
-    let last = report.last_line(row);
-    println!("{last}");
+    writeln!(out, "{}", report.last_line(row))?;
     if report.ok() {
         Ok(())
     } else {
@@ -308,7 +321,7 @@ mod tests {
             exits: vec![ExitRule {
                 role: SINGLE,
                 process: RUNNER,
-                writes: None,
+                spawn: None,
                 exit: Exit::Code(0),
             }],
             records: vec![],
@@ -357,10 +370,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rows: &[Row] = &[("bare", bare)];
         // An empty folder: no run.jsonl.
-        let e = run(rows, "bare", dir.path()).unwrap_err().to_string();
+        let mut out = Vec::new();
+        let e = run(rows, "bare", dir.path(), &mut out)
+            .unwrap_err()
+            .to_string();
         assert_eq!(e, "the run does not match row `bare`'s expectation");
+        let printed = String::from_utf8(out).unwrap();
+        // The last line is printed once, last; the error does not repeat it.
+        assert_eq!(printed.matches("CONTRACT").count(), 1, "{printed}");
+        assert!(printed.ends_with("CONTRACT bare mismatch 1\n"), "{printed}");
+        assert!(!e.contains("CONTRACT"), "{e}");
         let start = format!(
-            r#"{{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"bare","role":"run","build":"0123456789ab","process":{{"pid":1,"created":2}},"commit":"{}","tag":7,"args":[]}}"#,
+            r#"{{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"bare","role":"run","build":"0123456789ab","process":{{"pid":1,"created":2}},"commit":"{}","tag":7,"cut":1073741825,"args":[]}}"#,
             super::super::COMMIT
         );
         let end = r#"{"t":"end","exit":0,"errors":[]}"#;
@@ -377,6 +398,8 @@ mod tests {
             format!("{verdict}\n"),
         )
         .unwrap();
-        run(rows, "bare", dir.path()).unwrap();
+        let mut out = Vec::new();
+        run(rows, "bare", dir.path(), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "CONTRACT bare ok\n");
     }
 }

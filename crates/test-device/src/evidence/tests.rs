@@ -1,6 +1,6 @@
 use super::*;
 
-const START: &str = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"sink","role":"run","build":"0123456789ab","process":{"pid":7,"created":11},"commit":"fedcba987654","tag":7,"args":["--build","0123456789ab"],"set":null}"#;
+const START: &str = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"sink","role":"run","build":"0123456789ab","process":{"pid":7,"created":11},"commit":"fedcba987654","tag":7,"cut":1073741831,"args":["--build","0123456789ab"],"set":null}"#;
 const SEAL: &str = r#"{"t":"seal","run":"0123456789abcdef0123456789abcdef","role":"run","path":"link.jsonl","sha256":"00"}"#;
 const END: &str = r#"{"t":"end","exit":0,"errors":[]}"#;
 
@@ -187,7 +187,7 @@ fn a_killed_stream_needs_its_observed_exit() {
 #[test]
 fn the_link_stream_reads_what_the_link_writes() {
     let lines = [
-        r#"{"com":"COM4","freq":10000000,"location":"PCIROOT(0)#USBROOT(0)#USB(12)","path":"\\\\?\\USB#VID_1209&PID_0001&MI_02#x","q":5,"t":"open"}"#,
+        r#"{"com":"COM4","freq":10000000,"location":"PCIROOT(0)#USBROOT(0)#USB(12)","path":"\\\\?\\USB#VID_1209&PID_0001&MI_02#x","process":{"created":11,"pid":7},"q":5,"run":"0123456789abcdef0123456789abcdef","t":"open"}"#,
         r#"{"line":"hello 2 build 0123456789ab mode 24","q":6,"t":"ans"}"#,
         r#"{"line":"ping 1","q":7,"t":"cmd"}"#,
         r#"{"cmd":"ping 1","line":"pong 1 99","q":9,"sent":7,"t":"ans"}"#,
@@ -234,6 +234,44 @@ fn verdict_lines_read_strictly() {
     let mut cut = file(&[line]);
     cut.extend_from_slice(line.as_bytes());
     assert!(read::<Verdict>(&cut).unwrap().finished(false).is_err());
+}
+
+/// The runner's children: started, terminated, observed ended.
+#[test]
+fn the_runner_s_children_read() {
+    let spawn = r#"{"t":"spawn","q":1,"name":"recorder","process":{"pid":8,"created":12}}"#;
+    let kill = r#"{"t":"kill","q":2,"name":"recorder","process":{"pid":8,"created":12}}"#;
+    let exit = r#"{"t":"exit","q":3,"name":"recorder","process":{"pid":8,"created":12},"code":1073741831}"#;
+    let s = read_run(&file(&[START, spawn, kill, exit, END])).unwrap();
+    assert_eq!(s.records.len(), 5);
+    let Run::Start(start) = &s.records[0] else {
+        panic!("{s:?}")
+    };
+    assert_eq!(start.cut, 0x4000_0007);
+    assert_eq!(s.records[3].q(), Some(3));
+    // An exit says nothing of who ended it: its code does.
+    let killed = exit.replace(r#""code":1073741831"#, r#""code":0,"killed":true"#);
+    assert!(record_error(&file(&[START, &killed])).contains("unknown field"));
+}
+
+/// Every stream's first record names its run and its writer.
+#[test]
+fn a_stream_s_first_record_names_its_run_and_writer() {
+    let ready = r#"{"t":"ready","q":1,"run":"0123456789abcdef0123456789abcdef","process":{"pid":8,"created":12},"window":5,"location":"L","keyboard":null,"pad":null}"#;
+    let end = r#"{"t":"end","q":2}"#;
+    assert!(read::<Recorder>(&file(&[ready, end])).is_ok());
+    let anonymous = ready.replace(r#""run":"0123456789abcdef0123456789abcdef","#, "");
+    assert!(matches!(
+        read::<Recorder>(&file(&[&anonymous, end])),
+        Err(Error::Record { line: 1, .. })
+    ));
+}
+
+/// JSON whitespace may lead a record; anything else than an object may not.
+#[test]
+fn whitespace_may_lead_a_record() {
+    let spaced = format!(" \t{END}");
+    assert!(read_run(&file(&[START, &spaced])).unwrap().ended);
 }
 
 #[test]
