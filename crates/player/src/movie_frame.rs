@@ -15,11 +15,12 @@
 //! same frame. It shows its newest frame once one was taken on the screen,
 //! and nothing before. Anything else shows nothing.
 //!
-//! The planes are reserved when a movie is admitted and the arrays are
-//! smaller than it, never otherwise: that is a screen's preparation, which
-//! allocates on the GPU, and stays outside the app region. Under
-//! dev-tools the region covers each peek and each take, inside the
-//! upload's mapping, and nothing of wgpu's.
+//! A movie's planes are reserved at its slot's size when it is admitted,
+//! never otherwise and never another slot's: that is the movie's
+//! preparation, which allocates on the GPU, and stays outside the app
+//! region. A peer's admission leaves a movie's planes and its shown frame
+//! as they are. Under dev-tools the region covers each peek and each take,
+//! inside the upload's mapping, and nothing of wgpu's.
 //!
 //! Every slot's state is made when the screen's movies are opened: the hook
 //! allocates nothing, panics nowhere and never waits on the media session.
@@ -43,28 +44,22 @@ pub type Fill<'a> = dyn FnMut(&mut dyn FnMut(usize, &[u8]) -> bool, [usize; 2]) 
 
 /// Where a movie's frames go: the renderer's movie planes, or a test's.
 pub trait Planes {
-    /// Replaces the planes with room for `layers` movies up to `width` ×
-    /// `height` ([`render::Renderer::video_reserve`]).
-    fn reserve(&mut self, width: u32, height: u32, layers: u32);
-    /// Writes a frame of `width` × `height` into layer `layer` through
+    /// Replaces slot `slot`'s planes with ones of a movie of `width` ×
+    /// `height`, the other slot's left as they are
+    /// ([`render::Renderer::video_reserve`]).
+    fn reserve(&mut self, slot: u32, width: u32, height: u32);
+    /// Writes a frame of `width` × `height` into slot `slot` through
     /// `fill` ([`render::Renderer::video_write_with`]): whether it did.
-    fn write(&mut self, layer: u32, width: u32, height: u32, fill: &mut Fill<'_>) -> bool;
-    /// The uv a movie of `width` × `height` is sampled at
-    /// ([`render::Renderer::video_uv`]).
-    fn uv(&self, width: u32, height: u32) -> [f32; 4];
+    fn write(&mut self, slot: u32, width: u32, height: u32, fill: &mut Fill<'_>) -> bool;
 }
 
 impl Planes for render::Renderer {
-    fn reserve(&mut self, width: u32, height: u32, layers: u32) {
-        self.video_reserve(width, height, layers);
+    fn reserve(&mut self, slot: u32, width: u32, height: u32) {
+        self.video_reserve(slot, width, height);
     }
 
-    fn write(&mut self, layer: u32, width: u32, height: u32, fill: &mut Fill<'_>) -> bool {
-        self.video_write_with(layer, width, height, |sink, pitch| fill(sink, pitch))
-    }
-
-    fn uv(&self, width: u32, height: u32) -> [f32; 4] {
-        self.video_uv(width, height)
+    fn write(&mut self, slot: u32, width: u32, height: u32, fill: &mut Fill<'_>) -> bool {
+        self.video_write_with(slot, width, height, |sink, pitch| fill(sink, pitch))
     }
 }
 
@@ -233,9 +228,9 @@ impl<S: Source> Slot<S> {
 /// A screen's movies, by slot, with what the hook keeps of each.
 pub struct Movies<S = Movie> {
     slots: [Slot<S>; MAX_MOVIES],
-    /// The planes' size and layers as last reserved through this value;
-    /// zero before.
-    reserved: [u32; 3],
+    /// Each slot's planes' size as last reserved through this value; zero
+    /// before.
+    reserved: [[u32; 2]; MAX_MOVIES],
     /// The screen's preparation deadline (L5).
     deadline: Instant,
 }
@@ -247,7 +242,7 @@ impl<S: Source> Movies<S> {
         let [a, b] = movies;
         Self {
             slots: [Slot::new(a), Slot::new(b)],
-            reserved: [0; 3],
+            reserved: [[0; 2]; MAX_MOVIES],
             deadline: preparation_deadline(start),
         }
     }
@@ -332,7 +327,7 @@ impl<S: Source> Movies<S> {
                         s.bt601 = live.bt601;
                         s.full = live.full;
                     }
-                    self.reserve(planes, live.width, live.height);
+                    self.reserve(planes, i, live.width, live.height);
                 }
             }
         }
@@ -392,7 +387,7 @@ impl<S: Source> Movies<S> {
         }
         if slot.shown {
             MovieShow::Frame {
-                uv: planes.uv(width, height),
+                uv: render::VIDEO_UV,
                 layer: u16::try_from(i).unwrap_or(u16::MAX),
                 size: [width, height],
                 bt601: slot.bt601,
@@ -403,19 +398,19 @@ impl<S: Source> Movies<S> {
         }
     }
 
-    /// Makes room in the planes for an admitted movie of `width` ×
-    /// `height`, when they are smaller: every movie's frame is then gone
-    /// from them until its next take.
-    fn reserve(&mut self, planes: &mut dyn Planes, width: u32, height: u32) {
-        let layers = u32::try_from(MAX_MOVIES).unwrap_or(u32::MAX);
-        let [w, h, l] = self.reserved;
-        if width <= w && height <= h && layers <= l {
+    /// Makes slot `i`'s planes those of its admitted movie of `width` ×
+    /// `height`, unless they are already: that slot's frame is then gone
+    /// from them until its next take. Another slot's planes and frame stay.
+    fn reserve(&mut self, planes: &mut dyn Planes, i: usize, width: u32, height: u32) {
+        let Some(reserved) = self.reserved.get_mut(i) else {
+            return;
+        };
+        if *reserved == [width, height] {
             return;
         }
-        let (w, h) = (w.max(width), h.max(height));
-        planes.reserve(w, h, layers);
-        self.reserved = [w, h, layers];
-        for s in &mut self.slots {
+        planes.reserve(u32::try_from(i).unwrap_or(u32::MAX), width, height);
+        *reserved = [width, height];
+        if let Some(s) = self.slots.get_mut(i) {
             s.shown = false;
         }
     }

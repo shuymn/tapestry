@@ -130,7 +130,9 @@ pub use upload::{
     ChartBands, Payload, Refused, StagingEnd, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE,
     UploadGate, UploadState, Uploaded,
 };
-pub use video::{FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES};
+pub use video::{
+    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES, VIDEO_UV,
+};
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).
 #[cfg(feature = "dev-tools")]

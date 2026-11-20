@@ -189,9 +189,12 @@ struct Proj {
 @group(0) @binding(3) var<uniform> proj: Proj;
 @group(0) @binding(4) var pool: texture_2d_array<f32>;
 @group(1) @binding(0) var bga: texture_2d_array<f32>;
-@group(2) @binding(0) var video_y: texture_2d_array<f32>;
-@group(2) @binding(1) var video_u: texture_2d_array<f32>;
-@group(2) @binding(2) var video_v: texture_2d_array<f32>;
+@group(2) @binding(0) var video_y0: texture_2d<f32>;
+@group(2) @binding(1) var video_u0: texture_2d<f32>;
+@group(2) @binding(2) var video_v0: texture_2d<f32>;
+@group(2) @binding(3) var video_y1: texture_2d<f32>;
+@group(2) @binding(4) var video_u1: texture_2d<f32>;
+@group(2) @binding(5) var video_v1: texture_2d<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -226,9 +229,12 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // the BGA bit reads the BGA array instead, at level 0 by explicit level:
 // bilinear, or at the nearest texel with the nearest bit, and with the key
 // bit a pure black texel is transparent. A sprite with the video bit
-// reads its movie's Y, U and V planes bilinearly at level 0 and converts
-// them by the movie's matrix and range to opaque R'G'B' (limited range
-// expanded from 16-235 luma and 16-240 chroma, full range read as is).
+// reads its movie's (the layer's slot) Y, U and V planes bilinearly at
+// level 0 and converts them by the movie's matrix and range to opaque
+// R'G'B' (limited range expanded from 16-235 luma and 16-240 chroma, full
+// range read as is). Each plane is the movie's own size, so its edge
+// clamps to its own texels; a chroma plane's uv is scaled by its luma
+// width over twice its own, the half of an odd side rounded up.
 //
 // A quad with the pool bit samples the chart-image pool instead, by the
 // same filters, never the built-in read (its layer 0 holds ordinary
@@ -272,11 +278,25 @@ fn tinted(v: VOut) -> vec4f {
     return c * v.color;
 }
 
+// A movie's raw Y, U and V at luma `uv` from its planes `y`, `u` and `v`.
+fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f) -> vec3f {
+    let cuv = uv * vec2f(textureDimensions(y)) / (2.0 * vec2f(textureDimensions(u)));
+    return vec3f(
+        textureSampleLevel(y, smooth_samp, uv, 0.0).r,
+        textureSampleLevel(u, smooth_samp, cuv, 0.0).r,
+        textureSampleLevel(v, smooth_samp, cuv, 0.0).r,
+    );
+}
+
 // A movie's texel: Y'CbCr by its matrix and range to opaque R'G'B'.
 fn movie(uv: vec2f, layer: i32, flags: u32) -> vec4f {
-    let y0 = textureSampleLevel(video_y, smooth_samp, uv, layer, 0.0).r;
-    let u0 = textureSampleLevel(video_u, smooth_samp, uv, layer, 0.0).r;
-    let v0 = textureSampleLevel(video_v, smooth_samp, uv, layer, 0.0).r;
+    var s = yuv(video_y0, video_u0, video_v0, uv);
+    if layer == 1 {
+        s = yuv(video_y1, video_u1, video_v1, uv);
+    }
+    let y0 = s.x;
+    let u0 = s.y;
+    let v0 = s.z;
     var y = (y0 * 255.0 - 16.0) / 219.0;
     var cb = (u0 * 255.0 - 128.0) / 224.0;
     var cr = (v0 * 255.0 - 128.0) / 224.0;
@@ -1572,7 +1592,7 @@ struct Bindings {
     nearest: wgpu::Sampler,
     /// The second group's layout: the BGA array.
     bga: wgpu::BindGroupLayout,
-    /// The third group's layout: the movies' plane arrays.
+    /// The third group's layout: the movies' planes, by slot.
     video: wgpu::BindGroupLayout,
     /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
     projection: wgpu::Buffer,
@@ -1677,7 +1697,7 @@ pub struct Renderer {
     text_counts: Vec<(u64, crate::TextCount)>,
     #[cfg(feature = "dev-tools")]
     text_last: Option<(LoadingTextKey, [u32; 2], u64, u64)>,
-    /// The movies' plane arrays and upload buffer.
+    /// The movies' planes and upload buffers, by slot.
     video: crate::video::Video,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
@@ -6469,36 +6489,29 @@ impl Renderer {
         self.skin.set_movies(movies);
     }
 
-    /// Replaces the movies' plane arrays and upload buffer with room for
-    /// `layers` movies (at most [`crate::VIDEO_MAX_MOVIES`]) up to
-    /// `width` × `height`: a screen's preparation, never a frame's work.
-    pub fn video_reserve(&mut self, width: u32, height: u32, layers: u32) {
-        self.video.reserve(&self.gpu, width, height, layers);
+    /// Replaces movie slot `slot`'s planes and upload buffer with ones of
+    /// a movie of `width` × `height`: its admission, never a frame's
+    /// upload. The other slot keeps its planes, frame and queued copy.
+    pub fn video_reserve(&mut self, slot: u32, width: u32, height: u32) {
+        self.video.reserve(&self.gpu, slot, width, height);
     }
 
     /// The movie hook's upload: `fill` writes a frame of `width` ×
-    /// `height` into movie layer `layer`'s region of the mapped upload
-    /// buffer through the sink it is given (a byte offset and the bytes),
-    /// each plane's rows at the pitch it is given (luma, chroma), and says
-    /// whether the frame is whole; the next frame drawn then copies it
-    /// into the planes before its pass. `false` when the frame does not
-    /// fit the planes, the buffer cannot be mapped or `fill` says no; the
-    /// planes then keep the frame they hold.
+    /// `height` into movie slot `slot`'s mapped upload buffer through the
+    /// sink it is given (a byte offset and the bytes), each plane's rows
+    /// at the pitch it is given (luma, chroma), and says whether the frame
+    /// is whole; the next frame drawn then copies it into the slot's
+    /// planes before its pass. `false` when the frame is not the size the
+    /// slot was reserved for, the buffer cannot be mapped or `fill` says
+    /// no; the planes then keep the frame they hold.
     pub fn video_write_with(
         &mut self,
-        layer: u32,
+        slot: u32,
         width: u32,
         height: u32,
         fill: impl FnOnce(&mut dyn FnMut(usize, &[u8]) -> bool, [usize; 2]) -> bool,
     ) -> bool {
-        self.video.write_with(&self.gpu, layer, width, height, fill)
-    }
-
-    /// The uv a quad of a movie of `width` × `height` samples in the
-    /// planes.
-    #[must_use]
-    pub fn video_uv(&self, width: u32, height: u32) -> [f32; 4] {
-        self.video.uv(width, height)
+        self.video.write_with(&self.gpu, slot, width, height, fill)
     }
 
     /// Publishes `entries` as the BGA table of the array `key` names

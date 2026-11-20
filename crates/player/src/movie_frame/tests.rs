@@ -104,7 +104,8 @@ impl Source for Fake {
     }
 }
 
-/// Planes that keep the luma rows each write took, by layer.
+/// Planes that keep the luma rows each write took, by slot; a slot's
+/// reservation empties that slot's.
 #[derive(Default)]
 struct Kept {
     reserved: Vec<[u32; 3]>,
@@ -113,8 +114,9 @@ struct Kept {
 }
 
 impl Planes for Kept {
-    fn reserve(&mut self, width: u32, height: u32, layers: u32) {
-        self.reserved.push([width, height, layers]);
+    fn reserve(&mut self, slot: u32, width: u32, height: u32) {
+        self.reserved.push([slot, width, height]);
+        self.luma[slot as usize].clear();
     }
 
     fn write(&mut self, layer: u32, width: u32, height: u32, fill: &mut Fill<'_>) -> bool {
@@ -135,10 +137,6 @@ impl Planes for Kept {
             self.luma[layer as usize] = bytes[..pitch[0] * height as usize].to_vec();
         }
         whole
-    }
-
-    fn uv(&self, width: u32, height: u32) -> [f32; 4] {
-        [0.0, 0.0, width as f32, height as f32]
     }
 }
 
@@ -200,7 +198,7 @@ fn each_state_shows_what_it_should() {
     assert_eq!(
         shows[1],
         MovieShow::Frame {
-            uv: [0.0, 0.0, 16.0, 8.0],
+            uv: render::VIDEO_UV,
             layer: 1,
             size: [16, 8],
             bt601: true,
@@ -209,7 +207,7 @@ fn each_state_shows_what_it_should() {
     );
     assert!(b.staged.load(Ordering::SeqCst));
     assert_eq!(b.freed.load(Ordering::SeqCst), 1);
-    assert_eq!(planes.reserved, [[16, 8, 2]]);
+    assert_eq!(planes.reserved, [[1, 16, 8]]);
     assert!(planes.luma[1].iter().all(|&v| v == 9));
     // Live with no new frame: the last one still shows.
     assert!(matches!(
@@ -272,7 +270,7 @@ fn a_movie_past_the_total_is_refused_and_draws_nothing() {
     assert_eq!(b.loss(), Some(Loss::OverTotal));
     // Refused stays nothing, never black.
     assert_eq!(m.frame(&mut planes, 10, start)[1], MovieShow::Nothing);
-    assert_eq!(planes.reserved, [[2560, 1440, 2]]);
+    assert_eq!(planes.reserved, [[0, 2560, 1440]]);
 }
 
 #[test]
@@ -306,6 +304,37 @@ fn a_ring_fault_loses_the_movie_in_that_frame_and_it_stays_black() {
     assert_eq!(b.loss(), None);
 }
 
+/// A movie keeps its planes and its shown frame when a larger peer is
+/// admitted: only the peer's slot is reserved, and the movie's frame
+/// stays shown on the frame of the admission and after it.
+#[test]
+fn a_peer_s_admission_leaves_a_movie_s_planes_and_frame() {
+    let start = Instant::now();
+    let (a, b) = (Fake::new(640, 360), Fake::new(1280, 720));
+    a.set(Status::Live);
+    a.publish(1, 0, 7);
+    let mut m = movies(Some(&a), Some(&b), start);
+    let mut planes = Kept::default();
+    assert!(matches!(
+        m.frame(&mut planes, 0, start)[0],
+        MovieShow::Frame { .. }
+    ));
+    b.set(Status::Live);
+    b.publish(1, 10, 9);
+    let shows = m.frame(&mut planes, 10, start);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }), "{shows:?}");
+    assert!(matches!(shows[1], MovieShow::Frame { .. }), "{shows:?}");
+    assert_eq!(planes.reserved, [[0, 640, 360], [1, 1_280, 720]]);
+    assert!(
+        !planes.luma[0].is_empty() && planes.luma[0].iter().all(|&v| v == 7),
+        "the movie's frame stays in its planes"
+    );
+    assert!(matches!(
+        m.frame(&mut planes, 20, start)[0],
+        MovieShow::Frame { .. }
+    ));
+}
+
 #[test]
 fn the_preparation_deadline_loses_what_is_not_settled() {
     let start = Instant::now();
@@ -333,7 +362,7 @@ struct Preallocated {
 
 #[cfg(feature = "dev-tools")]
 impl Planes for Preallocated {
-    fn reserve(&mut self, _width: u32, _height: u32, _layers: u32) {}
+    fn reserve(&mut self, _slot: u32, _width: u32, _height: u32) {}
 
     fn write(&mut self, _layer: u32, width: u32, _height: u32, fill: &mut Fill<'_>) -> bool {
         let pitch = [width as usize, width.div_ceil(2) as usize];
@@ -348,10 +377,6 @@ impl Planes for Preallocated {
             },
             pitch,
         )
-    }
-
-    fn uv(&self, width: u32, height: u32) -> [f32; 4] {
-        [0.0, 0.0, width as f32, height as f32]
     }
 }
 
