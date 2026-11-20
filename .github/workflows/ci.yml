@@ -98,27 +98,8 @@ jobs:
           cmd-format: mise exec -- {0}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # tapestry's FFmpeg release (docs/setup.md "FFmpeg"): fetched here and
-      # refused unless its sha256 is ffmpeg.toml's, kept in a cache keyed by
-      # that sha256. With no release pinned, fetch says so and does nothing.
-      - name: Read the pinned FFmpeg release
-        id: ffmpeg
-        run: |
-          sha=$(python -c 'import tomllib; r = tomllib.load(open("ffmpeg.toml", "rb")).get("release"); print(r["binary"]["sha256"] if r else "")')
-          echo "sha256=$sha" | tee -a "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: ffmpeg-cache
-        if: steps.ffmpeg.outputs.sha256 != ''
-        with:
-          path: target/ffmpeg
-          key: ffmpeg-${{ steps.ffmpeg.outputs.sha256 }}
-      - name: Fetch FFmpeg
-        run: mise exec -- cargo xtask ffmpeg fetch
-      - if: github.ref == 'refs/heads/main' && steps.ffmpeg.outputs.sha256 != '' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/ffmpeg
-          key: ffmpeg-${{ steps.ffmpeg.outputs.sha256 }}
+      # The player's build script requires tapestry's FFmpeg release.
+      - uses: ./.github/actions/fetch-ffmpeg
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Clippy
@@ -163,6 +144,7 @@ jobs:
       # (docs/setup.md "Benchmarks"); bench.yml measures.
       - name: Benchmarks run once
         run: mise exec -- cargo bench --locked -p render --bench skin -- --test
+      - uses: ./.github/actions/fetch-ffmpeg
       - name: Production build
         run: mise exec -- cargo build --release --locked -p player --no-default-features
       # The allocation contracts also hold with optimizations (design.md
@@ -177,9 +159,26 @@ jobs:
       # checks the name against the test target.
       - name: Chart memory ceiling (release)
         run: mise exec -- cargo nextest run --release --locked -p bms-parser --test memory --run-ignored only -- --exact measure_load_peaks
+      # The media worker imports no graphics DLL and the game no FFmpeg DLL
+      # (design.md "Threat Model" T02).
+      - name: Executables' imports (release)
+        run: mise exec -- cargo xtask ffmpeg check-exes target/release
       - name: Production excludes dev-tools
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
+          mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry-media.exe
+          # The media worker's development arguments.
+          for arg in --dev-tools-probe --dev-gen-clip --dev-secondary-open --dev-max-alloc \
+              --dev-no-codec-list --dev-refuse-at-park --dev-probe --dev-silent \
+              --dev-deaf --dev-flood; do
+            set +e
+            target/release/tapestry-media.exe "$arg" x 2> probe.err
+            code=$?
+            set -e
+            cat probe.err
+            test "$code" -eq 2
+            grep -q "unknown argument: $arg" probe.err
+          done
           # Each development argument, alone and in the `play` form a
           # development build takes, and the `measure` command (the
           # dev-tools tests are the positive control).
@@ -257,6 +256,7 @@ jobs:
           cache-bin: false
           shared-key: windows-dev-tools
           save-if: ${{ github.ref == 'refs/heads/main' && env.PART == '1' }}
+      - uses: ./.github/actions/fetch-ffmpeg
       - name: Clippy (dev-tools)
         if: ${{ env.PART == '1' }}
         run: |
@@ -268,6 +268,8 @@ jobs:
           mise exec -- cargo build --locked -p player --features dev-tools
           mise exec -- cargo xtask check-binary --present "tapestry dev-tools enabled" target/debug/tapestry.exe
           target/debug/tapestry.exe --dev-tools-probe
+          mise exec -- cargo xtask check-binary --present "tapestry dev-tools enabled" target/debug/tapestry-media.exe
+          target/debug/tapestry-media.exe --dev-tools-probe
       # The partitions together list each test of the unpartitioned run
       # exactly once, so no test leaves CI unnoticed.
       - name: Partitions cover every test (dev-tools)

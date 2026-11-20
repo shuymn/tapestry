@@ -46,6 +46,11 @@ mod loading_text;
 mod log_file;
 mod loudness;
 mod measure;
+#[expect(
+    dead_code,
+    reason = "the media worker's host lands before the change that plays videos through it"
+)]
+mod media_host;
 mod menu_screen;
 mod page_jobs;
 mod play;
@@ -180,6 +185,8 @@ fn main() -> ExitCode {
         Command::MeasureSelect => report(measure_select(clock)),
         #[cfg(feature = "dev-tools")]
         Command::Scenario(s) => report(dev::scenario::run(s, clock)),
+        #[cfg(feature = "dev-tools")]
+        Command::TestDevice(t) => report(dev::test_device::run(t)),
     };
     // The transition probe's marks, whatever the command, unless its run
     // printed them already (a scenario, before its transition record).
@@ -194,7 +201,7 @@ fn logged(command: &Command) -> Option<&'static str> {
     match command {
         Command::Version => None,
         #[cfg(feature = "dev-tools")]
-        Command::DevToolsProbe => None,
+        Command::DevToolsProbe | Command::TestDevice(_) => None,
         Command::Keys(_) => Some("keys"),
         Command::Play(_) => Some("play"),
         Command::Select(_) => Some("select"),

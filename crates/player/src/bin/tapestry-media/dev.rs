@@ -1,0 +1,293 @@
+//! The worker's development commands (dev-tools only):
+//!
+//! - `--dev-tools-probe`: prints the dev-tools marker.
+//! - `--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>`:
+//!   encodes a synthesized clip through the build's encoder and muxer of
+//!   those FFmpeg names. Frame `i` shows `i` in its top row of 16 × 16
+//!   blocks, bit `b` of `i` in block `b` (luma 235 for a one, 16 for a
+//!   zero), over a pattern that moves with `i`.
+//! - `--dev-secondary-open <file> <refuse|default>`: opens `file` as the
+//!   worker opens a video, with its own `io_open` or FFmpeg's, and prints
+//!   what a secondary open through the opened file's context gives, as a
+//!   playlist or a reference would make it.
+//! - `--dev-max-alloc <bytes>`: serves the control pipe with FFmpeg's
+//!   largest allocation lowered to `bytes`.
+//! - `--dev-no-codec-list`: serves the control pipe with FFmpeg's codec
+//!   whitelist left unset at every open, as an allocation refused while it
+//!   is set would leave it.
+//! - `--dev-refuse-at-park`: serves the control pipe with an allocation
+//!   refused for the player each time it parks its decoder at a video's end
+//!   (the park seam), as a decoder's thread still at work when its other
+//!   thread gave the end would refuse one.
+//! - `--dev-probe <probe>…`: answers the hello, then tries what the
+//!   sandbox denies the worker and what it leaves it ([`probe`]).
+//! - `--dev-silent <ms>`: waits `ms` milliseconds without answering the
+//!   game's launch, then exits.
+//! - `--dev-deaf`: answers the hello, then never reads its commands.
+//! - `--dev-flood <n>`: answers the hello and, at the game's first
+//!   command, sends `n` replies the game never asked for, as fast as the
+//!   pipe takes them, then waits.
+//! - `--dev-balloon <step> <total> [<last> [free]]`: answers the hello and
+//!   serves the control pipe while a thread commits memory the worker never
+//!   frees, `step` MiB at a time about 10 ms apart up to `total` MiB and
+//!   then `last` MiB at once, which `free` releases at once, logging each
+//!   commit, release and a refusal's error code, after which it commits no
+//!   more ([`balloon`]).
+
+mod probe;
+
+use std::ffi::OsString;
+use std::process::ExitCode;
+
+use crate::ffmpeg::{self, Clip, Input, IoOpen};
+use crate::os::Source;
+
+/// The marker a dev-tools build prints and holds.
+const MARKER: &str = "tapestry dev-tools enabled";
+
+/// Runs the development command `args` names, or `None` when it names
+/// none.
+pub fn run(args: &[OsString]) -> Option<ExitCode> {
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let (command, rest) = args.split_first()?;
+    let result = match command.as_str() {
+        "--dev-tools-probe" => {
+            println!("{MARKER}");
+            Ok(())
+        }
+        "--dev-gen-clip" => gen_clip(rest),
+        "--dev-secondary-open" => secondary_open(rest),
+        "--dev-no-codec-list" => {
+            return Some(match rest {
+                [] => {
+                    ffmpeg::leave_codec_list_unset();
+                    crate::serve(ffmpeg::MAX_ALLOC)
+                }
+                _ => usage("--dev-no-codec-list"),
+            });
+        }
+        "--dev-refuse-at-park" => {
+            return Some(match rest {
+                [] => {
+                    ffmpeg::refuse_while_parked();
+                    crate::serve(ffmpeg::MAX_ALLOC)
+                }
+                _ => usage("--dev-refuse-at-park"),
+            });
+        }
+        "--dev-max-alloc" => {
+            return Some(match rest {
+                [bytes] => match bytes.parse() {
+                    Ok(bytes) => crate::serve(bytes),
+                    Err(e) => usage(&format!("--dev-max-alloc {bytes}: {e}")),
+                },
+                _ => usage("--dev-max-alloc <bytes>"),
+            });
+        }
+        "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-balloon" => return Some(balloon(rest)),
+        "--dev-deaf" => {
+            let _ = crate::hello(ffmpeg::MAX_ALLOC);
+            wait_for_ever()
+        }
+        "--dev-flood" => match rest {
+            [n] => n
+                .parse::<u64>()
+                .map(|n| {
+                    let out = crate::hello(ffmpeg::MAX_ALLOC);
+                    // After the launch has taken the hello.
+                    let _ = crate::read_command(&mut std::io::stdin().lock());
+                    for _ in 0..n {
+                        out.send(&skin_model::media::control::Reply::Closed {
+                            id: skin_model::media::control::NO_COMMAND,
+                            player: 0,
+                        });
+                    }
+                    wait_for_ever()
+                })
+                .map_err(|e| format!("--dev-flood {n}: {e}")),
+            _ => Err("--dev-flood <n>".to_owned()),
+        },
+        "--dev-silent" => match rest {
+            [ms] => ms
+                .parse()
+                .map(|ms| std::thread::sleep(std::time::Duration::from_millis(ms)))
+                .map_err(|e| format!("--dev-silent {ms}: {e}")),
+            _ => Err("--dev-silent <ms>".to_owned()),
+        },
+        _ => return None,
+    };
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => usage(&e),
+    })
+}
+
+/// `--dev-balloon`: the memory the job's cap and its watcher are tested
+/// with. The worker's own limits bound single operations, the pixel cap a
+/// frame and the allocation cap each of FFmpeg's allocations, while the
+/// job's cap bounds the worker's commit in all (design.md "Threat Model"
+/// T02); the tests reach that cap by committing memory directly.
+fn balloon(args: &[String]) -> ExitCode {
+    let mib = |s: &String| s.parse::<usize>().map_err(|e| format!("{s}: {e}"));
+    let parsed = match args {
+        [step, total] => mib(step).and_then(|step| Ok((step, mib(total)?, 0))),
+        [step, total, last] => mib(step).and_then(|step| Ok((step, mib(total)?, mib(last)?))),
+        [step, total, last, free] if free == "free" => {
+            mib(step).and_then(|step| Ok((step, mib(total)?, mib(last)?)))
+        }
+        _ => Err("--dev-balloon <step> <total> [<last> [free]]".to_owned()),
+    };
+    let free = args.len() == 4;
+    let (step, total, last) = match parsed {
+        Ok((0, ..)) => return usage("--dev-balloon: a step of 0 MiB"),
+        Ok(sizes) => sizes,
+        Err(e) => return usage(&e),
+    };
+    let out = crate::hello(ffmpeg::MAX_ALLOC);
+    let inflating = std::thread::Builder::new()
+        .name("balloon".to_owned())
+        .spawn(move || inflate(step, total, last, free));
+    if let Err(e) = inflating {
+        crate::say(&format!("balloon: its thread did not start: {e}"));
+    }
+    crate::serve_on(&out)
+}
+
+/// Commits `step` MiB at a time up to `total`, then `last` at once,
+/// released at once when `free` says so, stopping at the first refusal.
+fn inflate(step: usize, total: usize, last: usize, free: bool) {
+    use windows::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+    let mut committed = 0;
+    while committed < total {
+        let n = step.min(total - committed);
+        if commit(n).is_none() {
+            return;
+        }
+        committed += n;
+        crate::say(&format!("balloon: committed {committed} MiB"));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if last > 0
+        && let Some(region) = commit(last)
+    {
+        if free {
+            // SAFETY: the region just committed, which nothing else uses.
+            let freed = unsafe { VirtualFree(region, 0, MEM_RELEASE) };
+            crate::say(&format!(
+                "balloon: committed {} MiB and released {last} MiB ({freed:?})",
+                committed + last
+            ));
+        } else {
+            committed += last;
+            crate::say(&format!("balloon: committed {committed} MiB"));
+        }
+    }
+    crate::say("balloon: done");
+}
+
+/// Commits `mib` MiB the worker never touches: the region, or `None` when
+/// the commit was refused, the refusal logged with its error code.
+fn commit(mib: usize) -> Option<*mut std::ffi::c_void> {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    // SAFETY: a new private region, which nothing reads.
+    let region = unsafe { VirtualAlloc(None, mib << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    if region.is_null() {
+        // SAFETY: the calling thread's last error, which the refusal set.
+        let code = unsafe { GetLastError() }.0;
+        crate::say(&format!("balloon: {mib} MiB refused with {code}"));
+        return None;
+    }
+    Some(region)
+}
+
+/// Waits until the game ends the worker.
+fn wait_for_ever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Reports `message` and fails.
+fn usage(message: &str) -> ExitCode {
+    eprintln!("tapestry-media: {message}");
+    ExitCode::FAILURE
+}
+
+/// `--dev-gen-clip`.
+fn gen_clip(args: &[String]) -> Result<(), String> {
+    let [out, codec, format, size, rate, frames, gop] = args else {
+        return Err(
+            "--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>".to_owned(),
+        );
+    };
+    let number = |s: &str| s.parse::<i32>().map_err(|e| format!("{s}: {e}"));
+    let (w, h) = size
+        .split_once('x')
+        .ok_or_else(|| format!("{size}: not <W>x<H>"))?;
+    let clip = Clip {
+        codec: codec.clone(),
+        format: format.clone(),
+        width: number(w)?,
+        height: number(h)?,
+        rate: number(rate)?,
+        frames: frames.parse().map_err(|e| format!("{frames}: {e}"))?,
+        gop: number(gop)?,
+    };
+    if clip.width <= 0 || clip.height <= 0 || clip.rate <= 0 || clip.gop <= 0 {
+        return Err("sizes, the rate and the GOP are positive".to_owned());
+    }
+    let (w, h) = (clip.width.unsigned_abs(), clip.height.unsigned_abs());
+    ffmpeg::encode_clip(std::path::Path::new(out), &clip, &mut |i, frame| {
+        paint(i, w, h, frame);
+    })
+}
+
+/// Paints frame `i` of a `w` × `h` clip into `frame`, tight I420.
+fn paint(i: u32, w: u32, h: u32, frame: &mut [u8]) {
+    let (w, h) = (w as usize, h as usize);
+    let (luma, chroma) = frame.split_at_mut(w * h);
+    for (y, row) in luma.chunks_exact_mut(w).enumerate() {
+        for (x, p) in row.iter_mut().enumerate() {
+            let block = x / 16;
+            *p = if y < 16 && block < 16 && (block + 1) * 16 <= w {
+                if i >> block & 1 == 1 { 235 } else { 16 }
+            } else {
+                let v = (x + 2 * y + 3 * i as usize) % 160;
+                u8::try_from(48 + v).unwrap_or(128)
+            };
+        }
+    }
+    let (u, v) = chroma.split_at_mut(chroma.len() / 2);
+    let cw = w.div_ceil(2);
+    for (k, p) in u.iter_mut().enumerate() {
+        *p = u8::try_from(112 + (k % cw) % 32).unwrap_or(128);
+    }
+    for (k, p) in v.iter_mut().enumerate() {
+        *p = u8::try_from(112 + (k / cw + i as usize) % 32).unwrap_or(128);
+    }
+}
+
+/// `--dev-secondary-open`.
+fn secondary_open(args: &[String]) -> Result<(), String> {
+    let [file, io] = args else {
+        return Err("--dev-secondary-open <file> <refuse|default>".to_owned());
+    };
+    let io = match io.as_str() {
+        "refuse" => IoOpen::Refuse,
+        "default" => IoOpen::Default,
+        other => return Err(format!("{other}: not refuse or default")),
+    };
+    let file = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
+    let (mut input, _) = Input::open(Source::opened(file), io)
+        .map_err(|(why, code)| format!("refused: {why:?} {code}"))?;
+    let code = input.secondary_open(c"segment-0.ts");
+    println!("secondary open: {code}");
+    Ok(())
+}

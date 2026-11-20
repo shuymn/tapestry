@@ -2913,12 +2913,14 @@ fn result_cell(outcome: Outcome, exit: Exit, close: bool, looped: bool) {
             "{case}: the show's start"
         );
         assert_eq!(delta(probe), (own, [0; 3]), "{case}: the show");
+        // Read as kept once silent: a one-shot runs on the running clock,
+        // and an audio thread behind it plays the sound through at once.
         assert!(
-            wait_until(|| probe.reserved(kind).is_some()),
+            wait_until(|| probe.sounded(kind).is_some()),
             "{case}: the result's sound sounds"
         );
         assert_eq!(
-            probe.reserved(kind).map(|(_, l)| l),
+            probe.sounded(kind).map(|(_, l)| l),
             Some(looped),
             "{case}: looped as loop_result"
         );

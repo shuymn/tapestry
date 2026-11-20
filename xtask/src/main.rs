@@ -70,6 +70,8 @@ commands:
                                           release assets under target/ffmpeg-build
   ffmpeg fetch                            unpack ffmpeg.toml's pinned release into
                                           target/ffmpeg after checking its sha256
+  ffmpeg check-exes <dir>                 check the imports of the worker's and the
+                                          game's executables in a profile directory
   media fixtures [--record]               remake the committed video clips in the
                                           flake's `ffmpeg` shell and check them
                                           against their hashes; --record commits
