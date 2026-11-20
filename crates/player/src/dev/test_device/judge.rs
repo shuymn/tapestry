@@ -878,12 +878,14 @@ pub mod tests {
         assert_eq!(outcome(&f, "n1.quiet-before-close").0, Outcome::Fail);
     }
 
-    /// Every order, on the host's counter and in the stream, of the five
-    /// records the release evidence rests on: the fence, the `release`
-    /// written, its `ok` read, the `hello` written, and the evidence read
-    /// as its answer (each answer naming its command's write by `sent`).
-    /// The evidence stands exactly in the order fence, `release`, `ok`,
-    /// `hello`, answer, which is the positive control.
+    /// Every order of the five records the release evidence rests on (the
+    /// fence, the `release` written, its `ok` read, the `hello` written,
+    /// and the evidence read as its answer, each answer naming its
+    /// command's write by `sent`), once on the host's counter with the
+    /// stream in that order, and once in the stream alone with the counter
+    /// in the release order. The evidence stands exactly in the order
+    /// fence, `release`, `ok`, `hello`, answer, which is the positive
+    /// control of each.
     #[test]
     fn the_evidence_stands_only_in_the_release_order() {
         fn permutations(n: usize) -> Vec<Vec<usize>> {
@@ -902,30 +904,49 @@ pub mod tests {
         }
         let quiet = hello(true, "released", "-");
         let mut passed = 0;
-        for order in permutations(5) {
+        for (order, in_stream) in permutations(5)
+            .into_iter()
+            .flat_map(|o| [(o.clone(), false), (o, true)])
+        {
             // order[k]: the rank of record k (fence, release, ok, hello,
-            // answer) among the five.
-            let at = |k: usize| 5100 + i64::try_from(order[k]).unwrap() * 10;
-            let mut five = vec![
+            // answer) among the five, on the counter or in the stream.
+            let rank = |k: usize| i64::try_from(order[k]).unwrap();
+            let at = |k: usize| {
+                5100 + 10
+                    * if in_stream {
+                        i64::try_from(k).unwrap()
+                    } else {
+                        rank(k)
+                    }
+            };
+            let mut five: Vec<(usize, Value)> = [
                 json!({"t": "fence", "q": at(0)}),
                 json!({"t": "cmd", "q": at(1), "line": "release"}),
                 json!({"t": "ans", "q": at(2), "sent": at(1), "cmd": "release", "line": "ok"}),
                 json!({"t": "cmd", "q": at(3), "line": "hello"}),
                 json!({"t": "ans", "q": at(4), "sent": at(3), "cmd": "hello", "line": quiet}),
-            ];
-            five.sort_by_key(q);
+            ]
+            .into_iter()
+            .enumerate()
+            .collect();
+            // The stream follows the ranks in both cases.
+            five.sort_by_key(|(k, _)| order[*k]);
             let mut f = good();
             edit(&mut f.link, |l| {
                 let from = l.iter().position(|v| v["t"] == "fence").unwrap();
                 l.truncate(from);
-                l.extend(five);
+                l.extend(five.into_iter().map(|(_, v)| v));
             });
             let got = outcome(&f, "n1.quiet-before-close").0;
             let ordered = order == [0, 1, 2, 3, 4];
-            assert_eq!(got == Outcome::Pass, ordered, "{order:?}: {f:?}");
+            assert_eq!(
+                got == Outcome::Pass,
+                ordered,
+                "{order:?} {in_stream}: {f:?}"
+            );
             passed += usize::from(got == Outcome::Pass);
         }
-        assert_eq!(passed, 1, "the positive control");
+        assert_eq!(passed, 2, "the positive controls");
         // An answer bound to another write does not count: the `hello`
         // answered names an earlier `hello`'s write.
         let mut f = good();
