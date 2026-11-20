@@ -241,13 +241,21 @@ impl BgaArray {
             && u64::try_from(texels.len()).ok() == Some(u64::from(w) * u64::from(h) * 4)
     }
 
-    /// Queues `up`'s next rows, at most `budget` bytes as the queue stages
-    /// them (at least one row), each cell's texels dropped once its last
-    /// row is queued.
+    /// Writes `up`'s next rows through the uploader's write function,
+    /// `gate` read immediately before each write: at most `budget` bytes as
+    /// the queue stages them (at least one row), each cell's texels dropped
+    /// once its last row is written. The bytes staged, and the gate's
+    /// refusal that ended it, if one did: a refused band is kept.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) fn write_some(&self, gpu: &Gpu, up: &mut BgaUpload, budget: u64) {
+    pub(crate) fn write_some(
+        &self,
+        gpu: &Gpu,
+        up: &mut BgaUpload,
+        budget: u64,
+        gate: &mut dyn crate::UploadGate,
+    ) -> (u64, Option<crate::Refused>) {
         let Some(t) = &self.texture else {
-            return;
+            return (0, None);
         };
         let mut bytes = 0_u64;
         while let Some((place, texels)) = up.cells.get_mut(up.cell) {
@@ -256,7 +264,7 @@ impl BgaArray {
             let row = crate::text_upload::padded(w);
             let room = budget.saturating_sub(bytes) / row.max(1);
             if room == 0 && bytes > 0 {
-                return;
+                return (bytes, None);
             }
             let n = u32::try_from(room.max(1))
                 .unwrap_or(u32::MAX)
@@ -264,15 +272,22 @@ impl BgaArray {
             let stride = usize::try_from(w).unwrap_or(0) * 4;
             let from = usize::try_from(up.row).unwrap_or(0) * stride;
             let to = from + usize::try_from(n).unwrap_or(0) * stride;
-            if let Some(rows) = texels.get(from..to) {
-                crate::skin_atlas::write_region(
-                    gpu.queue(),
-                    t,
-                    (place.page, 0),
-                    [x, y + up.row],
-                    [w, n],
-                    rows,
-                );
+            if let Some(rows) = texels.get(from..to)
+                && let Err(r) = crate::upload::write(
+                    gpu,
+                    gate,
+                    crate::Payload::Bga,
+                    &crate::upload::Band {
+                        texture: t,
+                        layer: place.page,
+                        level: 0,
+                        origin: [x, y + up.row],
+                        size: [w, n],
+                        bytes: rows,
+                    },
+                )
+            {
+                return (bytes, Some(r));
             }
             bytes = bytes.saturating_add(row * u64::from(n));
             up.row += n;
@@ -282,6 +297,7 @@ impl BgaArray {
                 up.row = 0;
             }
         }
+        (bytes, None)
     }
 }
 

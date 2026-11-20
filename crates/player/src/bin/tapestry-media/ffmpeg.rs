@@ -37,10 +37,13 @@ use std::io::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::ptr;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ffmpeg_sys_next as ff;
-use skin_model::media::control::{Failure, Refusal};
+use skin_model::media::control::{Failure, Matrix, Range, Refusal};
 use skin_model::media::{MAX_PIXELS, MAX_SIDE};
 
+use crate::loop_clock::{LoopClock, rescale_us};
 use crate::os::Source;
 
 /// The largest single allocation FFmpeg may make: below the 64 MiB margin
@@ -99,6 +102,18 @@ static REFUSE_WHILE_PARKED: std::sync::atomic::AtomicBool =
 #[cfg(feature = "dev-tools")]
 pub fn refuse_while_parked() {
     REFUSE_WHILE_PARKED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Each frame's conversion first sleeps this many milliseconds (dev-tools):
+/// a slow converter, whose decoder still makes progress.
+#[cfg(feature = "dev-tools")]
+static SLOW_CONVERT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes each frame's conversion sleep `ms` milliseconds first from now on
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn slow_convert(ms: u64) {
+    SLOW_CONVERT_MS.store(ms, Ordering::Relaxed);
 }
 
 /// The codec whitelist, as the option an open sets.
@@ -917,8 +932,140 @@ pub struct Probe {
     pub height: u32,
     /// µs, 0 when unknown.
     pub duration: i64,
+    /// The colour of the frames the worker publishes ([`Colour`]).
+    pub matrix: Matrix,
+    pub range: Range,
     pub codec: String,
     pub container: String,
+}
+
+/// The colour of the frames a player publishes, fixed at its probe
+/// (design.md "Rendering and Skins", video frames): the stream's matrix,
+/// else BT.709 for frames at least 1280 wide or over 576 high and BT.601
+/// below; the stream's range, else limited, but full for the JPEG pixel
+/// formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Colour {
+    pub matrix: Matrix,
+    pub range: Range,
+}
+
+impl Colour {
+    /// The tagged matrix, if it is one the contract has.
+    fn tagged_matrix(space: ff::AVColorSpace) -> Option<Matrix> {
+        use ff::AVColorSpace as S;
+        match space {
+            S::AVCOL_SPC_BT709 => Some(Matrix::Bt709),
+            S::AVCOL_SPC_BT470BG | S::AVCOL_SPC_SMPTE170M => Some(Matrix::Bt601),
+            _ => None,
+        }
+    }
+
+    /// The tagged range, if tagged.
+    fn tagged_range(range: ff::AVColorRange) -> Option<Range> {
+        use ff::AVColorRange as R;
+        match range {
+            R::AVCOL_RANGE_JPEG => Some(Range::Full),
+            R::AVCOL_RANGE_MPEG => Some(Range::Limited),
+            _ => None,
+        }
+    }
+
+    /// Whether `format` is one of the JPEG (full-range) pixel formats.
+    fn jpeg(format: c_int) -> bool {
+        use ff::AVPixelFormat as P;
+        [
+            P::AV_PIX_FMT_YUVJ420P,
+            P::AV_PIX_FMT_YUVJ422P,
+            P::AV_PIX_FMT_YUVJ444P,
+            P::AV_PIX_FMT_YUVJ440P,
+            P::AV_PIX_FMT_YUVJ411P,
+        ]
+        .iter()
+        .any(|f| *f as c_int == format)
+    }
+
+    /// The contract for a stream of `width` × `height` in `format` with
+    /// these tags.
+    fn of_stream(
+        width: c_int,
+        height: c_int,
+        format: c_int,
+        space: ff::AVColorSpace,
+        range: ff::AVColorRange,
+    ) -> Self {
+        let guess = if width >= 1280 || height > 576 {
+            Matrix::Bt709
+        } else {
+            Matrix::Bt601
+        };
+        let untagged = if Self::jpeg(format) {
+            Range::Full
+        } else {
+            Range::Limited
+        };
+        Self {
+            matrix: Self::tagged_matrix(space).unwrap_or(guess),
+            range: Self::tagged_range(range).unwrap_or(untagged),
+        }
+    }
+
+    /// A decoded frame's own colour: its tags, else the stream's defaults
+    /// (the contract's matrix, the size's guess or the stream's tag; the
+    /// JPEG formats' full range, else limited).
+    fn of_frame(self, format: c_int, space: ff::AVColorSpace, range: ff::AVColorRange) -> Self {
+        let untagged = if Self::jpeg(format) {
+            Range::Full
+        } else {
+            Range::Limited
+        };
+        Self {
+            matrix: Self::tagged_matrix(space).unwrap_or(self.matrix),
+            range: Self::tagged_range(range).unwrap_or(untagged),
+        }
+    }
+
+    /// FFmpeg's names of this colour, for a frame's fields.
+    const fn tags(self) -> (ff::AVColorSpace, ff::AVColorRange) {
+        (
+            match self.matrix {
+                Matrix::Bt709 => ff::AVColorSpace::AVCOL_SPC_BT709,
+                Matrix::Bt601 => ff::AVColorSpace::AVCOL_SPC_SMPTE170M,
+            },
+            match self.range {
+                Range::Full => ff::AVColorRange::AVCOL_RANGE_JPEG,
+                Range::Limited => ff::AVColorRange::AVCOL_RANGE_MPEG,
+            },
+        )
+    }
+}
+
+/// Converts `src` into `dst` with `sws`, made single-threaded and bilinear
+/// at its first use: FFmpeg's error when it fails.
+///
+/// # Safety
+///
+/// `sws` is null or a context this function made; `dst` and `src` are
+/// frames with their formats, sizes and colours set, `src` with its data.
+unsafe fn scale(
+    sws: &mut *mut ff::SwsContext,
+    dst: *mut ff::AVFrame,
+    src: *const ff::AVFrame,
+) -> Result<(), c_int> {
+    // SAFETY: as the caller promises; a context made here is the caller's
+    // to free.
+    unsafe {
+        if sws.is_null() {
+            *sws = ff::sws_alloc_context();
+            if sws.is_null() {
+                return Err(averror(ff::ENOMEM));
+            }
+            (**sws).threads = 1;
+            (**sws).flags = ff::SwsFlags::SWS_BILINEAR as u32;
+        }
+        let r = ff::sws_scale_frame(*sws, dst, src);
+        if r < 0 { Err(r) } else { Ok(()) }
+    }
 }
 
 /// Sets the string options `pairs` on an FFmpeg context before it opens,
@@ -972,6 +1119,16 @@ pub struct Input {
     stream: c_int,
     time_base: ff::AVRational,
     start: i64,
+    /// The stamps of the frames, each pass of a loop following the last.
+    clock: LoopClock,
+    /// A seek has positioned the video: the next frame decoded is no longer
+    /// the clip's first usable one.
+    sought: bool,
+    /// The colour every published frame meets.
+    colour: Colour,
+    /// Where each frame the decoder returns is counted (the frame ring's
+    /// progress word), once the player has a ring.
+    progress: *const AtomicU64,
     width: c_int,
     height: c_int,
     /// The demuxer has given its last packet and the decoder is draining.
@@ -1016,6 +1173,13 @@ impl Input {
             stream: -1,
             time_base: ff::AVRational { num: 0, den: 1 },
             start: 0,
+            clock: LoopClock::new(0, None),
+            sought: false,
+            colour: Colour {
+                matrix: Matrix::Bt709,
+                range: Range::Limited,
+            },
+            progress: ptr::null(),
             width: 0,
             height: 0,
             drained: false,
@@ -1189,14 +1353,77 @@ impl Input {
             };
             self.width = width;
             self.height = height;
+            self.clock = LoopClock::new(self.start, interval(self.time_base, (*st).avg_frame_rate));
+            self.colour = Colour::of_stream(
+                width,
+                height,
+                (*par).format,
+                (*par).color_space,
+                (*par).color_range,
+            );
             let duration = (*self.fc).duration;
             Ok(Probe {
                 width: width.unsigned_abs(),
                 height: height.unsigned_abs(),
                 duration: if duration > 0 { duration } else { 0 },
+                matrix: self.colour.matrix,
+                range: self.colour.range,
                 codec: text(ff::avcodec_get_name(id)),
                 container: text((*(*self.fc).iformat).name),
             })
+        }
+    }
+
+    /// Counts each frame the decoder returns from now on in `word`, right
+    /// as the decoder returns it, before it is converted or skipped.
+    ///
+    /// # Safety
+    ///
+    /// `word` stays valid while this input lives.
+    pub unsafe fn count_into(&mut self, word: *const AtomicU64) {
+        self.progress = word;
+    }
+
+    /// Starts the next pass of a looping play at the clip's first usable
+    /// frame, after its end was taken from [`Input::next`] (which parked
+    /// and checked), and decodes that frame into `out`: its stamp, which
+    /// follows this pass's last frame's end. The seek is [`Input::seek`]'s,
+    /// to that frame: a demuxer that lands past it (an MPEG program stream
+    /// lands on its second group of pictures) is sought again from further
+    /// back, and a landing on any other frame fails the player. A play
+    /// whose first frame was not decoded from the start takes the first
+    /// pass's landing as the clip's first frame.
+    ///
+    /// # Errors
+    ///
+    /// When the pass yielded no frame, or the next has none (a loop of
+    /// nothing never spins), when the seek does not land on the clip's
+    /// first usable frame ([`Failure::Seek`]), and as [`Input::seek`].
+    pub fn restart(&mut self, out: &mut [u8]) -> Result<i64, (Failure, c_int)> {
+        if !self.clock.wrap() {
+            return Err((Failure::Decode, 0));
+        }
+        let known = self.clock.first();
+        let first = known.unwrap_or(self.start);
+        let tb = self.time_base;
+        let target = rescale_us(first.saturating_sub(self.start), tb.num, tb.den);
+        let Some(stamped) = self.clock.pass_first() else {
+            return Err((Failure::Decode, 0));
+        };
+        let stamped = rescale_us(stamped, tb.num, tb.den);
+        match self.seek_stamped(target, stamped, out)? {
+            Some(landed) => {
+                // SAFETY: this input's frame, the landing's.
+                let pts = unsafe { (*self.frame).best_effort_timestamp };
+                if !self.clock.lands_on_first(pts) {
+                    return Err((Failure::Seek, 0));
+                }
+                if known.is_none() {
+                    self.clock.set_first(pts);
+                }
+                Ok(landed.stamp)
+            }
+            None => Err((Failure::Decode, 0)),
         }
     }
 
@@ -1235,11 +1462,12 @@ impl Input {
         }
     }
 
-    /// Positions the video so its first frame at or after `target` µs is
-    /// decoded into `out`: seeks to the target, and when the first frame
-    /// decoded there is already past it (the demuxer overshot), seeks again
-    /// from a second further back, up to three times, all within one seek's
-    /// budget. `None` when no frame at or after the target exists.
+    /// Positions the video so its first frame at or after `target` µs of
+    /// the clip (of the current pass, in a looping play) is decoded into
+    /// `out`: seeks to the target, and when the first frame decoded there
+    /// is already past it (the demuxer overshot), seeks again from a second
+    /// further back, up to three times, all within one seek's budget.
+    /// `None` when no frame at or after the target exists.
     ///
     /// # Errors
     ///
@@ -1250,8 +1478,23 @@ impl Input {
         target: i64,
         out: &mut [u8],
     ) -> Result<Option<Landed>, (Failure, c_int)> {
+        // The stamps the frames get count the passes before this one.
+        let tb = self.time_base;
+        let pass = rescale_us(self.clock.pass_start(), tb.num, tb.den);
+        self.seek_stamped(target, target.saturating_add(pass), out)
+    }
+
+    /// [`Input::seek`] to `target` µs of the clip, whose frame's stamp is
+    /// `stamped`.
+    fn seek_stamped(
+        &mut self,
+        target: i64,
+        stamped: i64,
+        out: &mut [u8],
+    ) -> Result<Option<Landed>, (Failure, c_int)> {
+        self.sought = true;
         self.budget(Some(BUDGET));
-        let landed = self.seek_within_budget(target, out);
+        let landed = self.seek_within_budget(target, stamped, out);
         if matches!(landed, Ok(None)) {
             self.park();
         }
@@ -1267,6 +1510,7 @@ impl Input {
     fn seek_within_budget(
         &mut self,
         target: i64,
+        stamped: i64,
         out: &mut [u8],
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         for (attempts, back) in (1..).zip(BACK_OFF) {
@@ -1293,11 +1537,11 @@ impl Input {
                     continue;
                 };
                 first.get_or_insert(stamp);
-                if stamp >= target {
+                if stamp >= stamped {
                     break Some(stamp);
                 }
             };
-            let exact = first.is_some_and(|f| f <= target);
+            let exact = first.is_some_and(|f| f <= stamped);
             if exact || back == MAX_BACK_OFF || landed.is_none() {
                 return match landed {
                     Some(stamp) => {
@@ -1355,6 +1599,9 @@ impl Input {
             unsafe {
                 let r = ff::avcodec_receive_frame(self.dec, self.frame);
                 if r >= 0 {
+                    if !self.progress.is_null() {
+                        (*self.progress).fetch_add(1, Ordering::Release);
+                    }
                     return Ok(true);
                 }
                 if r == ff::AVERROR_EOF {
@@ -1421,54 +1668,100 @@ impl Input {
         }
     }
 
-    /// The decoded frame's stamp in µs from the stream's start, or `None`
-    /// when it has no time.
-    fn stamp(&self) -> Option<i64> {
-        // SAFETY: this input's frame and plain arithmetic.
-        unsafe {
-            let pts = (*self.frame).best_effort_timestamp;
-            if pts == ff::AV_NOPTS_VALUE {
-                return None;
-            }
-            let from_start = pts.checked_sub(self.start)?;
-            Some(ff::av_rescale_q(
-                from_start,
-                self.time_base,
-                ff::AV_TIME_BASE_Q,
-            ))
+    /// The decoded frame's stamp in µs from the play's start (the passes
+    /// of a loop before it included), or `None` when it has no time.
+    fn stamp(&mut self) -> Option<i64> {
+        // SAFETY: this input's frame.
+        let (pts, duration) =
+            unsafe { ((*self.frame).best_effort_timestamp, (*self.frame).duration) };
+        if pts == ff::AV_NOPTS_VALUE {
+            return None;
         }
+        if !self.sought && self.clock.first().is_none() {
+            self.clock.set_first(pts);
+        }
+        let ticks = self.clock.ticks(pts, Some(duration))?;
+        Some(rescale_us(ticks, self.time_base.num, self.time_base.den))
     }
 
     /// The decoded frame into `out`, I420 at the probed size, scaled when
     /// its size or format differs.
     fn convert(&mut self, out: &mut [u8]) -> Result<(), (Failure, c_int)> {
+        #[cfg(feature = "dev-tools")]
+        match SLOW_CONVERT_MS.load(Ordering::Relaxed) {
+            0 => {}
+            ms => std::thread::sleep(std::time::Duration::from_millis(ms)),
+        }
         // SAFETY: this input's frames and scaler.
         unsafe {
             let f = self.frame;
-            let src =
-                if (*f).format == I420 && (*f).width == self.width && (*f).height == self.height {
-                    f.cast_const()
-                } else {
-                    if self.sws.is_null() {
-                        self.sws = ff::sws_alloc_context();
-                        if self.sws.is_null() {
-                            return Err((Failure::Memory, averror(ff::ENOMEM)));
-                        }
-                        (*self.sws).threads = 1;
-                        (*self.sws).flags = ff::SwsFlags::SWS_BILINEAR as u32;
+            let own = self
+                .colour
+                .of_frame((*f).format, (*f).colorspace, (*f).color_range);
+            let i420 =
+                (*f).format == I420 && (*f).width == self.width && (*f).height == self.height;
+            // Its matrix differs: the frame in its own colour, then its
+            // matrix converted in place below.
+            let rematrix = own.matrix != self.colour.matrix;
+            let size = (self.width.unsigned_abs(), self.height.unsigned_abs());
+            // A deeper 4:2:0 frame at the probed size whose matrix differs:
+            // converted from its own samples, quantized once.
+            if rematrix
+                && (*f).width == self.width
+                && (*f).height == self.height
+                && let Some(bits) = deep_420((*f).format)
+            {
+                let (w, h) = (size.0 as usize, size.1 as usize);
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let plane = |i: usize, rows: usize| -> Option<(&[u16], usize)> {
+                    let stride = usize::try_from(*(*f).linesize.get(i)?).ok()? / 2;
+                    let data = (*(*f).data.get(i)?).cast::<u16>();
+                    if data.is_null() || data.align_offset(2) != 0 {
+                        return None;
                     }
-                    let r = ff::sws_scale_frame(self.sws, self.scaled, f);
-                    if r < 0 {
-                        self.check()?;
-                        return Err((Failure::Decode, r));
-                    }
-                    self.scaled.cast_const()
+                    // SAFETY: the decoded frame's plane `i`, `rows` rows of
+                    // its stride, aligned for its words.
+                    Some((std::slice::from_raw_parts(data, stride * rows), stride))
                 };
-            if copy_i420(src, self.width, self.height, out) {
-                Ok(())
-            } else {
-                Err((Failure::Decode, 0))
+                let (Some(y), Some(u), Some(v)) = (plane(0, h), plane(1, ch), plane(2, ch)) else {
+                    return Err((Failure::Decode, 0));
+                };
+                if out.len() < w * h + 2 * cw * ch {
+                    return Err((Failure::Decode, 0));
+                }
+                let deep = Deep { y, u, v, bits };
+                rematrix_deep(out, size, own, self.colour, &deep);
+                return Ok(());
             }
+            let into = if rematrix { own } else { self.colour };
+            let src = if i420 && own == into {
+                f.cast_const()
+            } else {
+                // Its format, its size or its range alone differs: swscale
+                // converts into `into`, each side's colour set. Both sides
+                // keep the frame's primaries and transfer (BT.709's where
+                // it names none), so it maps no gamut.
+                ((*f).colorspace, (*f).color_range) = own.tags();
+                ((*self.scaled).colorspace, (*self.scaled).color_range) = into.tags();
+                if (*f).color_primaries == ff::AVColorPrimaries::AVCOL_PRI_UNSPECIFIED {
+                    (*f).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
+                }
+                if (*f).color_trc == ff::AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED {
+                    (*f).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+                }
+                (*self.scaled).color_primaries = (*f).color_primaries;
+                (*self.scaled).color_trc = (*f).color_trc;
+                scale(&mut self.sws, self.scaled, f)
+                    .or_else(|r| self.check().and(Err((Failure::Decode, r))))?;
+                self.scaled.cast_const()
+            };
+            if !copy_i420(src, self.width, self.height, out) {
+                return Err((Failure::Decode, 0));
+            }
+            if rematrix {
+                convert_matrix(out, size, own, self.colour);
+            }
+            Ok(())
         }
     }
 
@@ -1526,6 +1819,17 @@ impl Drop for Input {
     }
 }
 
+/// A frame's interval at `rate` frames a second in ticks of `time_base`,
+/// rounded; `None` when either is unknown.
+fn interval(time_base: ff::AVRational, rate: ff::AVRational) -> Option<i64> {
+    let den = i128::from(time_base.num) * i128::from(rate.num);
+    let num = i128::from(time_base.den) * i128::from(rate.den);
+    if den <= 0 || num <= 0 {
+        return None;
+    }
+    i64::try_from((num + den / 2) / den).ok().filter(|i| *i > 0)
+}
+
 /// Copies an I420 frame of `width` × `height` into `out`, its planes one
 /// after another with no padding.
 ///
@@ -1565,6 +1869,155 @@ unsafe fn copy_i420(
         }
     }
     at == out.len()
+}
+
+/// The map from a colour's Y'CbCr, each normalized (Y' from 0 to 1, Cb and
+/// Cr from -0.5 to 0.5), to another matrix's: through the R'G'B' both
+/// express, linear, so nothing is clipped on the way.
+fn matrix_map(from: Matrix, to: Matrix) -> [[f32; 3]; 3] {
+    let k = |m| match m {
+        Matrix::Bt709 => (0.2126_f64, 0.0722_f64),
+        Matrix::Bt601 => (0.299, 0.114),
+    };
+    // R'G'B' of (Y', Cb, Cr) under `from`.
+    let (kr, kb) = k(from);
+    let kg = 1.0 - kr - kb;
+    let to_rgb = [
+        [1.0, 0.0, 2.0 * (1.0 - kr)],
+        [
+            1.0,
+            -2.0 * (1.0 - kb) * kb / kg,
+            -2.0 * (1.0 - kr) * kr / kg,
+        ],
+        [1.0, 2.0 * (1.0 - kb), 0.0],
+    ];
+    // (Y', Cb, Cr) of R'G'B' under `to`.
+    let (kr, kb) = k(to);
+    let kg = 1.0 - kr - kb;
+    let from_rgb = [
+        [kr, kg, kb],
+        [-kr / (2.0 * (1.0 - kb)), -kg / (2.0 * (1.0 - kb)), 0.5],
+        [0.5, -kg / (2.0 * (1.0 - kr)), -kb / (2.0 * (1.0 - kr))],
+    ];
+    let mut map = [[0.0_f32; 3]; 3];
+    for (row, out) in from_rgb.iter().zip(&mut map) {
+        for (col, cell) in out.iter_mut().enumerate() {
+            let v: f64 = row
+                .iter()
+                .zip(&to_rgb)
+                .map(|(a, rgb_row)| a * rgb_row.get(col).copied().unwrap_or(0.0))
+                .sum();
+            #[expect(clippy::cast_possible_truncation, reason = "a coefficient near 1")]
+            {
+                *cell = v as f32;
+            }
+        }
+    }
+    map
+}
+
+/// A range's luma offset and scale and its chroma scale, in 8-bit levels.
+const fn levels(range: Range) -> (f32, f32, f32) {
+    match range {
+        Range::Limited => (16.0, 219.0, 224.0),
+        Range::Full => (0.0, 255.0, 255.0),
+    }
+}
+
+/// The bits of a planar 4:2:0 format deeper than 8 bits (little-endian
+/// words), or `None`.
+fn deep_420(format: c_int) -> Option<u32> {
+    use ff::AVPixelFormat as F;
+    [
+        (F::AV_PIX_FMT_YUV420P10LE, 10),
+        (F::AV_PIX_FMT_YUV420P12LE, 12),
+        (F::AV_PIX_FMT_YUV420P16LE, 16),
+    ]
+    .into_iter()
+    .find_map(|(f, bits)| (f as c_int == format).then_some(bits))
+}
+
+/// A deeper 4:2:0 frame's planes, each with its stride in samples.
+struct Deep<'a> {
+    y: (&'a [u16], usize),
+    u: (&'a [u16], usize),
+    v: (&'a [u16], usize),
+    bits: u32,
+}
+
+impl Deep<'_> {
+    /// The sample at `(x, y)` of `plane`, on the 8-bit scale of `range`:
+    /// a limited range's levels are the 8-bit ones shifted left, a full
+    /// range's span the whole code range.
+    fn at(&self, plane: (&[u16], usize), x: usize, y: usize, range: Range) -> f32 {
+        let v = f32::from(plane.0.get(y * plane.1 + x).copied().unwrap_or(0));
+        #[expect(clippy::cast_precision_loss, reason = "at most 16 bits")]
+        match range {
+            Range::Limited => v / (1_u32 << (self.bits - 8)) as f32,
+            Range::Full => v * 255.0 / ((1_u32 << self.bits) - 1) as f32,
+        }
+    }
+}
+
+/// Converts the I420 frame `out` of `size` (its planes tightly packed) from
+/// the colour `from` to `to`, in place: each pixel's Y' from its own and its
+/// block's Cb and Cr, each block's Cb and Cr from its pixels' mean Y' and
+/// its own; linear throughout, quantized once at the end.
+fn convert_matrix(out: &mut [u8], size: (u32, u32), from: Colour, to: Colour) {
+    rematrix(out, size, from, to, None);
+}
+
+/// [`convert_matrix`] from the deeper frame `deep` into `out`, at the
+/// source's own precision.
+fn rematrix_deep(out: &mut [u8], size: (u32, u32), from: Colour, to: Colour, deep: &Deep) {
+    rematrix(out, size, from, to, Some(deep));
+}
+
+/// [`convert_matrix`]'s work, reading `deep` when given, else `out`
+/// itself.
+fn rematrix(out: &mut [u8], size: (u32, u32), from: Colour, to: Colour, deep: Option<&Deep>) {
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let m = matrix_map(from.matrix, to.matrix);
+    let (fy0, fys, fcs) = levels(from.range);
+    let (ty0, tys, tcs) = levels(to.range);
+    let level = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    let (luma, chroma) = out.split_at_mut(w * h);
+    let (u_plane, v_plane) = chroma.split_at_mut(cw * ch);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let c = cy * cw + cx;
+            let (Some(u), Some(v)) = (u_plane.get_mut(c), v_plane.get_mut(c)) else {
+                return;
+            };
+            let (u0, v0) = match deep {
+                Some(d) => (d.at(d.u, cx, cy, from.range), d.at(d.v, cx, cy, from.range)),
+                None => (f32::from(*u), f32::from(*v)),
+            };
+            let cb = (u0 - 128.0) / fcs;
+            let cr = (v0 - 128.0) / fcs;
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for y in (2 * cy)..(2 * cy + 2).min(h) {
+                for x in (2 * cx)..(2 * cx + 2).min(w) {
+                    let Some(p) = luma.get_mut(y * w + x) else {
+                        continue;
+                    };
+                    let y0 = match deep {
+                        Some(d) => d.at(d.y, x, y, from.range),
+                        None => f32::from(*p),
+                    };
+                    let yy = (y0 - fy0) / fys;
+                    sum += yy;
+                    n += 1.0;
+                    *p = level(ty0 + tys * (m[0][0] * yy + m[0][1] * cb + m[0][2] * cr));
+                }
+            }
+            let yy = if n > 0.0 { sum / n } else { 0.0 };
+            *u = level(128.0 + tcs * (m[1][0] * yy + m[1][1] * cb + m[1][2] * cr));
+            *v = level(128.0 + tcs * (m[2][0] * yy + m[2][1] * cb + m[2][2] * cr));
+        }
+    }
 }
 
 /// A synthesized clip for the tests and the reference rig (dev-tools).
@@ -1945,5 +2398,133 @@ unsafe extern "C" fn write(opaque: *mut c_void, buf: *const u8, size: c_int) -> 
     match file.write_all(buf) {
         Ok(()) => size,
         Err(_) => averror(ff::EIO),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame of one colour `yuv`, 2 × 2.
+    fn solid(yuv: [u8; 3]) -> Vec<u8> {
+        vec![yuv[0], yuv[0], yuv[0], yuv[0], yuv[1], yuv[2]]
+    }
+
+    // Covers: T02
+    #[test]
+    fn a_matrix_conversion_keeps_colours_outside_the_cube_until_it_quantizes() {
+        // Limited BT.709 (50, 64, 176) is outside the R'G'B' cube (its G'
+        // negative); in BT.601 it is (53, 59, 180), where clipping R'G'B'
+        // first would give about (62, 101, 173).
+        let mut frame = solid([50, 64, 176]);
+        let colour = |matrix| Colour {
+            matrix,
+            range: Range::Limited,
+        };
+        convert_matrix(
+            &mut frame,
+            (2, 2),
+            colour(Matrix::Bt709),
+            colour(Matrix::Bt601),
+        );
+        assert_eq!(frame, solid([53, 59, 180]));
+    }
+
+    // Covers: T02
+    #[test]
+    fn a_deeper_frame_changes_matrix_from_its_own_samples() {
+        // Limited 10-bit BT.709 (697, 946, 434) is (181, 238, 101) in 8-bit
+        // BT.601 from its own samples; cut to its top 8 bits first, (174,
+        // 236, 108), it would come out (181, 237, 101).
+        let colour = |matrix| Colour {
+            matrix,
+            range: Range::Limited,
+        };
+        let (y, u, v) = ([697_u16; 4], [946_u16], [434_u16]);
+        let deep = Deep {
+            y: (&y, 2),
+            u: (&u, 1),
+            v: (&v, 1),
+            bits: 10,
+        };
+        let mut frame = solid([0, 0, 0]);
+        rematrix_deep(
+            &mut frame,
+            (2, 2),
+            colour(Matrix::Bt709),
+            colour(Matrix::Bt601),
+            &deep,
+        );
+        assert_eq!(frame, solid([181, 238, 101]));
+        let mut eight = solid([174, 236, 108]);
+        convert_matrix(
+            &mut eight,
+            (2, 2),
+            colour(Matrix::Bt709),
+            colour(Matrix::Bt601),
+        );
+        assert_eq!(eight, solid([181, 237, 101]));
+    }
+
+    // Covers: T02
+    #[test]
+    fn an_untagged_frame_is_limited_unless_its_format_is_full() {
+        use ff::AVColorRange as R;
+        use ff::AVColorSpace as S;
+        // A stream tagged full range: its frames' own tags still win, and
+        // an untagged frame takes the contract's defaults, not the stream's
+        // tag.
+        let stream = Colour {
+            matrix: Matrix::Bt709,
+            range: Range::Full,
+        };
+        let untagged = (S::AVCOL_SPC_UNSPECIFIED, R::AVCOL_RANGE_UNSPECIFIED);
+        let yuvj = ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as c_int;
+        assert_eq!(
+            stream.of_frame(I420, untagged.0, untagged.1),
+            Colour {
+                matrix: Matrix::Bt709,
+                range: Range::Limited
+            }
+        );
+        assert_eq!(stream.of_frame(yuvj, untagged.0, untagged.1), stream);
+        assert_eq!(
+            stream.of_frame(I420, S::AVCOL_SPC_BT470BG, R::AVCOL_RANGE_JPEG),
+            Colour {
+                matrix: Matrix::Bt601,
+                range: Range::Full
+            }
+        );
+    }
+
+    // Covers: T02
+    #[test]
+    fn a_matrix_conversion_there_and_back_is_the_identity() {
+        for range in [Range::Limited, Range::Full] {
+            let colour = |matrix| Colour { matrix, range };
+            for yuv in [
+                [16, 128, 128],
+                [235, 128, 128],
+                [100, 90, 190],
+                [50, 64, 176],
+            ] {
+                let mut frame = solid(yuv);
+                convert_matrix(
+                    &mut frame,
+                    (2, 2),
+                    colour(Matrix::Bt709),
+                    colour(Matrix::Bt601),
+                );
+                convert_matrix(
+                    &mut frame,
+                    (2, 2),
+                    colour(Matrix::Bt601),
+                    colour(Matrix::Bt709),
+                );
+                for (got, want) in frame.iter().zip(solid(yuv)) {
+                    assert!(got.abs_diff(want) <= 1, "{range:?} {yuv:?}: {frame:?}");
+                }
+            }
+        }
     }
 }

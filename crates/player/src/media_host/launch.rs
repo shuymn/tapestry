@@ -58,9 +58,9 @@ use std::time::Duration;
 
 use skin_model::media::control::{self, Reply};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_TIMEOUT, GENERIC_ALL, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation, WAIT_ABANDONED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_REVISION_MISMATCH, ERROR_TIMEOUT,
+    GENERIC_ALL, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree,
+    SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -82,9 +82,10 @@ use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_REA
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT,
-    JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_AFFINITY,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -100,10 +101,10 @@ use windows::Win32::System::StationsAndDesktops::{
 use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
 use windows::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW,
-    CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, GetProcessMitigationPolicy,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW, CreateProcessW, DETACHED_PROCESS,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessMitigationPolicy, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, NORMAL_PRIORITY_CLASS, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_MITIGATION_POLICY,
@@ -116,7 +117,7 @@ use windows::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_R
 use windows::core::{PCWSTR, PWSTR, w};
 
 use super::watch::{self, Watch};
-use super::{Hello, Owned, Worker, handles};
+use super::{Hello, Owned, Worker, handles, placement};
 
 /// The worker's executable, in the directory the game launches it from.
 pub const EXECUTABLE: &str = "tapestry-media.exe";
@@ -326,6 +327,8 @@ pub struct Setup {
     profile: Option<String>,
     #[cfg(test)]
     observe: Duration,
+    #[cfg(test)]
+    priority: PROCESS_CREATION_FLAGS,
 }
 
 impl Setup {
@@ -353,6 +356,8 @@ impl Setup {
             profile: None,
             #[cfg(test)]
             observe: OBSERVE,
+            #[cfg(test)]
+            priority: PRIORITY,
         }
     }
 
@@ -445,7 +450,28 @@ impl Setup {
     const fn observe(&self) -> Duration {
         OBSERVE
     }
+
+    /// The worker's priority class.
+    #[cfg(test)]
+    const fn priority(&self) -> PROCESS_CREATION_FLAGS {
+        self.priority
+    }
+
+    #[cfg(not(test))]
+    #[expect(
+        clippy::unused_self,
+        reason = "a test's setup may measure another priority; the recipe's is `PRIORITY`"
+    )]
+    const fn priority(&self) -> PROCESS_CREATION_FLAGS {
+        PRIORITY
+    }
 }
+
+/// The worker's priority class: normal, the game threads' own. Below
+/// normal, other programs filling the CPUs starve it (launches, opens and
+/// frames late by seconds); its job's CPUs bound what it takes from the
+/// game ([`worker_cpus`]).
+const PRIORITY: PROCESS_CREATION_FLAGS = NORMAL_PRIORITY_CLASS;
 
 #[cfg(test)]
 impl Setup {
@@ -504,6 +530,13 @@ impl Setup {
         self.observe = limit;
         self
     }
+
+    /// Launching the worker below normal priority rather than the
+    /// recipe's (a measurement's comparison).
+    pub const fn at_below_normal_priority(mut self) -> Self {
+        self.priority = windows::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
+        self
+    }
 }
 
 /// The calling thread's last error.
@@ -560,11 +593,11 @@ fn early((step, (code, what)): (Step, Failure)) -> LaunchError {
 /// copies of its files staged in the game's data folder `data`.
 pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     let applied = setup.applied;
-    let (job, port) = if applied.has(Restrictions::JOB) {
-        let (job, port) = run(setup, Step::Job, || job(applied)).map_err(early)?;
-        (Some(job), Some(port))
+    let (job, port, placement) = if applied.has(Restrictions::JOB) {
+        let (job, port, placement) = run(setup, Step::Job, || job(applied)).map_err(early)?;
+        (Some(job), Some(port), Some(placement))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let profiled = if applied.has(Restrictions::APP_CONTAINER) {
         Some(run(setup, Step::Profile, || profile(setup.profile())).map_err(early)?)
@@ -621,7 +654,15 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
             })?;
         }
         let table = run(setup, Step::Check, || {
-            check(&child, job.as_ref(), sid, pipe_ends, setup.expected)
+            check(
+                &child,
+                job.as_ref(),
+                placement.as_ref(),
+                sid,
+                pipe_ends,
+                setup.expected,
+                setup.priority(),
+            )
         })?;
         // Watched from before it runs: a worker whose memory reaches the
         // cap at once is ended as one that reaches it later is.
@@ -644,20 +685,32 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
     let log = std::sync::Arc::new(Mutex::new(String::new()));
     let (tx, rx) = mpsc::sync_channel(REPLIES);
     let overflowed = Arc::new(AtomicBool::new(false));
+    let in_hand = Arc::new(AtomicBool::new(false));
+    let beats = Arc::new(super::Beats::new());
     let reading = {
         #[cfg(test)]
         let log = std::sync::Arc::clone(&log);
         let overflowed = Arc::clone(&overflowed);
+        let in_hand = Arc::clone(&in_hand);
+        let beats = Arc::clone(&beats);
         std::thread::Builder::new()
             .name("media worker replies".to_owned())
             .spawn(move || {
-                read_replies(
+                let end = read_replies(
                     replies,
                     &tx,
                     &overflowed,
+                    &in_hand,
+                    &beats,
                     #[cfg(test)]
                     &log,
                 );
+                // The replies' end is published before its line is logged:
+                // a log that stalls never delays it.
+                drop(tx);
+                if let Some(line) = end {
+                    log::warn!("media worker: {line}");
+                }
             })
     };
     if let Err(e) = reading {
@@ -671,18 +724,30 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
         Ok(hello) => hello,
         Err(e) => return Err(child.refuse(e, setup.observe())),
     };
-    // The worker has loaded its copies, which its images now hold.
-    drop(staged);
-    let (process, pid) = child.release();
     // SAFETY: the game's end of the pipe to the worker, owned by the file
     // from here.
     let commands = unsafe { std::fs::File::from_raw_handle(commands.release().0) };
+    let commands = match super::writer::Writer::start(commands) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let code = e.raw_os_error().map_or(0, i32::cast_unsigned);
+            return Err(child.refuse(
+                (Step::Handshake, (code, "its commands' thread".to_owned())),
+                setup.observe(),
+            ));
+        }
+    };
+    // The worker has loaded its copies, which its images now hold.
+    drop(staged);
+    let (process, pid) = child.release();
     #[cfg(not(test))]
     let _ = table;
     Ok(Worker {
         commands: Some(commands),
         replies: rx,
         overflowed,
+        in_hand,
+        beats,
         hello,
         process,
         pid,
@@ -721,6 +786,9 @@ fn job_flags(r: Restrictions) -> JOB_OBJECT_LIMIT {
     let mut flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
         | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    if !many_groups() {
+        flags |= JOB_OBJECT_LIMIT_AFFINITY;
+    }
     if r.has(Restrictions::ONE_PROCESS) {
         flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
     }
@@ -739,13 +807,148 @@ const JOB_UI: JOB_OBJECT_UILIMIT = JOB_OBJECT_UILIMIT(
         | JOB_OBJECT_UILIMIT_WRITECLIPBOARD.0,
 );
 
-/// Step 1: the job, and the completion port its messages come to.
-fn job(applied: Restrictions) -> Result<(Owned, Owned), Failure> {
+/// The game's primary processor group and its affinity there: the
+/// calling thread's, which a thread the game makes inherits.
+fn primary() -> Result<(u16, usize), Failure> {
+    let mut affinity = windows::Win32::System::SystemInformation::GROUP_AFFINITY::default();
+    // SAFETY: this thread's pseudo handle and an out value.
+    unsafe {
+        windows::Win32::System::Threading::GetThreadGroupAffinity(
+            windows::Win32::System::Threading::GetCurrentThread(),
+            &raw mut affinity,
+        )
+    }
+    .ok()
+    .map_err(failed("the game's processor group"))?;
+    Ok((affinity.Group, affinity.Mask))
+}
+
+/// The system's logical processors, from its CPU sets, as this process
+/// sees them.
+fn cpu_sets() -> Result<Vec<placement::Cpu>, Failure> {
+    use windows::Win32::System::SystemInformation::{
+        CpuSetInformation, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+    };
+    // SAFETY: this process's pseudo handle.
+    let process = Some(unsafe { GetCurrentProcess() });
+    let mut len = 0_u32;
+    // SAFETY: a query of the size alone, which fails with it set.
+    let _ = unsafe { GetSystemCpuSetInformation(None, 0, &raw mut len, process, None) };
+    // Eight-byte words, so the entries are aligned.
+    let mut words = vec![0_u64; (len as usize).div_ceil(8)];
+    // SAFETY: a buffer of at least `len` bytes, the size just given.
+    unsafe {
+        GetSystemCpuSetInformation(
+            Some(words.as_mut_ptr().cast()),
+            len,
+            &raw mut len,
+            process,
+            None,
+        )
+    }
+    .ok()
+    .map_err(failed("the system's CPU sets"))?;
+    let bytes = (len as usize).min(words.len() * 8);
+    let base: *const u8 = words.as_ptr().cast();
+    let mut cpus = Vec::new();
+    let mut at = 0;
+    while at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes {
+        // SAFETY: an entry the call wrote within the buffer, read whole.
+        let entry = unsafe {
+            base.add(at)
+                .cast::<SYSTEM_CPU_SET_INFORMATION>()
+                .read_unaligned()
+        };
+        if entry.Size == 0 {
+            break;
+        }
+        if entry.Type == CpuSetInformation {
+            // SAFETY: an entry of the CPU-set type holds a CPU set.
+            let set = unsafe { entry.Anonymous.CpuSet };
+            // SAFETY: the flags' byte, every pattern of which is valid.
+            let flags = unsafe { set.Anonymous1.AllFlags };
+            // Allocated (2) to another process than this one (4).
+            let free = flags & 2 == 0 || flags & 4 != 0;
+            cpus.push(placement::Cpu {
+                id: set.Id,
+                group: set.Group,
+                index: set.LogicalProcessorIndex,
+                core: set.CoreIndex,
+                efficiency: set.EfficiencyClass,
+                free,
+            });
+        }
+        at += entry.Size as usize;
+    }
+    Ok(cpus)
+}
+
+/// Where the worker runs ([`placement`]): half the whole cores of the
+/// game's primary group, its job's bound. A failure when the game may run
+/// on fewer than two whole cores, so no subset leaves it one: no worker runs
+/// and its videos are lost.
+///
+/// # Errors
+///
+/// When the topology cannot be read, or no subset leaves the game a core.
+pub fn placement() -> Result<placement::Placement, Failure> {
+    let (group, allowed) = primary()?;
+    let cpus = cpu_sets()?;
+    placement::split(&cpus, group, allowed).ok_or_else(|| {
+        (
+            0,
+            format!("no whole core is left for the game (group {group}, CPUs {allowed:#x})"),
+        )
+    })
+}
+
+/// Whether the system has more than one processor group: the worker's
+/// group is then set apart from its CPUs.
+fn many_groups() -> bool {
+    // SAFETY: a plain query.
+    (unsafe { windows::Win32::System::Threading::GetActiveProcessorGroupCount() }) > 1
+}
+
+/// Checks that the worker's process runs in `placement`'s group alone, on
+/// its CPUs alone.
+fn placed(process: HANDLE, placement: &placement::Placement) -> Result<(), Failure> {
+    use windows::Win32::System::Threading::{GetProcessAffinityMask, GetProcessGroupAffinity};
+    let mut groups = [0_u16; 4];
+    let mut count = u16::try_from(groups.len()).unwrap_or(0);
+    // SAFETY: the worker's process handle and a buffer of `count` groups.
+    let read = unsafe { GetProcessGroupAffinity(process, &raw mut count, groups.as_mut_ptr()) };
+    let groups = groups.get(..usize::from(count)).unwrap_or(&[]);
+    if !read.as_bool() || groups != [placement.group] {
+        return Err((
+            0,
+            format!("it runs in groups {groups:?}, not {}", placement.group),
+        ));
+    }
+    let (mut mask, mut system) = (0, 0);
+    // SAFETY: the worker's process handle and two out values.
+    unsafe { GetProcessAffinityMask(process, &raw mut mask, &raw mut system) }
+        .map_err(failed("its CPUs"))?;
+    if mask != placement.worker {
+        return Err((
+            0,
+            format!("it runs on CPUs {mask:#x}, not {:#x}", placement.worker),
+        ));
+    }
+    Ok(())
+}
+
+/// Step 1: where the worker runs ([`placement()`]), its job, and the
+/// completion port the job's messages come to.
+fn job(applied: Restrictions) -> Result<(Owned, Owned, placement::Placement), Failure> {
+    let placement = placement()?;
     // SAFETY: an unnamed job, owned by the value returned.
     let job = Owned(unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(failed("a job"))?);
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = job_flags(applied);
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
+    if !many_groups() {
+        limits.BasicLimitInformation.Affinity = placement.worker;
+    }
     limits.ProcessMemoryLimit = MEMORY_CAP;
     // SAFETY: the job just made, and a struct of the size given.
     unsafe {
@@ -757,6 +960,25 @@ fn job(applied: Restrictions) -> Result<(Owned, Owned), Failure> {
         )
     }
     .map_err(failed("the job's limits"))?;
+    if many_groups() {
+        // The worker's group and its CPUs there: the basic limit's
+        // affinity names no group.
+        let affinity = windows::Win32::System::SystemInformation::GROUP_AFFINITY {
+            Mask: placement.worker,
+            Group: placement.group,
+            Reserved: [0; 3],
+        };
+        // SAFETY: the job just made, and one group's affinity.
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                windows::Win32::System::JobObjects::JobObjectGroupInformationEx,
+                (&raw const affinity).cast(),
+                u32::try_from(size_of_val(&affinity)).unwrap_or(0),
+            )
+        }
+        .map_err(failed("the job's processor group"))?;
+    }
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
         UIRestrictionsClass: JOB_UI,
     };
@@ -771,7 +993,7 @@ fn job(applied: Restrictions) -> Result<(Owned, Owned), Failure> {
     }
     .map_err(failed("the job's UI restrictions"))?;
     let port = watch::port(&job).map_err(failed("the job's completion port"))?;
-    Ok((job, port))
+    Ok((job, port, placement))
 }
 
 /// The AppContainer profile's SID, freed when dropped.
@@ -1634,10 +1856,8 @@ fn create(
             startup.StartupInfo.lpDesktop = PWSTR(desktop.path.as_ptr().cast_mut());
         }
         let environment = environment(sid)?;
-        let mut flags: PROCESS_CREATION_FLAGS = CREATE_SUSPENDED
-            | DETACHED_PROCESS
-            | BELOW_NORMAL_PRIORITY_CLASS
-            | CREATE_UNICODE_ENVIRONMENT;
+        let mut flags: PROCESS_CREATION_FLAGS =
+            CREATE_SUSPENDED | DETACHED_PROCESS | setup.priority() | CREATE_UNICODE_ENVIRONMENT;
         if let Some(list) = &list {
             startup.lpAttributeList = list.list;
             flags |= EXTENDED_STARTUPINFO_PRESENT;
@@ -1729,10 +1949,20 @@ fn environment(sid: Option<&Sid>) -> Result<Vec<u16>, Failure> {
 fn check(
     child: &Child,
     job: Option<&Owned>,
+    placement: Option<&placement::Placement>,
     sid: Option<&Sid>,
     pipe_ends: [u64; 2],
     expected: Restrictions,
+    priority: PROCESS_CREATION_FLAGS,
 ) -> Result<Vec<handles::Entry>, Failure> {
+    // SAFETY: the process this launch made, with every access.
+    let class = unsafe { windows::Win32::System::Threading::GetPriorityClass(child.process.0) };
+    if class != priority.0 {
+        return Err((
+            0,
+            format!("its priority class is {class:#x}, not {:#x}", priority.0),
+        ));
+    }
     // Still suspended: suspending its thread finds it suspended once, by
     // its creation.
     // SAFETY: the thread this launch made.
@@ -1759,7 +1989,11 @@ fn check(
         if !inside.as_bool() {
             return Err((0, "not in its job".to_owned()));
         }
-        job_holds(job, expected)?;
+        let Some(placement) = placement else {
+            return Err((0, "no placement".to_owned()));
+        };
+        job_holds(job, expected, placement)?;
+        placed(child.process.0, placement)?;
     }
     policies(child.process.0, expected)?;
     if expected.has(Restrictions::APP_CONTAINER) {
@@ -1788,7 +2022,11 @@ fn check(
 /// Checks that `job`'s limits and UI restrictions read back exactly as
 /// `expected` sets them: the memory cap, the flags (no breakaway among
 /// them) and the process limit.
-fn job_holds(job: &Owned, expected: Restrictions) -> Result<(), Failure> {
+fn job_holds(
+    job: &Owned,
+    expected: Restrictions,
+    placement: &placement::Placement,
+) -> Result<(), Failure> {
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     // SAFETY: the job this launch made, and a struct of the size given.
     unsafe {
@@ -1801,17 +2039,24 @@ fn job_holds(job: &Owned, expected: Restrictions) -> Result<(), Failure> {
         )
     }
     .map_err(failed("the job's limits"))?;
+    if many_groups() {
+        group_holds(job, placement)?;
+    }
     let basic = limits.BasicLimitInformation;
     let one = expected.has(Restrictions::ONE_PROCESS);
     if basic.LimitFlags != job_flags(expected)
         || limits.ProcessMemoryLimit != MEMORY_CAP
         || (one && basic.ActiveProcessLimit != 1)
+        || (!many_groups() && basic.Affinity != placement.worker)
     {
         return Err((
             0,
             format!(
-                "its job's limits are {:#x}, {} bytes, {} processes",
-                basic.LimitFlags.0, limits.ProcessMemoryLimit, basic.ActiveProcessLimit
+                "its job's limits are {:#x}, {} bytes, {} processes, CPUs {:#x}",
+                basic.LimitFlags.0,
+                limits.ProcessMemoryLimit,
+                basic.ActiveProcessLimit,
+                basic.Affinity
             ),
         ));
     }
@@ -1833,6 +2078,43 @@ fn job_holds(job: &Owned, expected: Restrictions) -> Result<(), Failure> {
             format!(
                 "its job's UI restrictions are {:#x}",
                 ui.UIRestrictionsClass.0
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that `job`'s group affinity reads back as `placement`'s group
+/// and CPUs alone (a system of more than one group, where the basic limit's
+/// affinity names no group).
+fn group_holds(job: &Owned, placement: &placement::Placement) -> Result<(), Failure> {
+    use windows::Win32::System::SystemInformation::GROUP_AFFINITY;
+    let mut groups = [GROUP_AFFINITY::default(); 4];
+    let mut len = 0_u32;
+    // SAFETY: the job this launch made, and an array of the size given.
+    unsafe {
+        QueryInformationJobObject(
+            Some(job.0),
+            windows::Win32::System::JobObjects::JobObjectGroupInformationEx,
+            groups.as_mut_ptr().cast(),
+            u32::try_from(size_of_val(&groups)).unwrap_or(0),
+            Some(&raw mut len),
+        )
+    }
+    .map_err(failed("the job's processor group"))?;
+    let n = len as usize / size_of::<GROUP_AFFINITY>();
+    let read: Vec<(u16, usize)> = groups
+        .get(..n)
+        .unwrap_or(&[])
+        .iter()
+        .map(|g| (g.Group, g.Mask))
+        .collect();
+    if read != [(placement.group, placement.worker)] {
+        return Err((
+            0,
+            format!(
+                "its job's groups are {read:x?}, not group {} CPUs {:#x}",
+                placement.group, placement.worker
             ),
         ));
     }
@@ -1977,16 +2259,23 @@ fn token(process: HANDLE, sid: &Sid) -> Result<(), Failure> {
 
 /// Reads the worker's replies from `replies` until the pipe ends, a reply
 /// does not decode or the game holds [`REPLIES`] unread: log lines to the
-/// game's log, the rest to `tx`. One reply past the queue's capacity marks
-/// the worker `overflowed` and ends the reading, which closes the pipe: the
-/// worker's next reply fails and ends it. The game's thread never waits on
-/// the queue, and takes each reply without allocating.
+/// game's log, the rest to `tx`, each stamped with its arrival. One reply
+/// past the queue's capacity marks the worker `overflowed` and ends the
+/// reading, which closes the pipe: the worker's next reply fails and ends
+/// it. The game's thread never waits on the queue, and takes each reply
+/// without allocating. `in_hand` is set from before a reply's stamp until
+/// it is queued, so the session can tell that every reply stamped before
+/// an instant is queued ([`super::Worker::in_hand`]). Returns the line the
+/// end of an unexpected end logs, which the caller logs once the sender is
+/// dropped.
 fn read_replies(
     replies: Owned,
-    tx: &SyncSender<Reply>,
+    tx: &SyncSender<(std::time::Instant, Reply)>,
     overflowed: &AtomicBool,
+    in_hand: &AtomicBool,
+    beats: &super::Beats,
     #[cfg(test)] log: &std::sync::Arc<Mutex<String>>,
-) {
+) -> Option<String> {
     use std::io::Read as _;
     // SAFETY: the game's end of the pipe from the worker, owned by the file
     // from here.
@@ -1995,18 +2284,15 @@ fn read_replies(
     loop {
         let mut prefix = [0; 2];
         if pipe.read_exact(&mut prefix).is_err() {
-            return;
+            return None;
         }
         let len = match control::frame_len(prefix) {
             Ok(len) => len,
-            Err(e) => {
-                log::warn!("media worker: a reply frame the protocol does not have ({e})");
-                return;
-            }
+            Err(e) => return Some(format!("a reply frame the protocol does not have ({e})")),
         };
         let mut message = vec![0; len];
         if pipe.read_exact(&mut message).is_err() {
-            return;
+            return None;
         }
         match Reply::decode(&message) {
             Ok(Reply::Log { text }) => {
@@ -2027,34 +2313,48 @@ fn read_replies(
                     log.push('\n');
                 }
             }
-            Ok(reply) => match tx.try_send(reply) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    overflowed.store(true, Ordering::Release);
-                    log::warn!("media worker: more than {REPLIES} replies unread; its replies end");
-                    return;
+            Ok(Reply::Beat) => beats.beat(),
+            Ok(reply) => {
+                in_hand.store(true, Ordering::SeqCst);
+                let sent = tx.try_send((std::time::Instant::now(), reply));
+                in_hand.store(false, Ordering::SeqCst);
+                match sent {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        overflowed.store(true, Ordering::Release);
+                        return Some(format!(
+                            "more than {REPLIES} replies unread; its replies end"
+                        ));
+                    }
+                    Err(TrySendError::Disconnected(_)) => return None,
                 }
-                Err(TrySendError::Disconnected(_)) => return,
-            },
-            Err(e) => {
-                log::warn!("media worker: a reply that does not decode ({e})");
-                return;
             }
+            Err(e) => return Some(format!("a reply that does not decode ({e})")),
         }
     }
 }
 
 /// The handshake: the first reply other than a log line is the hello,
-/// within the deadline.
-fn handshake(replies: &Receiver<Reply>, limit: Duration) -> Result<Hello, Failure> {
-    match replies.recv_timeout(limit) {
+/// within the deadline, naming the protocol's version the game speaks
+/// (`control::PROTOCOL`): a worker of another version is refused before
+/// anything is handed to it.
+fn handshake(
+    replies: &Receiver<(std::time::Instant, Reply)>,
+    limit: Duration,
+) -> Result<Hello, Failure> {
+    match replies.recv_timeout(limit).map(|(_, reply)| reply) {
         Ok(Reply::Hello {
+            protocol,
             version,
             configuration,
-        }) => Ok(Hello {
+        }) if protocol == control::PROTOCOL => Ok(Hello {
             version,
             configuration,
         }),
+        Ok(Reply::Hello { protocol, .. }) => Err((
+            ERROR_REVISION_MISMATCH.0,
+            format!("it speaks protocol {protocol}, not {}", control::PROTOCOL),
+        )),
         Ok(other) => Err((0, format!("it answered {other:?} before its hello"))),
         Err(RecvTimeoutError::Timeout) => Err((ERROR_TIMEOUT.0, "no hello in time".to_owned())),
         Err(RecvTimeoutError::Disconnected) => Err((0, "it ended before its hello".to_owned())),

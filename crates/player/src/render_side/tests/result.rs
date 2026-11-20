@@ -166,6 +166,14 @@ pub(super) struct Faults {
     pub(crate) step_log: Mutex<Vec<u64>>,
     /// The result-kind stagings asked in steps, each look counted.
     pub(crate) stepped_installs: std::sync::atomic::AtomicU64,
+    /// The next result-kind staging made in steps has its next atlas step
+    /// refused by the device (development builds).
+    pub(crate) refuse_step: AtomicBool,
+    /// The device is destroyed at the next boundary with a result-kind
+    /// staging stepping.
+    pub(crate) lose_in_staging: AtomicBool,
+    /// A result-kind staging was left stepping by its last look.
+    pub(crate) result_stepping: AtomicBool,
 }
 
 impl Recorded {
@@ -293,6 +301,11 @@ impl Screen for Recorded {
         })
     }
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        if self.faults.result_stepping.swap(false, Ordering::AcqRel)
+            && self.faults.lose_in_staging.swap(false, Ordering::AcqRel)
+        {
+            self.menu.renderer_mut().gpu().device().destroy();
+        }
         let up = self.menu.upload_boundary(past);
         let (log, _) = self.menu.renderer_mut().step_log();
         log.clone_into(
@@ -392,7 +405,18 @@ impl Screen for Recorded {
         if kind == ScreenKind::Result {
             self.faults.stepped_installs.fetch_add(1, Ordering::AcqRel);
         }
-        self.menu.install_stepped(kind, skin, request)
+        let answer = self.menu.install_stepped(kind, skin, request);
+        #[cfg(feature = "dev-tools")]
+        if kind == ScreenKind::Result
+            && answer.is_none()
+            && self.faults.refuse_step.swap(false, Ordering::AcqRel)
+        {
+            self.menu.renderer_mut().refuse_next_step();
+        }
+        if kind == ScreenKind::Result && answer.is_none() {
+            self.faults.result_stepping.store(true, Ordering::Release);
+        }
+        answer
     }
     fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
         self.menu.installation(kind)
@@ -4378,6 +4402,53 @@ fn play_and_the_pages_are_created_in_two_intervals_play_first() {
     rig.link.commit_attempt().unwrap();
     rig.link.end_loading().unwrap();
     rig.link.exit();
+}
+
+/// H1 (r2): a result bundle's staging whose atlas step the device refuses,
+/// or whose device is lost while it steps, ends at that boundary with its
+/// one end: the selection waiting for it is asked again in that pass and
+/// answered, never left to the pending selection's 30 s bound.
+// Revert: the end not reported (`out.staged` left `None` where a step
+// retired the staging, or the loss only breaking the boundary's loop) ->
+// "answered at its end" (the wait runs to its bound).
+#[cfg(feature = "dev-tools")]
+fn a_result_bundle_staging_ended_answers_the_selection(lose: bool) {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    if lose {
+        rig.faults.lose_in_staging.store(true, Ordering::Release);
+    } else {
+        rig.faults.refuse_step.store(true, Ordering::Release);
+    }
+    let start = Instant::now();
+    let answer = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Bundle(Arc::clone(&skin)))
+        .wait();
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "answered at its end: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        rig.faults.stepped_installs.load(Ordering::Acquire) >= 2,
+        "asked again"
+    );
+    if !lose {
+        assert!(!matches!(answer, Ok(Preparation::Ready)), "{answer:?}");
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_refused_result_bundle_step_answers_the_selection() {
+    a_result_bundle_staging_ended_answers_the_selection(false);
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_lost_device_under_a_result_bundle_staging_answers_the_selection() {
+    a_result_bundle_staging_ended_answers_the_selection(true);
 }
 
 /// H3 (design.md "Load Pipeline", screen skins across the flow): a result

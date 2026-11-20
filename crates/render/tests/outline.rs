@@ -695,7 +695,7 @@ fn step_to_staged(r: &mut Renderer) -> (render::PreparedToken, Vec<render::TextD
     for _ in 0..1_000 {
         let up = r.upload_boundary();
         texts.extend(up.text);
-        if let Some(t) = up.staged {
+        if let Some(render::StagingEnd::Ready(t)) = up.staged {
             return (t, texts);
         }
         if r.upload_state() == render::UploadState::InFlight {

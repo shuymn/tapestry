@@ -28,6 +28,10 @@
 //!   `use` trees are resolved to their full paths, grouped imports
 //!   included; macros are not expanded. [`crate::privacy`] checks the
 //!   privacy that keeps the runtime in `screens`.
+//! - R7 (design.md "Memory Budget", the uploader): the GPU queue's writes
+//!   are called only from render's `upload` module, and its unpaced write
+//!   only from the functions [`crate::queue_writes::UNPACED`] lists
+//!   ([`crate::queue_writes`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -114,9 +118,9 @@ pub fn run(manifest: &Path, cargo_args: &[&str]) -> anyhow::Result<Vec<String>> 
             ),
     )?;
     let mut diagnostics = check_metadata(&metadata)?;
-    diagnostics.extend(check_player_sources(
-        manifest.parent().context("the manifest has no folder")?,
-    )?);
+    let root = manifest.parent().context("the manifest has no folder")?;
+    diagnostics.extend(check_player_sources(root)?);
+    diagnostics.extend(crate::queue_writes::check(root)?);
     for &(package, target) in PRODUCTION {
         diagnostics.extend(check_production_features(
             manifest, &metadata, package, target, cargo_args,

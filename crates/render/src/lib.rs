@@ -126,7 +126,8 @@ pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, t
 #[cfg(feature = "dev-tools")]
 pub use upload::TextCount;
 pub use upload::{
-    ChartBands, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE, UploadGate, UploadState, Uploaded,
+    ChartBands, Payload, Refused, StagingEnd, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE,
+    UploadGate, UploadState, Uploaded,
 };
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).

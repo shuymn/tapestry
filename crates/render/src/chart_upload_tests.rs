@@ -249,7 +249,8 @@ impl crate::UploadGate for Renewed {
         false
     }
 
-    fn chart_current(&mut self) -> bool {
+    fn current(&mut self, payload: crate::Payload) -> bool {
+        assert_eq!(payload, crate::Payload::Chart);
         self.looks += 1;
         self.looks <= self.current
     }
@@ -294,7 +295,29 @@ fn a_renewal_between_bands_of_one_boundary_ends_it_unwritten() {
         .begin_chart_upload(ChartTarget::Committed, images)
         .unwrap();
     r.chart_submissions.clear();
-    // Current at the look before the first band, superseded at the next.
+    // Current at the boundary's look and at the first band's write,
+    // superseded at the next round's look.
+    let mut gate = Renewed {
+        looks: 0,
+        current: 2,
+    };
+    r.step_seen.set(Some(true));
+    let out = r.upload_boundary_within(Duration::from_secs(60), &mut gate, Some((&mut up, images)));
+    r.step_seen.set(None);
+    assert!(
+        matches!(out.chart, Some(Err(RenderError::ChartChanged))),
+        "{:?}",
+        out.chart
+    );
+    assert_eq!(r.chart_submissions.len(), 1, "a band after the renewal");
+    assert_eq!(presented(&r), None);
+    // M1 (r2): renewed between the boundary's look and the first band's
+    // write: read at the write, nothing is written.
+    let mut up = r
+        .begin_chart_upload(ChartTarget::Committed, images)
+        .unwrap();
+    r.chart_submissions.clear();
+    let writes = r.queue_writes();
     let mut gate = Renewed {
         looks: 0,
         current: 1,
@@ -307,6 +330,6 @@ fn a_renewal_between_bands_of_one_boundary_ends_it_unwritten() {
         "{:?}",
         out.chart
     );
-    assert_eq!(r.chart_submissions.len(), 1, "a band after the renewal");
-    assert_eq!(presented(&r), None);
+    assert_eq!(r.queue_writes(), writes, "a band written after the renewal");
+    assert!(r.chart_submissions.is_empty());
 }

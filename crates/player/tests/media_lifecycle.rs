@@ -73,6 +73,8 @@ impl Said {
                 width: 64,
                 height: 48,
                 duration: 0,
+                matrix: skin_model::media::control::Matrix::Bt601,
+                range: skin_model::media::control::Range::Limited,
                 codec: String::new(),
                 container: String::new(),
             },

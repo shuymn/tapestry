@@ -102,10 +102,11 @@ impl Renderer {
         }
         match res {
             Ok(res) => {
+                let writes = skin_atlas::AtlasWrites::new(Arc::clone(pages), &res.atlas);
                 self.pages_upload = Some(PagesUpload {
                     ticket,
                     res,
-                    writes: skin_atlas::AtlasWrites::new(Arc::clone(pages)),
+                    writes,
                     entry: Some(entry),
                     written: false,
                     #[cfg(any(test, feature = "dev-tools"))]
@@ -219,22 +220,22 @@ impl Renderer {
         Some(ticket)
     }
 
-    /// One step of the upload's pages, as a staging's
-    /// ([`write_staging_step`](Self::write_staging_step)): up to
-    /// [`UPLOAD_STEP`](crate::UPLOAD_STEP) / [`UPLOAD_WRITE`](crate::UPLOAD_WRITE)
-    /// writes under one submission inside one pair of error scopes, a write
-    /// after the first only while the slice has time left and `past`
-    /// answers that the hold's bound has not passed; then its completion
-    /// registered. Whether a step was written. A refusal retires the
-    /// upload and is reported at the boundary.
+    /// One step of the upload's array, as a staging's
+    /// ([`write_staging_step`](Self::write_staging_step)): its
+    /// initialization, then its pages, in writes of at most
+    /// [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) under one submission inside
+    /// one pair of error scopes, each through the uploader's write function
+    /// with `past` read immediately before it, a write after the first only
+    /// while the slice has time left and the step's bytes stay within
+    /// [`UPLOAD_STEP`](crate::UPLOAD_STEP); then its completion registered.
+    /// A refusal retires the upload and is reported at the boundary.
     pub(super) fn write_pages_step(
         &mut self,
         started: Instant,
         steps: u32,
         slice: Duration,
         past: &mut dyn crate::UploadGate,
-    ) -> bool {
-        const WRITES: u64 = crate::UPLOAD_STEP / crate::UPLOAD_WRITE;
+    ) -> super::AtlasStep {
         #[cfg(not(test))]
         let _ = steps;
         #[cfg(test)]
@@ -246,12 +247,14 @@ impl Renderer {
             &self.step_submits,
             &self.step_writes,
         );
+        #[cfg(feature = "dev-tools")]
+        let refuse = std::mem::take(&mut self.step_refusal);
         let gpu = &self.gpu;
         let Some(up) = self.pages_upload.as_mut() else {
-            return false;
+            return super::AtlasStep::Nothing;
         };
         if up.writes.written() {
-            return false;
+            return super::AtlasStep::Nothing;
         }
         let (atlas, writes) = (&up.res.atlas, &mut up.writes);
         let elapsed = || {
@@ -261,18 +264,21 @@ impl Renderer {
             }
             started.elapsed()
         };
-        let ((number, index), refused) = skin_atlas::scoped(gpu.device(), || {
+        let (submitted, refused) = skin_atlas::scoped(gpu.device(), || {
             #[cfg(test)]
             if let Some(f) = write_fault {
                 f(gpu);
             }
-            let mut n = 0_u64;
-            loop {
-                writes.write_one(gpu, atlas, crate::UPLOAD_WRITE);
-                n += 1;
-                if n >= WRITES || writes.written() || elapsed() >= slice || past.past() {
-                    break;
-                }
+            #[cfg(feature = "dev-tools")]
+            if refuse {
+                crate::upload::refuse(gpu);
+            }
+            let (n, staged) =
+                super::atlas_writes(gpu, atlas, writes, past, crate::Payload::Pages, || {
+                    elapsed() >= slice
+                });
+            if n == 0 {
+                return None;
             }
             #[cfg(test)]
             {
@@ -282,14 +288,22 @@ impl Renderer {
                 }
                 submits.set(submits.get() + 1);
             }
-            gpu.submit([])
+            Some((gpu.submit([]), staged))
         });
+        let Some(((number, index), staged)) = submitted else {
+            return super::AtlasStep::Nothing;
+        };
         atlas.mark(number);
         #[cfg(any(test, feature = "dev-tools"))]
         {
             up.timing.1 = Instant::now();
         }
-        self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
+        self.step = Some(crate::upload::InFlight::register(
+            &self.gpu,
+            index,
+            staged,
+            crate::Payload::Pages,
+        ));
         if let Some(e) = refused
             && let Some(up) = self.pages_upload.take()
         {
@@ -300,6 +314,6 @@ impl Renderer {
                 RenderError::Atlas(UploadError::Device(e)),
             ));
         }
-        true
+        super::AtlasStep::Stepped
     }
 }

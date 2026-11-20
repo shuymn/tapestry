@@ -21,7 +21,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use media_support::{
-    Kind, LaunchError, Launched, Made, REFUSED, Restrictions, Setup, Stage, Step, change_shared,
+    Kind, Launched, Made, Restrictions, Setup, Stage, Step, change_shared, ends_refused,
     granted_all, media_host, policy, recipe, revoked, token_facts,
 };
 #[cfg(feature = "dev-tools")]
@@ -63,49 +63,6 @@ fn value(h: HANDLE) -> u64 {
 /// Launches the worker in `stage` under `setup`.
 fn launch(stage: &Stage, setup: Setup) -> Launched {
     stage.launch(&setup).unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// Waits up to `limit` for the process `process` to end: its exit code,
-/// once it has.
-fn exit_of(process: HANDLE, limit: Duration) -> Option<u32> {
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
-    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-
-    let ms = u32::try_from(limit.as_millis()).unwrap();
-    // SAFETY: a process handle with the right to wait on it.
-    if unsafe { WaitForSingleObject(process, ms) } != WAIT_OBJECT_0 {
-        return None;
-    }
-    let mut code = 0;
-    // SAFETY: as above, with the right to query it.
-    unsafe { GetExitCodeProcess(process, &raw mut code) }.unwrap();
-    Some(code)
-}
-
-/// Asserts that the process the failed launch `e` made ends with
-/// `REFUSED`: as the launch saw, or, when it stopped watching first, within
-/// a minute on the handle it kept. One that does not is terminated before
-/// the assertion fails, so it outlives no test.
-fn ends_refused(e: &LaunchError) {
-    use windows::Win32::System::Threading::TerminateProcess;
-
-    match e.process {
-        Made::Ended(code) => assert_eq!((code, e.unended.is_none()), (Some(REFUSED), true), "{e}"),
-        Made::Pending => {
-            let kept = e
-                .unended
-                .as_ref()
-                .unwrap_or_else(|| panic!("no process kept: {e}"));
-            let process = HANDLE(kept.as_raw_handle());
-            let code = exit_of(process, Duration::from_secs(60));
-            if code.is_none() {
-                // SAFETY: the process the launch kept.
-                let _ = unsafe { TerminateProcess(process, 1) };
-            }
-            assert_eq!(code, Some(REFUSED), "it did not end: {e}");
-        }
-        other => panic!("{other:?}: {e}"),
-    }
 }
 
 // Covers: T02
@@ -318,6 +275,7 @@ fn worker_takes_a_handle_only_of_its_kind_and_access_unheld() {
             player: 1,
             section: held_section,
             event: held_event,
+            looping: false,
         })
         .unwrap();
     assert_eq!(
@@ -340,6 +298,7 @@ fn worker_takes_a_handle_only_of_its_kind_and_access_unheld() {
             player: 3,
             section: held_section,
             event: other_event,
+            looping: false,
         })
         .unwrap();
     assert_eq!(
@@ -447,6 +406,7 @@ fn worker_holds_its_handles_with_their_least_access() {
                 player: 0,
                 section: section_value,
                 event: event_value,
+                looping: false,
             })
             .unwrap();
         let log = worker.probed(3);
@@ -1680,10 +1640,11 @@ fn dropping_a_worker_never_waits_on_it() {
 #[test]
 fn worker_job_reads_back_exactly_its_limits() {
     use windows::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
-        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_AFFINITY,
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT_DESKTOP,
+        JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+        JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
         JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
         JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_UI_RESTRICTIONS,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
@@ -1706,18 +1667,104 @@ fn worker_job_reads_back_exactly_its_limits() {
     }
     .unwrap();
     // The memory cap, the end on the job's closing and on an unhandled
-    // exception, one process, and no breakaway.
+    // exception, one process, the CPUs (with more than one group, set by
+    // the job's group affinity instead), and no breakaway.
+    // SAFETY: a plain query.
+    let many_groups =
+        unsafe { windows::Win32::System::Threading::GetActiveProcessorGroupCount() } > 1;
     let basic = limits.BasicLimitInformation;
+    let flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
     assert_eq!(
         basic.LimitFlags,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
-            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        if many_groups {
+            flags
+        } else {
+            flags | JOB_OBJECT_LIMIT_AFFINITY
+        }
     );
     assert_eq!(
         (limits.ProcessMemoryLimit, basic.ActiveProcessLimit),
         (512 << 20, 1)
+    );
+    // Half of this process's whole cores in its primary group, by the
+    // system's own core list: each core's hardware threads all inside the
+    // worker's CPUs or all outside, the worker's within this process's CPUs.
+    let (mut mine, mut system) = (0, 0);
+    // SAFETY: this process's pseudo handle and two out values.
+    unsafe {
+        windows::Win32::System::Threading::GetProcessAffinityMask(
+            windows::Win32::System::Threading::GetCurrentProcess(),
+            &raw mut mine,
+            &raw mut system,
+        )
+    }
+    .unwrap();
+    let cores: Vec<usize> = media_support::processor_cores()
+        .into_iter()
+        .filter(|core| core & mine == *core)
+        .collect();
+    let worker_cpus = if many_groups {
+        let mut group = windows::Win32::System::SystemInformation::GROUP_AFFINITY::default();
+        // SAFETY: the worker's job, and one group's affinity.
+        unsafe {
+            QueryInformationJobObject(
+                Some(job),
+                windows::Win32::System::JobObjects::JobObjectGroupInformationEx,
+                (&raw mut group).cast(),
+                u32::try_from(size_of_val(&group)).unwrap(),
+                None,
+            )
+        }
+        .unwrap();
+        group.Mask
+    } else {
+        basic.Affinity
+    };
+    assert_ne!(worker_cpus, 0);
+    assert_eq!(worker_cpus & !mine, 0, "this process's CPUs {mine:#x}");
+    for core in &cores {
+        let on = core & worker_cpus;
+        assert!(
+            on == 0 || on == *core,
+            "core {core:#x} split by {worker_cpus:#x}"
+        );
+    }
+    let worker_cores = cores.iter().filter(|c| *c & worker_cpus != 0).count();
+    assert_eq!(worker_cores, cores.len() / 2, "cores {cores:#x?}");
+    // The worker's process runs on those CPUs alone.
+    let (mut its, mut system) = (0, 0);
+    // SAFETY: the worker's process handle and two out values.
+    unsafe {
+        windows::Win32::System::Threading::GetProcessAffinityMask(
+            worker.process(),
+            &raw mut its,
+            &raw mut system,
+        )
+    }
+    .unwrap();
+    assert_eq!(its, worker_cpus);
+    // The game's own scheduling is left alone: its process has no default
+    // CPU sets.
+    let mut count = 0;
+    // SAFETY: this process's pseudo handle, a size query.
+    let _ = unsafe {
+        windows::Win32::System::Threading::GetProcessDefaultCpuSets(
+            windows::Win32::System::Threading::GetCurrentProcess(),
+            None,
+            &raw mut count,
+        )
+    };
+    assert_eq!(count, 0, "the game's CPU sets");
+    // At normal priority: below it, other programs filling the CPUs starve
+    // it.
+    // SAFETY: the worker's process handle, which has every access.
+    let class = unsafe { windows::Win32::System::Threading::GetPriorityClass(worker.process()) };
+    assert_eq!(
+        class,
+        windows::Win32::System::Threading::NORMAL_PRIORITY_CLASS.0
     );
     let mut ui = JOBOBJECT_BASIC_UI_RESTRICTIONS::default();
     // SAFETY: as above.

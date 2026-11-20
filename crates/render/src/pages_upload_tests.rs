@@ -253,3 +253,122 @@ fn the_witness_counts_the_upload_in_hand() {
     assert_eq!(published.pages_upload, 0);
     assert!(published.result_atlas > 0);
 }
+
+/// M3 (r2): play's admission counted at the larger of its committed
+/// charge and its staged candidate's. The selection stated 430 Mi (less
+/// the pages' own texels, so the pages count as 250 Mi), play committed at
+/// 120 Mi and staging a candidate stated 240 Mi: 430 + 240 + 250 = 920 Mi
+/// is refused against 896 Mi; the control, play's candidate not staged,
+/// is 430 + 120 + 250 = 800 Mi and begins.
+// Revert: `pending_charge` dropped from the other kinds' charge -> the
+// refused case begins: "920 Mi admitted".
+#[test]
+fn a_pages_begin_counts_play_at_its_larger_charge() {
+    const MI: u64 = 1 << 20;
+    let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+    let ctx = crate::test_common::context(&crate::test_common::GAUGES, false);
+    for staged in [true, false] {
+        let (mut r, [a, b], _dirs) = fixture();
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let look = |rgba, side| crate::test_decl::Look {
+            side,
+            ..crate::test_decl::Look::left(rgba)
+        };
+        let (played, _) = crate::test_decl::bundle(&r, dirs[0].path(), &look([9, 9, 9, 255], 500));
+        let (candidate, _) =
+            crate::test_decl::bundle(&r, dirs[1].path(), &look([0, 255, 0, 255], 700));
+        let p = pages(&b);
+        let pages_mi = pages_texels(p);
+        assert!(pages_mi < 250 * MI);
+        r.state_charge(&a, 430 * MI);
+        let token = r.install(ScreenKind::Selection, &a, 1).unwrap();
+        r.commit(token).unwrap();
+        r.state_charge(&played, 120 * MI);
+        let token = r.install(ScreenKind::Play, &played, 2).unwrap();
+        r.commit(token).unwrap();
+        if staged {
+            r.state_candidate_charge(&candidate, 240 * MI);
+            let input = crate::test_common::attempt(&r, &chart, &ctx);
+            assert_eq!(r.stage_stepped(&candidate, &input, 3).unwrap(), None);
+        }
+        // The pages count as 250 Mi: the selection's statement carries the
+        // rest, stated once play's candidate is staged.
+        r.state_charge(&a, 430 * MI + 250 * MI - pages_mi);
+        if staged {
+            let e = r.begin_pages(p, 1).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    crate::RenderError::Admission { kind: ScreenKind::Result, needed, limit }
+                        if needed == 920 * MI && limit == crate::SHARED_TEXELS
+                ),
+                "920 Mi admitted: {e:?}"
+            );
+            assert_eq!(r.pages_in_hand(), None);
+        } else {
+            assert_eq!(r.begin_pages(p, 1).unwrap(), PagesBegun::Begun, "800 Mi");
+        }
+    }
+}
+
+/// M4 (r2): the witness counts the queue's staging of the pages upload as
+/// its outstanding submission: nothing before a step, the step's bytes
+/// while its completion is unseen, nothing once it is seen; never the
+/// whole payload.
+// Revert: the whole payload's staged bytes counted again
+// (`upload_bytes()` in `pages_upload`) -> "before its first step".
+#[test]
+fn the_witness_counts_the_pages_step_in_flight() {
+    let (mut r, [a, _], _dirs) = fixture();
+    assert_eq!(r.begin_pages(pages(&a), 1).unwrap(), PagesBegun::Begun);
+    let held = r.memory().pages_upload;
+    let base = r
+        .pages_upload
+        .as_ref()
+        .map(|u| u.res.atlas.bytes() + u.res.text_cache.bytes())
+        .unwrap();
+    assert_eq!(held, base, "before its first step");
+    r.step_seen.set(Some(false));
+    let _ = r.upload_boundary_within(Duration::from_secs(60), &mut || false, None);
+    let in_flight = r.memory().pages_upload;
+    assert!(in_flight > base, "its step in flight: {in_flight} {base}");
+    assert!(in_flight - base <= crate::UPLOAD_STEP);
+    r.step_seen.set(Some(true));
+    let _ = r.upload_boundary_within(Duration::ZERO, &mut || true, None);
+    r.step_seen.set(None);
+    assert_eq!(r.memory().pages_upload, base, "its step seen complete");
+}
+
+/// H2 (r2): a pages begin while play's staging has a step in flight
+/// creates its array with nothing written or submitted; its
+/// initialization is written by its own steps, after play's.
+// Revert: the initialization written at creation (`make` writing whatever
+// `whole`) -> "the begin queued writes".
+#[test]
+fn a_pages_begin_writes_nothing_beside_a_step_in_flight() {
+    let (mut r, [_, b], _dirs) = fixture();
+    let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+    let ctx = crate::test_common::context(&crate::test_common::GAUGES, false);
+    let dir = tempfile::tempdir().unwrap();
+    let (c, _) = crate::test_decl::bundle(
+        &r,
+        dir.path(),
+        &crate::test_decl::Look {
+            side: 700,
+            ..crate::test_decl::Look::left([0, 255, 0, 255])
+        },
+    );
+    let input = crate::test_common::attempt(&r, &chart, &ctx);
+    assert_eq!(r.stage_stepped(&c, &input, 2).unwrap(), None);
+    r.step_seen.set(Some(false));
+    let _ = r.upload_boundary_within(Duration::from_secs(60), &mut || false, None);
+    assert_eq!(r.step_submits.get(), 1, "play's step in flight");
+    let (writes, submissions) = (r.queue_writes(), r.gpu().latest());
+    assert_eq!(r.begin_pages(pages(&b), 1).unwrap(), PagesBegun::Begun);
+    r.step_seen.set(None);
+    assert_eq!(r.queue_writes(), writes, "the begin queued writes");
+    assert!(
+        r.gpu().latest() <= submissions + 1,
+        "the begin submitted more than its empty creation"
+    );
+}

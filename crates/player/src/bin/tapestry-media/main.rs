@@ -27,6 +27,7 @@ compile_error!("tapestry-media is Windows-only");
 mod dev;
 mod ffmpeg;
 mod handles;
+mod loop_clock;
 mod os;
 mod player;
 
@@ -34,9 +35,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use skin_model::media::control::{self, Command, Reply};
 
@@ -105,6 +107,7 @@ pub enum ToPlayer {
         id: u32,
         section: os::Owned,
         event: os::Owned,
+        looping: bool,
     },
     Seek {
         id: u32,
@@ -127,6 +130,7 @@ fn hello(max_alloc: usize) -> Out {
     let out = OUT.get_or_init(|| Out(Arc::new(Mutex::new(std::io::stdout()))));
     let (version, configuration) = ffmpeg::version();
     out.send(&Reply::Hello {
+        protocol: protocol(),
         version,
         configuration,
     });
@@ -138,6 +142,16 @@ fn hello(max_alloc: usize) -> Out {
     out.clone()
 }
 
+/// The protocol version the hello names: [`control::PROTOCOL`], or another
+/// a dev-tools command sets.
+fn protocol() -> u32 {
+    #[cfg(feature = "dev-tools")]
+    if let Some(p) = dev::protocol() {
+        return p;
+    }
+    control::PROTOCOL
+}
+
 /// Reads commands until the game quits or closes the pipe, FFmpeg's largest
 /// allocation capped at `max_alloc` bytes.
 fn serve(max_alloc: usize) -> ExitCode {
@@ -147,11 +161,24 @@ fn serve(max_alloc: usize) -> ExitCode {
 /// Reads commands until the game quits or closes the pipe, after the hello
 /// (`out`).
 fn serve_on(out: &Out) -> ExitCode {
-    let mut stdin = std::io::stdin().lock();
+    let commands = read_commands();
     let mut players: BTreeMap<u8, (Sender<ToPlayer>, JoinHandle<()>)> = BTreeMap::new();
     let mut closing: Vec<JoinHandle<()>> = Vec::new();
     let mut quit = control::NO_COMMAND;
-    while let Some((id, command)) = read_command(&mut stdin) {
+    let beat = Duration::from_millis(control::BEAT_INTERVAL_MS);
+    let mut last_beat = Instant::now();
+    loop {
+        let wait = beat.saturating_sub(last_beat.elapsed());
+        let received = commands.recv_timeout(wait);
+        if last_beat.elapsed() >= beat {
+            out.send(&Reply::Beat);
+            last_beat = Instant::now();
+        }
+        let (id, command) = match received {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         closing.retain(|t| !t.is_finished());
         match command {
             Command::Open { player, file } => {
@@ -186,6 +213,7 @@ fn serve_on(out: &Out) -> ExitCode {
                 player,
                 section,
                 event,
+                looping,
             } => {
                 let taken = os::Owned::take(section, os::Kind::Section).and_then(|section| {
                     os::Owned::take(event, os::Kind::Event).map(|event| (section, event))
@@ -196,7 +224,12 @@ fn serve_on(out: &Out) -> ExitCode {
                         out,
                         id,
                         player,
-                        ToPlayer::Play { id, section, event },
+                        ToPlayer::Play {
+                            id,
+                            section,
+                            event,
+                            looping,
+                        },
                     ),
                     Err(code) => refuse_handle(out, id, player, code),
                 }
@@ -258,6 +291,54 @@ fn refuse_handle(out: &Out, id: u32, player: u8, code: u32) {
     ));
     reject(out, id, player, code.cast_signed());
 }
+
+/// The commands on the standard input, read on a thread of their own so
+/// that the control loop beats while no command comes: the channel ends
+/// once the pipe ends or carries a frame the protocol does not have.
+fn read_commands() -> Receiver<(u32, Command)> {
+    let (tx, rx) = mpsc::sync_channel(COMMANDS);
+    let spawned = std::thread::Builder::new()
+        .name("commands".to_owned())
+        .spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut read = 0_u32;
+            loop {
+                stop_hearing(read);
+                let Some(command) = read_command(&mut stdin) else {
+                    return;
+                };
+                if tx.send(command).is_err() {
+                    return;
+                }
+                read = read.saturating_add(1);
+            }
+        });
+    if let Err(e) = spawned {
+        say(&format!(
+            "tapestry-media: the command reader did not start: {e}"
+        ));
+    }
+    rx
+}
+
+/// Parks the command reader for good once it has read the commands
+/// `--dev-serve deaf` lets it read, while the control loop beats
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn stop_hearing(read: u32) {
+    if dev::deaf(read) {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// Nothing without dev-tools.
+#[cfg(not(feature = "dev-tools"))]
+const fn stop_hearing(_: u32) {}
+
+/// The commands read ahead of the control loop.
+const COMMANDS: usize = 16;
 
 /// The next command on `input` and its id, or `None` once the pipe ends or
 /// carries a frame the protocol does not have (the game's commands are

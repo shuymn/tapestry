@@ -867,7 +867,7 @@ impl render::UploadGate for TextGate {
         self.looks > self.free
     }
 
-    fn loading_current(&mut self, _: u64, _: u64) -> bool {
+    fn current(&mut self, _: render::Payload) -> bool {
         self.current
     }
 }
@@ -887,11 +887,12 @@ fn text_in_hand(dir: &std::path::Path) -> Renderer {
     r
 }
 
-/// M1: the loading text is written in bands with the gate read before
-/// each band after a step's first: a gate past from its second look ends
-/// the step after one band, so once that step has completed the text is
-/// still unwritten and a boundary past at once installs nothing; with a
-/// free gate it then installs.
+/// M1, H3 (r2): the loading text is written one band a step, the gate
+/// read immediately before each band's write: a gate past from its third
+/// look (the boundary's, the first band's write, the second's) writes one
+/// band, so once that step has completed the text is still unwritten and
+/// a boundary past at once installs nothing; with a free gate it then
+/// installs.
 // Revert: `write_step` writing every line of its budget without reading
 // the gate -> "installed after one band".
 #[test]
@@ -900,7 +901,7 @@ fn the_gate_is_read_before_each_band_of_the_loading_text() {
     let mut r = text_in_hand(dir.path());
     let mut gate = TextGate {
         looks: 0,
-        free: 1,
+        free: 2,
         current: true,
     };
     let out = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None);
@@ -929,7 +930,7 @@ fn a_superseded_loading_text_is_never_installed() {
     let text = MenuText::new(&r);
     let mut gate = TextGate {
         looks: 0,
-        free: 1,
+        free: 2,
         current: true,
     };
     let _ = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None);

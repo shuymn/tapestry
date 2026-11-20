@@ -529,6 +529,9 @@ pub const IN_PLAY: &[Site] = &[
     // ring's setup and the worker's writer in the same file are not in
     // play.
     Site::File("crates/skin-model/src/media.rs"),
+    // A video's state, which the game thread's preparation deadline and
+    // the render side's staged frames and ring faults change each frame.
+    Site::File("crates/player/src/media_host/movie.rs"),
     Site::Fns(
         "crates/skin-model/src/bga.rs",
         &[

@@ -57,11 +57,10 @@ pub fn dlls() -> Vec<String> {
         .collect()
 }
 
-/// How long a test waits for the worker's hello. The worker runs below
-/// normal priority, and while normal-priority work fills every core
-/// (parallel tests, another build) it can wait seconds for the CPU: its
-/// hello once took 14.7 s that way, against 0.02 s at normal priority. Only
-/// the handshake's own test keeps the recipe's limit.
+/// How long a test waits for the worker's hello. While other work fills
+/// every core (parallel tests, another build) a launch waits for the CPU
+/// and for the other tests' launches, which stage their copies one at a
+/// time. Only the handshake's own test keeps the recipe's limit.
 pub const PATIENT: Duration = Duration::from_secs(30);
 
 /// The recipe, waiting `PATIENT` for the worker's hello.
@@ -355,4 +354,66 @@ pub fn probe<'a>(found: &'a BTreeMap<String, Probe>, name: &str, log: &str) -> &
     found
         .get(name)
         .unwrap_or_else(|| panic!("no probe {name}; the worker's log:\n{log}"))
+}
+
+/// Each processor core's logical processors, as a mask, from the system's
+/// logical processor information.
+pub fn processor_cores() -> Vec<usize> {
+    use windows::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformation, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
+    };
+    let mut len = 0;
+    // SAFETY: a size query.
+    let _ = unsafe { GetLogicalProcessorInformation(None, &raw mut len) };
+    let n = len as usize / size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
+    let mut info = vec![SYSTEM_LOGICAL_PROCESSOR_INFORMATION::default(); n];
+    // SAFETY: a buffer of `len` bytes.
+    unsafe { GetLogicalProcessorInformation(Some(info.as_mut_ptr()), &raw mut len) }.unwrap();
+    info.iter()
+        .filter(|i| i.Relationship == RelationProcessorCore)
+        .map(|i| i.ProcessorMask)
+        .collect()
+}
+
+/// Waits up to `limit` for the process `process` to end: its exit code,
+/// once it has.
+pub fn exit_of(process: HANDLE, limit: Duration) -> Option<u32> {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    let ms = u32::try_from(limit.as_millis()).unwrap();
+    // SAFETY: a process handle with the right to wait on it.
+    if unsafe { WaitForSingleObject(process, ms) } != WAIT_OBJECT_0 {
+        return None;
+    }
+    let mut code = 0;
+    // SAFETY: as above, with the right to query it.
+    unsafe { GetExitCodeProcess(process, &raw mut code) }.unwrap();
+    Some(code)
+}
+
+/// Asserts that the process the failed launch `e` made ends with
+/// `REFUSED`: as the launch saw, or, when it stopped watching first, within
+/// a minute on the handle it kept. One that does not is terminated before
+/// the assertion fails, so it outlives no test.
+pub fn ends_refused(e: &LaunchError) {
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    match e.process {
+        Made::Ended(code) => assert_eq!((code, e.unended.is_none()), (Some(REFUSED), true), "{e}"),
+        Made::Pending => {
+            let kept = e
+                .unended
+                .as_ref()
+                .unwrap_or_else(|| panic!("no process kept: {e}"));
+            let process = HANDLE(kept.as_raw_handle());
+            let code = exit_of(process, Duration::from_secs(60));
+            if code.is_none() {
+                // SAFETY: the process the launch kept.
+                let _ = unsafe { TerminateProcess(process, 1) };
+            }
+            assert_eq!(code, Some(REFUSED), "it did not end: {e}");
+        }
+        other => panic!("{other:?}: {e}"),
+    }
 }

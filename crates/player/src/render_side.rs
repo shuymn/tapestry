@@ -6277,13 +6277,24 @@ thread_local! {
 /// chart publication's generation against its owner's.
 struct PassGate<'a, H: FnMut() -> bool> {
     frame: FrameDue,
+    /// READY's cutoff as the render thread found it.
     cut_off: bool,
+    /// READY's cutoff word, read live: asked, the boundary begins nothing.
+    cutoff: Option<&'a AtomicU32>,
     /// The hold's bound, in a held pass.
     hold: Option<H>,
-    /// The chart publication in hand: its owner's generation and its own.
+    /// The chart publication in hand: its owner's generation, read live,
+    /// and its own.
     chart: Option<(&'a AtomicU64, u64)>,
-    /// The loading lifetime drawn and its newest revision, if any.
+    /// The BGA batch in hand: its owner's generation, read live, and its
+    /// own.
+    bga: Option<(&'a AtomicU64, u64)>,
+    /// The loading lifetime drawn and the newest revision the render
+    /// thread took, if any.
     loading: Option<(u64, u64)>,
+    /// The loading slot, read live: the lifetime current and the newest
+    /// revision the game put there.
+    slot: Option<&'a Mutex<LoadingSlot>>,
     /// Set when the gate took the swap chain's grant: the frame keeps it.
     granted: &'a mut bool,
 }
@@ -6311,10 +6322,14 @@ impl<H: FnMut() -> bool> render::UploadGate for PassGate<'_, H> {
             }
         };
         let hold_past = self.hold.as_mut().is_some_and(|h| h());
+        let cut_off = self.cut_off
+            || self
+                .cutoff
+                .is_some_and(|w| w.load(Ordering::Acquire) & cutoff::ASKED != 0);
         !admits(
             GateState {
                 frame_due,
-                cut_off: self.cut_off,
+                cut_off,
                 hold_past,
                 heavy_spent: false,
             },
@@ -6322,14 +6337,25 @@ impl<H: FnMut() -> bool> render::UploadGate for PassGate<'_, H> {
         )
     }
 
-    fn chart_current(&mut self) -> bool {
-        self.chart
-            .is_none_or(|(now, g)| now.load(Ordering::SeqCst) == g)
-    }
-
-    fn loading_current(&mut self, lifetime: u64, revision: u64) -> bool {
-        self.loading
-            .is_none_or(|(l, r)| l != lifetime || r == revision)
+    fn current(&mut self, payload: render::Payload) -> bool {
+        match payload {
+            render::Payload::Chart => self
+                .chart
+                .is_none_or(|(now, g)| now.load(Ordering::SeqCst) == g),
+            render::Payload::Bga => self
+                .bga
+                .is_none_or(|(now, g)| now.load(Ordering::SeqCst) == g),
+            render::Payload::LoadingText { lifetime, revision } => {
+                self.loading
+                    .is_none_or(|(l, r)| l != lifetime || r == revision)
+                    && self.slot.is_none_or(|m| {
+                        let slot = m.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.lifetime == lifetime
+                            && slot.update.as_ref().is_none_or(|u| u.revision == revision)
+                    })
+            }
+            render::Payload::Staging | render::Payload::Pages => true,
+        }
     }
 }
 
@@ -9320,6 +9346,14 @@ impl Run {
         if let Some((_, reply)) = self.pages_hand.take() {
             let _ = reply.send(PagesAnswer::Lost);
         }
+        // A staging in hand went with it too: its one end, so the
+        // preparation waiting for it is asked again (design.md "Memory
+        // Budget", the uploader).
+        if self.attempt.as_ref().is_some_and(|p| p.taken)
+            || self.select_hand.as_ref().is_some_and(|h| h.taken)
+        {
+            self.staged_seen = true;
+        }
         let word = self.shared.cutoff.load(Ordering::Acquire);
         if !self.cut_off && word & cutoff::ASKED != 0 && word & cutoff::PHASE != cutoff::CUT_OFF {
             self.shared
@@ -9886,41 +9920,59 @@ impl Run {
             Admit::ByStall if self.grant_found() => return,
             Admit::ByStall | Admit::Free => {}
         }
-        // A selection entry's regrowth runs at the pass that takes the
-        // entry, before the entry's first frame (design.md "Load
-        // Pipeline", the priority); every other operation waits for a frame
-        // due.
-        let frame = if regrow {
-            FrameDue::Never
+        #[cfg(test)]
+        let regime = if self.screen.is_none() || matches!(mode, Mode::Idle) || held.is_some() {
+            Regime::Clock
+        } else if self.stalled {
+            Regime::Stalled
         } else {
-            self.frame_due_by(mode, held)
+            Regime::Presenting
         };
-        let state = GateState {
-            frame_due: match frame {
-                FrameDue::Never => false,
-                FrameDue::Now => true,
-                FrameDue::Grant(g) => {
-                    let found = g.ready();
-                    if found {
-                        self.granted = true;
-                        self.stalled = false;
-                    }
-                    found
-                }
-                FrameDue::At(at) => gate_now() >= at,
-            },
-            cut_off: self.cut_off,
-            hold_past: held
-                .is_some_and(|shown_at| Self::hold_past(self.clock, &self.shared, shown_at)()),
-            heavy_spent: false,
-        };
-        if !admits(state, Ask::Heavy) {
+        // A selection entry's regrowth itself runs at the pass that takes
+        // the entry, before the entry's first frame (design.md "Load
+        // Pipeline", the priority), with no look at the frame; one with
+        // nothing to do leaves the other operations to the frame's check.
+        if regrow {
+            if !admits(self.heavy_state(FrameDue::Never, held), Ask::Heavy) {
+                return;
+            }
+            let Some(before) = self.screen.as_ref().map(|s| s.heavy_ops().count) else {
+                return;
+            };
+            #[cfg(test)]
+            let (start, refills) = (
+                Instant::now(),
+                self.shared.refilling_frames.load(Ordering::SeqCst),
+            );
+            if let Some(s) = &mut self.screen {
+                s.regrow_pool();
+            }
+            if self
+                .screen
+                .as_ref()
+                .is_some_and(|s| s.heavy_ops().count != before)
+            {
+                #[cfg(test)]
+                self.note_heavy_record(HeavyRec {
+                    kind: HeavyKind::Regrowth,
+                    start,
+                    end: Instant::now(),
+                    regime,
+                    refills,
+                });
+                self.note_heavy();
+                return;
+            }
+        }
+        // Every other operation waits for a frame due.
+        let frame = self.frame_due_by(mode, held);
+        if !admits(self.heavy_state(frame, held), Ask::Heavy) {
             return;
         }
-        // An owed creation first after an entry's regrowth, play's before
-        // the pages' and a result skin's selection (design.md "Load
-        // Pipeline", the priority): it is the interval's operation.
-        if let Some(c) = creation.filter(|_| !regrow) {
+        // An owed creation first, play's before the pages' and a result
+        // skin's selection (design.md "Load Pipeline", the priority): it is
+        // the interval's operation.
+        if let Some(c) = creation {
             #[cfg(test)]
             let start = Instant::now();
             match c {
@@ -9952,13 +10004,7 @@ impl Run {
                 },
                 start,
                 end: Instant::now(),
-                regime: if self.screen.is_none() || matches!(mode, Mode::Idle) || held.is_some() {
-                    Regime::Clock
-                } else if self.stalled {
-                    Regime::Stalled
-                } else {
-                    Regime::Presenting
-                },
+                regime,
                 refills: self.shared.refilling_frames.load(Ordering::SeqCst),
             });
             self.note_heavy();
@@ -9968,16 +10014,9 @@ impl Run {
             return;
         };
         #[cfg(test)]
-        let (start, refills, regime) = (
+        let (start, refills) = (
             Instant::now(),
             self.shared.refilling_frames.load(Ordering::SeqCst),
-            if self.screen.is_none() || matches!(mode, Mode::Idle) || held.is_some() {
-                Regime::Clock
-            } else if self.stalled {
-                Regime::Stalled
-            } else {
-                Regime::Presenting
-            },
         );
         let ran = |r: &Self| {
             r.screen
@@ -9986,13 +10025,6 @@ impl Run {
         };
         #[cfg(test)]
         let mut kind = None;
-        if regrow && let Some(s) = &mut self.screen {
-            s.regrow_pool();
-            #[cfg(test)]
-            {
-                kind = Some(HeavyKind::Regrowth);
-            }
-        }
         if bga && !ran(self) {
             self.bga_op_boundary(true);
             #[cfg(test)]
@@ -10031,6 +10063,33 @@ impl Run {
             });
         }
         self.note_heavy();
+    }
+
+    /// The admission gate's state for a heavy operation (design.md "Memory
+    /// Budget", the uploader's admission gate): `frame` looked at (a grant
+    /// found is kept for the frame), READY's cutoff as found (a cutoff
+    /// asked with entries filled waits for their destruction, a heavy
+    /// operation), and the hold's bound in a held pass.
+    fn heavy_state(&mut self, frame: FrameDue, held: Option<TimeUs>) -> GateState {
+        GateState {
+            frame_due: match frame {
+                FrameDue::Never => false,
+                FrameDue::Now => true,
+                FrameDue::Grant(g) => {
+                    let found = g.ready();
+                    if found {
+                        self.granted = true;
+                        self.stalled = false;
+                    }
+                    found
+                }
+                FrameDue::At(at) => gate_now() >= at,
+            },
+            cut_off: self.cut_off,
+            hold_past: held
+                .is_some_and(|shown_at| Self::hold_past(self.clock, &self.shared, shown_at)()),
+            heavy_spent: false,
+        }
     }
 
     /// What makes a frame due before the boundary's work ends, for a pass
@@ -10776,6 +10835,10 @@ impl Run {
             } => Some((*lifetime, update.revision)),
             _ => None,
         };
+        let bga = self
+            .bga_reply
+            .as_ref()
+            .map(|(g, _)| (&*self.shared.bga_generation, *g));
         let mut granted = false;
         let step = match self.screen.as_mut() {
             Some(s) => {
@@ -10783,17 +10846,23 @@ impl Run {
                     Some(shown_at) => s.upload_boundary(&mut PassGate {
                         frame,
                         cut_off: self.cut_off,
+                        cutoff: Some(&self.shared.cutoff),
                         hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
                         chart,
+                        bga,
                         loading,
+                        slot: Some(&self.shared.loading),
                         granted: &mut granted,
                     }),
                     None => s.upload_boundary(&mut PassGate::<fn() -> bool> {
                         frame,
                         cut_off: self.cut_off,
+                        cutoff: Some(&self.shared.cutoff),
                         hold: None,
                         chart,
+                        bga,
                         loading,
+                        slot: Some(&self.shared.loading),
                         granted: &mut granted,
                     }),
                 };
@@ -24282,10 +24351,13 @@ pub(crate) mod tests {
     // passes that present nothing, with no sleep while it can act.
     #[cfg(feature = "dev-tools")]
     mod upload;
-    // The boundary's admission gate over every order of its events (the
-    // grant's stand-in exists with dev-tools).
+    // The uploader's writes against the boundary's admission gate on the
+    // production path, every event before every write (the grant's
+    // stand-in exists with dev-tools).
     #[cfg(feature = "dev-tools")]
     mod admission_gate;
+    #[cfg(feature = "dev-tools")]
+    mod chart_fixture;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,

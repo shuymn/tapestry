@@ -1,12 +1,15 @@
 //! The uploader's staging steps on WARP (design.md "Memory Budget", the
-//! uploader): a staging with its own array answers ready only after its
-//! last step's completion, its pages written in atlas steps of up to
-//! eight 4 MiB writes under one submission; a hold's bound closes a step
-//! with the writes it has; a step refused retires the staging and answers
-//! its request with the refusal.
+//! uploader): a staging with its own array is created with nothing
+//! written, and answers ready only after its last step's completion, its
+//! initialization and pages written in atlas steps of writes of at most
+//! 4 MiB under one submission, at most 32 MiB a step; a hold's bound read
+//! before each write closes a step with the writes it has; a step refused,
+//! or the device lost, retires the staging, reports its one end and
+//! answers its request with the refusal.
 //!
 //! The fixture is one 3 500² cell on a 3 584-texel page: 49 MiB at level
-//! 0 and 16 MiB below, 19 writes of at most 4 MiB, so three steps.
+//! 0 and 16 MiB below, 19 page writes of at most 4 MiB after the
+//! initialization's, so three steps.
 
 use std::time::Duration;
 
@@ -25,18 +28,50 @@ const GREEN: [u8; 4] = [0, 255, 0, 255];
 const TOP: (u32, u32) = (480, 60);
 const BOTTOM: (u32, u32) = (480, 1_020);
 
-/// The writes of `b`'s pages, each at most 4 MiB as the queue stages
-/// them, level by level.
-fn writes(b: &render::SkinBundle) -> u64 {
-    let side = b.side();
-    let per_page: u64 = (0..skin_model::MIP_LEVELS)
-        .map(|k| {
-            let s = side >> k;
-            let rows = (crate::UPLOAD_WRITE / crate::text_upload::padded(s)).max(1);
-            u64::from(s).div_ceil(rows)
-        })
-        .sum();
-    per_page * u64::try_from(b.atlas_pages().pages().len()).unwrap()
+/// The bytes each write of `b`'s array stages, in order: its
+/// initialization (the built-in atlas, then a zero texel at each level of
+/// each kept layer), then its pages' bands of at most 4 MiB, level by
+/// level.
+fn write_sizes(b: &render::SkinBundle) -> Vec<u64> {
+    use crate::text_upload::padded;
+    let pages = b.atlas_pages();
+    let kept = u64::from(pages.text_layer().is_some()) + u64::from(pages.chart_layer().is_some());
+    let levels = skin_model::MIP_LEVELS as u64;
+    let mut sizes = vec![padded(crate::atlas::ATLAS_SIZE) * u64::from(crate::atlas::ATLAS_SIZE)];
+    sizes.extend((0..kept * levels).map(|_| padded(1)));
+    for _ in pages.pages() {
+        for k in 0..skin_model::MIP_LEVELS {
+            let s = b.side() >> k;
+            let per = (crate::UPLOAD_WRITE / padded(s)).max(1);
+            let mut left = u64::from(s);
+            while left > 0 {
+                let rows = left.min(per);
+                sizes.push(padded(s) * rows);
+                left -= rows;
+            }
+        }
+    }
+    sizes
+}
+
+/// The writes of each atlas step for `sizes` in order, by the step's
+/// rule: the first always, each later one while the step's bytes with it
+/// stay within 32 MiB.
+fn steps_of(sizes: &[u64]) -> Vec<u64> {
+    let mut steps = Vec::new();
+    let (mut n, mut bytes) = (0_u64, 0_u64);
+    for &size in sizes {
+        if n > 0 && bytes + size > crate::UPLOAD_STEP {
+            steps.push(n);
+            (n, bytes) = (0, 0);
+        }
+        n += 1;
+        bytes += size;
+    }
+    if n > 0 {
+        steps.push(n);
+    }
+    steps
 }
 
 fn chart() -> Chart {
@@ -83,7 +118,7 @@ fn a_staging_answers_ready_only_after_its_last_step() {
     let mut before = 0;
     let ready = loop {
         let up = r.upload_boundary_within(Duration::from_secs(10), &mut || false, None);
-        if let Some(t) = up.staged {
+        if let Some(crate::StagingEnd::Ready(t)) = up.staged {
             break t;
         }
         before += 1;
@@ -119,10 +154,14 @@ fn a_staging_answers_ready_only_after_its_last_step() {
 }
 
 /// One boundary with time for every step, each completion seen at once:
-/// atlas steps of eight writes under one submission each, the last of
-/// what is left, so 19 writes go over in three submissions.
+/// atlas steps under one submission each, a write joining its step only
+/// while the step's bytes stay within 32 MiB, the initialization's writes
+/// first, so the array's writes go over in three submissions.
+// Revert: a step's bound counted in writes again (eight a step whatever
+// their bytes) -> the first step takes the initialization and eight
+// bands, past 32 MiB.
 #[test]
-fn an_atlas_step_is_eight_writes_under_one_submission() {
+fn an_atlas_step_stays_within_its_bytes_under_one_submission() {
     let mut r = offscreen(W, H);
     let b = big(&r);
     let chart = chart();
@@ -131,15 +170,16 @@ fn an_atlas_step_is_eight_writes_under_one_submission() {
         r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).unwrap(),
         None
     );
-    let n = writes(&b);
-    assert!((17..=24).contains(&n), "{n} writes: three steps");
+    let sizes = write_sizes(&b);
+    let steps = steps_of(&sizes);
+    assert_eq!(steps.len(), 3, "{steps:?}");
     r.step_seen.set(Some(true));
     let up = r.upload_boundary_within(Duration::from_secs(60), &mut || false, None);
     r.step_seen.set(None);
-    assert_eq!(*r.step_writes.borrow(), [8, 8, n - 16]);
+    assert_eq!(*r.step_writes.borrow(), steps);
     assert_eq!(r.step_submits.get(), 3);
     assert!(
-        up.staged.is_some(),
+        matches!(up.staged, Some(crate::StagingEnd::Ready(_))),
         "ready in the boundary that saw its last step"
     );
 }
@@ -157,16 +197,17 @@ fn the_holds_bound_closes_a_step_with_its_writes() {
         r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).unwrap(),
         None
     );
-    let n = writes(&b);
+    let sizes = write_sizes(&b);
     // Its completion withheld: the step stays in flight.
     r.step_seen.set(Some(false));
-    // Read before each write: the bound passes after the third.
+    // Read before the step and immediately before each write: the bound
+    // passes at the fifth look, before the step's fourth write.
     let mut looks = 0;
     let up = r.upload_boundary_within(
         Duration::from_secs(60),
         &mut || {
             looks += 1;
-            looks > 3
+            looks > 4
         },
         None,
     );
@@ -176,17 +217,24 @@ fn the_holds_bound_closes_a_step_with_its_writes() {
     assert_eq!(up.staged, None);
     r.step_seen.set(Some(true));
     // Past the bound before the first write: nothing written at all.
+    let writes = r.queue_writes();
     let _ = r.upload_boundary_within(Duration::from_secs(60), &mut || true, None);
     assert_eq!(r.step_submits.get(), 1, "no write past the bound");
+    assert_eq!(r.queue_writes(), writes, "no write past the bound");
     let up = r.upload_boundary_within(Duration::from_secs(60), &mut || false, None);
     r.step_seen.set(None);
-    assert_eq!(*r.step_writes.borrow(), [3, 8, n - 11]);
-    assert!(up.staged.is_some());
+    let mut expected = vec![3];
+    expected.extend(steps_of(&sizes[3..]));
+    assert_eq!(*r.step_writes.borrow(), expected);
+    assert!(matches!(up.staged, Some(crate::StagingEnd::Ready(_))));
 }
 
 /// A refusal at a step ends the staging: its array retires into the
-/// entry it reserved, nothing is staged, and its request asked again
-/// answers the refusal once.
+/// entry it reserved, nothing is staged, the boundary reports its one end
+/// (the event a waiting preparation is asked again on), and its request
+/// asked again answers the refusal once.
+// Revert: the refusal not reported (`out.staged` left `None` when a
+// step retired the staging) -> "its one end reported".
 #[test]
 fn a_refused_step_retires_the_staging_and_answers_its_request() {
     fn refuse(gpu: &crate::gpu::Gpu) {
@@ -212,7 +260,11 @@ fn a_refused_step_retires_the_staging_and_answers_its_request() {
     r.step_submit_fault = Some(refuse);
     let up = r.upload_boundary();
     r.step_submit_fault = None;
-    assert_eq!(up.staged, None);
+    assert_eq!(
+        up.staged,
+        Some(crate::StagingEnd::Refused(1)),
+        "its one end reported"
+    );
     assert_eq!(r.staged(), None, "nothing staged");
     assert_eq!(r.filled(), filled + 1, "its array in its entry");
     let e = r
@@ -242,4 +294,89 @@ fn a_text_band_is_at_most_one_write() {
         assert!(rows >= 1);
         assert!(padded(w) * u64::from(rows) <= crate::UPLOAD_WRITE, "{w}");
     }
+}
+
+/// H2 (r2): a stepped staging's array is created with nothing written:
+/// its creation queues no write; a boundary whose gate refuses every
+/// write writes nothing; the first write admitted is its initialization's
+/// (the built-in atlas in layer 0), through the uploader.
+// Revert: the initialization written at creation again (`make` writing
+// the built-in atlas and the zero texels whatever `whole`) -> "the
+// creation queued writes".
+#[test]
+fn a_stepped_creation_writes_nothing_until_a_boundary_admits_it() {
+    let mut r = offscreen(W, H);
+    let b = big(&r);
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    let before = r.queue_writes();
+    assert_eq!(
+        r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).unwrap(),
+        None
+    );
+    assert_eq!(r.queue_writes(), before, "the creation queued writes");
+    let _ = r.upload_boundary_within(Duration::from_secs(60), &mut || true, None);
+    assert_eq!(r.queue_writes(), before, "a write past the gate");
+    assert_eq!(r.step_submits.get(), 0);
+    r.step_seen.set(Some(false));
+    let mut looks = 0;
+    let _ = r.upload_boundary_within(
+        Duration::from_secs(60),
+        &mut || {
+            looks += 1;
+            looks > 2
+        },
+        None,
+    );
+    r.step_seen.set(None);
+    assert_eq!(r.queue_writes(), before + 1, "one write admitted");
+    assert_eq!(*r.step_writes.borrow(), [1]);
+    let sizes = write_sizes(&b);
+    assert_eq!(
+        sizes[0],
+        crate::text_upload::padded(crate::atlas::ATLAS_SIZE) * u64::from(crate::atlas::ATLAS_SIZE),
+        "the initialization first"
+    );
+}
+
+/// H1 (r2): the device lost while a staging steps ends it at the next
+/// boundary with its one end reported, and its request asked again
+/// answers the loss: a waiting preparation is never left without an
+/// answer.
+// Revert: the loss not ending the staging (the `gpu.lost()` branch only
+// breaking) -> "its end reported on the loss".
+#[test]
+fn a_lost_device_ends_a_staging_with_its_one_end() {
+    let mut r = offscreen(W, H);
+    let b = big(&r);
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    assert_eq!(
+        r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).unwrap(),
+        None
+    );
+    r.gpu().device().destroy();
+    let mut end = None;
+    for _ in 0..100 {
+        end = r
+            .upload_boundary_within(Duration::from_secs(1), &mut || false, None)
+            .staged;
+        if end.is_some() || r.gpu().lost() {
+            break;
+        }
+    }
+    if end.is_none() {
+        end = r
+            .upload_boundary_within(Duration::from_secs(1), &mut || false, None)
+            .staged;
+    }
+    assert_eq!(
+        end,
+        Some(crate::StagingEnd::Refused(1)),
+        "its end reported on the loss"
+    );
+    assert!(matches!(
+        r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1),
+        Err(RenderError::DeviceLost)
+    ));
 }

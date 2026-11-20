@@ -237,13 +237,16 @@ impl ChartPool {
         });
         for layer in 0..layers {
             for level in 0..levels {
-                skin_atlas::write_region(
-                    gpu.queue(),
-                    &texture,
-                    (layer, level),
-                    [0, 0],
-                    [1, 1],
-                    &[0; 4],
+                crate::upload::write_unpaced(
+                    gpu,
+                    &crate::upload::Band {
+                        texture: &texture,
+                        layer,
+                        level,
+                        origin: [0, 0],
+                        size: [1, 1],
+                        bytes: &[0; 4],
+                    },
                 );
             }
         }
@@ -375,13 +378,16 @@ impl ChartPool {
                     let Some(size) = f.level_size(level) else {
                         continue;
                     };
-                    skin_atlas::write_region(
-                        gpu.queue(),
-                        &self.texture,
-                        (layer, k),
-                        origin.map(|o| o >> k),
-                        size,
-                        bytes,
+                    crate::upload::write_unpaced(
+                        gpu,
+                        &crate::upload::Band {
+                            texture: &self.texture,
+                            layer,
+                            level: k,
+                            origin: origin.map(|o| o >> k),
+                            size,
+                            bytes,
+                        },
                     );
                 }
             }
