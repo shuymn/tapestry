@@ -652,18 +652,19 @@ struct Begun {
 fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
     desktop::dpi_aware()?;
     desktop::unswapped(desktop::swapped())?;
-    let (dir, run, role) = match (&a.out, &a.set, &a.role) {
+    let (dir, run, role, set) = match (&a.out, &a.set, &a.role) {
         (Some(out), None, None) => {
             owner::reserve(out)?;
             (
                 out.clone(),
                 owner::random_hex(16)?,
                 test_device::contract::SINGLE.to_owned(),
+                None,
             )
         }
         (None, Some(set), Some(role)) => {
-            let (run, dir) = owner::reserved(set, role, &a.row)?;
-            (dir, run, role.clone())
+            let (outer, run, dir) = owner::reserved(set, role, &a.row)?;
+            (dir, run, role.clone(), Some(outer))
         }
         _ => bail!("a run takes `--out <dir>`, or `--set <dir> --role <role>`"),
     };
@@ -677,7 +678,7 @@ fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
         "t": "start", "run": run, "row": a.row, "role": role, "build": a.build,
         "process": { "pid": me.pid, "created": me.created }, "commit": super::COMMIT,
         "tag": prefix, "args": std::env::args().skip(1).collect::<Vec<_>>(),
-        "set": a.set.as_ref().map(|s| s.to_string_lossy().into_owned()),
+        "set": set,
         "inner": inner.map(|r| json!({ "role": r.role, "row": r.row, "run": r.run, "dir": r.dir })),
     }));
     Ok(Begun {
@@ -792,7 +793,14 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         beat: &beat_fn,
     };
     let log = b.log.clone();
-    let mut record = |v: Value| log.put(v);
+    let window = sink.window;
+    let mut record = |mut v: Value| {
+        // The sink's close names the window it closed.
+        if v["t"] == "close" {
+            v["window"] = json!(window);
+        }
+        log.put(v);
+    };
     let clock = end::Wall(Instant::now());
     errors.extend(end::end(end::Run {
         link: &mut link,

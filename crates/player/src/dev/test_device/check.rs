@@ -216,6 +216,13 @@ fn sink_kill() -> Expectation {
                 writes: None,
                 exit: Exit::Killed,
             },
+            // The outer's record of that kill.
+            ExitRule {
+                role: SINGLE,
+                process: "inner",
+                writes: Some(file(INNER, RUN)),
+                exit: Exit::Killed,
+            },
             // The inner's recorder ends with its input or with the inner's
             // job, either way with code 0 (a job's kill-on-close gives 0).
             ExitRule {

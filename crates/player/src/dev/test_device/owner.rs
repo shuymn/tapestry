@@ -143,21 +143,22 @@ pub fn seal(dir: &Path, path: &Path, run: &str, role: &str) -> anyhow::Result<Va
     }))
 }
 
-/// The run an outer run in `set` reserved for `role` running `row`: its run
-/// id and its folder, which is made here (`create_dir`, so a role runs
-/// once). The reservation is the outer's `start` record, the first line of
-/// its `run.jsonl`.
+/// The run an outer run in `set` reserved for `role` running `row`: the
+/// outer's run id (the inner's set), the inner's run id and its folder,
+/// which is made here (`create_dir`, so a role runs once). The reservation
+/// is the outer's `start` record, the first line of its `run.jsonl`.
 ///
 /// # Errors
 ///
 /// No such reservation, or the folder exists.
-pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, PathBuf)> {
+pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, String, PathBuf)> {
     let text = std::fs::read_to_string(set.join(test_device::contract::RUN))
         .with_context(|| format!("the reserving run in {}", set.display()))?;
     let first = text.lines().next().unwrap_or_default();
     let Ok(Run::Start(start)) = serde_json::from_str::<Run>(first) else {
         anyhow::bail!("{}'s first record is not a `start`", set.display());
     };
+    let outer = start.run;
     let Some(inner) = start.inner.filter(|r| r.role == role) else {
         anyhow::bail!("the run in {} reserved no role `{role}`", set.display());
     };
@@ -169,7 +170,7 @@ pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, Pa
     }
     let dir = set.join(&inner.dir);
     reserve(&dir)?;
-    Ok((inner.run, dir))
+    Ok((outer, inner.run, dir))
 }
 
 /// Checks the recorder's `ready` against the child the runner spawned: its
@@ -337,7 +338,8 @@ mod tests {
             set,
             &json!({"role": "inner", "row": "sink", "run": id, "dir": "inner"}),
         );
-        let (run, dir) = reserved(set, "inner", "sink").unwrap();
+        let (outer, run, dir) = reserved(set, "inner", "sink").unwrap();
+        assert_eq!(outer, "a".repeat(32));
         assert_eq!(run, id);
         assert_eq!(dir, set.join("inner"));
         assert!(dir.is_dir());
