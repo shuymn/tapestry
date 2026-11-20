@@ -312,3 +312,73 @@ fn the_preparation_deadline_loses_what_is_not_settled() {
         [MovieShow::Lost, MovieShow::Lost]
     );
 }
+
+/// Planes whose writes land in a buffer made beforehand.
+struct Preallocated {
+    bytes: Vec<u8>,
+}
+
+impl Planes for Preallocated {
+    fn reserve(&mut self, _width: u32, _height: u32, _layers: u32) {}
+
+    fn write(&mut self, _layer: u32, width: u32, _height: u32, fill: &mut Fill<'_>) -> bool {
+        let pitch = [width as usize, width.div_ceil(2) as usize];
+        let bytes = &mut self.bytes;
+        fill(
+            &mut |at, b| match bytes.get_mut(at..at + b.len()) {
+                Some(d) => {
+                    d.copy_from_slice(b);
+                    true
+                }
+                None => false,
+            },
+            pitch,
+        )
+    }
+
+    fn uv(&self, width: u32, height: u32) -> [f32; 4] {
+        [0.0, 0.0, width as f32, height as f32]
+    }
+}
+
+/// The movie hook allocates nothing (design.md "Scope of No Allocation"):
+/// frames that admit a movie, peek its ring, take its due frames into the
+/// planes and show them, each counted on this thread whole, the take's
+/// sink included; with a positive control.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn movie_upload_hook_alloc() {
+    use crate::alloc_count::this_thread;
+    let start = Instant::now();
+    let a = Fake::new(64, 32);
+    a.set(Status::Live);
+    // The worker's four slots, published before the count.
+    for seq in 1..=4_u64 {
+        a.publish(
+            seq,
+            i64::try_from(seq).unwrap() * 16_667,
+            u8::try_from(seq).unwrap(),
+        );
+    }
+    let mut m = movies(Some(&a), None, start);
+    let mut planes = Preallocated {
+        bytes: vec![0; 64 * 32 * 2],
+    };
+    // The first frame admits the movie and takes its reader: counted too.
+    let before = this_thread();
+    let mut shown = 0;
+    for k in 1..=4_i64 {
+        let shows = m.frame(&mut planes, k * 16_667, start);
+        if matches!(shows[0], MovieShow::Frame { .. }) {
+            shown += 1;
+        }
+    }
+    let after = this_thread();
+    assert_eq!(after - before, 0, "allocations");
+    assert_eq!(shown, 4, "each due frame taken and shown");
+    assert_eq!(planes.bytes[0], 4, "the newest frame's bytes");
+    // The positive control: an allocation on this thread is counted.
+    let v = std::hint::black_box(vec![0_u8; 16]);
+    assert!(this_thread() > after);
+    drop(v);
+}
