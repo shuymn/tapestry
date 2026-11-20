@@ -48,10 +48,12 @@ mod loudness;
 mod measure;
 #[expect(
     dead_code,
-    reason = "the media worker's host lands before the change that plays videos through it"
+    reason = "parts of the media worker's host serve its tests alone"
 )]
 mod media_host;
 mod menu_screen;
+mod movie_frame;
+mod movie_screen;
 mod page_jobs;
 mod play;
 mod pointer;
@@ -1341,6 +1343,7 @@ fn play(
         }
     };
     let link = window_thread.link();
+    let media = movie_screen::MediaHub::new(loaded.root().path());
     let make: MakeScreen = Box::new(move || {
         let target = Target::Window {
             window: surface.into(),
@@ -1348,7 +1351,9 @@ fn play(
             height: surface.height,
         };
         Renderer::new(target, AdapterChoice::HighPerformance).map(|r| {
-            let screen = MenuScreen::new(r, None).with_sink(Box::new(link.clone()));
+            let screen = MenuScreen::new(r, None)
+                .with_sink(Box::new(link.clone()))
+                .with_media(Arc::clone(&media));
             Box::new(screen) as Box<dyn Screen>
         })
     });
@@ -1758,6 +1763,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let ime = window_thread.as_ref().map(window::WindowThread::ime);
     let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
+    let media = movie_screen::MediaHub::new(root.path());
     let make: MakeScreen = match (surface, link) {
         (Some(surface), Some(link)) => Box::new(move || {
             let target = Target::Window {
@@ -1767,7 +1773,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             };
             let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
             let fonts = render::text::Fonts::runtime()?;
-            let screen = MenuScreen::new(r, Some(fonts)).with_sink(Box::new(link.clone()));
+            let screen = MenuScreen::new(r, Some(fonts))
+                .with_sink(Box::new(link.clone()))
+                .with_media(Arc::clone(&media));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // Headless (dev-tools): offscreen on WARP, or on the hardware
@@ -1788,7 +1796,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             log::info!("{line}");
             dev::scenario::admit(adapter, &got)?;
             let fonts = render::text::Fonts::runtime()?;
-            Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
+            let screen = MenuScreen::new(r, Some(fonts)).with_media(Arc::clone(&media));
+            Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // A production run always has its window.
         #[cfg(not(feature = "dev-tools"))]
@@ -2089,13 +2098,15 @@ fn headless(
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),
         None => Box::new(NoFrames),
     };
+    let media = movie_screen::MediaHub::new(loaded.root().path());
     let make: MakeScreen = Box::new(move || {
         let target = Target::Offscreen {
             width: size.0,
             height: size.1,
         };
-        Renderer::new(target, AdapterChoice::Warp)
-            .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
+        Renderer::new(target, AdapterChoice::Warp).map(|r| {
+            Box::new(MenuScreen::new(r, None).with_media(Arc::clone(&media))) as Box<dyn Screen>
+        })
     });
     // Offscreen: no refresh rate and no frame statistics.
     let measure = measure(

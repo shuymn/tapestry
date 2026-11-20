@@ -726,6 +726,13 @@ pub trait Screen: Send {
     /// again; the screen stays usable, and the next attempt's preparation
     /// builds again.
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), BuildError>;
+    /// The play frame's skin movie hook at the screen clock's `screen_us`,
+    /// before its [`build`](Self::build) ([`crate::movie_frame`]): it may
+    /// upload a movie's frame through wgpu, so it runs outside the frame's
+    /// app region and enters its own around the reads. Nothing by default.
+    fn movie_frame(&mut self, screen_us: i64) {
+        let _ = screen_us;
+    }
     /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
     /// the start gate): the skin's runtime state for the attempt starts
     /// over, its chart and text resources kept. Nothing by default.
@@ -7444,6 +7451,15 @@ impl Run {
                     {
                         screen_stamp = Some(screen_us);
                     }
+                    // The skin movies' frames, taken at the screen clock
+                    // before the build: their upload maps wgpu's buffer,
+                    // so the app region pauses around the hook, which
+                    // enters its own around its reads.
+                    #[cfg(feature = "dev-tools")]
+                    drop(region);
+                    screen.movie_frame(screen_us);
+                    #[cfg(feature = "dev-tools")]
+                    let region = crate::alloc_count::AppRegion::enter();
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing

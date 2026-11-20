@@ -65,10 +65,14 @@ pub enum Loss {
     Preparation,
     /// The render side found its ring at fault.
     Fault,
+    /// The render side refused it at its probed size: with the screen's
+    /// earlier movies it passed the screen's pixel total
+    /// ([`skin_model::movie::MAX_MOVIE_PIXELS`]). It draws nothing.
+    OverTotal,
 }
 
 impl Loss {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Queue,
         Self::Launch,
         Self::Struck,
@@ -81,6 +85,7 @@ impl Loss {
         Self::Failed,
         Self::Preparation,
         Self::Fault,
+        Self::OverTotal,
     ];
 }
 

@@ -41,6 +41,7 @@ use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 
 use crate::loading_state::LoadingUpdate;
 use crate::loading_text::ChosenChart;
+use crate::movie_screen::{MediaHub, MovieSet};
 use crate::render_side::{Screen, refusal};
 use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionUpdate, StripText};
 
@@ -379,6 +380,13 @@ pub struct MenuScreen {
     /// The views the selection skin has taken (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     selection_views: u64,
+    /// The run's media session, which plays the skins' movies; without
+    /// one no movie is opened.
+    media: Option<Arc<MediaHub>>,
+    /// The movies of the screen shown or being prepared.
+    movies: Option<MovieSet>,
+    /// The play preparation whose movies' readiness is awaited, staged.
+    movie_wait: Option<u64>,
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -504,6 +512,92 @@ impl MenuScreen {
             alloc_probe: false,
             #[cfg(all(test, feature = "dev-tools"))]
             selection_views: 0,
+            media: None,
+            movies: None,
+            movie_wait: None,
+        }
+    }
+
+    /// Plays the skins' movies through the run's media session `hub`.
+    #[must_use]
+    pub fn with_media(mut self, hub: Arc<MediaHub>) -> Self {
+        self.media = Some(hub);
+        self
+    }
+
+    /// Opens the movies of the play skin an attempt is prepared with:
+    /// `skin` staged, else the play skin in use. A screen already showing
+    /// that skin's movies keeps them (a retry, a practice round).
+    fn open_play_movies(&mut self, skin: Option<&Arc<SkinBundle>>) {
+        let Some(hub) = &self.media else {
+            return;
+        };
+        let bundle = skin
+            .cloned()
+            .or_else(|| self.renderer.installed(ScreenKind::Play).cloned());
+        let Some(bundle) = bundle else {
+            self.movies = None;
+            return;
+        };
+        if self
+            .movies
+            .as_ref()
+            .is_some_and(|m| m.is_for(ScreenKind::Play, &bundle, 0))
+        {
+            return;
+        }
+        let hub = Arc::clone(hub);
+        // The screen before is left first.
+        self.movies = None;
+        self.movies = MovieSet::open(
+            &hub,
+            ScreenKind::Play,
+            &bundle,
+            0,
+            std::time::Instant::now(),
+            0,
+        );
+    }
+
+    /// Opens the selection skin `bundle`'s movies for selection's entry
+    /// `lifetime` at `now`, unless its screen shows them already.
+    fn open_selection_movies(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        lifetime: u64,
+        now: bms_model::TimeUs,
+    ) {
+        if self
+            .movies
+            .as_ref()
+            .is_some_and(|m| m.is_for(ScreenKind::Selection, bundle, lifetime))
+        {
+            return;
+        }
+        self.movies = None;
+        if let Some(hub) = &self.media {
+            self.movies = MovieSet::open(
+                hub,
+                ScreenKind::Selection,
+                bundle,
+                lifetime,
+                std::time::Instant::now(),
+                now.0,
+            );
+        }
+    }
+
+    /// The selection frame's movie hook at `now` ([`crate::movie_frame`]):
+    /// what the selection skin's movies show.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn selection_movies(&mut self, now: bms_model::TimeUs) -> skin_model::movie::MovieShows {
+        match self.movies.as_mut() {
+            Some(m) if m.kind() == ScreenKind::Selection => {
+                let due = now.0.saturating_sub(m.origin);
+                m.movies
+                    .frame(&mut self.renderer, due, std::time::Instant::now())
+            }
+            _ => skin_model::movie::MovieShows::default(),
         }
     }
 
@@ -895,27 +989,51 @@ impl Screen for MenuScreen {
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
     ) -> Option<Result<Preparation, RenderError>> {
-        #[cfg(feature = "dev-tools")]
-        let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
-        #[cfg(feature = "dev-tools")]
-        let p_t = render::probe::Span::start();
-        let done = match skin {
-            Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
-            None => self.renderer.prepare_attempt(a),
-        };
-        #[cfg(feature = "dev-tools")]
-        {
-            let took = crate::dev::loop_probe::us(p_t.elapsed());
-            crate::dev::loop_probe::mark("att:staged", i64::from(skin.is_some()));
-            crate::dev::loop_probe::mark("att:stage_us", took);
-            drop(p_caller);
+        if self.movie_wait != Some(request) {
+            self.movie_wait = None;
+            #[cfg(feature = "dev-tools")]
+            let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
+            #[cfg(feature = "dev-tools")]
+            let p_t = render::probe::Span::start();
+            let done = match skin {
+                Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
+                None => self.renderer.prepare_attempt(a),
+            };
+            #[cfg(feature = "dev-tools")]
+            {
+                let took = crate::dev::loop_probe::us(p_t.elapsed());
+                crate::dev::loop_probe::mark("att:staged", i64::from(skin.is_some()));
+                crate::dev::loop_probe::mark("att:stage_us", took);
+                drop(p_caller);
+            }
+            match done {
+                Ok(()) => {}
+                // The whole chain: the skin's or the device's own reason too.
+                Err(e) if e.is_refusal() => {
+                    return Some(Ok(refusal(game::Chain(&e).to_string())));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+            self.open_play_movies(skin);
+            self.movie_wait = Some(request);
         }
-        Some(match done {
-            Ok(()) => Ok(Preparation::Ready),
-            // The whole chain: the skin's or the device's own reason too.
-            Err(e) if e.is_refusal() => Ok(refusal(game::Chain(&e).to_string())),
-            Err(e) => Err(e),
-        })
+        // The movies' readiness (design.md "Threat Model" T02, L5): their
+        // first frames are taken as the polls come, and the answer waits
+        // for each to settle, never past the preparation's deadline.
+        if let Some(m) = self
+            .movies
+            .as_mut()
+            .filter(|m| m.kind() == ScreenKind::Play)
+        {
+            let now = std::time::Instant::now();
+            let due = i64::try_from(now.duration_since(m.start).as_micros()).unwrap_or(i64::MAX);
+            let _ = m.movies.frame(&mut self.renderer, due, now);
+            if !m.movies.settle(now) {
+                return None;
+            }
+        }
+        self.movie_wait = None;
+        Some(Ok(Preparation::Ready))
     }
 
     fn device(&self) -> u64 {
@@ -1262,6 +1380,8 @@ impl Screen for MenuScreen {
     }
 
     fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
+        // The play screen is left.
+        self.movies = None;
         let lines = self.result_strip();
         let timing = match self.result_strip.first().and_then(|(t, _)| t.as_ref()) {
             Some(t) if lines > 0 => self.renderer.submit_result(&[t]),
@@ -1321,6 +1441,8 @@ impl Screen for MenuScreen {
     }
 
     fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
+        // The select screen is left.
+        self.movies = None;
         let timing = self.renderer.submit_decision(&[])?;
         self.shown(timing.presented());
         Ok(timing)
@@ -1391,6 +1513,21 @@ impl Screen for MenuScreen {
         self.renderer.build(f)
     }
 
+    /// The play frame's movie hook at the screen clock's `screen_us`
+    /// ([`crate::movie_frame`]): the play skin's movies' shows for the
+    /// build that follows.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn movie_frame(&mut self, screen_us: i64) {
+        let shows = match self.movies.as_mut() {
+            Some(m) if m.kind() == ScreenKind::Play => {
+                m.movies
+                    .frame(&mut self.renderer, screen_us, std::time::Instant::now())
+            }
+            _ => skin_model::movie::MovieShows::default(),
+        };
+        self.renderer.set_play_movies(shows);
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
         let timing = self.renderer.submit()?;
@@ -1414,6 +1551,8 @@ impl Screen for MenuScreen {
     }
 
     fn end(&mut self, page: &crate::render_side::EndPage) -> Result<FrameOutcome, RenderError> {
+        // The play screen is left.
+        self.movies = None;
         let outcome = self
             .renderer
             .result_frame(&page.lines, page.graphs.as_deref())?
@@ -1515,6 +1654,8 @@ impl Screen for MenuScreen {
         let installed = self.renderer.selection_bundle().cloned();
         let logic = logic.filter(|l| installed.is_some_and(|b| Arc::ptr_eq(&b, &l.bundle)));
         let Some(logic) = logic else {
+            // The skin's screen, if it was shown, is left.
+            self.movies = None;
             // A page laid out for the skin's screen sent no caret: it is
             // laid out again with its own.
             let changed = changed || self.selection_key.take().is_some();
@@ -1525,6 +1666,7 @@ impl Screen for MenuScreen {
                 skinned: false,
             });
         };
+        self.open_selection_movies(&logic.bundle, u.lifetime, now);
         let refused = match self.prepare_selection(u, logic, changed)? {
             // The frame's timers, then the runtime over that state, then
             // the build from it (docs/stage3.md S7-07).
@@ -1540,6 +1682,8 @@ impl Screen for MenuScreen {
                     if let Some(stop) = stop {
                         self.script_stopped(u, logic, stop)?;
                     }
+                    let shows = self.selection_movies(now);
+                    logic.sel.set_movies(shows);
                     self.build_selection_frame(u, logic, now, app)
                         .err()
                         .map(|e| e.to_string())
