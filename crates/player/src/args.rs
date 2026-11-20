@@ -590,6 +590,7 @@ mod tests {
                 "--port",
                 "L",
             ],
+            &["test-device", "check", "sink", "runs/a"],
             &["test-device"],
         ] {
             assert_eq!(

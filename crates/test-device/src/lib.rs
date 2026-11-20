@@ -8,8 +8,9 @@
 //! nothing: the firmware (`test-device/firmware`, outside the workspace)
 //! builds it that way for the RP2350. The host's half needs `std`: the
 //! clock bounds ([`clock`]), the matching behind the timing checks
-//! ([`matcher`]), the trace check ([`trace::Check`]) and the report
-//! descriptor parser ([`hid`]).
+//! ([`matcher`]), the trace check ([`trace::Check`]), the report
+//! descriptor parser ([`hid`]), and a run's evidence reader ([`evidence`]),
+//! verdict contract ([`contract`]) and provenance check ([`provenance`]).
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_code)]
@@ -22,7 +23,11 @@
 pub mod boot;
 #[cfg(feature = "std")]
 pub mod clock;
+#[cfg(feature = "std")]
+pub mod contract;
 pub mod device;
+#[cfg(feature = "std")]
+pub mod evidence;
 pub mod faults;
 #[cfg(feature = "std")]
 pub mod hid;
@@ -32,6 +37,8 @@ pub mod lease;
 pub mod matcher;
 pub mod mode;
 pub mod protocol;
+#[cfg(feature = "std")]
+pub mod provenance;
 pub mod report;
 pub mod revoke;
 pub mod schedule;
