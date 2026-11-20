@@ -5791,10 +5791,21 @@ impl Renderer {
             if let Some(done) = self.stale_loading_text() {
                 out.text = Some(done);
             }
-            // The chart publication's device and target checked before
-            // each band and at its completion.
+            // And its revision against its owner's newest (M2's currency).
+            if let Some((lifetime, revision)) = self.loading_text_in_hand()
+                && !past.loading_current(lifetime, revision)
+            {
+                self.cancel_loading_text();
+                out.text = Some(crate::TextDone {
+                    lifetime,
+                    revision,
+                    result: Err(crate::TextFault::Install(LoadingTextError::Stale)),
+                });
+            }
+            // The chart publication's device, target and its owner's
+            // currency checked before each band and before its publication.
             if let Some((up, _)) = &chart
-                && (self.gpu.lost() || !self.chart_current(up))
+                && (self.gpu.lost() || !self.chart_current(up) || !past.chart_current())
             {
                 out.chart = Some(Err(self.chart_stale()));
                 chart = None;

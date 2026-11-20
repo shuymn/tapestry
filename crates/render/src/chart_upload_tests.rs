@@ -235,3 +235,78 @@ fn the_holds_bound_writes_no_band_past_it() {
     assert!(boundary(&mut r, &mut up, images).is_none());
     assert_eq!(r.chart_submissions.len(), 1);
 }
+
+/// A gate that answers its chart's currency from a count of looks: current
+/// for the first `current` looks, superseded after (its owner's generation
+/// moved between two bands of one boundary).
+struct Renewed {
+    looks: u32,
+    current: u32,
+}
+
+impl crate::UploadGate for Renewed {
+    fn past(&mut self) -> bool {
+        false
+    }
+
+    fn chart_current(&mut self) -> bool {
+        self.looks += 1;
+        self.looks <= self.current
+    }
+}
+
+/// M2: the owner's generation moving between two bands of one boundary
+/// ends the publication before the next band, nothing more written and
+/// no table; the control, current throughout, writes every band and
+/// publishes.
+// Revert: currency read once a boundary (`past.chart_current()` dropped
+// from the loop's check) -> "a band after the renewal".
+#[test]
+fn a_renewal_between_bands_of_one_boundary_ends_it_unwritten() {
+    let (mut r, _dir, side) = chart_renderer();
+    let [s, back] = big(side);
+    let images = [Some(&s), Some(&back), None];
+    let n = bands(images);
+    // The control.
+    let mut up = r
+        .begin_chart_upload(ChartTarget::Committed, images)
+        .unwrap();
+    r.chart_submissions.clear();
+    let mut gate = Renewed {
+        looks: 0,
+        current: u32::MAX,
+    };
+    let mut end = None;
+    for _ in 0..n * 4 {
+        r.step_seen.set(Some(true));
+        let out =
+            r.upload_boundary_within(Duration::from_secs(60), &mut gate, Some((&mut up, images)));
+        r.step_seen.set(None);
+        if let Some(e) = out.chart {
+            end = Some(e);
+            break;
+        }
+    }
+    assert!(matches!(end, Some(Ok(_))), "{end:?}");
+    assert_eq!(r.chart_submissions.len(), n);
+    // Renewed after the first band.
+    let mut up = r
+        .begin_chart_upload(ChartTarget::Committed, images)
+        .unwrap();
+    r.chart_submissions.clear();
+    // Current at the look before the first band, superseded at the next.
+    let mut gate = Renewed {
+        looks: 0,
+        current: 1,
+    };
+    r.step_seen.set(Some(true));
+    let out = r.upload_boundary_within(Duration::from_secs(60), &mut gate, Some((&mut up, images)));
+    r.step_seen.set(None);
+    assert!(
+        matches!(out.chart, Some(Err(RenderError::ChartChanged))),
+        "{:?}",
+        out.chart
+    );
+    assert_eq!(r.chart_submissions.len(), 1, "a band after the renewal");
+    assert_eq!(presented(&r), None);
+}
