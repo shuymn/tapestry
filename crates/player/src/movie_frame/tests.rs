@@ -326,10 +326,12 @@ fn the_preparation_deadline_loses_what_is_not_settled() {
 }
 
 /// Planes whose writes land in a buffer made beforehand.
+#[cfg(feature = "dev-tools")]
 struct Preallocated {
     bytes: Vec<u8>,
 }
 
+#[cfg(feature = "dev-tools")]
 impl Planes for Preallocated {
     fn reserve(&mut self, _width: u32, _height: u32, _layers: u32) {}
 
