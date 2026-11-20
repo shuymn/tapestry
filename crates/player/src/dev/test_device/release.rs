@@ -8,6 +8,11 @@
 //! closed is still in progress: its writes are its own and synchronous, so
 //! at its loop's top none is) and writes `release`; a hold-bearing command
 //! it takes from the queue after the gate closed is dropped, not written.
+//! A hold-bearing write is admitted under the gate's lock, which marks it
+//! in flight until the port write returns (bounded by the port's write
+//! timeout): the gate cannot close between the admission and the write,
+//! and nothing writes a file between them, its records written before the
+//! admission and after the write.
 //! Only a `hello` written after the fence counts as release evidence. A device refusal of a hold-bearing command
 //! stops holds as a lost check does.
 
@@ -75,9 +80,16 @@ pub struct State {
     pub ended: bool,
 }
 
+/// The gate: why holds stopped, once they have, and whether an admitted
+/// hold-bearing write is in progress.
+#[derive(Debug, Default)]
+struct Gate {
+    stopped: Option<String>,
+    in_flight: bool,
+}
+
 struct Shared {
-    /// The gate: why holds stopped, once they have.
-    gate: Mutex<Option<String>>,
+    gate: Mutex<Gate>,
     queue: Mutex<VecDeque<Item>>,
     state: Mutex<State>,
     changed: Condvar,
@@ -85,6 +97,9 @@ struct Shared {
     end: AtomicBool,
     log: Stream,
     run: Stream,
+    /// A test's point in a hold-bearing write at which holds stop.
+    #[cfg(test)]
+    probe: Mutex<Option<&'static str>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -102,7 +117,7 @@ impl Writer {
     /// to `log` (the link's stream) and `run` (the runner's, for `stop`).
     pub fn start(conn: Connection, log: Stream, run: Stream) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Shared {
-            gate: Mutex::new(None),
+            gate: Mutex::new(Gate::default()),
             queue: Mutex::new(VecDeque::new()),
             state: Mutex::new(State {
                 token: conn.token(),
@@ -112,6 +127,8 @@ impl Writer {
             end: AtomicBool::new(false),
             log,
             run,
+            #[cfg(test)]
+            probe: Mutex::new(None),
         });
         let w = Self {
             shared: Arc::clone(&shared),
@@ -127,7 +144,10 @@ impl Writer {
     ///
     /// The queue is full, or holds have stopped and `cmd` holds input.
     pub fn enqueue(&self, cmd: Command, check: Option<i64>) -> Result<(), Refused> {
-        if cmd.holds_input() && lock(&self.shared.gate).is_some() {
+        // The gate's lock held while queueing: a hold-bearing command is
+        // queued only while holds last.
+        let gate = lock(&self.shared.gate);
+        if cmd.holds_input() && gate.stopped.is_some() {
             return Err(Refused::Closed);
         }
         let mut q = lock(&self.shared.queue);
@@ -151,7 +171,7 @@ impl Writer {
 
     /// Whether holds have stopped, and why.
     pub fn stopped(&self) -> Option<String> {
-        lock(&self.shared.gate).clone()
+        lock(&self.shared.gate).stopped.clone()
     }
 
     /// A copy of what the link thread has seen.
@@ -198,10 +218,10 @@ impl Writer {
 fn stop_holds(shared: &Shared, cause: &str) {
     {
         let mut g = lock(&shared.gate);
-        if g.is_some() {
+        if g.stopped.is_some() {
             return;
         }
-        *g = Some(cause.to_owned());
+        g.stopped = Some(cause.to_owned());
     }
     shared
         .run
@@ -244,6 +264,22 @@ impl Thread {
         }
     }
 
+    /// A point in a hold-bearing write: a test may stop holds there, as
+    /// another thread could at that moment.
+    #[cfg(test)]
+    fn probe(&self, at: &'static str) {
+        if *lock(&self.shared.probe) == Some(at) {
+            stop_holds(&self.shared, at);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[expect(
+        clippy::unused_self,
+        reason = "a test's probe point, empty outside tests"
+    )]
+    const fn probe(&self, _: &'static str) {}
+
     fn update(&self, f: impl FnOnce(&mut State)) {
         f(&mut lock(&self.shared.state));
         self.shared.changed.notify_all();
@@ -255,13 +291,7 @@ impl Thread {
         self.record(None);
         let sent = self.conn.send(cmd);
         let done = qpc();
-        for mut j in self.conn.take_journal() {
-            if j["t"] == "cmd" {
-                j["queued"] = json!(queued);
-                j["done"] = json!(done);
-            }
-            self.shared.log.write(&j);
-        }
+        self.journal_sent(queued, done);
         sent.map(drop)
     }
 
@@ -283,7 +313,11 @@ impl Thread {
         loop {
             // The fence and the one release: no hold-bearing write is in
             // progress at the loop's top, the writes being this thread's.
-            if !self.released && lock(&self.shared.gate).is_some() {
+            let fence = {
+                let gate = lock(&self.shared.gate);
+                gate.stopped.is_some() && !gate.in_flight
+            };
+            if !self.released && fence {
                 self.record(Some(json!({ "t": "fence", "q": qpc() })));
                 self.update(|s| s.fenced = true);
                 self.released = true;
@@ -323,21 +357,47 @@ impl Thread {
         }
     }
 
-    /// Writes one queued command: a hold-bearing one only while the gate
-    /// is open.
+    /// Writes one queued command: a hold-bearing one only when admitted
+    /// while the gate is open, its records written before the admission.
     fn write(&mut self, item: Item) -> anyhow::Result<()> {
-        if item.cmd.holds_input() && lock(&self.shared.gate).is_some() {
-            self.record(Some(
-                json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
-            ));
-            return Ok(());
+        if !item.cmd.holds_input() {
+            return self.send(item.cmd, item.queued);
         }
-        if let Some(check) = item.check {
-            self.record(Some(
-                json!({ "t": "check", "q": check, "line": item.cmd.to_string() }),
-            ));
+        self.probe("taken");
+        let check = item
+            .check
+            .map(|check| json!({ "t": "check", "q": check, "line": item.cmd.to_string() }));
+        self.record(check);
+        self.probe("recorded");
+        {
+            let mut gate = lock(&self.shared.gate);
+            if gate.stopped.is_some() {
+                drop(gate);
+                self.record(Some(
+                    json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
+                ));
+                return Ok(());
+            }
+            gate.in_flight = true;
         }
-        self.send(item.cmd, item.queued)
+        self.probe("admitted");
+        let sent = self.conn.send(item.cmd);
+        let done = qpc();
+        lock(&self.shared.gate).in_flight = false;
+        self.journal_sent(item.queued, done);
+        sent.map(drop)
+    }
+
+    /// Writes the connection's records, the command's with when it was
+    /// queued and when its write ended.
+    fn journal_sent(&mut self, queued: i64, done: i64) {
+        for mut j in self.conn.take_journal() {
+            if j["t"] == "cmd" {
+                j["queued"] = json!(queued);
+                j["done"] = json!(done);
+            }
+            self.shared.log.write(&j);
+        }
     }
 
     /// What one line from the device changes.
@@ -698,6 +758,104 @@ mod tests {
         let renew = lines.iter().position(|l| l.starts_with("renew")).unwrap();
         let release = lines.iter().position(|l| l == "release").unwrap();
         assert!(renew < release, "{lines:?}");
+    }
+
+    /// A port that stops holds while it writes a hold-bearing line.
+    struct Stopping {
+        inner: super::super::link::fake::Shared,
+        writer: Arc<std::sync::OnceLock<Writer>>,
+    }
+
+    impl Port for Stopping {
+        fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+            if bytes.starts_with(b"button")
+                && let Some(w) = self.writer.get()
+            {
+                w.stop_holds("writing");
+            }
+            self.inner.write(bytes)
+        }
+        fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
+            self.inner.read(buf)
+        }
+        fn touch_bootsel(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn setup(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Holds stop at every point of a hold-bearing command's way to the
+    /// wire: before it is queued, once the link thread took it, once its
+    /// records are written, once it is admitted, and while the port writes
+    /// it; and, the control, never. The command reaches the wire exactly
+    /// when the stop came after its admission, and then before the fence
+    /// and the `release`; no line holding input follows the `release`,
+    /// and every hold not written is refused or dropped.
+    #[test]
+    fn a_hold_is_written_only_when_admitted_before_the_stop() {
+        for at in [
+            Some("queue"),
+            Some("taken"),
+            Some("recorded"),
+            Some("admitted"),
+            Some("writing"),
+            None,
+        ] {
+            let writer = Arc::new(std::sync::OnceLock::new());
+            let w2 = Arc::clone(&writer);
+            let mut r = Run::with(Dev::new(HERE, "COM5", hello("abc", false)), move |d| {
+                Box::new(Stopping {
+                    inner: d,
+                    writer: Arc::clone(&w2),
+                })
+            });
+            grant(&r);
+            if at == Some("writing") {
+                assert!(writer.set(r.w.clone()).is_ok());
+            }
+            *lock(&r.w.shared.probe) = at.filter(|a| *a != "queue" && *a != "writing");
+            let press = press(&r.w);
+            if at == Some("queue") {
+                r.w.stop_holds("queue");
+                assert_eq!(r.w.enqueue(press, Some(qpc())), Err(Refused::Closed));
+            } else {
+                r.w.enqueue(press, Some(qpc())).unwrap();
+            }
+            if at.is_some() {
+                wait_for(&r.w, |s| s.released);
+            } else {
+                wait_for(&r.w, |s| {
+                    s.answers
+                        .iter()
+                        .any(|(c, _)| matches!(c, Command::Set { .. }))
+                });
+            }
+            r.finish();
+            let lines = r.lines();
+            let written = lines.iter().position(|l| l.starts_with("button"));
+            let release = lines.iter().position(|l| l == "release");
+            // The oracle.
+            let admitted_first = matches!(at, Some("admitted" | "writing") | None);
+            assert_eq!(written.is_some(), admitted_first, "{at:?}: {lines:?}");
+            if let Some(release) = release {
+                assert!(written.is_none_or(|w| w < release), "{at:?}: {lines:?}");
+                assert!(
+                    !lines[release..]
+                        .iter()
+                        .any(|l| Command::parse_canonical(l).is_some_and(|c| c.holds_input())),
+                    "{at:?}: {lines:?}"
+                );
+            }
+            assert_eq!(release.is_some(), at.is_some(), "{at:?}: {lines:?}");
+            let dropped = Run::records(&r.log)
+                .iter()
+                .filter(|v| v["t"] == "dropped")
+                .count();
+            let want = usize::from(matches!(at, Some("taken" | "recorded")));
+            assert_eq!(dropped, want, "{at:?}");
+        }
     }
 
     /// A full queue refuses rather than waits: the link thread is held in
