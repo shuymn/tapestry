@@ -470,7 +470,12 @@ fn p5() -> Expectation {
 }
 
 /// N2p (`p1-kill`), and with `escape` its negative: the outer reserves and
-/// kills an inner `p1` at its kill barrier.
+/// kills an inner `p1` at its kill barrier. The negative's runner ends the
+/// inner's process alone, not its job: the inner's player outlives it (the
+/// outer then ends it), and the inner's recorder ends by itself at its
+/// input's end, so both of those checks fail. A player can leave the job
+/// the outer ends in no other way: it is in the inner's job from its
+/// creation, and the job refuses breakaway.
 fn n2p(row: &'static str, escape: bool) -> Expectation {
     use Count::{AtLeast, Exactly};
     let (run, link, rec) = (
@@ -480,7 +485,7 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
     );
     let (inner_run, inner_link) = (file(INNER, RUN), file(INNER, LINK));
     let check = |id, inputs: &[File], events: &[Event]| {
-        let outcome = if escape && id == "n2p.player-gone" {
+        let outcome = if escape && ["n2p.player-gone", "n2p.children-gone"].contains(&id) {
             Outcome::Fail
         } else {
             Outcome::Pass
@@ -511,7 +516,7 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
                 SINGLE,
                 "inner-recorder",
                 Some((INNER, "recorder")),
-                Exit::Killed,
+                if escape { Exit::Code(0) } else { Exit::Killed },
             ),
             exit_rule(
                 SINGLE,
@@ -568,7 +573,7 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
             ),
         ],
         negative: escape.then_some(Negative {
-            mutation: "the inner's player is left outside the job the outer ends (a local build)",
+            mutation: "the outer ends the inner's process alone, not its job (a local build)",
             trigger: "n2p.player-gone",
         }),
     }
@@ -693,7 +698,10 @@ mod tests {
             failing(&p5()),
             ["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"]
         );
-        assert_eq!(failing(&p1_kill_escape()), ["n2p.player-gone"]);
+        assert_eq!(
+            failing(&p1_kill_escape()),
+            ["n2p.children-gone", "n2p.player-gone"]
+        );
         assert!(failing(&p1_kill()).is_empty());
         for (neg, pos) in [(p4(), p1()), (p5(), p1()), (p1_kill_escape(), p1_kill())] {
             assert_eq!(ids(&neg), ids(&pos));
@@ -867,5 +875,154 @@ mod tests {
         let mut out = Vec::new();
         run(rows, "bare", dir.path(), &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "CONTRACT bare ok\n");
+    }
+
+    /// Writes a panel row's run folder as the runner writes it, from the
+    /// judge's good panel records in their full form, every file sealed;
+    /// with `volumes_left`, the player kept the volumes at 1.0 (as P5's
+    /// player does). Then the judge's verdicts, and the panel judge's
+    /// verdict lines with `failing` failed.
+    fn panel_folder(dir: &std::path::Path, row: &str, volumes_left: bool, failing: &[&str]) {
+        use serde_json::{Value, json};
+
+        use super::super::launch::{
+            DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE, STDERR, STDOUT,
+        };
+        use super::super::run::{MODE_LINK, SHOT_A, SHOT_B};
+        let run_id = "0123456789abcdef0123456789abcdef";
+        let me = json!({"pid": 1, "created": 2});
+        let rec = json!({"pid": 7, "created": 70});
+        let player = json!({"pid": 8, "created": 80});
+        let (f, x) = super::super::judge::tests::panel_good();
+        let mut run = f.run.records.unwrap();
+        let mut link = f.link.records.unwrap();
+        let mut recorder = f.recorder.records.unwrap();
+        run[0] = json!({
+            "t": "start", "run": run_id, "row": row, "role": SINGLE, "build": "0123456789ab",
+            "process": me, "commit": super::super::COMMIT, "tag": 0xABCD, "cut": 0x4000_0123,
+            "args": [], "set": null, "inner": null,
+        });
+        let end = run.pop().unwrap();
+        let hello = recs_line(&x.mode);
+        run.splice(
+            1..1,
+            [
+                json!({"t": "mode", "q": 20, "line": hello}),
+                json!({"t": "spawn", "q": 40, "name": "recorder", "process": rec}),
+                json!({"t": "player", "q": 45, "path": "t.exe", "sha256": "00", "commit": "c", "modified": 1}),
+            ],
+        );
+        let at = run.iter().position(|v| v["t"] == "call").unwrap();
+        run.splice(
+            at + 2..at + 2,
+            [
+                json!({"t": "spawn", "q": 215, "name": "player", "process": player}),
+                json!({"t": "window", "q": 216, "window": 99}),
+            ],
+        );
+        run.push(json!({"t": "exit", "q": 6100, "name": "recorder", "process": rec, "code": 0}));
+        run.push(json!({"t": "exit", "q": 6200, "name": "player", "process": player, "code": 0}));
+        link[0] = json!({
+            "t": "open", "q": 10, "run": run_id, "process": me, "freq": 10_000_000,
+            "location": "L", "com": "COM9", "path": "p",
+        });
+        link.push(json!({"t": "end", "q": 5700, "problems": []}));
+        recorder[0] = json!({
+            "t": "ready", "q": 50, "run": run_id, "process": rec, "window": 9,
+            "location": "L", "keyboard": 1, "pad": 2,
+        });
+        let lines =
+            |records: &[Value]| -> String { records.iter().map(|v| format!("{v}\n")).collect() };
+        let mode = [
+            json!({
+                "t": "open", "q": 5, "run": run_id, "process": me, "freq": 10_000_000,
+                "location": "L", "com": "COM9", "path": "p",
+            }),
+            json!({"t": "cmd", "q": 6, "line": "hello"}),
+            json!({"t": "ans", "q": 7, "sent": 6, "cmd": "hello", "line": hello}),
+            json!({"t": "end", "q": 8, "problems": []}),
+        ];
+        let mut device_after = x.device_after.unwrap();
+        if volumes_left {
+            device_after = x.device_before.clone().unwrap();
+        }
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            (LINK, lines(&link).into_bytes()),
+            (RECORDER, lines(&recorder).into_bytes()),
+            (MODE_LINK, lines(&mode).into_bytes()),
+            (DEVICE_BEFORE, x.device_before.unwrap()),
+            (PLAYER_BEFORE, x.player_before.unwrap()),
+            (DEVICE_AFTER, device_after),
+            (PLAYER_AFTER, x.player_after.unwrap()),
+            (STDOUT, Vec::new()),
+            (STDERR, Vec::new()),
+            (SHOT_A, b"a".to_vec()),
+            (SHOT_B, b"b".to_vec()),
+        ];
+        for (name, bytes) in &files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+            run.push(super::super::owner::seal(dir, &dir.join(name), run_id, SINGLE).unwrap());
+        }
+        run.push(end);
+        std::fs::write(dir.join(RUN), lines(&run)).unwrap();
+        super::super::judge::judge(row, dir).unwrap();
+        let sha = |p: &str| super::super::owner::digest(&dir.join(p)).unwrap();
+        let panel: String = [
+            ("panel.drawn-a", SHOT_A),
+            ("panel.knobs", SHOT_A),
+            ("panel.graphs", SHOT_A),
+            ("panel.numbers", SHOT_A),
+            ("panel.closed-b", SHOT_B),
+        ]
+        .iter()
+        .map(|(check, path)| {
+            let outcome = if failing.contains(check) {
+                "fail"
+            } else {
+                "pass"
+            };
+            format!(
+                "{}\n",
+                json!({
+                    "row": row, "run": run_id, "check": check, "outcome": outcome, "detail": "",
+                    "inputs": [{"role": SINGLE, "path": path, "sha256": sha(path)}],
+                    "producer": {"name": PANEL, "version": "0"},
+                })
+            )
+        })
+        .collect();
+        std::fs::write(dir.join("verdicts-panel.jsonl"), panel).unwrap();
+    }
+
+    fn recs_line(s: &super::super::judge::Stream) -> String {
+        s.records.as_ref().unwrap()[0]["line"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// A panel run folder matches its row's expectation through the
+    /// checker: a good P1 run matches `p1`; P5's (the volumes left, the
+    /// knobs, graphs and numbers failed) matches `p5` and not `p1`; and P1's
+    /// matches no `p5`.
+    #[test]
+    fn a_panel_run_folder_matches_its_row() {
+        let verdict = |row: &str, left: bool, failing: &[&str]| {
+            let dir = tempfile::tempdir().unwrap();
+            panel_folder(dir.path(), row, left, failing);
+            let mut out = Vec::new();
+            let r = run(ROWS, row, dir.path(), &mut out);
+            (r.is_ok(), String::from_utf8(out).unwrap())
+        };
+        let (ok, out) = verdict("p1", false, &[]);
+        assert!(ok, "{out}");
+        let p5 = ["panel.knobs", "panel.graphs", "panel.numbers"];
+        let (ok, out) = verdict("p5", true, &p5);
+        assert!(ok, "{out}");
+        let (ok, out) = verdict("p1", true, &p5);
+        assert!(!ok, "{out}");
+        assert!(out.contains("p1.volumes"), "{out}");
+        let (ok, out) = verdict("p5", false, &[]);
+        assert!(!ok, "{out}");
     }
 }

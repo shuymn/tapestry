@@ -209,8 +209,8 @@ struct Outer {
 }
 
 /// The outer rows. `p1-kill-escape` runs as `p1-kill`; its expectation is
-/// N2p's negative, which only a runner whose inner leaves its player
-/// outside the job it ends meets.
+/// N2p's negative, which only a runner that ends the inner's process alone,
+/// not its job, meets.
 fn outer_of(row: &str) -> Option<Outer> {
     match row {
         "sink-kill" => Some(Outer {
