@@ -112,9 +112,6 @@ pub struct Run<'a> {
     pub record: &'a mut dyn FnMut(Value),
     /// The cause the end stops holds with.
     pub cause: &'a str,
-    /// The negative row `sink-early-close`: the sink closes straight after
-    /// the release request.
-    pub early_close: bool,
 }
 
 /// Whether `line` is release evidence for the run: a `hello` of `token`
@@ -135,12 +132,7 @@ fn evidence(line: &str, token: Option<Token>, granted: bool) -> Result<bool, Str
 pub fn end(r: Run<'_>) -> Vec<String> {
     let mut errors = Vec::new();
     r.link.stop_holds(r.cause);
-    let mut sink = r.sink;
-    if r.early_close
-        && let Some(s) = sink.take()
-    {
-        close(s, r.record, &mut errors);
-    }
+    let sink = r.sink;
     if let Err(e) = r.link.released(QUIET_WAIT) {
         errors.push(format!("the release: {e}"));
     }
@@ -341,7 +333,6 @@ mod tests {
         removed_after: Option<usize>,
         stop: Result<(), String>,
         granted: bool,
-        early: bool,
     }
 
     impl Default for Case {
@@ -352,7 +343,6 @@ mod tests {
                 removed_after: Some(0),
                 stop: Ok(()),
                 granted: true,
-                early: false,
             }
         }
     }
@@ -390,7 +380,6 @@ mod tests {
             granted: c.granted,
             record: &mut record,
             cause: "end",
-            early_close: c.early,
         });
         let steps = log.borrow().clone();
         (errors, steps, records.into_inner())
@@ -516,12 +505,5 @@ mod tests {
         assert_eq!(recovery[1], "the 1200-baud touch");
         assert!(recovery[2].contains("stays open"));
         assert!(recovery[3].contains("removed"));
-        // The early-close negative closes first and still recovers.
-        let (_, steps, _) = run(Case {
-            hellos: vec!["ok".into()],
-            early: true,
-            ..Case::default()
-        });
-        assert!(at(&steps, "close") < at(&steps, "released"));
     }
 }

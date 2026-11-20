@@ -365,6 +365,84 @@ mod tests {
         assert_eq!(ids(neg), ids(sink()));
     }
 
+    /// Writes an N1 run folder as the runner writes it, from the judge's
+    /// good N1 records in their full form, its link and recorder sealed;
+    /// with `early`, the sink closed before the release evidence, as N1's
+    /// negative would. Then the judge's verdicts.
+    fn n1_folder(dir: &std::path::Path, row: &str, early: bool) {
+        use serde_json::{Value, json};
+        let run_id = "0123456789abcdef0123456789abcdef";
+        let me = json!({"pid": 1, "created": 2});
+        let rec = json!({"pid": 7, "created": 70});
+        let f = super::super::judge::tests::good();
+        let mut run = f.run.records.unwrap();
+        let mut link = f.link.records.unwrap();
+        let mut recorder = f.recorder.records.unwrap();
+        run[0] = json!({
+            "t": "start", "run": run_id, "row": row, "role": SINGLE, "build": "0123456789ab",
+            "process": me, "commit": super::super::COMMIT, "tag": 0xABCD, "cut": 0x4000_0123,
+            "args": [], "set": null, "inner": null,
+        });
+        run.insert(
+            1,
+            json!({"t": "spawn", "q": 40, "name": "recorder", "process": rec}),
+        );
+        let end = run.pop().unwrap();
+        if early {
+            let close = run.iter().position(|v| v["t"] == "close").unwrap();
+            let quiet = run.iter().position(|v| v["t"] == "quiet").unwrap();
+            let c = run.remove(close);
+            run.insert(quiet, c);
+        }
+        run.push(json!({"t": "exit", "q": 6100, "name": "recorder", "process": rec, "code": 0}));
+        link[0] = json!({
+            "t": "open", "q": 10, "run": run_id, "process": me, "freq": 10_000_000,
+            "location": "L", "com": "COM9", "path": "p",
+        });
+        link.push(json!({"t": "end", "q": 5700, "problems": []}));
+        recorder[0] = json!({
+            "t": "ready", "q": 50, "run": run_id, "process": rec, "window": 9,
+            "location": "L", "keyboard": 1, "pad": 2,
+        });
+        let write = |name: &str, records: &[Value]| {
+            let text: String = records.iter().map(|v| format!("{v}\n")).collect();
+            std::fs::write(dir.join(name), text).unwrap();
+        };
+        write(LINK, &link);
+        write(RECORDER, &recorder);
+        for name in [LINK, RECORDER] {
+            run.push(super::super::owner::seal(dir, &dir.join(name), run_id, SINGLE).unwrap());
+        }
+        run.push(end);
+        write(RUN, &run);
+        super::super::judge::judge(row, dir).unwrap();
+    }
+
+    /// N1's negative is judged and checked on a run folder, never run: the
+    /// early close fails exactly `n1.quiet-before-close`, which matches the
+    /// negative's expectation and not N1's; the run without it matches
+    /// N1's (the positive control).
+    #[test]
+    fn the_early_close_negative_is_checked_on_its_records() {
+        let verdict = |row: &str, early: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            n1_folder(dir.path(), row, early);
+            let mut out = Vec::new();
+            let r = run(ROWS, row, dir.path(), &mut out);
+            (r.is_ok(), String::from_utf8(out).unwrap())
+        };
+        let (ok, out) = verdict("sink", false);
+        assert!(ok, "{out}");
+        let (ok, out) = verdict("sink-early-close", true);
+        assert!(ok, "{out}");
+        assert!(out.ends_with("CONTRACT sink-early-close ok\n"), "{out}");
+        let (ok, out) = verdict("sink", true);
+        assert!(!ok, "{out}");
+        assert!(out.contains("n1.quiet-before-close"), "{out}");
+        let (ok, out) = verdict("sink-early-close", false);
+        assert!(!ok, "{out}");
+    }
+
     #[test]
     fn the_last_line_names_the_mismatches() {
         let dir = tempfile::tempdir().unwrap();

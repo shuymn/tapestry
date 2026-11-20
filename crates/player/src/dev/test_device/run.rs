@@ -6,9 +6,7 @@
 //! goes through the end ([`super::end`]).
 //!
 //! Rows: `sink` (N1: a focus click on the sink, a lease of 3 s, button 1
-//! and F24 held, 1 s, the end), `sink-early-close` (N1's negative: the
-//! same, with the sink closed straight after the end's release request),
-//! and `sink-kill` (N2: an outer run that starts an inner `sink` in a job
+//! and F24 held, 1 s, the end) and `sink-kill` (N2: an outer run that starts an inner `sink` in a job
 //! of its own, terminates that job with its cut code once the inner's
 //! recorder shows the presses, observes the inner's and its recorder's
 //! ends, and opens its own connection).
@@ -100,12 +98,14 @@ pub fn sink_steps() -> Vec<Step> {
     ]
 }
 
-/// The rows with steps of their own, and whether the row closes its sink
-/// straight after the release request (the negative).
-pub fn row(name: &str) -> Option<(Vec<Step>, bool)> {
+/// The rows with steps of their own. N1's negative, `sink-early-close`,
+/// is not one: closing the sink before the release evidence would let a
+/// held input land in another window, so no runner performs it; its
+/// expectation is checked on a run folder a test writes
+/// (`check::tests`).
+pub fn row(name: &str) -> Option<Vec<Step>> {
     match name {
-        "sink" => Some((sink_steps(), false)),
-        "sink-early-close" => Some((sink_steps(), true)),
+        "sink" => Some(sink_steps()),
         _ => None,
     }
 }
@@ -781,7 +781,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     if a.row == "sink-kill" {
         return outer(a);
     }
-    let Some((steps, early_close)) = row(&a.row) else {
+    let Some(steps) = row(&a.row) else {
         bail!("no row `{}`", a.row);
     };
     let b = begin(a, None)?;
@@ -866,7 +866,6 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         granted,
         record: &mut record,
         cause: "end",
-        early_close,
     }));
     guard.end();
     let _ = guard_thread.join();
@@ -1022,7 +1021,6 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
         granted: false,
         record: &mut record,
         cause: "end",
-        early_close: false,
     }));
     if let Some(e) = link_log.close() {
         errors.push(e);
@@ -1206,18 +1204,36 @@ mod tests {
             token: super::super::link::fake::TOKEN,
             n: 1,
         };
-        for name in ["sink", "sink-early-close"] {
-            let (steps, _) = row(name).unwrap();
-            for s in &steps {
-                match command(s, id) {
-                    None => {}
-                    Some(Command::Set { id: got, .. }) => assert_eq!(got, id),
-                    Some(c) => panic!("row {name}'s step {s:?} writes `{c}`"),
-                }
+        let steps = row("sink").unwrap();
+        for s in &steps {
+            match command(s, id) {
+                None => {}
+                Some(Command::Set { id: got, .. }) => assert_eq!(got, id),
+                Some(c) => panic!("row sink's step {s:?} writes `{c}`"),
             }
-            // Positive control: the row does hold.
-            assert!(steps.iter().any(|s| command(s, id).is_some()));
         }
+        // Positive control: the row does hold.
+        assert!(steps.iter().any(|s| command(s, id).is_some()));
+    }
+
+    /// The runner refuses N1's negative before it holds, opens or starts
+    /// anything: no run closes its sink before the release evidence.
+    #[test]
+    fn the_runner_refuses_the_early_close_negative() {
+        let args = |row: &str| Args {
+            row: row.into(),
+            out: Some(PathBuf::from("unused")),
+            set: None,
+            role: None,
+            build: BUILD.into(),
+            port: "L".into(),
+            monitor: "M".into(),
+        };
+        let e = run(&args("sink-early-close")).unwrap_err();
+        assert_eq!(format!("{e:#}"), "no row `sink-early-close`");
+        // The row it negates is one.
+        assert!(row("sink").is_some());
+        assert!(!Path::new("unused").exists());
     }
 
     #[test]
