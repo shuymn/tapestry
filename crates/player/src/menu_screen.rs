@@ -1027,7 +1027,7 @@ impl Screen for MenuScreen {
         self.renderer.stage_bga_cells(key, cells)
     }
 
-    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
         let chart = self.chart.as_mut().map(|(up, set)| (up, set.fitted()));
         let up = self
             .renderer
@@ -1333,6 +1333,22 @@ impl Screen for MenuScreen {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn grant_ready(&self) -> bool {
         self.paced() && !self.minimized() && self.renderer.wait_for_frame(0)
+    }
+
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        (self.paced() && !self.minimized())
+            .then(|| self.renderer.grant_probe())
+            .flatten()
+    }
+
+    fn loading_text_held(&self) -> bool {
+        self.renderer.loading_text_in_hand().is_some()
+    }
+
+    fn drop_loading_text(&mut self) {
+        if self.chosen.in_hand.take().is_some() {
+            self.renderer.cancel_loading_text();
+        }
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

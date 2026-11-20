@@ -269,7 +269,7 @@ impl Screen for Noted {
     ) -> Result<(), render::BgaFault> {
         self.menu.stage_bga_cells(key, cells)
     }
-    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
         self.menu.upload_boundary(past)
     }
     fn upload_state(&self) -> render::UploadState {
@@ -585,6 +585,15 @@ impl Screen for Noted {
     }
     fn text_settled(&self) -> bool {
         self.menu.text_settled()
+    }
+    fn drop_loading_text(&mut self) {
+        self.menu.drop_loading_text();
+    }
+    fn loading_text_held(&self) -> bool {
+        self.menu.loading_text_held()
+    }
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        self.menu.grant_probe()
     }
     fn loading(
         &mut self,

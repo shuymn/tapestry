@@ -242,7 +242,7 @@ pub trait Screen: Send {
     /// ([`render::Renderer::upload_boundary_within`]), `past` answering
     /// whether the pass's hold's bound has passed; nothing in hand by
     /// default.
-    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
         let _ = past;
         render::Uploaded {
             bga: render::BgaStep::Idle,
@@ -589,6 +589,31 @@ pub trait Screen: Send {
     fn grant_ready(&self) -> bool {
         false
     }
+    /// The swap chain's grant, looked at without waiting, while frames
+    /// are paced by it ([`render::Renderer::grant_probe`]); none by
+    /// default.
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        None
+    }
+    /// [`install`](Self::install) in steps: `None` while the uploader's
+    /// boundaries write it; asked again with the same request it answers
+    /// that staging. By default the whole installation at once.
+    fn install_stepped(
+        &mut self,
+        kind: ScreenKind,
+        skin: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Option<Result<Preparation, RenderError>> {
+        Some(self.install(kind, skin, request))
+    }
+    /// Whether a loading text is in the uploader's hand; none by default.
+    fn loading_text_held(&self) -> bool {
+        false
+    }
+    /// Drops the loading text in the uploader's hand, if any, so nothing
+    /// of a loading that ended is written (READY's cutoff). The default
+    /// holds none.
+    fn drop_loading_text(&mut self) {}
     /// Whether a BGA array is in use ([`render::Renderer::bga_key`]);
     /// never by default.
     fn bga_in_use(&self) -> bool {
@@ -2062,6 +2087,9 @@ struct Shared {
     /// The frames paced by the clock so far (tests).
     #[cfg(test)]
     clock_paced: AtomicU64,
+    /// The clock's pacing of each pass while it records (tests).
+    #[cfg(test)]
+    pacing: Mutex<Vec<Pace>>,
     /// The stamps so far, and whether the last left the image valid,
     /// right after it (tests).
     #[cfg(test)]
@@ -2224,6 +2252,8 @@ impl Shared {
             answer_gate: TestGate::default(),
             #[cfg(test)]
             clock_paced: AtomicU64::new(0),
+            #[cfg(test)]
+            pacing: Mutex::new(Vec::new()),
             #[cfg(test)]
             stamps: [AtomicU64::new(0), AtomicU64::new(0)],
         }
@@ -4308,6 +4338,28 @@ impl RenderLink {
         self.shared.bga_ops_held.load(Ordering::Acquire)
     }
 
+    /// Notes each pass's pacing by the clock from now, `room` at most, the
+    /// record kept so far dropped (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn record_pacing(&self, room: usize) {
+        *self
+            .shared
+            .pacing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Vec::with_capacity(room);
+    }
+
+    /// The passes' pacing since [`record_pacing`](Self::record_pacing)
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn pacing(&self) -> Vec<Pace> {
+        self.shared
+            .pacing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Notes each heavy operation a boundary runs from now, `room` at
     /// most, the record kept so far dropped (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -4924,6 +4976,9 @@ pub fn spawn(
                 chart_hand: None,
                 pace_deadline: None,
                 pages_hand: None,
+                pages_owed: None,
+                select_hand: None,
+                creation_answered: false,
                 released: None,
                 #[cfg(feature = "dev-tools")]
                 pages_retained: 0,
@@ -5965,6 +6020,10 @@ struct Preparing {
     /// The declarative skin it stages, if one is chosen.
     skin: Option<Arc<SkinBundle>>,
     reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+    /// The screen took it (its staging, which may create play's array):
+    /// only at a boundary whose heavy-operation allowance admits it
+    /// (design.md "Load Pipeline", one heavy operation a frame interval).
+    taken: bool,
 }
 
 /// How an attempt's preparation ended on the render thread, with the
@@ -6148,6 +6207,157 @@ const fn pace_of(pace: TimeUs) -> Duration {
     Duration::from_micros(pace.0.unsigned_abs())
 }
 
+/// What makes a pass's frame due before its boundary's work ends.
+#[derive(Clone, Copy, Debug)]
+enum FrameDue {
+    /// Nothing: the pass draws no frame, or its pacing is the clock's.
+    Never,
+    /// A grant kept from before.
+    Now,
+    /// The swap chain's grant, looked at before each heavy operation and
+    /// write.
+    Grant(render::GrantProbe),
+    /// The frame's clock deadline.
+    At(Instant),
+}
+
+/// What the gate knows when it is asked (design.md "Memory Budget", the
+/// uploader's admission gate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GateState {
+    /// The pass's frame is due: its grant found or its deadline passed.
+    frame_due: bool,
+    /// READY's cutoff holds.
+    cut_off: bool,
+    /// A held pass reached the hold's bound.
+    hold_past: bool,
+    /// The interval's heavy operation ran.
+    heavy_spent: bool,
+}
+
+/// What the gate is asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ask {
+    Heavy,
+    Write,
+}
+
+/// The boundary's one admission rule, in its order: a frame due draws
+/// first, nothing runs under READY's cutoff, a heavy operation needs the
+/// interval's allowance, and nothing begins in a held pass at or past the
+/// hold's bound.
+const fn admits(s: GateState, ask: Ask) -> bool {
+    if s.frame_due || s.cut_off {
+        return false;
+    }
+    if matches!(ask, Ask::Heavy) && s.heavy_spent {
+        return false;
+    }
+    !s.hold_past
+}
+
+/// The admission gate's clock: the system's, or a test's when it set one.
+fn gate_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = GATE_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The admission gate's clock on this thread (tests).
+    static GATE_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The gate a boundary's uploader asks before each write and band
+/// ([`render::UploadGate`]): [`admits`] over the pass's sources, read at
+/// each ask, a frame found due kept so for the rest of the pass; and the
+/// chart publication's generation against its owner's.
+struct PassGate<'a, H: FnMut() -> bool> {
+    frame: FrameDue,
+    cut_off: bool,
+    /// The hold's bound, in a held pass.
+    hold: Option<H>,
+    /// The chart publication in hand: its owner's generation and its own.
+    chart: Option<(&'a AtomicU64, u64)>,
+    /// The loading lifetime drawn and its newest revision, if any.
+    loading: Option<(u64, u64)>,
+    /// Set when the gate took the swap chain's grant: the frame keeps it.
+    granted: &'a mut bool,
+}
+
+impl<H: FnMut() -> bool> render::UploadGate for PassGate<'_, H> {
+    fn past(&mut self) -> bool {
+        let frame_due = match self.frame {
+            FrameDue::Never => false,
+            FrameDue::Now => true,
+            FrameDue::Grant(g) => {
+                if g.ready() {
+                    *self.granted = true;
+                    self.frame = FrameDue::Now;
+                    true
+                } else {
+                    false
+                }
+            }
+            FrameDue::At(at) => {
+                let due = gate_now() >= at;
+                if due {
+                    self.frame = FrameDue::Now;
+                }
+                due
+            }
+        };
+        let hold_past = self.hold.as_mut().is_some_and(|h| h());
+        !admits(
+            GateState {
+                frame_due,
+                cut_off: self.cut_off,
+                hold_past,
+                heavy_spent: false,
+            },
+            Ask::Write,
+        )
+    }
+
+    fn chart_current(&mut self) -> bool {
+        self.chart
+            .is_none_or(|(now, g)| now.load(Ordering::SeqCst) == g)
+    }
+
+    fn loading_current(&mut self, lifetime: u64, revision: u64) -> bool {
+        self.loading
+            .is_none_or(|(l, r)| l != lifetime || r == revision)
+    }
+}
+
+/// A creation owed to the boundary's heavy-operation allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Creation {
+    /// Play's staging: the attempt's first take.
+    Play,
+    /// The result pages' begin.
+    Pages,
+    /// A result skin's selection: its staging's first take.
+    Select,
+}
+
+/// A result skin's selection in hand ([`Run::begin_select`]).
+struct SelectHand {
+    request: u64,
+    kind: ScreenKind,
+    bundle: Arc<SkinBundle>,
+    script: ScriptSlot,
+    reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    /// Its staging was taken at a boundary.
+    taken: bool,
+    /// Development builds: the atlas uploads its staging made.
+    #[cfg(feature = "dev-tools")]
+    uploads: u64,
+}
+
 /// What a pass does before its frame while an upload is in hand
 /// ((r2)'s passes between frames).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6254,6 +6464,27 @@ fn snapshot_waits(shared: &Shared, at: usize) {
     }
 }
 
+/// How the clock paced a pass (tests): a stepping pass waiting for the
+/// frame's deadline, or reaching it; a frame after an upload keeping the
+/// deadline it was paced to; a frame paced afresh.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pace {
+    Step(Instant),
+    StepDue(Instant),
+    Kept(Instant),
+    Fresh,
+}
+
+/// Notes a pass's pacing while the record has room (tests).
+#[cfg(test)]
+fn note_pace(shared: &Shared, pace: Pace) {
+    let mut v = shared.pacing.lock().unwrap_or_else(PoisonError::into_inner);
+    if v.len() < v.capacity() {
+        v.push(pace);
+    }
+}
+
 /// Counts a wait of `kind` as it begins (tests).
 #[cfg(test)]
 fn count_wait(shared: &Shared, kind: WaitKind) {
@@ -6334,6 +6565,12 @@ pub(crate) enum HeavyKind {
     Bga,
     OwedPool,
     Destruction,
+    /// Play's staging taken, its array created.
+    PlayCreation,
+    /// The result pages' begin, their array created.
+    PagesCreation,
+    /// A result skin's selection taken, its array created.
+    SelectCreation,
 }
 
 /// The regime a boundary read (design.md "Load Pipeline", the
@@ -6384,6 +6621,13 @@ struct Run {
     /// The result pages upload in hand: its ticket and where its answer
     /// goes.
     pages_hand: Option<(u64, mpsc::SyncSender<PagesAnswer>)>,
+    /// A result skin's selection in hand, stepped by the uploader.
+    select_hand: Option<SelectHand>,
+    /// The boundary's creation answered the attempt's preparation.
+    creation_answered: bool,
+    /// A result pages begin owed to the boundary's allowance: its ticket,
+    /// its pages and its reply.
+    pages_owed: Option<(u64, Arc<PackedPages>, mpsc::SyncSender<PagesAnswer>)>,
     /// The request of the play staging whose admission released the
     /// result kind's installation last.
     released: Option<u64>,
@@ -7005,6 +7249,10 @@ impl Run {
                     }
                     #[cfg(test)]
                     self.shared.loading_end_gate.pass();
+                    // Nothing of the loading is written from here (READY's cutoff).
+                    if let Some(s) = self.screen.as_mut() {
+                        s.drop_loading_text();
+                    }
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -7049,6 +7297,10 @@ impl Run {
                     self.paused = None;
                     #[cfg(test)]
                     self.shared.loading_end_gate.pass();
+                    // Nothing of the loading is written from here (READY's cutoff).
+                    if let Some(s) = self.screen.as_mut() {
+                        s.drop_loading_text();
+                    }
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -7083,8 +7335,6 @@ impl Run {
                     self.turntable.begin_presentation();
                     self.begin_attempt(request, lifetime, attempt, skin, reply);
                     mode = self.after_preparing(mode);
-                    #[cfg(test)]
-                    self.shared.answer_gate.pass();
                     continue;
                 }
                 Ok(RenderMsg::PlayState(state)) => {
@@ -7166,7 +7416,7 @@ impl Run {
                     pages,
                     reply,
                 }) => {
-                    self.begin_pages(ticket, &pages, reply);
+                    self.owe_pages(ticket, pages, reply);
                     continue;
                 }
                 Ok(RenderMsg::Select {
@@ -7380,10 +7630,17 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
+            // A preparation its boundary's creation answered: the messages
+            // first, as when it is answered in its own turn, so a discard
+            // sent on its answer is taken before any frame.
+            if std::mem::take(&mut self.creation_answered) {
+                continue;
+            }
             // A staging whose last step this boundary saw complete answers
             // in this pass (design.md "Memory Budget", the uploader).
             if std::mem::take(&mut self.staged_seen) {
                 self.poll_attempt();
+                self.poll_select();
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -7569,8 +7826,20 @@ impl Run {
                 continue;
             };
             let between = if !stepping {
-                self.pace_deadline = None;
-                Between::Frame
+                // An upload that ended mid-interval: its frame keeps the
+                // deadline it was paced to, not a fresh pace.
+                match self.pace_deadline.take() {
+                    Some(deadline) if !(swap_paced && !minimized) => {
+                        #[cfg(test)]
+                        note_pace(&self.shared, Pace::Kept(deadline));
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if !left.is_zero() {
+                            std::thread::sleep(left);
+                        }
+                        Between::Granted
+                    }
+                    _ => Between::Frame,
+                }
             } else if swap_paced && !minimized {
                 if self.granted {
                     Between::Frame
@@ -7592,8 +7861,12 @@ impl Run {
                     );
                 }
                 if Instant::now() < deadline {
+                    #[cfg(test)]
+                    note_pace(&self.shared, Pace::Step(deadline));
                     Between::Pass
                 } else {
+                    #[cfg(test)]
+                    note_pace(&self.shared, Pace::StepDue(deadline));
                     self.pace_deadline = None;
                     Between::Granted
                 }
@@ -7614,6 +7887,8 @@ impl Run {
             } else {
                 #[cfg(test)]
                 self.shared.clock_paced.fetch_add(1, Ordering::SeqCst);
+                #[cfg(test)]
+                note_pace(&self.shared, Pace::Fresh);
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("sleep0", 0);
                 std::thread::sleep(CLOCK_PACE);
@@ -9094,6 +9369,7 @@ impl Run {
             return;
         }
         let word = self.shared.cutoff.load(Ordering::Acquire);
+        self.settle_for_cutoff(word);
         match word & cutoff::PHASE {
             cutoff::CUT_OFF => self.found_cut_off(),
             cutoff::LOST => {}
@@ -9103,6 +9379,18 @@ impl Run {
                 self.cut_off_now();
             }
             _ => {}
+        }
+    }
+
+    /// READY's cutoff asked (`word`): the loading text in hand is cancelled
+    /// before the render thread can acknowledge it, by cutting off or by
+    /// marking itself waiting, so no upload is kept under it (design.md
+    /// "Scope of No Allocation").
+    fn settle_for_cutoff(&mut self, word: u32) {
+        if word & cutoff::ASKED != 0
+            && let Some(s) = &mut self.screen
+        {
+            s.drop_loading_text();
         }
     }
 
@@ -9135,6 +9423,15 @@ impl Run {
         if self.cut_off {
             return;
         }
+        // Not waiting with a loading text in hand: the game's swap would
+        // cut off over it, so its request is left to the render thread's
+        // own look, which settles the text first.
+        if self.screen.as_ref().is_some_and(|s| s.loading_text_held()) {
+            self.settle_for_cutoff(self.shared.cutoff.load(Ordering::Acquire));
+            if self.screen.as_ref().is_some_and(|s| s.loading_text_held()) {
+                return;
+            }
+        }
         let mut word = self.shared.cutoff.load(Ordering::Acquire);
         loop {
             match word & cutoff::PHASE {
@@ -9145,6 +9442,7 @@ impl Run {
                 cutoff::LOST => return,
                 _ => {}
             }
+            self.settle_for_cutoff(word);
             if word & cutoff::ASKED != 0 && filled == 0 {
                 self.cut_off_now();
                 return;
@@ -9257,7 +9555,7 @@ impl Run {
         if self.cut_off {
             return false;
         }
-        if self.bga_op.is_some() {
+        if self.bga_op.is_some() || self.creation_owed().is_some() {
             return true;
         }
         self.screen.as_ref().is_some_and(|s| {
@@ -9285,6 +9583,8 @@ impl Run {
             return Some(Duration::ZERO);
         }
         let work = self.attempt.is_some()
+            || self.pages_owed.is_some()
+            || self.select_hand.is_some()
             || upload == render::UploadState::InFlight
             || self.decision_busy()
             || self.bga_reply.is_some()
@@ -9355,6 +9655,11 @@ impl Run {
     /// to the lifetime's chart and revision on that installation; the
     /// pending presentation asks nothing.
     fn loading_text_pass(&mut self, mode: &Mode) {
+        // Nothing is prepared once READY's cutoff is asked, nor under it;
+        // the next pass after it lifts asks again.
+        if self.cut_off || self.shared.cutoff.load(Ordering::Acquire) & cutoff::ASKED != 0 {
+            return;
+        }
         let Mode::Menu {
             loading: Some(lifetime),
             update: Some(update),
@@ -9521,7 +9826,7 @@ impl Run {
             }
             self.heavy_op(mode, held, regrow, destroy_ok);
         }
-        self.upload_boundary(held);
+        self.upload_boundary(mode, held);
         #[cfg(all(test, feature = "dev-tools"))]
         let published_from = crate::alloc_count::this_thread();
         if !self.cut_off {
@@ -9561,13 +9866,92 @@ impl Run {
         };
         let owed = destroy_ok && s.pool_owed();
         let destroy = destroy_ok && s.due_heavy();
-        if !(regrow || bga || owed || destroy) {
+        let creation = self.creation_owed();
+        if !(regrow || bga || owed || destroy || creation.is_some()) {
             return;
         }
         match self.admit(mode, held) {
             Admit::No => return,
             Admit::ByStall if self.grant_found() => return,
             Admit::ByStall | Admit::Free => {}
+        }
+        // A selection entry's regrowth runs at the pass that takes the
+        // entry, before the entry's first frame (design.md "Load
+        // Pipeline", the priority); every other operation waits for a frame
+        // due.
+        let frame = if regrow {
+            FrameDue::Never
+        } else {
+            self.frame_due_by(mode, held)
+        };
+        let state = GateState {
+            frame_due: match frame {
+                FrameDue::Never => false,
+                FrameDue::Now => true,
+                FrameDue::Grant(g) => {
+                    let found = g.ready();
+                    if found {
+                        self.granted = true;
+                        self.stalled = false;
+                    }
+                    found
+                }
+                FrameDue::At(at) => gate_now() >= at,
+            },
+            cut_off: self.cut_off,
+            hold_past: held
+                .is_some_and(|shown_at| Self::hold_past(self.clock, &self.shared, shown_at)()),
+            heavy_spent: false,
+        };
+        if !admits(state, Ask::Heavy) {
+            return;
+        }
+        // An owed creation first after an entry's regrowth, play's before
+        // the pages' and a result skin's selection (design.md "Load
+        // Pipeline", the priority): it is the interval's operation.
+        if let Some(c) = creation.filter(|_| !regrow) {
+            #[cfg(test)]
+            let start = Instant::now();
+            match c {
+                Creation::Play => {
+                    if let Some(p) = &mut self.attempt {
+                        p.taken = true;
+                    }
+                    self.poll_attempt();
+                    self.creation_answered = self.attempt.is_none();
+                }
+                Creation::Pages => {
+                    if let Some((ticket, pages, reply)) = self.pages_owed.take() {
+                        self.begin_pages(ticket, &pages, reply);
+                    }
+                }
+                Creation::Select => {
+                    if let Some(h) = &mut self.select_hand {
+                        h.taken = true;
+                    }
+                    self.poll_select();
+                }
+            }
+            #[cfg(test)]
+            self.note_heavy_record(HeavyRec {
+                kind: match c {
+                    Creation::Play => HeavyKind::PlayCreation,
+                    Creation::Pages => HeavyKind::PagesCreation,
+                    Creation::Select => HeavyKind::SelectCreation,
+                },
+                start,
+                end: Instant::now(),
+                regime: if self.screen.is_none() || matches!(mode, Mode::Idle) || held.is_some() {
+                    Regime::Clock
+                } else if self.stalled {
+                    Regime::Stalled
+                } else {
+                    Regime::Presenting
+                },
+                refills: self.shared.refilling_frames.load(Ordering::SeqCst),
+            });
+            self.note_heavy();
+            return;
         }
         let Some(before) = self.screen.as_ref().map(|s| s.heavy_ops().count) else {
             return;
@@ -9636,6 +10020,41 @@ impl Run {
             });
         }
         self.note_heavy();
+    }
+
+    /// What makes a frame due before the boundary's work ends, for a pass
+    /// that draws one (design.md "Memory Budget", the uploader's admission
+    /// gate): the swap chain's grant where frames are paced by it, or the
+    /// frame's clock deadline while an upload steps offscreen or
+    /// minimized. Nothing in an Idle or a held pass, or with a grant kept.
+    fn frame_due_by(&self, mode: &Mode, held: Option<TimeUs>) -> FrameDue {
+        let Some(s) = &self.screen else {
+            return FrameDue::Never;
+        };
+        if held.is_some() || matches!(mode, Mode::Idle) {
+            return FrameDue::Never;
+        }
+        if self.granted {
+            return FrameDue::Now;
+        }
+        if s.paced() && !s.minimized() {
+            return s.grant_probe().map_or(FrameDue::Never, FrameDue::Grant);
+        }
+        self.pace_deadline.map_or(FrameDue::Never, FrameDue::At)
+    }
+
+    /// The creation owed to the boundary's allowance, if any: play's
+    /// staging not yet taken, else a result pages begin.
+    fn creation_owed(&self) -> Option<Creation> {
+        if self.attempt.as_ref().is_some_and(|p| !p.taken) {
+            Some(Creation::Play)
+        } else if self.pages_owed.is_some() {
+            Some(Creation::Pages)
+        } else if self.select_hand.as_ref().is_some_and(|h| !h.taken) {
+            Some(Creation::Select)
+        } else {
+            None
+        }
     }
 
     /// Notes a boundary's heavy operation while the record has room
@@ -9746,6 +10165,7 @@ impl Run {
             attempt,
             skin,
             reply,
+            taken: false,
         };
         if let Err(e) = self.recover() {
             let _ = p.reply.send(Err(e));
@@ -9794,6 +10214,10 @@ impl Run {
             text: &text,
             target: screen.target(),
         };
+        // Its first take waits for the boundary's allowance.
+        if !p.taken {
+            return;
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
         let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
@@ -9861,6 +10285,9 @@ impl Run {
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(answer);
         }
+        // Tests: held right after the answer, wherever it is sent.
+        #[cfg(test)]
+        self.shared.answer_gate.pass();
     }
 
     /// `preparation` with the screen's structural inputs: those the
@@ -10303,7 +10730,7 @@ impl Run {
     /// ([`render::Renderer::bga_boundary`]), its job answered once they
     /// end. A batch the screen no longer holds (a screen built again) is
     /// answered stale.
-    fn upload_boundary(&mut self, held: Option<TimeUs>) {
+    fn upload_boundary(&mut self, mode: &Mode, held: Option<TimeUs>) {
         let stale = render::BgaStep::Done(Err(render::BgaFault::Stale));
         let current = self
             .bga_reply
@@ -10316,17 +10743,55 @@ impl Run {
         }
         self.check_chart_hand();
         self.check_pages_hand();
+        // A result skin's selection in hand: its steps' figures are its own
+        // (development builds).
+        #[cfg(feature = "dev-tools")]
+        let _caller = self
+            .select_hand
+            .as_ref()
+            .filter(|h| h.taken)
+            .map(|_| crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN));
         let mut pages_end = None;
+        let frame = self.frame_due_by(mode, held);
+        let chart = self
+            .chart_hand
+            .as_ref()
+            .map(|h| (&*self.shared.chart_generation, h.key.generation));
+        let loading = match mode {
+            Mode::Menu {
+                loading: Some(lifetime),
+                update: Some(update),
+                ..
+            } => Some((*lifetime, update.revision)),
+            _ => None,
+        };
+        let mut granted = false;
         let step = match self.screen.as_mut() {
             Some(s) => {
                 let mut up = match held {
-                    Some(shown_at) => {
-                        s.upload_boundary(&mut Self::hold_past(self.clock, &self.shared, shown_at))
-                    }
-                    None => s.upload_boundary(&mut || false),
+                    Some(shown_at) => s.upload_boundary(&mut PassGate {
+                        frame,
+                        cut_off: self.cut_off,
+                        hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
+                        chart,
+                        loading,
+                        granted: &mut granted,
+                    }),
+                    None => s.upload_boundary(&mut PassGate::<fn() -> bool> {
+                        frame,
+                        cut_off: self.cut_off,
+                        hold: None,
+                        chart,
+                        loading,
+                        granted: &mut granted,
+                    }),
                 };
                 self.staged_seen |= up.staged.is_some();
                 pages_end = up.pages.take();
+                if granted {
+                    self.granted = true;
+                    self.stalled = false;
+                }
                 if let Some(end) = up.chart
                     && let Some(hand) = self.chart_hand.take()
                 {
@@ -11544,6 +12009,25 @@ impl Run {
         self.publish_result_status();
     }
 
+    /// The result pages begin of `ticket`, owed to a boundary whose
+    /// heavy-operation allowance admits its creation, after play's
+    /// (design.md "Load Pipeline"): at or below the withdrawn mark it does
+    /// nothing; an earlier owed begin is answered cancelled.
+    fn owe_pages(
+        &mut self,
+        ticket: u64,
+        pages: Arc<PackedPages>,
+        reply: mpsc::SyncSender<PagesAnswer>,
+    ) {
+        if ticket <= self.shared.pages().withdrawn {
+            let _ = reply.send(PagesAnswer::Cancelled);
+            return;
+        }
+        if let Some((_, _, old)) = self.pages_owed.replace((ticket, pages, reply)) {
+            let _ = old.send(PagesAnswer::Cancelled);
+        }
+    }
+
     /// The result pages begin of `ticket` (design.md "Memory Budget", the
     /// result pages upload): at or below the withdrawn mark it does
     /// nothing; else it withdraws the upload in hand and begins its own,
@@ -11637,6 +12121,10 @@ impl Run {
     /// The upload in hand, read once a pass: withdrawn by its owner, it
     /// steps no further and its array retires.
     fn check_pages_hand(&mut self) {
+        let withdrawn = self.shared.pages().withdrawn;
+        if let Some((_, _, reply)) = self.pages_owed.take_if(|(t, _, _)| *t <= withdrawn) {
+            let _ = reply.send(PagesAnswer::Cancelled);
+        }
         let Some(ticket) = self.pages_hand.as_ref().map(|(t, _)| *t) else {
             return;
         };
@@ -12964,6 +13452,109 @@ pub(crate) mod tests {
         assert_eq!(&seen[..3], [(1, true), (1, false), (1, false)]);
         assert_eq!(seen[3], (2, true), "{seen:?}");
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A menu screen with a loading text in its uploader's hand until it
+    /// is dropped; each drop counted.
+    struct Texting {
+        held: Arc<AtomicBool>,
+        drops: Arc<AtomicU32>,
+    }
+
+    impl Screen for Texting {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn loading_text_held(&self) -> bool {
+            self.held.load(Ordering::SeqCst)
+        }
+        fn drop_loading_text(&mut self) {
+            if self.held.swap(false, Ordering::SeqCst) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// H5 (design.md "Scope of No Allocation"): READY's cutoff asked while
+    /// a loading text is in the uploader's hand is acknowledged only after
+    /// that text is dropped, whether the render thread runs or waits for
+    /// its frame when it is asked; the control, no text in hand, is cut
+    /// off as before.
+    // Revert: the cutoff acknowledged with the text in hand (no settling
+    // in `mark_waiting` and `check_cutoff`) -> "cut off over a loading
+    // text in hand".
+    #[test]
+    fn the_cutoff_is_acknowledged_only_after_the_loading_text_is_dropped() {
+        for in_hand in [false, true] {
+            let held = Arc::new(AtomicBool::new(in_hand));
+            let drops = Arc::new(AtomicU32::new(0));
+            let (h, d) = (Arc::clone(&held), Arc::clone(&drops));
+            let make: MakeScreen = Box::new(move || {
+                Ok(Box::new(Texting {
+                    held: Arc::clone(&h),
+                    drops: Arc::clone(&d),
+                }) as Box<dyn Screen>)
+            });
+            let clock = QpcClock::start();
+            let link = spawn(
+                make,
+                None,
+                None,
+                clock,
+                view(),
+                measure(clock),
+                Box::new(NoFrames),
+            )
+            .unwrap();
+            link.send(RenderMsg::Menu(Box::default()));
+            let frames = link.shared.clock_paced.load(Ordering::SeqCst);
+            assert!(wait_until(|| link
+                .shared
+                .clock_paced
+                .load(Ordering::SeqCst)
+                > frames + 2));
+            assert_eq!(held.load(Ordering::SeqCst), in_hand, "kept until asked");
+            link.ask_cutoff();
+            assert!(wait_until(
+                || link.cutoff_phase() == super::CutoffPhase::CutOff
+            ));
+            assert!(
+                !held.load(Ordering::SeqCst),
+                "cut off over a loading text in hand"
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), u32::from(in_hand));
+            link.exit();
+        }
     }
 
     /// The loading state is drawn on through a chart's load and a
@@ -16329,7 +16920,7 @@ pub(crate) mod tests {
         fn upload_waited(&self) -> bool {
             self.steps.load(Ordering::Acquire) > 0
         }
-        fn upload_boundary(&mut self, _past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
             if self
                 .steps
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -18034,7 +18625,7 @@ pub(crate) mod tests {
             b.pending = Some((key.array, cells.len(), bytes, boundaries));
             Ok(())
         }
-        fn upload_boundary(&mut self, _past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
             let bga = (|| {
                 let mut b = self.shared.bga.lock().unwrap();
                 let Some((array, cells, bytes, left)) = b.pending else {
@@ -21700,7 +22291,7 @@ pub(crate) mod tests {
             }
             answer
         }
-        fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
             self.menu.upload_boundary(past)
         }
         fn upload_state(&self) -> render::UploadState {
@@ -21795,6 +22386,15 @@ pub(crate) mod tests {
         }
         fn text_settled(&self) -> bool {
             self.menu.text_settled()
+        }
+        fn drop_loading_text(&mut self) {
+            self.menu.drop_loading_text();
+        }
+        fn loading_text_held(&self) -> bool {
+            self.menu.loading_text_held()
+        }
+        fn grant_probe(&self) -> Option<render::GrantProbe> {
+            self.menu.grant_probe()
         }
         fn loading(
             &mut self,
@@ -22123,7 +22723,7 @@ pub(crate) mod tests {
         ) -> Option<Result<Preparation, RenderError>> {
             self.menu.prepare_attempt(a, skin, request)
         }
-        fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
             if self.hold_up.load(Ordering::Acquire) {
                 return render::Uploaded {
                     bga: render::BgaStep::Idle,
@@ -22227,6 +22827,15 @@ pub(crate) mod tests {
         }
         fn text_settled(&self) -> bool {
             self.menu.text_settled()
+        }
+        fn drop_loading_text(&mut self) {
+            self.menu.drop_loading_text();
+        }
+        fn loading_text_held(&self) -> bool {
+            self.menu.loading_text_held()
+        }
+        fn grant_probe(&self) -> Option<render::GrantProbe> {
+            self.menu.grant_probe()
         }
         fn loading(
             &mut self,
@@ -23506,6 +24115,10 @@ pub(crate) mod tests {
     // passes that present nothing, with no sleep while it can act.
     #[cfg(feature = "dev-tools")]
     mod upload;
+    // The boundary's admission gate over every order of its events (the
+    // grant's stand-in exists with dev-tools).
+    #[cfg(feature = "dev-tools")]
+    mod admission_gate;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,

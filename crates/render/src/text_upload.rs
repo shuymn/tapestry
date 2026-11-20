@@ -397,8 +397,11 @@ pub(crate) fn prepare(
 pub(crate) struct TextUpload {
     placement: Placement,
     slots: usize,
-    /// The next new line to write.
+    /// The next new line to write, and within it the level and the row
+    /// its next band begins at.
     next: usize,
+    level: usize,
+    row: u32,
     report: TextReport,
     /// Why it failed: a line refused by its producer or a step by the
     /// device; nothing more is written.
@@ -433,6 +436,8 @@ impl TextUpload {
             placement,
             slots,
             next: 0,
+            level: 0,
+            row: 0,
             failed: None,
         }
     }
@@ -455,11 +460,15 @@ impl TextUpload {
     }
 
     /// Writes its next step into `atlas`'s text layer: lines rasterized
-    /// through `producer` and written, until the step's bytes reach
-    /// `budget`, then submitted, inside one pair of error scopes. The
-    /// step's submission, if it wrote anything. A line its producer
-    /// refuses, or a write the device refuses, fails it: nothing more is
-    /// written, and its lines are rolled back at
+    /// through `producer` and written in bands of rows, each at most
+    /// [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes as the queue stages them
+    /// (a level larger than that takes several), until the step's bytes
+    /// reach `budget` or `gate` answers past before a band after the
+    /// step's first, then submitted, inside one pair of error scopes. A
+    /// line cut between bands resumes at its next band in a later step,
+    /// rasterized again. The step's submission, if it wrote anything. A
+    /// line its producer refuses, or a write the device refuses, fails it:
+    /// nothing more is written, and its lines are rolled back at
     /// [`finish`](Self::finish).
     pub(crate) fn write_step(
         &mut self,
@@ -468,6 +477,7 @@ impl TextUpload {
         scratch: &mut TextScratch,
         producer: &dyn AttemptText,
         budget: u64,
+        gate: &mut dyn crate::UploadGate,
     ) -> Option<wgpu::SubmissionIndex> {
         let Some(z) = atlas.text_layer() else {
             self.failed = Some(RenderError::Atlas(UploadError::Side {
@@ -478,29 +488,50 @@ impl TextUpload {
         };
         let queue = gpu.queue();
         let texture = atlas.texture();
-        let (new, next) = (&self.placement.new, &mut self.next);
+        let new = &self.placement.new;
+        let (next, level, row) = (&mut self.next, &mut self.level, &mut self.row);
         let mut bytes = 0_u64;
         let ((raster, submission), refused) = skin_atlas::scoped(gpu.device(), || {
             let mut raster = Ok(());
             let mut written = false;
+            // The scratch holds no line yet: one resumed is rasterized again.
+            let mut fresh = true;
             while let Some(n) = new.get(*next) {
-                if written && bytes >= budget {
+                if written && (bytes >= budget || gate.past()) {
                     break;
                 }
-                if let Err(e) = rasterize(producer, &n.layout, scratch) {
-                    raster = Err(RenderError::Skin(e));
-                    break;
+                if fresh {
+                    if let Err(e) = rasterize(producer, &n.layout, scratch) {
+                        raster = Err(RenderError::Skin(e));
+                        break;
+                    }
+                    expand(scratch, n.rect, n.layout.size);
+                    fresh = false;
                 }
-                expand(scratch, n.rect, n.layout.size);
-                for k in 0..MIP_LEVELS {
-                    let [x, y, w, h] = n.rect.map(|v| v >> k);
-                    if let Some(level) = scratch.rgba.get(k) {
-                        write(queue, texture, z, k, [x, y, w, h], level);
-                        bytes += padded(w) * u64::from(h);
+                let [x, y, w, h] = n.rect.map(|v| v >> *level);
+                let band = band_rows(w, h - (*row).min(h));
+                if band > 0
+                    && let Some(levels) = scratch.rgba.get(*level)
+                {
+                    let row_bytes = usize::try_from(u64::from(w) * 4).unwrap_or(0);
+                    let from = usize::try_from(*row).unwrap_or(0) * row_bytes;
+                    let to = from + usize::try_from(band).unwrap_or(0) * row_bytes;
+                    if let Some(rows) = levels.get(from..to) {
+                        write(queue, texture, z, *level, [x, y + *row, w, band], rows);
+                        bytes += padded(w) * u64::from(band);
+                    }
+                    written = true;
+                }
+                *row += band;
+                if *row >= h {
+                    *row = 0;
+                    *level += 1;
+                    if *level >= MIP_LEVELS {
+                        *level = 0;
+                        *next += 1;
+                        fresh = true;
                     }
                 }
-                written = true;
-                *next += 1;
             }
             // Inside the scopes: the queued writes reach the device only at
             // a submission, the array's last use for its retirement.
@@ -644,6 +675,14 @@ fn expand(scratch: &mut TextScratch, rect: [u32; 4], [w, h]: [u32; 2]) {
         prev = next;
         pw = nw;
     }
+}
+
+/// The rows of a level `w` texels wide one band writes, of `left` rows
+/// left: as many as fit [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) padded
+/// bytes, at least one.
+pub(crate) fn band_rows(w: u32, left: u32) -> u32 {
+    let per = (crate::UPLOAD_WRITE / padded(w).max(1)).max(1);
+    left.min(u32::try_from(per).unwrap_or(u32::MAX))
 }
 
 /// A row of `w` RGBA texels padded to `COPY_BYTES_PER_ROW_ALIGNMENT`, as

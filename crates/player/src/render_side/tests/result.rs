@@ -253,7 +253,7 @@ impl Screen for Recorded {
             Err(e) => Err(e),
         })
     }
-    fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
         let up = self.menu.upload_boundary(past);
         let (log, _) = self.menu.renderer_mut().step_log();
         log.clone_into(

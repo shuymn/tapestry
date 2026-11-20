@@ -225,3 +225,21 @@ fn a_refused_step_retires_the_staging_and_answers_its_request() {
         Err(RenderError::Superseded { .. })
     ));
 }
+
+/// M1: a text band is at most one write of padded bytes, at least one row:
+/// a 2 048-texel level of 1 024 rows (8 MiB) takes two bands of 512, a
+/// row wider than a write goes alone.
+// Revert: one band a level (`band_rows` answering `left`) -> "8 MiB in
+// one band".
+#[test]
+fn a_text_band_is_at_most_one_write() {
+    use crate::text_upload::{band_rows, padded};
+    assert_eq!(band_rows(2_048, 1_024), 512, "8 MiB in one band");
+    assert_eq!(band_rows(2_048, 100), 100);
+    assert_eq!(band_rows(2_000_000, 5), 1);
+    for w in [1, 64, 500, 2_048, 4_096] {
+        let rows = band_rows(w, u32::MAX);
+        assert!(rows >= 1);
+        assert!(padded(w) * u64::from(rows) <= crate::UPLOAD_WRITE, "{w}");
+    }
+}

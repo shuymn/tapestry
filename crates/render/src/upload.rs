@@ -54,6 +54,38 @@ pub enum UploadState {
     InFlight,
 }
 
+/// What a boundary's uploader asks before each heavy operation it begins
+/// and each write (design.md "Memory Budget", the uploader's admission
+/// gate): its owner answers for the frame grant or the clock deadline,
+/// READY's cutoff and the hold's bound, and for the currency of the
+/// chart-image publication in hand, which only its owner can tell. A
+/// closure is a gate that answers [`past`](Self::past) alone.
+pub trait UploadGate {
+    /// Whether the boundary must begin nothing more now: a frame is due
+    /// (its grant found or its deadline passed), READY's cutoff holds, or
+    /// a held pass reached the hold's bound. A write begun before ends
+    /// first.
+    fn past(&mut self) -> bool;
+    /// Whether the chart-image publication in hand is still its owner's
+    /// current one, read before each band and before its publication.
+    fn chart_current(&mut self) -> bool {
+        true
+    }
+    /// Whether the loading text of `lifetime` at `revision` in hand is
+    /// still its owner's newest, read before each step and before its
+    /// installation: one superseded is dropped, never installed.
+    fn loading_current(&mut self, lifetime: u64, revision: u64) -> bool {
+        let _ = (lifetime, revision);
+        true
+    }
+}
+
+impl<F: FnMut() -> bool> UploadGate for F {
+    fn past(&mut self) -> bool {
+        self()
+    }
+}
+
 /// The attempt's chart-image publication a boundary steps: the payload in
 /// hand and its images, which its caller keeps.
 pub type ChartBands<'a> = (

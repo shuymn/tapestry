@@ -231,7 +231,7 @@ impl Renderer {
         started: Instant,
         steps: u32,
         slice: Duration,
-        past: &mut dyn FnMut() -> bool,
+        past: &mut dyn crate::UploadGate,
     ) -> bool {
         const WRITES: u64 = crate::UPLOAD_STEP / crate::UPLOAD_WRITE;
         #[cfg(not(test))]
@@ -269,7 +269,7 @@ impl Renderer {
             loop {
                 writes.write_one(gpu, atlas, crate::UPLOAD_WRITE);
                 n += 1;
-                if n >= WRITES || writes.written() || elapsed() >= slice || past() {
+                if n >= WRITES || writes.written() || elapsed() >= slice || past.past() {
                     break;
                 }
             }

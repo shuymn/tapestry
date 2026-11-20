@@ -5626,7 +5626,7 @@ impl Renderer {
     pub fn upload_boundary_within(
         &mut self,
         slice: Duration,
-        past: &mut dyn FnMut() -> bool,
+        past: &mut dyn crate::UploadGate,
         chart: Option<crate::ChartBands<'_>>,
     ) -> crate::Uploaded {
         self.upload_steps(slice, past, chart, false)
@@ -5645,7 +5645,7 @@ impl Renderer {
     fn upload_steps(
         &mut self,
         slice: Duration,
-        past: &mut dyn FnMut() -> bool,
+        past: &mut dyn crate::UploadGate,
         mut chart: Option<crate::ChartBands<'_>>,
         staging_only: bool,
     ) -> crate::Uploaded {
@@ -5783,7 +5783,7 @@ impl Renderer {
                 if steps > 0 && self.step_elapsed(started, steps) >= slice {
                     break;
                 }
-                if past() {
+                if past.past() {
                     break;
                 }
                 if let Some(done) = self.write_chart_band(up, *images) {
@@ -5805,7 +5805,7 @@ impl Renderer {
             if steps > 0 && self.step_elapsed(started, steps) >= slice {
                 break;
             }
-            if past() {
+            if past.past() {
                 break;
             }
             let Some(up) = self.bga_upload.as_mut() else {
@@ -5896,7 +5896,7 @@ impl Renderer {
         started: Instant,
         steps: u32,
         slice: Duration,
-        past: &mut dyn FnMut() -> bool,
+        past: &mut dyn crate::UploadGate,
     ) -> bool {
         const WRITES: u64 = crate::UPLOAD_STEP / crate::UPLOAD_WRITE;
         #[cfg(not(test))]
@@ -5940,7 +5940,7 @@ impl Renderer {
             loop {
                 writes.write_one(gpu, atlas, crate::UPLOAD_WRITE);
                 n += 1;
-                if n >= WRITES || writes.written() || elapsed() >= slice || past() {
+                if n >= WRITES || writes.written() || elapsed() >= slice || past.past() {
                     break;
                 }
             }
@@ -7300,7 +7300,7 @@ impl Renderer {
             return;
         }
         while self.loading_upload.as_ref().is_some_and(|t| !t.written()) {
-            if !self.write_text_step() {
+            if !self.write_text_step(&mut || false) {
                 break;
             }
         }
@@ -7428,6 +7428,7 @@ impl Renderer {
             &mut self.text_scratch,
             producer.as_ref(),
             crate::UPLOAD_WRITE,
+            gate,
         );
         self.text_report.upload_bytes = up.report().upload_bytes;
         self.text_report
@@ -8939,10 +8940,44 @@ impl Renderer {
     }
 }
 
+/// The holders of shared pages [`Renderer::memory_with`] counts once per
+/// identity: play's installation, the staging, the result's slot, its
+/// pages-only installation, the pages upload in hand and each entry.
+const HOLDERS: usize = 5 + ENTRIES;
+
 /// Development builds: the staging steps whose writes
 /// [`Renderer::step_log`] keeps.
 #[cfg(feature = "dev-tools")]
 const STEP_LOG: usize = 8;
+
+/// The swap chain's grant, looked at without waiting
+/// ([`Renderer::grant_probe`]). A grant it finds is taken: its caller
+/// keeps it for the frame. Valid while its renderer's swap chain is
+/// (only reconfigured through `&mut Renderer`).
+#[derive(Clone, Copy, Debug)]
+pub enum GrantProbe {
+    /// The frame latency waitable object's handle.
+    Waitable(usize),
+    /// Tests and development builds: a flag standing for the grant, taken
+    /// when found.
+    #[cfg(any(test, feature = "dev-tools"))]
+    Flag(&'static std::sync::atomic::AtomicBool),
+}
+
+impl GrantProbe {
+    /// Whether the swap chain grants a frame now; a grant found is taken.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        match *self {
+            // SAFETY: the live swap chain's handle, see the type.
+            Self::Waitable(h) => unsafe {
+                WaitForSingleObject(HANDLE(h as *mut _), 0) == WAIT_OBJECT_0
+            },
+            #[cfg(any(test, feature = "dev-tools"))]
+            Self::Flag(f) => f.swap(false, std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+}
 
 /// How [`Renderer::wait_grant_or_pace`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

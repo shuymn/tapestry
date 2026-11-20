@@ -102,7 +102,7 @@ pub use renderer::UploadTiming;
 pub use renderer::take_build_start;
 pub use renderer::{
     Admission, ChartOutcome, ChartTarget, ChartUpload, Class, CommitError, CpuParts, Destroyed,
-    Destruction, FrameOutcome, FrameTiming, GrantWait, Handoff, HeavyOps, LoadingOn,
+    Destruction, FrameOutcome, FrameTiming, GrantProbe, GrantWait, Handoff, HeavyOps, LoadingOn,
     LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness, PagesBegun, PagesStep, Part,
     PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError,
     Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, TextDone, TextFault,
@@ -125,7 +125,9 @@ pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
 #[cfg(feature = "dev-tools")]
 pub use upload::TextCount;
-pub use upload::{ChartBands, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE, UploadState, Uploaded};
+pub use upload::{
+    ChartBands, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE, UploadGate, UploadState, Uploaded,
+};
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).
 #[cfg(feature = "dev-tools")]

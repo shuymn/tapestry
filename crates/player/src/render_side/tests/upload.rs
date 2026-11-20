@@ -306,3 +306,57 @@ fn a_loss_after_the_first_band_answers_unavailable() {
     assert!(!rig.faults.lose_after_band.load(SeqCst), "lost at a band");
     rig.exit();
 }
+
+/// H2 (design.md "Memory Budget", the uploader's passes between frames):
+/// offscreen, a staging stepped by loading's presenting passes ends
+/// mid-interval and its frame keeps the deadline those passes waited for:
+/// the pacing after the last stepping pass is that deadline, kept or
+/// reached, never a fresh pace.
+// Revert: the deadline dropped once no upload steps (`Between::Frame`
+// for every pass not stepping) -> "a fresh pace after the upload".
+#[test]
+fn an_upload_ended_mid_interval_keeps_its_frames_deadline() {
+    use crate::render_side::Pace;
+    let rig = Rig::new();
+    rig.faults.step_delay_us.store(2_000, SeqCst);
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let staged = big(&target);
+    // Loading frames presented by the clock: the hold never holds.
+    rig.link.shared.hold_bound.store(0, SeqCst);
+    rig.link.send(RenderMsg::Menu(Box::new(one_line("page"))));
+    rig.link.loading().show(one_line("loading"));
+    let paced = &rig.link.shared.clock_paced;
+    let from = paced.load(SeqCst);
+    assert!(wait_until(|| paced.load(SeqCst) >= from + 2));
+    rig.link.record_pacing(4_096);
+    let answer = rig
+        .link
+        .prepare_attempt_with(
+            super::titled(&chart),
+            super::super::AttemptSkin::Specialized(staged),
+            || false,
+        )
+        .unwrap();
+    assert_eq!(answer, Preparation::Ready);
+    let from = paced.load(SeqCst);
+    assert!(wait_until(|| paced.load(SeqCst) >= from + 2));
+    let pacing = rig.link.pacing();
+    let last = pacing
+        .iter()
+        .rposition(|p| matches!(p, Pace::Step(_)))
+        .expect("stepped by the clock");
+    let Some(Pace::Step(deadline)) = pacing.get(last).copied() else {
+        unreachable!()
+    };
+    assert!(
+        matches!(
+            pacing.get(last + 1),
+            Some(Pace::Kept(d) | Pace::StepDue(d)) if *d == deadline
+        ),
+        "a fresh pace after the upload: {:?}",
+        &pacing[last..]
+    );
+    rig.exit();
+}

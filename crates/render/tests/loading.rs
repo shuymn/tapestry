@@ -852,3 +852,125 @@ fn loading_text_holders_are_witnessed() {
     assert!(kept < installed.text_cache, "the holder kept: {kept}");
     assert!(kept >= staged.text_cache, "the cache shrank: {kept}");
 }
+
+/// A boundary's gate for the loading text: past from its look after the
+/// first `free`, the text in hand current while `current`.
+struct TextGate {
+    looks: u32,
+    free: u32,
+    current: bool,
+}
+
+impl render::UploadGate for TextGate {
+    fn past(&mut self) -> bool {
+        self.looks += 1;
+        self.looks > self.free
+    }
+
+    fn loading_current(&mut self, _: u64, _: u64) -> bool {
+        self.current
+    }
+}
+
+/// A renderer in loading lifetime 1 on a bundle with the chosen chart's
+/// text slots, three fields of it prepared at revision 1.
+fn text_in_hand(dir: &std::path::Path) -> Renderer {
+    let mut r = offscreen(1_920, 1_080);
+    let (a, _) = bundle(&r, dir, &chart_texts([255, 0, 0, 255]));
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    let all = TextSlots::field(TextField::Title)
+        .with(TextSlots::field(TextField::Artist))
+        .with(TextSlots::field(TextField::Genre));
+    r.prepare_loading_text(1, 1, all, &chosen("Title", "Artist", "Genre"));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    r
+}
+
+/// M1: the loading text is written in bands with the gate read before
+/// each band after a step's first: a gate past from its second look ends
+/// the step after one band, so once that step has completed the text is
+/// still unwritten and a boundary past at once installs nothing; with a
+/// free gate it then installs.
+// Revert: `write_step` writing every line of its budget without reading
+// the gate -> "installed after one band".
+#[test]
+fn the_gate_is_read_before_each_band_of_the_loading_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = text_in_hand(dir.path());
+    let mut gate = TextGate {
+        looks: 0,
+        free: 1,
+        current: true,
+    };
+    let out = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None);
+    assert!(out.text.is_none(), "{:?}", out.text.map(|t| t.result));
+    assert!(
+        gate.looks >= 2,
+        "read before its second band: {}",
+        gate.looks
+    );
+    r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    let out = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut || true, None);
+    assert!(out.text.is_none(), "installed after one band");
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
+}
+
+/// M2: the loading text in hand, its owner's revision moved on after its
+/// first band, ends stale at the next boundary and is never installed;
+/// the control, current throughout, installs.
+// Revert: no revision check in the boundary's loop -> "a superseded
+// revision installed".
+#[test]
+fn a_superseded_loading_text_is_never_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = text_in_hand(dir.path());
+    let text = MenuText::new(&r);
+    let mut gate = TextGate {
+        looks: 0,
+        free: 1,
+        current: true,
+    };
+    let _ = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None);
+    r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    let mut gate = TextGate {
+        looks: 0,
+        free: u32::MAX,
+        current: false,
+    };
+    let done = r
+        .upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None)
+        .text
+        .expect("ended");
+    assert_eq!((done.lifetime, done.revision), (1, 1));
+    assert!(
+        matches!(
+            done.result,
+            Err(render::TextFault::Install(LoadingTextError::Stale))
+        ),
+        "a superseded revision installed: {:?}",
+        done.result
+    );
+    assert_eq!(r.loading_text_in_hand(), None);
+    assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 0))), [BLACK; 4]);
+    // The control.
+    let mut r = text_in_hand(dir.path());
+    let mut gate = TextGate {
+        looks: 0,
+        free: u32::MAX,
+        current: true,
+    };
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let done = loop {
+        if let Some(done) = r
+            .upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None)
+            .text
+        {
+            break done;
+        }
+        assert!(std::time::Instant::now() < end, "never ended");
+        r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    };
+    assert!(done.result.is_ok(), "{:?}", done.result);
+}
