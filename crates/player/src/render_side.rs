@@ -18076,8 +18076,9 @@ pub(crate) mod tests {
         let (_, at) = link.loading_ack().unwrap();
         let minimum = || game::minimum_ends(at, link.loading_loadend()).0 - at.0;
         // Two frames of the new staging: the first's declaration is
-        // published before the second is drawn. The earlier staging's
-        // frames drawn until the new one is answered count for nothing.
+        // published before the second is drawn. A frame of the earlier
+        // staging, begun before the request and recorded after the count
+        // was read, counts for nothing.
         let stage = |ms: i64| {
             let earlier: Vec<u64> = staged().iter().map(|&(_, r)| r).collect();
             assert_eq!(
