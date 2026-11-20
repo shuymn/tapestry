@@ -1459,10 +1459,56 @@ fn launches_take_a_mutex_of_the_users_own() {
         unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) }.unwrap();
     // SAFETY: the handle just opened, closed when this drops.
     drop(unsafe { OwnedHandle::from_raw_handle(opened.0) });
+    // Compared as Windows writes it: SDDL names some accounts by an alias
+    // (the built-in Administrator, which runs CI, reads `LA`).
     assert_eq!(
         kernel_dacl(held.handle()),
-        format!("D:P(A;;0x1f0001;;;{user})")
+        canonical_sddl(&format!("D:P(A;;0x1f0001;;;{user})"))
     );
+}
+
+/// `sddl` as Windows writes it back, aliases and all.
+fn canonical_sddl(sddl: &str) -> String {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows::core::PWSTR;
+
+    let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a nul-terminated string; the descriptor returned is freed below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+    }
+    .unwrap();
+    let mut text = PWSTR::null();
+    // SAFETY: the descriptor just made; the string returned is freed below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &raw mut text,
+            None,
+        )
+    }
+    .unwrap();
+    // SAFETY: the nul-terminated string the call returned.
+    let written = unsafe { text.to_string() }.unwrap();
+    // SAFETY: the string and the descriptor the calls allocated.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    written
 }
 
 /// The DACL of the kernel object `object`, as SDDL.
