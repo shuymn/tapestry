@@ -30,6 +30,11 @@ pub trait Kinds: DeserializeOwned {
 
     /// This record's kind, its `t`.
     fn kind(&self) -> &'static str;
+
+    /// The host counter the record carries, if it carries one.
+    fn q(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// What a file held.
@@ -116,6 +121,14 @@ pub fn read<R: Kinds>(bytes: &[u8]) -> Result<Stream<R>, Error> {
             return Err(Error::Framing { line });
         }
         let text = std::str::from_utf8(raw).map_err(|_| Error::Utf8 { line })?;
+        // A record is an object: serde would also take a struct's fields
+        // as a positional array.
+        if !text.starts_with('{') {
+            return Err(Error::Record {
+                line,
+                error: "the line is not a JSON object".into(),
+            });
+        }
         let record: R = serde_json::from_str(text).map_err(|e| Error::Record {
             line,
             error: e.to_string(),
@@ -294,6 +307,8 @@ pub struct RunNote {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exit {
+    /// The host counter when the runner observed the exit.
+    pub q: i64,
     /// The process's name in the row (`recorder`, `player`, `inner`).
     pub name: String,
     pub process: Process,
@@ -325,6 +340,17 @@ impl Kinds for Run {
             Self::Recovery(_) => "recovery",
             Self::Exit(_) => "exit",
             Self::End(_) => "end",
+        }
+    }
+
+    fn q(&self) -> Option<i64> {
+        match self {
+            Self::Spawn(r) => Some(r.q),
+            Self::Sink(r) => Some(r.q),
+            Self::Held(r) => Some(r.q),
+            Self::Stop(r) | Self::Recovery(r) => Some(r.q),
+            Self::Exit(e) => Some(e.q),
+            Self::Start(_) | Self::Seal(_) | Self::End(_) => None,
         }
     }
 }
@@ -459,6 +485,20 @@ impl Kinds for Link {
             Self::Refused(_) => "refused",
             Self::End(_) => "end",
         }
+    }
+
+    fn q(&self) -> Option<i64> {
+        Some(match self {
+            Self::Open(r) => r.q,
+            Self::Cmd(r) => r.q,
+            Self::Rec(r) | Self::Check(r) | Self::Dropped(r) => r.q,
+            Self::Fence(r) | Self::Close(r) => r.q,
+            Self::Ans(r) => r.q,
+            Self::Ping(r) => r.recv,
+            Self::Malformed(r) => r.q,
+            Self::Lost(r) | Self::Refused(r) => r.q,
+            Self::End(r) => r.q,
+        })
     }
 }
 
@@ -595,6 +635,18 @@ impl Kinds for Recorder {
             Self::End(_) => "end",
         }
     }
+
+    fn q(&self) -> Option<i64> {
+        Some(match self {
+            Self::Ready(r) => r.q,
+            Self::Pad(r) => r.q,
+            Self::Key(r) => r.q,
+            Self::Mouse(r) => r.q,
+            Self::Dev(r) => r.q,
+            Self::Error(r) => r.to,
+            Self::End(r) => r.q,
+        })
+    }
 }
 
 /// A set's `reservation.jsonl`: its one record.
@@ -629,6 +681,8 @@ impl Kinds for Reservation {
 #[serde(deny_unknown_fields)]
 pub struct Verdict {
     pub row: String,
+    /// The run it judges: a single run's id, or a set's.
+    pub run: String,
     pub check: String,
     pub outcome: Outcome,
     pub detail: String,

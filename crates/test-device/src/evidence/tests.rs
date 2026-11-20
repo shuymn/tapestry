@@ -221,7 +221,7 @@ fn a_reservation_holds_one_record() {
 
 #[test]
 fn verdict_lines_read_strictly() {
-    let line = r#"{"row":"sink","check":"provenance","outcome":"pass","detail":"","inputs":[{"role":"run","path":"link.jsonl","sha256":"00"}],"producer":{"name":"judge","version":"0123456789ab"}}"#;
+    let line = r#"{"row":"sink","run":"r","check":"provenance","outcome":"pass","detail":"","inputs":[{"role":"run","path":"link.jsonl","sha256":"00"}],"producer":{"name":"judge","version":"0123456789ab"}}"#;
     let s = read::<Verdict>(&file(&[line, line])).unwrap();
     assert_eq!(s.records.len(), 2);
     assert_eq!(s.records[0].outcome, Outcome::Pass);
@@ -234,4 +234,21 @@ fn verdict_lines_read_strictly() {
     let mut cut = file(&[line]);
     cut.extend_from_slice(line.as_bytes());
     assert!(read::<Verdict>(&cut).unwrap().finished(false).is_err());
+}
+
+#[test]
+fn a_positional_array_fails() {
+    let array = r#"["end",0,[]]"#;
+    assert_eq!(
+        read_run(&file(&[START, array])),
+        Err(Error::Record {
+            line: 2,
+            error: "the line is not a JSON object".into()
+        })
+    );
+    let verdict = r#"["sink","r","provenance","pass","",[],["judge","0"]]"#;
+    assert!(matches!(
+        read::<Verdict>(&file(&[verdict])),
+        Err(Error::Record { line: 1, .. })
+    ));
 }
