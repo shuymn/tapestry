@@ -516,8 +516,15 @@ mod tests {
             "runner" => {
                 let job = Job::join().unwrap();
                 let (exe, args, _) = me("sleep");
-                let p = Pipe::new(false).unwrap();
-                let child = spawn(&job, &exe, &args, &[(HELPER, "sleep")], &stdio(&p)).unwrap();
+                // The null device for every standard handle: a pipe to this
+                // runner would end the sleeper by itself once the runner
+                // dies, whatever the job does.
+                let null = Stdio {
+                    input: Stdio::null().unwrap(),
+                    output: Stdio::null().unwrap(),
+                    error: Stdio::null().unwrap(),
+                };
+                let child = spawn(&job, &exe, &args, &[(HELPER, "sleep")], &null).unwrap();
                 out(child.process.pid.to_string());
                 std::thread::sleep(Duration::from_secs(30));
             }

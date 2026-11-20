@@ -707,7 +707,7 @@ mod tests {
     fn each_broken_rule_refuses_the_click() {
         assert_eq!(check(&scene()), Ok(POINT));
         type Case = (fn(&mut Scene), fn(&Refusal) -> bool);
-        let cases: [Case; 10] = [
+        let cases: [Case; 11] = [
             (|s| s.monitor_now = None, |r| *r == Refusal::MonitorGone),
             (
                 |s| s.monitor_now = Some([0, 0, 1920, 1080]),
@@ -732,6 +732,10 @@ mod tests {
                 |r| matches!(r, Refusal::CursorMoved { .. }),
             ),
             (|s| s.buttons_down = true, |r| *r == Refusal::ButtonDown),
+            (
+                |s| s.gui.foreign_capture = true,
+                |r| *r == Refusal::ForeignCapture,
+            ),
             (|s| s.gui.menu = true, |r| *r == Refusal::Menu),
         ];
         for (i, (spoil, want)) in cases.iter().enumerate() {
