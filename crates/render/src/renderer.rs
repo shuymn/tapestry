@@ -3912,6 +3912,9 @@ impl Renderer {
             self.retire_refused(pages, atlas, atlas_bind, buffer);
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
+        // The wait's start, so a reading can place the summary after it.
+        #[cfg(feature = "dev-tools")]
+        crate::probe::cmark!("up", "wait_begin", 0);
         #[cfg(feature = "dev-tools")]
         let p_wait = crate::probe::Span::start();
         // In steps, its pages are written by the uploader, which never

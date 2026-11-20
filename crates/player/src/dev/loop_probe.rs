@@ -71,7 +71,10 @@
 //! - An upload's summary (`up:*`) is marked once its wait returned, or at
 //!   once when it was refused: no wait is added to the refusal, so a
 //!   refused upload's queued writes can still be in flight when its
-//!   summary is marked.
+//!   summary is marked. `up:wait_begin` is marked on the same thread just
+//!   before the wait, so the summary follows it in the marks' order;
+//!   `up:gpu_wait_us` is zero for an upload written in the uploader's
+//!   steps, which adds no wait (design.md "Load Pipeline").
 //!
 //! Off, the probe reads no clock and no thread-local of its own: its spans
 //! and its own time are zero, and the renderer's after-submit readings are
