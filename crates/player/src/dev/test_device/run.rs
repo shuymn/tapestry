@@ -405,6 +405,40 @@ struct Looks {
     beat: Arc<AtomicI64>,
     /// The recorder's process, by a handle of the guard's own.
     recorder: Child,
+    /// The recorder's file, and its growth: the recorder writes a `beat`
+    /// every 20 ms.
+    recorder_file: PathBuf,
+    recorder_growth: Growth,
+}
+
+/// How recently the recorder's file must have grown for a look to count
+/// it as recording: three of its beats.
+const RECORDER_FRESH: Duration = Duration::from_millis(60);
+
+/// Whether a file its writer appends to has grown lately: its size at
+/// the last look, and when it last grew. A size that could not be read is
+/// no growth.
+struct Growth {
+    size: u64,
+    grew: Instant,
+}
+
+impl Growth {
+    const fn new(now: Instant) -> Self {
+        Self { size: 0, grew: now }
+    }
+
+    /// Looks at the file's size `size` at `now`: whether it grew within
+    /// [`RECORDER_FRESH`].
+    fn look(&mut self, size: Option<u64>, now: Instant) -> bool {
+        if let Some(n) = size
+            && n > self.size
+        {
+            self.size = n;
+            self.grew = now;
+        }
+        now.saturating_duration_since(self.grew) <= RECORDER_FRESH
+    }
 }
 
 impl Watch for Looks {
@@ -413,6 +447,8 @@ impl Watch for Looks {
             self.monitor_now = desktop::monitor(&self.monitor).ok().map(|m| m.area);
             self.read = Instant::now();
         }
+        let size = std::fs::metadata(&self.recorder_file).ok().map(|m| m.len());
+        let growing = self.recorder_growth.look(size, Instant::now());
         let at = qpc();
         let client = desktop::client_rect(self.sink);
         let placed = self.monitor_now == Some(self.monitor_then)
@@ -423,7 +459,7 @@ impl Watch for Looks {
             front: desktop::foreground() == self.sink,
             placed,
             beat: self.beat.load(Ordering::Acquire),
-            recording: self.recorder.wait(Duration::ZERO).is_none(),
+            recording: self.recorder.wait(Duration::ZERO) == Ok(None) && growing,
         }
     }
 }
@@ -454,17 +490,20 @@ fn kill_record(log: &Log, name: &str, p: Process) {
 
 /// Waits up to `wait` for `c` to end; else records its kill, terminates it
 /// with the cut code and waits for that end. The exit is recorded only once
-/// observed: its code, or why its end was not observed.
+/// observed: its code, or why its end was not observed (a timeout, or a
+/// wait that failed).
 fn end_child(log: &Log, name: &str, c: &Child, wait: Duration, cut: i32) -> Result<i32, String> {
-    let code = match c.wait(wait) {
+    let code = match c.wait(wait).map_err(|e| format!("{name}: {e}"))? {
         Some(code) => code,
         None => {
             kill_record(log, name, c.process);
             c.kill(cut.cast_unsigned())
                 .map_err(|e| format!("terminating {name}: {e:#}"))?;
-            c.wait(KILL_WAIT).ok_or_else(|| {
-                format!("{name} did not end within {KILL_WAIT:?} of its termination")
-            })?
+            c.wait(KILL_WAIT)
+                .map_err(|e| format!("{name}: {e}"))?
+                .ok_or_else(|| {
+                    format!("{name} did not end within {KILL_WAIT:?} of its termination")
+                })?
         }
     };
     exit_record(log, name, c.process, code);
@@ -484,6 +523,9 @@ struct RecChild {
     cut: i32,
     /// The device's bound location.
     location: String,
+    /// Its exit code, once its end was observed: only then is its stream
+    /// final, and sealed.
+    ended: Option<i32>,
 }
 
 impl RecChild {
@@ -524,6 +566,7 @@ impl RecChild {
             run: b.run.clone(),
             cut: b.cut,
             location: port.to_owned(),
+            ended: None,
         };
         me.ready()?;
         Ok(me)
@@ -542,7 +585,11 @@ impl RecChild {
                     .map_err(anyhow::Error::msg)?;
                 return Ok(());
             }
-            if let Some(code) = self.child.wait(Duration::ZERO) {
+            if let Some(code) = self
+                .child
+                .wait(Duration::ZERO)
+                .map_err(anyhow::Error::msg)?
+            {
                 bail!("the recorder ended with {code} before it was ready");
             }
             if Instant::now() >= end {
@@ -554,23 +601,21 @@ impl RecChild {
 }
 
 impl end::Recorder for RecChild {
-    fn removed(&mut self) -> bool {
-        !devices::raw_sources().iter().any(|s| {
-            devices::raw_location(&s.path).is_some_and(|(mi, location)| {
-                location == self.location && super::listen::Ours::of(mi).is_some()
-            })
-        })
+    fn removed(&mut self) -> Result<bool, String> {
+        devices::input_interfaces_at(&self.location).map(|found| found.is_empty())
     }
 
     fn stop(&mut self) -> Result<(), String> {
         drop(self.input.take());
-        match end_child(
+        let code = end_child(
             &self.log,
             self.name,
             &self.child,
             Duration::from_secs(5),
             self.cut,
-        )? {
+        )?;
+        self.ended = Some(code);
+        match code {
             0 => Ok(()),
             c if c == self.cut => {
                 Err("it did not end within 5 s of its input's end, and was terminated".into())
@@ -588,6 +633,9 @@ struct EndLink<'a> {
     build: &'a str,
     dir: &'a Path,
     beat: &'a dyn Fn(),
+    /// The link thread ended within the deadline and closed its stream
+    /// without an error: only then is the stream final, and sealed.
+    closed: bool,
 }
 
 impl end::Link for EndLink<'_> {
@@ -629,8 +677,15 @@ impl end::Link for EndLink<'_> {
         let Some(t) = self.thread.take() else {
             return Ok(());
         };
+        // A link thread that has not ended keeps its stream: the runner
+        // never takes the stream's lock, and leaves it unsealed.
         owner::join_within(t, "the link", deadline)?;
-        match self.writer.state().lost {
+        let s = self.writer.state();
+        if let Some(e) = s.log_error {
+            return Err(format!("the link's stream: {e}"));
+        }
+        self.closed = true;
+        match s.lost {
             Some(why) => Err(why),
             None => Ok(()),
         }
@@ -750,6 +805,23 @@ fn seal(b: &Begun, dir: &Path, name: &str, run: &str, role: &str, errors: &mut V
     }
 }
 
+/// Seals the run's own link and recorder streams, each only once its
+/// writer's end was observed; an unsealed one is an error.
+fn seal_own(b: &Begun, link_closed: bool, recorder_ended: bool, errors: &mut Vec<String>) {
+    for (name, final_) in [
+        (test_device::contract::LINK, link_closed),
+        (test_device::contract::RECORDER, recorder_ended),
+    ] {
+        if final_ {
+            seal(b, &b.dir, name, &b.run, &b.role, errors);
+        } else {
+            errors.push(format!(
+                "{name} is left unsealed: its writer's end was not observed"
+            ));
+        }
+    }
+}
+
 /// Writes the `end` record and closes the stream: the exit code.
 fn finish(b: &Begun, mut errors: Vec<String>) -> i32 {
     if let Some(e) = b.stream.failed() {
@@ -792,7 +864,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     let hello = conn.facts().context("no checked `hello`")?.line.clone();
     may_hold(&a.build, &hello).map_err(anyhow::Error::msg)?;
     let token: Option<Token> = conn.token();
-    let (writer, thread) = Writer::start(conn, link_log.clone(), b.stream.clone());
+    let (writer, thread) = Writer::start(conn, link_log, b.stream.clone());
     let beat = Arc::new(AtomicI64::new(qpc()));
     let client = desktop::client_rect(sink.window).context("the sink's client area")?;
     let (guard, guard_thread) = guard::start(
@@ -806,6 +878,8 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
             read: Instant::now(),
             beat: Arc::clone(&beat),
             recorder: job::open(rec.child.process).context("the recorder's process")?,
+            recorder_file: rec.path.clone(),
+            recorder_growth: Growth::new(Instant::now()),
         }),
         Arc::new(writer.clone()),
     );
@@ -844,6 +918,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         build: &a.build,
         dir: &b.dir,
         beat: &beat_fn,
+        closed: false,
     };
     let log = b.log.clone();
     let window = sink.window;
@@ -869,12 +944,8 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     if let Err(e) = owner::join_within(guard_thread, "the guard's thread", GUARD_WAIT) {
         errors.push(e);
     }
-    if let Some(e) = link_log.close() {
-        errors.push(e);
-    }
-    for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
-        seal(&b, &b.dir, name, &b.run, &b.role, &mut errors);
-    }
+    let link_closed = link.closed;
+    seal_own(&b, link_closed, rec.ended.is_some(), &mut errors);
     Ok(finish(&b, errors))
 }
 
@@ -959,37 +1030,52 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
     }
     // The inner and its job, its recorder with it, end with the cut code.
     kill_record(&b.log, "inner", child.process);
-    inner_job
-        .terminate(b.cut.cast_unsigned())
-        .context("terminating the inner's job")?;
-    let mut observed = true;
-    match child.wait(KILL_WAIT) {
-        Some(code) => exit_record(&b.log, "inner", child.process, code),
-        None => {
-            observed = false;
-            errors.push(format!(
-                "the inner did not end within {KILL_WAIT:?} of its termination"
-            ));
+    if let Err(e) = inner_job.terminate(b.cut.cast_unsigned()) {
+        errors.push(format!("terminating the inner's job: {e:#}"));
+    }
+    // Each end counts only once observed: a timeout or a failed wait is
+    // none.
+    let mut observe = |name: &str, c: &Child, wait: Duration| match c.wait(wait) {
+        Ok(Some(code)) => {
+            exit_record(&b.log, name, c.process, code);
+            true
         }
-    }
-    match survivor {
-        Some(Ok(s)) => match s.wait(SURVIVOR_WAIT) {
-            Some(code) => exit_record(&b.log, "inner-recorder", s.process, code),
-            None => {
-                observed = false;
-                errors.push(format!(
-                    "the inner's recorder did not end within {SURVIVOR_WAIT:?} of the termination"
-                ));
-            }
-        },
-        Some(Err(e)) => errors.push(format!("opening the inner's recorder: {e:#}")),
-        None => errors.push("the inner recorded no recorder".into()),
-    }
+        Ok(None) => {
+            errors.push(format!(
+                "{name} did not end within {wait:?} of the termination"
+            ));
+            false
+        }
+        Err(e) => {
+            errors.push(format!("{name}'s end was not observed: {e}"));
+            false
+        }
+    };
+    let inner_ended = observe("inner", &child, KILL_WAIT);
+    let recorder_ended = match &survivor {
+        Some(Ok(s)) => observe("inner-recorder", s, SURVIVOR_WAIT),
+        Some(Err(e)) => {
+            errors.push(format!("opening the inner's recorder: {e:#}"));
+            false
+        }
+        None => {
+            errors.push("the inner recorded no recorder".into());
+            false
+        }
+    };
     drop(inner_job);
-    // The inner's streams, sealed only once their writers' ends were seen.
-    if observed {
-        for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
+    // The inner's streams, each sealed only once its writer's end was
+    // observed: the link's by the inner's, the recorder's by its own.
+    for (name, ended) in [
+        (test_device::contract::LINK, inner_ended),
+        (test_device::contract::RECORDER, recorder_ended),
+    ] {
+        if ended {
             seal(&b, &inner_dir, name, &inner.run, &inner.role, &mut errors);
+        } else {
+            errors.push(format!(
+                "the inner's {name} is left unsealed: its writer's end was not observed"
+            ));
         }
     }
     // Its own connection: the first `hello` is N2's evidence.
@@ -997,7 +1083,7 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
     let mut conn = owner::rediscover(&System, &a.port, &a.build)?;
     conn.identify(&b.run, b.process);
     let token = conn.token();
-    let (writer, thread) = Writer::start(conn, link_log.clone(), b.stream.clone());
+    let (writer, thread) = Writer::start(conn, link_log, b.stream.clone());
     // Let the outer's recorder see what the device sends now.
     std::thread::sleep(Duration::from_millis(500));
     let beat_fn = || {};
@@ -1008,6 +1094,7 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
         build: &a.build,
         dir: &b.dir,
         beat: &beat_fn,
+        closed: false,
     };
     let log = b.log.clone();
     let mut record = |v: Value| log.put(v);
@@ -1022,12 +1109,8 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
         record: &mut record,
         cause: "end",
     }));
-    if let Some(e) = link_log.close() {
-        errors.push(e);
-    }
-    for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
-        seal(&b, &b.dir, name, &b.run, &b.role, &mut errors);
-    }
+    let link_closed = link.closed;
+    seal_own(&b, link_closed, rec.ended.is_some(), &mut errors);
     Ok(finish(&b, errors))
 }
 
@@ -1209,6 +1292,22 @@ mod tests {
         // The row it negates is one.
         assert!(row("sink").is_some());
         assert!(!out.exists());
+    }
+
+    /// A recorder counts as recording only while its file grows: a file
+    /// that stops growing, or whose size cannot be read, stops counting
+    /// within three beats; growth again counts again.
+    #[test]
+    fn a_recorder_that_stops_writing_is_not_recording() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut g = Growth::new(t0);
+        assert!(g.look(Some(100), at(10)));
+        assert!(g.look(Some(100), at(70)), "within three beats");
+        assert!(!g.look(Some(100), at(71)), "stalled");
+        assert!(!g.look(None, at(80)), "unreadable");
+        assert!(g.look(Some(120), at(90)), "growing again");
+        assert!(!g.look(Some(110), at(151)), "shrinking is no growth");
     }
 
     #[test]

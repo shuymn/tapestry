@@ -314,6 +314,11 @@ impl<'a> Recorder<'a> {
         self.last = q;
     }
 
+    /// Records that the loop runs.
+    pub fn beat(&mut self, q: i64) {
+        self.put(&json!({ "t": "beat", "q": q }), q);
+    }
+
     /// Records a handle present at the start.
     pub fn present(&mut self, q: i64, h: u64) {
         let ours = self.binding.arrive(h, (self.resolve)(h));
@@ -429,20 +434,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 }
 
 /// Every Raw Input device present.
-fn present() -> Vec<u64> {
+fn present() -> anyhow::Result<Vec<u64>> {
     let size = u32::try_from(size_of::<RAWINPUTDEVICELIST>()).unwrap_or(0);
     let mut count = 0;
     // SAFETY: a count query.
-    let _ = unsafe { GetRawInputDeviceList(None, &mut count, size) };
+    if unsafe { GetRawInputDeviceList(None, &mut count, size) } == u32::MAX {
+        bail!("the Raw Input device count could not be read");
+    }
     let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize + 8];
     let mut cap = u32::try_from(list.len()).unwrap_or(0);
     // SAFETY: the list holds `cap` entries.
     let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut cap, size) };
     if got == u32::MAX {
-        return Vec::new();
+        bail!("the Raw Input device list could not be read");
     }
     list.truncate(got as usize);
-    list.iter().map(|d| d.hDevice.0 as u64).collect()
+    Ok(list.iter().map(|d| d.hDevice.0 as u64).collect())
 }
 
 fn resolve(h: u64) -> Option<(u8, String)> {
@@ -509,7 +516,7 @@ pub fn listen(args: &Args) -> anyhow::Result<()> {
         .map(|ms| Instant::now() + Duration::from_millis(ms));
     let mut write = |v: &Value| out.write(v);
     let mut rec = Recorder::new(Binding::new(&args.port), &mut write, &resolve, &fg_now);
-    let handles = present();
+    let handles = present()?;
     let ready_q = qpc();
     let mut bound = Binding::new(&args.port);
     for &h in &handles {
@@ -527,6 +534,7 @@ pub fn listen(args: &Args) -> anyhow::Result<()> {
     unsafe { SetTimer(Some(hwnd), 1, 10, None) };
     let mut buf = vec![0_u64; 1024];
     let mut msg = MSG::default();
+    let mut ticks = 0_u32;
     loop {
         // SAFETY: one MSG written per call.
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -536,6 +544,15 @@ pub fn listen(args: &Args) -> anyhow::Result<()> {
         if msg.message == WM_TIMER {
             if stop.load(Ordering::Acquire) || until.is_some_and(|u| Instant::now() >= u) {
                 break;
+            }
+            // A failed write ends the recorder at once: its runner sees it
+            // gone rather than a recorder that no longer records.
+            if let Some(e) = out.failed() {
+                bail!("the recorder's file: {e}");
+            }
+            ticks = ticks.wrapping_add(1);
+            if ticks.is_multiple_of(2) {
+                rec.beat(qpc());
             }
             continue;
         }

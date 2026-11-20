@@ -64,7 +64,11 @@ pub trait Recorder {
     /// Whether none of the device's input interfaces is at the bound
     /// location now, by this process's own enumeration: fresh at every
     /// call, every interface counted, the recorder's stream not needed.
-    fn removed(&mut self) -> bool;
+    ///
+    /// # Errors
+    ///
+    /// The enumeration failed: the removal is not observed.
+    fn removed(&mut self) -> Result<bool, String>;
     /// Ends it (its input closed), after it drains, and waits for its exit.
     ///
     /// # Errors
@@ -183,7 +187,10 @@ fn close(s: &mut dyn Window, record: &mut dyn FnMut(Value), errors: &mut Vec<Str
 
 /// Recovery, with the sink open: `release` and `hello` on a reopened
 /// connection, the 1200-baud touch, then the device's input interfaces
-/// gone from the bound location, waited for however long it takes.
+/// gone from the bound location, waited for however long it takes. Only
+/// an enumeration that succeeded and found neither interface is the
+/// removal; a failed one is recorded (each new failure once) and looked
+/// at again.
 fn recover(
     link: &mut dyn Link,
     rec: &mut dyn Recorder,
@@ -202,7 +209,18 @@ fn recover(
     }
     let begun = clock.now();
     let mut told = false;
-    while !rec.removed() {
+    let mut failed: Option<String> = None;
+    loop {
+        match rec.removed() {
+            Ok(true) => break,
+            Ok(false) => failed = None,
+            Err(e) => {
+                if failed.as_ref() != Some(&e) {
+                    step(format!("the enumeration failed, no removal observed: {e}"));
+                }
+                failed = Some(e);
+            }
+        }
         if !told && clock.now() - begun >= RECOVERY_WAIT {
             told = true;
             let msg = "the device's input interfaces are still at the bound location 30 s \
@@ -297,20 +315,24 @@ mod tests {
         }
     }
 
-    /// A stand-in recorder: the removal shows after `removed_after`
-    /// looks (never when `None`).
+    /// A stand-in recorder: each look at the removal takes the next of
+    /// `looks` (the last repeats; none present when empty).
     struct R {
         log: Log,
-        looks: usize,
-        removed_after: Option<usize>,
+        n: usize,
+        looks: Vec<Result<bool, String>>,
         stop: Result<(), String>,
     }
 
     impl Recorder for R {
-        fn removed(&mut self) -> bool {
-            self.looks += 1;
-            let r = self.removed_after.is_some_and(|n| self.looks > n);
-            if r {
+        fn removed(&mut self) -> Result<bool, String> {
+            let r = self
+                .looks
+                .get(self.n.min(self.looks.len().saturating_sub(1)))
+                .cloned()
+                .unwrap_or(Ok(false));
+            self.n += 1;
+            if r == Ok(true) {
                 self.log.borrow_mut().push("removed".into());
             }
             r
@@ -333,9 +355,17 @@ mod tests {
     struct Case {
         hellos: Vec<String>,
         finish: Result<(), String>,
-        removed_after: Option<usize>,
+        /// What each look at the removal finds.
+        looks: Vec<Result<bool, String>>,
         stop: Result<(), String>,
         granted: bool,
+    }
+
+    /// Looks that find the interfaces `n` times, then their removal.
+    fn removed_after(n: usize) -> Vec<Result<bool, String>> {
+        let mut v = vec![Ok(false); n];
+        v.push(Ok(true));
+        v
     }
 
     impl Default for Case {
@@ -343,7 +373,7 @@ mod tests {
             Self {
                 hellos: vec![hello(TOKEN, true, "released")],
                 finish: Ok(()),
-                removed_after: Some(0),
+                looks: removed_after(0),
                 stop: Ok(()),
                 granted: true,
             }
@@ -362,8 +392,8 @@ mod tests {
         };
         let mut rec = R {
             log: Rc::clone(&log),
-            looks: 0,
-            removed_after: c.removed_after,
+            n: 0,
+            looks: c.looks,
             stop: c.stop,
         };
         let mut sink = W(Rc::clone(&log));
@@ -460,12 +490,63 @@ mod tests {
     fn a_lagging_recorder_cannot_close_the_window() {
         let (errors, steps, _) = run(Case {
             hellos: vec![hello(TOKEN, false, "released")],
-            removed_after: Some(5),
+            looks: removed_after(5),
             ..Case::default()
         });
         assert!(errors[0].contains("no `hello`"), "{errors:?}");
         assert!(at(&steps, "removed") < at(&steps, "close"));
         assert!(at(&steps, "touch") < at(&steps, "removed"));
+    }
+
+    /// Every sequence of up to four looks at the removal, each a failed
+    /// enumeration, the interfaces still there, or their absence, then
+    /// their absence: the sink closes exactly after the first look that
+    /// enumerated and found neither interface, never on a failed one, and
+    /// each failure is recorded. The control: absence at the first look.
+    #[test]
+    fn the_sink_closes_only_after_an_observed_removal() {
+        let kinds = [Err("no list".to_owned()), Ok(false), Ok(true)];
+        let mut runs = 0;
+        for len in 0..=4_u32 {
+            for n in 0..3_usize.pow(len) {
+                let mut looks: Vec<Result<bool, String>> = (0..len)
+                    .map(|i| kinds[n / 3_usize.pow(i) % 3].clone())
+                    .collect();
+                looks.push(Ok(true));
+                let first = looks.iter().position(|l| *l == Ok(true)).unwrap();
+                let (_, steps, records) = run(Case {
+                    hellos: vec!["ok".into()],
+                    looks: looks.clone(),
+                    ..Case::default()
+                });
+                // The removal is the look it is, and the close follows it.
+                let removed = at(&steps, "removed");
+                assert!(removed < at(&steps, "close"), "{looks:?}: {steps:?}");
+                assert_eq!(
+                    steps.iter().filter(|s| *s == "removed").count(),
+                    1,
+                    "{looks:?}"
+                );
+                let failures = records
+                    .iter()
+                    .filter(|v| {
+                        v["t"] == "recovery"
+                            && v["what"]
+                                .as_str()
+                                .is_some_and(|w| w.contains("no removal observed"))
+                    })
+                    .count();
+                // Each run of failures is recorded once.
+                let runs_of_failures = looks[..first]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, l)| l.is_err() && (i == 0 || looks[i - 1].is_ok()))
+                    .count();
+                assert_eq!(failures, runs_of_failures, "{looks:?}: {records:?}");
+                runs += 1;
+            }
+        }
+        assert_eq!(runs, 1 + 3 + 9 + 27 + 81);
     }
 
     #[test]
@@ -488,7 +569,7 @@ mod tests {
         let looks = 4000;
         let (errors, steps, records) = run(Case {
             hellos: vec!["ok".into()],
-            removed_after: Some(looks),
+            looks: removed_after(looks),
             ..Case::default()
         });
         assert_eq!(errors.len(), 2, "{errors:?}");

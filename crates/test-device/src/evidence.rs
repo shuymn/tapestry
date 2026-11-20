@@ -555,8 +555,17 @@ pub enum Recorder {
     /// A recorder error: what failed and the stretch of the stream it
     /// affects, from and to on the host's counter.
     Error(RecorderError),
+    /// The recorder's loop is running: written every 20 ms whatever it
+    /// reads, so its runner tells a stalled recorder from a quiet one.
+    Beat(RecorderBeat),
     /// The recorder's end, after draining its queue.
     End(RecorderEnd),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderBeat {
+    pub q: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -668,6 +677,7 @@ impl Kinds for Recorder {
             Self::Mouse(_) => "mouse",
             Self::Dev(_) => "dev",
             Self::Error(_) => "error",
+            Self::Beat(_) => "beat",
             Self::End(_) => "end",
         }
     }
@@ -680,6 +690,7 @@ impl Kinds for Recorder {
             Self::Mouse(r) => r.q,
             Self::Dev(r) => r.q,
             Self::Error(r) => r.to,
+            Self::Beat(r) => r.q,
             Self::End(r) => r.q,
         })
     }

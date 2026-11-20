@@ -77,20 +77,25 @@ pub struct State {
     pub answers: Vec<(Command, String)>,
     /// The link failed: why.
     pub lost: Option<String>,
-    /// The link thread has ended.
+    /// The link thread has ended, its stream closed by itself: the close's
+    /// first write error, if any.
     pub ended: bool,
+    pub log_error: Option<String>,
 }
 
-/// The gate: why holds stopped, once they have, and whether an admitted
-/// hold-bearing write is in progress.
+/// The gate: why holds stopped, once they have.
 #[derive(Debug, Default)]
 struct Gate {
     stopped: Option<String>,
-    in_flight: bool,
 }
 
 struct Shared {
     gate: Mutex<Gate>,
+    /// Held by the link thread across a hold-bearing command's submission
+    /// to the port, and by `stop_holds` while it closes the gate: a hold is
+    /// either submitted whole before the stop or never. The queue's
+    /// writers take only the gate, so they never wait on a write.
+    submit: Mutex<()>,
     queue: Mutex<VecDeque<Item>>,
     state: Mutex<State>,
     changed: Condvar,
@@ -119,6 +124,7 @@ impl Writer {
     pub fn start(conn: Connection, log: Stream, run: Stream) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Shared {
             gate: Mutex::new(Gate::default()),
+            submit: Mutex::new(()),
             queue: Mutex::new(VecDeque::new()),
             state: Mutex::new(State {
                 token: conn.token(),
@@ -218,6 +224,9 @@ impl Writer {
 
 fn stop_holds(shared: &Shared, cause: &str) {
     {
+        // Waits for a submission in progress (the port's write is bounded
+        // by its timeout), so none is cut by the stop.
+        let _submit = lock(&shared.submit);
         let mut g = lock(&shared.gate);
         if g.stopped.is_some() {
             return;
@@ -310,17 +319,21 @@ impl Thread {
         self.record(Some(
             json!({ "t": "end", "q": qpc(), "problems": self.problems }),
         ));
-        self.update(|s| s.ended = true);
+        // The stream is this thread's: it closes it, so no other thread
+        // waits on its lock.
+        let log_error = self.shared.log.close();
+        self.update(|s| {
+            s.log_error = log_error;
+            s.ended = true;
+        });
     }
 
     fn turns(&mut self) -> anyhow::Result<()> {
         loop {
             // The fence and the one release: no hold-bearing write is in
-            // progress at the loop's top, the writes being this thread's.
-            let fence = {
-                let gate = lock(&self.shared.gate);
-                gate.stopped.is_some() && !gate.in_flight
-            };
+            // progress at the loop's top, the writes being this thread's,
+            // and none is submitted after the gate closed.
+            let fence = lock(&self.shared.gate).stopped.is_some();
             if !self.released && fence {
                 self.record(Some(json!({ "t": "fence", "q": qpc() })));
                 self.update(|s| s.fenced = true);
@@ -361,8 +374,9 @@ impl Thread {
         }
     }
 
-    /// Writes one queued command: a hold-bearing one only when admitted
-    /// while the gate is open, its records written before the admission.
+    /// Writes one queued command: a hold-bearing one only when the gate is
+    /// open as its submission begins, its records written before; the
+    /// submission holds the submit lock, so a stop waits for it to end.
     fn write(&mut self, item: Item) -> anyhow::Result<()> {
         if !item.cmd.holds_input() {
             return self.send(item.cmd, item.queued);
@@ -373,22 +387,19 @@ impl Thread {
             .map(|check| json!({ "t": "check", "q": check, "line": item.cmd.to_string() }));
         self.record(check);
         self.probe("recorded");
-        {
-            let mut gate = lock(&self.shared.gate);
-            if gate.stopped.is_some() {
-                drop(gate);
-                self.record(Some(
-                    json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
-                ));
-                return Ok(());
-            }
-            gate.in_flight = true;
+        let submit = lock(&self.shared.submit);
+        if lock(&self.shared.gate).stopped.is_some() {
+            drop(submit);
+            self.record(Some(
+                json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
+            ));
+            return Ok(());
         }
-        self.probe("admitted");
         let sent = self.conn.send(item.cmd);
         let done = qpc();
-        lock(&self.shared.gate).in_flight = false;
+        drop(submit);
         self.journal_sent(item.queued, done);
+        self.probe("written");
         sent.map(drop)
     }
 
@@ -751,8 +762,66 @@ mod tests {
         }
     }
 
-    /// A renewal whose write blocks mid-way when holds stop: the fence
-    /// waits for that write to end, and `release` follows it.
+    /// A link thread stalled in its `flush` keeps its stream: the bounded
+    /// join gives up within its deadline without the stream's lock, the
+    /// thread has not ended; once it runs again it writes its `end` and
+    /// closes the stream itself.
+    #[test]
+    fn a_stalled_link_thread_keeps_its_stream() {
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let g2 = Arc::clone(&gate);
+        let mut r = Run::with(Dev::new(HERE, "COM5", hello("abc", false)), move |d| {
+            Box::new(Blocking {
+                inner: d,
+                block: "flush",
+                gate: Arc::clone(&g2),
+            })
+        });
+        r.w.end();
+        {
+            let (m, c) = &*gate;
+            let mut g = lock(m);
+            while !g.0 {
+                g = c.wait(g).unwrap();
+            }
+        }
+        // The write is let go 2 s on whatever the join does, so a join that
+        // waits past its bound ends too, late.
+        let g3 = Arc::clone(&gate);
+        let unblock = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            let (m, c) = &*g3;
+            lock(m).1 = true;
+            c.notify_all();
+        });
+        let begun = Instant::now();
+        let joined = super::super::owner::join_within(
+            r.thread.take().unwrap(),
+            "the link",
+            Duration::from_millis(100),
+        );
+        let took = begun.elapsed();
+        let ended_then = r.w.state().ended;
+        unblock.join().unwrap();
+        assert!(joined.is_err(), "the join waited for the stalled thread");
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert!(!ended_then);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !r.w.state().ended {
+            assert!(Instant::now() < until, "the link thread did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(r.w.state().log_error, None);
+        let records = Run::records(&r.log);
+        assert_eq!(records.last().unwrap()["t"], "end", "{records:?}");
+        // The thread closed it: a later record is refused.
+        r.log.write(&json!({ "t": "late" }));
+        assert!(r.log.failed().is_some());
+    }
+
+    /// A renewal whose write blocks mid-way when another thread stops
+    /// holds: the stop waits for that write to end (the gate stays open
+    /// meanwhile, so no fence), and `release` follows it.
     #[test]
     fn the_fence_waits_for_a_hold_bearing_write_in_progress() {
         let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
@@ -782,8 +851,13 @@ mod tests {
                 g = c.wait(g).unwrap();
             }
         }
-        r.w.stop_holds("lost");
+        let w = r.w.clone();
+        let stopper = std::thread::spawn(move || w.stop_holds("lost"));
         std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            r.w.stopped().is_none() && !stopper.is_finished(),
+            "the stop came while a write was in progress"
+        );
         assert!(
             !r.w.state().fenced,
             "the fence came while a write was in progress"
@@ -793,6 +867,7 @@ mod tests {
             lock(m).1 = true;
             c.notify_all();
         }
+        stopper.join().unwrap();
         wait_for(&r.w, |s| s.released);
         r.finish();
         let lines = r.lines();
@@ -801,10 +876,15 @@ mod tests {
         assert!(renew < release, "{lines:?}");
     }
 
-    /// A port that stops holds while it writes a hold-bearing line.
+    /// A port that, while it writes a hold-bearing line, has another
+    /// thread stop holds, and notes whether that stop returned before the
+    /// write ended (it must not).
     struct Stopping {
         inner: super::super::link::fake::Shared,
         writer: Arc<std::sync::OnceLock<Writer>>,
+        /// The stop returned while the write was in progress.
+        early: Arc<AtomicBool>,
+        stopper: Option<JoinHandle<()>>,
     }
 
     impl Port for Stopping {
@@ -812,7 +892,18 @@ mod tests {
             if bytes.starts_with(b"button")
                 && let Some(w) = self.writer.get()
             {
-                w.stop_holds("writing");
+                let (w, done) = (w.clone(), Arc::new(AtomicBool::new(false)));
+                let d2 = Arc::clone(&done);
+                let stopper = std::thread::spawn(move || {
+                    w.stop_holds("writing");
+                    d2.store(true, Ordering::Release);
+                });
+                // Long enough for an unserialized stop to return.
+                std::thread::sleep(Duration::from_millis(50));
+                if done.load(Ordering::Acquire) {
+                    self.early.store(true, Ordering::Release);
+                }
+                self.stopper = Some(stopper);
             }
             self.inner.write(bytes)
         }
@@ -829,27 +920,31 @@ mod tests {
 
     /// Holds stop at every point of a hold-bearing command's way to the
     /// wire: before it is queued, once the link thread took it, once its
-    /// records are written, once it is admitted, and while the port writes
-    /// it; and, the control, never. The command reaches the wire exactly
-    /// when the stop came after its admission, and then before the fence
-    /// and the `release`; no line holding input follows the `release`,
-    /// and every hold not written is refused or dropped.
+    /// records are written, from another thread while the port writes it,
+    /// and once it is written; and, the control, never. The command
+    /// reaches the wire exactly when its submission began before the stop,
+    /// a stop during the write waits for the write to end, the write comes
+    /// before the fence and the `release`, no line holding input follows
+    /// the `release`, and every hold not written is refused or dropped.
     #[test]
-    fn a_hold_is_written_only_when_admitted_before_the_stop() {
+    fn a_hold_is_written_only_when_submitted_before_the_stop() {
         for at in [
             Some("queue"),
             Some("taken"),
             Some("recorded"),
-            Some("admitted"),
             Some("writing"),
+            Some("written"),
             None,
         ] {
             let writer = Arc::new(std::sync::OnceLock::new());
-            let w2 = Arc::clone(&writer);
+            let early = Arc::new(AtomicBool::new(false));
+            let (w2, e2) = (Arc::clone(&writer), Arc::clone(&early));
             let mut r = Run::with(Dev::new(HERE, "COM5", hello("abc", false)), move |d| {
                 Box::new(Stopping {
                     inner: d,
                     writer: Arc::clone(&w2),
+                    early: Arc::clone(&e2),
+                    stopper: None,
                 })
             });
             grant(&r);
@@ -878,8 +973,12 @@ mod tests {
             let written = lines.iter().position(|l| l.starts_with("button"));
             let release = lines.iter().position(|l| l == "release");
             // The oracle.
-            let admitted_first = matches!(at, Some("admitted" | "writing") | None);
-            assert_eq!(written.is_some(), admitted_first, "{at:?}: {lines:?}");
+            let submitted_first = matches!(at, Some("writing" | "written") | None);
+            assert_eq!(written.is_some(), submitted_first, "{at:?}: {lines:?}");
+            assert!(
+                !early.load(Ordering::Acquire),
+                "{at:?}: the stop returned during the write"
+            );
             if let Some(release) = release {
                 assert!(written.is_none_or(|w| w < release), "{at:?}: {lines:?}");
                 assert!(

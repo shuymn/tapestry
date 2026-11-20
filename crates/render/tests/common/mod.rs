@@ -322,6 +322,36 @@ pub fn loading(r: &mut Renderer, text: &MenuText, f: &LoadingFrame<'_>) -> Vec<u
     read_back(r)
 }
 
+/// Runs the uploader's boundaries until the loading text in hand ends
+/// (design.md "Memory Budget", the uploader), waiting for each step's
+/// completion, at most 10 s: `Ok(true)` installed, `Ok(false)` with none
+/// in hand, or why its installation refused it. A failed preparation
+/// panics.
+#[allow(
+    dead_code,
+    reason = "each test binary uses its own share of the helpers"
+)]
+pub fn settle_text(r: &mut Renderer) -> Result<bool, render::LoadingTextError> {
+    if r.loading_text_in_hand().is_none() {
+        return Ok(false);
+    }
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(done) = r.upload_boundary().text {
+            return match done.result {
+                Ok(()) => Ok(true),
+                Err(render::TextFault::Install(e)) => Err(e),
+                Err(render::TextFault::Prepare(e)) => panic!("the loading text failed: {e}"),
+            };
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "the loading text never ended"
+        );
+        r.wait_step(Duration::from_secs(1)).unwrap();
+    }
+}
+
 /// Installs `b` chart-independently for `request` and commits it.
 pub fn install(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) {
     let token = r.install(ScreenKind::Play, b, request).unwrap();

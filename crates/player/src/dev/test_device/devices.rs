@@ -1026,6 +1026,56 @@ pub fn raw_sources() -> Vec<RawSource> {
         .collect()
 }
 
+/// The device's input interfaces (`MI_00`, `MI_01`) that Raw Input lists
+/// at `location` now, by a fresh enumeration. Every entry is read: one of
+/// the device's whose name or location cannot be read, or a list that
+/// cannot be read, is an error, so an empty answer is the interfaces'
+/// absence and never a failed query.
+///
+/// # Errors
+///
+/// The list, or one of its entries, could not be read.
+pub fn input_interfaces_at(location: &str) -> Result<Vec<u8>, String> {
+    let size = u32::try_from(size_of::<RAWINPUTDEVICELIST>()).unwrap_or(0);
+    let mut count = 0;
+    // SAFETY: a count query.
+    if unsafe { GetRawInputDeviceList(None, &mut count, size) } == u32::MAX {
+        return Err("the Raw Input device count could not be read".into());
+    }
+    let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize + 8];
+    let mut cap = u32::try_from(list.len()).unwrap_or(0);
+    // SAFETY: the list holds `cap` entries.
+    let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut cap, size) };
+    if got == u32::MAX {
+        return Err("the Raw Input device list could not be read".into());
+    }
+    list.truncate(got as usize);
+    let vid_pid = format!("VID_{:04X}&PID_{:04X}", test_device::VID, test_device::PID);
+    let mut found = Vec::new();
+    for d in &list {
+        let path = device_name(d.hDevice).ok_or_else(|| {
+            format!(
+                "the name of Raw Input device {:#x} could not be read",
+                d.hDevice.0 as usize
+            )
+        })?;
+        if !path.to_ascii_uppercase().contains(&vid_pid) {
+            continue;
+        }
+        let (mi, at) = raw_location(&path)
+            .ok_or_else(|| format!("the location of `{path}` could not be read"))?;
+        if at == location
+            && matches!(
+                mi,
+                test_device::KEYBOARD_INTERFACE | test_device::PAD_INTERFACE
+            )
+        {
+            found.push(mi);
+        }
+    }
+    Ok(found)
+}
+
 /// The test device's interface and location of the Raw Input device whose
 /// interface path is `path`: its HID collection's function (`MI_xx`) and
 /// that function's composite parent's location. `None` when it is not an

@@ -194,6 +194,10 @@ pub struct ResultReport {
     /// The atlas of the result's installation committed (or pages-only),
     /// kept to restore.
     pub installed: Option<AtlasId>,
+    /// The request of the play staging whose admission released the
+    /// result's installation last (design.md "Memory Budget", R5): the
+    /// attempt committed with it draws the built-in result.
+    pub released: Option<u64>,
     /// The level-0 texels the selection's and decision's committed
     /// installations are charged (`render::Renderer::menu_charges`, the
     /// selection's with its pool's firm layer, made now or not), as of the

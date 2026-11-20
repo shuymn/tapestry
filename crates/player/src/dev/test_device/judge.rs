@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use test_device::clock::{self, Ping, ticks_to_us};
-use test_device::contract::{INNER, LINK, RECORDER, RUN, SINGLE};
+use test_device::contract::{self, INNER, LINK, RECORDER, RUN, SINGLE};
 use test_device::evidence::{self, Kinds, Outcome};
 use test_device::lease::Reason;
 use test_device::protocol::{Answer, Command, Token};
@@ -87,6 +87,25 @@ impl Files {
             link: Stream::read::<evidence::Link>(&dir.join(LINK)),
             recorder: Stream::read::<evidence::Recorder>(&dir.join(RECORDER)),
         }
+    }
+
+    /// Keeps only the streams the checker takes as evidence for role
+    /// `role` (each bound to its run and writer, finished as its writer's
+    /// ending allows, its seal matching): any other stream's checks are
+    /// `incomplete`, never judged on a prefix the checker refuses.
+    fn standing(mut self, role: &str, standing: &contract::Standing) -> Self {
+        for (name, s) in [
+            (RUN, &mut self.run),
+            (LINK, &mut self.link),
+            (RECORDER, &mut self.recorder),
+        ] {
+            if s.records.is_ok()
+                && let Err(why) = standing.of(role, name)
+            {
+                s.records = Err(format!("not evidence: {why}"));
+            }
+        }
+        self
     }
 }
 
@@ -544,61 +563,83 @@ pub fn n2(build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
         }
         Ok(Ok(()))
     };
+    // The device quiet after the kill, and the kill's fixture reached: a
+    // lease live when the inner's connection ended, and that connection's
+    // end the kill's. The device numbers its connections and sets reason
+    // `closed` only when a held lease ends with one, so the outer's first
+    // `hello` naming the connection right after the inner's, with reason
+    // `closed`, shows the inner's connection ended holding a lease and no
+    // other connection ended between (a device-side end before the kill
+    // would be a second one).
     let quiet = || -> Result<Result<(), String>, String> {
-        let link = recs(&outer.link)?;
-        let first = link
-            .iter()
-            .find(|v| {
-                v["t"] == "ans" && v["line"].as_str().is_some_and(|l| l.starts_with("hello "))
-            })
-            .ok_or("the outer read no `hello`")?;
-        let run = recs(&outer.run)?;
+        fn hello_of<'a>(
+            link: &'a [Value],
+            what: &str,
+        ) -> Result<test_device::protocol::Hello<'a>, String> {
+            link.iter()
+                .filter(|v| v["t"] == "ans")
+                .find_map(|v| match Answer::parse_canonical(v["line"].as_str()?) {
+                    Some(Answer::Hello(h)) => Some(h),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("{what} read no `hello`"))
+        }
+        let first = hello_of(recs(&outer.link)?, "the outer")?;
         let inner_link = recs(&inner.link)?;
+        let theirs = hello_of(inner_link, "the inner")?;
+        let run = recs(&outer.run)?;
         let kill = run
             .iter()
             .find(|v| v["t"] == "kill" && v["name"] == "inner")
             .map(q)
             .ok_or("the outer recorded no kill of the inner")?;
-        let freq = inner_link
-            .first()
-            .and_then(|v| v["freq"].as_i64())
-            .ok_or("the inner's link has no `open`")?;
-        // The inner's lease was live at the kill: its last grant or renewal
-        // written within a slice before it.
-        let renewed = inner_link
-            .iter()
-            .filter(|v| {
-                v["t"] == "cmd"
-                    && q(v) <= kill
-                    && matches!(
-                        Command::parse_canonical(v["line"].as_str().unwrap_or_default()),
-                        Some(Command::Lease { .. } | Command::Renew { .. })
-                    )
-            })
-            .map(q)
-            .max()
-            .ok_or("the inner wrote no grant before the kill")?;
-        let age = ticks_to_us(kill - renewed, freq);
-        if age > i64::from(SLICE_MS) * 1000 {
+        if first.lease.is_some() || !first.quiet {
             return Ok(Err(format!(
-                "the inner's last grant or renewal was {age} µs before the kill: no live lease"
+                "the outer's first `hello` is not quiet with no lease: {first:?}"
             )));
         }
-        Ok(
-            match Answer::parse_canonical(first["line"].as_str().unwrap_or_default()) {
-                Some(Answer::Hello(h))
-                    if h.lease.is_none() && h.quiet && h.reason == Reason::Closed =>
-                {
-                    Ok(())
-                }
-                _ => Err(format!(
-                    "the outer's first `hello` is not quiet with no lease, its lease ended by the close: {first}"
-                )),
-            },
-        )
+        // The inner's last answer to a grant or renewal before the kill
+        // granted.
+        let granted = inner_link
+            .iter()
+            .rev()
+            .filter(|v| v["t"] == "ans" && q(v) <= kill)
+            .find(|v| {
+                matches!(
+                    Command::parse_canonical(v["cmd"].as_str().unwrap_or_default()),
+                    Some(Command::Lease { .. } | Command::Renew { .. })
+                )
+            })
+            .ok_or("the inner read no answer to a grant before the kill")?;
+        if !granted["line"]
+            .as_str()
+            .is_some_and(|l| l.starts_with("lease "))
+        {
+            return Err(format!(
+                "the inner's last grant before the kill was refused: {granted}"
+            ));
+        }
+        let (Some(mine), Some(before)) = (first.session, theirs.session) else {
+            return Err("a `hello` names no session".into());
+        };
+        if mine.boot != before.boot || Some(mine.count) != before.count.checked_add(1) {
+            return Err(format!(
+                "the outer's connection {mine} is not the one after the inner's {before}: \
+                 another connection ended between, so the kill did not end a live lease"
+            ));
+        }
+        if first.reason != Reason::Closed {
+            return Err(format!(
+                "the outer's first `hello` reads reason {:?}: the inner's lease had ended \
+                 before its connection did",
+                first.reason
+            ));
+        }
+        Ok(Ok(()))
     };
     // No foreign input while the inner held: from its first call to the
-    // outer's kill, on the outer's recorder, live throughout.
+    // inner's end as the outer observed it, on the outer's recorder, live
+    // throughout.
     let no_foreign_inner = || -> Result<Result<(), String>, String> {
         let rec = recs(&outer.recorder)?;
         let inner_run = recs(&inner.run)?;
@@ -609,9 +650,9 @@ pub fn n2(build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
             .ok_or("the inner recorded no call")?;
         let to = recs(&outer.run)?
             .iter()
-            .find(|v| v["t"] == "kill" && v["name"] == "inner")
+            .find(|v| v["t"] == "exit" && v["name"] == "inner")
             .map(q)
-            .ok_or("the outer recorded no kill of the inner")?;
+            .ok_or("the outer observed no end of the inner")?;
         let calls: Vec<u32> = inner_run
             .iter()
             .filter(|v| v["t"] == "call" && v["what"] == "click")
@@ -686,10 +727,14 @@ pub fn judge(row: &str, dir: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("{}: no `start` record", dir.display()))?;
     let run = start["run"].as_str().unwrap_or_default().to_owned();
     let build = start["build"].as_str().map(str::to_owned);
+    let e = super::check::expectation_of(row)
+        .ok_or_else(|| anyhow::anyhow!("`judge` has no row `{row}`"))?;
+    let standing = contract::standing(&e, dir, super::COMMIT);
+    let f = f.standing(SINGLE, &standing);
     let (judged, inner) = match row {
         "sink" | "sink-early-close" => (n1(build.as_deref(), &f), None),
         "sink-kill" => {
-            let inner = Files::read(&dir.join(INNER));
+            let inner = Files::read(&dir.join(INNER)).standing(INNER, &standing);
             (n2(build.as_deref(), &f, &inner), Some(inner))
         }
         _ => anyhow::bail!("`judge` has no row `{row}`"),
@@ -740,11 +785,23 @@ pub mod tests {
     const FREQ: i64 = 10_000_000;
 
     fn hello(quiet: bool, reason: &str, lease: &str) -> String {
+        hello_of(TOKEN, quiet, reason, lease)
+    }
+
+    fn hello_of(token: Token, quiet: bool, reason: &str, lease: &str) -> String {
         format!(
             "hello {VERSION} build 0123456789ab mode 8 lease {lease} armed 0 reason {reason} \
-             boot power-on count 0 identified 1 faults 0 quiet {} session {TOKEN}",
+             boot power-on count 0 identified 1 faults 0 quiet {} session {token}",
             u8::from(quiet)
         )
+    }
+
+    /// The connection `n` after [`TOKEN`]'s.
+    fn after(n: u32) -> Token {
+        Token {
+            count: TOKEN.count + n,
+            ..TOKEN
+        }
     }
 
     fn pad(q: i64, buttons: u16, ours: bool) -> Value {
@@ -1141,7 +1198,8 @@ pub mod tests {
                 json!({"t": "call", "q": 210, "tag": 0xABCD_0001_u32, "what": "click"}),
                 json!({"t": "held", "q": 2000}),
             ]),
-            link: Stream::of(recs(&n1.link).unwrap()[..9].to_vec()),
+            // Through the grant's answer.
+            link: Stream::of(recs(&n1.link).unwrap()[..10].to_vec()),
             recorder: Stream::of(Vec::new()),
         };
         let outer = Files {
@@ -1154,7 +1212,7 @@ pub mod tests {
             ]),
             link: Stream::of(vec![
                 json!({"t": "open", "q": 2300, "freq": FREQ}),
-                json!({"t": "ans", "q": 2310, "cmd": "hello", "line": hello(true, "closed", "-")}),
+                json!({"t": "ans", "q": 2310, "cmd": "hello", "line": hello_of(after(1), true, "closed", "-")}),
             ]),
             recorder: Stream::of(vec![
                 pad(1500, 1, true),
@@ -1182,16 +1240,39 @@ pub mod tests {
             .map(|j| j.outcome)
             .collect();
         assert!(all.iter().all(|x| *x == Outcome::Pass), "{all:?}");
-        // The lease had expired by itself: not ended by the close.
+        // The kill's fixture not reached, so nothing shown either way: the
+        // lease had expired before the inner's connection ended; another
+        // connection ended between the inner's and the outer's (a
+        // device-side end before the kill); the inner's last grant was
+        // refused.
         let (mut o, i) = n2_good();
         edit(&mut o.link, |l| {
-            l[1]["line"] = json!(hello(true, "expired", "-"))
+            l[1]["line"] = json!(hello_of(after(1), true, "expired", "-"))
         });
-        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Fail);
-        // The inner's last grant more than a slice before the kill.
+        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Incomplete);
         let (mut o, i) = n2_good();
-        edit(&mut o.run, |r| r[1]["q"] = json!(1010 + 2_510_000));
-        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Fail);
+        edit(&mut o.link, |l| {
+            l[1]["line"] = json!(hello_of(after(2), true, "closed", "-"))
+        });
+        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Incomplete);
+        let (o, mut i) = n2_good();
+        edit(&mut i.link, |l| l[9]["line"] = json!("err stale"));
+        assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Incomplete);
+        // A foreign edge after the kill and before the inner's end was
+        // observed; and no observed end at all.
+        let (mut o, i) = n2_good();
+        edit(&mut o.recorder, |r| {
+            r.insert(
+                2,
+                json!({"t": "key", "q": 2080, "h": 5, "ours": false, "code": 30, "down": true, "fg": {}}),
+            );
+        });
+        assert_eq!(n2_outcome(&o, &i, "n2.no-foreign"), Outcome::Fail);
+        let (mut o, i) = n2_good();
+        edit(&mut o.run, |r| {
+            r.remove(2);
+        });
+        assert_eq!(n2_outcome(&o, &i, "n2.no-foreign"), Outcome::Incomplete);
         // A foreign edge while the inner held, and one with tag 0 though a
         // move call had it.
         for (extra, h) in [(0_u32, 0), (0xABCD_0000, 0)] {
@@ -1234,7 +1315,7 @@ pub mod tests {
         // A lease still held on the outer's first hello.
         let (mut o, i) = n2_good();
         edit(&mut o.link, |l| {
-            l[1]["line"] = json!(hello(false, "none", "1"))
+            l[1]["line"] = json!(hello_of(after(1), false, "none", "1"))
         });
         assert_eq!(n2_outcome(&o, &i, "n2.quiet"), Outcome::Fail);
     }

@@ -1060,6 +1060,7 @@ fn rig<'a>(
         presenter: crate::result_present::Presenter::default(),
         result_labels: None,
         result_withdrawn: false,
+        pages_ticket: None,
         cutoff_asked: false,
         result_facts: None,
         result_offset: None,

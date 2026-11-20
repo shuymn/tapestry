@@ -10,15 +10,19 @@
 //! each frame whose stamp is not below the run's start and rises above the
 //! last it published, and waits on the event while every slot is full. It
 //! answers the end of the video, a seek and a failure; a failed or refused
-//! player only waits to be closed. A refusal or a failure is sent once the
+//! player only waits to be closed. A looping play starts again at the
+//! video's start at each end, in the same run, its stamps rising on, and
+//! never ends. It counts every frame its decoder returns in the ring's
+//! progress word and says in its state word whether it decodes, waits for
+//! a free slot or has ended, which the game reads to supervise it. A refusal or a failure is sent once the
 //! player has closed its file (and its ring), so a worker that ends before
 //! sending it still has the file open as far as the game knows. Closing
 //! unmaps its view of the ring before it answers.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use skin_model::media::Writer;
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
+use skin_model::media::{PROGRESS_WORD, State, Writer};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
@@ -27,6 +31,61 @@ use crate::{Out, ToPlayer};
 /// How long a player with every slot full waits on the free-slot event
 /// before it looks for a command.
 const SLOT_WAIT_MS: u32 = 50;
+
+/// Where a player freezes for good (dev-tools): its thread stops, answering
+/// nothing more, as a hung decoder would.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freeze {
+    /// Before it answers its play.
+    Play,
+    /// Once it has answered its play, before its first frame, saying it
+    /// decodes.
+    Start,
+    /// Once it has published a frame, saying it decodes.
+    Decoding,
+    /// Once it has published a frame, saying it waits for a free slot.
+    Waiting,
+}
+
+/// The player that freezes, and where (dev-tools).
+#[cfg(feature = "dev-tools")]
+static FREEZE: std::sync::Mutex<Option<(u8, Freeze)>> = std::sync::Mutex::new(None);
+
+/// Has player `player` freeze at `at` (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn freeze(player: u8, at: Freeze) {
+    if let Ok(mut f) = FREEZE.lock() {
+        *f = Some((player, at));
+    }
+}
+
+/// Freezes the calling player's thread for good when `player` is to
+/// freeze at `at` (dev-tools); returns at once otherwise.
+#[cfg(feature = "dev-tools")]
+fn freeze_at(player: u8, at: Freeze) {
+    if FREEZE.lock().is_ok_and(|f| *f == Some((player, at))) {
+        crate::say(&format!(
+            "tapestry-media: player {player} freezes at {at:?}"
+        ));
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+#[cfg(not(feature = "dev-tools"))]
+const fn freeze_at(_: u8, _: Freeze) {}
+
+/// Where a player may freeze (dev-tools; nothing without).
+#[cfg(not(feature = "dev-tools"))]
+#[derive(Clone, Copy)]
+enum Freeze {
+    Play,
+    Start,
+    Decoding,
+    Waiting,
+}
 
 /// How a playing player stopped.
 enum Stopped {
@@ -60,12 +119,19 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         width,
         height,
         duration: probe.duration,
+        matrix: probe.matrix,
+        range: probe.range,
         codec: probe.codec,
         container: probe.container,
     });
-    let (play, section, event) = loop {
+    let (play, section, event, looping) = loop {
         match rx.recv() {
-            Ok(ToPlayer::Play { id, section, event }) => break (id, section, event),
+            Ok(ToPlayer::Play {
+                id,
+                section,
+                event,
+                looping,
+            }) => break (id, section, event, looping),
             Ok(ToPlayer::Seek { id, .. }) => crate::reject(out, id, player, 0),
             Ok(ToPlayer::Close { id }) => {
                 drop(input);
@@ -101,9 +167,19 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
             return;
         }
     };
+    let mut input = input;
+    if let Some(progress) = view.words().get(PROGRESS_WORD) {
+        // SAFETY: the word lies in the view, which `Playing` drops after the
+        // input (its field order), and the mapping does not move.
+        unsafe { input.count_into(progress) };
+    }
+    writer.state(view.words(), State::Decoding);
+    freeze_at(player, Freeze::Play);
     out.send(&Reply::Playing { id: play, player });
+    freeze_at(player, Freeze::Start);
     let mut playing = Playing {
         player,
+        looping,
         input,
         view,
         event,
@@ -127,9 +203,12 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
     }
 }
 
-/// A player decoding into its ring.
+/// A player decoding into its ring. The input drops before the view: it
+/// counts its decoded frames in the view's progress word.
 struct Playing {
     player: u8,
+    /// From the start again at each end.
+    looping: bool,
     input: Input,
     view: View,
     event: Event,
@@ -166,7 +245,9 @@ impl Playing {
             };
             match message {
                 Some(ToPlayer::Close { id }) => return Stopped::Closed(id),
-                Some(ToPlayer::Play { id, section, event }) => {
+                Some(ToPlayer::Play {
+                    id, section, event, ..
+                }) => {
                     drop((section, event));
                     crate::reject(out, id, self.player, 0);
                     continue;
@@ -194,6 +275,7 @@ impl Playing {
         self.last = None;
         self.pending = None;
         self.ended = false;
+        self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
             Some(landed) => {
                 self.pending = Some(landed.stamp);
@@ -207,6 +289,7 @@ impl Playing {
             }
             None => {
                 self.ended = true;
+                self.writer.state(self.view.words(), State::Ended);
                 out.send(&Reply::Ended {
                     player: self.player,
                     run,
@@ -225,8 +308,15 @@ impl Playing {
                     self.pending = Some(stamp);
                 }
                 Some(_) => {}
+                None if self.looping => {
+                    let stamp = self.input.restart(&mut self.frame)?;
+                    if stamp >= self.floor && self.last.is_none_or(|l| stamp > l) {
+                        self.pending = Some(stamp);
+                    }
+                }
                 None => {
                     self.ended = true;
+                    self.writer.state(self.view.words(), State::Ended);
                     out.send(&Reply::Ended {
                         player: self.player,
                         run: self.run,
@@ -237,9 +327,14 @@ impl Playing {
         };
         let words = self.view.words();
         let Some(slot) = self.writer.claim(words) else {
+            self.writer.state(words, State::Waiting);
+            if self.seq > 0 {
+                freeze_at(self.player, Freeze::Waiting);
+            }
             self.event.wait(SLOT_WAIT_MS);
             return Ok(());
         };
+        self.writer.state(words, State::Decoding);
         let seq = self.seq.saturating_add(1);
         self.writer
             .publish(words, slot, &self.frame, seq, self.run, stamp)
@@ -247,6 +342,7 @@ impl Playing {
         self.seq = seq;
         self.last = Some(stamp);
         self.pending = None;
+        freeze_at(self.player, Freeze::Decoding);
         Ok(())
     }
 }
@@ -261,7 +357,9 @@ fn fail(player: u8, out: &Out, why: Failure, code: i32) {
 fn idle(player: u8, rx: &Receiver<ToPlayer>, out: &Out) {
     let id = loop {
         match rx.recv() {
-            Ok(ToPlayer::Play { id, section, event }) => {
+            Ok(ToPlayer::Play {
+                id, section, event, ..
+            }) => {
                 drop((section, event));
                 crate::reject(out, id, player, 0);
             }

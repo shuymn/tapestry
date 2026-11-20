@@ -583,8 +583,10 @@ fn a_superseded_staging_stays_charged_until_its_destruction() {
     let a = r.admission();
     assert_eq!(a.candidate, Some((ScreenKind::Decision, TINY)));
     assert_eq!(a.filled, TINY, "the superseded candidate");
+    // The superseded candidate's entry and the staged decision, as its
+    // commit would leave it (H4), both counted.
     let e = r.admit(ScreenKind::Play, &big).unwrap_err();
-    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + 2 * TINY);
     // Its completion seen: still charged until it is destroyed.
     let began = std::time::Instant::now();
     while r.pending_completion() {
@@ -593,11 +595,13 @@ fn a_superseded_staging_stays_charged_until_its_destruction() {
     }
     assert_eq!(r.admission().filled, TINY);
     let e = r.admit(ScreenKind::Play, &big).unwrap_err();
-    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + 2 * TINY);
     let d = r.destroy_due(true).heavy.unwrap();
     assert_eq!(d.id, Some(d1.atlas_id()));
     assert_eq!(r.admission().filled, 0);
-    r.admit(ScreenKind::Play, &big).unwrap();
+    // Destroyed: the staged decision alone is past the limit.
+    let e = r.admit(ScreenKind::Play, &big).unwrap_err();
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
     // The committed bundle staged again: no entry of its own, nothing
     // filled after its discard, its charge counted once.
     r.discard();

@@ -148,7 +148,7 @@ fn n1(row: &'static str, failing: Option<&'static str>) -> Expectation {
             check(
                 "n1.no-foreign",
                 &[run, rec],
-                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RUN, "close")],
+                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RUN, "quiet")],
             ),
         ],
         negative: failing.map(|trigger| Negative {
@@ -270,13 +270,13 @@ fn sink_kill() -> Expectation {
                 &[
                     ev(SINGLE, RUN, "kill"),
                     ev(SINGLE, LINK, "ans"),
-                    ev(INNER, LINK, "cmd"),
+                    ev(INNER, LINK, "ans"),
                 ],
             ),
             pass(
                 "n2.no-foreign",
                 &[run, rec, inner_run],
-                &[ev(INNER, RUN, "call"), ev(SINGLE, RUN, "kill")],
+                &[ev(INNER, RUN, "call"), ev(SINGLE, RUN, "exit")],
             ),
             pass("n2.children-gone", &[run], &[ev(SINGLE, RUN, "exit")]),
         ],
@@ -287,6 +287,11 @@ fn sink_kill() -> Expectation {
 /// The expectation of `row` among `rows`.
 fn expectation(rows: &[Row], row: &str) -> Option<Expectation> {
     rows.iter().find(|(name, _)| *name == row).map(|(_, e)| e())
+}
+
+/// The expectation compiled into this build for `row`.
+pub fn expectation_of(row: &str) -> Option<Expectation> {
+    expectation(ROWS, row)
 }
 
 /// Prints every note and mismatch, then `CONTRACT <row> ok` or
@@ -383,6 +388,13 @@ mod tests {
     /// with `early`, the sink closed before the release evidence, as N1's
     /// negative would. Then the judge's verdicts.
     fn n1_folder(dir: &std::path::Path, row: &str, early: bool) {
+        n1_files(dir, row, early, false);
+        super::super::judge::judge(row, dir).unwrap();
+    }
+
+    /// As [`n1_folder`] without the verdicts; with `torn`, the recorder's
+    /// last line (its `end`) is cut short though it exited 0, and sealed so.
+    fn n1_files(dir: &std::path::Path, row: &str, early: bool, torn: bool) {
         use serde_json::{Value, json};
         let run_id = "0123456789abcdef0123456789abcdef";
         let me = json!({"pid": 1, "created": 2});
@@ -417,18 +429,53 @@ mod tests {
             "t": "ready", "q": 50, "run": run_id, "process": rec, "window": 9,
             "location": "L", "keyboard": 1, "pad": 2,
         });
-        let write = |name: &str, records: &[Value]| {
-            let text: String = records.iter().map(|v| format!("{v}\n")).collect();
+        let write = |name: &str, records: &[Value], torn: bool| {
+            let mut text: String = records.iter().map(|v| format!("{v}\n")).collect();
+            if torn {
+                text.truncate(text.len() - 3);
+            }
             std::fs::write(dir.join(name), text).unwrap();
         };
-        write(LINK, &link);
-        write(RECORDER, &recorder);
+        write(LINK, &link, false);
+        write(RECORDER, &recorder, torn);
         for name in [LINK, RECORDER] {
             run.push(super::super::owner::seal(dir, &dir.join(name), run_id, SINGLE).unwrap());
         }
         run.push(end);
-        write(RUN, &run);
-        super::super::judge::judge(row, dir).unwrap();
+        write(RUN, &run, false);
+    }
+
+    /// The judge judges only streams the checker takes: a recorder that
+    /// exited 0 with its `end` cut short is no evidence, so every check
+    /// reading it is `incomplete` rather than judged on the prefix; the
+    /// whole stream (the control) passes them.
+    #[test]
+    fn the_judge_reads_only_streams_the_checker_takes() {
+        let outcomes = |torn: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            n1_files(dir.path(), "sink", false, torn);
+            super::super::judge::judge("sink", dir.path()).unwrap();
+            let text = std::fs::read_to_string(dir.path().join("verdicts-judge.jsonl")).unwrap();
+            text.lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|v| {
+                    v["inputs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|i| i["path"] == RECORDER)
+                })
+                .map(|v| v["outcome"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let whole = outcomes(false);
+        assert!(
+            !whole.is_empty() && whole.iter().all(|o| o == "pass"),
+            "{whole:?}"
+        );
+        let torn = outcomes(true);
+        assert_eq!(torn.len(), whole.len());
+        assert!(torn.iter().all(|o| o == "incomplete"), "{torn:?}");
     }
 
     /// N1's negative is judged and checked on a run folder, never run: the

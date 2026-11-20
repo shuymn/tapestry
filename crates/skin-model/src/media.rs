@@ -50,7 +50,10 @@
 //!
 //! The layout, in words: a header of [`HEADER_WORDS`] (a magic word, the
 //! version, the slot count, the width, the height, a frame's bytes and, at
-//! [`WATERMARK_WORD`], the watermark), then the slots,
+//! [`WATERMARK_WORD`], the watermark, then the worker's supervision words,
+//! the decoder's progress at [`PROGRESS_WORD`] and its [`State`] at
+//! [`STATE_WORD`], which the game reads only to supervise the worker
+//! ([`supervision`])), then the slots,
 //! each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its own
 //! index and its frame's bytes) followed by its frame: the luma plane, then
 //! the two chroma planes, each half the width and height rounded up (I420),
@@ -84,7 +87,7 @@ pub const SLOT_HEADER_WORDS: usize = 8;
 pub const CHUNK_WORDS: usize = 8_192;
 
 /// The layout's version, in the header.
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 
 /// The header's first word.
 const MAGIC: u64 = u64::from_le_bytes(*b"TAPRING1");
@@ -101,6 +104,69 @@ const H_BYTES: usize = 5;
 /// has published, which it raises after each publication and the game reads
 /// before each scan of the slots.
 pub const WATERMARK_WORD: usize = 6;
+
+/// The header word holding the decoder's progress: the frames its decoder
+/// has returned, raised for each before it is converted or skipped. The
+/// worker writes it; the game reads it only to judge whether the player
+/// stalls ("Threat Model" T02).
+pub const PROGRESS_WORD: usize = 7;
+
+/// The header word holding the player's [`State`], which the worker
+/// writes and the game reads only to supervise it.
+pub const STATE_WORD: usize = 8;
+
+/// What a player is doing, as its worker says in [`STATE_WORD`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// Decoding: its progress is to rise.
+    Decoding,
+    /// Waiting for the game to free a slot: every slot holds a frame.
+    Waiting,
+    /// Its video ended, for good (a looping play never ends).
+    Ended,
+}
+
+impl State {
+    /// The state's value in its word.
+    #[must_use]
+    pub const fn word(self) -> u64 {
+        match self {
+            Self::Decoding => 1,
+            Self::Waiting => 2,
+            Self::Ended => 3,
+        }
+    }
+
+    /// The state `word` holds; `None` for a value no state has (0 before
+    /// the worker wrote one).
+    #[must_use]
+    pub const fn of(word: u64) -> Option<Self> {
+        match word {
+            1 => Some(Self::Decoding),
+            2 => Some(Self::Waiting),
+            3 => Some(Self::Ended),
+            _ => None,
+        }
+    }
+}
+
+/// What the worker last wrote in `ring`'s supervision words: its decoder's
+/// progress and its state (`None` before it wrote one, or for a value no
+/// state has). Untrusted, as every word the worker writes; `None` when the
+/// ring does not hold the header.
+#[must_use]
+pub fn supervision<W: Words + ?Sized>(ring: &W) -> Option<(u64, Option<State>)> {
+    let progress = word(ring, PROGRESS_WORD)?.load(Ordering::Acquire);
+    let state = word(ring, STATE_WORD)?.load(Ordering::Acquire);
+    Some((progress, State::of(state)))
+}
+
+/// The highest sequence the worker says it has published: `ring`'s
+/// watermark, untrusted; `None` when the ring does not hold the header.
+#[must_use]
+pub fn watermark<W: Words + ?Sized>(ring: &W) -> Option<u64> {
+    Some(word(ring, WATERMARK_WORD)?.load(Ordering::Acquire))
+}
 
 /// A slot's words before its frame.
 const S_STATE: usize = 0;
@@ -310,6 +376,8 @@ pub struct Reader {
     window: Window,
     /// The highest sequence taken out of the ring, 0 before the first.
     taken: u64,
+    /// The slots it has freed, over the ring's life.
+    freed: u64,
     /// The stamp of the last frame staged in the current run.
     last_stamp: Option<i64>,
     staged: Option<Frame>,
@@ -348,6 +416,8 @@ impl Reader {
             (H_HEIGHT, u64::from(geometry.height)),
             (H_BYTES, wide(geometry.frame_bytes())),
             (WATERMARK_WORD, 0),
+            (PROGRESS_WORD, 0),
+            (STATE_WORD, 0),
         ];
         for (i, v) in header {
             if let Some(w) = word(ring, i) {
@@ -365,6 +435,7 @@ impl Reader {
             run: 1,
             window,
             taken: 0,
+            freed: 0,
             last_stamp: None,
             staged: None,
             staging: staging.into_boxed_slice(),
@@ -382,6 +453,14 @@ impl Reader {
     #[must_use]
     pub fn run(&self) -> u64 {
         self.run
+    }
+
+    /// The slots it has freed over the ring's life: the game's own count,
+    /// which its supervision of the worker compares with the frames the
+    /// worker says it published ("Threat Model" T02).
+    #[must_use]
+    pub fn freed(&self) -> u64 {
+        self.freed
     }
 
     /// The fault that failed the player, if one has.
@@ -585,6 +664,7 @@ impl Reader {
             .ok_or(Fault::Section)?
             .store(FREE, Ordering::Release);
         self.taken = self.taken.max(a.seq);
+        self.freed = self.freed.saturating_add(1);
         Ok(())
     }
 }
@@ -655,6 +735,20 @@ impl Writer {
     #[must_use]
     pub fn geometry(self) -> Geometry {
         self.geometry
+    }
+
+    /// Raises the decoder's progress by one: a frame its decoder returned.
+    pub fn progress<W: Words + ?Sized>(self, ring: &W) {
+        if let Some(w) = word(ring, PROGRESS_WORD) {
+            w.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Says the player is in `state`.
+    pub fn state<W: Words + ?Sized>(self, ring: &W, state: State) {
+        if let Some(w) = word(ring, STATE_WORD) {
+            w.store(state.word(), Ordering::Release);
+        }
     }
 
     /// A free slot, claimed for the next frame, or `None` while every slot

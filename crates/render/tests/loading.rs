@@ -697,13 +697,12 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     let all = TextSlots::field(TextField::Title)
         .with(TextSlots::field(TextField::Artist))
         .with(TextSlots::field(TextField::Genre));
-    r.prepare_loading_text(1, 1, all, &chosen("B", "", ""))
-        .unwrap();
-    assert_eq!(r.staged_loading_text(), Some((1, 1)));
+    r.prepare_loading_text(1, 1, all, &chosen("B", "", ""));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
     assert!(r.memory().staged_text > 0);
     // Staged, nothing of it draws yet.
     assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 0))), [BLACK; 4]);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(r.memory().staged_text, 0);
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 16))),
@@ -717,9 +716,8 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     // The title cleared: its slot and the full title's draw nothing.
     r.clear_loading_text(TextSlots::field(TextField::Title));
     assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 32))), [BLACK; 4]);
-    r.prepare_loading_text(1, 2, all, &chosen("B", "b", ""))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 2, all, &chosen("B", "b", ""));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 48))),
         [RED, RED, BLACK, RED]
@@ -732,39 +730,29 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     );
 
     // Prepared on A, then B committed within the lifetime: dropped.
-    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"))
-        .unwrap();
+    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"));
     install(&mut r, &b, 2);
     r.enter_loading(1);
-    assert_eq!(
-        r.install_staged_loading_text(),
-        Err(LoadingTextError::Stale)
-    );
-    assert_eq!(r.staged_loading_text(), None);
+    assert_eq!(common::settle_text(&mut r), Err(LoadingTextError::Stale));
+    assert_eq!(r.loading_text_in_hand(), None);
     assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 80))), [BLACK; 4]);
-    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 96))),
         [GREEN, GREEN, GREEN, GREEN]
     );
     // An older revision and another lifetime are dropped.
-    r.prepare_loading_text(1, 2, all, &chosen("", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 2, all, &chosen("", "", ""));
     assert_eq!(
-        r.install_staged_loading_text(),
+        common::settle_text(&mut r),
         Err(LoadingTextError::Older {
             installed: 3,
             revision: 2
         })
     );
-    r.prepare_loading_text(2, 4, all, &chosen("", "", ""))
-        .unwrap();
-    assert_eq!(
-        r.install_staged_loading_text(),
-        Err(LoadingTextError::Lifetime)
-    );
+    r.prepare_loading_text(2, 4, all, &chosen("", "", ""));
+    assert_eq!(common::settle_text(&mut r), Err(LoadingTextError::Lifetime));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 112))),
         [GREEN, GREEN, GREEN, GREEN]
@@ -782,27 +770,24 @@ fn staged_chart_text_is_bounded() {
     let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
     install(&mut r, &a, 1);
     r.enter_loading(1);
-    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("B", "b", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("B", "b", ""));
     let first = r.memory().staged_text;
     assert!(first > 0);
-    r.prepare_loading_text(1, 2, TextSlots::ALL, &chosen("A", "a", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 2, TextSlots::ALL, &chosen("A", "a", ""));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert!(r.text_report().upload_bytes > 0);
-    r.prepare_loading_text(1, 3, TextSlots::ALL, &chosen("A", "a", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 3, TextSlots::ALL, &chosen("A", "a", ""));
     let one = r.memory();
     assert_eq!(one.staged_text, first);
     assert_eq!(one.text_upload, 0, "hits upload nothing");
     for revision in 4..20 {
-        r.prepare_loading_text(1, revision, TextSlots::ALL, &chosen("A", "a", ""))
-            .unwrap();
+        r.prepare_loading_text(1, revision, TextSlots::ALL, &chosen("A", "a", ""));
         assert_eq!(r.memory(), one, "revision {revision}");
     }
-    assert_eq!(r.staged_loading_text(), Some((1, 19)));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 19)));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(r.memory().staged_text, 0);
-    assert_eq!(r.install_staged_loading_text(), Ok(false));
+    assert_eq!(common::settle_text(&mut r), Ok(false));
 }
 
 /// Only the slots asked for are laid out: with the title asked, the
@@ -818,20 +803,20 @@ fn only_the_named_slots_are_laid_out() {
     install(&mut r, &a, 1);
     r.enter_loading(1);
     let title = TextSlots::field(TextField::Title);
-    r.prepare_loading_text(1, 1, title, &chosen("B", "b", "g"))
-        .unwrap();
+    r.prepare_loading_text(1, 1, title, &chosen("B", "b", "g"));
     assert_eq!(*producer.strings.lock().unwrap(), ["B"]);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     assert_eq!(
         texts(&loading(&mut r, &text, &frame_at(1, 0))),
         [RED, BLACK, BLACK, RED]
     );
 }
 
-/// The witness counts the staged loading text's holder with that text,
-/// its strings included, and the installed loading lines' holder with the
-/// text cache once installed; replacing the skin with `set_skin` lets go
-/// of the installed lines' holder, the cache staying.
+/// The witness counts the slots of the loading text in the uploader's
+/// hand with that text, their strings included, and the installed loading
+/// lines' holder with the text cache once installed; replacing the skin
+/// with `set_skin` lets go of the installed lines' holder, the cache with
+/// its published lines staying.
 #[test]
 fn loading_text_holders_are_witnessed() {
     let dir = tempfile::tempdir().unwrap();
@@ -841,24 +826,21 @@ fn loading_text_holders_are_witnessed() {
     r.enter_loading(1);
     let title = TextSlots::field(TextField::Title);
     // No title: no line, an empty holder.
-    r.prepare_loading_text(1, 1, title, &chosen("", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 1, title, &chosen("", "", ""));
     let empty = r.memory().staged_text;
-    r.prepare_loading_text(1, 1, title, &chosen("B", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 1, title, &chosen("B", "", ""));
     let short = r.memory().staged_text;
     // Two held lines (the title and the full title): their strings, 4
     // bytes, and the list's own storage, each element holding two keys
     // with a string header each.
     let headers = 2 * 2 * size_of::<String>();
     assert!(short - empty >= 4 + headers as u64, "{empty} {short}");
-    r.prepare_loading_text(1, 2, title, &chosen("BBBB", "", ""))
-        .unwrap();
+    r.prepare_loading_text(1, 2, title, &chosen("BBBB", "", ""));
     let staged = r.memory();
     // Two slots (the title and the full title), each holding its alias's
     // and its line's string, 3 bytes longer.
     assert_eq!(staged.staged_text - short, 2 * 2 * 3);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let installed = r.memory();
     assert_eq!(installed.staged_text, 0);
     assert!(
@@ -866,5 +848,130 @@ fn loading_text_holders_are_witnessed() {
         "{installed:?} {staged:?}"
     );
     r.set_skin(Box::new(render::SimpleSkin::new())).unwrap();
-    assert_eq!(r.memory().text_cache, staged.text_cache);
+    let kept = r.memory().text_cache;
+    assert!(kept < installed.text_cache, "the holder kept: {kept}");
+    assert!(kept >= staged.text_cache, "the cache shrank: {kept}");
+}
+
+/// A boundary's gate for the loading text: past from its look after the
+/// first `free`, the text in hand current while `current`.
+struct TextGate {
+    looks: u32,
+    free: u32,
+    current: bool,
+}
+
+impl render::UploadGate for TextGate {
+    fn past(&mut self) -> bool {
+        self.looks += 1;
+        self.looks > self.free
+    }
+
+    fn current(&mut self, _: render::Payload) -> bool {
+        self.current
+    }
+}
+
+/// A renderer in loading lifetime 1 on a bundle with the chosen chart's
+/// text slots, three fields of it prepared at revision 1.
+fn text_in_hand(dir: &std::path::Path) -> Renderer {
+    let mut r = offscreen(1_920, 1_080);
+    let (a, _) = bundle(&r, dir, &chart_texts([255, 0, 0, 255]));
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    let all = TextSlots::field(TextField::Title)
+        .with(TextSlots::field(TextField::Artist))
+        .with(TextSlots::field(TextField::Genre));
+    r.prepare_loading_text(1, 1, all, &chosen("Title", "Artist", "Genre"));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    r
+}
+
+/// M1, H3 (r2): the loading text is written one band a step, the gate
+/// read immediately before each band's write: a gate past from its third
+/// look (the boundary's, the first band's write, the second's) writes one
+/// band, so once that step has completed the text is still unwritten and
+/// a boundary past at once installs nothing; with a free gate it then
+/// installs.
+// Revert: `write_step` writing every line of its budget without reading
+// the gate -> "installed after one band".
+#[test]
+fn the_gate_is_read_before_each_band_of_the_loading_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = text_in_hand(dir.path());
+    let mut gate = TextGate {
+        looks: 0,
+        free: 2,
+        current: true,
+    };
+    let out = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None);
+    assert!(out.text.is_none(), "{:?}", out.text.map(|t| t.result));
+    assert!(
+        gate.looks >= 2,
+        "read before its second band: {}",
+        gate.looks
+    );
+    r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    let out = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut || true, None);
+    assert!(out.text.is_none(), "installed after one band");
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
+}
+
+/// M2: the loading text in hand, its owner's revision moved on after its
+/// first band, ends stale at the next boundary and is never installed;
+/// the control, current throughout, installs.
+// Revert: no revision check in the boundary's loop -> "a superseded
+// revision installed".
+#[test]
+fn a_superseded_loading_text_is_never_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = text_in_hand(dir.path());
+    let text = MenuText::new(&r);
+    let mut gate = TextGate {
+        looks: 0,
+        free: 2,
+        current: true,
+    };
+    let _ = r.upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None);
+    r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    let mut gate = TextGate {
+        looks: 0,
+        free: u32::MAX,
+        current: false,
+    };
+    let done = r
+        .upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None)
+        .text
+        .expect("ended");
+    assert_eq!((done.lifetime, done.revision), (1, 1));
+    assert!(
+        matches!(
+            done.result,
+            Err(render::TextFault::Install(LoadingTextError::Stale))
+        ),
+        "a superseded revision installed: {:?}",
+        done.result
+    );
+    assert_eq!(r.loading_text_in_hand(), None);
+    assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 0))), [BLACK; 4]);
+    // The control.
+    let mut r = text_in_hand(dir.path());
+    let mut gate = TextGate {
+        looks: 0,
+        free: u32::MAX,
+        current: true,
+    };
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let done = loop {
+        if let Some(done) = r
+            .upload_boundary_within(std::time::Duration::from_secs(60), &mut gate, None)
+            .text
+        {
+            break done;
+        }
+        assert!(std::time::Instant::now() < end, "never ended");
+        r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    };
+    assert!(done.result.is_ok(), "{:?}", done.result);
 }

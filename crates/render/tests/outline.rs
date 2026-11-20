@@ -421,8 +421,7 @@ fn loading_frame(r: &mut Renderer, menu: &MenuText) -> Vec<u8> {
 /// The loading text of `text` prepared for lifetime 1 at `revision`, every
 /// slot.
 fn prepare_loading(r: &mut Renderer, revision: u64, text: &ChartText<'_>) {
-    r.prepare_loading_text(1, revision, TextSlots::ALL, text)
-        .unwrap();
+    r.prepare_loading_text(1, revision, TextSlots::ALL, text);
 }
 
 /// The attempt staged on the installed resources keeps its lines while
@@ -486,9 +485,8 @@ fn staged_loading_lines_move_with_the_commit() {
     };
     // The first staged frame enters the lifetime.
     staged_frame(&mut r);
-    r.prepare_loading_text_on(on, 1, 1, TextSlots::ALL, &labels("A", "B"))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text_on(on), Ok(true));
+    r.prepare_loading_text_on(on, 1, 1, TextSlots::ALL, &labels("A", "B"));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let drawn = staged_frame(&mut r);
     assert!(
         lit(&drawn).is_some(),
@@ -499,7 +497,7 @@ fn staged_loading_lines_move_with_the_commit() {
 
     r.commit(staged).unwrap();
     assert_eq!(r.loading_text_key(), key);
-    assert_eq!(r.install_staged_loading_text(), Ok(false));
+    assert_eq!(common::settle_text(&mut r), Ok(false));
     assert_eq!(loading_frame(&mut r, &menu), drawn);
 
     // Under pressure: the attempt's and the loading lines fill the layer.
@@ -535,9 +533,8 @@ fn a_reused_specialization_draws_with_no_upload() {
         read_back(r)
     };
     let before = staged(&mut r);
-    r.prepare_loading_text_on(on, 2, 1, TextSlots::ALL, &labels("Beta", ""))
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text_on(on), Ok(true));
+    r.prepare_loading_text_on(on, 2, 1, TextSlots::ALL, &labels("Beta", ""));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let drawn = staged(&mut r);
     assert!(lit(&drawn).is_some());
     assert_ne!(drawn, before, "the lifetime's own text drawn");
@@ -549,11 +546,12 @@ fn a_reused_specialization_draws_with_no_upload() {
     );
 }
 
-/// The staged loading text and then the installed loading lines keep
-/// their lines while an attempt is staged under pressure: with the
-/// loading lines filling the layer, the attempt's lines evict none of
-/// them and are set smaller, and the loading frame draws the loading
-/// lines as it does where no attempt was staged.
+/// The loading text in the uploader's hand, finished and installed before
+/// an attempt's text is placed on the same resources, and then the
+/// installed loading lines keep their lines while an attempt is staged
+/// under pressure: with the loading lines filling the layer, the attempt's
+/// lines evict none of them and are set smaller, and the loading frame
+/// draws the loading lines as it does where no attempt was staged.
 #[test]
 fn loading_pins_survive_attempt() {
     let dir = step_skin();
@@ -565,13 +563,15 @@ fn loading_pins_survive_attempt() {
     prepare_loading(&mut r, 1, &labels("A", "B"));
     assert_eq!(r.text_report().counts.rounds, 1);
 
-    // Staged: held by the staged text.
+    // In hand: finished and installed before the attempt's text.
     stage(&mut r, &b, &labels("C", "D"), 2);
+    assert_eq!(r.loading_text_in_hand(), None);
     let report = r.text_report();
     assert!(report.notes.is_empty(), "{:?}", report.notes);
     assert_eq!(report.counts.evictions, 0, "{:?}", report.counts);
     assert!(report.counts.rounds > 1, "{:?}", report.counts);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let done = r.upload_boundary().text.expect("answered at the boundary");
+    assert_eq!(done.result.ok(), Some(()));
     let drawn = loading_frame(&mut r, &menu);
     assert!(lit(&drawn).is_some(), "the loading lines drew nothing");
 
@@ -589,7 +589,7 @@ fn loading_pins_survive_attempt() {
     common::install(&mut q, &qb, 1);
     q.enter_loading(1);
     prepare_loading(&mut q, 1, &labels("A", "B"));
-    assert_eq!(q.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut q), Ok(true));
     assert_eq!(drawn, loading_frame(&mut q, &qmenu));
 }
 
@@ -608,7 +608,7 @@ fn loading_to_attempt_reuse_after_refit() {
     let refit = r.text_report().counts;
     assert!(refit.rounds > 1, "{refit:?}");
     assert_eq!(refit.placements, 2);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let (layouts, rasters) = (
         c.layouts.load(Ordering::SeqCst),
         c.rasters.load(Ordering::SeqCst),
@@ -641,7 +641,7 @@ fn cleared_loading_slots_release_their_lines() {
     common::install(&mut r, &b, 1);
     r.enter_loading(1);
     prepare_loading(&mut r, 1, &labels("A", "B"));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     r.clear_loading_text(TextSlots::field(skin_model::TextField::Title));
     stage(&mut r, &b, &labels("C", "D"), 2);
     let counts = r.text_report().counts;
@@ -669,12 +669,11 @@ fn replaced_loading_slots_release_their_lines() {
     common::install(&mut r, &b, 1);
     r.enter_loading(1);
     prepare_loading(&mut r, 1, &labels("A", "B"));
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let title = TextSlots::field(skin_model::TextField::Title);
-    r.prepare_loading_text(1, 2, title, &labels("C", "B"))
-        .unwrap();
+    r.prepare_loading_text(1, 2, title, &labels("C", "B"));
     assert_eq!(r.text_report().counts.evictions, 0);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let drawn = loading_frame(&mut r, &menu);
     assert!(lit(&drawn).is_some());
 
@@ -687,4 +686,94 @@ fn replaced_loading_slots_release_their_lines() {
     let counts = r.text_report().counts;
     assert_eq!((counts.hits, counts.placements), (2, 0), "{counts:?}");
     assert_eq!(c.layouts.load(Ordering::SeqCst), layouts);
+}
+
+/// Boundaries until the staging in hand answers, each step's completion
+/// waited for: its token, and the loading text's ends seen meanwhile.
+fn step_to_staged(r: &mut Renderer) -> (render::PreparedToken, Vec<render::TextDone>) {
+    let mut texts = Vec::new();
+    for _ in 0..1_000 {
+        let up = r.upload_boundary();
+        texts.extend(up.text);
+        if let Some(render::StagingEnd::Ready(t)) = up.staged {
+            return (t, texts);
+        }
+        if r.upload_state() == render::UploadState::InFlight {
+            r.wait_step(Duration::from_secs(10)).unwrap();
+        }
+    }
+    panic!("never staged");
+}
+
+/// H3: an attempt's text staged in steps is not rasterized in the
+/// staging's call: the uploader's steps write it after the atlas, the
+/// staging answering only once it is published, and it draws as the
+/// whole staging's does.
+// Revert: `prepare_staged` writing the text in the staging's call when
+// stepped -> "rasterized in the staging's call".
+#[test]
+fn an_attempt_text_is_written_in_the_uploaders_steps() {
+    let dir = title_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let (b, counting) = counted(&r, dir.path());
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    let text = labels("AB", "");
+    let a = AttemptInput {
+        chart: &chart,
+        context: &ctx,
+        text: &text,
+        target: r.target(),
+    };
+    assert_eq!(r.stage_stepped(&b, &a, 1).unwrap(), None);
+    assert_eq!(
+        counting.rasters.load(Ordering::SeqCst),
+        0,
+        "rasterized in the staging's call"
+    );
+    let (token, _) = step_to_staged(&mut r);
+    assert!(counting.rasters.load(Ordering::SeqCst) > 0);
+    r.commit(token).unwrap();
+    let stepped = frame(&mut r);
+    let mut q = offscreen(1_920, 1_080);
+    let qb = outline_support::bundle_in(&q, dir.path(), &default_font());
+    let token = stage(&mut q, &qb, &labels("AB", ""), 1);
+    q.commit(token).unwrap();
+    assert_eq!(stepped, frame(&mut q));
+}
+
+/// H3: a staging on the installed resources with a loading text in hand
+/// on their cache drains nothing in its call: the loading text is still
+/// in hand after it, ends installed at a boundary, and the attempt's
+/// text follows, the staging answering after both.
+// Revert: the staging's call finishing the loading text in hand
+// (`finish_loading_now`) -> "drained in the staging's call".
+#[test]
+fn a_shared_cache_staging_leaves_the_loading_text_to_the_steps() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let token = stage(&mut r, &b, &labels("A", "B"), 1);
+    r.commit(token).unwrap();
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("E", "F"));
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    let text = labels("C", "D");
+    let a = AttemptInput {
+        chart: &chart,
+        context: &ctx,
+        text: &text,
+        target: r.target(),
+    };
+    assert_eq!(r.stage_stepped(&b, &a, 2).unwrap(), None);
+    assert_eq!(
+        r.loading_text_in_hand(),
+        Some((1, 1)),
+        "drained in the staging's call"
+    );
+    let (_, texts) = step_to_staged(&mut r);
+    assert_eq!(texts.len(), 1, "the loading text's end");
+    assert!(texts[0].result.is_ok(), "{:?}", texts[0].result);
 }

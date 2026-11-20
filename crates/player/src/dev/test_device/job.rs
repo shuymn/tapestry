@@ -19,6 +19,7 @@ use anyhow::{Context as _, bail};
 use test_device::evidence::Process;
 use windows::Win32::Foundation::{
     FILETIME, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -176,18 +177,33 @@ pub struct Child {
 }
 
 impl Child {
-    /// Waits up to `wait` for the child to end: its exit code, or `None`
-    /// while it runs.
-    pub fn wait(&self, wait: Duration) -> Option<i32> {
+    /// Waits up to `wait` for the child to end: its exit code once its end
+    /// is observed, `None` while it runs.
+    ///
+    /// # Errors
+    ///
+    /// The wait or the exit code's read failed: the child's end is not
+    /// observed, which is neither an end nor a timeout.
+    pub fn wait(&self, wait: Duration) -> Result<Option<i32>, String> {
         let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: an open process handle.
-        if unsafe { WaitForSingleObject(self.handle.0, ms) } != WAIT_OBJECT_0 {
-            return None;
+        match unsafe { WaitForSingleObject(self.handle.0, ms) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(None),
+            other => {
+                return Err(format!(
+                    "waiting for process {} failed ({:#x}): {}",
+                    self.process.pid,
+                    other.0,
+                    windows::core::Error::from_thread()
+                ));
+            }
         }
         let mut code = 0_u32;
         // SAFETY: one u32 written.
-        unsafe { GetExitCodeProcess(self.handle.0, &mut code) }.ok()?;
-        Some(code.cast_signed())
+        unsafe { GetExitCodeProcess(self.handle.0, &mut code) }
+            .map_err(|e| format!("reading process {}'s exit code: {e}", self.process.pid))?;
+        Ok(Some(code.cast_signed()))
     }
 
     /// Ends the child with exit code `code`, by its handle.
@@ -511,6 +527,23 @@ mod tests {
 
     use super::*;
 
+    /// A wait that fails is neither an end nor a timeout: a handle to a
+    /// running process without the right to wait on it gives an error,
+    /// while one with it (the control) gives `None`.
+    #[test]
+    fn a_failed_wait_is_not_an_end() {
+        let me = this_process().unwrap();
+        // SAFETY: no pointers.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, me.pid) }.unwrap();
+        let blind = Child {
+            handle: Owned(h),
+            process: me,
+        };
+        assert!(blind.wait(Duration::ZERO).is_err());
+        let seeing = open(me).unwrap();
+        assert_eq!(seeing.wait(Duration::ZERO), Ok(None));
+    }
+
     /// The environment variable that makes [`helper`] act.
     const HELPER: &str = "TAPESTRY_JOB_TEST_HELPER";
 
@@ -721,7 +754,7 @@ mod tests {
     #[test]
     fn a_child_s_own_job_ends_its_tree_with_the_cut_code() {
         let (mut helper, line) = run_helper("cutter");
-        let code = Some(CUT.cast_signed());
+        let code: Result<Option<i32>, String> = Ok(Some(CUT.cast_signed()));
         assert_eq!(line, format!("codes {code:?} {code:?}"));
         let _ = helper.wait();
     }
