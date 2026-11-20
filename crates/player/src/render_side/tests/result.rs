@@ -1465,6 +1465,10 @@ fn a_refused_first_presentation_draws_its_own_page() {
         "{page:?}"
     );
     assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
+    // The refusal publishes the disabled kind before the page's frame is
+    // counted, and the frame is recorded before it returns: what it shows
+    // is published after both.
+    assert!(wait_until(|| rig.link.result_status().shown.is_some()));
     assert_eq!(rig.link.result_status().shown, Some((1, false)));
     rig.link.exit();
 }
