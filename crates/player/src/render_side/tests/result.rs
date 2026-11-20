@@ -161,6 +161,9 @@ pub(super) struct Faults {
     /// The device is destroyed at the boundary that wrote the first
     /// chart-image band.
     pub(crate) lose_after_band: AtomicBool,
+    /// The writes of the staging's first atlas steps on the menu screen's
+    /// renderer, each step's count in order, as of its last boundary.
+    pub(crate) step_log: Mutex<Vec<u64>>,
 }
 
 impl Drop for Recorded {
@@ -252,6 +255,14 @@ impl Screen for Recorded {
     }
     fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
         let up = self.menu.upload_boundary(past);
+        let (log, _) = self.menu.renderer_mut().step_log();
+        log.clone_into(
+            &mut self
+                .faults
+                .step_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let bands = self.menu.renderer_mut().chart_bands();
         self.faults.chart_bands.store(bands, Ordering::Release);
         if bands > 0 && self.faults.lose_after_band.swap(false, Ordering::AcqRel) {

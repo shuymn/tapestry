@@ -1757,6 +1757,10 @@ pub struct Renderer {
     /// count in order.
     #[cfg(test)]
     pub(crate) step_writes: std::cell::RefCell<Vec<u64>>,
+    /// Development builds: the writes of the staging's first atlas steps,
+    /// each step's count in order, and how many steps were written.
+    #[cfg(feature = "dev-tools")]
+    step_log: ([u64; STEP_LOG], usize),
     /// Unit tests: a BGA step in flight taken as complete (`Some(true)`)
     /// or not yet (`Some(false)`, its completion withheld) instead of
     /// read from its flag.
@@ -1977,6 +1981,8 @@ impl Renderer {
             step_submits: std::cell::Cell::new(0),
             #[cfg(test)]
             step_writes: std::cell::RefCell::new(Vec::new()),
+            #[cfg(feature = "dev-tools")]
+            step_log: ([0; STEP_LOG], 0),
             #[cfg(test)]
             step_seen: std::cell::Cell::new(None),
             #[cfg(test)]
@@ -5923,6 +5929,8 @@ impl Renderer {
             }
             started.elapsed()
         };
+        #[cfg(feature = "dev-tools")]
+        let mut wrote = 0_u64;
         let ((number, index), refused) = skin_atlas::scoped(gpu.device(), || {
             #[cfg(test)]
             if let Some(f) = write_fault {
@@ -5935,6 +5943,10 @@ impl Renderer {
                 if n >= WRITES || writes.written() || elapsed() >= slice || past() {
                     break;
                 }
+            }
+            #[cfg(feature = "dev-tools")]
+            {
+                wrote = n;
             }
             // The step's submission, in the same scopes as its writes.
             #[cfg(test)]
@@ -5949,6 +5961,14 @@ impl Renderer {
         });
         // Its last use, for its retirement.
         atlas.mark(number);
+        #[cfg(feature = "dev-tools")]
+        {
+            let (log, logged) = &mut self.step_log;
+            if let Some(slot) = log.get_mut(*logged) {
+                *slot = wrote;
+            }
+            *logged = logged.saturating_add(1);
+        }
         self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
         if let Some(e) = refused {
             if let Some(p) = self.pending.take() {
@@ -6009,6 +6029,16 @@ impl Renderer {
     #[cfg(feature = "dev-tools")]
     pub const fn delay_steps(&mut self, delay: Option<Duration>) {
         self.step_delay = delay;
+    }
+
+    /// Development builds: the writes of the staging's first
+    /// [`STEP_LOG`] atlas steps, each step's count in order, and how many
+    /// steps this renderer wrote, so a test sees where a step closed.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn step_log(&self) -> (&[u64], usize) {
+        let (log, logged) = &self.step_log;
+        (log.get(..(*logged).min(STEP_LOG)).unwrap_or(&[]), *logged)
     }
 
     /// Development builds: the chart-image bands this renderer wrote
@@ -8908,6 +8938,11 @@ impl Renderer {
         out
     }
 }
+
+/// Development builds: the staging steps whose writes
+/// [`Renderer::step_log`] keeps.
+#[cfg(feature = "dev-tools")]
+const STEP_LOG: usize = 8;
 
 /// How [`Renderer::wait_grant_or_pace`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -77,6 +77,69 @@ fn an_idle_staging_steps_without_sleeping_and_answers_in_its_last_pass() {
     rig.exit();
 }
 
+/// V10f (iii): the staging of (i) under a held lifetime, the hold's
+/// clock 1 ms before its bound as the staging is taken and moved 400 µs at
+/// each look of the uploader's after a pass's first: the first atlas step
+/// is closed with the writes it had when its writes reached the bound,
+/// fewer than a step's eight; the hold then ends, its pending
+/// presentation acknowledged while the staging still steps, and the
+/// remaining writes go in later steps.
+#[test]
+fn a_held_staging_stops_writing_at_the_holds_bound() {
+    use crate::render_side::FIRST_FRAME_HOLD;
+    let rig = Rig::new();
+    rig.faults.step_delay_us.store(2_000, SeqCst);
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    assert_eq!(
+        rig.link.pend(ScreenKind::Play).wait().unwrap(),
+        Preparation::Ready
+    );
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let staged = big(&target);
+    // A page presented and stamped valid, then the lifetime shown over it
+    // and held on the test's time.
+    rig.link.send(RenderMsg::Menu(Box::new(one_line("page"))));
+    let [stamps, valid] = &rig.link.shared.stamps;
+    let from = stamps.load(SeqCst);
+    assert!(wait_until(
+        || stamps.load(SeqCst) >= from + 2 && valid.load(SeqCst) == 1
+    ));
+    rig.link.shared.hold_elapsed.store(0, SeqCst);
+    let from = rig.link.shared.held[1].load(SeqCst);
+    rig.link.loading().show(one_line("loading"));
+    assert!(wait_until(
+        || rig.link.shared.held[1].load(SeqCst) >= from + 3
+    ));
+    assert_eq!(rig.link.loading_ack(), None, "held");
+    rig.link
+        .shared
+        .hold_elapsed
+        .store(FIRST_FRAME_HOLD.0 - 1_000, SeqCst);
+    rig.link.shared.write_clock_step.store(400, SeqCst);
+    let answer = rig
+        .link
+        .prepare_attempt_with(
+            super::titled(&chart),
+            super::super::AttemptSkin::Specialized(staged),
+            || false,
+        )
+        .unwrap();
+    assert_eq!(answer, Preparation::Ready);
+    let (ack, answered) = (rig.link.loading_ack(), rig.link.clock.now());
+    let log = rig.faults.step_log.lock().unwrap().clone();
+    assert!(log.len() >= 3, "{log:?}");
+    let first = log[0];
+    assert!(
+        (1..8).contains(&first),
+        "the first step closed at the bound: {log:?}"
+    );
+    assert!(log[1..].iter().all(|&n| n > 0), "{log:?}");
+    let (_, at) = ack.expect("the pending presentation acknowledged");
+    assert!(at <= answered, "{at:?} {answered:?}");
+    rig.exit();
+}
+
 /// A green play skin keeping a chart layer, over its own atlas.
 fn charted(target: &render::Renderer) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
     let dir = tempfile::tempdir().unwrap();
