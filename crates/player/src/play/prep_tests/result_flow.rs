@@ -1008,9 +1008,14 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     assert!(between.len() >= 3, "{between:?}");
     // The result frames probed are presented.
     assert!(values("rf:presented").iter().all(|&v| v == 1));
-    // B's chart images, written for the result's view inside its staging.
+    // B's chart images, written for the result's view inside its staging,
+    // its stage file a band a step.
     let (install, chart) = (one("res:install_us", 1), one("res:chart_us", 1));
-    assert_eq!(within("ci:result:image", install, chart), [0]);
+    let images = within("ci:result:image", install, chart);
+    assert!(
+        !images.is_empty() && images.iter().all(|&i| i == 0),
+        "{images:?}"
+    );
     assert!(
         within("ci:result:bytes", install, chart)
             .iter()

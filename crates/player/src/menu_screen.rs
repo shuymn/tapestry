@@ -329,6 +329,12 @@ pub struct MenuScreen {
     /// The attempt's chart-image publication in hand and its images,
     /// stepped by the uploader's boundaries.
     chart: Option<(render::ChartUpload, Arc<crate::chart_images::ChartImages>)>,
+    /// A result view's chart-image publication in hand and its images
+    /// ([`Screen::begin_result_view`]), stepped after the attempt's.
+    result_chart: Option<(render::ChartUpload, Arc<crate::chart_images::ChartImages>)>,
+    /// That publication's end, or its table ready at once, until the
+    /// view's staging is answered.
+    result_table: Option<Result<skin_model::chart_image::ChartTable, RenderError>>,
     /// The font, read once per screen: when it is built on a screen that
     /// draws menus, and on a screen for plays only when its first page
     /// comes.
@@ -502,6 +508,8 @@ impl MenuScreen {
         Self {
             renderer,
             chart: None,
+            result_chart: None,
+            result_table: None,
             fonts,
             text: None,
             cursor: None,
@@ -938,6 +946,22 @@ impl MenuScreen {
     }
 }
 
+impl MenuScreen {
+    /// The result view's text taken in the uploader's hand
+    /// ([`render::Renderer::begin_result_text`]): stepping, or its
+    /// refusal.
+    fn begin_result_text(
+        &mut self,
+        state: &skin_model::ResultScreen,
+    ) -> Result<Result<Option<skin_model::chart_image::ChartTable>, String>, RenderError> {
+        match self.renderer.begin_result_text(state) {
+            Ok(()) => Ok(Ok(None)),
+            Err(e) if e.is_refusal() => Ok(Err(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl Screen for MenuScreen {
     fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError> {
         self.renderer.load(chart, section)
@@ -1028,12 +1052,23 @@ impl Screen for MenuScreen {
     }
 
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-        let chart = self.chart.as_mut().map(|(up, set)| (up, set.fitted()));
-        let up = self
+        // The attempt's images first; a result view's while it has none.
+        let attempt = self.chart.is_some();
+        let chart = match (&mut self.chart, &mut self.result_chart) {
+            (Some((up, set)), _) | (None, Some((up, set))) => Some((up, set.fitted())),
+            (None, None) => None,
+        };
+        let mut up = self
             .renderer
             .upload_boundary_within(render::UPLOAD_TIME_SLICE, past, chart);
-        if up.chart.is_some() {
-            self.chart = None;
+        if attempt {
+            if up.chart.is_some() {
+                self.chart = None;
+            }
+        } else if let Some(end) = up.chart.take() {
+            // The result view's: its own, never the attempt's answer.
+            self.result_chart = None;
+            self.result_table = Some(end);
         }
         if let Some(done) = &up.text {
             self.text_done(done);
@@ -1042,17 +1077,18 @@ impl Screen for MenuScreen {
     }
 
     fn upload_state(&self) -> render::UploadState {
-        match (self.renderer.upload_state(), &self.chart) {
-            (render::UploadState::Idle, Some(_)) if self.renderer.step_in_flight() => {
+        let charts = self.chart.is_some() || self.result_chart.is_some();
+        match (self.renderer.upload_state(), charts) {
+            (render::UploadState::Idle, true) if self.renderer.step_in_flight() => {
                 render::UploadState::InFlight
             }
-            (render::UploadState::Idle, Some(_)) => render::UploadState::Ready,
+            (render::UploadState::Idle, true) => render::UploadState::Ready,
             (state, _) => state,
         }
     }
 
     fn upload_waited(&self) -> bool {
-        self.chart.is_some() || self.renderer.waited_upload()
+        self.chart.is_some() || self.result_chart.is_some() || self.renderer.waited_upload()
     }
 
     fn loading_text(
@@ -1385,6 +1421,63 @@ impl Screen for MenuScreen {
             Err(e) if e.is_refusal() => Ok(Err(game::Chain(&e).to_string())),
             Err(e) => Err(e),
         }
+    }
+
+    fn install_creates(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        self.renderer.install_creates(kind, skin)
+    }
+
+    fn begin_result_view(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        state: &mut skin_model::ResultScreen,
+        view: &skin_model::ResultView,
+        labels: &skin_model::ResultLabels,
+        target: render::ResultChartTarget,
+        chart: Option<&Arc<crate::chart_images::ChartImages>>,
+    ) -> Result<Result<Option<skin_model::chart_image::ChartTable>, String>, RenderError> {
+        self.cancel_result_view();
+        if let Err(e) = skin.skin().update_result(state, view, labels) {
+            return Ok(Err(e.to_string()));
+        }
+        self.result_table = Some(match chart {
+            None => Ok(skin_model::chart_image::ChartTable::ABSENT),
+            Some(set) => match self
+                .renderer
+                .begin_result_chart(target, set.fitted(), set.id())
+            {
+                Ok(render::ResultChartBegin::Done(table)) => Ok(table),
+                Ok(render::ResultChartBegin::Begun(up)) => {
+                    self.result_chart = Some((up, Arc::clone(set)));
+                    return self.begin_result_text(state);
+                }
+                Err(e) => Err(e),
+            },
+        });
+        self.begin_result_text(state)
+    }
+
+    fn result_view_ready(
+        &mut self,
+        state: &mut skin_model::ResultScreen,
+    ) -> Option<Result<Result<skin_model::chart_image::ChartTable, String>, RenderError>> {
+        // Its images first, then its lines.
+        if self.result_chart.is_some() || self.result_table.is_none() {
+            return None;
+        }
+        let text = self.renderer.result_text_answer(state)?;
+        let table = self.result_table.take()?;
+        Some(match text {
+            Err(e) if e.is_refusal() => Ok(Err(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+            Ok(()) => crate::render_side::chart_absent(table).map(Ok),
+        })
+    }
+
+    fn cancel_result_view(&mut self) {
+        self.result_chart = None;
+        self.result_table = None;
+        self.renderer.cancel_result_text();
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

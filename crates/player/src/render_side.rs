@@ -606,6 +606,12 @@ pub trait Screen: Send {
     ) -> Option<Result<Preparation, RenderError>> {
         Some(self.install(kind, skin, request))
     }
+    /// Whether staging `skin` as `kind`'s would create an array of its own
+    /// ([`render::Renderer::install_creates`]); never by default.
+    fn install_creates(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        let _ = (kind, skin);
+        false
+    }
     /// Whether a loading text is in the uploader's hand; none by default.
     fn loading_text_held(&self) -> bool {
         false
@@ -646,6 +652,57 @@ pub trait Screen: Send {
         let _ = (skin, state, view, labels);
         Ok(Err("this screen draws no declarative skin".to_owned()))
     }
+    /// Begins a result view's staging on `state`, a state of `skin`'s
+    /// whose installation for request `target` is staged (or committed):
+    /// the view and labels taken ([`skin_model::Skin::update_result`]),
+    /// then its chart images `chart` and its lines in the uploader's steps
+    /// (design.md "Memory Budget", the uploader), the lines staged for the
+    /// result bundle, not drawn until
+    /// [`install_result_text`](Self::install_result_text). `Some` with the
+    /// view's chart table when it is ready at once; `None` while it steps,
+    /// [`result_view_ready`](Self::result_view_ready) answering it. A
+    /// staging begun before is cancelled. Allocates. The default prepares
+    /// it whole at once: the chart images, then the text.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is the device's; the inner one the skin's refusal
+    /// on a healthy device.
+    fn begin_result_view(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        state: &mut skin_model::ResultScreen,
+        view: &skin_model::ResultView,
+        labels: &skin_model::ResultLabels,
+        target: render::ResultChartTarget,
+        chart: Option<&Arc<crate::chart_images::ChartImages>>,
+    ) -> Result<Result<Option<skin_model::chart_image::ChartTable>, String>, RenderError> {
+        let table = match chart {
+            None => skin_model::chart_image::ChartTable::ABSENT,
+            Some(set) => chart_absent(self.write_result_chart(target, set.fitted(), set.id()))?,
+        };
+        Ok(self
+            .prepare_result(skin, state, view, labels)?
+            .map(|()| Some(table)))
+    }
+    /// The result view's staging begun by
+    /// [`begin_result_view`](Self::begin_result_view), once its steps
+    /// ended: its chart table, its lines staged. `None` while it steps.
+    /// None by default, which stages at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_result_view`](Self::begin_result_view).
+    fn result_view_ready(
+        &mut self,
+        state: &mut skin_model::ResultScreen,
+    ) -> Option<Result<Result<skin_model::chart_image::ChartTable, String>, RenderError>> {
+        let _ = state;
+        None
+    }
+    /// Drops the result view's staging in hand, if any. Nothing by
+    /// default.
+    fn cancel_result_view(&mut self) {}
     /// Installs the result's staged lines, at the commit point: whether
     /// they were. Allocates nothing. Never by default.
     fn install_result_text(&mut self) -> bool {
@@ -5022,6 +5079,7 @@ pub fn spawn(
                 first_frame: None,
                 result_hold: None,
                 wait_page: None,
+                wait_laid: false,
                 extent: None,
                 applied: None,
                 selected: None,
@@ -5289,7 +5347,7 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
         Mode::Play { .. } => K::Play,
         Mode::End => K::End,
         Mode::Selection => K::Selection,
-        Mode::Result | Mode::ResultPending { .. } => K::Result,
+        Mode::Result | Mode::ResultPending => K::Result,
         Mode::Menu {
             loading: Some(_), ..
         } => K::Loading,
@@ -5372,7 +5430,7 @@ fn stage_of(mode: &Mode, f: &StageFacts) -> crate::measure::Stage {
         }
         Mode::End => result(None),
         Mode::Result => result(f.result.map(|r| r.path)),
-        Mode::ResultPending { .. } => result(Some(crate::measure::ResultPath::Pending)),
+        Mode::ResultPending => result(Some(crate::measure::ResultPath::Pending)),
         Mode::Selection => {
             let (lifetime, skinned) = f.selection.unwrap_or((0, false));
             let drew = if skinned { Drew::Skin } else { Drew::BuiltIn };
@@ -5987,10 +6045,8 @@ enum Mode {
     Result,
     /// The result's pending presentation, with no result side
     /// ([`Run::result_hold`], design.md "Rendering and Skins", the
-    /// result's hold): the wait page, `changed` until it is laid out.
-    ResultPending {
-        changed: bool,
-    },
+    /// result's hold): the wait page.
+    ResultPending,
 }
 
 /// The select screen as the render thread holds it: the newest update
@@ -6425,6 +6481,8 @@ enum Creation {
     Pages,
     /// A result skin's selection: its staging's first take.
     Select,
+    /// A result view's staging: its installation's first take.
+    ResultView,
 }
 
 /// A result skin's selection in hand ([`Run::begin_select`]).
@@ -6654,6 +6712,8 @@ pub(crate) enum HeavyKind {
     PagesCreation,
     /// A result skin's selection taken, its array created.
     SelectCreation,
+    /// A result view's staging taken, its union's array created.
+    ResultCreation,
 }
 
 /// The regime a boundary read (design.md "Load Pipeline", the
@@ -6730,6 +6790,9 @@ struct Run {
     result_hold: Option<ResultHold>,
     /// The result's pending presentation, composed once.
     wait_page: Option<MenuPage>,
+    /// The last frame drawn was the pending presentation: its page is
+    /// laid out.
+    wait_laid: bool,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
     /// The size last applied to the screen; `None` until one is, and for
@@ -7027,7 +7090,7 @@ impl Run {
                     Mode::Decision => 5,
                     Mode::Selection => 6,
                     Mode::Result => 7,
-                    Mode::ResultPending { .. } => 8,
+                    Mode::ResultPending => 8,
                 },
             );
             self.sync_chart();
@@ -7426,7 +7489,7 @@ impl Run {
                         // the pending presentation draws from the rebuilt
                         // screen's first frame.
                         h.held = false;
-                        mode = Mode::ResultPending { changed: true };
+                        mode = Mode::ResultPending;
                     }
                     continue;
                 }
@@ -7809,10 +7872,8 @@ impl Run {
             // The result's hold before the hand-over: the outgoing screen
             // (the play's) draws until the bound, the pending presentation
             // after it.
-            if !matches!(mode, Mode::Result | Mode::ResultPending { .. })
-                && self.result_hold_passed()
-            {
-                mode = Mode::ResultPending { changed: true };
+            if !matches!(mode, Mode::Result | Mode::ResultPending) && self.result_hold_passed() {
+                mode = Mode::ResultPending;
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -7939,6 +8000,49 @@ impl Run {
                     first.hold_ended(crate::measure::HoldEnd::Skin);
                 }
                 self.first_frame = Some(first);
+            }
+            // The result's held pass after the hand-over: nothing built or
+            // presented while the first view stages within the bound; its
+            // outgoing phase ends at the bound, a size notice, a target
+            // change or a lost device, never to resume.
+            if matches!(mode, Mode::Result)
+                && self.result_hold.is_some_and(|h| h.held)
+                && self.result.as_ref().is_some_and(|s| {
+                    s.presented.is_none() && s.prepared.is_none() && s.staging.is_some()
+                })
+            {
+                let lost = self.screen.as_ref().is_some_and(|s| s.device_lost());
+                match self.result_held().filter(|_| !lost) {
+                    Some(from) => {
+                        let now = self.clock.now();
+                        #[cfg(test)]
+                        let now = hold_now(&self.shared, now, from);
+                        let wait = held_wait(now, from, first_frame_bound(&self.shared))
+                            .map_or(Duration::ZERO, |w| {
+                                Duration::from_micros(w.0.unsigned_abs())
+                            });
+                        #[cfg(test)]
+                        self.shared.held[0].fetch_add(1, Ordering::SeqCst);
+                        match self.screen.as_ref().map(|s| s.upload_state()) {
+                            // A step ready to write: the next pass at once.
+                            Some(render::UploadState::Ready) => {}
+                            Some(render::UploadState::InFlight) => self.wait_step(wait),
+                            _ => {
+                                #[cfg(test)]
+                                count_wait(&self.shared, WaitKind::HeldPace);
+                                std::thread::sleep(wait);
+                            }
+                        }
+                        #[cfg(test)]
+                        self.shared.held[1].fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    None => {
+                        if let Some(h) = &mut self.result_hold {
+                            h.held = false;
+                        }
+                    }
+                }
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -8170,6 +8274,8 @@ impl Run {
             // its instant: the presents of the last second, the local time
             // and the uptime, the clock reading 0 at launch.
             let mut frame_at = self.clock.now();
+            // Whether this frame draws the result's pending presentation.
+            let mut pending_frame = false;
             // Whether a result frame was built with its skin (dev-tools:
             // G3's and G5's ends).
             #[cfg(feature = "dev-tools")]
@@ -8795,6 +8901,7 @@ impl Run {
                             path: match built {
                                 ResultDrawn::Built => crate::measure::ResultPath::Skin,
                                 ResultDrawn::BuiltIn => crate::measure::ResultPath::BuiltIn,
+                                ResultDrawn::Pending => crate::measure::ResultPath::Pending,
                                 ResultDrawn::Refused(_) => crate::measure::ResultPath::Refused,
                             },
                             page: self.end_page.0,
@@ -8830,6 +8937,13 @@ impl Run {
                         ResultDrawn::BuiltIn => screen
                             .end(&page(self.result.as_ref(), &self.end_page.1))
                             .map(|p| (timing_of(p), None)),
+                        ResultDrawn::Pending => {
+                            let page = self
+                                .wait_page
+                                .get_or_insert_with(crate::loading_text::skin_wait_page);
+                            pending_frame = true;
+                            screen.menu(page, !self.wait_laid).map(|t| (t, None))
+                        }
                         ResultDrawn::Refused(e) => {
                             // Refused on a healthy device: the built-in page
                             // draws in this frame, and the result kind is
@@ -8948,15 +9062,15 @@ impl Run {
                         }
                     }
                 }
-                Mode::ResultPending { changed } => {
-                    // The wait page, laid out at the mode's first frame; no
-                    // result picture (design.md "Rendering and Skins", the
+                Mode::ResultPending => {
+                    // The wait page, laid out at its first frame; no result
+                    // picture (design.md "Rendering and Skins", the
                     // result's hold).
                     let page = self
                         .wait_page
                         .get_or_insert_with(crate::loading_text::skin_wait_page);
-                    let drawn = screen.menu(page, *changed).map(|t| (t, None));
-                    *changed = false;
+                    pending_frame = true;
+                    let drawn = screen.menu(page, !self.wait_laid).map(|t| (t, None));
                     #[cfg(feature = "dev-tools")]
                     {
                         result_stamp = Some(crate::measure::ResultStamp {
@@ -9027,6 +9141,7 @@ impl Run {
             if decision_refused.is_some() {
                 self.shared.decision_cleanup_gate.pass();
             }
+            self.wait_laid = pending_frame && drawn.is_ok();
             #[cfg(feature = "dev-tools")]
             crate::dev::loop_probe::mark("draw1", 0);
             // A result or end frame lost as a device loss (dev-tools: a
@@ -9351,10 +9466,11 @@ impl Run {
                     if timing.presented()
                         && (matches!(mode, Mode::End)
                             || matches!(mode, Mode::Result)
-                                && self
-                                    .result
-                                    .as_ref()
-                                    .is_none_or(|r| r.incoming.is_none() && r.prepared.is_none()))
+                                && self.result.as_ref().is_none_or(|r| {
+                                    r.incoming.is_none()
+                                        && r.staging.is_none()
+                                        && r.prepared.is_none()
+                                }))
                     {
                         self.shared
                             .end_drawn
@@ -9517,6 +9633,25 @@ impl Run {
         )
     }
 
+    /// The result's held pass (design.md "Rendering and Skins", the
+    /// result's hold): from the hand-over, while the hold's outgoing phase
+    /// lasts, the side has no view presented or prepared, the bound has
+    /// not passed and the image on screen is valid, the pass presents
+    /// nothing; the preparation's start, then.
+    fn result_held(&self) -> Option<TimeUs> {
+        let h = self.result_hold.filter(|h| h.held)?;
+        let side = self.result.as_ref()?;
+        if side.presented.is_some() || side.prepared.is_some() || self.screen.is_none() {
+            return None;
+        }
+        let now = self.clock.now();
+        #[cfg(test)]
+        let now = hold_now(&self.shared, now, h.from);
+        (held_wait(now, h.from, first_frame_bound(&self.shared)).is_some()
+            && self.image.valid(notices_of(self.extent.as_ref())))
+        .then_some(h.from)
+    }
+
     /// The result's hold's own lifetime check, at the top of a loop turn
     /// while one lasts: a mark that no longer names it (released, or a
     /// newer hold begun) drops it, and its pending presentation turns
@@ -9529,7 +9664,7 @@ impl Run {
             return;
         }
         self.result_hold = None;
-        if matches!(mode, Mode::ResultPending { .. }) {
+        if matches!(mode, Mode::ResultPending) {
             *mode = Mode::Idle;
         }
     }
@@ -9832,6 +9967,9 @@ impl Run {
     /// the image held is valid and the bound has not passed. Changes
     /// nothing.
     fn held(&self, mode: &Mode) -> Option<TimeUs> {
+        if matches!(mode, Mode::Result) {
+            return self.result_held();
+        }
         let (
             Mode::Menu {
                 loading: Some(lifetime),
@@ -10169,6 +10307,18 @@ impl Run {
                     }
                     self.poll_select();
                 }
+                Creation::ResultView => {
+                    #[cfg(feature = "dev-tools")]
+                    let uploads = self.screen.as_ref().map_or(0, |s| s.atlas_uploads());
+                    if let Some(st) = self.result.as_mut().and_then(|r| r.staging.as_mut()) {
+                        st.taken = true;
+                        #[cfg(feature = "dev-tools")]
+                        {
+                            st.uploads = uploads;
+                        }
+                    }
+                    self.prepare_result();
+                }
             }
             #[cfg(test)]
             self.note_heavy_record(HeavyRec {
@@ -10176,6 +10326,7 @@ impl Run {
                     Creation::Play => HeavyKind::PlayCreation,
                     Creation::Pages => HeavyKind::PagesCreation,
                     Creation::Select => HeavyKind::SelectCreation,
+                    Creation::ResultView => HeavyKind::ResultCreation,
                 },
                 start,
                 end: Instant::now(),
@@ -10297,6 +10448,13 @@ impl Run {
             Some(Creation::Pages)
         } else if self.select_hand.as_ref().is_some_and(|h| !h.taken) {
             Some(Creation::Select)
+        } else if self
+            .result
+            .as_ref()
+            .and_then(|r| r.staging.as_ref())
+            .is_some_and(|s| !s.taken)
+        {
+            Some(Creation::ResultView)
         } else {
             None
         }
@@ -12009,6 +12167,9 @@ enum ResultDrawn {
     Built,
     /// The built-in page of the view presented.
     BuiltIn,
+    /// The result's pending presentation: no view presented, the first
+    /// one staging (design.md "Rendering and Skins", the result's hold).
+    Pending,
     /// The skin refused its frame on a healthy device: nothing of it was
     /// staged.
     Refused(BuildError),
@@ -12047,6 +12208,31 @@ fn stage_result_chart(
     }
 }
 
+/// A result view's chart table from a write's outcome: a target with no
+/// chart layer and a refused write (a misfit, a level mismatch, a write
+/// the device refused) leave an all-absent table, never a failed screen.
+///
+/// # Errors
+///
+/// The device's failure during the write.
+pub(crate) fn chart_absent(
+    written: Result<skin_model::chart_image::ChartTable, RenderError>,
+) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+    use skin_model::chart_image::ChartTable;
+    match written {
+        Ok(table) => Ok(table),
+        Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
+        Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
+            eprintln!(
+                "render: the result's chart images are not shown: {}",
+                Chain(&e)
+            );
+            Ok(ChartTable::ABSENT)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The strip's text slots, after the one drawn: the one prepared with a
 /// view payload waiting, and the one prepared for the view presented.
 pub(super) const STRIP_PREPARED: usize = 1;
@@ -12069,6 +12255,49 @@ struct HeldView {
     script: ScriptSlot,
 }
 
+/// A view payload whose staging steps (design.md "beatoraja Lua Skins",
+/// the result skin): its request; whether its installation's first take
+/// ran, a creation owed to the boundary's allowance until then; and, once
+/// that installation answered ready, its token and the skin state whose
+/// chart images and text step.
+struct StagingView {
+    held: HeldView,
+    request: u64,
+    taken: bool,
+    token: Option<PreparedToken>,
+    state: Option<skin_model::ResultScreen>,
+    /// The atlas uploads counted before its first take (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    uploads: u64,
+}
+
+/// How a result view's staging ended.
+enum StagingEnd {
+    /// Its steps completed: its text staged, or the skin's refusal of it.
+    Text(Result<(), String>),
+    /// Its installation was refused, with why.
+    Refused(String),
+    /// The device failed.
+    Failed(RenderError),
+}
+
+impl StagingView {
+    /// Withdraws what the screen holds of it: its chart images and text
+    /// in hand, and what was staged for its request, in flight or
+    /// answered, whose array retires into its own entry.
+    fn withdraw(&self, screen: &mut dyn Screen) {
+        if !self.taken {
+            return;
+        }
+        screen.cancel_result_view();
+        screen.discard_token(self.token.unwrap_or(PreparedToken {
+            request: self.request,
+            device: screen.device(),
+            kind: ScreenKind::Result,
+        }));
+    }
+}
+
 /// A view payload prepared and not yet presented: its staging's token.
 struct PreparedView {
     held: HeldView,
@@ -12083,6 +12312,10 @@ struct PreparedView {
 struct ResultSide {
     lifetime: u64,
     incoming: Option<Box<ResultPresentation>>,
+    /// The view payload whose staging steps (design.md "beatoraja Lua
+    /// Skins", the result skin), asked again each pass with the same
+    /// request until its last step completes, when it is prepared.
+    staging: Option<StagingView>,
     prepared: Option<PreparedView>,
     presented: Option<HeldView>,
     /// The lifetime's origin, its `screen` timer's start (design.md
@@ -12128,6 +12361,7 @@ impl ResultSide {
         Self {
             lifetime,
             incoming: None,
+            staging: None,
             prepared: None,
             presented: None,
             origin: None,
@@ -12177,6 +12411,7 @@ impl ResultSide {
             .presented
             .iter_mut()
             .chain(self.prepared.iter_mut().map(|v| &mut v.held))
+            .chain(self.staging.iter_mut().map(|v| &mut v.held))
             .chain(self.dropped.iter_mut().flatten())
             .chain(self.overflow.iter_mut())
         {
@@ -12186,7 +12421,10 @@ impl ResultSide {
 
     /// Whether it has something to draw.
     const fn shows(&self) -> bool {
-        self.incoming.is_some() || self.prepared.is_some() || self.presented.is_some()
+        self.incoming.is_some()
+            || self.staging.is_some()
+            || self.prepared.is_some()
+            || self.presented.is_some()
     }
 
     /// Prints the lifetime's book (dev-tools: a scenario run's runtime
@@ -12314,10 +12552,14 @@ impl Run {
             }
         }
         if let Some(side) = self.result.take()
-            && let Some(token) = side.prepared.and_then(|p| p.token)
             && let Some(screen) = &mut self.screen
         {
-            screen.discard_token(token);
+            if let Some(st) = side.staging {
+                st.withdraw(screen.as_mut());
+            }
+            if let Some(token) = side.prepared.and_then(|p| p.token) {
+                screen.discard_token(token);
+            }
         }
     }
 
@@ -12336,6 +12578,17 @@ impl Run {
         self.reconcile_result();
         if let Some(side) = &mut self.result {
             side.reapply = true;
+            // A staging on the old screen went with it: staged again.
+            if let Some(st) = side.staging.take() {
+                side.restaged = true;
+                side.incoming = Some(Box::new(ResultPresentation {
+                    lifetime: side.lifetime,
+                    revision: st.held.revision,
+                    request: st.request,
+                    payload: st.held.payload,
+                    overlay: st.held.overlay,
+                }));
+            }
             if let Some(p) = side.prepared.take() {
                 side.restaged = true;
                 side.incoming = Some(Box::new(ResultPresentation {
@@ -12590,6 +12843,22 @@ impl Run {
         // own rows: the one presented, else the one prepared, whose
         // staging the screen dropped (it commits as the built-in page, the
         // first presentation's rows and reason drawn in this frame).
+        if let Some(side) = &mut self.result
+            && let Some(mut st) = side.staging.take()
+        {
+            // The view staging becomes the view prepared, with no staging:
+            // its built-in page, the first view's when none is presented.
+            if let Some(screen) = &mut self.screen {
+                st.withdraw(screen.as_mut());
+            }
+            st.held.state = None;
+            if side.presented.is_none() && side.prepared.is_none() {
+                side.prepared = Some(PreparedView {
+                    held: st.held,
+                    token: None,
+                });
+            }
+        }
         if let Some(side) = &mut self.result {
             let latest = &self.end_page.1;
             let why = self.result_disabled.as_deref();
@@ -12719,18 +12988,29 @@ impl Run {
         if let Some(p) = side.incoming.take() {
             let same = |h: &HeldView| Arc::ptr_eq(&h.payload, &p.payload);
             let presented = side.presented.as_ref().is_some_and(same);
-            let known = presented || side.prepared.as_ref().is_some_and(|v| same(&v.held));
-            if presented && side.prepared.as_ref().is_some_and(|v| !same(&v.held)) {
+            let known = presented
+                || side.prepared.as_ref().is_some_and(|v| same(&v.held))
+                || side.staging.as_ref().is_some_and(|v| same(&v.held));
+            if presented {
                 // The newest is the view presented again: the other one
-                // prepared goes, so it is not committed after it.
-                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                // prepared or staging goes, so it is not committed after it.
+                if side.prepared.as_ref().is_some_and(|v| !same(&v.held))
+                    && let Some(token) = side.prepared.take().and_then(|v| v.token)
+                {
                     screen.discard_token(token);
+                }
+                if let Some(st) = side.staging.take() {
+                    st.withdraw(screen.as_mut());
                 }
             }
             if !known {
-                // A new view payload: the one prepared before goes.
+                // A new view payload: the one prepared or staging before
+                // goes.
                 if let Some(token) = side.prepared.take().and_then(|v| v.token) {
                     screen.discard_token(token);
+                }
+                if let Some(st) = side.staging.take() {
+                    st.withdraw(screen.as_mut());
                 }
                 let request = p.request;
                 let restaged = std::mem::take(&mut side.restaged);
@@ -12746,18 +13026,53 @@ impl Run {
                     page: None,
                     script: self.scripts.result_slot(p.payload.script),
                 };
-                let mut token = None;
-                let mut ok = true;
                 if !fresh && !restaged {
                     // A later attempt or selection superseded it: nothing
                     // of it is prepared, and it is no view's refusal.
-                    ok = false;
-                } else if let (Some(bundle), false) = (&p.payload.skin, disabled) {
-                    #[cfg(feature = "dev-tools")]
-                    let uploads = screen.atlas_uploads();
-                    #[cfg(feature = "dev-tools")]
-                    let p_t = render::probe::Span::start();
-                    let installed = screen.install(ScreenKind::Result, bundle, request);
+                } else if let (Some(_), false) = (&p.payload.skin, disabled) {
+                    // Its staging steps; an installation that creates an
+                    // array takes it first at a boundary the allowance
+                    // admits, any other at once.
+                    let taken = p
+                        .payload
+                        .skin
+                        .as_ref()
+                        .is_some_and(|b| !screen.install_creates(ScreenKind::Result, b));
+                    side.staging = Some(StagingView {
+                        held,
+                        request,
+                        taken,
+                        token: None,
+                        state: None,
+                        #[cfg(feature = "dev-tools")]
+                        uploads: screen.atlas_uploads(),
+                    });
+                } else {
+                    held.page = Some(crate::result_present::compose_page(
+                        &held.payload.page,
+                        &self.end_page.1,
+                        self.result_disabled
+                            .as_deref()
+                            .or_else(|| held.payload.why.as_ref().map(|(_, w)| w.as_str())),
+                    ));
+                    side.prepared = Some(PreparedView { held, token: None });
+                }
+            }
+            side.overlay = Some((p.revision, p.overlay));
+        }
+        // The staging in hand, asked again with the same request each pass
+        // until its last step completes (design.md "beatoraja Lua Skins",
+        // the result skin): its installation, then its chart images and
+        // text, none waiting for the GPU.
+        let mut ended: Option<StagingEnd> = None;
+        if let Some(st) = side.staging.as_mut().filter(|s| s.taken)
+            && let Some(bundle) = st.held.payload.skin.clone()
+        {
+            if st.token.is_none() {
+                #[cfg(feature = "dev-tools")]
+                let p_t = render::probe::Span::start();
+                let installed = screen.install_stepped(ScreenKind::Result, &bundle, st.request);
+                if let Some(installed) = installed {
                     #[cfg(feature = "dev-tools")]
                     {
                         crate::dev::loop_probe::mark(
@@ -12777,16 +13092,15 @@ impl Run {
                             "res:bundle_level_bytes",
                             crate::dev::loop_probe::pages_level_bytes(pages),
                         );
+                        crate::dev::result_staged(screen.atlas_uploads() - st.uploads);
                     }
-                    #[cfg(feature = "dev-tools")]
-                    crate::dev::result_staged(screen.atlas_uploads() - uploads);
                     // A refusal injected by a test of the real flow
                     // (dev-tools).
                     #[cfg(feature = "dev-tools")]
                     let installed = match installed {
                         Ok(Preparation::Ready) if crate::dev::refuse_result_staging() => {
                             screen.discard_token(PreparedToken {
-                                request,
+                                request: st.request,
                                 device: screen.device(),
                                 kind: ScreenKind::Result,
                             });
@@ -12794,115 +13108,153 @@ impl Run {
                         }
                         other => other,
                     };
-                    match installed {
+                    ended = match installed {
                         Ok(Preparation::Ready) => {
-                            let staged = PreparedToken {
-                                request,
+                            let token = PreparedToken {
+                                request: st.request,
                                 device: screen.device(),
                                 kind: ScreenKind::Result,
                             };
-                            token = Some(staged);
+                            st.token = Some(token);
                             let mut state = bundle.skin().prepare_result();
-                            #[cfg(feature = "dev-tools")]
-                            let p_t = render::probe::Span::start();
-                            // The view's images, into the array its
-                            // staging uses, keyed to its installation.
-                            let p_chart = stage_result_chart(
-                                screen.as_mut(),
-                                render::ResultChartTarget::Staged(staged),
-                                p.payload.chart.as_deref(),
-                            );
-                            #[cfg(feature = "dev-tools")]
-                            crate::dev::loop_probe::mark(
-                                "res:chart_us",
-                                crate::dev::loop_probe::us(p_t.elapsed()),
-                            );
-                            match p_chart {
-                                Ok(table) => state.set_chart_images(table),
-                                Err(e) => failed = Some(e),
-                            }
-                            #[cfg(feature = "dev-tools")]
-                            let p_t = render::probe::Span::start();
-                            let prepared = screen.prepare_result(
-                                bundle,
+                            let begun = screen.begin_result_view(
+                                &bundle,
                                 &mut state,
-                                &p.payload.view,
-                                &p.payload.labels,
+                                &st.held.payload.view,
+                                &st.held.payload.labels,
+                                render::ResultChartTarget::Staged(token),
+                                st.held.payload.chart.as_ref(),
                             );
-                            #[cfg(feature = "dev-tools")]
-                            crate::dev::loop_probe::mark(
-                                "res:text_us",
-                                crate::dev::loop_probe::us(p_t.elapsed()),
-                            );
-                            // A refusal injected by a test of the real flow
-                            // (dev-tools).
-                            #[cfg(feature = "dev-tools")]
-                            let prepared = match prepared {
-                                Ok(Ok(())) if crate::dev::refuse_result_text() => {
-                                    Ok(Err("dev: the view's text was refused".to_owned()))
+                            let end = match begun {
+                                Ok(Ok(Some(table))) => {
+                                    state.set_chart_images(table);
+                                    Some(StagingEnd::Text(Ok(())))
                                 }
-                                other => other,
+                                Ok(Ok(None)) => None,
+                                Ok(Err(why)) => Some(StagingEnd::Text(Err(why))),
+                                Err(e) => Some(StagingEnd::Failed(e)),
                             };
-                            match prepared {
-                                Ok(Ok(())) => held.state = Some(state),
-                                Ok(Err(why)) => {
-                                    // Disabled below; the first presentation
-                                    // still commits, as the built-in page with
-                                    // its own rows and the reason.
-                                    refused = Some(why);
-                                    ok = side.presented.is_none();
-                                }
-                                Err(e) => {
-                                    failed = Some(e);
-                                    ok = false;
-                                }
-                            }
+                            st.state = Some(state);
+                            end
                         }
-                        Ok(why) => {
-                            // The view's staging was refused: the presenter
-                            // shows the built-in result for it (scope view).
-                            let why = match why {
-                                Preparation::Refused(r) => r.to_string(),
-                                _ => "the staging was cancelled".to_owned(),
-                            };
-                            eprintln!("render: the result view's staging was refused: {why}");
-                            // The view draws the built-in page with its own
-                            // rows at once (scope view, the S10-09i design's
-                            // D7); the presenter's built-in payload for it
-                            // follows.
-                            held.page = Some(crate::result_present::compose_page(
-                                &held.payload.page,
-                                &self.end_page.1,
-                                Some(&why),
-                            ));
-                            side.refused = Some((p.payload.key, why));
-                        }
-                        Err(e) => {
-                            failed = Some(e);
-                            ok = false;
-                        }
-                    }
+                        Ok(why) => Some(StagingEnd::Refused(match why {
+                            Preparation::Refused(r) => r.to_string(),
+                            _ => "the staging was cancelled".to_owned(),
+                        })),
+                        Err(e) => Some(StagingEnd::Failed(e)),
+                    };
                 }
-                if ok {
-                    if held.page.is_none() && (held.state.is_none() || disabled) {
+            } else if let Some(state) = st.state.as_mut() {
+                ended = match screen.result_view_ready(state) {
+                    None => None,
+                    Some(Ok(Ok(table))) => {
+                        state.set_chart_images(table);
+                        Some(StagingEnd::Text(Ok(())))
+                    }
+                    Some(Ok(Err(why))) => Some(StagingEnd::Text(Err(why))),
+                    Some(Err(e)) => Some(StagingEnd::Failed(e)),
+                };
+            }
+        }
+        // A refusal of the text injected by a test of the real flow
+        // (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let ended = match ended {
+            Some(StagingEnd::Text(Ok(()))) if crate::dev::refuse_result_text() => Some(
+                StagingEnd::Text(Err("dev: the view's text was refused".to_owned())),
+            ),
+            other => other,
+        };
+        // Its chart images and text ended (dev-tools: the transition
+        // probe's view staged).
+        #[cfg(feature = "dev-tools")]
+        if matches!(ended, Some(StagingEnd::Text(_))) {
+            crate::dev::loop_probe::mark("res:chart_us", 0);
+        }
+        if let Some(end) = ended
+            && let Some(st) = side.staging.take()
+        {
+            let StagingView {
+                mut held,
+                request,
+                token,
+                state,
+                ..
+            } = st;
+            match end {
+                StagingEnd::Text(Ok(())) => {
+                    held.state = state;
+                    side.prepared = Some(PreparedView { held, token });
+                }
+                StagingEnd::Text(Err(why)) => {
+                    // Disabled below; the first presentation still commits,
+                    // as the built-in page with its own rows and the reason.
+                    refused = Some(why);
+                    if side.presented.is_none() {
                         held.page = Some(crate::result_present::compose_page(
                             &held.payload.page,
                             &self.end_page.1,
-                            self.result_disabled
-                                .as_deref()
-                                .or_else(|| held.payload.why.as_ref().map(|(_, w)| w.as_str())),
+                            held.payload.why.as_ref().map(|(_, w)| w.as_str()),
                         ));
+                        side.prepared = Some(PreparedView { held, token });
+                    } else if let Some(token) = token {
+                        screen.cancel_result_view();
+                        screen.discard_token(token);
                     }
-                    side.prepared = Some(PreparedView { held, token });
-                } else if let Some(token) = token {
-                    screen.discard_token(token);
+                }
+                StagingEnd::Refused(why) => {
+                    // The view's staging was refused: the presenter shows
+                    // the built-in result for it (scope view).
+                    eprintln!("render: the result view's staging was refused: {why}");
+                    // The view draws the built-in page with its own rows at
+                    // once (scope view, the S10-09i design's D7); the
+                    // presenter's built-in payload for it follows.
+                    held.page = Some(crate::result_present::compose_page(
+                        &held.payload.page,
+                        &self.end_page.1,
+                        Some(&why),
+                    ));
+                    side.refused = Some((held.payload.key, why));
+                    side.prepared = Some(PreparedView { held, token: None });
+                }
+                StagingEnd::Failed(e) => {
+                    // The screen fails below: the view is staged again on
+                    // the screen built again (`result_rebuilt`).
+                    failed = Some(e);
+                    if let Some(token) = token {
+                        screen.cancel_result_view();
+                        screen.discard_token(token);
+                    }
+                    side.staging = Some(StagingView {
+                        held,
+                        request,
+                        taken: false,
+                        token: None,
+                        state: None,
+                        #[cfg(feature = "dev-tools")]
+                        uploads: 0,
+                    });
                 }
             }
-            side.overlay = Some((p.revision, p.overlay));
         }
         // The strip's text for what each outcome of the commit point
         // presents: the view prepared, or the view presented, with the
         // newest overlay.
+        // A view prepared once its staging ended, after the overlay merged
+        // into the view presented, takes that one.
+        if let Some(v) = &side.prepared
+            && side.overlay.is_none()
+        {
+            let overlay = side
+                .presented
+                .as_ref()
+                .filter(|h| h.revision > v.held.revision)
+                .map_or(&v.held.overlay, |h| &h.overlay);
+            let lines = strip_lines(&v.held.payload, overlay, side.stop);
+            if let Err(e) = screen.prepare_result_strip(STRIP_PREPARED, &lines) {
+                failed = Some(e);
+            }
+        }
         if let Some((_, overlay)) = &side.overlay {
             if let Some(v) = &side.prepared {
                 let lines = strip_lines(&v.held.payload, overlay, side.stop);
@@ -12992,8 +13344,8 @@ impl Run {
                     side.discard = v.token.or(side.discard);
                     side.drop_later(v.held);
                 }
-                if let (Some((revision, overlay)), Some(h)) =
-                    (side.overlay.take(), side.presented.as_mut())
+                if let Some(h) = side.presented.as_mut()
+                    && let Some((revision, overlay)) = side.overlay.take()
                 {
                     h.revision = h.revision.max(revision);
                     h.overlay = overlay;
@@ -13039,6 +13391,14 @@ impl Run {
                     if let Some((revision, overlay)) = side.overlay.take() {
                         h.revision = h.revision.max(revision);
                         h.overlay = overlay;
+                    } else if let Some(old) = side.presented.as_mut()
+                        && old.revision > h.revision
+                    {
+                        // A newer overlay merged into the view it replaces
+                        // while it staged: it goes on, taken from the view
+                        // dropped after the frame.
+                        h.revision = old.revision;
+                        h.overlay = std::mem::take(&mut old.overlay);
                     }
                     screen.use_result_strip(STRIP_PREPARED);
                     if let Some(old) = side.presented.as_mut() {
@@ -13057,8 +13417,8 @@ impl Run {
                     if let Some(old) = side.presented.replace(h) {
                         side.drop_later(old);
                     }
-                } else if let (Some((revision, overlay)), Some(h)) =
-                    (side.overlay.take(), side.presented.as_mut())
+                } else if let Some(h) = side.presented.as_mut()
+                    && let Some((revision, overlay)) = side.overlay.take()
                 {
                     h.revision = h.revision.max(revision);
                     h.overlay = overlay;
@@ -13136,7 +13496,11 @@ impl Run {
         };
         let origin = side.origin;
         let Some(h) = side.presented.as_mut() else {
-            return ResultDrawn::BuiltIn;
+            return if side.staging.is_some() {
+                ResultDrawn::Pending
+            } else {
+                ResultDrawn::BuiltIn
+            };
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
             let frame = skin_model::ResultFrame {
