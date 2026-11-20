@@ -1002,3 +1002,56 @@ fn result_chart_frame_alloc() {
     assert!(control > 0, "the count sees allocations");
     assert!(counts.iter().all(|&n| n == 0), "{counts:?}");
 }
+
+/// R5: an attempt's admission that releases the result's installation is
+/// recorded with the attempt's request and published before its answer
+/// (`ResultReport::released`), which the result step reads.
+#[test]
+fn a_release_by_an_attempts_admission_is_published_with_its_request() {
+    let (_dir, skin, _) = chart_skin("");
+    let big = {
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        crate::render_decl::atlas_cap_bundle(&r, [0, 0, 255, 255])
+    };
+    let mut rig = Rig::new();
+    rig.link
+        .set_timeouts(Duration::from_secs(60), Duration::from_secs(10));
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(skin_model::ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.faults.charge_result.store(
+        render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + 256 * 256 * 2,
+        Ordering::Release,
+    );
+    assert_eq!(
+        rig.link
+            .select(skin_model::ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert_eq!(rig.link.result_status().released, None);
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let mut attempt = rig.link.begin_attempt(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(big),
+    );
+    let request = attempt.request();
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    let status = rig.link.result_status();
+    assert_eq!(status.released, Some(request), "{status:?}");
+    assert_eq!(status.installed, None, "{status:?}");
+    rig.exit();
+}

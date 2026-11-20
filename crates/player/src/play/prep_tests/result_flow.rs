@@ -883,9 +883,10 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     assert_eq!(values("prep:begin"), [0, 1]);
     assert_eq!(values("img:stage_end"), [1, 1]);
     // Each attempt's result upload: inside its select (the play skin's own
-    // select, at the rig's start, is upload 0), its levels' writes summing
-    // to its pages' bytes with the built-in layer's 128² texels, its pages
-    // the bundle's; none refused.
+    // select, at the rig's start, is upload 0), its levels' writes, made in
+    // the uploader's steps after its creation and before its answer
+    // (design.md "Load Pipeline"), summing to its pages' bytes with the
+    // built-in layer's 128² texels, its pages the bundle's; none refused.
     let begins = times("up:selskin:begin");
     assert_eq!(begins.len(), 3, "{begins:?}");
     for k in 0..2 {
@@ -893,7 +894,7 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         let t0 = one("up:selskin:t0", k + 1);
         let begin = one("up:selskin:begin", k + 1);
         assert!(sent < t0 && begin < ready, "upload {k} outside its select");
-        let written: i64 = within("wt:selskin:bytes", t0, begin).iter().sum();
+        let written: i64 = within("wt:selskin:bytes", t0, ready).iter().sum();
         let raw = values("up:selskin:raw_bytes")[k + 1];
         assert_eq!(written + 128 * 128 * 4, raw, "upload {k}'s writes");
         assert_eq!(values("res:bundle_level_bytes")[k] + 128 * 128 * 4, raw);
@@ -1001,4 +1002,56 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     );
     // Nothing lost for want of room.
     assert_eq!(crate::dev::loop_probe::tests::dropped(), 0);
+}
+
+/// §5.1's step 3 (design.md "Memory Budget", the result pages upload):
+/// the attempt's own pages ticket is begun after its PrepareAttempt, its
+/// array uploaded before the commit, and the commit waits for its
+/// publication instead of selecting the pages; the result draws on them.
+/// A retry whose pages are installed begins no ticket and uploads
+/// nothing (step 5, V10g).
+#[test]
+fn the_attempts_pages_are_its_own_ticket_and_a_retry_sends_nothing() {
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    // A pending skin reading a result fact: its layout is the view's, so
+    // the attempt uploads its pages.
+    let skin = lua_result(
+        "local nr = ms.number(154)",
+        &format!("d[#d + 1] = {MARK_DST}"),
+    );
+    let p = result::pending(skin.path(), result::LIMITS);
+    on_warp(l.chart(), true, |rig, seen| {
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))))
+            .with_scripts(rig.render.scripts().clone());
+        let u0 = crate::dev::result_uploads();
+        let mut h = begin(rig, &l);
+        readied(rig, &mut h);
+        assert!(rig.pages_ticket.is_some(), "begun with the preparation");
+        assert_eq!(
+            crate::dev::result_uploads() - u0,
+            1,
+            "its array uploaded before the commit"
+        );
+        rig.commit_attempt().unwrap();
+        assert!(rig.pages_ticket.is_none(), "settled at the commit");
+        let (atlas, _) = uploaded(rig);
+        assert_eq!(rig.render.result_status().installed, Some(atlas));
+        let first = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+        assert!(
+            first.is_some_and(|[_, m]| near(m, MARK)),
+            "drawn: {first:?}"
+        );
+        // The retry: its pages installed, nothing begun or uploaded.
+        let mut h = begin(rig, &l);
+        readied(rig, &mut h);
+        assert!(rig.pages_ticket.is_none(), "installed: no ticket");
+        rig.commit_attempt().unwrap();
+        assert_eq!(
+            crate::dev::result_uploads() - u0,
+            1,
+            "nothing uploaded again"
+        );
+        assert_eq!(rig.render.result_status().installed, Some(atlas));
+    });
 }

@@ -9,6 +9,7 @@
 //! render thread draws at the clock minus the origin. This thread runs the
 //! logic step, woken by the input thread after each publication.
 
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -434,6 +435,11 @@ pub struct PlayerRig<'a> {
     /// thread's failure: the end of loading does not wait on the render
     /// thread, which may still be in it.
     pub result_withdrawn: bool,
+    /// The attempt's own result pages ticket (design.md "Memory Budget",
+    /// the result pages upload): begun right after its `PrepareAttempt`
+    /// when its result names pages not installed, and its answer once
+    /// polled. Dropped unanswered, it is withdrawn.
+    pub pages_ticket: Option<PagesTicket>,
     /// The current attempt asked for READY's cutoff already
     /// ([`Rig::cutoff`]): cleared at each attempt's preparation, so a
     /// deferred opening of the same attempt asks no second one.
@@ -577,6 +583,15 @@ enum PrepStage {
     /// Answered: with the render request answered ready, which the final
     /// readiness and the commit name; `None` when it failed.
     Answered(Option<u64>),
+}
+
+/// The attempt's own result pages ticket: the pages it uploads and its
+/// answer once a look took it.
+#[derive(Debug)]
+pub struct PagesTicket {
+    pending: crate::render_side::PendingPages,
+    pages: Arc<skin_model::PackedPages>,
+    answer: Option<Result<crate::render_side::PagesAnswer, ScreenError>>,
 }
 
 /// How the play skin's stage began.
@@ -825,7 +840,64 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::loop_probe::mark("att:send", 0);
         prep.staging = Instant::now();
-        PrepStage::Screen(self.render.begin_attempt(attempt, skin))
+        let stage = PrepStage::Screen(self.render.begin_attempt(attempt, skin));
+        // After its PrepareAttempt, so play's admission comes first on the
+        // render thread.
+        self.begin_pages_ticket();
+        stage
+    }
+
+    /// The attempt's own result pages ticket (design.md "Memory Budget",
+    /// the result pages upload, §5.1's step 3): begun when the attempt's
+    /// result names pages whose atlas the result status does not name as
+    /// installed; an earlier ticket is withdrawn first.
+    fn begin_pages_ticket(&mut self) {
+        self.pages_ticket = None;
+        let status = self.render.result_status();
+        if status.disabled.is_some() {
+            return;
+        }
+        let Some(crate::result_skin::Upload::Pages(pages)) = self.result_skin.upload() else {
+            return;
+        };
+        if status.installed == Some(pages.id()) {
+            return;
+        }
+        // Development builds' `cold` asks for the pages after the commit,
+        // through a selection that removes the installation first (G1).
+        #[cfg(feature = "dev-tools")]
+        if crate::dev::result_cold() {
+            return;
+        }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("res:pages_begun", 0);
+        self.pages_ticket = Some(PagesTicket {
+            pending: self.render.begin_result_pages(Arc::clone(&pages)),
+            pages,
+            answer: None,
+        });
+    }
+
+    /// Looks at the attempt's own ticket once, without waiting: its answer
+    /// kept; lost before play's commit, it is begun again on the screen
+    /// built again (design.md "Memory Budget", the result pages upload,
+    /// Recovery).
+    fn look_at_pages_ticket(&mut self) {
+        let Some(t) = self.pages_ticket.as_mut() else {
+            return;
+        };
+        match t.pending.poll(Duration::ZERO) {
+            Some(Ok(crate::render_side::PagesAnswer::Lost)) => {
+                let pages = Arc::clone(&t.pages);
+                self.pages_ticket = Some(PagesTicket {
+                    pending: self.render.begin_result_pages(Arc::clone(&pages)),
+                    pages,
+                    answer: None,
+                });
+            }
+            Some(answer) => t.answer = Some(answer),
+            None => {}
+        }
     }
 
     /// The render thread's answer to the attempt's preparation `pending`,
@@ -1027,6 +1099,10 @@ impl PlayerRig<'_> {
     /// unanswered render request is discarded as it drops. `None` when no
     /// preparation was begun.
     fn drop_prep(&mut self) -> Option<crate::imports::Settled> {
+        // Its own ticket withdrawn: a publication after it installs nothing.
+        if let Some(mut t) = self.pages_ticket.take() {
+            t.pending.withdraw();
+        }
         let mut prep = self.prep.take()?;
         let settled = match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
             PrepStage::Skin(mut job) => match self.pending.take() {
@@ -1059,6 +1135,9 @@ impl PlayerRig<'_> {
     /// bound, the specialization's outcome kept from a successful run and
     /// the image stage's images handed back unless it was abandoned.
     fn end_prep(&mut self) {
+        if let Some(mut t) = self.pages_ticket.take() {
+            t.pending.withdraw();
+        }
         let Some(mut prep) = self.prep.take() else {
             return;
         };
@@ -1310,6 +1389,105 @@ impl PlayerRig<'_> {
         self.result_outro = None;
     }
 
+    /// The request the attempt's preparation was answered ready with, which
+    /// its commit installed.
+    fn answered_request(&self) -> Option<u64> {
+        match self.prep.as_ref().map(|p| &p.stage) {
+            Some(PrepStage::Answered(r)) => *r,
+            _ => None,
+        }
+    }
+
+    /// The attempt's result after its commit (design.md "Memory Budget",
+    /// the result step): the first of these that applies. 1, the kind is
+    /// disabled; 2, nothing to upload; 3, the attempt's own pages ticket,
+    /// waited for; 4, play's admission for the attempt's request released
+    /// the result: the built-in result; 5, its atlas is installed; 6, a
+    /// bundle not installed, selected as before; 8, otherwise the built-in
+    /// result with why. Never begins a pages upload after the commit.
+    pub(crate) fn result_step(&mut self) {
+        self.result_withdrawn = false;
+        let status = self.render.result_status();
+        // 1.
+        if status.disabled.is_some() {
+            self.pages_ticket = None;
+            return;
+        }
+        // 2.
+        let Some(upload) = self.result_skin.upload() else {
+            self.pages_ticket = None;
+            return;
+        };
+        // 3.
+        if let Some(t) = self.pages_ticket.take() {
+            #[cfg(feature = "dev-tools")]
+            if let Some((_, step)) = &mut self.probe_ready {
+                *step = "uploaded";
+            }
+            self.wait_pages(t);
+            return;
+        }
+        // 4.
+        if let Some(request) = self.answered_request()
+            && status.released == Some(request)
+        {
+            let why = "play's admission released it";
+            println!("skin: result: built-in for this attempt: {why}");
+            self.presenter.attempt_fallback(why.to_owned());
+            return;
+        }
+        // 5, 6 and 8.
+        self.upload_result(upload, &status);
+    }
+
+    /// Step 3: the attempt's own ticket waited for, the quit key, the
+    /// close and the threads looked at between slices; withdrawn on any of
+    /// them. Lost after the commit ends the wait, nothing begun again; a
+    /// refusal or withdrawal shows the built-in result for the attempt.
+    fn wait_pages(&mut self, mut t: PagesTicket) {
+        use crate::render_side::PagesAnswer;
+        loop {
+            let answer = match t.answer.take() {
+                Some(a) => a,
+                None => {
+                    if preparation_stops(
+                        self.quitting(),
+                        self.controls.leaving(),
+                        self.input_failure(),
+                        self.audio_failure(),
+                    ) {
+                        // Withdrawn: a publication after it installs nothing.
+                        if !t.pending.withdraw() {
+                            self.result_withdrawn = true;
+                            #[cfg(feature = "dev-tools")]
+                            println!("dev: result upload withdrawn");
+                        }
+                        return;
+                    }
+                    match t.pending.poll(crate::render_side::SELECT_SLICE) {
+                        None if t.pending.settled() => Ok(PagesAnswer::Cancelled),
+                        None => continue,
+                        Some(a) => a,
+                    }
+                }
+            };
+            let why = match answer {
+                Ok(PagesAnswer::Ready) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("res:pages_ready", 0);
+                    return;
+                }
+                Ok(PagesAnswer::Cancelled) => "the upload was withdrawn".to_owned(),
+                Ok(PagesAnswer::Refused(why)) => why,
+                Ok(PagesAnswer::Lost) => "the screen was lost".to_owned(),
+                Err(e) => Chain(&e).to_string(),
+            };
+            println!("skin: result: built-in for this attempt: {why}");
+            self.presenter.attempt_fallback(why);
+            return;
+        }
+    }
+
     /// The attempt's result is uploaded after its commit and before
     /// recording opens (the S10-09i design's D2): a fixed skin reinstalled
     /// when play's admission released it, a chart-only specialization, or
@@ -1318,15 +1496,11 @@ impl PlayerRig<'_> {
     /// slices: on any of them the upload is withdrawn, so a late staging
     /// installs nothing, and the end of loading does not wait on the
     /// render thread. A refusal shows the built-in result for the attempt.
-    pub(crate) fn upload_result(&mut self) {
-        self.result_withdrawn = false;
-        let status = self.render.result_status();
-        if status.disabled.is_some() {
-            return;
-        }
-        let Some(upload) = self.result_skin.upload() else {
-            return;
-        };
+    fn upload_result(
+        &mut self,
+        upload: crate::result_skin::Upload,
+        status: &crate::result_present::ResultReport,
+    ) {
         // Development builds: `cold` asks for every upload (G1), and G2's
         // sample says what the step did: `none` (no skin, or the kind
         // disabled), `reused` (installed) or `uploaded` (asked for).
@@ -1344,6 +1518,18 @@ impl PlayerRig<'_> {
             *step = if installed { "reused" } else { "uploaded" };
         }
         if installed {
+            return;
+        }
+        // 8: pages with no ticket of their own (development builds' `cold`
+        // asks for them again through a selection).
+        #[cfg(not(feature = "dev-tools"))]
+        let cold = false;
+        #[cfg(feature = "dev-tools")]
+        let cold = crate::dev::result_cold();
+        if matches!(upload, crate::result_skin::Upload::Pages(_)) && !cold {
+            let why = "its pages were not uploaded for the attempt";
+            println!("skin: result: built-in for this attempt: {why}");
+            self.presenter.attempt_fallback(why.to_owned());
             return;
         }
         #[cfg(feature = "dev-tools")]
@@ -2354,7 +2540,7 @@ impl Rig for PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::loop_probe::mark("att:committed", 0);
-        self.upload_result();
+        self.result_step();
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("commit");
         Ok(())
@@ -2546,6 +2732,7 @@ impl Rig for PlayerRig<'_> {
                 return Err(ScreenError::Lost);
             }
         };
+        self.look_at_pages_ticket();
         // The skin in use's images, published as soon as they are read, so
         // the loading frames draw them while the attempt is prepared.
         if self.pending.is_none() && self.selection.is_some() {

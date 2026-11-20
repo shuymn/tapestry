@@ -152,6 +152,65 @@ pub(super) struct Faults {
     pub(super) cancel_install: AtomicBool,
     /// The next result chart write fails as a lost device.
     pub(super) lose_chart: AtomicBool,
+    /// Each uploader step's completion is held unseen this long after its
+    /// submission, µs; 0 as the device answers.
+    pub(crate) step_delay_us: std::sync::atomic::AtomicU64,
+    /// The chart-image bands the menu screen's renderer wrote, as of its
+    /// last boundary.
+    pub(crate) chart_bands: std::sync::atomic::AtomicU64,
+    /// The device is destroyed at the boundary that wrote the first
+    /// chart-image band.
+    pub(crate) lose_after_band: AtomicBool,
+    /// The writes of the staging's first atlas steps on the menu screen's
+    /// renderer, each step's count in order, as of its last boundary.
+    pub(crate) step_log: Mutex<Vec<u64>>,
+    /// The result-kind stagings asked in steps, each look counted.
+    pub(crate) stepped_installs: std::sync::atomic::AtomicU64,
+    /// The next result-kind staging made in steps has its next atlas step
+    /// refused by the device (development builds).
+    pub(crate) refuse_step: AtomicBool,
+    /// The device is destroyed at the next boundary with a result-kind
+    /// staging stepping.
+    pub(crate) lose_in_staging: AtomicBool,
+    /// A result-kind staging was left stepping by its last look.
+    pub(crate) result_stepping: AtomicBool,
+}
+
+impl Recorded {
+    /// The test's one-shot faults of an installation of `kind`: an answer
+    /// in place of the installation, or `None` to install.
+    fn install_faults(
+        &mut self,
+        kind: ScreenKind,
+        skin: &Arc<render::SkinBundle>,
+    ) -> Option<Result<Preparation, render::RenderError>> {
+        assert!(
+            !(kind == ScreenKind::Result
+                && self.faults.panic_install.swap(false, Ordering::AcqRel)),
+            "the render thread panics in the upload (a test's fault)"
+        );
+        if kind == ScreenKind::Result && self.faults.refuse_install.swap(false, Ordering::AcqRel) {
+            return Some(Ok(crate::render_side::refusal(
+                "the test refused the staging",
+            )));
+        }
+        if kind == ScreenKind::Result && self.faults.cancel_install.swap(false, Ordering::AcqRel) {
+            return Some(Ok(Preparation::Cancelled));
+        }
+        if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
+            self.menu.remove(ScreenKind::Result);
+            return Some(Err(render::RenderError::SurfaceLost));
+        }
+        let charge = if kind == ScreenKind::Result {
+            self.faults.charge_result.swap(0, Ordering::AcqRel)
+        } else {
+            0
+        };
+        if charge > 0 {
+            self.menu.renderer_mut().state_charge(skin, charge);
+        }
+        None
+    }
 }
 
 impl Drop for Recorded {
@@ -229,6 +288,10 @@ impl Screen for Recorded {
         // A specialization stages on the menu screen; an attempt with the
         // skin in use loads through this screen's faults, as before.
         if skin.is_some() {
+            let delay = self.faults.step_delay_us.load(Ordering::Acquire);
+            self.menu
+                .renderer_mut()
+                .delay_steps((delay > 0).then(|| Duration::from_micros(delay)));
             return self.menu.prepare_attempt(a, skin, request);
         }
         Some(match self.load(a.chart, a.section()) {
@@ -236,6 +299,66 @@ impl Screen for Recorded {
             Err(render::RenderError::Skin(e)) => Ok(super::super::refusal(e.reason)),
             Err(e) => Err(e),
         })
+    }
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        if self.faults.result_stepping.swap(false, Ordering::AcqRel)
+            && self.faults.lose_in_staging.swap(false, Ordering::AcqRel)
+        {
+            self.menu.renderer_mut().gpu().device().destroy();
+        }
+        let up = self.menu.upload_boundary(past);
+        let (log, _) = self.menu.renderer_mut().step_log();
+        log.clone_into(
+            &mut self
+                .faults
+                .step_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let bands = self.menu.renderer_mut().chart_bands();
+        self.faults.chart_bands.store(bands, Ordering::Release);
+        if bands > 0 && self.faults.lose_after_band.swap(false, Ordering::AcqRel) {
+            self.menu.renderer_mut().gpu().device().destroy();
+        }
+        up
+    }
+    fn upload_state(&self) -> render::UploadState {
+        self.menu.upload_state()
+    }
+    fn upload_waited(&self) -> bool {
+        self.menu.upload_waited()
+    }
+    fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+        self.menu.wait_step(timeout)
+    }
+    fn publish_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        self.menu.publish_chart_images(target, images)
+    }
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, render::RenderError> {
+        self.menu.begin_chart_images(target, set)
+    }
+    fn cancel_chart_images(&mut self) {
+        self.menu.cancel_chart_images();
+    }
+    fn publish_chart_absent(
+        &mut self,
+        target: render::ChartTarget,
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        self.menu.publish_chart_absent(target)
+    }
+    fn invalidate_chart_images(&mut self) {
+        self.menu.invalidate_chart_images();
+    }
+    fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.menu.chart_key()
     }
     fn write_result_chart(
         &mut self,
@@ -265,30 +388,35 @@ impl Screen for Recorded {
         skin: &Arc<render::SkinBundle>,
         request: u64,
     ) -> Result<Preparation, render::RenderError> {
-        assert!(
-            !(kind == ScreenKind::Result
-                && self.faults.panic_install.swap(false, Ordering::AcqRel)),
-            "the render thread panics in the upload (a test's fault)"
-        );
-        if kind == ScreenKind::Result && self.faults.refuse_install.swap(false, Ordering::AcqRel) {
-            return Ok(crate::render_side::refusal("the test refused the staging"));
-        }
-        if kind == ScreenKind::Result && self.faults.cancel_install.swap(false, Ordering::AcqRel) {
-            return Ok(Preparation::Cancelled);
-        }
-        if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
-            self.menu.remove(ScreenKind::Result);
-            return Err(render::RenderError::SurfaceLost);
-        }
-        let charge = if kind == ScreenKind::Result {
-            self.faults.charge_result.swap(0, Ordering::AcqRel)
-        } else {
-            0
-        };
-        if charge > 0 {
-            self.menu.renderer_mut().state_charge(skin, charge);
+        if let Some(answer) = self.install_faults(kind, skin) {
+            return answer;
         }
         self.menu.install(kind, skin, request)
+    }
+    fn install_stepped(
+        &mut self,
+        kind: ScreenKind,
+        skin: &Arc<render::SkinBundle>,
+        request: u64,
+    ) -> Option<Result<Preparation, render::RenderError>> {
+        if let Some(answer) = self.install_faults(kind, skin) {
+            return Some(answer);
+        }
+        if kind == ScreenKind::Result {
+            self.faults.stepped_installs.fetch_add(1, Ordering::AcqRel);
+        }
+        let answer = self.menu.install_stepped(kind, skin, request);
+        #[cfg(feature = "dev-tools")]
+        if kind == ScreenKind::Result
+            && answer.is_none()
+            && self.faults.refuse_step.swap(false, Ordering::AcqRel)
+        {
+            self.menu.renderer_mut().refuse_next_step();
+        }
+        if kind == ScreenKind::Result && answer.is_none() {
+            self.faults.result_stepping.store(true, Ordering::Release);
+        }
+        answer
     }
     fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
         self.menu.installation(kind)
@@ -315,6 +443,22 @@ impl Screen for Recorded {
         request: u64,
     ) -> Result<Preparation, render::RenderError> {
         self.menu.install_pages(kind, pages, request)
+    }
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<skin_model::PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, render::RenderError> {
+        self.menu.begin_pages(pages, ticket)
+    }
+    fn publish_pages(&mut self) -> Option<u64> {
+        self.menu.publish_pages()
+    }
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        self.menu.withdraw_pages()
+    }
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        self.menu.take_result_release()
     }
     fn restore_pages(
         &mut self,
@@ -1988,7 +2132,7 @@ fn a_panic_in_the_upload_fails_the_screen_before_its_teardown() {
             .image_stage(ResultChart::default(), None, || false, || false);
         faults.hold_drop.store(true, Ordering::Release);
         faults.panic_install.store(true, Ordering::Release);
-        p.upload_result();
+        p.result_step();
         let failed = p.render.failed();
         let preflight_stops = p.screen_failed();
         assert!(failed, "the failure is seen when the wait returns");
@@ -2224,7 +2368,7 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
                     }
                     at
                 });
-                p.upload_result();
+                p.result_step();
                 let returned = Instant::now();
                 let at = stopper.join().unwrap();
                 returned.duration_since(at)
@@ -4026,5 +4170,317 @@ fn a_first_frame_lost_is_acknowledged_after_its_recovery() {
     rig.link.prepare().unwrap();
     assert!(rig.until(|d| skin_frame(d).is_some()));
     assert!(wait_until(|| rig.link.result_acknowledged() == entry));
+    rig.link.exit();
+}
+
+/// The pages ticket's answer, polled as the game thread does.
+pub(crate) fn pages_answer(
+    t: &mut crate::render_side::PendingPages,
+) -> crate::render_side::PagesAnswer {
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end {
+        if let Some(a) = t.poll(Duration::from_millis(5)) {
+            return a.unwrap();
+        }
+    }
+    panic!("the pages ticket was never answered");
+}
+
+/// V16a, the publication first: the pages published before the owner's
+/// withdrawal are the result's pages-only installation, and the
+/// withdrawal reports them published, which is final.
+#[test]
+fn a_pages_ticket_published_first_is_reported_published() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    assert!(wait_until(
+        || rig.link.result_status().installed == Some(skin.atlas_id())
+    ));
+    assert!(t.withdraw(), "published before the withdrawal");
+    assert!(!t.withdraw(), "final");
+    assert!(t.poll(Duration::ZERO).is_none(), "settled");
+    rig.link.exit();
+}
+
+/// V16a, before the begin: a ticket withdrawn before the render thread
+/// takes it releases, reserves and creates nothing; the earlier
+/// installation stays installed.
+#[test]
+fn a_pages_ticket_withdrawn_before_its_begin_releases_nothing() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_a_dir, a) = fixed_skin();
+    let (_b_dir, b) = fixed_skin();
+    let rig = Rig::new();
+    let mut first = rig.link.begin_result_pages(Arc::clone(a.atlas_pages()));
+    assert_eq!(
+        pages_answer(&mut first),
+        crate::render_side::PagesAnswer::Ready
+    );
+    // The render thread held in a selection of `a`'s pages (installed: it
+    // keeps them), `b`'s ticket queued behind it and withdrawn.
+    crate::dev::hold_result_uploads(true);
+    let held = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+            a.atlas_pages(),
+        )));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    let mut late = rig.link.begin_result_pages(Arc::clone(b.atlas_pages()));
+    assert!(!late.withdraw(), "nothing published");
+    crate::dev::hold_result_uploads(false);
+    assert_eq!(held.wait().unwrap(), Preparation::Ready);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, Some(a.atlas_id()), "{status:?}");
+    assert!(!status.retained.contains(&b.atlas_id()), "{status:?}");
+    rig.link.exit();
+}
+
+/// V16a, after the begin: the begin's release stands, nothing is
+/// published, the ticket answers cancelled, and both arrays retire.
+#[test]
+fn a_pages_ticket_withdrawn_after_its_begin_keeps_the_release() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_a_dir, a) = fixed_skin();
+    let (_b_dir, b) = fixed_skin();
+    let rig = Rig::new();
+    let mut first = rig.link.begin_result_pages(Arc::clone(a.atlas_pages()));
+    assert_eq!(
+        pages_answer(&mut first),
+        crate::render_side::PagesAnswer::Ready
+    );
+    // Held after the withdrawn mark was read: the begin then runs.
+    crate::dev::hold_result_uploads(true);
+    let mut t = rig.link.begin_result_pages(Arc::clone(b.atlas_pages()));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    assert!(!t.withdraw(), "nothing published");
+    crate::dev::hold_result_uploads(false);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, None, "{status:?}");
+    assert!(
+        wait_until(|| {
+            let s = rig.link.result_status();
+            !s.retained.contains(&a.atlas_id()) && !s.retained.contains(&b.atlas_id())
+        }),
+        "{:?}",
+        rig.link.result_status()
+    );
+    rig.link.exit();
+}
+
+/// Recovery: the screen dropped with the upload in hand answers its
+/// ticket lost, never published.
+#[test]
+fn a_pages_ticket_in_hand_when_the_screen_drops_is_lost() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    crate::dev::hold_result_uploads(true);
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    // Queued behind the begin, which the hold lets go meanwhile: a chart
+    // load that fails on the device.
+    rig.faults.fail_load.store(1, Ordering::Release);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::dev::hold_result_uploads(false);
+        });
+        // Built again after the failure, the load answers as it may.
+        let _ = rig.link.load(Arc::clone(&chart), None);
+    });
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Lost);
+    rig.link.exit();
+}
+
+/// §5.3: a pages begin taken while the attempt is staged takes no request
+/// and supersedes nothing: the attempt answers ready and commits, and
+/// the pages publish beside it.
+#[test]
+fn a_pages_begin_leaves_the_attempts_staging() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    let (_staged_dir, staged) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.link.loading().show(super::one_line("loading"));
+    let mut attempt = rig.link.begin_attempt(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(staged),
+    );
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Ready);
+    rig.link.commit_attempt().unwrap();
+    assert!(rig.faults.commit_found.load(Ordering::Acquire));
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    rig.link.end_loading().unwrap();
+    rig.link.exit();
+}
+
+/// H1 (design.md "Load Pipeline", one heavy operation a frame interval):
+/// play's staging and the result pages' array, asked back to back, are
+/// each created at a boundary the allowance admits, play's first, in two
+/// intervals: the pages' creation begins only after a refill or the
+/// clock's pace from play's.
+// Revert: the pages begun in their message's turn (`owe_pages` calling
+// `begin_pages` at once) -> no pages creation at a boundary: "the pages
+// created outside the allowance".
+#[test]
+fn play_and_the_pages_are_created_in_two_intervals_play_first() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    let (_staged_dir, staged) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.link.loading().show(super::one_line("loading"));
+    rig.link.record_heavy(64);
+    let mut attempt = rig.link.begin_attempt(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(staged),
+    );
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Ready);
+    use crate::render_side::HeavyKind;
+    let made: Vec<_> = rig
+        .link
+        .heavy_record()
+        .into_iter()
+        .filter(|r| matches!(r.kind, HeavyKind::PlayCreation | HeavyKind::PagesCreation))
+        .collect();
+    assert_eq!(
+        made.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [HeavyKind::PlayCreation, HeavyKind::PagesCreation],
+        "the pages created outside the allowance"
+    );
+    let (play, pages) = (made[0], made[1]);
+    assert!(
+        pages.refills > play.refills || pages.start >= play.end + Duration::from_millis(16),
+        "the pages created in play's interval: {play:?} {pages:?}"
+    );
+    rig.link.commit_attempt().unwrap();
+    rig.link.end_loading().unwrap();
+    rig.link.exit();
+}
+
+/// H1 (r2): a result bundle's staging whose atlas step the device refuses,
+/// or whose device is lost while it steps, ends at that boundary with its
+/// one end: the selection waiting for it is asked again in that pass and
+/// answered, never left to the pending selection's 30 s bound.
+// Revert: the end not reported (`out.staged` left `None` where a step
+// retired the staging, or the loss only breaking the boundary's loop) ->
+// "answered at its end" (the wait runs to its bound).
+#[cfg(feature = "dev-tools")]
+fn a_result_bundle_staging_ended_answers_the_selection(lose: bool) {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    if lose {
+        rig.faults.lose_in_staging.store(true, Ordering::Release);
+    } else {
+        rig.faults.refuse_step.store(true, Ordering::Release);
+    }
+    let start = Instant::now();
+    let answer = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Bundle(Arc::clone(&skin)))
+        .wait();
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "answered at its end: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        rig.faults.stepped_installs.load(Ordering::Acquire) >= 2,
+        "asked again"
+    );
+    if !lose {
+        assert!(!matches!(answer, Ok(Preparation::Ready)), "{answer:?}");
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_refused_result_bundle_step_answers_the_selection() {
+    a_result_bundle_staging_ended_answers_the_selection(false);
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_lost_device_under_a_result_bundle_staging_answers_the_selection() {
+    a_result_bundle_staging_ended_answers_the_selection(true);
+}
+
+/// H3 (design.md "Load Pipeline", screen skins across the flow): a result
+/// skin's bundle (a chart-only layout) is staged in the uploader's steps:
+/// taken at a boundary the allowance admits, asked again until its last
+/// step's completion, and answered ready then, installed.
+// Revert: the result kind's `Select` staged by the blocking install ->
+// "a blocking install".
+#[test]
+fn a_result_bundle_is_staged_in_the_uploaders_steps() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    rig.link.record_heavy(64);
+    let answer = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Bundle(Arc::clone(&skin)))
+        .wait()
+        .unwrap();
+    assert_eq!(answer, Preparation::Ready);
+    assert!(
+        rig.faults.stepped_installs.load(Ordering::Acquire) >= 2,
+        "a blocking install"
+    );
+    assert!(
+        rig.link
+            .heavy_record()
+            .iter()
+            .any(|r| r.kind == crate::render_side::HeavyKind::SelectCreation),
+        "taken outside the allowance"
+    );
+    assert!(wait_until(
+        || rig.link.result_status().installed == Some(skin.atlas_id())
+    ));
     rig.link.exit();
 }

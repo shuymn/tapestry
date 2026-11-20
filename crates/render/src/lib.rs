@@ -48,6 +48,8 @@ mod test_common;
 #[cfg(test)]
 #[path = "../tests/decl_support/mod.rs"]
 mod test_decl;
+#[cfg(test)]
+mod upload_tests;
 
 mod atlas;
 mod bga;
@@ -72,10 +74,11 @@ mod staging;
 pub mod text;
 mod text_cache;
 mod text_upload;
+mod upload;
 mod video;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
-pub use bga::{BGA_WRITE_BUDGET, BgaFault, BgaStep, UPLOAD_TIME_SLICE};
+pub use bga::{BgaFault, BgaStep};
 pub use chart_pool::{POOL_MAX_SLOTS, POOL_MAX_TEXELS, PoolLayout, PoolWriteError};
 pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
@@ -99,11 +102,12 @@ pub use renderer::UploadTiming;
 #[cfg(feature = "dev-tools")]
 pub use renderer::take_build_start;
 pub use renderer::{
-    Admission, ChartOutcome, ChartTarget, Class, CommitError, CpuParts, Destroyed, Destruction,
-    FrameOutcome, FrameTiming, Handoff, HeavyOps, LoadingOn, LoadingTextError, LoadingTextKey,
-    MAX_SPRITES, MemoryWitness, Part, PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES,
-    RETIREMENT_ENTRIES, RenderError, Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES,
-    Target, VM_TEXELS, letterbox,
+    Admission, ChartOutcome, ChartTarget, ChartUpload, Class, CommitError, CpuParts, Destroyed,
+    Destruction, FrameOutcome, FrameTiming, GrantProbe, GrantWait, Handoff, HeavyOps, LoadingOn,
+    LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness, PagesBegun, PagesStep, Part,
+    PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError,
+    Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, TextDone, TextFault,
+    VM_TEXELS, letterbox,
 };
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::{DestroyRecord, RECORD_LEN};
@@ -120,6 +124,12 @@ pub use sprite::{
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
+#[cfg(feature = "dev-tools")]
+pub use upload::TextCount;
+pub use upload::{
+    ChartBands, Payload, Refused, StagingEnd, UPLOAD_STEP, UPLOAD_TIME_SLICE, UPLOAD_WRITE,
+    UploadGate, UploadState, Uploaded,
+};
 pub use video::{FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES};
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).

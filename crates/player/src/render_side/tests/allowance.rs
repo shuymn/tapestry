@@ -114,7 +114,13 @@ struct Fake {
     dropped_with_array: AtomicU64,
     /// The last per-pass permission to destroy in a staging's call.
     destroy_allowed: AtomicBool,
+    /// The swap chain's grant is looked at through [`GRANT`]
+    /// (`grant_probe`), as a paced window's is.
+    probe: AtomicBool,
 }
+
+/// The fake's swap chain grant while `Fake::probe` (one test uses it).
+static GRANT: AtomicBool = AtomicBool::new(false);
 
 impl Fake {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -188,6 +194,12 @@ impl Screen for Timed {
     }
     fn grant_ready(&self) -> bool {
         self.0.gate.take_ready()
+    }
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        self.0
+            .probe
+            .load(Ordering::SeqCst)
+            .then_some(render::GrantProbe::Flag(&GRANT))
     }
     fn minimized(&self) -> bool {
         self.0.minimized.load(Ordering::SeqCst)
@@ -1182,6 +1194,43 @@ fn a_spent_entry_boundary_makes_no_regrowth_until_the_next_entry() {
 #[test]
 fn an_entry_spent_by_a_destruction_makes_no_regrowth() {
     no_regrowth_after_a_spent_entry(false);
+}
+
+/// M2 (r2): the regrowth's exemption from the frame's check is the
+/// regrowth's alone. A selection entry whose regrowth has nothing to do,
+/// its boundary finding the swap chain's grant, leaves the BGA `Drop` held
+/// to the frame's check: the entry's first frame draws, and the `Drop`
+/// runs after it (a regrowth to make still runs before that frame:
+/// `a_selection_entry_regrows_first_and_the_drop_waits`).
+// Revert: the exemption kept for the whole boundary (`heavy_op` skipping
+// the frame's check whenever `regrow`) -> the `Drop` at the entry's
+// boundary: "the Drop before the entry's first frame".
+#[test]
+fn a_no_op_regrowth_leaves_the_others_to_the_frames_check() {
+    let r = Rig::page();
+    r.generation(5);
+    let _key = r.live_array(5);
+    let _x = r.spend(1);
+    r.bga(5, BgaMsg::Drop);
+    r.step(false);
+    let before = r.ran().len();
+    r.fake.probe.store(true, Ordering::SeqCst);
+    GRANT.store(true, Ordering::SeqCst);
+    r.select(1);
+    r.step(true);
+    r.step(true);
+    r.step(true);
+    let ran = r.until_ran(before + 1);
+    let drop = ran[before];
+    assert_eq!(drop.op, Op::BgaDrop, "{ran:?}");
+    let frames = r.fake.state().frames.clone();
+    assert!(
+        frames
+            .iter()
+            .any(|(k, t, p)| *k == Kind::Selection && *p && *t < drop.start),
+        "the Drop before the entry's first frame: {frames:?} {drop:?}"
+    );
+    r.fake.probe.store(false, Ordering::SeqCst);
 }
 
 // ---- M4 / V18: READY's cutoff on the fake ----

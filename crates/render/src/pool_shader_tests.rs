@@ -358,7 +358,17 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
     for (z, levels) in (0..).zip(&pool_images) {
         for (k, bytes) in (0..).zip(levels) {
             let s = POOL_SIDE >> k;
-            skin_atlas::write_region(gpu.queue(), pool.texture(), (z, k), [0, 0], [s, s], bytes);
+            crate::upload::write_unpaced(
+                gpu,
+                &crate::upload::Band {
+                    texture: pool.texture(),
+                    layer: z,
+                    level: k,
+                    origin: [0, 0],
+                    size: [s, s],
+                    bytes,
+                },
+            );
         }
     }
     // The same images as pages of an atlas of the pool's side, layers 1

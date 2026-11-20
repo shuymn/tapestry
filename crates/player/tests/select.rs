@@ -1702,9 +1702,11 @@ fn a_pending_skin_is_reused_while_its_class_holds() {
 
 /// What a skin built per chart shows of its text, and when, on the real
 /// threads (design.md "The pending presentation"). Loading shows the
-/// load's lines on a cleared canvas until a specialization commits; the
-/// lifetime's first frame of the skin has no chosen text, which is prepared
-/// on a frame for the next; READY shows the attempt's text. Each attempt's
+/// load's lines on a cleared canvas until a specialization commits and
+/// its text is installed; the
+/// lifetime's first frame of the skin already shows the chosen chart's
+/// text, every slot filled (design.md "Rendering and Skins"); READY shows
+/// the attempt's text. Each attempt's
 /// play shows its own chart's, the title or the string for none: a retry,
 /// with no loading state, as a reused specialization; a chart of another
 /// class through a replacement; the op-80 text never, the op-81 text
@@ -1746,16 +1748,21 @@ fn a_per_chart_skin_shows_its_text_as_its_lifetime_allows() {
     );
     let all = [Band::Always, Band::Loading, Band::Loaded];
     let shown = |name: &str| all.map(|b| bars(&frames.join(name), b));
-    // The pending presentation: nothing of the skin.
-    assert_eq!(shown("loading.png"), [0, 0, 0], "{stdout}");
-    // The first frame the skin draws in a lifetime, when one comes: no
-    // chosen text.
+    // The first loading frame: the pending presentation (nothing of the
+    // skin), or the skin already filled when the staging and its text
+    // came within the first frame's hold; never the skin without them.
+    let filled =
+        |[always, loading, loaded]: [usize; 3]| always > 0 && loading == always && loaded == 0;
+    let first = shown("loading.png");
+    assert!(first == [0, 0, 0] || filled(first), "{first:?} {stdout}");
+    // The first frame the skin draws in a lifetime, when one comes: the
+    // chosen text in every slot, the loaded-only text not yet.
     let dumps: Vec<_> = fs::read_dir(&frames)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     for skin in dumps.iter().filter(|n| n.starts_with("loading-skin-")) {
-        assert_eq!(shown(skin), [0, 0, 0], "{skin}");
+        assert!(filled(shown(skin)), "{skin}: {:?}", shown(skin));
     }
     // READY: the attempt's text, the op-80 text gone.
     assert_eq!(shown("ready.png"), [2, 0, 2], "{stdout}");
