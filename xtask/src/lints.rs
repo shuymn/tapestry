@@ -552,6 +552,17 @@ pub const IN_PLAY: &[Site] = &[
     ),
     // Each play frame's live BGA key.
     Site::Fns("crates/render/src/bga.rs", &["BgaArray::key"]),
+    // The skin movie hook's write path: a due frame taken into its
+    // movie's mapped upload buffer, and each frame's copies into the
+    // planes.
+    Site::Fns(
+        "crates/render/src/video.rs",
+        &["Video::write_with", "Video::record"],
+    ),
+    Site::Fns(
+        "crates/render/src/upload.rs",
+        &["write_buffer_with_unpaced"],
+    ),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
