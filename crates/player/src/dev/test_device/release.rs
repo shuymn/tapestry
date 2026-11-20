@@ -6,9 +6,9 @@
 //! admitted or written, and requests the one `release`. The link thread
 //! then records the fence (no hold-bearing write begun before the gate
 //! closed is still in progress: its writes are its own and synchronous, so
-//! at its loop's top none is), drops the hold-bearing commands still
-//! queued, and writes `release`. Only a `hello` written after the fence
-//! counts as release evidence. A device refusal of a hold-bearing command
+//! at its loop's top none is) and writes `release`; a hold-bearing command
+//! it takes from the queue after the gate closed is dropped, not written.
+//! Only a `hello` written after the fence counts as release evidence. A device refusal of a hold-bearing command
 //! stops holds as a lost check does.
 
 use std::collections::VecDeque;
@@ -284,18 +284,6 @@ impl Thread {
             // The fence and the one release: no hold-bearing write is in
             // progress at the loop's top, the writes being this thread's.
             if !self.released && lock(&self.shared.gate).is_some() {
-                let dropped: Vec<Item> = {
-                    let mut q = lock(&self.shared.queue);
-                    let (hold, keep): (Vec<Item>, Vec<Item>) =
-                        q.drain(..).partition(|i| i.cmd.holds_input());
-                    q.extend(keep);
-                    hold
-                };
-                for i in dropped {
-                    self.record(Some(
-                        json!({ "t": "dropped", "q": qpc(), "line": i.cmd.to_string() }),
-                    ));
-                }
                 self.record(Some(json!({ "t": "fence", "q": qpc() })));
                 self.update(|s| s.fenced = true);
                 self.released = true;
