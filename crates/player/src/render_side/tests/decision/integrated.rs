@@ -237,6 +237,16 @@ impl Screen for Noted {
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         self.menu.publish_chart_images(target, images)
     }
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, RenderError> {
+        self.menu.begin_chart_images(target, set)
+    }
+    fn cancel_chart_images(&mut self) {
+        self.menu.cancel_chart_images();
+    }
     fn publish_chart_absent(
         &mut self,
         target: render::ChartTarget,

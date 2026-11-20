@@ -188,6 +188,26 @@ pub trait Screen: Send {
         let _ = (target, images);
         Err(RenderError::NoChartLayer)
     }
+    /// Takes the attempt's chart-image publication of `set` into `target`
+    /// in hand (design.md "Rendering and Skins", chart images): `None`
+    /// while its bands step at the boundaries
+    /// ([`upload_boundary`](Self::upload_boundary) answers its end), or
+    /// its table at once. The default publishes at once
+    /// ([`publish_chart_images`](Self::publish_chart_images)).
+    ///
+    /// # Errors
+    ///
+    /// As [`render::Renderer::begin_chart_upload`].
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, RenderError> {
+        self.publish_chart_images(target, set.fitted()).map(Some)
+    }
+    /// Drops the chart-image publication in hand, if any, writing nothing
+    /// more and publishing no table. The default holds none.
+    fn cancel_chart_images(&mut self) {}
     /// Publishes the chart's images absent into `target`
     /// ([`render::Renderer::publish_chart_absent`]).
     ///
@@ -227,6 +247,7 @@ pub trait Screen: Send {
         render::Uploaded {
             bga: render::BgaStep::Idle,
             staged: None,
+            chart: None,
         }
     }
     /// What the uploader can do now ([`render::Renderer::upload_state`]);
@@ -1941,10 +1962,11 @@ struct Shared {
     staged_pass: AtomicU64,
     #[cfg(test)]
     answered_pass: AtomicU64,
-    /// The loop's waits by kind when the last attempt was taken and when
-    /// it was answered (tests).
+    /// The loop's waits by kind when the last attempt was taken (0) and
+    /// answered (1), and when the last chart-image publication was taken
+    /// (2) and answered (3) (tests).
     #[cfg(test)]
-    attempt_waits: [[AtomicU64; 4]; 2],
+    attempt_waits: [[AtomicU64; 4]; 4],
     /// The lifetime whose first frame was visited last, and its showing
     /// (tests).
     #[cfg(test)]
@@ -4698,6 +4720,7 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 rf_armed: 0,
                 granted: false,
+                chart_hand: None,
                 staged_seen: false,
                 image: Image::default(),
                 first_frame: None,
@@ -5953,6 +5976,23 @@ const fn held_wait(now: TimeUs, shown_at: TimeUs, bound: TimeUs) -> Option<TimeU
     }
 }
 
+/// The attempt's chart-image publication in hand: what its answer names
+/// and where it goes, and the screen it is stepped on.
+struct ChartHand {
+    key: crate::chart_images::PublicationKey,
+    /// Into the committed installation (a staging without its own array
+    /// included), not the staging's own.
+    committed: bool,
+    /// The committed installation's chart key when it was taken.
+    now_committed: Option<skin_model::chart_image::ChartKey>,
+    /// The screen's device it was taken on.
+    device: u64,
+    reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    /// When it was taken (the probe's answer time).
+    #[cfg(feature = "dev-tools")]
+    at: render::probe::Span,
+}
+
 /// A kind of the loop's wait (tests: the no-sleep rule's counters).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6098,6 +6138,9 @@ struct Run {
     /// frame of latency), so the next frame takes it instead of waiting
     /// again, which would never end; until a new screen is built.
     granted: bool,
+    /// The attempt's chart-image publication in hand, its bands stepped
+    /// by the uploader (design.md "Rendering and Skins", chart images).
+    chart_hand: Option<ChartHand>,
     /// The uploader's boundary saw a staging's last step complete: the
     /// attempt is asked again in that pass.
     staged_seen: bool,
@@ -6844,8 +6887,9 @@ impl Run {
                     set,
                     reply,
                 }) => {
-                    let ack = self.publish_chart(generation, request, set.as_deref());
-                    let _ = reply.send(ack);
+                    // Taken in hand and stepped at the boundaries; this
+                    // pass goes on to its boundary at once.
+                    self.take_chart(generation, request, set, reply);
                     continue;
                 }
                 Ok(RenderMsg::Bga { generation, msg }) => {
@@ -9544,22 +9588,40 @@ impl Run {
         }
     }
 
-    /// Publishes `set` (absent when `None`) of `generation` for the
-    /// attempt of `request`: for `None` into the committed play
-    /// installation; for a staging, into its array, or, when it has none of
-    /// its own (a pending skin's specialization reused on the installation
-    /// in use), into the committed installation it draws from (S10-12
-    /// design §5.3). The publication is admitted only while its key is
-    /// current ([`crate::chart_images::PublicationKey::current`]): another
-    /// generation, or a request whose staging is gone, publishes nothing
-    /// anywhere. The answer says what it was for and where it went.
-    fn publish_chart(
+    /// Takes `set` (absent when `None`) of `generation` for the attempt of
+    /// `request` (design.md "Rendering and Skins", chart images): for
+    /// `None` into the committed play installation; for a staging, into
+    /// its array, or, when it has none of its own (a pending skin's
+    /// specialization reused on the installation in use), into the
+    /// committed installation it draws from. It is admitted only while its
+    /// key is current ([`crate::chart_images::PublicationKey::current`]):
+    /// another generation, or a request whose staging is gone, publishes
+    /// nothing anywhere. Absent, refused at the take, or published at once
+    /// (a screen without the uploader), it is answered here. Otherwise it
+    /// is held in hand, its target unavailable, its bands written at the
+    /// boundaries that follow; it is answered in the pass whose boundary
+    /// ends it ([`Self::chart_answer`]) or that finds it no longer current
+    /// ([`Self::check_chart_hand`]). One still in hand is replaced,
+    /// answered Unavailable.
+    fn take_chart(
         &mut self,
         generation: u64,
         request: Option<u64>,
-        set: Option<&crate::chart_images::ChartImages>,
-    ) -> crate::chart_images::Ack {
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+        reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    ) {
         use crate::chart_images::{Ack, PublicationKey, PublishedTo};
+        #[cfg(test)]
+        snapshot_waits(&self.shared, 2);
+        if let Some(old) = self.chart_hand.take() {
+            if let Some(screen) = &mut self.screen {
+                screen.cancel_chart_images();
+            }
+            let _ = old.reply.send(Ack {
+                key: old.key,
+                answer: Err(render::ChartOutcome::Unavailable),
+            });
+        }
         #[cfg(test)]
         self.chart_held();
         self.sync_chart();
@@ -9577,31 +9639,37 @@ impl Run {
             answer: Err(render::ChartOutcome::Unavailable),
         };
         if !key.current(&now, request) {
-            return unpublished;
+            let _ = reply.send(unpublished);
+            return;
         }
         let target = match (request, self.prepared.as_ref()) {
             (None, _) => render::ChartTarget::Committed,
             (Some(_), Some(p)) => render::ChartTarget::Staged(p.token),
-            (Some(_), None) => return unpublished,
+            (Some(_), None) => {
+                let _ = reply.send(unpublished);
+                return;
+            }
         };
         let Some(screen) = &mut self.screen else {
-            return unpublished;
+            let _ = reply.send(unpublished);
+            return;
         };
-        let publish = |screen: &mut Box<dyn Screen>, target| match set {
-            Some(set) => screen.publish_chart_images(target, set.fitted()),
-            None => screen.publish_chart_absent(target),
+        let begin = |screen: &mut Box<dyn Screen>, target| match &set {
+            Some(set) => screen.begin_chart_images(target, set),
+            None => screen.publish_chart_absent(target).map(Some),
         };
         #[cfg(feature = "dev-tools")]
         let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
         #[cfg(feature = "dev-tools")]
         let p_t = render::probe::Span::start();
-        let mut answer = publish(screen, target);
+        let mut begun = begin(screen, target);
         // The admitted staging draws from the committed installation when
         // it has no array of its own: its table is published there.
-        let committed = request.is_none() || matches!(answer, Err(RenderError::NoChartLayer));
+        let committed = request.is_none() || matches!(begun, Err(RenderError::NoChartLayer));
         if request.is_some() && committed {
-            answer = publish(screen, render::ChartTarget::Committed);
+            begun = begin(screen, render::ChartTarget::Committed);
         }
+        let device = screen.device();
         #[cfg(feature = "dev-tools")]
         {
             crate::dev::loop_probe::mark(
@@ -9609,30 +9677,105 @@ impl Run {
                 crate::dev::loop_probe::us(p_t.elapsed()),
             );
             crate::dev::loop_probe::mark("ci:att:staged", i64::from(!committed));
-            crate::dev::loop_probe::mark("ci:att:ok", i64::from(answer.is_ok()));
             drop(p_caller);
         }
+        let hand = ChartHand {
+            key,
+            committed,
+            now_committed: now.committed,
+            device,
+            reply,
+            #[cfg(feature = "dev-tools")]
+            at: p_t,
+        };
+        match begun {
+            // In hand: its bands step at the boundaries.
+            Ok(None) => self.chart_hand = Some(hand),
+            Ok(Some(table)) => self.chart_answer(hand, Ok(table)),
+            Err(e) => self.chart_answer(hand, Err(e)),
+        }
+    }
+
+    /// Ends the chart-image publication in hand when it is no longer
+    /// current, before each boundary that would write its next band: its
+    /// key ([`crate::chart_images::PublicationKey::current`], after
+    /// [`Self::sync_chart`]), the committed installation it was taken on
+    /// when it goes there, and the screen's device (the same, not lost).
+    /// Nothing more is written, no table published, and it is answered
+    /// Unavailable.
+    fn check_chart_hand(&mut self) {
+        if self.chart_hand.is_none() {
+            return;
+        }
+        self.sync_chart();
+        let now = self.chart_now();
+        let device = self
+            .screen
+            .as_ref()
+            .filter(|s| !s.device_lost())
+            .map(|s| s.device());
+        let current = self.chart_hand.as_ref().is_some_and(|h| {
+            h.key.current(&now, h.key.request)
+                && (!h.committed || now.committed == h.now_committed)
+                && device == Some(h.device)
+        });
+        if current {
+            return;
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.cancel_chart_images();
+        }
+        if let Some(hand) = self.chart_hand.take() {
+            self.chart_answer(hand, Err(RenderError::ChartChanged));
+        }
+    }
+
+    /// Answers the chart-image publication `hand` with how it ended,
+    /// checked again here: a table or an all-absent one left in a target
+    /// still current is recorded as the committed or the staged table
+    /// ([`Self::sync_chart`] keeps them current); for anything else
+    /// nothing is recorded. The game thread logs what it left; this
+    /// thread draws frames and logs nothing.
+    fn chart_answer(
+        &mut self,
+        hand: ChartHand,
+        end: Result<skin_model::chart_image::ChartTable, RenderError>,
+    ) {
+        use crate::chart_images::{Ack, PublicationKey, PublishedTo};
+        self.sync_chart();
+        let now = self.chart_now();
+        let current = hand.key.current(&now, hand.key.request)
+            && (!hand.committed || now.committed == hand.now_committed);
+        let answer = match end {
+            _ if !current => Err(render::ChartOutcome::Unavailable),
+            end => end.map_err(|e| e.chart_outcome()),
+        };
         // What a publication left in its target: a table, or an all-absent
         // one; nothing for the other failures.
-        let left = answer.is_ok()
-            || answer
-                .as_ref()
-                .is_err_and(|e| e.chart_outcome() == render::ChartOutcome::Absent);
-        if left && committed {
+        let left = answer.is_ok() || answer == Err(render::ChartOutcome::Absent);
+        if left && hand.committed {
             self.chart_table = Some(PublicationKey {
-                generation,
+                generation: hand.key.generation,
                 request: None,
-                target: PublishedTo::Committed(now.committed),
+                target: PublishedTo::Committed(hand.now_committed),
             });
         } else if left {
-            self.staged_table = Some(key);
+            self.staged_table = Some(hand.key);
         }
-        // The game thread logs what it left; this thread draws frames and
-        // logs nothing.
-        Ack {
-            key,
-            answer: answer.map_err(|e| e.chart_outcome()),
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::loop_probe::mark("ci:att:ok", i64::from(answer.is_ok()));
+            crate::dev::loop_probe::mark(
+                "ci:att:answer_us",
+                crate::dev::loop_probe::us(hand.at.elapsed()),
+            );
         }
+        #[cfg(test)]
+        snapshot_waits(&self.shared, 3);
+        let _ = hand.reply.send(Ack {
+            key: hand.key,
+            answer,
+        });
     }
 
     /// Takes a step of the BGA pictures' publication of `generation`:
@@ -9792,6 +9935,7 @@ impl Run {
         {
             s.cancel_bga_upload();
         }
+        self.check_chart_hand();
         let step = match self.screen.as_mut() {
             Some(s) => {
                 let up = match held {
@@ -9801,6 +9945,11 @@ impl Run {
                     None => s.upload_boundary(&mut || false),
                 };
                 self.staged_seen |= up.staged.is_some();
+                if let Some(end) = up.chart
+                    && let Some(hand) = self.chart_hand.take()
+                {
+                    self.chart_answer(hand, end);
+                }
                 #[cfg(test)]
                 if up.staged.is_some() {
                     self.shared
@@ -17224,7 +17373,11 @@ pub(crate) mod tests {
                 b.batches.push((cells, bytes));
                 render::BgaStep::Done(Ok(()))
             })();
-            render::Uploaded { bga, staged: None }
+            render::Uploaded {
+                bga,
+                staged: None,
+                chart: None,
+            }
         }
         fn upload_state(&self) -> render::UploadState {
             if self.shared.bga.lock().unwrap().pending.is_some() {

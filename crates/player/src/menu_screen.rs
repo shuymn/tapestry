@@ -326,6 +326,9 @@ const LOADING_TOP: f32 = 400.0;
 /// The renderer, with the select screen's text when it draws menus.
 pub struct MenuScreen {
     renderer: Renderer,
+    /// The attempt's chart-image publication in hand and its images,
+    /// stepped by the uploader's boundaries.
+    chart: Option<(render::ChartUpload, Arc<crate::chart_images::ChartImages>)>,
     /// The font, read once per screen: when it is built on a screen that
     /// draws menus, and on a screen for plays only when its first page
     /// comes.
@@ -476,6 +479,7 @@ impl MenuScreen {
     pub const fn new(renderer: Renderer, fonts: Option<Fonts>) -> Self {
         Self {
             renderer,
+            chart: None,
             fonts,
             text: None,
             cursor: None,
@@ -970,12 +974,39 @@ impl Screen for MenuScreen {
     }
 
     fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
-        self.renderer
-            .upload_boundary_within(render::UPLOAD_TIME_SLICE, past)
+        let chart = self.chart.as_mut().map(|(up, set)| (up, set.fitted()));
+        let up = self
+            .renderer
+            .upload_boundary_within(render::UPLOAD_TIME_SLICE, past, chart);
+        if up.chart.is_some() {
+            self.chart = None;
+        }
+        up
     }
 
     fn upload_state(&self) -> render::UploadState {
-        self.renderer.upload_state()
+        match (self.renderer.upload_state(), &self.chart) {
+            (render::UploadState::Idle, Some(_)) if self.renderer.step_in_flight() => {
+                render::UploadState::InFlight
+            }
+            (render::UploadState::Idle, Some(_)) => render::UploadState::Ready,
+            (state, _) => state,
+        }
+    }
+
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, RenderError> {
+        self.chart = None;
+        let up = self.renderer.begin_chart_upload(target, set.fitted())?;
+        self.chart = Some((up, Arc::clone(set)));
+        Ok(None)
+    }
+
+    fn cancel_chart_images(&mut self) {
+        self.chart = None;
     }
 
     fn wait_step(&mut self, timeout: Duration) -> Result<bool, RenderError> {

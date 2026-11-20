@@ -576,6 +576,111 @@ pub enum ChartTarget {
     Staged(PreparedToken),
 }
 
+/// The attempt's chart-image publication in hand
+/// ([`Renderer::begin_chart_upload`]): its target and the key of the
+/// array taken, the images' places, and the next band to write, an
+/// image's level's next rows. The images themselves stay with the caller,
+/// which passes them to each boundary.
+#[derive(Debug)]
+pub struct ChartUpload {
+    target: ChartTarget,
+    key: skin_model::chart_image::ChartKey,
+    /// The chart layer in the array.
+    at: u32,
+    /// The array's side.
+    side: u32,
+    uvs: [Option<skin_model::chart_image::ChartUv>; 3],
+    image: usize,
+    level: usize,
+    row: u32,
+}
+
+impl ChartUpload {
+    /// The target it was taken for.
+    #[must_use]
+    pub const fn target(&self) -> ChartTarget {
+        self.target
+    }
+
+    /// Whether every band is written.
+    #[must_use]
+    pub const fn written(&self) -> bool {
+        self.image >= 3
+    }
+
+    /// Moves to the next band to write: past an absent image, a level
+    /// written and an image written.
+    fn settle(&mut self, images: [Option<&skin_model::chart_image::Fitted>; 3]) {
+        use skin_model::chart_image::ChartImage;
+        while self.image < 3 {
+            let image = images.get(self.image).copied().flatten();
+            let slot = ChartImage::ALL
+                .get(self.image)
+                .and_then(|which| which.slot(self.side));
+            let size = image.and_then(|f| f.levels().get(self.level).and(f.level_size(self.level)));
+            match (slot, size) {
+                (Some(_), Some([_, h])) if self.row < h => return,
+                (Some(_), Some(_)) => {
+                    self.level += 1;
+                    self.row = 0;
+                }
+                _ => {
+                    self.image += 1;
+                    self.level = 0;
+                    self.row = 0;
+                }
+            }
+        }
+    }
+
+    /// Queues the next band into `texture`: the current level's next rows,
+    /// at most [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes as the queue
+    /// stages them, at least one row; then moves on.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn write(
+        &mut self,
+        gpu: &Gpu,
+        texture: &wgpu::Texture,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+    ) {
+        use skin_model::chart_image::ChartImage;
+        self.settle(images);
+        let image = images.get(self.image).copied().flatten();
+        let origin = ChartImage::ALL
+            .get(self.image)
+            .and_then(|which| which.slot(self.side))
+            .map(|(origin, _)| origin);
+        let (Some(f), Some(origin)) = (image, origin) else {
+            return;
+        };
+        let (Some(bytes), Some([w, h])) = (f.levels().get(self.level), f.level_size(self.level))
+        else {
+            return;
+        };
+        let padded = crate::text_upload::padded(w).max(1);
+        let rows = u32::try_from((crate::UPLOAD_WRITE / padded).max(1))
+            .unwrap_or(u32::MAX)
+            .min(h.saturating_sub(self.row));
+        let stride = usize::try_from(w).unwrap_or(0) * 4;
+        let from = usize::try_from(self.row).unwrap_or(0) * stride;
+        let to = from + usize::try_from(rows).unwrap_or(0) * stride;
+        let k = u32::try_from(self.level).unwrap_or(0);
+        let [x, y] = origin.map(|o| o >> k);
+        if let Some(texels) = bytes.get(from..to) {
+            skin_atlas::write_region(
+                gpu.queue(),
+                texture,
+                (self.at, k),
+                [x, y + self.row],
+                [w, rows],
+                texels,
+            );
+        }
+        self.row += rows;
+        self.settle(images);
+    }
+}
+
 /// Where a result view's chart images are written
 /// ([`Renderer::write_result_chart`]): the array the result staging named
 /// by its token draws from (its own, or the result kind's installed array
@@ -1375,6 +1480,10 @@ pub struct Renderer {
     /// long after its submission ([`delay_steps`](Self::delay_steps)).
     #[cfg(feature = "dev-tools")]
     step_delay: Option<Duration>,
+    /// Development builds: the chart-image bands written
+    /// ([`chart_bands`](Self::chart_bands)).
+    #[cfg(feature = "dev-tools")]
+    chart_bands: u64,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -1708,6 +1817,8 @@ impl Renderer {
             stage_failed: None,
             #[cfg(feature = "dev-tools")]
             step_delay: None,
+            #[cfg(feature = "dev-tools")]
+            chart_bands: 0,
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -4859,6 +4970,220 @@ impl Renderer {
         Ok(table)
     }
 
+    /// Takes the attempt's chart-image publication of `images` into
+    /// `target` in hand as an uploader payload (design.md "Rendering and
+    /// Skins", chart images; "Memory Budget", the uploader): the target is
+    /// unavailable from now on and every image's place in its chart layer
+    /// is checked; nothing is written. The boundaries write it one band
+    /// of at most [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes a step,
+    /// checking before each band and at its completion that the device is
+    /// not lost and the target is still the array taken
+    /// ([`upload_boundary_within`](Self::upload_boundary_within)).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::NoChartLayer`] for a target with no chart layer,
+    /// [`RenderError::ChartChanged`] for a token that is not the staging's
+    /// and [`RenderError::DeviceLost`], nothing changed; and
+    /// [`RenderError::ChartImage`] for an image that does not fit its
+    /// slot, the target's all-absent table published.
+    pub fn begin_chart_upload(
+        &mut self,
+        target: ChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+    ) -> Result<ChartUpload, RenderError> {
+        use skin_model::chart_image::{ChartImage, ChartTable, ChartUv};
+        let (layer, at, side, levels) = match target {
+            ChartTarget::Committed => {
+                let Some(installed) = self.installed.as_ref() else {
+                    return Err(RenderError::NoChartLayer);
+                };
+                (
+                    installed.bundle().chart_layer(),
+                    self.atlas.chart_layer(),
+                    self.atlas.side(),
+                    self.atlas.levels(),
+                )
+            }
+            ChartTarget::Staged(token) => {
+                let Some(p) = self.pending.as_ref().filter(|p| p.token == token) else {
+                    return Err(RenderError::ChartChanged);
+                };
+                let (PendingRes::Own(res), Some(skin)) = (&p.res, &p.skin) else {
+                    return Err(RenderError::NoChartLayer);
+                };
+                (
+                    skin.installation().bundle().chart_layer(),
+                    res.atlas.chart_layer(),
+                    res.atlas.side(),
+                    res.atlas.levels(),
+                )
+            }
+        };
+        let (Some(layer), Some(at)) = (layer, at) else {
+            return Err(RenderError::NoChartLayer);
+        };
+        if u32::from(layer) != at {
+            return Err(RenderError::NoChartLayer);
+        }
+        let key = match target {
+            ChartTarget::Committed => self.chart_key(),
+            ChartTarget::Staged(token) => self.staged_chart_key(token),
+        };
+        let Some(key) = key else {
+            return Err(RenderError::DeviceLost);
+        };
+        // 1. Unavailable from the take.
+        self.set_chart_table(target, key, None);
+        let mut uvs = [None; 3];
+        for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+            let Some(f) = image else {
+                continue;
+            };
+            // Every level the array has, no more and no fewer.
+            let uv = ChartUv::of(f, which, side, layer)
+                .filter(|_| u32::try_from(f.levels().len()).ok() == Some(levels));
+            let Some(uv) = uv else {
+                self.set_chart_table(target, key, Some(ChartTable::ABSENT.keyed(key)));
+                return Err(RenderError::ChartImage { which });
+            };
+            if let Some(slot) = uvs.get_mut(which.index()) {
+                *slot = Some(uv);
+            }
+        }
+        let mut up = ChartUpload {
+            target,
+            key,
+            at,
+            side,
+            uvs,
+            image: 0,
+            level: 0,
+            row: 0,
+        };
+        up.settle(images);
+        Ok(up)
+    }
+
+    /// Publishes `table` as `target`'s chart table, `key` the array's: the
+    /// committed installation's, drawn while its key is live, or the
+    /// staging's own; `None` makes the target's images unavailable.
+    fn set_chart_table(
+        &mut self,
+        target: ChartTarget,
+        key: skin_model::chart_image::ChartKey,
+        table: Option<skin_model::chart_image::ChartTable>,
+    ) {
+        match target {
+            ChartTarget::Committed => {
+                self.chart = table.map(|table| PublishedChart { key, table });
+                self.sync_chart();
+            }
+            ChartTarget::Staged(token) => {
+                if let Some(p) = self.pending.as_mut().filter(|p| p.token == token) {
+                    p.chart = table;
+                }
+                self.sync_staged_chart();
+            }
+        }
+    }
+
+    /// Whether `up`'s target is still the array it was taken for, on a
+    /// device not lost.
+    fn chart_current(&self, up: &ChartUpload) -> bool {
+        let live = match up.target {
+            ChartTarget::Committed => self.chart_key(),
+            ChartTarget::Staged(token) => self.staged_chart_key(token),
+        };
+        live == Some(up.key)
+    }
+
+    /// Why `up`'s target failed its check: the device lost, or the array
+    /// replaced.
+    fn chart_stale(&self) -> RenderError {
+        if self.gpu.lost() {
+            RenderError::DeviceLost
+        } else {
+            RenderError::ChartChanged
+        }
+    }
+
+    /// One band of `up`'s images, its target checked by the caller: the
+    /// next rows of the current image's current level, at most
+    /// [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes as the queue stages
+    /// them, written and submitted inside one pair of error scopes, its
+    /// completion registered. `Some` ends the payload: the device refused
+    /// the band (the target's all-absent table published).
+    fn write_chart_band(
+        &mut self,
+        up: &mut ChartUpload,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+    ) -> Option<Result<skin_model::chart_image::ChartTable, RenderError>> {
+        #[cfg(test)]
+        use skin_model::chart_image::ChartImage;
+        use skin_model::chart_image::ChartTable;
+        let texture = match up.target {
+            ChartTarget::Committed => self.atlas.texture().clone(),
+            ChartTarget::Staged(_) => match self.pending.as_ref().map(|p| &p.res) {
+                Some(PendingRes::Own(r)) => r.atlas.texture().clone(),
+                _ => return Some(Err(RenderError::ChartChanged)),
+            },
+        };
+        #[cfg(test)]
+        let fault = self.chart_fault.take();
+        #[cfg(test)]
+        let which = ChartImage::ALL.get(up.image).copied();
+        let gpu = &self.gpu;
+        let ((number, index), refused) = skin_atlas::scoped(gpu.device(), || {
+            up.write(gpu, &texture, images);
+            #[cfg(test)]
+            if let Some(fault) = fault {
+                fault(gpu);
+            }
+            gpu.submit([])
+        });
+        match up.target {
+            ChartTarget::Committed => self.atlas.mark(number),
+            ChartTarget::Staged(_) => {
+                if let Some(PendingRes::Own(r)) = self.pending.as_ref().map(|p| &p.res) {
+                    r.atlas.mark(number);
+                }
+            }
+        }
+        self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
+        #[cfg(feature = "dev-tools")]
+        {
+            self.chart_bands += 1;
+        }
+        #[cfg(test)]
+        if let Some(which) = which {
+            self.chart_submissions.push((which, self.chart_waits));
+        }
+        if let Some(e) = refused {
+            self.set_chart_table(up.target, up.key, Some(ChartTable::ABSENT.keyed(up.key)));
+            return Some(Err(RenderError::Atlas(UploadError::Device(e))));
+        }
+        None
+    }
+
+    /// `up`'s table, published into its target once its last band's
+    /// completion was seen, its target checked by the caller.
+    fn finish_chart(
+        &mut self,
+        up: &ChartUpload,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        use skin_model::chart_image::ChartTable;
+        let [stage, back, banner] = up.uvs;
+        let table = ChartTable::new(stage, back, banner).keyed(up.key);
+        self.set_chart_table(up.target, up.key, Some(table));
+        // A loss after the check discards the publication: it is the
+        // device's failure, never a success.
+        if up.target == ChartTarget::Committed && self.valid_chart() != Some(table) {
+            return Err(RenderError::DeviceLost);
+        }
+        Ok(table)
+    }
+
     /// Publishes an all-absent table into `target` with no write: the
     /// images are absent there, their fields false, and the presentation
     /// without them shows (S10-12 design §5.3, a terminal absence: a
@@ -5185,7 +5510,7 @@ impl Renderer {
     /// within [`UPLOAD_TIME_SLICE`](crate::UPLOAD_TIME_SLICE) and with no
     /// hold's bound ([`upload_boundary_within`](Self::upload_boundary_within)).
     pub fn upload_boundary(&mut self) -> crate::Uploaded {
-        self.upload_boundary_within(crate::UPLOAD_TIME_SLICE, &mut || false)
+        self.upload_boundary_within(crate::UPLOAD_TIME_SLICE, &mut || false, None)
     }
 
     /// One frame boundary's steps of the uploader, answering the BGA
@@ -5197,7 +5522,7 @@ impl Renderer {
     /// One frame boundary's steps of the uploader within `slice`,
     /// answering the BGA batch's.
     pub fn bga_boundary_within(&mut self, slice: Duration) -> crate::BgaStep {
-        self.upload_boundary_within(slice, &mut || false).bga
+        self.upload_boundary_within(slice, &mut || false, None).bga
     }
 
     /// One frame boundary's steps of the uploader (design.md "Memory
@@ -5223,15 +5548,16 @@ impl Renderer {
         &mut self,
         slice: Duration,
         past: &mut dyn FnMut() -> bool,
+        chart: Option<crate::ChartBands<'_>>,
     ) -> crate::Uploaded {
-        self.upload_steps(slice, past, false)
+        self.upload_steps(slice, past, chart, false)
     }
 
     /// The staging's steps alone, within [`UPLOAD_TIME_SLICE`]
     /// (crate::UPLOAD_TIME_SLICE): a caller that answers at once drives
     /// them, leaving every other payload to the boundaries.
     fn step_staging(&mut self) {
-        let _ = self.upload_steps(crate::UPLOAD_TIME_SLICE, &mut || false, true);
+        let _ = self.upload_steps(crate::UPLOAD_TIME_SLICE, &mut || false, None, true);
     }
 
     /// The uploader's steps of one boundary (see
@@ -5241,11 +5567,13 @@ impl Renderer {
         &mut self,
         slice: Duration,
         past: &mut dyn FnMut() -> bool,
+        mut chart: Option<crate::ChartBands<'_>>,
         staging_only: bool,
     ) -> crate::Uploaded {
         let mut out = crate::Uploaded {
             bga: crate::BgaStep::Idle,
             staged: None,
+            chart: None,
         };
         let started = Instant::now();
         let mut steps = 0_u32;
@@ -5256,17 +5584,32 @@ impl Renderer {
                 self.bga_upload = None;
                 out.bga = crate::BgaStep::Done(Err(crate::BgaFault::Stale));
             }
-            if !self.uploading() || (staging_only && !self.staging_steps()) {
+            // The chart publication's target checked before each band.
+            if let Some((up, _)) = &chart
+                && !self.chart_current(up)
+            {
+                out.chart = Some(Err(self.chart_stale()));
+                chart = None;
+            }
+            if !(self.uploading() || chart.is_some()) || (staging_only && !self.staging_steps()) {
                 break;
             }
             if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
                 if self.bga_upload.take().is_some() {
                     out.bga = crate::BgaStep::Done(Err(crate::BgaFault::Refused));
                 }
+                if chart.take().is_some() {
+                    out.chart = Some(Err(RenderError::DeviceLost));
+                }
                 break;
             }
             if self.gpu.lost() {
-                continue;
+                // The next round ends the payloads the loss made stale;
+                // a staging dies with the renderer.
+                if self.bga_upload.is_some() || chart.is_some() {
+                    continue;
+                }
+                break;
             }
             if !self.step_completed() {
                 break;
@@ -5297,6 +5640,26 @@ impl Renderer {
             }
             if staging_only {
                 break;
+            }
+            // The attempt's chart images, before the BGA batch.
+            if let Some((up, images)) = chart.as_mut() {
+                if up.written() {
+                    out.chart = Some(self.finish_chart(up));
+                    chart = None;
+                    continue;
+                }
+                if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                    break;
+                }
+                if past() {
+                    break;
+                }
+                if let Some(done) = self.write_chart_band(up, *images) {
+                    out.chart = Some(done);
+                    break;
+                }
+                steps += 1;
+                continue;
             }
             if self
                 .bga_upload
@@ -5450,6 +5813,12 @@ impl Renderer {
         true
     }
 
+    /// Whether the uploader's step is in flight, its completion unseen.
+    #[must_use]
+    pub fn step_in_flight(&self) -> bool {
+        self.step.is_some() && !self.step_completed()
+    }
+
     /// What the uploader can do now (design.md "Memory Budget", the
     /// uploader): nothing in hand, a boundary able to act at once, or a
     /// step in flight whose completion is unseen. Reads no device.
@@ -5494,6 +5863,15 @@ impl Renderer {
     #[cfg(feature = "dev-tools")]
     pub const fn delay_steps(&mut self, delay: Option<Duration>) {
         self.step_delay = delay;
+    }
+
+    /// Development builds: the chart-image bands this renderer wrote
+    /// ([`begin_chart_upload`](Self::begin_chart_upload)), so a test sees
+    /// a publication's first band.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn chart_bands(&self) -> u64 {
+        self.chart_bands
     }
 
     /// The time the boundary's `steps` steps took since `started`.
@@ -8552,6 +8930,10 @@ pub(crate) mod pool_tests;
 mod decision_label_tests;
 
 #[cfg(test)]
+#[path = "chart_upload_tests.rs"]
+mod chart_upload_tests;
+
+#[cfg(test)]
 mod tests {
     use std::error::Error;
 
@@ -9165,7 +9547,11 @@ mod tests {
         (dir, b, producer)
     }
 
-    fn labels<'a>(title: &'a str, artist: &'a str, genre: &'a str) -> skin_model::ChartText<'a> {
+    pub(super) fn labels<'a>(
+        title: &'a str,
+        artist: &'a str,
+        genre: &'a str,
+    ) -> skin_model::ChartText<'a> {
         skin_model::ChartText {
             title,
             subtitle: "",
@@ -9175,7 +9561,7 @@ mod tests {
         }
     }
 
-    fn stage_labels(
+    pub(super) fn stage_labels(
         r: &mut Renderer,
         b: &std::sync::Arc<crate::SkinBundle>,
         text: &skin_model::ChartText<'_>,
@@ -9195,7 +9581,7 @@ mod tests {
 
     /// A buffer whose usage mixes both map modes: every device's
     /// validation refuses it.
-    fn refuse(gpu: &crate::Gpu) {
+    pub(super) fn refuse(gpu: &crate::Gpu) {
         let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("refused"),
             size: 4,
@@ -9212,7 +9598,7 @@ mod tests {
 
     /// A `w`×`h` picture of `rgb`, read and fitted into `which`'s slot of
     /// a chart layer of side `side`.
-    fn chart_picture(
+    pub(super) fn chart_picture(
         which: skin_model::chart_image::ChartImage,
         side: u32,
         [w, h]: [u32; 2],
@@ -9234,7 +9620,7 @@ mod tests {
 
     /// A renderer with a committed play installation keeping a chart
     /// layer, and the folder its image lives in.
-    fn chart_renderer() -> (Renderer, tempfile::TempDir, u32) {
+    pub(super) fn chart_renderer() -> (Renderer, tempfile::TempDir, u32) {
         let dir = tempfile::tempdir().unwrap();
         let mut r = crate::test_common::offscreen(1_920, 1_080);
         let look = crate::test_decl::Look {

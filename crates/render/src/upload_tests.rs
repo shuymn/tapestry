@@ -82,7 +82,7 @@ fn a_staging_answers_ready_only_after_its_last_step() {
     assert_eq!(r.commit(staged), Err(CommitError::NothingStaged));
     let mut before = 0;
     let ready = loop {
-        let up = r.upload_boundary_within(Duration::from_secs(10), &mut || false);
+        let up = r.upload_boundary_within(Duration::from_secs(10), &mut || false, None);
         if let Some(t) = up.staged {
             break t;
         }
@@ -134,7 +134,7 @@ fn an_atlas_step_is_eight_writes_under_one_submission() {
     let n = writes(&b);
     assert!((17..=24).contains(&n), "{n} writes: three steps");
     r.step_seen.set(Some(true));
-    let up = r.upload_boundary_within(Duration::from_secs(60), &mut || false);
+    let up = r.upload_boundary_within(Duration::from_secs(60), &mut || false, None);
     r.step_seen.set(None);
     assert_eq!(*r.step_writes.borrow(), [8, 8, n - 16]);
     assert_eq!(r.step_submits.get(), 3);
@@ -162,19 +162,23 @@ fn the_holds_bound_closes_a_step_with_its_writes() {
     r.step_seen.set(Some(false));
     // Read before each write: the bound passes after the third.
     let mut looks = 0;
-    let up = r.upload_boundary_within(Duration::from_secs(60), &mut || {
-        looks += 1;
-        looks > 3
-    });
+    let up = r.upload_boundary_within(
+        Duration::from_secs(60),
+        &mut || {
+            looks += 1;
+            looks > 3
+        },
+        None,
+    );
     assert_eq!(*r.step_writes.borrow(), [3], "closed after its third write");
     assert_eq!(r.step_submits.get(), 1, "submitted");
     assert!(r.step.is_some(), "its completion registered");
     assert_eq!(up.staged, None);
     r.step_seen.set(Some(true));
     // Past the bound before the first write: nothing written at all.
-    let _ = r.upload_boundary_within(Duration::from_secs(60), &mut || true);
+    let _ = r.upload_boundary_within(Duration::from_secs(60), &mut || true, None);
     assert_eq!(r.step_submits.get(), 1, "no write past the bound");
-    let up = r.upload_boundary_within(Duration::from_secs(60), &mut || false);
+    let up = r.upload_boundary_within(Duration::from_secs(60), &mut || false, None);
     r.step_seen.set(None);
     assert_eq!(*r.step_writes.borrow(), [3, 8, n - 11]);
     assert!(up.staged.is_some());

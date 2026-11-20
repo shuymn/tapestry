@@ -155,6 +155,12 @@ pub(super) struct Faults {
     /// Each uploader step's completion is held unseen this long after its
     /// submission, µs; 0 as the device answers.
     pub(crate) step_delay_us: std::sync::atomic::AtomicU64,
+    /// The chart-image bands the menu screen's renderer wrote, as of its
+    /// last boundary.
+    pub(crate) chart_bands: std::sync::atomic::AtomicU64,
+    /// The device is destroyed at the boundary that wrote the first
+    /// chart-image band.
+    pub(crate) lose_after_band: AtomicBool,
 }
 
 impl Drop for Recorded {
@@ -245,13 +251,48 @@ impl Screen for Recorded {
         })
     }
     fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
-        self.menu.upload_boundary(past)
+        let up = self.menu.upload_boundary(past);
+        let bands = self.menu.renderer_mut().chart_bands();
+        self.faults.chart_bands.store(bands, Ordering::Release);
+        if bands > 0 && self.faults.lose_after_band.swap(false, Ordering::AcqRel) {
+            self.menu.renderer_mut().gpu().device().destroy();
+        }
+        up
     }
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
     }
     fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
         self.menu.wait_step(timeout)
+    }
+    fn publish_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        self.menu.publish_chart_images(target, images)
+    }
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, render::RenderError> {
+        self.menu.begin_chart_images(target, set)
+    }
+    fn cancel_chart_images(&mut self) {
+        self.menu.cancel_chart_images();
+    }
+    fn publish_chart_absent(
+        &mut self,
+        target: render::ChartTarget,
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        self.menu.publish_chart_absent(target)
+    }
+    fn invalidate_chart_images(&mut self) {
+        self.menu.invalidate_chart_images();
+    }
+    fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.menu.chart_key()
     }
     fn write_result_chart(
         &mut self,

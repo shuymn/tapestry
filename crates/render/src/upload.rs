@@ -54,14 +54,26 @@ pub enum UploadState {
     InFlight,
 }
 
+/// The attempt's chart-image publication a boundary steps: the payload in
+/// hand and its images, which its caller keeps.
+pub type ChartBands<'a> = (
+    &'a mut crate::ChartUpload,
+    [Option<&'a skin_model::chart_image::Fitted>; 3],
+);
+
 /// What one boundary's steps came to, per payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Uploaded {
     /// The BGA batch's: answered once it is [`BgaStep::Done`](crate::BgaStep::Done).
     pub bga: crate::BgaStep,
     /// The staging whose last step's completion this boundary saw: it
     /// answers ready from now on.
     pub staged: Option<crate::PreparedToken>,
+    /// The chart-image publication's end in this boundary: its table,
+    /// published at the completion that passed its checks, or why it
+    /// ended (a check failed, nothing more written; a band refused, the
+    /// all-absent table published).
+    pub chart: Option<Result<skin_model::chart_image::ChartTable, crate::RenderError>>,
 }
 
 /// The step in flight: its completion's flag and its submission.
