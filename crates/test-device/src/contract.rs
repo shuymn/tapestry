@@ -267,9 +267,11 @@ struct Seen {
     seals: BTreeMap<String, String>,
 }
 
-/// Compares the run, set or outer run in `dir` with `e`.
+/// Compares the run, set or outer run in `dir` with `e`, the expectation
+/// compiled into the runner of commit `runner`: every role's run must name
+/// that commit as its runner's.
 #[must_use]
-pub fn check(e: &Expectation, dir: &Path) -> Report {
+pub fn check(e: &Expectation, dir: &Path, runner: &str) -> Report {
     let mut report = Report::default();
     for p in e.problems() {
         report.add(format!("the expectation: {p}"));
@@ -282,7 +284,7 @@ pub fn check(e: &Expectation, dir: &Path) -> Report {
     };
     let mut seen: BTreeMap<&str, Seen> = BTreeMap::new();
     for b in &bound {
-        if let Some(s) = read_role(b, dir, &mut report) {
+        if let Some(s) = read_role(b, dir, runner, &mut report) {
             seen.insert(b.name, s);
         }
     }
@@ -457,7 +459,7 @@ fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<Vec<Bound>> 
 
 /// A role's streams, read strictly, and its `start` against its
 /// reservation.
-fn read_role(b: &Bound, dir: &Path, report: &mut Report) -> Option<Seen> {
+fn read_role(b: &Bound, dir: &Path, runner: &str, report: &mut Report) -> Option<Seen> {
     let folder = dir.join(&b.dir);
     let at = |name: &str| {
         if b.dir.is_empty() {
@@ -478,6 +480,7 @@ fn read_role(b: &Bound, dir: &Path, report: &mut Report) -> Option<Seen> {
         ("role", start.role.as_str(), b.name),
         ("row", start.row.as_str(), b.row),
         ("build", start.build.as_str(), b.build.as_str()),
+        ("runner commit", start.commit.as_str(), runner),
         (
             "set",
             start.set.as_deref().unwrap_or("none"),

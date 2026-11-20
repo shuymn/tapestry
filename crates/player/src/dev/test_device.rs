@@ -19,6 +19,9 @@ use lexopt::Arg;
 
 use crate::args::{Command, UsageError};
 
+/// The commit this build of the runner was made from (the crate's `build.rs`).
+pub const COMMIT: &str = env!("TAPESTRY_COMMIT");
+
 const USAGE: &str = "usage: tapestry test-device devices [--out <json>] \
 | flash <uf2> --build <id> --port <location> \
 | bootsel --port <location> \

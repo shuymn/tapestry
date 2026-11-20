@@ -33,7 +33,7 @@ fn run(rows: &[Row], row: &str, dir: &Path) -> anyhow::Result<()> {
     let Some(e) = expectation(rows, row) else {
         bail!("no row `{row}`: this build compiles no expectation for it");
     };
-    let report = contract::check(&e, dir);
+    let report = contract::check(&e, dir, super::COMMIT);
     for n in &report.notes {
         println!("note: {n}");
     }
@@ -91,7 +91,7 @@ mod tests {
         // An empty folder: no run.jsonl.
         let e = run(rows, "bare", dir.path()).unwrap_err().to_string();
         assert_eq!(e, "CONTRACT bare mismatch 1");
-        let start = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"bare","role":"run","build":"0123456789ab","process":{"pid":1,"created":2},"args":[]}"#;
+        let start = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"bare","role":"run","build":"0123456789ab","process":{"pid":1,"created":2},"commit":"COMMIT","tag":7,"args":[]}"#;
         let end = r#"{"t":"end","exit":0,"errors":[]}"#;
         std::fs::write(dir.path().join("run.jsonl"), format!("{start}\n{end}\n")).unwrap();
         let e = run(rows, "bare", dir.path()).unwrap_err().to_string();

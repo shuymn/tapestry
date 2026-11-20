@@ -305,9 +305,74 @@ impl Bounds {
     }
 }
 
+/// Host counter ticks at `freq` Hz as µs, rounded down.
+#[must_use]
+pub fn ticks_to_us(t: i64, freq: i64) -> i64 {
+    let v = (i128::from(t) * 1_000_000).div_euclid(i128::from(freq.max(1)));
+    i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// The device time (µs) a lease granted or renewed after a check at host
+/// µs `checked` runs to: `length_ms` after the least device time `checked`
+/// may be ([`Bounds::unmap`] of `pings`' bounds), shortened by the clocks'
+/// rate bound, so the device reaches it no later than `length_ms` after
+/// the check on the host's clock, however late the command arrives. `None`
+/// without round trips that bound the clock.
+#[must_use]
+pub fn deadline(pings: &[Ping], checked: i64, length_ms: u64) -> Option<u64> {
+    let bounds = Bounds::fit(pings).ok()?;
+    let (least, _) = bounds.unmap(checked);
+    let us = u128::from(length_ms) * 1000;
+    let short = us * (1_000_000 - RATE_PPM.unsigned_abs()) / 1_000_000;
+    least.checked_add(u64::try_from(short).ok()?)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Round trips with the device's clock `ppm` fast against the host's,
+    /// `delay` µs each way, every 100 ms from host µs 0.
+    fn even_pings(ppm: i64, delay: i64) -> Vec<Ping> {
+        (0..10)
+            .map(|k| {
+                let mid = k * 100_000;
+                let device = 5_000_000 + mid + mid * ppm / 1_000_000;
+                Ping {
+                    sent: mid - delay,
+                    device: u64::try_from(device).unwrap(),
+                    received: mid + delay,
+                }
+            })
+            .collect()
+    }
+
+    /// A deadline is reached, on the host's clock, no later than its
+    /// length after the check, at any rate the bounds allow and however
+    /// stale the round trips are; and not far sooner.
+    #[test]
+    fn a_deadline_ends_no_later_than_its_length_after_the_check() {
+        for ppm in [-900, 0, 900] {
+            let p = even_pings(ppm, 300);
+            for checked in [900_000, 1_500_000, 20_000_000] {
+                let d = deadline(&p, checked, 250).unwrap();
+                // The true host time the device reaches the deadline.
+                let device_at_check = 5_000_000 + checked + checked * ppm / 1_000_000;
+                let ahead = i64::try_from(d).unwrap() - device_at_check;
+                let host_ahead = ahead * 1_000_000 / (1_000_000 + ppm);
+                assert!(host_ahead <= 250_000, "{ppm} {checked}: {host_ahead}");
+                // Stale round trips widen the bound by the rate's spread.
+                let slack = 1_000 + (checked - 900_000) * 2_000 / 1_000_000;
+                assert!(
+                    host_ahead >= 250_000 - slack,
+                    "{ppm} {checked}: {host_ahead}"
+                );
+            }
+        }
+        assert_eq!(deadline(&[], 0, 250), None);
+        assert_eq!(ticks_to_us(25, 10), 2_500_000);
+        assert_eq!(ticks_to_us(-1, 3), -333_334);
+    }
 
     /// A run's true clocks: host = HOST0 + (device − DEVICE0)·(5000 + k)/5000.
     pub(crate) struct Truth {

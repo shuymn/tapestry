@@ -205,6 +205,18 @@ pub struct Reserved {
 pub enum Run {
     Start(Start),
     Seal(Seal),
+    /// A child the runner started: its name in the row and its process.
+    Spawn(Spawn),
+    /// The runner's sink window, once it shows.
+    Sink(RunWindow),
+    /// The runner's recorder shows every press the row holds, from the
+    /// device's bound handles.
+    Held(RunQ),
+    /// `stop_holds`: no hold-bearing command is admitted after it, and the
+    /// one `release` is requested; its cause.
+    Stop(RunNote),
+    /// A step of the recovery after the end found no release evidence.
+    Recovery(RunNote),
     Exit(Exit),
     End(RunEnd),
 }
@@ -221,6 +233,11 @@ pub struct Start {
     /// The device's build the run expects.
     pub build: String,
     pub process: Process,
+    /// The runner's own commit: 12 hex digits, with `-dirty` for a build
+    /// of uncommitted changes (`nogit` when the build had no Git).
+    pub commit: String,
+    /// The 16-bit prefix of every injected input's 32-bit tag.
+    pub tag: u16,
     pub args: Vec<String>,
     /// The set whose role this run is, if any.
     pub set: Option<String>,
@@ -237,6 +254,39 @@ pub struct Seal {
     pub role: String,
     pub path: String,
     pub sha256: String,
+}
+
+/// A child the runner started.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spawn {
+    pub q: i64,
+    /// The child's name in the row (`recorder`, `inner`).
+    pub name: String,
+    pub process: Process,
+}
+
+/// A window of the runner's, by its handle's value.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunWindow {
+    pub q: i64,
+    pub window: u64,
+}
+
+/// A record with only its host counter.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunQ {
+    pub q: i64,
+}
+
+/// A cause or a step, with its host counter.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunNote {
+    pub q: i64,
+    pub what: String,
 }
 
 /// A process's exit as the runner observed it: the process its first
@@ -268,6 +318,11 @@ impl Kinds for Run {
         match self {
             Self::Start(_) => "start",
             Self::Seal(_) => "seal",
+            Self::Spawn(_) => "spawn",
+            Self::Sink(_) => "sink",
+            Self::Held(_) => "held",
+            Self::Stop(_) => "stop",
+            Self::Recovery(_) => "recovery",
             Self::Exit(_) => "exit",
             Self::End(_) => "end",
         }
@@ -282,8 +337,19 @@ pub enum Link {
     /// The port opened: the bound location, the COM port, the interface
     /// path it was opened by, and the counter's frequency.
     Open(LinkOpen),
-    /// A command written.
-    Cmd(LinkLine),
+    /// A command written: the host counter just before its write, and in
+    /// the runner's link also when it was queued and when its write ended.
+    Cmd(LinkCmd),
+    /// The guard's good check, at `q`, that the hold-bearing command
+    /// `line` written next is derived from.
+    Check(LinkLine),
+    /// A hold-bearing command not written: holds had stopped.
+    Dropped(LinkLine),
+    /// The fence: no hold-bearing write begun before holds stopped is in
+    /// progress.
+    Fence(LinkQ),
+    /// The runner closed its sink window.
+    Close(LinkQ),
     /// An answer read; `sent` and `cmd` name the command it answers (none
     /// for the `hello` read while the link opens).
     Ans(LinkAnswer),
@@ -317,6 +383,21 @@ pub struct LinkOpen {
 pub struct LinkLine {
     pub q: i64,
     pub line: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkCmd {
+    pub q: i64,
+    pub line: String,
+    pub queued: Option<i64>,
+    pub done: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkQ {
+    pub q: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -366,6 +447,10 @@ impl Kinds for Link {
         match self {
             Self::Open(_) => "open",
             Self::Cmd(_) => "cmd",
+            Self::Check(_) => "check",
+            Self::Dropped(_) => "dropped",
+            Self::Fence(_) => "fence",
+            Self::Close(_) => "close",
             Self::Ans(_) => "ans",
             Self::Ping(_) => "ping",
             Self::Rec(_) => "rec",
@@ -381,8 +466,17 @@ impl Kinds for Link {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Recorder {
-    /// The recorder's first record: its process.
+    /// The recorder's first record: its process, its window and the
+    /// device's handles it bound.
     Ready(RecorderReady),
+    /// A pad report, from the bound pad (`ours`) or another handle.
+    Pad(RecorderPad),
+    /// A keyboard edge, from the bound keyboard (`ours`) or another handle.
+    Key(RecorderKey),
+    /// A mouse button edge: its handle and `ulExtraInformation`.
+    Mouse(RecorderMouse),
+    /// A device's arrival, removal, or presence at the start.
+    Dev(RecorderDev),
     /// A recorder error: what failed and the stretch of the stream it
     /// affects, from and to on the host's counter.
     Error(RecorderError),
@@ -395,6 +489,81 @@ pub enum Recorder {
 pub struct RecorderReady {
     pub q: i64,
     pub process: Process,
+    /// Its message-only window.
+    pub window: u64,
+    /// The device's location the handles are bound by.
+    pub location: String,
+    /// The device's keyboard and pad handles, as bound at the start.
+    pub keyboard: Option<u64>,
+    pub pad: Option<u64>,
+}
+
+/// The foreground window and its process when an input was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Foreground {
+    pub window: u64,
+    pub pid: u32,
+}
+
+/// A pad report.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderPad {
+    pub q: i64,
+    pub h: u64,
+    pub ours: bool,
+    pub seq: u16,
+    /// Buttons 1-16, button n at bit n − 1.
+    pub buttons: u16,
+    pub x: u8,
+    pub fg: Foreground,
+}
+
+/// A keyboard edge.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderKey {
+    pub q: i64,
+    pub h: u64,
+    pub ours: bool,
+    /// The scan code, with 0xE000 added for an E0 key.
+    pub code: u16,
+    pub down: bool,
+    pub fg: Foreground,
+}
+
+/// A mouse button edge.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderMouse {
+    pub q: i64,
+    pub h: u64,
+    /// `RAWMOUSE.usButtonFlags`, only its button edges.
+    pub buttons: u16,
+    /// `RAWMOUSE.ulExtraInformation`: an injected input's tag.
+    pub extra: u32,
+    pub fg: Foreground,
+}
+
+/// A device's change.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderDev {
+    pub q: i64,
+    pub h: u64,
+    pub change: Change,
+    /// Whether it is one of the device's interfaces at the bound location.
+    pub ours: bool,
+}
+
+/// What a [`RecorderDev`] saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Change {
+    Present,
+    Arrival,
+    Removal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -418,6 +587,10 @@ impl Kinds for Recorder {
     fn kind(&self) -> &'static str {
         match self {
             Self::Ready(_) => "ready",
+            Self::Pad(_) => "pad",
+            Self::Key(_) => "key",
+            Self::Mouse(_) => "mouse",
+            Self::Dev(_) => "dev",
             Self::Error(_) => "error",
             Self::End(_) => "end",
         }

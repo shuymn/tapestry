@@ -1,6 +1,6 @@
 use super::*;
 
-const START: &str = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"sink","role":"run","build":"0123456789ab","process":{"pid":7,"created":11},"args":["--build","0123456789ab"],"set":null}"#;
+const START: &str = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"sink","role":"run","build":"0123456789ab","process":{"pid":7,"created":11},"commit":"fedcba987654","tag":7,"args":["--build","0123456789ab"],"set":null}"#;
 const SEAL: &str = r#"{"t":"seal","run":"0123456789abcdef0123456789abcdef","role":"run","path":"link.jsonl","sha256":"00"}"#;
 const END: &str = r#"{"t":"end","exit":0,"errors":[]}"#;
 
