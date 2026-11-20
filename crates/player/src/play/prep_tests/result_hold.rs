@@ -264,6 +264,9 @@ fn a_withdrawn_result_draws_no_pending_frame_after_the_next_message() {
         rig.withdraw_result(Some(game::MenuCommand::Retry));
         rig.prepare_screen().unwrap();
         let after = frames.len();
+        // The time a retry's preparation takes before its next message:
+        // frames a hold still current would draw.
+        std::thread::sleep(Duration::from_millis(200));
         rig.render.send(RenderMsg::Menu(Box::new(
             crate::render_side::tests::one_line("select"),
         )));
