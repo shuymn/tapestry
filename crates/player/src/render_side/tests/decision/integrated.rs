@@ -555,6 +555,18 @@ impl Screen for Noted {
     fn splash(&mut self, elapsed: Duration) -> Option<Result<render::FrameOutcome, RenderError>> {
         self.menu.splash(elapsed)
     }
+    fn loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        chart: &std::sync::Arc<crate::loading_text::ChosenChart>,
+        on: Option<render::PreparedToken>,
+    ) {
+        self.menu.loading_text(lifetime, revision, chart, on);
+    }
+    fn text_settled(&self) -> bool {
+        self.menu.text_settled()
+    }
     fn loading(
         &mut self,
         page: &MenuPage,

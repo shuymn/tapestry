@@ -639,7 +639,12 @@ impl MenuScreen {
     /// Preparing allocates: it runs only when the update needs new text,
     /// never in a frame's build.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64, on: LoadingOn) {
+    fn chosen_text(
+        &mut self,
+        (lifetime, revision): (u64, u64),
+        chart: &Arc<ChosenChart>,
+        on: LoadingOn,
+    ) {
         self.renderer.enter_loading_on(on, lifetime);
         let Some(key) = self.renderer.loading_text_key_on(on) else {
             self.renderer.cancel_loading_text();
@@ -650,8 +655,8 @@ impl MenuScreen {
             key,
             target: self.renderer.target(),
             lifetime,
-            revision: update.revision,
-            chart: Arc::clone(&update.chart),
+            revision,
+            chart: Arc::clone(chart),
         };
         self.chosen.current = Some(asked.clone());
         let in_progress = self
@@ -677,7 +682,7 @@ impl MenuScreen {
         // not this one prepares every slot.
         self.chosen.installed = None;
         self.renderer.clear_loading_text_on(on, which);
-        let c = &update.chart;
+        let c = chart;
         fn field(f: &Option<String>) -> &str {
             f.as_deref().unwrap_or_default()
         }
@@ -693,7 +698,7 @@ impl MenuScreen {
         #[cfg(feature = "dev-tools")]
         let p_t = render::probe::Span::start();
         self.renderer
-            .prepare_loading_text_on(on, lifetime, update.revision, which, &chart);
+            .prepare_loading_text_on(on, lifetime, revision, which, &chart);
         #[cfg(feature = "dev-tools")]
         {
             crate::dev::loop_probe::mark("ld:text_us", crate::dev::loop_probe::us(p_t.elapsed()));
@@ -763,8 +768,10 @@ impl MenuScreen {
         if std::mem::take(&mut self.chosen.failed) {
             return Err(RenderError::DeviceLost);
         }
-        if let Some(update) = update {
-            self.chosen_text(update, frame.lifetime, on);
+        // The text was brought to the update by the pass
+        // ([`Screen::loading_text`]); the frame only enters its lifetime.
+        if update.is_some() {
+            self.renderer.enter_loading_on(on, frame.lifetime);
         }
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
@@ -1042,6 +1049,21 @@ impl Screen for MenuScreen {
             (render::UploadState::Idle, Some(_)) => render::UploadState::Ready,
             (state, _) => state,
         }
+    }
+
+    fn loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        chart: &Arc<ChosenChart>,
+        on: Option<PreparedToken>,
+    ) {
+        let on = on.map_or(LoadingOn::Installed, LoadingOn::Staged);
+        self.chosen_text((lifetime, revision), chart, on);
+    }
+
+    fn text_settled(&self) -> bool {
+        self.chosen.settled()
     }
 
     fn begin_chart_images(

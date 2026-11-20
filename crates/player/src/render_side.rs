@@ -927,6 +927,26 @@ pub trait Screen: Send {
         let _ = token;
         self.loading(page, update, changed, frame)
     }
+    /// Brings the play skin's loading text to the chosen chart `chart` of
+    /// `revision` for loading lifetime `lifetime`, on the staging `on`
+    /// names or the installed skin for `None`, once per pass after the
+    /// newest size (design.md "Rendering and Skins"): settled or in
+    /// progress, nothing; else its slots are cleared and prepared into the
+    /// uploader's hand. Nothing by default.
+    fn loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        chart: &Arc<crate::loading_text::ChosenChart>,
+        on: Option<PreparedToken>,
+    ) {
+        let _ = (lifetime, revision, chart, on);
+    }
+    /// Whether the loading text last asked ([`loading_text`](Self::loading_text))
+    /// is settled: installed in every slot, or refused. True by default.
+    fn text_settled(&self) -> bool {
+        true
+    }
     /// The play staging the screen holds, if any: what a staged loading
     /// frame may draw. None by default.
     fn staged_token(&self) -> Option<PreparedToken> {
@@ -5896,6 +5916,9 @@ struct FirstFrame {
     lifetime: u64,
     shown_at: TimeUs,
     ended: bool,
+    /// A presented frame of the lifetime was drawn by the play skin: from
+    /// then on its loading text is no longer waited for.
+    skinned: bool,
     /// The time the render thread held the frame, once it has (dev-tools:
     /// a scenario's transition record).
     #[cfg(feature = "dev-tools")]
@@ -5924,6 +5947,14 @@ impl FirstFrame {
             h.ended_by = Some(why);
         }
     }
+}
+
+/// Whether the play skin's loading text keeps it from drawing a loading
+/// frame: before the lifetime's first skinned frame (`skinned`), while the
+/// text the pass last asked is not settled on `screen` (design.md
+/// "Rendering and Skins").
+fn text_unsettled(skinned: bool, screen: &dyn Screen) -> bool {
+    !skinned && !screen.text_settled()
 }
 
 /// The first frame's hold bound: [`FIRST_FRAME_HOLD`], or a test's.
@@ -7159,6 +7190,10 @@ impl Run {
             if matches!(mode, Mode::Idle) {
                 continue;
             }
+            // The play skin's loading text, once per pass after the newest
+            // size: brought to the lifetime's chart and the target applied
+            // (design.md "Rendering and Skins").
+            self.loading_text_pass(&mode);
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -7200,20 +7235,22 @@ impl Run {
                             lifetime,
                             shown_at,
                             ended: false,
+                            skinned: false,
                             #[cfg(feature = "dev-tools")]
                             hold: None,
                         }
                     }
                 };
                 let pending = !first.ended
-                    && presentation_of(
+                    && (presentation_of(
                         &self.committed,
                         self.specialized_in,
                         self.prepared.as_ref().map(Prepared::candidate),
                         self.requested,
                         (screen.staged_token(), screen.device()),
                         lifetime,
-                    ) == Presented::Placeholder;
+                    ) == Presented::Placeholder
+                        || text_unsettled(first.skinned, &**screen));
                 if pending && screen.device_lost() {
                     // The screen's failure, as a frame's.
                     first.ended = true;
@@ -7689,7 +7726,14 @@ impl Run {
                     {
                         frame_presented = presented;
                     }
-                    let pending = presented == Some(Presented::Placeholder);
+                    // Before the lifetime's first skinned frame, a skin whose
+                    // loading text is not settled draws the pending
+                    // presentation, declaring its own time.
+                    let skinned = self
+                        .first_frame
+                        .is_some_and(|f| loading_frame == Some(f.lifetime) && f.skinned);
+                    let pending = presented == Some(Presented::Placeholder)
+                        || (presented.is_some() && text_unsettled(skinned, &**screen));
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -7761,11 +7805,13 @@ impl Run {
                         let clock = self.clock;
                         self.shared
                             .presented_loading(lifetime, loadend, || clock.now());
-                        // Presented: the hold has ended for the lifetime.
+                        // Presented: the hold has ended for the lifetime, and
+                        // a frame the skin drew is its first skinned one.
                         if let Some(f) = &mut self.first_frame
                             && f.lifetime == lifetime
                         {
                             f.ended = true;
+                            f.skinned |= !pending;
                         }
                     }
                     #[cfg(feature = "dev-tools")]
@@ -8997,10 +9043,10 @@ impl Run {
             return None;
         }
         let now = self.clock.now();
-        let shown_at = match self.first_frame {
+        let (shown_at, skinned) = match self.first_frame {
             Some(f) if f.lifetime == *lifetime && f.ended => return None,
-            Some(f) if f.lifetime == *lifetime => f.shown_at,
-            _ => update.as_deref().map_or(now, |u| u.origin),
+            Some(f) if f.lifetime == *lifetime => (f.shown_at, f.skinned),
+            _ => (update.as_deref().map_or(now, |u| u.origin), false),
         };
         let pending = presentation_of(
             &self.committed,
@@ -9009,13 +9055,46 @@ impl Run {
             self.requested,
             (screen.staged_token(), screen.device()),
             *lifetime,
-        ) == Presented::Placeholder;
+        ) == Presented::Placeholder
+            || text_unsettled(skinned, &**screen);
         #[cfg(test)]
         let now = hold_now(&self.shared, now, shown_at);
         (pending
             && held_wait(now, shown_at, first_frame_bound(&self.shared)).is_some()
             && self.image.valid(notices_of(self.extent.as_ref())))
         .then_some(shown_at)
+    }
+
+    /// The play skin's loading text once per pass after the newest size
+    /// (design.md "Rendering and Skins"): for a loading lifetime whose frame
+    /// the skin draws (staged, committed or installed), its text is brought
+    /// to the lifetime's chart and revision on that installation; the
+    /// pending presentation asks nothing.
+    fn loading_text_pass(&mut self, mode: &Mode) {
+        let Mode::Menu {
+            loading: Some(lifetime),
+            update: Some(update),
+            ..
+        } = mode
+        else {
+            return;
+        };
+        let Some(screen) = &mut self.screen else {
+            return;
+        };
+        let on = match presentation_of(
+            &self.committed,
+            self.specialized_in,
+            self.prepared.as_ref().map(Prepared::candidate),
+            self.requested,
+            (screen.staged_token(), screen.device()),
+            *lifetime,
+        ) {
+            Presented::Placeholder => return,
+            Presented::Staged { token, .. } => Some(token),
+            Presented::Ordinary | Presented::Committed => None,
+        };
+        screen.loading_text(*lifetime, update.revision, &update.chart, on);
     }
 
     /// Whether the loading hold shown at `shown_at` has reached its bound
@@ -21100,6 +21179,18 @@ pub(crate) mod tests {
             }
             self.menu.menu(page, changed)
         }
+        fn loading_text(
+            &mut self,
+            lifetime: u64,
+            revision: u64,
+            chart: &std::sync::Arc<crate::loading_text::ChosenChart>,
+            on: Option<render::PreparedToken>,
+        ) {
+            self.menu.loading_text(lifetime, revision, chart, on);
+        }
+        fn text_settled(&self) -> bool {
+            self.menu.text_settled()
+        }
         fn loading(
             &mut self,
             page: &crate::menu_screen::MenuPage,
@@ -21485,6 +21576,18 @@ pub(crate) mod tests {
             changed: bool,
         ) -> Result<FrameTiming, RenderError> {
             self.menu.menu(page, changed)
+        }
+        fn loading_text(
+            &mut self,
+            lifetime: u64,
+            revision: u64,
+            chart: &std::sync::Arc<crate::loading_text::ChosenChart>,
+            on: Option<render::PreparedToken>,
+        ) {
+            self.menu.loading_text(lifetime, revision, chart, on);
+        }
+        fn text_settled(&self) -> bool {
+            self.menu.text_settled()
         }
         fn loading(
             &mut self,
