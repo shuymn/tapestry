@@ -27,7 +27,7 @@ use crate::result_skin::{ResultSkin, ResultStart, Upload};
 
 /// The colours of the stage files: chart A's, chart B's, and the one
 /// written again after a deletion.
-const RED: [u8; 3] = [200, 30, 30];
+pub(super) const RED: [u8; 3] = [200, 30, 30];
 const GREEN: [u8; 3] = [30, 200, 30];
 const BLUE: [u8; 3] = [30, 30, 200];
 /// The skins' own image, the 190 branch's mark.
@@ -199,7 +199,7 @@ fn png(dir: &Path, name: &str, rgb: [u8; 3]) {
 
 /// A chart naming the stage file `s.png`, written beside it in `rgb`
 /// when `Some`.
-fn chart(rgb: Option<[u8; 3]>) -> (tempfile::TempDir, game::Loaded) {
+pub(super) fn chart(rgb: Option<[u8; 3]>) -> (tempfile::TempDir, game::Loaded) {
     let (dir, l) = crate::imports::facts::tests::loaded_kept("#STAGEFILE s.png\n", "tapestry");
     if let Some(rgb) = rgb {
         png(dir.path(), "s.png", rgb);
@@ -235,7 +235,7 @@ fn lua_result(pre: &str, places: &str) -> tempfile::TempDir {
 }
 
 /// A fixed result skin drawing the stage file: it reads no fact.
-fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+pub(super) fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
     let d = lua_result("", &format!("d[#d + 1] = {CHART_DST}"));
     let choice = game::SkinChoice {
         root: d.path().to_owned(),
@@ -290,7 +290,7 @@ fn payload_stage(rig: &PlayerRig<'_>, bundle: &Arc<render::SkinBundle>) -> Optio
 }
 
 /// The preparation of `loaded` polled to its end, ready, and committed.
-fn prepared(rig: &mut PlayerRig<'_>, loaded: &game::Loaded) {
+pub(super) fn prepared(rig: &mut PlayerRig<'_>, loaded: &game::Loaded) {
     let mut h = begin(rig, loaded);
     readied(rig, &mut h);
     rig.commit_attempt().unwrap();

@@ -1450,6 +1450,10 @@ pub enum RenderMsg {
     /// Draw the result screen from the newest presentation in the slot
     /// ([`RenderLink::show_result`]), if its lifetime is current.
     ResultChanged,
+    /// The result's hold `number` begins, the result's preparation having
+    /// begun at `from` ([`RenderLink::hold_result`]; design.md "Rendering
+    /// and Skins", the result's hold).
+    HoldResult { number: u64, from: TimeUs },
     /// Draw the play screen's loading state of this loading lifetime with
     /// the lines in the slot ([`LoadingSink`]), kept through a chart's load
     /// and a preparation until something else is drawn; nothing when the
@@ -2959,6 +2963,8 @@ pub struct RenderLink {
     scripts: Scripts,
     /// The result lifetimes begun.
     result_lifetimes: AtomicU64,
+    /// The result's holds begun.
+    result_holds: AtomicU64,
 }
 
 impl RenderLink {
@@ -3085,8 +3091,27 @@ impl RenderLink {
         lifetime
     }
 
+    /// The result's hold begins (design.md "Rendering and Skins", the
+    /// result's hold), the result's preparation having begun at `from`: it
+    /// is numbered and marked in the result slot, under the slot's lock,
+    /// before the render thread is told. Its number.
+    pub fn hold_result(&self, from: TimeUs) -> u64 {
+        let number = self.result_holds.fetch_add(1, Ordering::Relaxed) + 1;
+        self.shared.result_slot().hold(number);
+        self.send(RenderMsg::HoldResult { number, from });
+        number
+    }
+
+    /// The result's hold is released with no lifetime begun (the
+    /// preparation withdrawn): no pending presentation draws after the
+    /// game's next screen message.
+    pub fn release_result_hold(&self) {
+        self.shared.result_slot().release_hold();
+    }
+
     /// The result is left: its lifetime ends and the slot empties, so no
-    /// presentation of it is drawn, one the render thread took included.
+    /// presentation of it is drawn, one the render thread took included;
+    /// its hold is released in the same lock.
     pub fn end_result(&self) {
         self.shared.result_slot().enter(0);
         self.scripts.leave_result();
@@ -3870,6 +3895,16 @@ impl RenderLink {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn set_first_frame_hold(&self, bound: TimeUs) {
         self.shared.hold_bound.store(bound.0, Ordering::SeqCst);
+    }
+
+    /// The hold's clock: `Some(elapsed)` µs since the hold's start (the
+    /// loading state's showing, the result preparation's start) in place
+    /// of the clock's reading, `None` the clock's (tests).
+    #[cfg(test)]
+    pub fn set_hold_clock(&self, elapsed: Option<i64>) {
+        self.shared
+            .hold_elapsed
+            .store(elapsed.unwrap_or(i64::MIN), Ordering::SeqCst);
     }
 
     /// The first frame's held iterations' waits so far, read from any
@@ -4985,6 +5020,8 @@ pub fn spawn(
                 staged_seen: false,
                 image: Image::default(),
                 first_frame: None,
+                result_hold: None,
+                wait_page: None,
                 extent: None,
                 applied: None,
                 selected: None,
@@ -5086,6 +5123,7 @@ pub fn spawn(
             clock,
             scripts,
             result_lifetimes: AtomicU64::new(0),
+            result_holds: AtomicU64::new(0),
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -5251,7 +5289,7 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
         Mode::Play { .. } => K::Play,
         Mode::End => K::End,
         Mode::Selection => K::Selection,
-        Mode::Result => K::Result,
+        Mode::Result | Mode::ResultPending { .. } => K::Result,
         Mode::Menu {
             loading: Some(_), ..
         } => K::Loading,
@@ -5304,6 +5342,7 @@ fn stage_of(mode: &Mode, f: &StageFacts) -> crate::measure::Stage {
         let drew = match path {
             Some(ResultPath::Skin) => Drew::Skin,
             Some(ResultPath::Refused) => Drew::Refused,
+            Some(ResultPath::Pending) => Drew::Pending,
             Some(ResultPath::BuiltIn) | None => Drew::BuiltIn,
         };
         stage(State::Result, lifetime, drew)
@@ -5333,6 +5372,7 @@ fn stage_of(mode: &Mode, f: &StageFacts) -> crate::measure::Stage {
         }
         Mode::End => result(None),
         Mode::Result => result(f.result.map(|r| r.path)),
+        Mode::ResultPending { .. } => result(Some(crate::measure::ResultPath::Pending)),
         Mode::Selection => {
             let (lifetime, skinned) = f.selection.unwrap_or((0, false));
             let drew = if skinned { Drew::Skin } else { Drew::BuiltIn };
@@ -5945,6 +5985,12 @@ enum Mode {
     Selection,
     /// The result screen from its presentations: [`Run::result`].
     Result,
+    /// The result's pending presentation, with no result side
+    /// ([`Run::result_hold`], design.md "Rendering and Skins", the
+    /// result's hold): the wait page, `changed` until it is laid out.
+    ResultPending {
+        changed: bool,
+    },
 }
 
 /// The select screen as the render thread holds it: the newest update
@@ -6152,6 +6198,17 @@ impl Image {
 /// The size notices `extent` published, none without one.
 fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
     extent.map_or(0, |e| e.notices())
+}
+
+/// The result's hold on the render thread (design.md "Rendering and
+/// Skins", the result's hold): its number, the result preparation's start
+/// on the clock, and whether the outgoing screen's phase lasts, which,
+/// once ended, never resumes.
+#[derive(Clone, Copy, Debug)]
+struct ResultHold {
+    number: u64,
+    from: TimeUs,
+    held: bool,
 }
 
 /// A loading lifetime's first frame: when it was shown, and whether its
@@ -6668,6 +6725,11 @@ struct Run {
     image: Image,
     /// The current loading lifetime's first frame, once visited.
     first_frame: Option<FirstFrame>,
+    /// The result's hold, while it lasts (design.md "Rendering and
+    /// Skins", the result's hold): `None` from READY through the tail.
+    result_hold: Option<ResultHold>,
+    /// The result's pending presentation, composed once.
+    wait_page: Option<MenuPage>,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
     /// The size last applied to the screen; `None` until one is, and for
@@ -6965,9 +7027,16 @@ impl Run {
                     Mode::Decision => 5,
                     Mode::Selection => 6,
                     Mode::Result => 7,
+                    Mode::ResultPending { .. } => 8,
                 },
             );
             self.sync_chart();
+            // The result's hold, while one lasts: dropped once its mark no
+            // longer names it (design.md "Rendering and Skins", the
+            // result's hold). In play it is `None`: one test.
+            if self.result_hold.is_some() {
+                self.check_result_hold(&mut mode);
+            }
             // Every pass's end comes back here, whichever way it ended:
             // READY's cutoff asked with no entry filled is given here, and
             // a heavy operation a handler ran spends the allowance.
@@ -7045,6 +7114,11 @@ impl Run {
             if self.ends_cutoff(&msg) {
                 self.end_cutoff();
                 self.result_unacked = false;
+            }
+            // Another screen's message ends a result hold still held, a
+            // screen built again excepted.
+            if self.result_hold.is_some() && Self::ends_result_hold(&msg) {
+                self.result_hold = None;
             }
             self.allow_destruction(&mode);
             // The select screen is left: its frames are reported; and the
@@ -7203,6 +7277,14 @@ impl Run {
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
+                Ok(RenderMsg::HoldResult { number, from }) => {
+                    self.result_hold = Some(ResultHold {
+                        number,
+                        from,
+                        held: true,
+                    });
+                    continue;
+                }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
                     if self.current_result().is_some() {
@@ -7339,6 +7421,12 @@ impl Run {
                     // A result lifetime draws on from what it presented.
                     if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
+                    } else if let Some(h) = &mut self.result_hold {
+                        // The outgoing picture went with the old target:
+                        // the pending presentation draws from the rebuilt
+                        // screen's first frame.
+                        h.held = false;
+                        mode = Mode::ResultPending { changed: true };
                     }
                     continue;
                 }
@@ -7542,6 +7630,10 @@ impl Run {
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
                     mode = if shows { Mode::Result } else { Mode::End };
+                    // The built-in page with no lifetime ends the hold.
+                    if !shows {
+                        self.result_hold = None;
+                    }
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -7714,6 +7806,14 @@ impl Run {
             // size: brought to the lifetime's chart and the target applied
             // (design.md "Rendering and Skins").
             self.loading_text_pass(&mode);
+            // The result's hold before the hand-over: the outgoing screen
+            // (the play's) draws until the bound, the pending presentation
+            // after it.
+            if !matches!(mode, Mode::Result | Mode::ResultPending { .. })
+                && self.result_hold_passed()
+            {
+                mode = Mode::ResultPending { changed: true };
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -8627,6 +8727,10 @@ impl Run {
                         .as_ref()
                         .is_some_and(|s| s.presented.is_some())
                         .then_some(entry);
+                    // The lifetime's first committed view ends the hold.
+                    if result_picture.is_some() {
+                        self.result_hold = None;
+                    }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
@@ -8843,6 +8947,28 @@ impl Run {
                             screen.menu(page, true).map(|t| (t, None))
                         }
                     }
+                }
+                Mode::ResultPending { changed } => {
+                    // The wait page, laid out at the mode's first frame; no
+                    // result picture (design.md "Rendering and Skins", the
+                    // result's hold).
+                    let page = self
+                        .wait_page
+                        .get_or_insert_with(crate::loading_text::skin_wait_page);
+                    let drawn = screen.menu(page, *changed).map(|t| (t, None));
+                    *changed = false;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        result_stamp = Some(crate::measure::ResultStamp {
+                            id: None,
+                            path: crate::measure::ResultPath::Pending,
+                            page: self.end_page.0,
+                            view: None,
+                            sampled: frame_at,
+                            timer_origin: None,
+                        });
+                    }
+                    drawn
                 }
                 Mode::End => {
                     // An entry whose result lifetime began shows first at
@@ -9375,6 +9501,55 @@ impl Run {
     /// which ends READY's cutoff (design.md "Memory Budget", its end):
     /// a loading lifetime's lines only for another lifetime than the one
     /// ended or paused last, whose sinks may still report late.
+    /// Whether `msg` is another screen's, which ends a result hold still
+    /// held (a screen built again keeps it).
+    const fn ends_result_hold(msg: &Result<RenderMsg, TryRecvError>) -> bool {
+        matches!(
+            msg,
+            Ok(RenderMsg::Load { .. }
+                | RenderMsg::PrepareAttempt { .. }
+                | RenderMsg::Menu(_)
+                | RenderMsg::Decision { .. }
+                | RenderMsg::PracticePage(_)
+                | RenderMsg::SelectionChanged
+                | RenderMsg::Select { .. }
+                | RenderMsg::Loading(_))
+        )
+    }
+
+    /// The result's hold's own lifetime check, at the top of a loop turn
+    /// while one lasts: a mark that no longer names it (released, or a
+    /// newer hold begun) drops it, and its pending presentation turns
+    /// Idle.
+    fn check_result_hold(&mut self, mode: &mut Mode) {
+        let Some(h) = self.result_hold else {
+            return;
+        };
+        if self.shared.result_slot().holds(h.number) {
+            return;
+        }
+        self.result_hold = None;
+        if matches!(mode, Mode::ResultPending { .. }) {
+            *mode = Mode::Idle;
+        }
+    }
+
+    /// Whether the result's hold's outgoing phase ends now, its bound
+    /// passed on the hold's clock: it never resumes.
+    fn result_hold_passed(&mut self) -> bool {
+        let Some(h) = self.result_hold.as_mut().filter(|h| h.held) else {
+            return false;
+        };
+        let now = self.clock.now();
+        #[cfg(test)]
+        let now = hold_now(&self.shared, now, h.from);
+        if held_wait(now, h.from, first_frame_bound(&self.shared)).is_some() {
+            return false;
+        }
+        h.held = false;
+        true
+    }
+
     fn ends_cutoff(&self, msg: &Result<RenderMsg, TryRecvError>) -> bool {
         match msg {
             Ok(
