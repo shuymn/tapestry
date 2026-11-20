@@ -19,11 +19,22 @@
 //!   refused for the player each time it parks its decoder at a video's end
 //!   (the park seam), as a decoder's thread still at work when its other
 //!   thread gave the end would refuse one.
+//! - `--dev-probe <probe>…`: answers the hello, then tries what the
+//!   sandbox denies the worker and what it leaves it ([`probe`]).
+//! - `--dev-silent <ms>`: waits `ms` milliseconds without answering the
+//!   game's launch, then exits.
+//! - `--dev-deaf`: answers the hello, then never reads its commands.
+//! - `--dev-flood <n>`: answers the hello and, at the game's first
+//!   command, sends `n` replies the game never asked for, as fast as the
+//!   pipe takes them, then waits.
+
+mod probe;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 
 use crate::ffmpeg::{self, Clip, Input, IoOpen};
+use crate::os::Source;
 
 /// The marker a dev-tools build prints and holds.
 const MARKER: &str = "tapestry dev-tools enabled";
@@ -70,12 +81,46 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
                 _ => usage("--dev-max-alloc <bytes>"),
             });
         }
+        "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-deaf" => {
+            let _ = crate::hello(ffmpeg::MAX_ALLOC);
+            wait_for_ever()
+        }
+        "--dev-flood" => match rest {
+            [n] => n
+                .parse::<u64>()
+                .map(|n| {
+                    let out = crate::hello(ffmpeg::MAX_ALLOC);
+                    // After the launch has taken the hello.
+                    let _ = crate::read_command(&mut std::io::stdin().lock());
+                    for _ in 0..n {
+                        out.send(&skin_model::media::control::Reply::Closed { player: 0 });
+                    }
+                    wait_for_ever()
+                })
+                .map_err(|e| format!("--dev-flood {n}: {e}")),
+            _ => Err("--dev-flood <n>".to_owned()),
+        },
+        "--dev-silent" => match rest {
+            [ms] => ms
+                .parse()
+                .map(|ms| std::thread::sleep(std::time::Duration::from_millis(ms)))
+                .map_err(|e| format!("--dev-silent {ms}: {e}")),
+            _ => Err("--dev-silent <ms>".to_owned()),
+        },
         _ => return None,
     };
     Some(match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e),
     })
+}
+
+/// Waits until the game ends the worker.
+fn wait_for_ever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// Reports `message` and fails.
@@ -149,8 +194,8 @@ fn secondary_open(args: &[String]) -> Result<(), String> {
         other => return Err(format!("{other}: not refuse or default")),
     };
     let file = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
-    let (mut input, _) =
-        Input::open(file, io).map_err(|(why, code)| format!("refused: {why:?} {code}"))?;
+    let (mut input, _) = Input::open(Source::opened(file), io)
+        .map_err(|(why, code)| format!("refused: {why:?} {code}"))?;
     let code = input.secondary_open(c"segment-0.ts");
     println!("secondary open: {code}");
     Ok(())

@@ -7,16 +7,18 @@
 //! refusing what is not a listed container and codec within the pixel cap,
 //! and decodes a probed file into the ring the game created for it, from
 //! its start or from a seek, until the game closes it. Each video plays on
-//! a thread of its own; FFmpeg's diagnostics go to standard error, a line
-//! each.
+//! a thread of its own. Its and FFmpeg's diagnostics go to the game as log
+//! replies, a line each, and to standard error in a dev-tools command.
 //!
 //! [`ffmpeg`] holds every call into FFmpeg; [`os`] the Windows calls on the
-//! handles the game hands the worker.
+//! handles the game hands the worker, which it takes only as [`os`] checks
+//! them.
 //!
 //! With dev-tools: `--dev-tools-probe` says the build has the development
 //! features, `--dev-gen-clip` encodes a synthesized clip through the
-//! build's encoders and muxers, and `--dev-secondary-open` reports what a
-//! secondary open through an opened file's I/O context gives.
+//! build's encoders and muxers, `--dev-secondary-open` reports what a
+//! secondary open through an opened file's I/O context gives, and
+//! `--dev-probe` tries what the sandbox denies the worker.
 
 #[cfg(not(windows))]
 compile_error!("tapestry-media is Windows-only");
@@ -24,6 +26,7 @@ compile_error!("tapestry-media is Windows-only");
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod ffmpeg;
+mod handles;
 mod os;
 mod player;
 
@@ -32,7 +35,7 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use skin_model::media::control::{self, Command, Failure, Reply};
@@ -62,13 +65,27 @@ fn main() -> ExitCode {
 #[derive(Clone)]
 pub struct Out(Arc<Mutex<std::io::Stdout>>);
 
+/// The control pipe once the worker serves: diagnostics go there.
+static OUT: OnceLock<Out> = OnceLock::new();
+
+/// Reports `line`, a diagnostic: to the game as a log reply while the
+/// worker serves, else to standard error.
+pub fn say(line: &str) {
+    match OUT.get() {
+        Some(out) => out.send(&Reply::Log {
+            text: line.to_owned(),
+        }),
+        None => eprintln!("{line}"),
+    }
+}
+
 impl Out {
     /// Writes `reply` as one frame (every reply's encoding fits one). A
     /// pipe the game no longer reads ends the worker: it has nobody to
     /// decode for.
     pub fn send(&self, reply: &Reply) {
         let Some(bytes) = control::frame(&reply.encode()) else {
-            eprintln!("tapestry-media: a reply that does not fit a frame");
+            say("tapestry-media: a reply that does not fit a frame");
             return;
         };
         let written = match self.0.lock() {
@@ -83,24 +100,43 @@ impl Out {
 
 /// What the control loop tells a player's thread.
 pub enum ToPlayer {
-    Play { section: u64, event: u64 },
-    Seek { run: u64, at: i64 },
+    Play {
+        section: os::Owned,
+        event: os::Owned,
+    },
+    Seek {
+        run: u64,
+        at: i64,
+    },
     Close,
 }
 
-/// Reads commands until the game quits or closes the pipe, FFmpeg's largest
-/// allocation capped at `max_alloc` bytes.
-fn serve(max_alloc: usize) -> ExitCode {
+/// Answers the game's launch with the hello on the control pipe, to which
+/// diagnostics go from then on: the pipe. A worker whose hooks in FFmpeg
+/// cannot be set ends instead, before it answers.
+fn hello(max_alloc: usize) -> Out {
     if let Err(e) = ffmpeg::init(max_alloc) {
-        eprintln!("tapestry-media: FFmpeg's hooks: {e}");
-        return ExitCode::FAILURE;
+        say(&format!("tapestry-media: FFmpeg's hooks: {e}"));
+        std::process::exit(1);
     }
-    let out = Out(Arc::new(Mutex::new(std::io::stdout())));
+    let out = OUT.get_or_init(|| Out(Arc::new(Mutex::new(std::io::stdout()))));
     let (version, configuration) = ffmpeg::version();
     out.send(&Reply::Hello {
         version,
         configuration,
     });
+    if let Err(e) = os::learn() {
+        say(&format!(
+            "tapestry-media: every handle a command names is refused: {e}"
+        ));
+    }
+    out.clone()
+}
+
+/// Reads commands until the game quits or closes the pipe, FFmpeg's largest
+/// allocation capped at `max_alloc` bytes.
+fn serve(max_alloc: usize) -> ExitCode {
+    let out = hello(max_alloc);
     let mut stdin = std::io::stdin().lock();
     let mut players: BTreeMap<u8, (Sender<ToPlayer>, JoinHandle<()>)> = BTreeMap::new();
     let mut closing: Vec<JoinHandle<()>> = Vec::new();
@@ -108,8 +144,15 @@ fn serve(max_alloc: usize) -> ExitCode {
         closing.retain(|t| !t.is_finished());
         match command {
             Command::Open { player, file } => {
+                let file = match os::Owned::take(file, os::Kind::File) {
+                    Ok(file) => file,
+                    Err(code) => {
+                        refuse_handle(&out, player, code);
+                        continue;
+                    }
+                };
                 if players.contains_key(&player) || players.len() >= MAX_PLAYERS {
-                    drop(os::Owned::adopt(file));
+                    drop(file);
                     out.send(&Reply::Failed {
                         player,
                         why: Failure::Command,
@@ -121,10 +164,10 @@ fn serve(max_alloc: usize) -> ExitCode {
                 let thread_out = out.clone();
                 // The thread owns the handle: one that does not start closes
                 // it with its closure.
-                let file = os::Owned::adopt(file);
+                let source = os::Source::taken(file);
                 let spawned = std::thread::Builder::new()
                     .name(format!("player {player}"))
-                    .spawn(move || player::run(player, file, &rx, &thread_out));
+                    .spawn(move || player::run(player, source, &rx, &thread_out));
                 match spawned {
                     Ok(thread) => {
                         players.insert(player, (tx, thread));
@@ -140,18 +183,19 @@ fn serve(max_alloc: usize) -> ExitCode {
                 player,
                 section,
                 event,
-            } => to_player(
-                &players,
-                &out,
-                player,
-                ToPlayer::Play { section, event },
-                || {
-                    drop(os::Owned::adopt(section));
-                    drop(os::Owned::adopt(event));
-                },
-            ),
+            } => {
+                let taken = os::Owned::take(section, os::Kind::Section).and_then(|section| {
+                    os::Owned::take(event, os::Kind::Event).map(|event| (section, event))
+                });
+                match taken {
+                    Ok((section, event)) => {
+                        to_player(&players, &out, player, ToPlayer::Play { section, event });
+                    }
+                    Err(code) => refuse_handle(&out, player, code),
+                }
+            }
             Command::Seek { player, run, at } => {
-                to_player(&players, &out, player, ToPlayer::Seek { run, at }, || {});
+                to_player(&players, &out, player, ToPlayer::Seek { run, at });
             }
             Command::Close { player } => match players.remove(&player) {
                 Some((tx, thread)) => {
@@ -178,25 +222,36 @@ fn serve(max_alloc: usize) -> ExitCode {
 }
 
 /// Sends `message` to `player`'s thread, or answers that no such player
-/// takes it, after `refused` closes the handles the command named.
+/// takes it, the handles it carries closed.
 fn to_player(
     players: &BTreeMap<u8, (Sender<ToPlayer>, JoinHandle<()>)>,
     out: &Out,
     player: u8,
     message: ToPlayer,
-    refused: impl FnOnce(),
 ) {
     let sent = players
         .get(&player)
         .is_some_and(|(tx, _)| tx.send(message).is_ok());
     if !sent {
-        refused();
         out.send(&Reply::Failed {
             player,
             why: Failure::Command,
             code: 0,
         });
     }
+}
+
+/// Answers a command naming a handle the worker does not take ([`os`]):
+/// `player` fails with the system's error `code`.
+fn refuse_handle(out: &Out, player: u8, code: u32) {
+    say(&format!(
+        "tapestry-media: a command for player {player} names a handle the worker does not take (error {code})"
+    ));
+    out.send(&Reply::Failed {
+        player,
+        why: Failure::Command,
+        code: code.cast_signed(),
+    });
 }
 
 /// The next command on `input`, or `None` once the pipe ends or carries a
@@ -211,7 +266,9 @@ fn read_command(input: &mut impl std::io::Read) -> Option<Command> {
     match Command::decode(&message) {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!("tapestry-media: a command that does not decode: {e}");
+            say(&format!(
+                "tapestry-media: a command that does not decode: {e}"
+            ));
             None
         }
     }

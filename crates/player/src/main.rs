@@ -46,6 +46,11 @@ mod loading_text;
 mod log_file;
 mod loudness;
 mod measure;
+#[expect(
+    dead_code,
+    reason = "the media worker's host lands before the change that plays videos through it"
+)]
+mod media_host;
 mod menu_screen;
 mod page_jobs;
 mod play;

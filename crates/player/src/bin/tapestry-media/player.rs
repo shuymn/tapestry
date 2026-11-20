@@ -18,17 +18,17 @@ use skin_model::media::Writer;
 use skin_model::media::control::{Failure, Reply};
 
 use crate::ffmpeg::{Input, IoOpen};
-use crate::os::{Event, Owned, View};
+use crate::os::{Event, Source, View};
 use crate::{Out, ToPlayer};
 
 /// How long a player with every slot full waits on the free-slot event
 /// before it looks for a command.
 const SLOT_WAIT_MS: u32 = 50;
 
-/// Plays the video whose file handle the game handed the worker as `file`,
-/// until the game closes it.
-pub fn run(player: u8, file: Owned, rx: &Receiver<ToPlayer>, out: &Out) {
-    let (input, probe) = match Input::open(file.into_file(), IoOpen::Refuse) {
+/// Plays the video in `file`, the file handle the worker took for
+/// `player`, until the game closes it.
+pub fn run(player: u8, file: Source, rx: &Receiver<ToPlayer>, out: &Out) {
+    let (input, probe) = match Input::open(file, IoOpen::Refuse) {
         Ok(opened) => opened,
         Err((why, code)) => {
             out.send(&Reply::Refused { player, why, code });
@@ -56,8 +56,8 @@ pub fn run(player: u8, file: Owned, rx: &Receiver<ToPlayer>, out: &Out) {
             }
         }
     };
-    let event = Event::adopt(event);
-    let view = match View::map(Owned::adopt(section)) {
+    let event = Event::new(event);
+    let view = match View::map(section) {
         Ok(view) => view,
         Err(e) => {
             fail(player, out, Failure::Ring, e.raw_os_error().unwrap_or(0));
@@ -139,7 +139,7 @@ impl Playing {
             match message {
                 Some(ToPlayer::Close) => return false,
                 Some(ToPlayer::Play { section, event }) => {
-                    drop((Owned::adopt(section), Owned::adopt(event)));
+                    drop((section, event));
                     refuse_command(self.player, out);
                     continue;
                 }
@@ -240,7 +240,7 @@ fn idle(player: u8, rx: &Receiver<ToPlayer>, out: &Out) {
     loop {
         match rx.recv() {
             Ok(ToPlayer::Play { section, event }) => {
-                drop((Owned::adopt(section), Owned::adopt(event)));
+                drop((section, event));
                 refuse_command(player, out);
             }
             Ok(ToPlayer::Seek { .. }) => refuse_command(player, out),

@@ -32,12 +32,16 @@
 //! the probed size, the size of the video's frame ring.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(feature = "dev-tools")]
+use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::ptr;
 
 use ffmpeg_sys_next as ff;
 use skin_model::media::control::{Failure, Refusal};
 use skin_model::media::{MAX_PIXELS, MAX_SIDE};
+
+use crate::os::Source;
 
 /// The largest single allocation FFmpeg may make: below the 64 MiB margin
 /// between the game's termination line and the job's cap
@@ -165,7 +169,6 @@ mod hooks {
     use std::alloc::Layout;
     use std::cell::Cell;
     use std::ffi::{CStr, c_int, c_void};
-    use std::io::Write as _;
     use std::ptr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -463,10 +466,9 @@ mod hooks {
                 let (width, height) = ((*frame).width, (*frame).height);
                 if !within_cap(width, height) {
                     record(|r| r.oversize.store(true, Ordering::SeqCst));
-                    let _ = writeln!(
-                        std::io::stderr().lock(),
+                    crate::say(&format!(
                         "tapestry-media: refused a frame of {width} x {height}"
-                    );
+                    ));
                     return averror(ff::EINVAL);
                 }
             }
@@ -613,11 +615,10 @@ mod hooks {
                 } else {
                     (*codec).id
                 };
-                let _ = writeln!(
-                    std::io::stderr().lock(),
+                crate::say(&format!(
                     "tapestry-media: refused a decoder for {}",
                     text(ff::avcodec_get_name(id))
-                );
+                ));
                 return averror(ff::EPERM);
             }
             cap(ctx);
@@ -775,7 +776,7 @@ unsafe extern "C" fn log(avcl: *mut c_void, level: c_int, fmt: *const c_char, ar
     let message = unsafe { CStr::from_ptr(line.as_ptr()) }.to_string_lossy();
     let message = message.trim_end();
     if !message.is_empty() {
-        let _ = writeln!(std::io::stderr().lock(), "ffmpeg: {message}");
+        crate::say(&format!("ffmpeg: {message}"));
     }
 }
 
@@ -813,17 +814,16 @@ unsafe extern "C" fn refuse_open(
     // SAFETY: FFmpeg passes the URL it would open, NUL-terminated, or null.
     let url = unsafe { text(url) };
     let url: String = url.chars().take(256).collect();
-    let _ = writeln!(
-        std::io::stderr().lock(),
+    crate::say(&format!(
         "tapestry-media: refused a secondary open of {url:?}"
-    );
+    ));
     averror(ff::EPERM)
 }
 
 /// What an input's I/O context reads through: the file, and the bytes and
 /// seeks left to the probe or the seek under way.
 struct Budgeted {
-    file: std::fs::File,
+    file: Source,
     /// What a read lands in before it is copied to FFmpeg's buffer, which
     /// FFmpeg may hand uninitialized.
     scratch: Box<[u8]>,
@@ -888,13 +888,13 @@ unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i6
         }
         *seeks -= 1;
     }
-    seek_in(&mut source.file, offset, whence)
+    seek_in(source.file.file(), offset, whence)
 }
 
 /// Moves in `file` as FFmpeg asks a seek callback to, or gives its size,
 /// asked of its handle without moving: one call moves in the file once at
 /// most.
-fn seek_in(file: &mut std::fs::File, offset: i64, whence: c_int) -> i64 {
+fn seek_in(mut file: &std::fs::File, offset: i64, whence: c_int) -> i64 {
     let at = if whence & ff::AVSEEK_SIZE != 0 {
         crate::os::file_size(file).and_then(|size| i64::try_from(size).ok())
     } else {
@@ -943,10 +943,9 @@ unsafe fn set_options(context: *mut c_void, pairs: &[(&CStr, &CStr)]) -> Result<
 
 /// Says that an allocation of `size` bytes was refused.
 fn refused_allocation(size: usize) {
-    let _ = writeln!(
-        std::io::stderr().lock(),
+    crate::say(&format!(
         "tapestry-media: an allocation of {size} bytes was refused"
-    );
+    ));
 }
 
 /// Where a seek landed.
@@ -995,7 +994,7 @@ impl Input {
     /// cap refuses the file for its size, an allocation refused while it
     /// probed for its decoder (with `ENOMEM`), and a probe past its budget
     /// for its reading (with [`SPENT`]).
-    pub fn open(file: std::fs::File, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
+    pub fn open(file: Source, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
         // Before any call into FFmpeg: this thread, and each thread FFmpeg
         // starts for this input, records for this input's record alone.
         let owner = hooks::Owner::adopt();
@@ -1395,10 +1394,9 @@ impl Input {
                     // the video as FFmpeg's own command line ends its input
                     // on one: the decoder gives the frames it still holds.
                     if r != ff::AVERROR_EOF {
-                        let _ = writeln!(
-                            std::io::stderr().lock(),
+                        crate::say(&format!(
                             "tapestry-media: demuxing ended on FFmpeg error {r}"
-                        );
+                        ));
                     }
                     self.drained = true;
                     let r = ff::avcodec_send_packet(self.dec, ptr::null());
@@ -1924,11 +1922,7 @@ unsafe extern "C" fn seek_file(opaque: *mut c_void, offset: i64, whence: c_int) 
     // SAFETY: `opaque` is the file this module boxed for this context,
     // alive until the context is freed and reached only through it while
     // FFmpeg runs.
-    seek_in(
-        unsafe { &mut *opaque.cast::<std::fs::File>() },
-        offset,
-        whence,
-    )
+    seek_in(unsafe { &*opaque.cast::<std::fs::File>() }, offset, whence)
 }
 
 /// Writes bytes FFmpeg muxed to the clip's file.
