@@ -5584,9 +5584,10 @@ impl Renderer {
                 self.bga_upload = None;
                 out.bga = crate::BgaStep::Done(Err(crate::BgaFault::Stale));
             }
-            // The chart publication's target checked before each band.
+            // The chart publication's device and target checked before
+            // each band and at its completion.
             if let Some((up, _)) = &chart
-                && !self.chart_current(up)
+                && (self.gpu.lost() || !self.chart_current(up))
             {
                 out.chart = Some(Err(self.chart_stale()));
                 chart = None;

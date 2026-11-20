@@ -129,6 +129,28 @@ fn a_discard_after_the_first_band_ends_it_unwritten() {
     assert_eq!(r.chart_submissions.len(), 1, "a band after the discard");
 }
 
+/// V3: a staging superseded by the next request's after the first band
+/// ends the publication, nothing written into the new staging's array.
+#[test]
+fn a_superseding_staging_after_the_first_band_ends_it_unwritten() {
+    let (mut r, _dir, side) = chart_renderer();
+    let (_d, b) = other(&r);
+    let token = stage_labels(&mut r, &b, &labels("T", "A", "G"), 2).unwrap();
+    let [s, back] = big(side);
+    let images = [Some(&s), Some(&back), None];
+    let mut up = r
+        .begin_chart_upload(ChartTarget::Staged(token), images)
+        .unwrap();
+    r.chart_submissions.clear();
+    assert!(boundary(&mut r, &mut up, images).is_none());
+    let (_e, c) = other(&r);
+    let next = stage_labels(&mut r, &c, &labels("T", "A", "G"), 3).unwrap();
+    assert_ne!(next, token);
+    let end = boundary(&mut r, &mut up, images).expect("ended");
+    assert!(matches!(end, Err(RenderError::ChartChanged)), "{end:?}");
+    assert_eq!(r.chart_submissions.len(), 1, "a band into the next staging");
+}
+
 /// V3: the committed installation replaced after the first band ends the
 /// publication, nothing more written and no table on the new one.
 #[test]
