@@ -54,6 +54,10 @@ pub enum Filter {
     /// A BGA layer picture: the nearest texel at level 0 of the BGA
     /// array, a pure black texel keyed transparent.
     BgaLayer,
+    /// A skin movie's frame: bilinear at level 0 of the movies' plane
+    /// arrays, its layer the movie's, converted from Y'CbCr by the matrix
+    /// (BT.601, else BT.709) and range (full, else limited).
+    Movie { bt601: bool, full: bool },
 }
 
 /// How a quad is blended over what is under it.

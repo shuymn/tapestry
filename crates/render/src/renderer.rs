@@ -159,7 +159,9 @@ const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
 // the layer (low 15 bits), the pool bit (bit 15), the nearest and base
-// filter bits (16, 17), the BGA bit (18) and the key bit (19).
+// filter bits (16, 17), the BGA bit (18), the key bit (19), and the video
+// bit (20) with the movie's matrix (21: BT.601, else BT.709) and range
+// (22: full, else limited).
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
@@ -184,6 +186,9 @@ struct Proj {
 @group(0) @binding(3) var<uniform> proj: Proj;
 @group(0) @binding(4) var pool: texture_2d_array<f32>;
 @group(1) @binding(0) var bga: texture_2d_array<f32>;
+@group(2) @binding(0) var video_y: texture_2d_array<f32>;
+@group(2) @binding(1) var video_u: texture_2d_array<f32>;
+@group(2) @binding(2) var video_v: texture_2d_array<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -217,7 +222,10 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // sprite with the base bit takes it. One result is chosen. A sprite with
 // the BGA bit reads the BGA array instead, at level 0 by explicit level:
 // bilinear, or at the nearest texel with the nearest bit, and with the key
-// bit a pure black texel is transparent.
+// bit a pure black texel is transparent. A sprite with the video bit
+// reads its movie's Y, U and V planes bilinearly at level 0 and converts
+// them by the movie's matrix and range to opaque R'G'B' (limited range
+// expanded from 16-235 luma and 16-240 chroma, full range read as is).
 //
 // A quad with the pool bit samples the chart-image pool instead, by the
 // same filters, never the built-in read (its layer 0 holds ordinary
@@ -255,7 +263,35 @@ fn tinted(v: VOut) -> vec4f {
             c = vec4f(0.0);
         }
     }
+    if (v.flags & 0x100000u) != 0u {
+        c = movie(v.uv, layer, v.flags);
+    }
     return c * v.color;
+}
+
+// A movie's texel: Y'CbCr by its matrix and range to opaque R'G'B'.
+fn movie(uv: vec2f, layer: i32, flags: u32) -> vec4f {
+    let y0 = textureSampleLevel(video_y, smooth_samp, uv, layer, 0.0).r;
+    let u0 = textureSampleLevel(video_u, smooth_samp, uv, layer, 0.0).r;
+    let v0 = textureSampleLevel(video_v, smooth_samp, uv, layer, 0.0).r;
+    var y = (y0 * 255.0 - 16.0) / 219.0;
+    var cb = (u0 * 255.0 - 128.0) / 224.0;
+    var cr = (v0 * 255.0 - 128.0) / 224.0;
+    if (flags & 0x400000u) != 0u {
+        y = y0;
+        cb = (u0 * 255.0 - 128.0) / 255.0;
+        cr = (v0 * 255.0 - 128.0) / 255.0;
+    }
+    var kr = 0.2126;
+    var kb = 0.0722;
+    if (flags & 0x200000u) != 0u {
+        kr = 0.299;
+        kb = 0.114;
+    }
+    let r = y + 2.0 * (1.0 - kr) * cr;
+    let b = y + 2.0 * (1.0 - kb) * cb;
+    let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    return vec4f(clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0)), 1.0);
 }
 
 @fragment
@@ -1279,6 +1315,8 @@ struct Bindings {
     nearest: wgpu::Sampler,
     /// The second group's layout: the BGA array.
     bga: wgpu::BindGroupLayout,
+    /// The third group's layout: the movies' plane arrays.
+    video: wgpu::BindGroupLayout,
     /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
     projection: wgpu::Buffer,
     /// The half last written to [`projection`](Self::projection), `None`
@@ -1364,6 +1402,8 @@ pub struct Renderer {
     /// it: no step is written while it is unset, whatever batch is in hand
     /// (one step's staging in flight).
     pub(crate) bga_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The movies' plane arrays and upload buffer.
+    video: crate::video::Video,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -1658,6 +1698,7 @@ impl Renderer {
         let atlas = AtlasTexture::builtin(&gpu);
         let atlas_bind = bindings.bind(device, &atlas, None);
         let bga = crate::bga::BgaArray::stand_in(&gpu, &bindings.bga);
+        let video = crate::video::Video::new(&gpu, &bindings.video);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
         // The simple skin's runs are as many as its sprites, the staging's
         // default.
@@ -1690,6 +1731,7 @@ impl Renderer {
             bga_table: Arc::new(skin_model::bga::BgaTable::ABSENT),
             bga_upload: None,
             bga_in_flight: None,
+            video,
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -5165,6 +5207,46 @@ impl Renderer {
             .map_or(0, crate::bga::BgaUpload::bytes)
     }
 
+    /// What the play skin's movie destinations show in the next builds
+    /// ([`PlaySkin::set_movies`]); a selection skin's are set on its
+    /// [`Selection`](skin_model::Selection).
+    pub fn set_play_movies(&mut self, movies: skin_model::movie::MovieShows) {
+        self.skin.set_movies(movies);
+    }
+
+    /// Replaces the movies' plane arrays and upload buffer with room for
+    /// `layers` movies (at most [`crate::VIDEO_MAX_MOVIES`]) up to
+    /// `width` × `height`: a screen's preparation, never a frame's work.
+    pub fn video_reserve(&mut self, width: u32, height: u32, layers: u32) {
+        self.video.reserve(&self.gpu, width, height, layers);
+    }
+
+    /// The movie hook's upload: `fill` writes a frame of `width` ×
+    /// `height` into movie layer `layer`'s region of the mapped upload
+    /// buffer through the sink it is given (a byte offset and the bytes),
+    /// each plane's rows at the pitch it is given (luma, chroma), and says
+    /// whether the frame is whole; the next frame drawn then copies it
+    /// into the planes before its pass. `false` when the frame does not
+    /// fit the planes, the buffer cannot be mapped or `fill` says no; the
+    /// planes then keep the frame they hold.
+    pub fn video_write_with(
+        &mut self,
+        layer: u32,
+        width: u32,
+        height: u32,
+        fill: impl FnOnce(&mut dyn FnMut(usize, &[u8]) -> bool, [usize; 2]) -> bool,
+    ) -> bool {
+        self.video
+            .write_with(self.gpu.queue(), layer, width, height, fill)
+    }
+
+    /// The uv a quad of a movie of `width` × `height` samples in the
+    /// planes.
+    #[must_use]
+    pub fn video_uv(&self, width: u32, height: u32) -> [f32; 4] {
+        self.video.uv(width, height)
+    }
+
     /// Publishes `entries` as the BGA table of the array `key` names
     /// (`None`: no array, every picture absent), which the play skin in
     /// use, a staged one and every attempt prepared later draw from the
@@ -7472,6 +7554,9 @@ impl Renderer {
             .gpu
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // The movie frames this frame took, into their planes before the
+        // pass samples them.
+        self.video.record(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -7492,6 +7577,7 @@ impl Renderer {
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_bind_group(0, atlas_bind, &[]);
             pass.set_bind_group(1, &self.bga.bind, &[]);
+            pass.set_bind_group(crate::video::GROUP, &self.video.bind, &[]);
             pass.set_vertex_buffer(0, instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
@@ -8060,12 +8146,15 @@ fn pipelines(
         label: Some("sprites"),
         source: wgpu::ShaderSource::Wgsl(SPRITE_WGSL.into()),
     });
-    let (alpha, additive, multiply) = sprite_pipelines(device, &layout, &bga, &module, format);
+    let video = crate::video::layout(device);
+    let (alpha, additive, multiply) =
+        sprite_pipelines(device, &layout, &bga, &video, &module, format);
     let bindings = Bindings {
         layout,
         smooth,
         nearest,
         bga,
+        video,
         projection,
         uploaded: None,
         placeholder,
@@ -8074,12 +8163,13 @@ fn pipelines(
 }
 
 /// The alpha, additive and multiply pipelines of the sprite shader
-/// `module` over bind group `layout` and the BGA array's `bga`
-/// ([`pipelines`]).
+/// `module` over bind group `layout`, the BGA array's `bga` and the
+/// movies' `video` ([`pipelines`]).
 fn sprite_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     bga: &wgpu::BindGroupLayout,
+    video: &wgpu::BindGroupLayout,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
 ) -> (
@@ -8089,7 +8179,7 @@ fn sprite_pipelines(
 ) {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sprites"),
-        bind_group_layouts: &[Some(layout), Some(bga)],
+        bind_group_layouts: &[Some(layout), Some(bga), Some(video)],
         immediate_size: 0,
     });
     let pipeline = |blend, fragment| {

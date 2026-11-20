@@ -231,6 +231,7 @@ pub struct SheetBuilder {
     frames: Vec<u32>,
     cell_ids: BTreeMap<Cell, u32>,
     fonts: Vec<String>,
+    movies: Vec<String>,
     font_bytes: Total,
     fnts: Vec<Fnt>,
     bitmap_fonts: Vec<Box<[u16]>>,
@@ -257,6 +258,7 @@ impl SheetBuilder {
             frames: Vec::new(),
             cell_ids: BTreeMap::new(),
             fonts: Vec::new(),
+            movies: Vec::new(),
             font_bytes: Total {
                 sum: 0,
                 cap: MAX_TOTAL_FONT_BYTES,
@@ -788,6 +790,20 @@ impl SheetBuilder {
         (self.glyphs, self.kernings)
     }
 
+    /// The slot of the skin movie in file `name` (inside the skin
+    /// folder): its slot when the name is already the sheet's, else the
+    /// next one; `None` past [`MAX_MOVIES`](crate::movie::MAX_MOVIES).
+    pub fn add_movie(&mut self, name: &str) -> Option<u8> {
+        if let Some(i) = self.movies.iter().position(|m| m == name) {
+            return u8::try_from(i).ok();
+        }
+        if self.movies.len() >= crate::movie::MAX_MOVIES {
+            return None;
+        }
+        self.movies.push(name.to_owned());
+        u8::try_from(self.movies.len() - 1).ok()
+    }
+
     /// The sheet, with the cells renumbered in file and rectangle order as
     /// [`Sheet::new`] does.
     #[must_use]
@@ -803,6 +819,7 @@ impl SheetBuilder {
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
             fonts: self.fonts.into_boxed_slice(),
+            movies: self.movies.into_boxed_slice(),
             fnts: self.fnts.into_boxed_slice(),
             bitmap_fonts: self.bitmap_fonts.into_boxed_slice(),
             #[cfg(any(test, feature = "dev-tools"))]

@@ -178,6 +178,12 @@ pub enum Source {
     /// drawn size; the black placeholder before chart time 0, for a
     /// chart with no BGA and for a base with no picture.
     Bga { stretch: BgaStretch },
+    /// The skin movie in this slot of the sheet's
+    /// ([`Sheet::movies`](crate::Sheet::movies)): its frame as the
+    /// frame's [`MovieShow`](crate::movie::MovieShow) gives it, met by
+    /// `stretch` against the movie's size as a BGA picture is, on the
+    /// play and selection screens.
+    Movie { slot: u8, stretch: BgaStretch },
 }
 
 /// What only a result skin has: the widgets it draws and the timing it
@@ -513,6 +519,8 @@ enum Kind {
     ChartImage(ChartImage, Filter, ChartStretch),
     /// The chart's BGA and its stretch.
     Bga(BgaStretch),
+    /// The skin movie's slot and its stretch.
+    Movie(u8, BgaStretch),
 }
 
 /// What a press on an element other than a slider gives, recorded in its
@@ -941,6 +949,7 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
                     | Source::Text(_)
                     | Source::ChartImage { .. }
                     | Source::Bga { .. }
+                    | Source::Movie { .. }
             )
         {
             return Err(LoadError::UnsupportedFollow { element });
@@ -1093,7 +1102,8 @@ fn check_widget_images(
         | Source::TimingVisualizer(_)
         | Source::HitErrorVisualizer(_)
         | Source::ChartImage { .. }
-        | Source::Bga { .. } => {}
+        | Source::Bga { .. }
+        | Source::Movie { .. } => {}
     }
     Ok(())
 }
@@ -1153,7 +1163,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::TimingVisualizer(_)
         | Source::HitErrorVisualizer(_)
         | Source::ChartImage { .. }
-        | Source::Bga { .. } => {}
+        | Source::Bga { .. }
+        | Source::Movie { .. } => {}
     }
     Ok(())
 }
@@ -1193,6 +1204,8 @@ fn worst(
         | Source::ChartImage { .. } => 0,
         // The base, or the placeholder, and the layer.
         Source::Bga { .. } => 2,
+        // Its frame, or the black.
+        Source::Movie { .. } => 1,
         Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
@@ -1338,7 +1351,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::TimingVisualizer(_)
             | Source::HitErrorVisualizer(_)
             | Source::ChartImage { .. }
-            | Source::Bga { .. } => {
+            | Source::Bga { .. }
+            | Source::Movie { .. } => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
                         l.placements
@@ -1376,7 +1390,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::TimingVisualizer(_)
                     | Source::HitErrorVisualizer(_)
                     | Source::ChartImage { .. }
-                    | Source::Bga { .. } => e.track.bounds(),
+                    | Source::Bga { .. }
+                    | Source::Movie { .. } => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -1635,7 +1650,8 @@ fn check_kind(
                 | Source::TimingVisualizer(_)
                 | Source::HitErrorVisualizer(_)
                 | Source::ChartImage { .. }
-                | Source::Bga { .. } => false,
+                | Source::Bga { .. }
+                | Source::Movie { .. } => false,
             },
             ScreenKind::Selection => match e.source {
                 Source::RatioBar(i) => score(i) != Some(true),
@@ -1672,6 +1688,7 @@ fn check_kind(
                                 | Source::TimingVisualizer(_)
                                 | Source::HitErrorVisualizer(_)
                                 | Source::Bga { .. }
+                                | Source::Movie { .. }
                         )
                 }
             },
@@ -2278,7 +2295,8 @@ impl Skin {
                 | Source::TimingVisualizer(_)
                 | Source::HitErrorVisualizer(_)
                 | Source::ChartImage { .. }
-                | Source::Bga { .. } => {}
+                | Source::Bga { .. }
+                | Source::Movie { .. } => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -2305,6 +2323,7 @@ impl Skin {
             Source::Image(_) | Source::Lanes | Source::ChartImage { .. } | Source::Bga { .. } => {
                 false
             }
+            Source::Movie { slot, .. } => def.sheet.movies().get(usize::from(slot)).is_none(),
             Source::CoverPaint(p) => w.cover_paints.get(index(p)).is_none(),
             Source::Number(i) => w.numbers.get(index(i)).is_none(),
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
@@ -2340,7 +2359,8 @@ impl Skin {
             | Source::TimingVisualizer(_)
             | Source::HitErrorVisualizer(_)
             | Source::ChartImage { .. }
-            | Source::Bga { .. } => false,
+            | Source::Bga { .. }
+            | Source::Movie { .. } => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -2805,6 +2825,7 @@ impl Skin {
                         stretch,
                     } => Kind::ChartImage(which, filter, stretch),
                     Source::Bga { stretch } => Kind::Bga(stretch),
+                    Source::Movie { slot, stretch } => Kind::Movie(slot, stretch),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -5144,6 +5165,41 @@ impl Skin {
                         scale: canvas.scale(),
                     };
                     parts.draw(out, &brush, rect, trim);
+                }
+                Kind::Movie(slot, stretch) => {
+                    let shows = match (play, sel) {
+                        (Some((play, _)), _) => Some(play.movies()),
+                        (None, Some(sel)) => Some(sel.movies()),
+                        (None, None) => None,
+                    };
+                    match shows.and_then(|m| m.get(usize::from(slot))) {
+                        Some(&crate::movie::MovieShow::Frame {
+                            uv,
+                            layer,
+                            size,
+                            bt601,
+                            full,
+                        }) => {
+                            let f = crate::FrameUv { uv, layer };
+                            let (r, f, native) = stretch.place(rect, size, f, canvas.scale());
+                            let b = Brush { native, ..brush };
+                            b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+                        }
+                        // Opaque black over the destination, whatever its
+                        // blend and colour.
+                        Some(crate::movie::MovieShow::Lost) => {
+                            let black = Brush {
+                                key: RunKey {
+                                    blend: Blend::Alpha,
+                                    ..brush.key
+                                },
+                                color: [0.0, 0.0, 0.0, 1.0],
+                                ..brush
+                            };
+                            black.push_clipped(out, rect, crate::bga::SOLID, Filter::Linear, trim);
+                        }
+                        Some(crate::movie::MovieShow::Nothing) | None => {}
+                    }
                 }
                 Kind::Number(i) => {
                     if let Some(n) = self.numbers.get(i) {

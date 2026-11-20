@@ -759,6 +759,9 @@ pub struct DeclSkin {
     /// The live key of the BGA array, set before each build
     /// ([`PlaySkin::set_bga_live`]).
     bga_live: Option<skin_model::bga::BgaKey>,
+    /// What the skin movies' destinations show in the next builds
+    /// ([`PlaySkin::set_movies`]).
+    movies: skin_model::movie::MovieShows,
     /// The attempt's labels, for a captured list's text (dev-tools).
     #[cfg(feature = "dev-tools")]
     labels: [String; 5],
@@ -782,6 +785,7 @@ impl DeclSkin {
             play: None,
             chart_live: None,
             bga_live: None,
+            movies: skin_model::movie::MovieShows::default(),
             #[cfg(feature = "dev-tools")]
             labels: Default::default(),
         }
@@ -910,6 +914,10 @@ impl PlaySkin for DeclSkin {
         self.bga_live = live;
     }
 
+    fn set_movies(&mut self, movies: skin_model::movie::MovieShows) {
+        self.movies = movies;
+    }
+
     /// The prepared attempt's images; nothing without one.
     fn set_chart_images(&mut self, table: ChartTable) {
         if let Some(play) = &mut self.play {
@@ -925,6 +933,7 @@ impl PlaySkin for DeclSkin {
         };
         play.set_chart_live(self.chart_live);
         play.set_bga_live(self.bga_live);
+        play.set_movies(self.movies);
         let bundle = &*self.bundle;
         bundle
             .skin

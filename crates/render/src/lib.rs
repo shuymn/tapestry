@@ -72,6 +72,7 @@ mod staging;
 pub mod text;
 mod text_cache;
 mod text_upload;
+mod video;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use bga::{BGA_WRITE_BUDGET, BgaFault, BgaStep, UPLOAD_TIME_SLICE};
@@ -119,6 +120,7 @@ pub use sprite::{
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
+pub use video::{FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES};
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).
 #[cfg(feature = "dev-tools")]

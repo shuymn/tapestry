@@ -767,6 +767,12 @@ impl Assets {
         Ok(outcome)
     }
 
+    /// The slot of the skin movie in file `name`, shared by every
+    /// destination of the same name; `None` past the screen's movies.
+    pub(crate) fn add_movie(&mut self, name: &str) -> Option<u8> {
+        self.builder.add_movie(name)
+    }
+
     pub(crate) fn finish(self) -> Sheet {
         self.builder.finish()
     }
