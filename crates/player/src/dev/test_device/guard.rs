@@ -2,8 +2,9 @@
 //! every lease the runner holds is a slice of [`SLICE_MS`], granted and
 //! renewed only after a good check, every [`POLL`]: the run's window in
 //! front, its client area unchanged and inside the run's monitor (the
-//! monitor read again at least every [`MONITOR_EVERY`]), and the step
-//! thread's heartbeat no older than a third of the slice. Each grant names
+//! monitor read again at least every [`MONITOR_EVERY`]), the recorder's
+//! process running, and the step thread's heartbeat no older than a third
+//! of the slice. Each grant names
 //! the connection's token and each grant and renewal carries the deadline
 //! that check bounds ([`clock::deadline`]); with no round trip on the
 //! connection, nothing is granted. A bad check, or a command the link's
@@ -43,6 +44,9 @@ pub struct Look {
     pub placed: bool,
     /// When the step thread last beat (host counter ticks).
     pub beat: i64,
+    /// The recorder's process runs: with it gone, nothing would show a
+    /// held input reaching another window.
+    pub recording: bool,
 }
 
 impl Look {
@@ -53,6 +57,9 @@ impl Look {
         }
         if !self.placed {
             return Some("the run's window or monitor moved".into());
+        }
+        if !self.recording {
+            return Some("the recorder is not running".into());
         }
         let age = ticks_to_us(self.at.saturating_sub(self.beat), freq);
         if age > BEAT_MAX_US {
@@ -324,6 +331,7 @@ mod tests {
             front: true,
             placed: true,
             beat: at,
+            recording: true,
         }
     }
 
@@ -354,7 +362,7 @@ mod tests {
     #[test]
     fn a_grant_or_renewal_follows_a_good_check_only() {
         let mut sent = 0;
-        for front in [false, true] {
+        for (front, recording) in [(false, true), (true, false), (true, true)] {
             for placed in [false, true] {
                 for age in [0, BEAT_MAX_US, BEAT_MAX_US + 1, 1_000_000] {
                     for grant in [false, true] {
@@ -364,8 +372,9 @@ mod tests {
                             front,
                             placed,
                             beat: 2_000_000 - age,
+                            recording,
                         };
-                        let ok = front && placed && age <= BEAT_MAX_US;
+                        let ok = front && placed && recording && age <= BEAT_MAX_US;
                         match g.decide(&look, &view(grant)) {
                             Act::Send { check, .. } => {
                                 assert!(ok, "{look:?}");

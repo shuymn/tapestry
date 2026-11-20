@@ -237,7 +237,14 @@ pub fn grants(link: &[Value]) -> Result<(), String> {
 
 /// The first ours press of button 1 and of F24 in the recorder's stream,
 /// with the sink in front when `front` names it: their counters.
-fn presses(rec: &[Value], front: Option<u64>) -> Result<(i64, i64), String> {
+/// A press: when the recorder read it, and the handle it came from.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    q: i64,
+    h: u64,
+}
+
+fn presses(rec: &[Value], front: Option<u64>) -> Result<(Press, Press), String> {
     let in_front = |v: &Value| front.is_none_or(|w| v["fg"]["window"] == w);
     let pad = rec
         .iter()
@@ -261,34 +268,41 @@ fn presses(rec: &[Value], front: Option<u64>) -> Result<(i64, i64), String> {
             return Err(format!("the sink was not in front: {v}"));
         }
     }
-    Ok((q(pad), q(key)))
+    let press = |v: &Value| Press {
+        q: q(v),
+        h: v["h"].as_u64().unwrap_or(u64::MAX),
+    };
+    Ok((press(pad), press(key)))
+}
+
+/// Whether `press` was released: after it, the first record of its own
+/// handle is a release (`is_release`) or the handle's removal. A device
+/// change of that handle before then (it arrived again: another binding)
+/// or no such record leaves it unreleased; another interface's removal
+/// says nothing of it.
+fn released(rec: &[Value], press: Press, is_release: impl Fn(&Value) -> bool) -> bool {
+    rec.iter()
+        .filter(|v| q(v) > press.q && v["h"].as_u64() == Some(press.h))
+        .find_map(|v| match v["t"].as_str() {
+            Some("dev") => Some(v["change"] == "removal"),
+            _ => is_release(v).then_some(true),
+        })
+        .unwrap_or(false)
 }
 
 /// After the presses, the recorder holds the neutral pad report and F24's
-/// break from the device's handles, or their removal.
-fn neutral(rec: &[Value], pad_at: i64, key_at: i64) -> Result<(), String> {
-    let removed = |after: i64| {
-        rec.iter().any(|v| {
-            v["t"] == "dev" && v["change"] == "removal" && v["ours"] == true && q(v) > after
-        })
-    };
-    let pad = rec.iter().any(|v| {
-        v["t"] == "pad"
-            && v["ours"] == true
-            && q(v) > pad_at
-            && v["bytes"].as_str().and_then(pad_buttons) == Some(0)
-    }) || removed(pad_at);
-    let key = rec.iter().any(|v| {
-        v["t"] == "key"
-            && v["ours"] == true
-            && v["code"] == F24_SCAN
-            && v["down"] == false
-            && q(v) > key_at
-    }) || removed(key_at);
+/// break, each from the handle of its press, or that handle's removal.
+fn neutral(rec: &[Value], pad: Press, key: Press) -> Result<(), String> {
+    let pad = released(rec, pad, |v| {
+        v["t"] == "pad" && v["ours"] == true && v["bytes"].as_str().and_then(pad_buttons) == Some(0)
+    });
+    let key = released(rec, key, |v| {
+        v["t"] == "key" && v["ours"] == true && v["code"] == F24_SCAN && v["down"] == false
+    });
     match (pad, key) {
         (true, true) => Ok(()),
-        (false, _) => Err("no neutral pad report from the device after the press".into()),
-        (_, false) => Err("no break of F24 from the device after the make".into()),
+        (false, _) => Err("no neutral pad report from the pressed pad after the press".into()),
+        (_, false) => Err("no break of F24 from the pressed keyboard after the make".into()),
     }
 }
 
@@ -388,7 +402,7 @@ pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
             .map(q)
             .ok_or_else(|| format!("the run recorded no `{kind}`"))
     };
-    let pressed = || -> Result<Result<(i64, i64), String>, String> {
+    let pressed = || -> Result<Result<(Press, Press), String>, String> {
         let rec = recs(&f.recorder)?;
         covered(rec, span("call")?, span("held")?)?;
         Ok(presses(rec, front))
@@ -427,7 +441,7 @@ pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
                     return Err("no press to be released".into());
                 };
                 let end = rec.iter().map(q).max().unwrap_or(i64::MAX);
-                covered(rec, pad.min(key), end)?;
+                covered(rec, pad.q.min(key.q), end)?;
                 Ok(neutral(rec, pad, key))
             }),
         ),
@@ -519,7 +533,7 @@ pub fn n2(build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
             );
         };
         let end = rec.iter().map(q).max().unwrap_or(i64::MAX);
-        covered(rec, pad.min(key), end)?;
+        covered(rec, pad.q.min(key.q), end)?;
         Ok(neutral(rec, pad, key))
     };
     vec![
@@ -783,15 +797,45 @@ pub mod tests {
         let mut f = good();
         edit(&mut f.recorder, |r| r.retain(|v| q(v) != 5210));
         assert_eq!(outcome(&f, "n1.neutral").0, Outcome::Fail);
-        // The removal of the device's handles stands for both.
+    }
+
+    /// A release counts only from the handle of its press: the pad's
+    /// removal does not stand for the keyboard's break, and a handle that
+    /// arrives again after the press is another binding, whose records do
+    /// not release it.
+    #[test]
+    fn a_release_is_matched_to_its_press_s_handle() {
+        let removal =
+            |q: i64, h: u64| json!({"t": "dev", "q": q, "h": h, "change": "removal", "ours": true});
+        let arrival =
+            |q: i64, h: u64| json!({"t": "dev", "q": q, "h": h, "change": "arrival", "ours": true});
+        // Neither release read; the removal of both interfaces stands for
+        // both (the control).
+        let mut f = good();
         edit(&mut f.recorder, |r| {
-            r.retain(|v| q(v) != 5200);
-            r.insert(
-                5,
-                json!({"t": "dev", "q": 5300, "h": 2, "change": "removal", "ours": true}),
-            );
+            r.retain(|v| q(v) != 5200 && q(v) != 5210);
+            r.insert(5, removal(5300, 2));
+            r.insert(6, removal(5310, 1));
         });
         assert_eq!(outcome(&f, "n1.neutral").0, Outcome::Pass);
+        // The pad's removal alone leaves F24 held.
+        let mut f = good();
+        edit(&mut f.recorder, |r| {
+            r.retain(|v| q(v) != 5200 && q(v) != 5210);
+            r.insert(5, removal(5300, 2));
+        });
+        assert_eq!(outcome(&f, "n1.neutral").0, Outcome::Fail);
+        // The keyboard's handle arrives again before its break.
+        let mut f = good();
+        edit(&mut f.recorder, |r| r.insert(5, arrival(5100, 1)));
+        assert_eq!(outcome(&f, "n1.neutral").0, Outcome::Fail);
+        // The break from another handle of the device.
+        let mut f = good();
+        edit(&mut f.recorder, |r| {
+            let at = r.iter().position(|v| q(v) == 5210).unwrap();
+            r[at]["h"] = json!(9);
+        });
+        assert_eq!(outcome(&f, "n1.neutral").0, Outcome::Fail);
     }
 
     #[test]

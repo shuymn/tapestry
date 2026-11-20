@@ -80,7 +80,7 @@ pub enum Ours {
 }
 
 impl Ours {
-    fn of(mi: u8) -> Option<Self> {
+    pub fn of(mi: u8) -> Option<Self> {
         match mi {
             test_device::KEYBOARD_INTERFACE => Some(Self::Keyboard),
             test_device::PAD_INTERFACE => Some(Self::Pad),

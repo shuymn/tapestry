@@ -25,7 +25,7 @@ use test_device::report::{PAD_REPORT, PadReport};
 
 use super::click::{self, Win};
 use super::desktop::{self, Real};
-use super::devices::System;
+use super::devices::{self, System};
 use super::end;
 use super::guard::{self, Look, Watch};
 use super::job::{self, Child, Job, Pipe, Stdio};
@@ -266,6 +266,8 @@ struct Live {
     call: u16,
     log: Log,
     recorder: Tail,
+    /// The recorder's records read and not yet looked at.
+    backlog: Vec<Value>,
     held: Vec<Change>,
     freq: i64,
 }
@@ -280,6 +282,19 @@ impl Live {
             Some(why) => Err(format!("holds stopped: {why}")),
             None => Ok(()),
         }
+    }
+
+    /// Reads the recorder's new records into the backlog: an `error`
+    /// record ends the steps, since the recorder can no longer vouch for
+    /// where held input goes.
+    fn read_recorder(&mut self) -> Result<(), String> {
+        for v in self.recorder.read() {
+            if v["t"] == "error" {
+                return Err(format!("the recorder reported an error: {v}"));
+            }
+            self.backlog.push(v);
+        }
+        Ok(())
     }
 }
 
@@ -364,7 +379,8 @@ impl Exec for Live {
                     "the recorder did not show the presses within {HELD_WAIT:?}"
                 ));
             }
-            for v in self.recorder.read() {
+            self.read_recorder()?;
+            for v in self.backlog.drain(..) {
                 if v["ours"] != true {
                     continue;
                 }
@@ -391,6 +407,8 @@ impl Exec for Live {
         while Instant::now() < end {
             self.beat();
             self.lost()?;
+            self.read_recorder()?;
+            self.backlog.clear();
             std::thread::sleep(LOOK);
         }
         Ok(())
@@ -410,6 +428,8 @@ struct Looks {
     monitor_now: Option<[i32; 4]>,
     read: Instant,
     beat: Arc<AtomicI64>,
+    /// The recorder's process, by a handle of the guard's own.
+    recorder: Child,
 }
 
 impl Watch for Looks {
@@ -428,6 +448,7 @@ impl Watch for Looks {
             front: desktop::foreground() == self.sink,
             placed,
             beat: self.beat.load(Ordering::Acquire),
+            recording: self.recorder.wait(Duration::ZERO).is_none(),
         }
     }
 }
@@ -483,6 +504,8 @@ struct RecChild {
     name: &'static str,
     run: String,
     cut: i32,
+    /// The device's bound location.
+    location: String,
 }
 
 impl RecChild {
@@ -522,6 +545,7 @@ impl RecChild {
             name: "recorder",
             run: b.run.clone(),
             cut: b.cut,
+            location: port.to_owned(),
         };
         me.ready()?;
         Ok(me)
@@ -553,10 +577,11 @@ impl RecChild {
 
 impl end::Recorder for RecChild {
     fn removed(&mut self) -> bool {
-        self.tail
-            .read()
-            .iter()
-            .any(|v| v["t"] == "dev" && v["change"] == "removal" && v["ours"] == true)
+        !devices::raw_sources().iter().any(|s| {
+            devices::raw_location(&s.path).is_some_and(|(mi, location)| {
+                location == self.location && super::listen::Ours::of(mi).is_some()
+            })
+        })
     }
 
     fn stop(&mut self) -> Result<(), String> {
@@ -809,6 +834,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
             monitor_now: Some(monitor.area),
             read: Instant::now(),
             beat: Arc::clone(&beat),
+            recorder: job::open(rec.child.process).context("the recorder's process")?,
         }),
         Arc::new(writer.clone()),
     );
@@ -823,6 +849,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         call: 0,
         log: b.log.clone(),
         recorder: Tail::new(&rec.path),
+        backlog: Vec::new(),
         held: Vec::new(),
         freq: qpc_freq(),
     };
@@ -1104,6 +1131,7 @@ mod tests {
                         front: true,
                         placed: true,
                         beat: self.at,
+                        recording: true,
                     };
                     if let Act::Send { cmd, .. } = g.decide(&look, &view) {
                         if matches!(cmd, Command::Lease { .. }) {

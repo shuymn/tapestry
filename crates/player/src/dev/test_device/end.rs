@@ -61,7 +61,9 @@ pub trait Link {
 
 /// The end's view of the recorder.
 pub trait Recorder {
-    /// Whether its stream shows the removal of the device's bound handles.
+    /// Whether none of the device's input interfaces is at the bound
+    /// location now, by this process's own enumeration: fresh at every
+    /// call, every interface counted, the recorder's stream not needed.
     fn removed(&mut self) -> bool;
     /// Ends it (its input closed), after it drains, and waits for its exit.
     ///
@@ -180,8 +182,8 @@ fn close(s: &mut dyn Window, record: &mut dyn FnMut(Value), errors: &mut Vec<Str
 }
 
 /// Recovery, with the sink open: `release` and `hello` on a reopened
-/// connection, the 1200-baud touch, then the recorder's removal of the
-/// bound handles, waited for however long it takes.
+/// connection, the 1200-baud touch, then the device's input interfaces
+/// gone from the bound location, waited for however long it takes.
 fn recover(
     link: &mut dyn Link,
     rec: &mut dyn Recorder,
@@ -203,15 +205,16 @@ fn recover(
     while !rec.removed() {
         if !told && clock.now() - begun >= RECOVERY_WAIT {
             told = true;
-            let msg = "no removal of the device's handles within 30 s of the touch: the sink \
-                       stays open until the board is unplugged or the runner is ended";
+            let msg = "the device's input interfaces are still at the bound location 30 s \
+                       after the touch: the sink stays open until the board is unplugged or the \
+                       runner is ended";
             eprintln!("{msg}");
             step(msg.into());
             errors.push(msg.into());
         }
         clock.sleep(HELLO_EVERY);
     }
-    step("the recorder saw the device's handles removed".into());
+    step("the device's input interfaces are gone from the bound location".into());
 }
 
 #[cfg(test)]
@@ -504,6 +507,6 @@ mod tests {
         assert!(recovery[0].starts_with("reopened"));
         assert_eq!(recovery[1], "the 1200-baud touch");
         assert!(recovery[2].contains("stays open"));
-        assert!(recovery[3].contains("removed"));
+        assert!(recovery[3].contains("gone from the bound location"));
     }
 }
