@@ -8,9 +8,10 @@
 //! Rows: `sink` (N1: a focus click on the sink, a lease of 3 s, button 1
 //! and F24 held, 1 s, the end), `sink-early-close` (N1's negative: the
 //! same, with the sink closed straight after the end's release request),
-//! and `sink-kill` (N2: an outer run that starts an inner `sink`, kills it
-//! once its recorder shows the presses, observes its recorder's end, and
-//! opens its own connection).
+//! and `sink-kill` (N2: an outer run that starts an inner `sink` in a job
+//! of its own, terminates that job with its cut code once the inner's
+//! recorder shows the presses, observes the inner's and its recorder's
+//! ends, and opens its own connection).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -431,24 +432,44 @@ impl Watch for Looks {
     }
 }
 
-/// Writes the `exit` record of `name`, process `p`.
-fn exit_record(log: &Log, name: &str, p: Process, code: i32, killed: bool) {
+/// How long a terminated process may take to end.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// Writes the `exit` record of `name`, process `p`, once its end was
+/// observed: the code it ended with.
+fn exit_record(log: &Log, name: &str, p: Process, code: i32) {
     log.put(json!({
-        "t": "exit", "name": name, "code": code, "killed": killed,
+        "t": "exit", "name": name, "code": code,
         "process": { "pid": p.pid, "created": p.created },
     }));
 }
 
-/// Waits up to `wait` for `c` to end, else ends it: its exit code (-1 when
-/// none could be read), and whether it was ended.
-fn wait_or_kill(c: &Child, wait: Duration) -> (i32, bool) {
-    match c.wait(wait) {
-        Some(code) => (code, false),
+/// Writes the `kill` record of `name`, process `p`, before the runner
+/// terminates it with its cut code.
+fn kill_record(log: &Log, name: &str, p: Process) {
+    log.put(json!({
+        "t": "kill", "name": name,
+        "process": { "pid": p.pid, "created": p.created },
+    }));
+}
+
+/// Waits up to `wait` for `c` to end; else records its kill, terminates it
+/// with the cut code and waits for that end. The exit is recorded only once
+/// observed: its code, or why its end was not observed.
+fn end_child(log: &Log, name: &str, c: &Child, wait: Duration, cut: i32) -> Result<i32, String> {
+    let code = match c.wait(wait) {
+        Some(code) => code,
         None => {
-            let _ = c.kill(1);
-            (c.wait(Duration::from_secs(5)).unwrap_or(-1), true)
+            kill_record(log, name, c.process);
+            c.kill(cut.cast_unsigned())
+                .map_err(|e| format!("terminating {name}: {e:#}"))?;
+            c.wait(KILL_WAIT).ok_or_else(|| {
+                format!("{name} did not end within {KILL_WAIT:?} of its termination")
+            })?
         }
-    }
+    };
+    exit_record(log, name, c.process, code);
+    Ok(code)
 }
 
 /// The recorder child: its process, its input (whose end ends it), and
@@ -460,10 +481,13 @@ struct RecChild {
     tail: Tail,
     log: Log,
     name: &'static str,
+    run: String,
+    cut: i32,
 }
 
 impl RecChild {
-    fn spawn(job: &Job, dir: &Path, port: &str, log: &Log) -> anyhow::Result<Self> {
+    fn spawn(b: &Begun, port: &str) -> anyhow::Result<Self> {
+        let (job, dir, log) = (b.job, &b.dir, &b.log);
         let exe = std::env::current_exe().context("the runner's own path")?;
         let path = dir.join(test_device::contract::RECORDER);
         let input = Pipe::new(true)?;
@@ -475,6 +499,8 @@ impl RecChild {
             &path.to_string_lossy(),
             "--port",
             port,
+            "--run",
+            &b.run,
         ]
         .map(str::to_owned);
         let stdio = Stdio {
@@ -494,6 +520,8 @@ impl RecChild {
             path,
             log: log.clone(),
             name: "recorder",
+            run: b.run.clone(),
+            cut: b.cut,
         };
         me.ready()?;
         Ok(me)
@@ -508,7 +536,7 @@ impl RecChild {
                     bail!("the recorder's first record is not `ready`: {v}");
                 };
                 let owner = desktop::process_of(r.window);
-                owner::ready_is_the_child_s(&r, self.child.process, owner)
+                owner::ready_is_the_child_s(&r, &self.run, self.child.process, owner)
                     .map_err(anyhow::Error::msg)?;
                 return Ok(());
             }
@@ -533,12 +561,18 @@ impl end::Recorder for RecChild {
 
     fn stop(&mut self) -> Result<(), String> {
         drop(self.input.take());
-        let (code, killed) = wait_or_kill(&self.child, Duration::from_secs(5));
-        exit_record(&self.log, self.name, self.child.process, code, killed);
-        match (code, killed) {
-            (0, false) => Ok(()),
-            (_, true) => Err("it did not end within 5 s of its input's end, and was killed".into()),
-            (c, false) => Err(format!("it exited {c}")),
+        match end_child(
+            &self.log,
+            self.name,
+            &self.child,
+            Duration::from_secs(5),
+            self.cut,
+        )? {
+            0 => Ok(()),
+            c if c == self.cut => {
+                Err("it did not end within 5 s of its input's end, and was terminated".into())
+            }
+            c => Err(format!("it exited {c}")),
         }
     }
 }
@@ -654,8 +688,14 @@ struct Begun {
     role: String,
     log: Log,
     stream: Stream,
-    job: Job,
+    /// The run's job, kept until this process exits: closing its handle
+    /// would end this process too, before it reports.
+    job: &'static Job,
     prefix: u16,
+    /// This runner's process and its cut code: `0x40000000` plus 30 random
+    /// bits, the exit code it gives every process it terminates.
+    process: Process,
+    cut: i32,
 }
 
 /// Reserves the run, joins its job and writes its `start`.
@@ -678,16 +718,18 @@ fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
         }
         _ => bail!("a run takes `--out <dir>`, or `--set <dir> --role <role>`"),
     };
-    let job = Job::join()?;
+    let job: &'static Job = Box::leak(Box::new(Job::join()?));
     let stream = Stream::create(&dir.join(test_device::contract::RUN))?;
     let log = Log(stream.clone());
     let prefix_hex = owner::random_hex(2)?;
     let prefix = u16::from_str_radix(&prefix_hex, 16).context("the tag prefix")?;
     let me = job::this_process()?;
+    let bits = u32::from_str_radix(&owner::random_hex(4)?, 16).context("the cut code")?;
+    let cut = (0x4000_0000 | (bits & 0x3FFF_FFFF)).cast_signed();
     log.put(json!({
         "t": "start", "run": run, "row": a.row, "role": role, "build": a.build,
         "process": { "pid": me.pid, "created": me.created }, "commit": super::COMMIT,
-        "tag": prefix, "args": std::env::args().skip(1).collect::<Vec<_>>(),
+        "tag": prefix, "cut": cut, "args": std::env::args().skip(1).collect::<Vec<_>>(),
         "set": set,
         "inner": inner.map(|r| json!({ "role": r.role, "row": r.row, "run": r.run, "dir": r.dir })),
     }));
@@ -699,6 +741,8 @@ fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
         stream,
         job,
         prefix,
+        process: me,
+        cut,
     })
 }
 
@@ -742,12 +786,13 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     };
     let b = begin(a, None)?;
     let mut errors = Vec::new();
-    let mut rec = RecChild::spawn(&b.job, &b.dir, &a.port, &b.log)?;
+    let mut rec = RecChild::spawn(&b, &a.port)?;
     let monitor = desktop::monitor(&a.monitor)?;
     let mut sink = Sink::open(sink::place(monitor.area))?;
     b.log.put(json!({ "t": "sink", "window": sink.window }));
     let link_log = Stream::create(&b.dir.join(test_device::contract::LINK))?;
-    let conn = owner::rediscover(&System, &a.port, &a.build)?;
+    let mut conn = owner::rediscover(&System, &a.port, &a.build)?;
+    conn.identify(&b.run, b.process);
     let hello = conn.facts().context("no checked `hello`")?.line.clone();
     may_hold(&a.build, &hello).map_err(anyhow::Error::msg)?;
     let token: Option<Token> = conn.token();
@@ -866,7 +911,7 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
     };
     let b = begin(a, Some(&inner))?;
     let mut errors = Vec::new();
-    let mut rec = RecChild::spawn(&b.job, &b.dir, &a.port, &b.log)?;
+    let mut rec = RecChild::spawn(&b, &a.port)?;
     let exe = std::env::current_exe().context("the runner's own path")?;
     let set = b.dir.to_string_lossy().into_owned();
     let args = [
@@ -890,7 +935,8 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
         output: Stdio::file(owner::create(&b.dir.join("inner-stdout.txt"))?),
         error: Stdio::file(owner::create(&b.dir.join("inner-stderr.txt"))?),
     };
-    let child = job::spawn(&b.job, &exe, &args, &[], &stdio)?;
+    // In a job of its own, so that its end takes everything it started.
+    let (inner_job, child) = job::spawn_in_own_job(b.job, &exe, &args, &[], &stdio)?;
     b.log.put(json!({
         "t": "spawn", "name": "inner",
         "process": { "pid": child.process.pid, "created": child.process.created },
@@ -912,23 +958,45 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
             "the inner showed no `held` within {INNER_HELD_WAIT:?}"
         ));
     }
-    child.kill(1).context("ending the inner")?;
-    let code = child.wait(Duration::from_secs(5)).unwrap_or(-1);
-    exit_record(&b.log, "inner", child.process, code, true);
-    match survivor {
-        Some(Ok(s)) => {
-            let (code, killed) = wait_or_kill(&s, SURVIVOR_WAIT);
-            exit_record(&b.log, "inner-recorder", s.process, code, killed);
+    // The inner and its job, its recorder with it, end with the cut code.
+    kill_record(&b.log, "inner", child.process);
+    inner_job
+        .terminate(b.cut.cast_unsigned())
+        .context("terminating the inner's job")?;
+    let mut observed = true;
+    match child.wait(KILL_WAIT) {
+        Some(code) => exit_record(&b.log, "inner", child.process, code),
+        None => {
+            observed = false;
+            errors.push(format!(
+                "the inner did not end within {KILL_WAIT:?} of its termination"
+            ));
         }
+    }
+    match survivor {
+        Some(Ok(s)) => match s.wait(SURVIVOR_WAIT) {
+            Some(code) => exit_record(&b.log, "inner-recorder", s.process, code),
+            None => {
+                observed = false;
+                errors.push(format!(
+                    "the inner's recorder did not end within {SURVIVOR_WAIT:?} of the termination"
+                ));
+            }
+        },
         Some(Err(e)) => errors.push(format!("opening the inner's recorder: {e:#}")),
         None => errors.push("the inner recorded no recorder".into()),
     }
-    for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
-        seal(&b, &inner_dir, name, &inner.run, &inner.role, &mut errors);
+    drop(inner_job);
+    // The inner's streams, sealed only once their writers' ends were seen.
+    if observed {
+        for name in [test_device::contract::LINK, test_device::contract::RECORDER] {
+            seal(&b, &inner_dir, name, &inner.run, &inner.role, &mut errors);
+        }
     }
     // Its own connection: the first `hello` is N2's evidence.
     let link_log = Stream::create(&b.dir.join(test_device::contract::LINK))?;
-    let conn = owner::rediscover(&System, &a.port, &a.build)?;
+    let mut conn = owner::rediscover(&System, &a.port, &a.build)?;
+    conn.identify(&b.run, b.process);
     let token = conn.token();
     let (writer, thread) = Writer::start(conn, link_log.clone(), b.stream.clone());
     // Let the outer's recorder see what the device sends now.

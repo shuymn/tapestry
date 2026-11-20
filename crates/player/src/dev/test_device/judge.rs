@@ -491,18 +491,21 @@ pub fn n2(build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
     };
     let gone = || -> Result<Result<(), String>, String> {
         let run = recs(&outer.run)?;
+        let cut = run.first().map(|v| v["cut"].clone()).unwrap_or_default();
         let kill = run
             .iter()
-            .position(|v| v["t"] == "exit" && v["name"] == "inner" && v["killed"] == true)
+            .position(|v| v["t"] == "kill" && v["name"] == "inner")
             .ok_or("the outer recorded no kill of the inner")?;
+        // The inner's job, the recorder with it, ends with the outer's cut
+        // code.
         Ok(
             match run[kill..]
                 .iter()
                 .find(|v| v["t"] == "exit" && v["name"] == "inner-recorder")
             {
-                Some(v) if v["killed"] == false => Ok(()),
+                Some(v) if v["code"] == cut => Ok(()),
                 Some(v) => Err(format!(
-                    "the inner's recorder outlived its wait and was ended: {v}"
+                    "the inner's recorder did not end with the inner's job: {v}"
                 )),
                 None => Err("the outer never observed the inner's recorder end".into()),
             },
@@ -843,6 +846,9 @@ pub mod tests {
         assert_eq!(outcome(&f, "n1.press").0, Outcome::Pass);
     }
 
+    /// The outer's cut code.
+    const CUT: i32 = 0x4000_0123;
+
     fn n2_good() -> (Files, Files) {
         let n1 = good();
         let inner = Files {
@@ -852,9 +858,10 @@ pub mod tests {
         };
         let outer = Files {
             run: Stream::of(vec![
-                json!({"t": "start"}),
-                json!({"t": "exit", "q": 2100, "name": "inner", "killed": true, "code": 1}),
-                json!({"t": "exit", "q": 2200, "name": "inner-recorder", "killed": false, "code": 0}),
+                json!({"t": "start", "cut": CUT}),
+                json!({"t": "kill", "q": 2050, "name": "inner"}),
+                json!({"t": "exit", "q": 2100, "name": "inner", "code": CUT}),
+                json!({"t": "exit", "q": 2200, "name": "inner-recorder", "code": CUT}),
                 json!({"t": "end", "exit": 0, "errors": []}),
             ]),
             link: Stream::of(vec![
@@ -887,14 +894,21 @@ pub mod tests {
             .map(|j| j.outcome)
             .collect();
         assert!(all.iter().all(|x| *x == Outcome::Pass), "{all:?}");
-        // The recorder outlived its wait and the outer ended it.
+        // The recorder ended by itself, not with the inner's job.
         let (mut o, i) = n2_good();
-        edit(&mut o.run, |r| r[2]["killed"] = json!(true));
+        edit(&mut o.run, |r| r[3]["code"] = json!(0));
+        assert_eq!(n2_outcome(&o, &i, "n2.children-gone"), Outcome::Fail);
+        // Its end observed before the kill only.
+        let (mut o, i) = n2_good();
+        edit(&mut o.run, |r| {
+            let x = r.remove(3);
+            r.insert(1, x);
+        });
         assert_eq!(n2_outcome(&o, &i, "n2.children-gone"), Outcome::Fail);
         // Never observed.
         let (mut o, i) = n2_good();
         edit(&mut o.run, |r| {
-            r.remove(2);
+            r.remove(3);
         });
         assert_eq!(n2_outcome(&o, &i, "n2.children-gone"), Outcome::Fail);
         // The inner wrote a release: not an abnormal exit.

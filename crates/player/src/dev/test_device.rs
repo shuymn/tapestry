@@ -37,7 +37,7 @@ const USAGE: &str = "usage: tapestry test-device devices [--out <json>] \
 | flash <uf2> --build <id> --port <location> \
 | bootsel --port <location> \
 | trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe] \
-| listen --out <jsonl> --port <location> [--for <ms>] \
+| listen --out <jsonl> --port <location> [--run <id>] [--for <ms>] \
 | run <row> (--out <dir> | --set <dir> --role <role>) --build <id> --port <location> --monitor <name> \
 | judge <row> <dir> | check <row> <dir>";
 
@@ -97,6 +97,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     let mut trace_on = true;
     let mut framing_probe = false;
     let mut for_ms = None;
+    let mut run_id = None;
     let mut set = None;
     let mut role = None;
     let mut monitor = None;
@@ -113,6 +114,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
             ("flash" | "bootsel" | "trace" | "listen" | "run", Arg::Long("port")) => {
                 port = Some(text(p)?);
             }
+            ("listen", Arg::Long("run")) => run_id = Some(text(p)?),
             ("listen", Arg::Long("for")) => {
                 for_ms = Some(
                     text(p)?
@@ -181,6 +183,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
         "listen" => TestDevice::Listen(listen::Args {
             out: out.ok_or_else(usage)?,
             port: port.ok_or_else(usage)?,
+            run: run_id,
             for_ms,
         }),
         _ => return Err(usage()),
@@ -273,10 +276,14 @@ mod tests {
             })
         );
         assert_eq!(
-            parsed(&["listen", "--out", "l.jsonl", "--port", "L", "--for", "500"]).unwrap(),
+            parsed(&[
+                "listen", "--out", "l.jsonl", "--port", "L", "--run", "r", "--for", "500"
+            ])
+            .unwrap(),
             TestDevice::Listen(listen::Args {
                 out: PathBuf::from("l.jsonl"),
                 port: "L".to_owned(),
+                run: Some("r".to_owned()),
                 for_ms: Some(500),
             })
         );

@@ -23,15 +23,16 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -97,6 +98,17 @@ impl Job {
         unsafe { IsProcessInJob(process, Some(self.handle.0), &mut inside) }
             .context("IsProcessInJob")?;
         Ok(inside.as_bool())
+    }
+
+    /// Ends every process in this job, and in the jobs nested in it, with
+    /// exit code `code`.
+    ///
+    /// # Errors
+    ///
+    /// The call failed.
+    pub fn terminate(&self, code: u32) -> anyhow::Result<()> {
+        // SAFETY: an open job handle.
+        unsafe { TerminateJobObject(self.handle.0, code) }.context("TerminateJobObject")
     }
 }
 
@@ -289,7 +301,7 @@ pub fn spawn(
     env: &[(&str, &str)],
     stdio: &Stdio,
 ) -> anyhow::Result<Child> {
-    let child = start(exe, args, env, stdio)?;
+    let child = start(exe, args, env, stdio, None)?;
     if !job.holds(child.handle.0)? {
         let _ = child.kill(1);
         bail!(
@@ -299,6 +311,35 @@ pub fn spawn(
         );
     }
     Ok(child)
+}
+
+/// Starts `exe` as [`spawn`] does, in a job of its own nested in the
+/// runner's `job` from its creation (`PROC_THREAD_ATTRIBUTE_JOB_LIST`), so
+/// that the runner can end the child with everything it starts
+/// ([`Job::terminate`]). The child's job and the child.
+///
+/// # Errors
+///
+/// The job cannot be made, the child cannot be started, or it is not in
+/// both jobs.
+pub fn spawn_in_own_job(
+    job: &Job,
+    exe: &Path,
+    args: &[String],
+    env: &[(&str, &str)],
+    stdio: &Stdio,
+) -> anyhow::Result<(Job, Child)> {
+    let own = Job::create()?;
+    let child = start(exe, args, env, stdio, Some(&own))?;
+    if !(job.holds(child.handle.0)? && own.holds(child.handle.0)?) {
+        let _ = own.terminate(1);
+        bail!(
+            "{} (process {}) is not in its own job within the run's",
+            exe.display(),
+            child.process.pid
+        );
+    }
+    Ok((own, child))
 }
 
 /// One start at a time: a child's handles are inheritable only while it
@@ -332,13 +373,15 @@ pub fn start(
     args: &[String],
     env: &[(&str, &str)],
     stdio: &Stdio,
+    job: Option<&Job>,
 ) -> anyhow::Result<Child> {
     let handles = [stdio.input.0, stdio.output.0, stdio.error.0];
     let _one = STARTING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     inherit(&handles, true)?;
-    let started = start_listed(exe, args, env, stdio, &handles);
+    let jobs = job.map(|j| [j.handle.0]);
+    let started = start_listed(exe, args, env, stdio, &handles, jobs.as_ref());
     let cleared = inherit(&handles, false);
     let child = started?;
     cleared?;
@@ -351,14 +394,16 @@ fn start_listed(
     env: &[(&str, &str)],
     stdio: &Stdio,
     handles: &[HANDLE; 3],
+    jobs: Option<&[HANDLE; 1]>,
 ) -> anyhow::Result<Child> {
+    let count = if jobs.is_some() { 2 } else { 1 };
     let mut size = 0;
     // SAFETY: a size query; it fails with the size written.
-    let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
+    let _ = unsafe { InitializeProcThreadAttributeList(None, count, None, &mut size) };
     let mut buf = vec![0_u64; size.div_ceil(8)];
     let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
     // SAFETY: the buffer holds `size` bytes.
-    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
+    unsafe { InitializeProcThreadAttributeList(Some(list), count, None, &mut size) }
         .context("InitializeProcThreadAttributeList")?;
     // SAFETY: the handle array outlives the list's use below.
     let listed = unsafe {
@@ -372,6 +417,21 @@ fn start_listed(
             None,
         )
     };
+    let listed = listed.and_then(|()| match jobs {
+        // SAFETY: the job array outlives the list's use below.
+        Some(jobs) => unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                Some(jobs.as_ptr().cast()),
+                size_of_val(jobs),
+                None,
+                None,
+            )
+        },
+        None => Ok(()),
+    });
     let result = listed.context("UpdateProcThreadAttribute").and_then(|()| {
         let mut si = STARTUPINFOEXW::default();
         si.StartupInfo.cb = u32::try_from(size_of::<STARTUPINFOEXW>()).unwrap_or(0);
@@ -500,7 +560,9 @@ mod tests {
     /// joins a job, starts a sleeper in it and prints the sleeper's id;
     /// `breakaway` joins a job and prints whether a child asking to break
     /// away was refused; `outside` prints whether a child of a job it did
-    /// not join is refused.
+    /// not join is refused; `cutter` joins a job, starts a `runner` in a job
+    /// of its own, terminates that job with a cut code and prints the exit
+    /// codes of the runner and of the sleeper the runner started.
     #[test]
     fn helper() {
         let Ok(mode) = std::env::var(HELPER) else {
@@ -527,6 +589,29 @@ mod tests {
                 let child = spawn(&job, &exe, &args, &[(HELPER, "sleep")], &null).unwrap();
                 out(child.process.pid.to_string());
                 std::thread::sleep(Duration::from_secs(30));
+            }
+            "cutter" => {
+                let job = Job::join().unwrap();
+                let (exe, args, _) = me("runner");
+                let piped = Pipe::new(false).unwrap();
+                let io = Stdio {
+                    input: Stdio::null().unwrap(),
+                    output: Owned(dup(piped.child.0)),
+                    error: Stdio::null().unwrap(),
+                };
+                let (own, runner) =
+                    spawn_in_own_job(&job, &exe, &args, &[(HELPER, "runner")], &io).unwrap();
+                drop(io);
+                drop(piped.child);
+                let pid: u32 = BufReader::new(piped.own)
+                    .lines()
+                    .find_map(|l| l.ok()?.split_once("HELPER ")?.1.parse().ok())
+                    .unwrap();
+                let sleeper = open_any(pid);
+                own.terminate(CUT).unwrap();
+                let runner_code = runner.wait(Duration::from_secs(5));
+                let sleeper_code = sleeper.wait(Duration::from_secs(5));
+                out(format!("codes {runner_code:?} {sleeper_code:?}"));
             }
             "breakaway" => {
                 let _job = Job::join().unwrap();
@@ -608,6 +693,39 @@ mod tests {
         );
     }
 
+    /// A cut code: `0x40000000` plus some bits.
+    const CUT: u32 = 0x4000_0123;
+
+    /// The process `pid`, to wait for, without its creation time.
+    fn open_any(pid: u32) -> Child {
+        // SAFETY: opening a process by id.
+        let h = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                false,
+                pid,
+            )
+        }
+        .unwrap();
+        let handle = Owned(h);
+        let created = created(handle.0).unwrap();
+        Child {
+            handle,
+            process: Process { pid, created },
+        }
+    }
+
+    /// A child started in a job of its own ends, with everything it
+    /// started in its own nested job, when the runner terminates that job:
+    /// each with the cut code.
+    #[test]
+    fn a_child_s_own_job_ends_its_tree_with_the_cut_code() {
+        let (mut helper, line) = run_helper("cutter");
+        let code = Some(CUT.cast_signed());
+        assert_eq!(line, format!("codes {code:?} {code:?}"));
+        let _ = helper.wait();
+    }
+
     /// A child in the job cannot break away from it.
     #[test]
     fn the_job_refuses_breakaway() {
@@ -627,10 +745,17 @@ mod tests {
         inherit(&[second.child.0], true).unwrap();
         let first_out = Pipe::new(false).unwrap();
         let (exe, args, _) = me("sleep");
-        let first = start(&exe, &args, &[(HELPER, "sleep")], &stdio(&first_out)).unwrap();
+        let first = start(&exe, &args, &[(HELPER, "sleep")], &stdio(&first_out), None).unwrap();
         // The second child ends at once.
         let cmd = std::path::PathBuf::from(std::env::var("ComSpec").unwrap());
-        let quick = start(&cmd, &["/c".into(), "exit 0".into()], &[], &stdio(&second)).unwrap();
+        let quick = start(
+            &cmd,
+            &["/c".into(), "exit 0".into()],
+            &[],
+            &stdio(&second),
+            None,
+        )
+        .unwrap();
         drop(second.child);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut own = second.own;

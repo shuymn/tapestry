@@ -173,17 +173,25 @@ pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, St
     Ok((outer, inner.run, dir))
 }
 
-/// Checks the recorder's `ready` against the child the runner spawned: its
-/// process, and its window, which must be that process's.
+/// Checks the recorder's `ready` against the child the runner spawned: the
+/// run the runner gave it, its process, and its window, which must be that
+/// process's.
 ///
 /// # Errors
 ///
 /// Another process's record or window.
 pub fn ready_is_the_child_s(
     ready: &RecorderReady,
+    run: &str,
     spawned: Process,
     window_pid: u32,
 ) -> Result<(), String> {
+    if ready.run != run {
+        return Err(format!(
+            "the recorder's `ready` names run `{}`, not this run, `{run}`",
+            ready.run
+        ));
+    }
     if ready.process != spawned {
         return Err(format!(
             "the recorder's `ready` names process {:?}, not the child spawned, {spawned:?}",
@@ -293,16 +301,18 @@ mod tests {
             pid: 40,
             created: 400,
         };
-        assert_eq!(ready_is_the_child_s(&ready(40, 9), child, 40), Ok(()));
+        assert_eq!(ready_is_the_child_s(&ready(40, 9), "r", child, 40), Ok(()));
+        // Another run's recorder.
+        assert!(ready_is_the_child_s(&ready(40, 9), "s", child, 40).is_err());
         // Its window is another process's.
-        assert!(ready_is_the_child_s(&ready(40, 9), child, 41).is_err());
+        assert!(ready_is_the_child_s(&ready(40, 9), "r", child, 41).is_err());
         // Another process's record (a reused id: another creation time).
-        assert!(ready_is_the_child_s(&ready(41, 9), child, 41).is_err());
+        assert!(ready_is_the_child_s(&ready(41, 9), "r", child, 41).is_err());
         let reused = Process {
             pid: 40,
             created: 401,
         };
-        assert!(ready_is_the_child_s(&ready(40, 9), reused, 40).is_err());
+        assert!(ready_is_the_child_s(&ready(40, 9), "r", reused, 40).is_err());
     }
 
     #[test]

@@ -66,6 +66,9 @@ pub struct Args {
     pub out: PathBuf,
     /// The device's USB location path.
     pub port: String,
+    /// The run its runner gave it, named in its `ready` (empty when it
+    /// runs on its own).
+    pub run: Option<String>,
     pub for_ms: Option<u64>,
 }
 
@@ -513,7 +516,7 @@ pub fn listen(args: &Args) -> anyhow::Result<()> {
         bound.arrive(h, resolve(h));
     }
     (rec.write)(&json!({
-        "t": "ready", "q": ready_q, "process": { "pid": me.pid, "created": me.created },
+        "t": "ready", "q": ready_q, "run": args.run.as_deref().unwrap_or_default(), "process": { "pid": me.pid, "created": me.created },
         "window": hwnd.0 as u64, "location": args.port,
         "keyboard": bound.first(Ours::Keyboard), "pad": bound.first(Ours::Pad),
     }));

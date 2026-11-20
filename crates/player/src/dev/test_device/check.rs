@@ -235,8 +235,8 @@ fn sink_kill() -> Expectation {
                 }),
                 exit: Exit::Killed,
             },
-            // The inner's recorder ends with its input or with the inner's
-            // job, either way with code 0 (a job's kill-on-close gives 0).
+            // The inner's recorder ends with the inner's job, which the
+            // outer terminates with its cut code.
             ExitRule {
                 role: SINGLE,
                 process: "inner-recorder",
@@ -244,7 +244,7 @@ fn sink_kill() -> Expectation {
                     role: INNER,
                     name: "recorder",
                 }),
-                exit: Exit::Code(0),
+                exit: Exit::Killed,
             },
         ],
         records,

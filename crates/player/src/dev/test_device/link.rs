@@ -409,6 +409,16 @@ impl Connection {
         &self.com
     }
 
+    /// Names the run and the process that write this link's journal in its
+    /// `open` record, before the journal is taken (docs/test-device.md
+    /// "Verdicts": a stream's first record names its run and writer).
+    pub fn identify(&mut self, run: &str, process: test_device::evidence::Process) {
+        if let Some(open) = self.journal.first_mut().filter(|o| o["t"] == "open") {
+            open["run"] = json!(run);
+            open["process"] = json!({ "pid": process.pid, "created": process.created });
+        }
+    }
+
     /// What its checked `hello` said.
     pub const fn facts(&self) -> Option<&Facts> {
         self.hello.as_ref()
