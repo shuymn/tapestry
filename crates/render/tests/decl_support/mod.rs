@@ -143,6 +143,8 @@ pub struct Look {
     /// The chart's BGA filling [`BGA_RECT`] (stretch 0) on the untimed
     /// `screen` timer, over the image.
     pub bga: bool,
+    /// The loading time the skin declares ([`skin_model::Skin::loadend`]).
+    pub loadend: Option<TimeUs>,
 }
 
 /// The images of the full lane fixture's categories, each its own texel
@@ -321,6 +323,7 @@ impl Look {
             full_lanes: false,
             chart: false,
             bga: false,
+            loadend: None,
         }
     }
 }
@@ -695,7 +698,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
         widgets,
         bomb_up_to: None,
         close: None,
-        loadend: None,
+        loadend: look.loadend,
         present: None,
     })
     .unwrap()

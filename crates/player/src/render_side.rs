@@ -21432,6 +21432,9 @@ pub(crate) mod tests {
         builds: Arc<AtomicU32>,
         resize: Resize,
         fail: Arc<AtomicBool>,
+        /// Set: no boundary steps the uploader, which reads as idle, so
+        /// what it holds stays in hand.
+        hold_up: Arc<AtomicBool>,
         /// Taken by the next loading frame: its renderer's next text
         /// preparation fails waiting for the GPU.
         #[cfg(feature = "dev-tools")]
@@ -21516,9 +21519,20 @@ pub(crate) mod tests {
             self.menu.prepare_attempt(a, skin, request)
         }
         fn upload_boundary(&mut self, past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+            if self.hold_up.load(Ordering::Acquire) {
+                return render::Uploaded {
+                    bga: render::BgaStep::Idle,
+                    staged: None,
+                    text: None,
+                    chart: None,
+                };
+            }
             self.menu.upload_boundary(past)
         }
         fn upload_state(&self) -> render::UploadState {
+            if self.hold_up.load(Ordering::Acquire) {
+                return render::UploadState::Idle;
+            }
             self.menu.upload_state()
         }
         fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
@@ -21635,6 +21649,7 @@ pub(crate) mod tests {
         builds: Arc<AtomicU32>,
         resize: Resize,
         fail: Arc<AtomicBool>,
+        hold_up: Arc<AtomicBool>,
         made: Arc<AtomicU32>,
         /// Set: the next loading frame's renderer fails its next text
         /// preparation's wait for the GPU.
@@ -21650,6 +21665,8 @@ pub(crate) mod tests {
             let builds = Arc::new(AtomicU32::new(0));
             let resize: Resize = Arc::new(std::sync::Mutex::new(None));
             let fail = Arc::new(AtomicBool::new(false));
+            let hold_up = Arc::new(AtomicBool::new(false));
+            let h = Arc::clone(&hold_up);
             let made = Arc::new(AtomicU32::new(0));
             #[cfg(feature = "dev-tools")]
             let text_fault = Arc::new(AtomicBool::new(false));
@@ -21680,6 +21697,7 @@ pub(crate) mod tests {
                     builds: Arc::clone(&b),
                     resize: Arc::clone(&r),
                     fail: Arc::clone(&f),
+                    hold_up: Arc::clone(&h),
                     #[cfg(feature = "dev-tools")]
                     text_fault: Arc::clone(&t),
                 }) as Box<dyn Screen>)
@@ -21689,6 +21707,7 @@ pub(crate) mod tests {
                 builds,
                 resize,
                 fail,
+                hold_up,
                 made,
                 #[cfg(feature = "dev-tools")]
                 text_fault,
@@ -22008,6 +22027,123 @@ pub(crate) mod tests {
         let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
         assert!(r2.iter().all(|s| s.target == [1_920, 1_080]), "{r2:?}");
         assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
+    }
+
+    /// V14: the play skin's first loading frame of each lifetime has every
+    /// text slot filled, whether the lifetime was a chart chosen to play,
+    /// held at a choice and revealed, a practice Start of the same chart,
+    /// or revealed right after it was held; the frames before it are the
+    /// outgoing picture or the pending presentation, never the skin.
+    #[test]
+    fn each_lifetimes_first_skin_frame_has_its_text() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        let mut lifetimes = Vec::new();
+        let mut seen = 0;
+        for (title, artist, held) in [
+            ("T", "x", false),
+            ("U", "y", true),
+            ("U", "y", false),
+            ("V", "z", true),
+        ] {
+            if held {
+                link.begin_loading_held(&chosen_by(title, Some(artist)), None);
+            } else {
+                link.begin_loading(&chosen_by(title, Some(artist)), None);
+            }
+            let lifetime = link.loading_lifetime();
+            if held {
+                link.reveal_loading();
+            }
+            link.loading()
+                .report(LoadInput::Stage(Stage::Chart), Some(one_line(title)));
+            seen = rec.until(seen, |s| s.lifetime == lifetime);
+            lifetimes.push(lifetime);
+        }
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        for lifetime in lifetimes {
+            let first = shots.iter().find(|s| s.lifetime == lifetime).unwrap();
+            assert!(
+                first.red.is_some_and(|r| r.title && r.artist),
+                "{lifetime}: {first:?}"
+            );
+        }
+    }
+
+    /// V14b: text installed for chart A, then B asked (its artist slot
+    /// cleared, its text kept in the uploader's hand), then A again: what
+    /// the slots hold after the clear is unknown, so A is prepared again in
+    /// every slot and its artist drawn, never taken as still installed.
+    #[test]
+    fn a_request_back_to_the_installed_text_after_a_clear_is_prepared_again() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        let by = |artist: &str| {
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some(artist.to_owned()),
+                ..ChosenChart::default()
+            })
+        };
+        rec.hold_up.store(true, Ordering::Release);
+        sink.report(by("y"), None);
+        let cleared = rec.until(shown, |s| s.text == 2 && s.red.is_some_and(|r| !r.artist));
+        sink.report(by("x"), None);
+        let back = rec.until(cleared, |s| s.text == 3);
+        rec.hold_up.store(false, Ordering::Release);
+        rec.until(back, |s| {
+            s.text == 3 && s.red.is_some_and(|r| r.title && r.artist)
+        });
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// V14b: a lifetime whose text has not installed when the hold ends
+    /// draws the pending presentation, never the skin, and each such frame
+    /// declares the loading time the skin would have declared; the skin
+    /// draws from the pass after the text installs, every slot filled.
+    #[test]
+    fn a_frame_pending_on_the_text_declares_the_skins_time() {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, _) = crate::render_decl::bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &crate::render_decl::Look {
+                loadend: Some(TimeUs(2_000_000)),
+                ..bridge_look()
+            },
+        );
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Play, Some(skin)).wait().unwrap(),
+            Preparation::Ready
+        );
+        rec.hold_up.store(true, Ordering::Release);
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        // The hold ends at its bound: the pending presentation is drawn.
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        assert_eq!(rec.count(), 0, "{:?}", rec.shots());
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_000_000)));
+        rec.hold_up.store(false, Ordering::Release);
+        let filled = rec.until(0, |s| s.red.is_some());
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        assert!(
+            shots[0].red.is_some_and(|r| r.title && r.artist),
+            "{:?}",
+            &shots[..filled]
+        );
     }
 
     /// A revision the producer refuses leaves its fields empty and is not
