@@ -546,17 +546,34 @@ impl MenuScreen {
         }
     }
 
-    /// Plays the skins' movies through the run's media session `hub`.
+    /// Plays the skins' movies through the run's media session `hub`,
+    /// taking back the movies a screen dropped for its device's recovery
+    /// left there ([`MediaHub::unpark`]).
     #[must_use]
     pub fn with_media(mut self, hub: Arc<MediaHub>) -> Self {
+        self.movies = hub.unpark();
         self.media = Some(hub);
         self
     }
 
-    /// Opens the movies of the play skin an attempt is prepared with:
-    /// `skin` staged, else the play skin in use. A screen already showing
-    /// that skin's movies keeps them (a retry, a practice round).
-    fn open_play_movies(&mut self, skin: Option<&Arc<SkinBundle>>) {
+    /// Drops the movies of play preparation `request`, if they are still
+    /// its own (not committed): its screen will not be shown.
+    fn drop_preparing_movies(&mut self, request: Option<u64>) {
+        let preparing = self.movies.as_ref().and_then(|m| m.preparing);
+        if preparing.is_some() && (request.is_none() || preparing == request) {
+            self.movies = None;
+            self.movie_wait = None;
+            self.renderer
+                .set_loading_movies(skin_model::movie::MovieShows::default());
+        }
+    }
+
+    /// Opens the movies of the play skin an attempt is prepared with for
+    /// preparation `request`: `skin` staged, else the play skin in use. A
+    /// screen already showing that skin's movies keeps them (a retry, a
+    /// practice round). Either way they belong to `request` until its
+    /// commit.
+    fn open_play_movies(&mut self, skin: Option<&Arc<SkinBundle>>, request: u64) {
         let Some(hub) = &self.media else {
             return;
         };
@@ -567,24 +584,26 @@ impl MenuScreen {
             self.movies = None;
             return;
         };
-        if self
+        if !self
             .movies
             .as_ref()
             .is_some_and(|m| m.is_for(ScreenKind::Play, &bundle, 0))
         {
-            return;
+            let hub = Arc::clone(hub);
+            // The screen before is left first.
+            self.movies = None;
+            self.movies = MovieSet::open(
+                &hub,
+                ScreenKind::Play,
+                &bundle,
+                0,
+                std::time::Instant::now(),
+                0,
+            );
         }
-        let hub = Arc::clone(hub);
-        // The screen before is left first.
-        self.movies = None;
-        self.movies = MovieSet::open(
-            &hub,
-            ScreenKind::Play,
-            &bundle,
-            0,
-            std::time::Instant::now(),
-            0,
-        );
+        if let Some(m) = &mut self.movies {
+            m.preparing = Some(request);
+        }
     }
 
     /// Opens the selection skin `bundle`'s movies for selection's entry
@@ -1079,7 +1098,7 @@ impl Screen for MenuScreen {
                 }
                 Err(e) => return Some(Err(e)),
             }
-            self.open_play_movies(skin);
+            self.open_play_movies(skin, request);
             self.movie_wait = Some(request);
         }
         // The movies' readiness (design.md "Threat Model" T02, L5): their
@@ -1109,17 +1128,26 @@ impl Screen for MenuScreen {
     }
 
     fn commit(&mut self, token: PreparedToken) -> Result<(), CommitError> {
-        if self.renderer.staged().is_some() {
+        let done = if self.renderer.staged().is_some() {
             self.renderer.commit(token)
         } else if token.device == self.renderer.device_generation() {
             Ok(())
         } else {
             Err(CommitError::Device)
+        };
+        // Committed, the movies are the shown screen's.
+        if done.is_ok()
+            && let Some(m) = &mut self.movies
+            && m.preparing == Some(token.request)
+        {
+            m.preparing = None;
         }
+        done
     }
 
     fn discard(&mut self) {
         self.renderer.discard();
+        self.drop_preparing_movies(None);
     }
 
     fn publish_chart_images(
@@ -1797,6 +1825,7 @@ impl Screen for MenuScreen {
         if self.renderer.staged() == Some(token) {
             self.renderer.discard();
         }
+        self.drop_preparing_movies(Some(token.request));
     }
 
     /// The cleared canvas with the load's lines where a skin's loading
@@ -2091,10 +2120,71 @@ impl MenuScreen {
     }
 }
 
+impl Drop for MenuScreen {
+    /// A screen dropped (its device's recovery builds another) parks its
+    /// movies in the hub for the screen built next; the run's end drops
+    /// them with the hub.
+    fn drop(&mut self) {
+        if let (Some(hub), Some(set)) = (&self.media, self.movies.take()) {
+            hub.park(set);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A screen dropped for its device's recovery parks its movies, and
+    /// the screen built again takes them back: the same set, of the same
+    /// lifetime and clock origin, its lost movie still lost, and the
+    /// selection's next frame does not open them again.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_rebuilt_screen_keeps_its_movies() {
+        use skin_model::ScreenKind;
+        use skin_model::movie::MovieShow;
+        let _turn = crate::warp_turn::take();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mp4"), b"x").unwrap();
+        let hub = crate::movie_screen::MediaHub::with(None);
+        let bundle = crate::render_side::tests::movies::movie_bundle_in(dir.path());
+        let warp = || {
+            render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 64,
+                    height: 64,
+                },
+                render::AdapterChoice::Warp,
+            )
+            .unwrap()
+        };
+        let mut first = super::MenuScreen::new(warp(), None).with_media(Arc::clone(&hub));
+        first.open_selection_movies(&bundle, 7, bms_model::TimeUs(5_000));
+        // No worker to play it: lost before the device's recovery.
+        let before = first.selection_movies(bms_model::TimeUs(6_000));
+        assert_eq!(before[0], MovieShow::Lost);
+        assert_eq!(hub.open_sets(), 1);
+        drop(first);
+        assert_eq!(hub.open_sets(), 1, "parked, not left");
+        let mut second = super::MenuScreen::new(warp(), None).with_media(Arc::clone(&hub));
+        let m = second.movies.as_ref().expect("taken back");
+        assert!(m.is_for(ScreenKind::Selection, &bundle, 7));
+        assert_eq!(m.origin, 5_000, "its clock origin");
+        second.open_selection_movies(&bundle, 7, bms_model::TimeUs(9_000));
+        assert_eq!(
+            second.movies.as_ref().map(|m| m.origin),
+            Some(5_000),
+            "not opened again"
+        );
+        assert_eq!(hub.open_sets(), 1);
+        assert_eq!(
+            second.selection_movies(bms_model::TimeUs(10_000))[0],
+            MovieShow::Lost,
+            "black for the rest of the screen"
+        );
+    }
 
     /// A request installed or refused needs nothing; in the place its
     /// text was installed for, only the changed fields are cleared and

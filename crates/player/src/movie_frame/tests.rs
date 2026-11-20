@@ -401,6 +401,38 @@ fn a_preparation_never_holds_a_frame_ahead_of_the_screen_clock() {
     );
 }
 
+/// After the device's recovery a live movie reserves its planes again on
+/// the new device and shows its next frame; a lost one stays lost.
+#[test]
+fn a_rebuilt_device_keeps_each_movie_s_state() {
+    let start = Instant::now();
+    let (a, b) = (Fake::new(16, 8), Fake::new(16, 8));
+    a.set(Status::Live);
+    b.set(Status::Live);
+    a.publish(1, 0, 3);
+    b.publish(1, 0, 4);
+    let mut m = movies(Some(&a), Some(&b), start);
+    let mut planes = Kept::default();
+    assert!(matches!(
+        m.frame(&mut planes, 0, start),
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
+    ));
+    b.lose(Loss::Failed);
+    m.rebuilt();
+    let mut fresh = Kept::default();
+    // No new frame yet: nothing in the new planes, so nothing shows.
+    assert_eq!(
+        m.frame(&mut fresh, 10, start),
+        [MovieShow::Nothing, MovieShow::Lost]
+    );
+    assert_eq!(fresh.reserved, [[0, 16, 8]], "only the live movie's");
+    a.publish(2, 20, 6);
+    let shows = m.frame(&mut fresh, 20, start);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }), "{shows:?}");
+    assert_eq!(shows[1], MovieShow::Lost);
+    assert!(fresh.luma[0].iter().all(|&v| v == 6));
+}
+
 #[test]
 fn the_preparation_deadline_loses_what_is_not_settled() {
     let start = Instant::now();

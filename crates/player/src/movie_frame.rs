@@ -364,9 +364,12 @@ impl<S: Source> Movies<S> {
                         s.bt601 = live.bt601;
                         s.full = live.full;
                     }
-                    self.reserve(planes, i, live.width, live.height);
                 }
             }
+        }
+        // Its planes, at its admission or after the device's recovery.
+        if let Some(&Slot { size: [w, h], .. }) = self.slots.get(i) {
+            self.reserve(planes, i, w, h);
         }
         let layer = u32::try_from(i).unwrap_or(u32::MAX);
         let Some(slot) = self.slots.get_mut(i) else {
@@ -439,6 +442,16 @@ impl<S: Source> Movies<S> {
             }
         } else {
             MovieShow::Nothing
+        }
+    }
+
+    /// The device was made again: no slot's planes are reserved or hold
+    /// a frame, and each admitted movie reserves its own again at its next
+    /// frame. Admissions, readers and the movies' states stay.
+    pub fn rebuilt(&mut self) {
+        self.reserved = [[0; 2]; MAX_MOVIES];
+        for s in &mut self.slots {
+            s.shown = false;
         }
     }
 

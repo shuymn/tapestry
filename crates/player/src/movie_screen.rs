@@ -13,12 +13,20 @@
 //! Dropping the screen's [`MovieSet`] leaves it: a new generation is
 //! entered, and the session closes the players of the one left.
 //!
+//! A set opened for a play's preparation belongs to that preparation
+//! request until it is committed: the screen drops it when that request is
+//! cancelled or discarded. A set outlives the screen object across a
+//! device's recovery: the screen dropped parks it in the hub
+//! ([`MediaHub::park`]) and the one built again takes it back, so its
+//! movies keep their lifetime, clock origin and losses, and only their
+//! GPU planes are made again ([`Movies::rebuilt`]).
+//!
 //! None of this waits on the session: entering stores a word and an open
 //! only queues a request.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Instant;
 
 use render::SkinBundle;
@@ -36,6 +44,12 @@ pub struct MediaHub {
     launching: Option<Launching>,
     session: OnceLock<Option<Session>>,
     generation: AtomicU64,
+    /// The set of a screen dropped for its device's recovery, until the
+    /// screen built again takes it.
+    parked: Mutex<Option<MovieSet>>,
+    /// The sets open (tests).
+    #[cfg(test)]
+    open: AtomicU64,
 }
 
 impl MediaHub {
@@ -61,7 +75,39 @@ impl MediaHub {
             launching,
             session: OnceLock::new(),
             generation: AtomicU64::new(0),
+            parked: Mutex::new(None),
+            #[cfg(test)]
+            open: AtomicU64::new(0),
         })
+    }
+
+    /// Keeps `set` for the screen built next ([`unpark`](Self::unpark)),
+    /// dropping one kept before.
+    pub fn park(&self, set: MovieSet) {
+        let old = self
+            .parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(set);
+        drop(old);
+    }
+
+    /// The set parked for a screen built again, its GPU state to be made
+    /// again on that screen's device.
+    pub fn unpark(&self) -> Option<MovieSet> {
+        let mut set = self
+            .parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        set.movies.rebuilt();
+        Some(set)
+    }
+
+    /// How many sets are open (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn open_sets(&self) -> u64 {
+        self.open.load(Ordering::SeqCst)
     }
 
     /// The session, started on first use.
@@ -85,7 +131,8 @@ impl MediaHub {
 /// A screen's movies: what the session plays for it, and what the render
 /// side's hook keeps of each. Dropped, the screen is left.
 pub struct MovieSet {
-    hub: Arc<MediaHub>,
+    /// Weak: a set parked in its hub must not keep the hub alive.
+    hub: Weak<MediaHub>,
     kind: ScreenKind,
     /// The skin it was opened for.
     bundle: Arc<SkinBundle>,
@@ -95,6 +142,9 @@ pub struct MovieSet {
     /// The screen's clock at its opening (µs), from which a selection
     /// frame's movie time counts.
     pub origin: i64,
+    /// The play preparation request it belongs to until that is
+    /// committed: its cancel or discard drops the set.
+    pub preparing: Option<u64>,
     pub movies: Movies,
 }
 
@@ -154,12 +204,15 @@ impl MovieSet {
             }
             *out = Some(movie);
         }
+        #[cfg(test)]
+        hub.open.fetch_add(1, Ordering::SeqCst);
         Some(Self {
-            hub: Arc::clone(hub),
+            hub: Arc::downgrade(hub),
             kind,
             bundle: Arc::clone(bundle),
             lifetime,
             origin,
+            preparing: None,
             // A play's READY opens at least the skin's loading minimum
             // into its screen clock (design.md "Timers").
             movies: match kind {
@@ -184,9 +237,14 @@ impl MovieSet {
 impl Drop for MovieSet {
     fn drop(&mut self) {
         // The screen is left: its players close. A session never started
-        // has none.
-        if let Some(Some(s)) = self.hub.session.get() {
-            s.enter(self.hub.next_generation());
+        // has none, and a hub gone took its session with it.
+        let Some(hub) = self.hub.upgrade() else {
+            return;
+        };
+        #[cfg(test)]
+        hub.open.fetch_sub(1, Ordering::SeqCst);
+        if let Some(Some(s)) = hub.session.get() {
+            s.enter(hub.next_generation());
         }
     }
 }

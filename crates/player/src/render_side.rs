@@ -24332,6 +24332,10 @@ pub(crate) mod tests {
     // The play state's screen origin through loading lifetimes, play
     // states, rearms and practice Starts into each play's frames.
     mod screen_clock;
+    // The skin movies' lifetime through a play preparation's commit and
+    // cancel.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) mod movies;
     // The chart images' tables: their generation, attempt and target.
     mod chart;
     // The decision labels' preparation, the skinned decision screen, its
