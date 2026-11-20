@@ -12,7 +12,7 @@ use std::time::Duration;
 use skin_model::PackedPages;
 
 use super::tests::refuse;
-use super::{PagesBegun, PagesStep, Renderer, ScreenKind};
+use super::{MemoryWitness, PagesBegun, PagesStep, Renderer, ScreenKind};
 use crate::decl::pages_texels;
 
 /// A renderer and two bundles of different pages, the folders their
@@ -177,4 +177,79 @@ fn a_refused_step_ends_the_upload() {
     assert_eq!(r.pages_in_hand(), None);
     assert_eq!(installed(&r), None);
     assert_eq!(r.publish_pages(), None);
+}
+
+/// H4 (r1): a pages begin is admitted beside another kind's staging as
+/// that staging's commit would leave it. The selection stated 656 Mi and
+/// play staging an array stated 240 Mi, unwritten: counted as committed
+/// alone the pages would fit (656 Mi and the pages); with the staging
+/// counted the sum is 896 Mi and the pages, past the limit, and the begin
+/// is refused with nothing left in hand.
+#[test]
+fn a_pages_begin_counts_the_staged_play_array() {
+    const MI: u64 = 1 << 20;
+    let (mut r, [a, b], _dirs) = fixture();
+    let dc = tempfile::tempdir().unwrap();
+    let (c, _) = crate::test_decl::bundle(
+        &r,
+        dc.path(),
+        &crate::test_decl::Look {
+            side: 600,
+            ..crate::test_decl::Look::left([0, 255, 0, 255])
+        },
+    );
+    r.state_charge(&a, 656 * MI);
+    let token = r.install(ScreenKind::Selection, &a, 1).unwrap();
+    r.commit(token).unwrap();
+    r.state_candidate_charge(&c, 240 * MI);
+    let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+    let ctx = crate::test_common::context(&crate::test_common::GAUGES, false);
+    let input = crate::test_common::attempt(&r, &chart, &ctx);
+    assert_eq!(
+        r.stage_stepped(&c, &input, 2).unwrap(),
+        None,
+        "staged, unwritten"
+    );
+    let p = pages(&b);
+    let e = r.begin_pages(p, 1).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            crate::RenderError::Admission { kind: ScreenKind::Result, needed, limit }
+                if needed == 896 * MI + pages_texels(p) && limit == crate::SHARED_TEXELS
+        ),
+        "{e:?}"
+    );
+    assert_eq!(r.pages_in_hand(), None);
+}
+
+/// H4 (r1): the memory witness counts the pages upload in hand, its array
+/// and text cache, in its total, until its publication moves them to the
+/// result's.
+// Revert: `pages_upload` left out of `MemoryWitness::total` -> "in the
+// total".
+#[test]
+fn the_witness_counts_the_upload_in_hand() {
+    let (mut r, [a, _], _dirs) = fixture();
+    let p = pages(&a);
+    assert_eq!(r.memory().pages_upload, 0);
+    assert_eq!(r.begin_pages(p, 1).unwrap(), PagesBegun::Begun);
+    let held = r.memory();
+    assert!(held.pages_upload > 0, "{held:?}");
+    assert_eq!(held.result_atlas, 0);
+    let without = MemoryWitness {
+        pages_upload: 0,
+        ..held
+    };
+    assert_eq!(
+        held.total(),
+        without.total() + held.pages_upload,
+        "in the total"
+    );
+    let (_, end) = until_end(&mut r);
+    assert!(matches!(end, PagesStep::Written(1)), "{end:?}");
+    assert_eq!(r.publish_pages(), Some(1));
+    let published = r.memory();
+    assert_eq!(published.pages_upload, 0);
+    assert!(published.result_atlas > 0);
 }

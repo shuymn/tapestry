@@ -1211,6 +1211,10 @@ pub struct MemoryWitness {
     /// installation's, with the lines its frames draw and the ones
     /// prepared to replace them.
     pub result_text: u64,
+    /// The result pages upload in hand ([`Renderer::begin_pages`]): its
+    /// array, the bytes the queue staged for its writes, and its text
+    /// layer's cache; its pages are in `shared_cpu`.
+    pub pages_upload: u64,
     /// The loading presentations of the result's committed installation
     /// and of the result's retirement entries still holding theirs, each
     /// distinct presentation once; a staging sharing one of them adds
@@ -1269,6 +1273,7 @@ impl MemoryWitness {
             .saturating_add(self.result_batch)
             .saturating_add(self.result_text)
             .saturating_add(self.result_loading)
+            .saturating_add(self.pages_upload)
             .saturating_add(self.retired)
             .saturating_add(self.retired_pool)
             .saturating_add(self.decision_labels)
@@ -1818,6 +1823,10 @@ pub struct Renderer {
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
     stated: Vec<(Arc<SkinBundle>, u64)>,
+    /// Tests and development builds: the candidate charges stated for
+    /// bundles ([`state_candidate_charge`](Self::state_candidate_charge)).
+    #[cfg(any(test, feature = "dev-tools"))]
+    stated_candidates: Vec<(Arc<SkinBundle>, u64)>,
 }
 
 impl Renderer {
@@ -2030,6 +2039,8 @@ impl Renderer {
             step_submit_fault: None,
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
+            #[cfg(any(test, feature = "dev-tools"))]
+            stated_candidates: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -2570,12 +2581,31 @@ impl Renderer {
             .saturating_add(self.retire.charged())
     }
 
-    /// [`needed`](Self::needed) without the filled entries.
+    /// [`needed`](Self::needed) without the filled entries. Another
+    /// kind's staging is charged as its commit would leave it: the larger
+    /// of that kind's committed charge and the staging's, so an array
+    /// staged and not yet committed is never left out of the sum.
     fn committed_needed(&self, kind: ScreenKind, charge: u64) -> u64 {
+        let staged = self.pending_charge().filter(|&(k, _)| k != kind);
         KINDS
             .iter()
             .filter(|&&k| k != kind)
-            .fold(charge, |sum, &k| sum.saturating_add(self.charge(k)))
+            .fold(charge, |sum, &k| {
+                let pending = staged.filter(|&(s, _)| s == k).map_or(0, |(_, c)| c);
+                sum.saturating_add(self.charge(k).max(pending))
+            })
+    }
+
+    /// The staging's kind and the charge it is admitted at, if any.
+    fn pending_charge(&self) -> Option<(ScreenKind, u64)> {
+        self.pending.as_ref().map(|p| {
+            let charge = match (&p.skin, &p.pages) {
+                (Some(s), _) => self.candidate_charge(p.token.kind, s.bundle()),
+                (None, Some(pages)) => pages_texels(pages),
+                (None, None) => 0,
+            };
+            (p.token.kind, charge)
+        })
     }
 
     /// Whether `charge` as `kind`'s fits now, filled entries and the
@@ -2727,6 +2757,14 @@ impl Renderer {
     /// What `bundle` is charged as `kind`'s candidate: its own charge, and
     /// for the selection its pool's firm layer at the current target.
     fn candidate_charge(&self, kind: ScreenKind, bundle: &SkinBundle) -> u64 {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if let Some((_, texels)) = self
+            .stated_candidates
+            .iter()
+            .find(|(b, _)| std::ptr::eq(Arc::as_ptr(b), bundle))
+        {
+            return *texels;
+        }
         let firm = if kind == ScreenKind::Selection {
             self.pool_grid_for(bundle).map_or(0, |g| g.layer_texels())
         } else {
@@ -2824,6 +2862,17 @@ impl Renderer {
         self.stated.push((Arc::clone(bundle), texels));
     }
 
+    /// Tests and development builds: charges `bundle` `texels` as a
+    /// candidate (its staging's admission and the staging's charge in
+    /// another kind's), in place of its own charge, so a staging that
+    /// large is tested without uploading it.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn state_candidate_charge(&mut self, bundle: &Arc<SkinBundle>, texels: u64) {
+        self.stated_candidates
+            .retain(|(b, _)| !Arc::ptr_eq(b, bundle));
+        self.stated_candidates.push((Arc::clone(bundle), texels));
+    }
+
     /// Tests and development builds: the next `n` chart-image pool arrays
     /// are refused as the device refuses one, so a selection can be
     /// committed with no pool, its firm layer included.
@@ -2858,14 +2907,7 @@ impl Renderer {
     pub fn admission(&self) -> Admission {
         Admission {
             committed: KINDS.map(|k| self.charge(k)),
-            candidate: self.pending.as_ref().map(|p| {
-                let charge = match (&p.skin, &p.pages) {
-                    (Some(s), _) => self.candidate_charge(p.token.kind, s.bundle()),
-                    (None, Some(pages)) => pages_texels(pages),
-                    (None, None) => 0,
-                };
-                (p.token.kind, charge)
-            }),
+            candidate: self.pending_charge(),
             firm: self.pool_firm(),
             pool: self.pool_optional(),
             filled: self.retire.charged(),
@@ -6511,12 +6553,19 @@ impl Renderer {
     /// with its pages' identity, their CPU bytes (0 for an entry whose CPU
     /// part was handed on) and their array's bytes on the GPU (0 when the
     /// array is another holder's).
-    fn shared_holders(&self) -> [Option<(AtlasId, u64, u64)>; 4 + ENTRIES] {
+    fn shared_holders(&self) -> [Option<(AtlasId, u64, u64)>; HOLDERS] {
         let result = Self::screen(ScreenKind::Result)
             .and_then(|i| self.screens.get(i))
             .and_then(Option::as_ref);
-        let mut out = [None; 4 + ENTRIES];
-        let [play, staged, slot, pages, entries @ ..] = &mut out;
+        let mut out = [None; HOLDERS];
+        let [play, staged, slot, pages, upload, entries @ ..] = &mut out;
+        *upload = self.pages_upload.as_ref().map(|u| {
+            (
+                u.res.pages.id(),
+                pages_bytes(&u.res.pages),
+                u.res.atlas.bytes(),
+            )
+        });
         *play = self.installed.as_ref().map(|i| {
             let b = i.bundle();
             (b.atlas_id(), b.shared_bytes(), self.atlas.bytes())
@@ -6655,7 +6704,7 @@ impl Renderer {
         // The pages each distinct identity keeps, once; an array on the
         // GPU is counted with its holder's resources. A holder whose CPU
         // part was handed on counts none: the handoff place counts them.
-        let mut seen: [Option<AtlasId>; 4 + ENTRIES] = [None; 4 + ENTRIES];
+        let mut seen: [Option<AtlasId>; HOLDERS] = [None; HOLDERS];
         let mut marked = 0;
         let mut shared_cpu = 0u64;
         for (id, cpu, _) in self.shared_holders().into_iter().flatten() {
@@ -6746,6 +6795,13 @@ impl Renderer {
                 )
                 .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
             result_loading,
+            pages_upload: self.pages_upload.as_ref().map_or(0, |u| {
+                u.res
+                    .atlas
+                    .bytes()
+                    .saturating_add(u.res.atlas.upload_bytes())
+                    .saturating_add(u.res.text_cache.bytes())
+            }),
             retired,
             retired_pool,
             // Kept apart from the renderer: `with_decision` adds them.
@@ -6753,6 +6809,17 @@ impl Renderer {
             decision_staged: 0,
             decision_text_mask: 0,
             decision_upload: 0,
+        }
+    }
+
+    /// The swap chain's grant, looked at without waiting (design.md
+    /// "Memory Budget", the uploader's admission gate): `None` for an
+    /// offscreen target or a swap chain without the waitable object.
+    #[must_use]
+    pub fn grant_probe(&self) -> Option<GrantProbe> {
+        match &self.output {
+            Output::Window(w) => w.waitable.map(GrantProbe::Waitable),
+            Output::Offscreen { .. } => None,
         }
     }
 
