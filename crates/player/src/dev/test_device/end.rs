@@ -77,7 +77,7 @@ pub trait Recorder {
     fn stop(&mut self) -> Result<(), String>;
 }
 
-/// The run's window, the sink.
+/// The run's windows: the sink, and the player a panel row started.
 pub trait Window {
     /// Closes it.
     ///
@@ -85,6 +85,55 @@ pub trait Window {
     ///
     /// It could not be closed.
     fn close(&mut self) -> Result<(), String>;
+}
+
+/// The player a panel row started, as the end closes it.
+pub trait Player {
+    /// Asks it to close (`WM_CLOSE` to its main window).
+    ///
+    /// # Errors
+    ///
+    /// It has no window, or the message cannot be posted.
+    fn ask_close(&mut self) -> Result<(), String>;
+    /// Waits up to `wait` for it to end: its exit code once its end is
+    /// observed, `None` while it runs.
+    ///
+    /// # Errors
+    ///
+    /// The wait failed: its end is not observed.
+    fn wait(&mut self, wait: Duration) -> Result<Option<i32>, String>;
+    /// Terminates it with the runner's cut code and waits for that end.
+    ///
+    /// # Errors
+    ///
+    /// The termination failed, or its end was not observed.
+    fn kill(&mut self) -> Result<(), String>;
+}
+
+/// How long the player may take to close: it writes its settings as it
+/// ends.
+pub const PLAYER_CLOSE: Duration = Duration::from_secs(15);
+
+/// Closes the player: asks it to close, then waits up to [`PLAYER_CLOSE`]
+/// for it to end by itself with code 0. A player that does not end in time
+/// is terminated, and the run fails.
+///
+/// # Errors
+///
+/// It could not be asked, it exited with another code, it missed the
+/// deadline, or its end was not observed.
+pub fn close_player(p: &mut dyn Player) -> Result<(), String> {
+    let asked = p.ask_close();
+    match p.wait(PLAYER_CLOSE)? {
+        Some(0) => asked,
+        Some(code) => Err(format!("the player exited {code}")),
+        None => Err(match p.kill() {
+            Ok(()) => format!("the player did not close within {PLAYER_CLOSE:?}: terminated"),
+            Err(e) => format!(
+                "the player did not close within {PLAYER_CLOSE:?}, and terminating it failed: {e}"
+            ),
+        }),
+    }
 }
 
 pub trait Clock {
@@ -181,7 +230,7 @@ pub fn end(r: Run<'_>) -> Vec<String> {
 fn close(s: &mut dyn Window, record: &mut dyn FnMut(Value), errors: &mut Vec<String>) {
     match s.close() {
         Ok(()) => record(json!({ "t": "close" })),
-        Err(e) => errors.push(format!("closing the sink: {e}")),
+        Err(e) => errors.push(format!("closing the run's windows: {e}")),
     }
 }
 
@@ -589,5 +638,70 @@ mod tests {
         assert_eq!(recovery[1], "the 1200-baud touch");
         assert!(recovery[2].contains("stays open"));
         assert!(recovery[3].contains("gone from the bound location"));
+    }
+
+    /// A stand-in player: it ends by itself with `code` after `after`, or
+    /// never.
+    struct P {
+        did: Vec<&'static str>,
+        ends: Option<(Duration, i32)>,
+        killed: bool,
+    }
+
+    impl Player for P {
+        fn ask_close(&mut self) -> Result<(), String> {
+            self.did.push("ask");
+            Ok(())
+        }
+        fn wait(&mut self, wait: Duration) -> Result<Option<i32>, String> {
+            self.did.push("wait");
+            if self.killed {
+                return Ok(Some(0x4000_0123));
+            }
+            Ok(self
+                .ends
+                .filter(|(after, _)| *after <= wait)
+                .map(|(_, c)| c))
+        }
+        fn kill(&mut self) -> Result<(), String> {
+            self.did.push("kill");
+            self.killed = true;
+            Ok(())
+        }
+    }
+
+    /// A player that does not end within its close's deadline is
+    /// terminated and fails the run; one that ends in time with 0 closes it
+    /// cleanly (the control), and one that ends with another code fails.
+    #[test]
+    fn a_player_that_misses_its_close_fails_the_run() {
+        let mut never = P {
+            did: Vec::new(),
+            ends: None,
+            killed: false,
+        };
+        let e = close_player(&mut never).unwrap_err();
+        assert!(e.contains("did not close within"), "{e}");
+        assert_eq!(never.did, ["ask", "wait", "kill"]);
+        let mut late = P {
+            did: Vec::new(),
+            ends: Some((PLAYER_CLOSE + Duration::from_millis(1), 0)),
+            killed: false,
+        };
+        assert!(close_player(&mut late).is_err());
+        assert!(late.did.contains(&"kill"));
+        let mut clean = P {
+            did: Vec::new(),
+            ends: Some((Duration::from_secs(2), 0)),
+            killed: false,
+        };
+        assert_eq!(close_player(&mut clean), Ok(()));
+        assert_eq!(clean.did, ["ask", "wait"]);
+        let mut failed = P {
+            did: Vec::new(),
+            ends: Some((Duration::from_secs(2), 3)),
+            killed: false,
+        };
+        assert_eq!(close_player(&mut failed), Err("the player exited 3".into()));
     }
 }

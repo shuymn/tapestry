@@ -15,11 +15,13 @@ mod flash;
 mod guard;
 mod job;
 mod judge;
+mod launch;
 mod link;
 mod listen;
 mod owner;
 mod release;
 mod run;
+mod shot;
 mod sink;
 mod trace;
 mod win;
@@ -39,7 +41,8 @@ const USAGE: &str = "usage: tapestry test-device devices [--out <json>] \
 | trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe] \
 | listen --out <jsonl> --port <location> [--run <id>] [--for <ms>] \
 | run <row> (--out <dir> | --set <dir> --role <role>) --build <id> --port <location> --monitor <name> \
-| judge <row> <dir> | check <row> <dir>";
+[--player <exe> --data <dir> --library <dir> --skin <dir> --skin-entry <file>] [--kill-barrier] \
+| judge <row> <dir> | check <row> <dir> | commit";
 
 /// A `test-device` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -58,7 +61,7 @@ pub enum TestDevice {
     },
     Trace(trace::Args),
     Listen(listen::Args),
-    Run(run::Args),
+    Run(Box<run::Args>),
     /// The repository's verdicts for the run in `dir`.
     Judge {
         row: String,
@@ -69,6 +72,8 @@ pub enum TestDevice {
         row: String,
         dir: PathBuf,
     },
+    /// Prints the commit this build was made from.
+    Commit,
 }
 
 fn usage() -> UsageError {
@@ -101,12 +106,24 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     let mut set = None;
     let mut role = None;
     let mut monitor = None;
+    let mut player = None;
+    let mut data = None;
+    let mut library = None;
+    let mut skin = None;
+    let mut skin_entry = None;
+    let mut kill_barrier = false;
     while let Some(arg) = p.next()? {
         match (cmd.as_str(), arg) {
             ("flash" | "check" | "judge" | "run", Arg::Value(v)) => values.push(PathBuf::from(v)),
             ("run", Arg::Long("set")) => set = Some(PathBuf::from(p.value()?)),
             ("run", Arg::Long("role")) => role = Some(text(p)?),
             ("run", Arg::Long("monitor")) => monitor = Some(text(p)?),
+            ("run", Arg::Long("player")) => player = Some(PathBuf::from(p.value()?)),
+            ("run", Arg::Long("data")) => data = Some(PathBuf::from(p.value()?)),
+            ("run", Arg::Long("library")) => library = Some(PathBuf::from(p.value()?)),
+            ("run", Arg::Long("skin")) => skin = Some(PathBuf::from(p.value()?)),
+            ("run", Arg::Long("skin-entry")) => skin_entry = Some(text(p)?),
+            ("run", Arg::Long("kill-barrier")) => kill_barrier = true,
             ("devices" | "trace" | "listen" | "run", Arg::Long("out")) => {
                 out = Some(PathBuf::from(p.value()?));
             }
@@ -167,7 +184,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
             trace: trace_on,
             framing_probe,
         }),
-        "run" => TestDevice::Run(run::Args {
+        "run" => TestDevice::Run(Box::new(run::Args {
             row: values
                 .next()
                 .ok_or_else(usage)?
@@ -179,13 +196,29 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
             build: build.ok_or_else(usage)?,
             port: port.ok_or_else(usage)?,
             monitor: monitor.ok_or_else(usage)?,
-        }),
+            // The player's paths come all together or not at all.
+            player: match (player, data, library, skin, skin_entry) {
+                (Some(exe), Some(data), Some(library), Some(skin), Some(skin_entry)) => {
+                    Some(launch::Player {
+                        exe,
+                        data,
+                        library,
+                        skin,
+                        skin_entry,
+                    })
+                }
+                (None, None, None, None, None) => None,
+                _ => return Err(usage()),
+            },
+            kill_barrier,
+        })),
         "listen" => TestDevice::Listen(listen::Args {
             out: out.ok_or_else(usage)?,
             port: port.ok_or_else(usage)?,
             run: run_id,
             for_ms,
         }),
+        "commit" => TestDevice::Commit,
         _ => return Err(usage()),
     };
     if let Some(extra) = values.next() {
@@ -214,6 +247,10 @@ pub fn run(t: TestDevice) -> anyhow::Result<()> {
         },
         TestDevice::Judge { row, dir } => judge::judge(&row, &dir),
         TestDevice::Check { row, dir } => check::check(&row, &dir),
+        TestDevice::Commit => {
+            println!("{COMMIT}");
+            Ok(())
+        }
     }
 }
 
@@ -319,6 +356,55 @@ mod tests {
             parsed(&["check", "sink", "a", "b"]).unwrap_err(),
             UsageError::Unknown("b".to_owned())
         );
+        let run = |extra: &[&str]| {
+            let mut a = vec![
+                "run",
+                "p1",
+                "--out",
+                "o",
+                "--build",
+                "b",
+                "--port",
+                "L",
+                "--monitor",
+                "M",
+            ];
+            a.extend_from_slice(extra);
+            parsed(&a)
+        };
+        let player = [
+            "--player",
+            "t.exe",
+            "--data",
+            "d",
+            "--library",
+            "l",
+            "--skin",
+            "s",
+            "--skin-entry",
+            "e",
+        ];
+        let Ok(TestDevice::Run(a)) = run(&player) else {
+            panic!("a panel run")
+        };
+        assert_eq!(
+            a.player,
+            Some(launch::Player {
+                exe: "t.exe".into(),
+                data: "d".into(),
+                library: "l".into(),
+                skin: "s".into(),
+                skin_entry: "e".into(),
+            })
+        );
+        assert!(!a.kill_barrier);
+        // Every path of the player, or none.
+        assert_eq!(run(&player[..8]).unwrap_err(), usage());
+        let Ok(TestDevice::Run(a)) = run(&["--kill-barrier"]) else {
+            panic!("a run")
+        };
+        assert!(a.kill_barrier && a.player.is_none());
+        assert_eq!(parsed(&["commit"]).unwrap(), TestDevice::Commit);
         assert_eq!(parsed(&["jump"]).unwrap_err(), usage());
         assert_eq!(parsed(&[]).unwrap_err(), usage());
     }

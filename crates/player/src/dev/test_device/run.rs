@@ -9,7 +9,15 @@
 //! and F24 held, 1 s, the end) and `sink-kill` (N2: an outer run that starts an inner `sink` in a job
 //! of its own, terminates that job with its cut code once the inner's
 //! recorder shows the presses, observes the inner's and its recorder's
-//! ends, and opens its own connection).
+//! ends, and opens its own connection). The panel rows start the player:
+//! `p1` (P1: the device's report mode set, the player started in a
+//! 1920×1080 window on the run's monitor, a focus click on it, the mapping
+//! calibration, buttons 9 and 10 held under a lease, one guarded click at
+//! each volume target, shot A, the buttons released, shot B, the end, then
+//! the player closed and its settings copied), `p5` (P1's steps, run
+//! against a player whose volume path is broken), `p4` (button 9 only),
+//! and `p1-kill` (N2p: `sink-kill`'s outer over an inner `p1` that waits
+//! at its kill barrier after shot A, both buttons held).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use serde_json::{Value, json};
 use test_device::evidence::{Process, Recorder as Rec, Reserved};
+use test_device::mode::{Mode, Rate, Reporting};
 use test_device::protocol::{Change, Command, Control, Token};
 use test_device::report::{PAD_REPORT, PadReport};
 
@@ -29,9 +38,11 @@ use super::devices::{self, System};
 use super::end;
 use super::guard::{self, Look, Watch};
 use super::job::{self, Child, Job, Pipe, Stdio};
+use super::launch;
 use super::link::{Connection, hello_facts};
 use super::owner::{self, Stream};
 use super::release::{Refused, Writer};
+use super::shot::Shots;
 use super::sink::{self, Sink};
 use super::win::{qpc, qpc_freq};
 
@@ -49,6 +60,10 @@ pub struct Args {
     pub port: String,
     /// The run's monitor, by its device name.
     pub monitor: String,
+    /// The player a panel row starts.
+    pub player: Option<launch::Player>,
+    /// An inner `p1` of `p1-kill`: wait at the kill barrier after shot A.
+    pub kill_barrier: bool,
 }
 
 /// A row's step.
@@ -68,6 +83,29 @@ pub enum Step {
     Wait {
         ms: u64,
     },
+    /// Starts the player from the sink in front, lets it take the
+    /// foreground, and makes its main window the run's window once it
+    /// shows on the run's monitor.
+    Launch,
+    /// A focus click on the run's window at a client point.
+    FocusAt {
+        x: i32,
+        y: i32,
+    },
+    /// The mapping calibration: a move-only call to each of the row's
+    /// click points, the pointer read back at each.
+    Calibrate,
+    /// A guarded click on the run's window at a client point.
+    Click {
+        x: i32,
+        y: i32,
+    },
+    /// A shot of the run's window's client area, as `name` in the run's
+    /// folder.
+    Shot(&'static str),
+    /// Writes `barrier` and waits there, holding, for the outer to end
+    /// the run: [`BARRIER_WAIT`] later it fails.
+    Barrier,
 }
 
 /// F24's keyboard usage: a key that types nothing.
@@ -88,14 +126,105 @@ pub fn sink_steps() -> Vec<Step> {
     ]
 }
 
-/// The rows with steps of their own. N1's negative, `sink-early-close`,
-/// is not one: closing the sink before the release evidence would let a
-/// held input land in another window, so no runner performs it; its
-/// expectation is checked on a run folder a test writes
-/// (`check::tests`).
-pub fn row(name: &str) -> Option<Vec<Step>> {
-    match name {
-        "sink" => Some(sink_steps()),
+/// The focus click's point on the player: the client's left edge, middle,
+/// where the select skin draws nothing that acts.
+pub const FOCUS_POINT: (i32, i32) = (5, test_device::panel::CLIENT[1] / 2);
+/// How long the player is given to settle on song selection (its library
+/// and skin loaded) before the focus click.
+pub const SETTLE_MS: u64 = 20_000;
+/// The shots, by their file names in the run's folder.
+pub const SHOT_A: &str = "shot-a.png";
+pub const SHOT_B: &str = "shot-b.png";
+/// START and SELECT, as the panel rows bind them.
+pub const START: u8 = 9;
+pub const SELECT: u8 = 10;
+
+/// The steps of a panel row holding `buttons` (START and SELECT for
+/// panel 3, START alone for panel 1); with `barrier`, the inner of
+/// `p1-kill`, which waits at its barrier after shot A.
+pub fn panel_steps(buttons: &[u8], barrier: bool) -> Vec<Step> {
+    let set = |n, value| {
+        Step::Hold(Change {
+            control: Control::Button(n),
+            value,
+        })
+    };
+    let mut steps = vec![
+        Step::Focus,
+        Step::Launch,
+        Step::Wait { ms: SETTLE_MS },
+        Step::FocusAt {
+            x: FOCUS_POINT.0,
+            y: FOCUS_POINT.1,
+        },
+        Step::Calibrate,
+        Step::Lease { ms: 30_000 },
+    ];
+    steps.extend(buttons.iter().map(|&b| set(b, 1)));
+    steps.extend([Step::AwaitHeld, Step::Wait { ms: 500 }]);
+    steps.extend(
+        test_device::panel::TARGETS
+            .iter()
+            .map(|t| Step::Click { x: t.x, y: t.y }),
+    );
+    steps.extend([Step::Wait { ms: 500 }, Step::Shot(SHOT_A)]);
+    if barrier {
+        steps.push(Step::Barrier);
+    }
+    steps.extend(buttons.iter().map(|&b| set(b, 0)));
+    steps.extend([Step::Wait { ms: 800 }, Step::Shot(SHOT_B)]);
+    steps
+}
+
+/// The client points a panel row clicks: the focus point, then each
+/// volume target.
+pub fn click_points() -> Vec<(i32, i32)> {
+    std::iter::once(FOCUS_POINT)
+        .chain(test_device::panel::TARGETS.iter().map(|t| (t.x, t.y)))
+        .collect()
+}
+
+/// The rows with steps of their own; `barrier` puts `p1`'s kill barrier in.
+/// N1's negative, `sink-early-close`, is not one: closing the sink before
+/// the release evidence would let a held input land in another window, so
+/// no runner performs it; its expectation is checked on a run folder a
+/// test writes (`check::tests`).
+pub fn row(name: &str, barrier: bool) -> Option<Vec<Step>> {
+    match (name, barrier) {
+        ("sink", false) => Some(sink_steps()),
+        ("p1" | "p5", _) => Some(panel_steps(&[START, SELECT], barrier)),
+        ("p4", false) => Some(panel_steps(&[START], false)),
+        _ => None,
+    }
+}
+
+/// An outer row: the inner row it reserves and kills, the inner's extra
+/// arguments, and the record the outer waits for before the kill.
+struct Outer {
+    inner: &'static str,
+    barrier: bool,
+    waits_for: &'static str,
+    /// How long it waits for that record.
+    wait: Duration,
+}
+
+/// The outer rows. `p1-kill-escape` runs as `p1-kill`; its expectation is
+/// N2p's negative, which only a runner whose inner leaves its player
+/// outside the job it ends meets.
+fn outer_of(row: &str) -> Option<Outer> {
+    match row {
+        "sink-kill" => Some(Outer {
+            inner: "sink",
+            barrier: false,
+            waits_for: "held",
+            wait: INNER_HELD_WAIT,
+        }),
+        "p1-kill" | "p1-kill-escape" => Some(Outer {
+            inner: "p1",
+            barrier: true,
+            waits_for: "barrier",
+            wait: INNER_BARRIER_WAIT,
+        }),
         _ => None,
     }
 }
@@ -139,6 +268,12 @@ pub trait Exec {
     fn hold(&mut self, change: Change) -> Result<(), String>;
     fn await_held(&mut self) -> Result<(), String>;
     fn wait(&mut self, ms: u64) -> Result<(), String>;
+    fn launch(&mut self) -> Result<(), String>;
+    fn focus_at(&mut self, point: (i32, i32)) -> Result<(), String>;
+    fn calibrate(&mut self) -> Result<(), String>;
+    fn click(&mut self, point: (i32, i32)) -> Result<(), String>;
+    fn shot(&mut self, name: &'static str) -> Result<(), String>;
+    fn barrier(&mut self) -> Result<(), String>;
 }
 
 /// Runs `steps`: the first error ends them.
@@ -154,6 +289,12 @@ pub fn perform(steps: &[Step], x: &mut dyn Exec) -> Result<(), String> {
             Step::Hold(c) => x.hold(c),
             Step::AwaitHeld => x.await_held(),
             Step::Wait { ms } => x.wait(ms),
+            Step::Launch => x.launch(),
+            Step::FocusAt { x: px, y } => x.focus_at((px, y)),
+            Step::Calibrate => x.calibrate(),
+            Step::Click { x: px, y } => x.click((px, y)),
+            Step::Shot(name) => x.shot(name),
+            Step::Barrier => x.barrier(),
         }?;
     }
     Ok(())
@@ -167,6 +308,8 @@ const HELD_WAIT: Duration = Duration::from_secs(2);
 const LOOK: Duration = Duration::from_millis(5);
 /// How long the recorder may take to be ready.
 const READY_WAIT: Duration = Duration::from_secs(5);
+/// How long a run waits at its kill barrier before it fails.
+pub const BARRIER_WAIT: Duration = Duration::from_secs(30);
 
 /// The run's records, each stamped with the host counter.
 #[derive(Clone)]
@@ -240,24 +383,81 @@ pub fn pad_buttons(hex: &str) -> Option<u16> {
 /// The run's live state: what the steps and the guard act on.
 struct Live {
     writer: Writer,
-    guard: guard::Handle,
+    /// The guard, started by the row's lease on the run's window then.
+    guard: Option<(guard::Handle, JoinHandle<()>)>,
     beat: Arc<AtomicI64>,
-    sink: Win,
+    /// The run's window: the sink, then the player's main window once it
+    /// shows.
+    window: Win,
     monitor: String,
     monitor_then: [i32; 4],
     prefix: u16,
     call: u16,
     log: Log,
     recorder: Tail,
+    /// The recorder's process and file, for the guard's looks.
+    recorder_process: Process,
+    recorder_file: PathBuf,
     /// The recorder's records read and not yet looked at.
     backlog: Vec<Value>,
     held: Vec<Change>,
     freq: i64,
+    /// The run's folder and job, for the player and its shots.
+    dir: PathBuf,
+    job: &'static Job,
+    player: Option<launch::Player>,
+    /// The player once started, and its main window once shown.
+    launched: Option<Launched>,
+    shots: Shots,
+}
+
+/// The player a run started.
+struct Launched {
+    child: Child,
+    window: Option<Win>,
 }
 
 impl Live {
     fn beat(&self) {
         self.beat.store(qpc(), Ordering::Release);
+    }
+
+    /// A guarded click (`focus`: a focus click) of the run's window at
+    /// client `point`.
+    fn guarded(&mut self, point: (i32, i32), focus: bool) -> Result<(), String> {
+        let log = self.log.clone();
+        let mut note = |tag: u32, what: &str| {
+            log.put(json!({ "t": "call", "q": qpc(), "tag": tag, "what": what }));
+        };
+        let mut desk = Real {
+            monitor: self.monitor.clone(),
+            note: &mut note,
+        };
+        let r = click::click(
+            &mut desk,
+            self.window,
+            point,
+            focus,
+            self.monitor_then,
+            self.prefix,
+            &mut self.call,
+        );
+        self.beat();
+        r.map_err(|e| format!("the click at {point:?}: {e}"))
+    }
+
+    /// Waits up to `wait` while beating and looking at the link and the
+    /// recorder; `done` ends it early.
+    fn idle(&mut self, wait: Duration) -> Result<(), String> {
+        let end = Instant::now() + wait;
+        while Instant::now() < end {
+            self.beat();
+            self.lost()?;
+            self.read_recorder()?;
+            self.backlog.clear();
+            std::thread::sleep(LOOK);
+        }
+        Ok(())
     }
 
     fn lost(&self) -> Result<(), String> {
@@ -283,32 +483,37 @@ impl Live {
 
 impl Exec for Live {
     fn focus(&mut self) -> Result<(), String> {
-        let log = self.log.clone();
-        let mut note = |tag: u32, what: &str| {
-            log.put(json!({ "t": "call", "q": qpc(), "tag": tag, "what": what }));
-        };
-        let mut desk = Real {
-            monitor: self.monitor.clone(),
-            note: &mut note,
-        };
-        let client = desktop::client_rect(self.sink).ok_or("the sink is gone")?;
-        let point = (client[2] / 2, client[3] / 2);
-        let r = click::click(
-            &mut desk,
-            self.sink,
-            point,
-            true,
-            self.monitor_then,
-            self.prefix,
-            &mut self.call,
-        );
-        self.beat();
-        r.map_err(|e| format!("the focus click: {e:?}"))
+        let client = desktop::client_rect(self.window).ok_or("the run's window is gone")?;
+        self.guarded((client[2] / 2, client[3] / 2), true)
     }
 
     fn lease(&mut self, ms: u32) -> Result<(), String> {
         self.beat();
-        self.guard.want(qpc() + i64::from(ms) * self.freq / 1000);
+        if self.guard.is_none() {
+            let client = desktop::client_rect(self.window).ok_or("the run's window is gone")?;
+            let recorder = job::open(self.recorder_process)
+                .map_err(|e| format!("the recorder's process: {e:#}"))?;
+            self.guard = Some(guard::start(
+                self.freq,
+                Box::new(Looks {
+                    window: self.window,
+                    client,
+                    monitor: self.monitor.clone(),
+                    monitor_then: self.monitor_then,
+                    monitor_now: Some(self.monitor_then),
+                    read: Instant::now(),
+                    beat: Arc::clone(&self.beat),
+                    recorder,
+                    recorder_file: self.recorder_file.clone(),
+                    recorder_growth: Growth::new(Instant::now()),
+                }),
+                Arc::new(self.writer.clone()),
+            ));
+        }
+        let Some((guard, _)) = &self.guard else {
+            return Err("no guard".into());
+        };
+        guard.want(qpc() + i64::from(ms) * self.freq / 1000);
         let beat = || self.beat();
         if !self
             .writer
@@ -334,7 +539,9 @@ impl Exec for Live {
             }
             Refused::Closed => "holds stopped".to_owned(),
         })?;
-        self.held.push(change);
+        if change.value != 0 {
+            self.held.push(change);
+        }
         Ok(())
     }
 
@@ -382,21 +589,101 @@ impl Exec for Live {
     }
 
     fn wait(&mut self, ms: u64) -> Result<(), String> {
-        let end = Instant::now() + Duration::from_millis(ms);
-        while Instant::now() < end {
-            self.beat();
-            self.lost()?;
-            self.read_recorder()?;
-            self.backlog.clear();
-            std::thread::sleep(LOOK);
+        self.idle(Duration::from_millis(ms))
+    }
+
+    fn launch(&mut self) -> Result<(), String> {
+        let spec = self
+            .player
+            .clone()
+            .ok_or("the row starts a player, and none is given")?;
+        if desktop::foreground() != self.window {
+            return Err("the sink is not in front as the player starts".into());
         }
+        let child = spec
+            .spawn(self.job, &self.dir)
+            .map_err(|e| format!("starting the player: {e:#}"))?;
+        self.log.put(json!({
+            "t": "spawn", "name": "player",
+            "process": { "pid": child.process.pid, "created": child.process.created },
+        }));
+        let pid = child.process.pid;
+        self.launched = Some(Launched {
+            child,
+            window: None,
+        });
+        let beat = || self.beat();
+        launch::grant(pid, &beat).map_err(|e| format!("{e:#}"))?;
+        let alive = || {
+            self.launched
+                .as_ref()
+                .is_some_and(|l| l.child.wait(Duration::ZERO) == Ok(None))
+        };
+        let (window, _) =
+            launch::window(pid, self.monitor_then, &alive, &beat).map_err(|e| format!("{e:#}"))?;
+        self.log.put(json!({ "t": "window", "window": window }));
+        if let Some(l) = self.launched.as_mut() {
+            l.window = Some(window);
+        }
+        self.window = window;
         Ok(())
+    }
+
+    fn focus_at(&mut self, point: (i32, i32)) -> Result<(), String> {
+        self.guarded(point, true)
+    }
+
+    fn calibrate(&mut self) -> Result<(), String> {
+        let log = self.log.clone();
+        let mut note = |tag: u32, what: &str| {
+            log.put(json!({ "t": "call", "q": qpc(), "tag": tag, "what": what }));
+        };
+        let mut desk = Real {
+            monitor: self.monitor.clone(),
+            note: &mut note,
+        };
+        let r = click::calibrate(
+            &mut desk,
+            self.window,
+            &click_points(),
+            self.prefix,
+            &mut self.call,
+        );
+        self.beat();
+        r.map_err(|e| format!("the mapping calibration: {e}"))
+    }
+
+    fn click(&mut self, point: (i32, i32)) -> Result<(), String> {
+        self.lost()?;
+        self.guarded(point, false)
+    }
+
+    fn shot(&mut self, name: &'static str) -> Result<(), String> {
+        self.lost()?;
+        self.beat();
+        let client = desktop::client_rect(self.window).ok_or("the run's window is gone")?;
+        let bgra = desktop::capture(client).map_err(|e| format!("the shot {name}: {e:#}"))?;
+        self.log.put(json!({ "t": "shot", "what": name }));
+        self.beat();
+        let (w, h) = (
+            u32::try_from(client[2]).unwrap_or(0),
+            u32::try_from(client[3]).unwrap_or(0),
+        );
+        self.shots.write(self.dir.join(name), w, h, bgra)
+    }
+
+    fn barrier(&mut self) -> Result<(), String> {
+        self.log.put(json!({ "t": "barrier" }));
+        self.idle(BARRIER_WAIT)?;
+        Err(format!(
+            "the run was not ended within {BARRIER_WAIT:?} of its kill barrier"
+        ))
     }
 }
 
 /// The guard's real look at the run.
 struct Looks {
-    sink: Win,
+    window: Win,
     client: [i32; 4],
     monitor: String,
     monitor_then: [i32; 4],
@@ -450,13 +737,13 @@ impl Watch for Looks {
         let size = std::fs::metadata(&self.recorder_file).ok().map(|m| m.len());
         let growing = self.recorder_growth.look(size, Instant::now());
         let at = qpc();
-        let client = desktop::client_rect(self.sink);
+        let client = desktop::client_rect(self.window);
         let placed = self.monitor_now == Some(self.monitor_then)
             && client == Some(self.client)
             && click::contains(self.monitor_then, self.client);
         Look {
             at,
-            front: desktop::foreground() == self.sink,
+            front: desktop::foreground() == self.window,
             placed,
             beat: self.beat.load(Ordering::Acquire),
             recording: self.recorder.wait(Duration::ZERO) == Ok(None) && growing,
@@ -747,6 +1034,10 @@ struct Begun {
     /// bits, the exit code it gives every process it terminates.
     process: Process,
     cut: i32,
+    /// Whether the run seals its own files: not when it waits at a kill
+    /// barrier, since a file whose writer is cut short is sealed only by the
+    /// runner that cut it.
+    seals: bool,
 }
 
 /// Reserves the run, joins its job and writes its `start`.
@@ -794,6 +1085,7 @@ fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
         prefix,
         process: me,
         cut,
+        seals: !a.kill_barrier,
     })
 }
 
@@ -802,6 +1094,13 @@ fn seal(b: &Begun, dir: &Path, name: &str, run: &str, role: &str, errors: &mut V
     match owner::seal(dir, &dir.join(name), run, role) {
         Ok(v) => b.log.put(v),
         Err(e) => errors.push(format!("sealing {name}: {e:#}")),
+    }
+}
+
+/// Seals the run's own file `name`, unless the run waits at a kill barrier.
+fn seal_file(b: &Begun, name: &str, errors: &mut Vec<String>) {
+    if b.seals {
+        seal(b, &b.dir, name, &b.run, &b.role, errors);
     }
 }
 
@@ -840,22 +1139,297 @@ fn finish(b: &Begun, mut errors: Vec<String>) -> i32 {
     exit
 }
 
+/// The report mode the panel rows run in: 125 Hz, on change.
+pub const PANEL_MODE: Mode = Mode {
+    rate: Rate::Hz125,
+    reporting: Reporting::OnChange,
+};
+/// The mode step's link stream in the run's folder.
+pub const MODE_LINK: &str = "mode.jsonl";
+/// How long the device may take to come back after a mode change.
+const MODE_BACK: Duration = Duration::from_secs(15);
+/// How long the device may take to answer `mode`.
+const MODE_ANSWER: Duration = Duration::from_secs(1);
+
+/// The mode step of a panel row, before anything binds the device's
+/// handles: a connection of its own reads the device's mode and, when it
+/// is not [`PANEL_MODE`], sets it (the device stores it and reboots) and
+/// waits for the device to come back in it at the bound location. A mode
+/// changed under a running player would make the player find the device
+/// after its other devices. The connections' records go to
+/// [`MODE_LINK`], sealed; the `hello` that reads the mode goes to the
+/// `mode` record.
+fn mode_step(b: &Begun, a: &Args) -> anyhow::Result<()> {
+    let journal = Stream::create(&b.dir.join(MODE_LINK))?;
+    let r = mode_change(b, a, &journal);
+    let problems: Vec<String> = r
+        .as_ref()
+        .err()
+        .map(|e| format!("{e:#}"))
+        .into_iter()
+        .collect();
+    journal.write(&json!({ "t": "end", "q": qpc(), "problems": problems }));
+    if let Some(e) = journal.close() {
+        bail!("{e}");
+    }
+    let line = r?;
+    b.log.put(json!({ "t": "mode", "line": line }));
+    let mut errors = Vec::new();
+    seal_file(b, MODE_LINK, &mut errors);
+    match errors.pop() {
+        Some(e) => bail!("{e}"),
+        None => Ok(()),
+    }
+}
+
+/// [`mode_step`]'s connections: the `hello` line that reads
+/// [`PANEL_MODE`].
+fn mode_change(b: &Begun, a: &Args, journal: &Stream) -> anyhow::Result<String> {
+    use super::link::{Event, What};
+    let mut c = owner::rediscover(&System, &a.port, &a.build)?;
+    c.identify(&b.run, b.process);
+    let first = c.facts().context("no checked `hello`")?.clone();
+    if first.mode == PANEL_MODE {
+        for j in c.take_journal() {
+            journal.write(&j);
+        }
+        return Ok(first.line);
+    }
+    let answered = (|| -> anyhow::Result<()> {
+        c.send(Command::Mode(PANEL_MODE))?;
+        let end = Instant::now() + MODE_ANSWER;
+        loop {
+            for e in c.poll()? {
+                if let Event::Answer { line, to, .. } = e
+                    && matches!(to.what, What::Command(Command::Mode(_)))
+                {
+                    if line == "ok" {
+                        return Ok(());
+                    }
+                    bail!("the device answered `mode` with `{line}`");
+                }
+            }
+            if Instant::now() >= end {
+                bail!("no answer to `mode` within {MODE_ANSWER:?}");
+            }
+            std::thread::sleep(LOOK);
+        }
+    })();
+    for j in c.take_journal() {
+        journal.write(&j);
+    }
+    drop(c);
+    answered?;
+    // The device reboots once it has answered.
+    std::thread::sleep(Duration::from_millis(1500));
+    let end = Instant::now() + MODE_BACK;
+    loop {
+        match owner::rediscover(&System, &a.port, &a.build) {
+            Ok(mut c) => {
+                let facts = c.facts().context("no checked `hello`")?.clone();
+                // One stream has one first record: this connection's
+                // records go in without its `open`.
+                for j in c.take_journal().into_iter().filter(|j| j["t"] != "open") {
+                    journal.write(&j);
+                }
+                if facts.mode != PANEL_MODE {
+                    bail!(
+                        "the device came back in mode {:?}, not {PANEL_MODE:?}",
+                        facts.mode
+                    );
+                }
+                return Ok(facts.line);
+            }
+            Err(e) if Instant::now() >= end => {
+                return Err(e.context(format!(
+                    "the device did not come back within {MODE_BACK:?} of its mode change"
+                )));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
+/// The `player` record: the executable a panel row starts, its sha256, the
+/// commit it reports (`<exe> test-device commit`, run in the run's job with
+/// its output in `player-commit.txt`) and its last write.
+fn player_record(b: &Begun, p: &launch::Player) -> anyhow::Result<()> {
+    let sha = owner::digest(&p.exe)?;
+    let modified = std::fs::metadata(&p.exe)
+        .and_then(|m| m.modified())
+        .with_context(|| p.exe.display().to_string())?;
+    // FILETIME: 100 ns since 1601.
+    let since = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("a last write before 1970")?;
+    let filetime = u64::try_from(since.as_nanos() / 100).context("the last write's time")?
+        + 116_444_736_000_000_000;
+    let out = b.dir.join("player-commit.txt");
+    let stdio = Stdio {
+        input: Stdio::null()?,
+        output: Stdio::file(owner::create(&out)?),
+        error: Stdio::null()?,
+    };
+    let args = ["test-device".to_owned(), "commit".to_owned()];
+    let child = job::spawn(b.job, &p.exe, &args, &[], &stdio)?;
+    drop(stdio);
+    match child
+        .wait(Duration::from_secs(10))
+        .map_err(anyhow::Error::msg)?
+    {
+        Some(0) => {}
+        Some(code) => bail!("`{} test-device commit` exited {code}", p.exe.display()),
+        None => {
+            let _ = child.kill(b.cut.cast_unsigned());
+            bail!(
+                "`{} test-device commit` did not end within 10 s",
+                p.exe.display()
+            );
+        }
+    }
+    let commit = std::fs::read_to_string(&out)
+        .with_context(|| out.display().to_string())?
+        .trim()
+        .to_owned();
+    b.log.put(json!({
+        "t": "player", "path": p.exe.to_string_lossy(), "sha256": sha, "commit": commit,
+        "modified": filetime,
+    }));
+    Ok(())
+}
+
+/// The player as the end closes it: its window, its process, and the
+/// records of what the runner did to it.
+struct RealPlayer<'a> {
+    child: &'a Child,
+    window: Option<Win>,
+    log: &'a Log,
+    cut: i32,
+    /// Its end was observed.
+    ended: bool,
+}
+
+impl end::Player for RealPlayer<'_> {
+    fn ask_close(&mut self) -> Result<(), String> {
+        let w = self.window.ok_or("the player showed no window to close")?;
+        desktop::close(w).map_err(|e| format!("{e:#}"))
+    }
+
+    fn wait(&mut self, wait: Duration) -> Result<Option<i32>, String> {
+        let code = self.child.wait(wait)?;
+        if let Some(code) = code {
+            exit_record(self.log, "player", self.child.process, code);
+            self.ended = true;
+        }
+        Ok(code)
+    }
+
+    fn kill(&mut self) -> Result<(), String> {
+        kill_record(self.log, "player", self.child.process);
+        self.child
+            .kill(self.cut.cast_unsigned())
+            .map_err(|e| format!("{e:#}"))?;
+        match self.wait(KILL_WAIT)? {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "it did not end within {KILL_WAIT:?} of its termination"
+            )),
+        }
+    }
+}
+
+/// The run's windows as the end closes them: the player first (its close
+/// asked, its end awaited, its settings copied and its files sealed), then
+/// the sink.
+struct Windows<'a> {
+    sink: &'a mut Sink,
+    player: Option<Launched>,
+    spec: Option<&'a launch::Player>,
+    b: &'a Begun,
+}
+
+impl end::Window for Windows<'_> {
+    fn close(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Some(l) = self.player.take() {
+            let mut p = RealPlayer {
+                child: &l.child,
+                window: l.window,
+                log: &self.b.log,
+                cut: self.b.cut,
+                ended: false,
+            };
+            if let Err(e) = end::close_player(&mut p) {
+                errors.push(e);
+            }
+            if p.ended {
+                if let Some(spec) = self.spec {
+                    match spec.collect(&self.b.dir) {
+                        Ok(()) => {
+                            for name in [launch::DEVICE_AFTER, launch::PLAYER_AFTER] {
+                                seal_file(self.b, name, &mut errors);
+                            }
+                        }
+                        Err(e) => errors.push(format!("the player's settings: {e:#}")),
+                    }
+                }
+                for name in [launch::STDOUT, launch::STDERR] {
+                    seal_file(self.b, name, &mut errors);
+                }
+            } else {
+                errors
+                    .push("the player's files are left unsealed: its end was not observed".into());
+            }
+        }
+        if let Err(e) = self.sink.close() {
+            errors.push(format!("closing the sink: {e:#}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
 /// Runs a row: the exit code.
 ///
 /// # Errors
 ///
 /// The run could not begin (nothing of it is held then).
 pub fn run(a: &Args) -> anyhow::Result<i32> {
-    if a.row == "sink-kill" {
-        return outer(a);
+    if let Some(o) = outer_of(&a.row) {
+        return outer(a, &o);
     }
-    let Some(steps) = row(&a.row) else {
+    if a.kill_barrier && a.role.as_deref() != Some(test_device::contract::INNER) {
+        bail!("--kill-barrier is for the inner run its outer reserves");
+    }
+    let Some(steps) = row(&a.row, a.kill_barrier) else {
         bail!("no row `{}`", a.row);
     };
+    let panel = steps.contains(&Step::Launch);
+    match (panel, &a.player) {
+        (true, None) => bail!(
+            "row `{}` starts the player: it takes --player, --data, --library, --skin and --skin-entry",
+            a.row
+        ),
+        (false, Some(_)) => bail!("row `{}` starts no player", a.row),
+        _ => {}
+    }
     let b = begin(a, None)?;
     let mut errors = Vec::new();
+    if panel {
+        mode_step(&b, a)?;
+    }
     let mut rec = RecChild::spawn(&b, &a.port)?;
     let monitor = desktop::monitor(&a.monitor)?;
+    if let Some(p) = &a.player {
+        player_record(&b, p)?;
+        p.prepare(&a.monitor, &b.dir)?;
+        for name in [launch::DEVICE_BEFORE, launch::PLAYER_BEFORE] {
+            seal_file(&b, name, &mut errors);
+        }
+    }
     let mut sink = Sink::open(sink::place(monitor.area))?;
     b.log.put(json!({ "t": "sink", "window": sink.window }));
     let link_log = Stream::create(&b.dir.join(test_device::contract::LINK))?;
@@ -866,37 +1440,38 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     let token: Option<Token> = conn.token();
     let (writer, thread) = Writer::start(conn, link_log, b.stream.clone());
     let beat = Arc::new(AtomicI64::new(qpc()));
-    let client = desktop::client_rect(sink.window).context("the sink's client area")?;
-    let (guard, guard_thread) = guard::start(
-        qpc_freq(),
-        Box::new(Looks {
-            sink: sink.window,
-            client,
-            monitor: a.monitor.clone(),
-            monitor_then: monitor.area,
-            monitor_now: Some(monitor.area),
-            read: Instant::now(),
-            beat: Arc::clone(&beat),
-            recorder: job::open(rec.child.process).context("the recorder's process")?,
-            recorder_file: rec.path.clone(),
-            recorder_growth: Growth::new(Instant::now()),
-        }),
-        Arc::new(writer.clone()),
-    );
+    let shot_log = b.log.clone();
+    let seals = b.seals;
     let mut live = Live {
         writer: writer.clone(),
-        guard: guard.clone(),
+        guard: None,
         beat: Arc::clone(&beat),
-        sink: sink.window,
+        window: sink.window,
         monitor: a.monitor.clone(),
         monitor_then: monitor.area,
         prefix: b.prefix,
         call: 0,
         log: b.log.clone(),
         recorder: Tail::new(&rec.path),
+        recorder_process: rec.child.process,
+        recorder_file: rec.path.clone(),
         backlog: Vec::new(),
         held: Vec::new(),
         freq: qpc_freq(),
+        dir: b.dir.clone(),
+        job: b.job,
+        player: a.player.clone(),
+        launched: None,
+        shots: Shots::start(
+            b.dir.clone(),
+            b.run.clone(),
+            b.role.clone(),
+            Box::new(move |v| {
+                if seals {
+                    shot_log.put(v);
+                }
+            }),
+        ),
     };
     let stepped =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| perform(&steps, &mut live)));
@@ -929,21 +1504,30 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         }
         log.put(v);
     };
+    let mut windows = Windows {
+        sink: &mut sink,
+        player: live.launched.take(),
+        spec: a.player.as_ref(),
+        b: &b,
+    };
     let clock = end::Wall(Instant::now());
     errors.extend(end::end(end::Run {
         link: &mut link,
         recorder: &mut rec,
-        sink: Some(&mut sink),
+        sink: Some(&mut windows),
         clock: &clock,
         token,
         granted,
         record: &mut record,
         cause: "end",
     }));
-    guard.end();
-    if let Err(e) = owner::join_within(guard_thread, "the guard's thread", GUARD_WAIT) {
-        errors.push(e);
+    if let Some((guard, guard_thread)) = live.guard.take() {
+        guard.end();
+        if let Err(e) = owner::join_within(guard_thread, "the guard's thread", GUARD_WAIT) {
+            errors.push(e);
+        }
     }
+    errors.extend(live.shots.finish());
     let link_closed = link.closed;
     seal_own(&b, link_closed, rec.ended.is_some(), &mut errors);
     Ok(finish(&b, errors))
@@ -951,7 +1535,10 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
 
 /// How long the outer waits for the inner's `held`.
 const INNER_HELD_WAIT: Duration = Duration::from_secs(30);
-/// How long the outer waits for the inner's recorder to end.
+/// How long the outer waits for the inner's kill barrier: the inner's
+/// mode step, its player's start and settling come first.
+const INNER_BARRIER_WAIT: Duration = Duration::from_secs(120);
+/// How long the outer waits for the inner's recorder and player to end.
 const SURVIVOR_WAIT: Duration = Duration::from_secs(10);
 
 /// Waits until `path` holds a record that `pick` takes, or `wait` passes.
@@ -971,11 +1558,35 @@ fn await_record<T>(
     None
 }
 
-/// The outer of `sink-kill` (N2).
-fn outer(a: &Args) -> anyhow::Result<i32> {
+/// The process the inner's `spawn` record names `name`, as it stands in the
+/// inner's stream now.
+fn spawned_in(path: &Path, name: &str) -> Option<Process> {
+    Tail::new(path).read().iter().find_map(|v| {
+        (v["t"] == "spawn" && v["name"] == name)
+            .then(|| serde_json::from_value::<Process>(v["process"].clone()).ok())
+            .flatten()
+    })
+}
+
+/// An outer row (N2 `sink-kill`, N2p `p1-kill`): it reserves the inner,
+/// starts it in a job of its own, waits for the inner's record `o.waits_for`
+/// (its presses held), terminates that job with its cut code, observes the
+/// inner's end and those of its recorder and (N2p) its player, each up to
+/// [`SURVIVOR_WAIT`] (a player still running then is recorded and ended by
+/// the outer itself), and opens its own connection, whose first `hello` is
+/// the evidence.
+fn outer(a: &Args, o: &Outer) -> anyhow::Result<i32> {
+    let panel = o.inner != "sink";
+    if panel != a.player.is_some() {
+        bail!(
+            "row `{}`'s inner {} the player's paths",
+            a.row,
+            if panel { "needs" } else { "takes none of" }
+        );
+    }
     let inner = Reserved {
         role: test_device::contract::INNER.to_owned(),
-        row: "sink".to_owned(),
+        row: o.inner.to_owned(),
         run: owner::random_hex(16)?,
         dir: test_device::contract::INNER.to_owned(),
     };
@@ -984,10 +1595,10 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
     let mut rec = RecChild::spawn(&b, &a.port)?;
     let exe = std::env::current_exe().context("the runner's own path")?;
     let set = b.dir.to_string_lossy().into_owned();
-    let args = [
+    let mut args: Vec<String> = [
         "test-device",
         "run",
-        "sink",
+        o.inner,
         "--set",
         &set,
         "--role",
@@ -999,7 +1610,22 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
         "--monitor",
         &a.monitor,
     ]
-    .map(str::to_owned);
+    .map(str::to_owned)
+    .to_vec();
+    if let Some(p) = &a.player {
+        for (flag, value) in [
+            ("--player", p.exe.to_string_lossy().into_owned()),
+            ("--data", p.data.to_string_lossy().into_owned()),
+            ("--library", p.library.to_string_lossy().into_owned()),
+            ("--skin", p.skin.to_string_lossy().into_owned()),
+            ("--skin-entry", p.skin_entry.clone()),
+        ] {
+            args.extend([flag.to_owned(), value]);
+        }
+    }
+    if o.barrier {
+        args.push("--kill-barrier".to_owned());
+    }
     let stdio = Stdio {
         input: Stdio::null()?,
         output: Stdio::file(owner::create(&b.dir.join("inner-stdout.txt"))?),
@@ -1020,15 +1646,20 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
             .flatten()
     });
     let survivor = recorder.map(job::open);
-    let held = await_record(&inner_run, INNER_HELD_WAIT, |v| {
-        (v["t"] == "held").then_some(())
+    let reached = await_record(&inner_run, o.wait, |v| {
+        (v["t"] == o.waits_for).then_some(())
     });
-    if held.is_none() {
+    if reached.is_none() {
         errors.push(format!(
-            "the inner showed no `held` within {INNER_HELD_WAIT:?}"
+            "the inner showed no `{}` within {:?}",
+            o.waits_for, o.wait
         ));
     }
-    // The inner and its job, its recorder with it, end with the cut code.
+    // The inner's player, by the inner's spawn record, opened before the
+    // kill so that its end can be observed.
+    let player = panel.then(|| spawned_in(&inner_run, "player").map(job::open));
+    // The inner and its job, its recorder and player with it, end with the
+    // cut code.
     kill_record(&b.log, "inner", child.process);
     if let Err(e) = inner_job.terminate(b.cut.cast_unsigned()) {
         errors.push(format!("terminating the inner's job: {e:#}"));
@@ -1063,6 +1694,22 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
             false
         }
     };
+    match player {
+        None => {}
+        Some(None) => errors.push("the inner recorded no player".into()),
+        Some(Some(Err(e))) => errors.push(format!("opening the inner's player: {e:#}")),
+        // A player still running after the wait outlived the inner's job:
+        // recorded, then ended by the outer itself.
+        Some(Some(Ok(p))) => match p.wait(SURVIVOR_WAIT) {
+            Ok(Some(code)) => exit_record(&b.log, "inner-player", p.process, code),
+            Ok(None) => {
+                if let Err(e) = end_child(&b.log, "inner-player", &p, Duration::ZERO, b.cut) {
+                    errors.push(e);
+                }
+            }
+            Err(e) => errors.push(format!("the inner's player's end was not observed: {e}")),
+        },
+    }
     drop(inner_job);
     // The inner's streams, each sealed only once its writer's end was
     // observed: the link's by the inner's, the recorder's by its own.
@@ -1078,7 +1725,7 @@ fn outer(a: &Args) -> anyhow::Result<i32> {
             ));
         }
     }
-    // Its own connection: the first `hello` is N2's evidence.
+    // Its own connection: the first `hello` is the evidence.
     let link_log = Stream::create(&b.dir.join(test_device::contract::LINK))?;
     let mut conn = owner::rediscover(&System, &a.port, &a.build)?;
     conn.identify(&b.run, b.process);
@@ -1162,6 +1809,30 @@ mod tests {
         }
         fn await_held(&mut self) -> Result<(), String> {
             self.did.push("held".into());
+            Ok(())
+        }
+        fn launch(&mut self) -> Result<(), String> {
+            self.did.push("launch".into());
+            Ok(())
+        }
+        fn focus_at(&mut self, p: (i32, i32)) -> Result<(), String> {
+            self.did.push(format!("focus {p:?}"));
+            Ok(())
+        }
+        fn calibrate(&mut self) -> Result<(), String> {
+            self.did.push("calibrate".into());
+            Ok(())
+        }
+        fn click(&mut self, p: (i32, i32)) -> Result<(), String> {
+            self.did.push(format!("click {p:?}"));
+            Ok(())
+        }
+        fn shot(&mut self, name: &'static str) -> Result<(), String> {
+            self.did.push(format!("shot {name}"));
+            Ok(())
+        }
+        fn barrier(&mut self) -> Result<(), String> {
+            self.did.push("barrier".into());
             Ok(())
         }
         fn wait(&mut self, ms: u64) -> Result<(), String> {
@@ -1258,7 +1929,7 @@ mod tests {
             token: super::super::link::fake::TOKEN,
             n: 1,
         };
-        let steps = row("sink").unwrap();
+        let steps = row("sink", false).unwrap();
         for s in &steps {
             match command(s, id) {
                 None => {}
@@ -1286,11 +1957,13 @@ mod tests {
             build: BUILD.into(),
             port: "L".into(),
             monitor: "M".into(),
+            player: None,
+            kill_barrier: false,
         };
         let e = run(&args("sink-early-close")).unwrap_err();
         assert_eq!(format!("{e:#}"), "no row `sink-early-close`");
         // The row it negates is one.
-        assert!(row("sink").is_some());
+        assert!(row("sink", false).is_some());
         assert!(!out.exists());
     }
 
@@ -1321,5 +1994,47 @@ mod tests {
         assert_eq!(pad_buttons(&hex), Some(0b101));
         assert_eq!(pad_buttons(&format!("00{hex}")), Some(0b101));
         assert_eq!(pad_buttons("0102"), None);
+    }
+
+    /// `p1-kill`'s inner reaches its barrier after shot A with START and
+    /// SELECT both held: every press before it, no release before it; the
+    /// releases follow it, then shot B. `p1` itself has no barrier, and
+    /// `p4` holds START alone.
+    #[test]
+    fn p1_kill_waits_at_its_barrier_with_both_buttons_held() {
+        let mut x = Steps::default();
+        perform(&row("p1", true).unwrap(), &mut x).unwrap();
+        let at = |s: &str| {
+            x.did
+                .iter()
+                .position(|d| d == s)
+                .unwrap_or_else(|| panic!("{s}: {:?}", x.did))
+        };
+        let barrier = at("barrier");
+        for b in [START, SELECT] {
+            assert!(at(&format!("hold b{b}+")) < barrier);
+            assert!(at(&format!("hold b{b}-")) > barrier);
+        }
+        assert!(at("shot shot-a.png") < barrier && barrier < at("shot shot-b.png"));
+        // Every target is clicked once, after the calibration, under the
+        // held buttons.
+        for t in test_device::panel::TARGETS {
+            assert!(at(&format!("click {:?}", (t.x, t.y))) > at("calibrate"));
+            assert!(at(&format!("click {:?}", (t.x, t.y))) > at("held"));
+        }
+        let mut plain = Steps::default();
+        perform(&row("p1", false).unwrap(), &mut plain).unwrap();
+        assert!(!plain.did.contains(&"barrier".to_owned()));
+        let holds = |r: &str| {
+            let mut x = Steps::default();
+            perform(&row(r, false).unwrap(), &mut x).unwrap();
+            x.did
+                .into_iter()
+                .filter(|d| d.starts_with("hold") && d.ends_with('+'))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(holds("p4"), [format!("hold b{START}+")]);
+        assert_eq!(holds("p5"), holds("p1"));
+        assert!(row("sink", true).is_none() && row("p4", true).is_none());
     }
 }

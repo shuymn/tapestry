@@ -3,9 +3,11 @@
 //! tagged `SendInput` calls: the real [`Desk`] of the guarded click.
 
 use anyhow::{Context as _, bail};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
+    GetDIBits, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
@@ -18,10 +20,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GUI_INMENUMODE, GUI_POPUPMENUMODE, GUI_SYSTEMMENUMODE, GUITHREADINFO, GetAncestor,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics,
-    GetWindowThreadProcessId, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WindowFromPoint,
+    EnumWindows, GA_ROOT, GUI_INMENUMODE, GUI_POPUPMENUMODE, GUI_SYSTEMMENUMODE, GUITHREADINFO,
+    GetAncestor, GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetSystemMetrics, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_CLOSE,
+    WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -148,6 +151,120 @@ pub fn process_of(w: Win) -> u32 {
     // SAFETY: one u32 written.
     unsafe { GetWindowThreadProcessId(hwnd(w), Some(&raw mut pid)) };
     pid
+}
+
+/// The visible top-level windows of process `pid`.
+pub fn windows_of(pid: u32) -> Vec<Win> {
+    struct Find {
+        pid: u32,
+        out: Vec<Win>,
+    }
+    unsafe extern "system" fn each(h: HWND, data: LPARAM) -> BOOL {
+        // SAFETY: `data` is the Find passed below, alive for the call.
+        let f = unsafe { &mut *(data.0 as *mut Find) };
+        let mut pid = 0;
+        // SAFETY: one u32 written.
+        unsafe { GetWindowThreadProcessId(h, Some(&raw mut pid)) };
+        // SAFETY: a window handle the system gave.
+        if pid == f.pid && unsafe { IsWindowVisible(h) }.as_bool() {
+            f.out.push(win(h));
+        }
+        BOOL(1)
+    }
+    let mut f = Find {
+        pid,
+        out: Vec::new(),
+    };
+    // SAFETY: the callback reads `f` only during the call.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM((&raw mut f) as isize)) };
+    f.out
+}
+
+/// The visible top-level window of `pid` with the largest client area, if
+/// it has one: a process can show other windows, of no size, before (or
+/// beside) its own.
+pub fn main_window_of(pid: u32) -> Option<Win> {
+    windows_of(pid)
+        .into_iter()
+        .filter_map(|w| {
+            let [_, _, cw, ch] = client_rect(w)?;
+            (cw > 0 && ch > 0).then_some((i64::from(cw) * i64::from(ch), w))
+        })
+        .max_by_key(|&(area, _)| area)
+        .map(|(_, w)| w)
+}
+
+/// Asks window `w` to close (`WM_CLOSE`), as its close button would.
+///
+/// # Errors
+///
+/// The message cannot be posted.
+pub fn close(w: Win) -> anyhow::Result<()> {
+    // SAFETY: no pointers.
+    unsafe { PostMessageW(Some(hwnd(w)), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+        .context("PostMessage(WM_CLOSE)")
+}
+
+/// The screen's pixels in `rect` ([x, y, w, h]) by GDI `BitBlt` from the
+/// screen's DC, as 32-bit BGRA rows from the top.
+///
+/// # Errors
+///
+/// An empty rectangle, or a GDI call failed.
+pub fn capture(rect: [i32; 4]) -> anyhow::Result<Vec<u8>> {
+    let [x, y, w, h] = rect;
+    if w <= 0 || h <= 0 {
+        bail!("an empty rectangle {rect:?}");
+    }
+    // SAFETY: the screen's DC, released below.
+    let screen = unsafe { GetDC(None) };
+    // SAFETY: a valid DC.
+    let mem = unsafe { CreateCompatibleDC(Some(screen)) };
+    // SAFETY: as above.
+    let bitmap = unsafe { CreateCompatibleBitmap(screen, w, h) };
+    // SAFETY: both handles were just made.
+    let old = unsafe { SelectObject(mem, bitmap.into()) };
+    // SAFETY: both DCs are valid; the bitmap is `w`×`h`.
+    let blit = unsafe { BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY) };
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(0),
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
+    };
+    let mut pixels =
+        vec![0_u8; usize::try_from(w).unwrap_or(0) * usize::try_from(h).unwrap_or(0) * 4];
+    // SAFETY: the bitmap is deselected first; the buffer holds `h` rows of
+    // `w` 32-bit pixels.
+    let rows = unsafe {
+        SelectObject(mem, old);
+        GetDIBits(
+            mem,
+            bitmap,
+            0,
+            u32::try_from(h).unwrap_or(0),
+            Some(pixels.as_mut_ptr().cast::<core::ffi::c_void>()),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    // SAFETY: each handle was made above and is released once.
+    unsafe {
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+    }
+    blit.context("BitBlt")?;
+    if rows != h {
+        bail!("GetDIBits read {rows} of {h} rows");
+    }
+    Ok(pixels)
 }
 
 /// The mouse input of one [`Input`], tagged.

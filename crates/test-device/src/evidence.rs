@@ -240,6 +240,21 @@ pub enum Run {
     Quiet(RunLine),
     /// The runner closed its sink window.
     Close(RunWindow),
+    /// The player's main window, once it shows on the run's monitor: the
+    /// run's window from then on.
+    Window(RunWindow),
+    /// The player's executable the runner starts: its path, sha256, the
+    /// commit it reports and its last write.
+    Player(RunPlayer),
+    /// The device's `hello` after the run's mode step, as the mode link
+    /// recorded it: the mode the run's reports come in.
+    Mode(RunLine),
+    /// A shot captured from the run's window: its file in the run's folder,
+    /// sealed once written.
+    Shot(RunNote),
+    /// The kill barrier: the run waits here, holding, for its outer to end
+    /// it.
+    Barrier(RunQ),
     Exit(Exit),
     End(RunEnd),
 }
@@ -332,6 +347,19 @@ pub struct RunNote {
     pub what: String,
 }
 
+/// The player's executable.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunPlayer {
+    pub q: i64,
+    pub path: String,
+    pub sha256: String,
+    /// What `<exe> test-device commit` printed.
+    pub commit: String,
+    /// The file's last write, as the system's FILETIME.
+    pub modified: u64,
+}
+
 /// A process's end as the runner observed it, once the process had ended:
 /// the process and its exit code (the observing runner's cut code when
 /// that runner's termination ended it).
@@ -371,6 +399,11 @@ impl Kinds for Run {
             Self::Call(_) => "call",
             Self::Quiet(_) => "quiet",
             Self::Close(_) => "close",
+            Self::Window(_) => "window",
+            Self::Player(_) => "player",
+            Self::Mode(_) => "mode",
+            Self::Shot(_) => "shot",
+            Self::Barrier(_) => "barrier",
             Self::Kill(_) => "kill",
             Self::Exit(_) => "exit",
             Self::End(_) => "end",
@@ -380,11 +413,12 @@ impl Kinds for Run {
     fn q(&self) -> Option<i64> {
         match self {
             Self::Spawn(c) | Self::Kill(c) => Some(c.q),
-            Self::Sink(r) | Self::Close(r) => Some(r.q),
+            Self::Sink(r) | Self::Close(r) | Self::Window(r) => Some(r.q),
             Self::Call(r) => Some(r.q),
-            Self::Quiet(r) => Some(r.q),
-            Self::Held(r) => Some(r.q),
-            Self::Stop(r) | Self::Recovery(r) => Some(r.q),
+            Self::Quiet(r) | Self::Mode(r) => Some(r.q),
+            Self::Held(r) | Self::Barrier(r) => Some(r.q),
+            Self::Stop(r) | Self::Recovery(r) | Self::Shot(r) => Some(r.q),
+            Self::Player(p) => Some(p.q),
             Self::Exit(e) => Some(e.q),
             Self::Start(_) | Self::Seal(_) | Self::End(_) => None,
         }

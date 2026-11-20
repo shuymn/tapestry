@@ -2759,7 +2759,7 @@ impl FrameDump {
 /// An RGBA8 image as a PNG file, stored without compression (deflate's
 /// stored blocks): enough for a few development screenshots without an
 /// image library.
-fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+pub(crate) fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let row = width as usize * 4;
     let mut raw = Vec::with_capacity((row + 1) * height as usize);
     for line in rgba.chunks(row) {

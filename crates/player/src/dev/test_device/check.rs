@@ -22,7 +22,15 @@ const ROWS: &[Row] = &[
     ("sink", sink),
     ("sink-early-close", sink_early_close),
     ("sink-kill", sink_kill),
+    ("p1", p1),
+    ("p4", p4),
+    ("p5", p5),
+    ("p1-kill", p1_kill),
+    ("p1-kill-escape", p1_kill_escape),
 ];
+
+/// The private panel judge's name: it writes `verdicts-panel.jsonl`.
+pub const PANEL: &str = "panel";
 
 const fn file(role: &'static str, path: &'static str) -> File {
     File { role, path }
@@ -53,6 +61,23 @@ fn check_rule(id: &'static str, outcome: Outcome, inputs: &[File], events: &[Eve
         outcome,
         inputs: inputs.to_vec(),
         events: events.to_vec(),
+    }
+}
+
+const fn exit_rule(
+    role: &'static str,
+    process: &'static str,
+    spawn: Option<(&'static str, &'static str)>,
+    exit: Exit,
+) -> ExitRule {
+    ExitRule {
+        role,
+        process,
+        spawn: match spawn {
+            Some((role, name)) => Some(Spawned { role, name }),
+            None => None,
+        },
+        exit,
     }
 }
 
@@ -284,6 +309,279 @@ fn sink_kill() -> Expectation {
     }
 }
 
+/// A panel row (P1, and its negatives P4 and P5): `failing` the checks
+/// that must fail, and the negative's mutation and trigger.
+fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Expectation {
+    use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE};
+    use super::run::{MODE_LINK, SHOT_A, SHOT_B};
+    use Count::{AtLeast, Exactly};
+    let f = |path| file(SINGLE, path);
+    let (run, link, rec) = (f(RUN), f(LINK), f(RECORDER));
+    let outcome = |id: &str| {
+        if failing.contains(&id) {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        }
+    };
+    let judge = |id, inputs: &[File], events: &[Event]| check_rule(id, outcome(id), inputs, events);
+    let private = |id, inputs: &[File]| CheckRule {
+        id,
+        producer: PANEL,
+        outcome: outcome(id),
+        inputs: inputs.to_vec(),
+        events: vec![ev(SINGLE, RUN, "shot")],
+    };
+    let role = SINGLE;
+    Expectation {
+        row,
+        binding: Binding::Run,
+        roles: vec![Role { name: SINGLE, row }],
+        exits: vec![
+            exit_rule(SINGLE, RUNNER, None, Exit::Code(0)),
+            exit_rule(
+                SINGLE,
+                "recorder",
+                Some((SINGLE, "recorder")),
+                Exit::Code(0),
+            ),
+            exit_rule(SINGLE, "player", Some((SINGLE, "player")), Exit::Code(0)),
+        ],
+        records: vec![
+            rule(role, RUN, "spawn", Exactly(2)),
+            rule(role, RUN, "mode", Exactly(1)),
+            rule(role, RUN, "player", Exactly(1)),
+            rule(role, RUN, "sink", Exactly(1)),
+            rule(role, RUN, "window", Exactly(1)),
+            rule(role, RUN, "call", AtLeast(9)),
+            rule(role, RUN, "held", Exactly(1)),
+            rule(role, RUN, "shot", Exactly(2)),
+            rule(role, RUN, "barrier", Exactly(0)),
+            rule(role, RUN, "stop", Exactly(1)),
+            rule(role, RUN, "quiet", Exactly(1)),
+            rule(role, RUN, "close", Exactly(1)),
+            rule(role, RUN, "kill", Exactly(0)),
+            rule(role, RUN, "exit", Exactly(2)),
+            // The link, the recorder, the mode link, the settings before
+            // and after, the player's output, the two shots.
+            rule(role, RUN, "seal", Exactly(11)),
+            rule(role, LINK, "open", Exactly(1)),
+            rule(role, LINK, "fence", Exactly(1)),
+            rule(role, LINK, "check", AtLeast(1)),
+        ],
+        checks: vec![
+            judge(
+                "provenance",
+                &[link, f(MODE_LINK)],
+                &[ev(SINGLE, LINK, "ans")],
+            ),
+            judge(
+                "p1.grants",
+                &[link],
+                &[ev(SINGLE, LINK, "check"), ev(SINGLE, LINK, "ping")],
+            ),
+            judge("p1.volumes", &[f(DEVICE_AFTER)], &[ev(SINGLE, RUN, "exit")]),
+            judge(
+                "p1.device-toml",
+                &[f(DEVICE_BEFORE), f(DEVICE_AFTER)],
+                &[ev(SINGLE, RUN, "exit")],
+            ),
+            judge(
+                "p1.player-toml",
+                &[f(PLAYER_BEFORE), f(PLAYER_AFTER)],
+                &[ev(SINGLE, RUN, "exit")],
+            ),
+            judge(
+                "p1.panel-keys",
+                &[run, rec],
+                &[ev(SINGLE, RECORDER, "pad"), ev(SINGLE, RUN, "quiet")],
+            ),
+            judge(
+                "p1.clicks",
+                &[run, rec],
+                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RECORDER, "mouse")],
+            ),
+            judge(
+                "p1.no-foreign",
+                &[run, rec],
+                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RUN, "quiet")],
+            ),
+            judge(
+                "p1.buttons-released",
+                &[run, rec],
+                &[ev(SINGLE, RECORDER, "pad")],
+            ),
+            judge(
+                "p1.release-requested",
+                &[run, link],
+                &[ev(SINGLE, RUN, "stop"), ev(SINGLE, LINK, "ans")],
+            ),
+            judge(
+                "p1.quiet-before-close",
+                &[run, link],
+                &[ev(SINGLE, RUN, "close"), ev(SINGLE, LINK, "fence")],
+            ),
+            private("panel.drawn-a", &[f(SHOT_A)]),
+            private("panel.knobs", &[f(SHOT_A)]),
+            private("panel.graphs", &[f(SHOT_A)]),
+            private("panel.numbers", &[f(SHOT_A)]),
+            private("panel.closed-b", &[f(SHOT_B)]),
+        ],
+        negative,
+    }
+}
+
+/// P1: panel 3 by START and SELECT held on the device's pad, the volumes set
+/// by clicks.
+fn p1() -> Expectation {
+    panel("p1", &[], None)
+}
+
+/// P4: START alone opens panel 1, so nothing of panel 3 is drawn and the
+/// clicks set nothing.
+fn p4() -> Expectation {
+    panel(
+        "p4",
+        &[
+            "p1.volumes",
+            "panel.drawn-a",
+            "panel.knobs",
+            "panel.graphs",
+            "panel.numbers",
+        ],
+        Some(Negative {
+            mutation: "SELECT is never held: START alone opens panel 1",
+            trigger: "panel.drawn-a",
+        }),
+    )
+}
+
+/// P5: P1's steps against a local player whose volume arm drops the value:
+/// panel 3 is drawn, the volumes stay at 100 %.
+fn p5() -> Expectation {
+    panel(
+        "p5",
+        &["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"],
+        Some(Negative {
+            mutation: "the player's pointer volume arm drops the value (a local build)",
+            trigger: "p1.volumes",
+        }),
+    )
+}
+
+/// N2p (`p1-kill`), and with `escape` its negative: the outer reserves and
+/// kills an inner `p1` at its kill barrier.
+fn n2p(row: &'static str, escape: bool) -> Expectation {
+    use Count::{AtLeast, Exactly};
+    let (run, link, rec) = (
+        file(SINGLE, RUN),
+        file(SINGLE, LINK),
+        file(SINGLE, RECORDER),
+    );
+    let (inner_run, inner_link) = (file(INNER, RUN), file(INNER, LINK));
+    let check = |id, inputs: &[File], events: &[Event]| {
+        let outcome = if escape && id == "n2p.player-gone" {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        };
+        check_rule(id, outcome, inputs, events)
+    };
+    Expectation {
+        row,
+        binding: Binding::Run,
+        roles: vec![
+            Role { name: SINGLE, row },
+            Role {
+                name: INNER,
+                row: "p1",
+            },
+        ],
+        exits: vec![
+            exit_rule(SINGLE, RUNNER, None, Exit::Code(0)),
+            exit_rule(
+                SINGLE,
+                "recorder",
+                Some((SINGLE, "recorder")),
+                Exit::Code(0),
+            ),
+            exit_rule(INNER, RUNNER, None, Exit::Killed),
+            exit_rule(SINGLE, "inner", Some((SINGLE, INNER)), Exit::Killed),
+            exit_rule(
+                SINGLE,
+                "inner-recorder",
+                Some((INNER, "recorder")),
+                Exit::Killed,
+            ),
+            exit_rule(
+                SINGLE,
+                "inner-player",
+                Some((INNER, "player")),
+                Exit::Killed,
+            ),
+        ],
+        records: vec![
+            rule(SINGLE, RUN, "spawn", Exactly(2)),
+            rule(SINGLE, RUN, "kill", Exactly(if escape { 2 } else { 1 })),
+            rule(SINGLE, RUN, "exit", Exactly(4)),
+            rule(SINGLE, RUN, "seal", Exactly(4)),
+            rule(SINGLE, RUN, "quiet", Exactly(1)),
+            rule(SINGLE, LINK, "open", Exactly(1)),
+            rule(INNER, RUN, "held", Exactly(1)),
+            rule(INNER, RUN, "barrier", Exactly(1)),
+            rule(INNER, RUN, "spawn", Exactly(2)),
+            rule(INNER, RUN, "stop", Exactly(0)),
+            rule(INNER, LINK, "open", Exactly(1)),
+            rule(INNER, LINK, "check", AtLeast(1)),
+        ],
+        checks: vec![
+            check(
+                "provenance",
+                &[link, inner_link],
+                &[ev(SINGLE, LINK, "ans"), ev(INNER, LINK, "ans")],
+            ),
+            check(
+                "n2p.abnormal",
+                &[inner_run, inner_link],
+                &[ev(INNER, RUN, "barrier")],
+            ),
+            check("n2p.neutral", &[rec], &[ev(SINGLE, RECORDER, "pad")]),
+            check(
+                "n2p.quiet",
+                &[run, link, inner_link],
+                &[
+                    ev(SINGLE, RUN, "kill"),
+                    ev(SINGLE, LINK, "ans"),
+                    ev(INNER, LINK, "ans"),
+                ],
+            ),
+            check(
+                "n2p.no-foreign",
+                &[run, rec, inner_run],
+                &[ev(INNER, RUN, "call"), ev(SINGLE, RUN, "exit")],
+            ),
+            check("n2p.children-gone", &[run], &[ev(SINGLE, RUN, "exit")]),
+            check(
+                "n2p.player-gone",
+                &[run],
+                &[ev(SINGLE, RUN, "kill"), ev(SINGLE, RUN, "exit")],
+            ),
+        ],
+        negative: escape.then_some(Negative {
+            mutation: "the inner's player is left outside the job the outer ends (a local build)",
+            trigger: "n2p.player-gone",
+        }),
+    }
+}
+
+fn p1_kill() -> Expectation {
+    n2p("p1-kill", false)
+}
+
+fn p1_kill_escape() -> Expectation {
+    n2p("p1-kill-escape", true)
+}
+
 /// The expectation of `row` among `rows`.
 fn expectation(rows: &[Row], row: &str) -> Option<Expectation> {
     rows.iter().find(|(name, _)| *name == row).map(|(_, e)| e())
@@ -369,6 +667,36 @@ mod tests {
             let e = e();
             assert_eq!(e.row, *name);
             assert!(e.problems().is_empty(), "{name}: {:?}", e.problems());
+        }
+        // Each negative fails exactly its declared set, and its checks are
+        // its positive row's, in the same order.
+        let ids = |e: &Expectation| e.checks.iter().map(|c| c.id).collect::<Vec<_>>();
+        let failing = |e: &Expectation| {
+            e.checks
+                .iter()
+                .filter(|c| c.outcome == Outcome::Fail)
+                .map(|c| c.id)
+                .collect::<Vec<_>>()
+        };
+        assert!(failing(&p1()).is_empty());
+        assert_eq!(
+            failing(&p4()),
+            [
+                "p1.volumes",
+                "panel.drawn-a",
+                "panel.knobs",
+                "panel.graphs",
+                "panel.numbers"
+            ]
+        );
+        assert_eq!(
+            failing(&p5()),
+            ["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"]
+        );
+        assert_eq!(failing(&p1_kill_escape()), ["n2p.player-gone"]);
+        assert!(failing(&p1_kill()).is_empty());
+        for (neg, pos) in [(p4(), p1()), (p5(), p1()), (p1_kill_escape(), p1_kill())] {
+            assert_eq!(ids(&neg), ids(&pos));
         }
         let neg = sink_early_close();
         let failing: Vec<&str> = neg

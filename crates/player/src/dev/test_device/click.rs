@@ -348,6 +348,48 @@ pub fn click<D: Desk>(
     Ok(())
 }
 
+/// The mapping calibration: one move-only call (no button) to each client
+/// `point` of `window`, each followed by a read of the pointer, which must
+/// be at that point's pixel. Only this read verifies the system's mapping
+/// of the absolute coordinate on the run's monitor; [`to_abs`]'s tests
+/// verify the runner's own inverse only.
+///
+/// # Errors
+///
+/// A call that did not insert its move, or a pointer elsewhere.
+pub fn calibrate<D: Desk>(
+    desk: &mut D,
+    window: Win,
+    points: &[(i32, i32)],
+    prefix: u16,
+    call: &mut u16,
+) -> Result<(), Refusal> {
+    let [vx, vy, vw, vh] = desk.virtual_screen();
+    for &point in points {
+        let client = desk.client(window).ok_or(Refusal::WindowGone)?;
+        let pixel = (client[0] + point.0, client[1] + point.1);
+        let to = Input::Move {
+            x: to_abs(pixel.0, vx, vw),
+            y: to_abs(pixel.1, vy, vh),
+        };
+        let t = tag(prefix, *call);
+        *call = call.wrapping_add(1);
+        desk.note(t, "calibrate");
+        let got = desk.send(&[to], t);
+        if got != 1 {
+            return Err(Refusal::Inserted { got, of: 1 });
+        }
+        let cursor = desk.cursor();
+        if cursor != Some(pixel) {
+            return Err(Refusal::CursorMoved {
+                cursor,
+                want: pixel,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A stand-in desktop for the tests: it records every call in order.
 #[cfg(test)]
 pub mod fake {
