@@ -11,10 +11,18 @@
 //!   MOV whose movie header is rewritten into a zlib `cmov` atom here
 //!   ([`cmov`]), and a Matroska file whose frames mkvmerge stores
 //!   zlib-compressed.
+//! - The colour contract's clips (design.md "Rendering and Skins", video
+//!   frames): frames of one known colour, lossless H.264 so they decode to
+//!   exactly the values made, tagged with a matrix that differs from the
+//!   one their size suggests, untagged, full range, an MJPEG in a JPEG
+//!   format, and two whose second half changes its range or its matrix
+//!   alone (two encodes joined in one stream, [`Make::Joined`]).
 //!
 //! The clips are made into `target/media-fixtures/` and checked: each has
-//! its codec, size and frame count, the H.264 clips have B-frames, the zlib
-//! clips use zlib and decode to the frames of their plain sources. Without
+//! its codec, size and frame count, the H.264 clips other than the
+//! lossless ones have B-frames, each frame has the colour tags its clip
+//! names, the zlib clips use zlib and decode to the frames of their plain
+//! sources. Without
 //! `--record` each clip's sha256 must then equal both `fixtures.toml`'s and
 //! the committed file's; `--record` copies them into the fixture directory
 //! and rewrites `fixtures.toml` with the commands, the tools' versions and
@@ -56,6 +64,11 @@ enum Make {
     /// `mkvmerge` storing the frames of the Matroska file at this path
     /// zlib-compressed.
     ZlibMkv(&'static str),
+    /// Two `ffmpeg` encodes to raw H.264 (each with these input and codec
+    /// arguments, then [`BITEXACT`]), joined into one stream and copied
+    /// into the clip's container at 10 frames a second: the second part's
+    /// parameter sets come in the stream, mid-way.
+    Joined([&'static [&'static str]; 2]),
 }
 
 /// What a made clip must be.
@@ -66,6 +79,14 @@ struct Expect {
     frames: u32,
     /// The clip whose decoded frames this one's must equal.
     same_frames_as: Option<&'static str>,
+    /// Whether it has B-frames (checked for H.264).
+    b_frames: bool,
+    /// Each frame's colour range and matrix as FFmpeg's decoder gives them
+    /// (`range/matrix`, as ffprobe names them), runs of one counted once;
+    /// empty when not checked.
+    colours: &'static [&'static str],
+    /// The Y, U and V every decoded sample has, when checked.
+    solid: Option<[u8; 3]>,
 }
 
 struct Clip {
@@ -110,7 +131,53 @@ macro_rules! h264 {
     };
 }
 
-const CLIPS: [Clip; 6] = [
+/// Frames of one colour, `$yuv` as `lutyuv` sets it, `$size`, 0.2 s at 10
+/// frames a second, in lossless H.264 with the tags `$tag`s give. The
+/// frames are tagged as the stream (`$params`, `setparams`'s) before they
+/// reach the encoder, so FFmpeg converts nothing on the way: they decode to
+/// exactly `$yuv`.
+macro_rules! solid {
+    ($size:literal, $yuv:literal, $params:literal $(, $tag:literal)*) => {
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            concat!(
+                "color=c=black:s=",
+                $size,
+                ":r=10:d=0.2,format=yuv420p,lutyuv=",
+                $yuv,
+                $params
+            ),
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p"
+            $(, $tag)*
+        ]
+    };
+}
+
+/// What a colour clip is: H.264 of `frames` frames without B-frames, of
+/// `colours`, decoding to `solid`.
+macro_rules! colour {
+    ($w:literal, $h:literal, $frames:literal, $colours:expr, $solid:expr) => {
+        Expect {
+            codec: "h264",
+            width: $w,
+            height: $h,
+            frames: $frames,
+            same_frames_as: None,
+            b_frames: false,
+            colours: $colours,
+            solid: Some($solid),
+        }
+    };
+}
+
+const CLIPS: [Clip; 15] = [
     Clip {
         path: "zlib/plain.mov",
         make: Make::Ffmpeg(MPEG4_320),
@@ -120,6 +187,11 @@ const CLIPS: [Clip; 6] = [
             height: 240,
             frames: 120,
             same_frames_as: None,
+            b_frames: false,
+            // Nothing signals its range: the colour contract's unspecified
+            // range.
+            colours: &["unknown/unknown"],
+            solid: None,
         },
     },
     Clip {
@@ -131,6 +203,9 @@ const CLIPS: [Clip; 6] = [
             height: 240,
             frames: 120,
             same_frames_as: None,
+            b_frames: false,
+            colours: &[],
+            solid: None,
         },
     },
     Clip {
@@ -142,6 +217,9 @@ const CLIPS: [Clip; 6] = [
             height: 240,
             frames: 120,
             same_frames_as: Some("zlib/plain.mov"),
+            b_frames: false,
+            colours: &[],
+            solid: None,
         },
     },
     Clip {
@@ -153,6 +231,9 @@ const CLIPS: [Clip; 6] = [
             height: 240,
             frames: 120,
             same_frames_as: Some("zlib/plain.mkv"),
+            b_frames: false,
+            colours: &[],
+            solid: None,
         },
     },
     Clip {
@@ -164,6 +245,9 @@ const CLIPS: [Clip; 6] = [
             height: 1080,
             frames: 60,
             same_frames_as: None,
+            b_frames: true,
+            colours: &[],
+            solid: None,
         },
     },
     Clip {
@@ -175,7 +259,177 @@ const CLIPS: [Clip; 6] = [
             height: 1080,
             frames: 60,
             same_frames_as: None,
+            b_frames: true,
+            colours: &[],
+            solid: None,
         },
+    },
+    // A matrix tag that differs from the size's guess, both ways.
+    Clip {
+        path: "colour/bt709-640x480.mkv",
+        make: Make::Ffmpeg(solid!(
+            "640x480",
+            "y=100:u=90:v=190",
+            ",setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709"
+        )),
+        expect: colour!(640, 480, 2, &["tv/bt709"], [100, 90, 190]),
+    },
+    Clip {
+        path: "colour/bt601-1920x1080.mkv",
+        make: Make::Ffmpeg(solid!(
+            "1920x1080",
+            "y=100:u=90:v=190",
+            ",setparams=range=tv:colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "smpte170m",
+            "-color_primaries",
+            "smpte170m",
+            "-color_trc",
+            "smpte170m"
+        )),
+        expect: colour!(1920, 1080, 2, &["tv/smpte170m"], [100, 90, 190]),
+    },
+    // Untagged: the size's guess, limited range.
+    Clip {
+        path: "colour/untagged-1280x720.mkv",
+        make: Make::Ffmpeg(solid!("1280x720", "y=100:u=90:v=190", "")),
+        expect: colour!(1280, 720, 2, &["tv/unknown"], [100, 90, 190]),
+    },
+    Clip {
+        path: "colour/untagged-640x480.mkv",
+        make: Make::Ffmpeg(solid!("640x480", "y=100:u=90:v=190", "")),
+        expect: colour!(640, 480, 2, &["tv/unknown"], [100, 90, 190]),
+    },
+    // Full range in I420 (not a JPEG format), white.
+    Clip {
+        path: "colour/full-320x240.mkv",
+        make: Make::Ffmpeg(solid!(
+            "320x240",
+            "y=255:u=128:v=128",
+            ",setparams=range=pc:colorspace=smpte170m",
+            "-color_range",
+            "pc",
+            "-colorspace",
+            "smpte170m"
+        )),
+        expect: colour!(320, 240, 2, &["pc/smpte170m"], [255, 128, 128]),
+    },
+    // A JPEG format: full range though nothing tags it.
+    Clip {
+        path: "colour/mjpeg-320x240.avi",
+        make: Make::Ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=320x240:r=10:d=0.2,format=yuvj420p,lutyuv=y=100:u=90:v=190",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "2",
+            "-pix_fmt",
+            "yuvj420p",
+        ]),
+        expect: Expect {
+            codec: "mjpeg",
+            width: 320,
+            height: 240,
+            frames: 2,
+            same_frames_as: None,
+            b_frames: false,
+            colours: &[],
+            solid: None,
+        },
+    },
+    // The range alone changes mid-stream, then the matrix alone.
+    Clip {
+        path: "colour/range-change-128x96.mkv",
+        make: Make::Joined([
+            solid!(
+                "128x96",
+                "y=100:u=90:v=190",
+                ",setparams=range=tv:colorspace=smpte170m",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "smpte170m"
+            ),
+            solid!(
+                "128x96",
+                "y=100:u=90:v=190",
+                ",setparams=range=pc:colorspace=smpte170m",
+                "-color_range",
+                "pc",
+                "-colorspace",
+                "smpte170m"
+            ),
+        ]),
+        expect: colour!(
+            128,
+            96,
+            4,
+            &["tv/smpte170m", "pc/smpte170m"],
+            [100, 90, 190]
+        ),
+    },
+    Clip {
+        path: "colour/matrix-change-128x96.mkv",
+        make: Make::Joined([
+            solid!(
+                "128x96",
+                "y=100:u=90:v=190",
+                ",setparams=range=tv:colorspace=bt709",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709"
+            ),
+            solid!(
+                "128x96",
+                "y=100:u=90:v=190",
+                ",setparams=range=tv:colorspace=smpte170m",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "smpte170m"
+            ),
+        ]),
+        expect: colour!(128, 96, 4, &["tv/bt709", "tv/smpte170m"], [100, 90, 190]),
+    },
+    // A matrix change whose first colour is outside the R'G'B' cube: its
+    // conversion keeps the negative component until it quantizes.
+    Clip {
+        path: "colour/gamut-change-128x96.mkv",
+        make: Make::Joined([
+            solid!(
+                "128x96",
+                "y=50:u=64:v=176",
+                ",setparams=range=tv:colorspace=bt709",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709"
+            ),
+            solid!(
+                "128x96",
+                "y=50:u=64:v=176",
+                ",setparams=range=tv:colorspace=smpte170m",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "smpte170m"
+            ),
+        ]),
+        expect: colour!(128, 96, 4, &["tv/bt709", "tv/smpte170m"], [50, 64, 176]),
     },
 ];
 
@@ -244,6 +498,28 @@ fn command(clip: &Clip) -> String {
                 clip.path
             )
         }
+        Make::Joined(parts) => {
+            let mut steps: Vec<String> = parts
+                .iter()
+                .enumerate()
+                .map(|(i, args)| {
+                    let mut p = vec!["ffmpeg"];
+                    p.extend(*args);
+                    p.extend(BITEXACT);
+                    p.extend(["-f", "h264"]);
+                    format!("{} {}.{i}.h264", p.join(" "), clip.path)
+                })
+                .collect();
+            steps.push(format!("cat {0}.0.h264 {0}.1.h264 > {0}.h264", clip.path));
+            let mut p = vec!["ffmpeg", "-f", "h264", "-framerate", "10", "-i"];
+            let joined = format!("{}.h264", clip.path);
+            p.push(&joined);
+            p.extend(["-c", "copy"]);
+            p.extend(BITEXACT);
+            p.push(clip.path);
+            steps.push(p.join(" "));
+            steps.join("; ")
+        }
     }
 }
 
@@ -266,6 +542,37 @@ fn make(clip: &Clip, dir: &Path) -> anyhow::Result<()> {
                 &out,
                 cmov(&bytes).map_err(|e| anyhow::anyhow!("{src}: {e}"))?,
             )?;
+        }
+        Make::Joined(parts) => {
+            let mut joined = Vec::new();
+            for (i, args) in parts.iter().enumerate() {
+                let part = format!("{}.{i}.h264", clip.path);
+                let mut all = vec!["-hide_banner", "-v", "error", "-y"];
+                all.extend(*args);
+                all.extend(BITEXACT);
+                all.extend(["-f", "h264", &part]);
+                run_tool("ffmpeg", &all, dir)?;
+                joined.extend(fs::read(dir.join(&part))?);
+            }
+            let stream = format!("{}.h264", clip.path);
+            fs::write(dir.join(&stream), joined)?;
+            let mut all = vec![
+                "-hide_banner",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "h264",
+                "-framerate",
+                "10",
+                "-i",
+                &stream,
+                "-c",
+                "copy",
+            ];
+            all.extend(BITEXACT);
+            all.push(clip.path);
+            run_tool("ffmpeg", &all, dir)?;
         }
         Make::ZlibMkv(src) => {
             run_tool(
@@ -333,9 +640,46 @@ fn check(clip: &Clip, dir: &Path) -> anyhow::Result<()> {
     if e.codec == "h264" {
         let delay: u32 = field("has_b_frames").parse().unwrap_or(0);
         ensure!(
-            delay > 0,
-            "{}: no B-frames (has_b_frames {delay})",
-            clip.path
+            (delay > 0) == e.b_frames,
+            "{}: has_b_frames {delay}, B-frames wanted: {}",
+            clip.path,
+            e.b_frames
+        );
+    }
+    if !e.colours.is_empty() {
+        let frames = run_tool(
+            "ffprobe",
+            &[
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=color_range,color_space",
+                "-of",
+                "csv=p=0",
+                clip.path,
+            ],
+            dir,
+        )?;
+        let mut colours: Vec<String> = frames
+            .lines()
+            .map(|l| {
+                // A frame with side data ends its line with an empty field.
+                l.trim()
+                    .split(',')
+                    .filter(|f| !f.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .filter(|l| !l.is_empty())
+            .collect();
+        colours.dedup();
+        ensure!(
+            colours == e.colours,
+            "{}: frame colours {colours:?}, want {:?}",
+            clip.path,
+            e.colours
         );
     }
     match clip.make {
@@ -359,7 +703,42 @@ fn check(clip: &Clip, dir: &Path) -> anyhow::Result<()> {
                 clip.path
             );
         }
-        Make::Ffmpeg(_) => {}
+        Make::Ffmpeg(_) | Make::Joined(_) => {}
+    }
+    if let Some(yuv) = e.solid {
+        // The frames as decoded, in their own format: no conversion, not
+        // even where a frame's colour tags change mid-stream (which would
+        // otherwise rebuild the filters into one).
+        let raw = Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-reinit_filter", "0"])
+            .args(["-i", clip.path])
+            .args(["-map", "0:v:0", "-c:v", "rawvideo", "-f", "rawvideo", "-"])
+            .current_dir(dir)
+            .output()
+            .context("cannot run ffmpeg")?;
+        ensure!(raw.status.success(), "{}: decoding failed", clip.path);
+        let (w, h) = (e.width as usize, e.height as usize);
+        let luma = w * h;
+        let chroma = w.div_ceil(2) * h.div_ceil(2);
+        let frame = luma + 2 * chroma;
+        ensure!(
+            raw.stdout.len() == frame * e.frames as usize,
+            "{}: {} bytes decoded, not {} frames of {frame}",
+            clip.path,
+            raw.stdout.len(),
+            e.frames
+        );
+        for (i, f) in raw.stdout.chunks(frame).enumerate() {
+            let planes = [&f[..luma], &f[luma..luma + chroma], &f[luma + chroma..]];
+            for (plane, want) in planes.into_iter().zip(yuv) {
+                ensure!(
+                    plane.iter().all(|b| *b == want),
+                    "{}: frame {i} decodes to {}, not {want}",
+                    clip.path,
+                    plane[0]
+                );
+            }
+        }
     }
     if let Some(reference) = e.same_frames_as {
         let frames = |path: &str| -> anyhow::Result<Vec<String>> {

@@ -1,0 +1,1400 @@
+//! The game's media session (design.md "Threat Model" T02): the worker,
+//! launched when a screen first needs a video and kept for the run, and the
+//! supervision that turns a video black when the worker cannot be trusted
+//! to show it. Standard technique: an asynchronous child supervisor, as a
+//! browser's process host runs its IPC: commands go through a queue to a
+//! writer thread ([`super::writer`]), replies come from a reader thread,
+//! and a session thread of its own judges both on a monotonic clock, while
+//! the game thread only hands requests over and reads each video's state.
+//!
+//! The rules, each judged on the session's clock:
+//!
+//! - **Transport** (L1): a hand-off from the game that finds the session's
+//!   queue full or gone loses the videos it concerns; a command the writer
+//!   has been writing for [`Deadlines::transport`], a writer queue full or
+//!   gone, a reply that does not decode or one past the reply queue (the
+//!   replies' end), fails the whole worker. Beats do not excuse a stuck
+//!   write.
+//! - **Acknowledgements** (L2): an open or a play not answered within
+//!   [`Deadlines::answer`] of its own command's write, a close within
+//!   [`Deadlines::close`], loses that player's video; an answer that
+//!   arrives later, by the reader's stamp, counts as none. The worker,
+//!   marked, is terminated once no player of it is live. A result moves a
+//!   player only when it echoes the command the player waits on
+//!   ([`super::movie::answer`]), and a player goes when the worker's
+//!   tracker frees its id.
+//! - **Progress** (L3): a decoding player whose progress word has not risen
+//!   for [`Deadlines::progress`] is lost. Waiting for a free slot excuses it
+//!   only while every slot holds a frame the game has not freed, by the
+//!   game's own count of the slots it freed; from the first look that finds
+//!   a slot free the window runs again. An end excuses it only as an end
+//!   for good: a looping play never ends.
+//! - **Heartbeat** (L4): no beat for [`Deadlines::heartbeat`] fails the
+//!   whole worker.
+//!
+//! A failure of the whole worker loses every one of its players first, each
+//! by one atomic step that writes nothing else, then terminates its job ([`super::EXIT_HUNG`]) and reaps it: the files it had
+//! open get their strikes. The next video a screen needs launches a new
+//! worker. The launch runs on a thread of its own, so a launch held up
+//! (another launch staging its copies) holds neither the game nor the
+//! session.
+//!
+//! Each video's [`Movie`] is shared with the game: the session moves it
+//! from pending to absent (refused at its probe), live (its ring set up)
+//! or lost; lost is for good, whatever comes later. The screen that asked
+//! for it keeps its own preparation deadline (L5, [`Movie::expire`]). Its
+//! state is one atomic word ([`super::movie::Cell`]); the session logs the
+//! losses after its look, through a thread of its own, so no deadline, no
+//! frame and no loss waits on the log's file.
+
+use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use skin_model::media::control::{Command, Matrix, Range, Reply};
+use skin_model::media::{self, Geometry, Reader, State, Window};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Memory::{
+    FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+};
+use windows::Win32::System::Threading::SetEvent;
+
+use super::launch::{LaunchError, Setup};
+use super::strikes::Strikes;
+use super::{Kind, OpenError, Taken, Worker};
+
+/// The session's deadlines (design.md "Threat Model" T02).
+#[derive(Clone, Copy, Debug)]
+pub struct Deadlines {
+    /// An open's or a play's answer, from its write.
+    pub answer: Duration,
+    /// A close's answer, from its write.
+    pub close: Duration,
+    /// A command write under way.
+    pub transport: Duration,
+    /// The worker's control loop's beats.
+    pub heartbeat: Duration,
+    /// A decoding player's progress.
+    pub progress: Duration,
+    /// How often the session looks, at most.
+    pub tick: Duration,
+}
+
+impl Deadlines {
+    /// The game's.
+    pub const GAME: Self = Self {
+        answer: Duration::from_secs(2),
+        close: Duration::from_secs(1),
+        transport: Duration::from_secs(2),
+        heartbeat: Duration::from_secs(2),
+        progress: Duration::from_secs(2),
+        tick: Duration::from_millis(100),
+    };
+}
+
+/// A screen's preparation deadline (L5): how long it waits for its videos'
+/// first frames from its preparation's start.
+pub const PREPARATION: Duration = Duration::from_secs(3);
+
+/// The most players the session holds in a worker at once: the worker's.
+const PLAYERS: u8 = 8;
+
+/// The requests the session's queue holds.
+const REQUESTS: usize = 32;
+
+use super::movie::{Cell, Outcome, Stage, Then};
+pub use super::movie::{Loss, Status};
+
+/// A video a screen asked for, shared between the game, the render side
+/// and the session. Its state is a [`Cell`]: each thread changes it by one
+/// atomic step and writes nothing else on the way (the session logs the
+/// losses later, off the game's and the render side's paths).
+pub struct Movie {
+    cell: Cell,
+    live: OnceLock<Live>,
+    /// Slots the render side freed.
+    freed: AtomicU64,
+}
+
+impl Movie {
+    /// A pending video of the screen of `generation`.
+    pub fn new(generation: u64) -> Arc<Self> {
+        Arc::new(Self {
+            cell: Cell::new(generation),
+            live: OnceLock::new(),
+            freed: AtomicU64::new(0),
+        })
+    }
+
+    /// Where it stands.
+    pub fn status(&self) -> Status {
+        self.cell.status()
+    }
+
+    /// The generation of the screen that asked for it.
+    pub const fn generation(&self) -> u64 {
+        self.cell.generation()
+    }
+
+    /// Its ring and probe, once live.
+    pub fn live(&self) -> Option<&Live> {
+        self.live.get()
+    }
+
+    /// Loses it for `why`, unless it is lost already: whether this did.
+    pub fn lose(&self, why: Loss) -> bool {
+        self.cell.lose(why)
+    }
+
+    /// Why it was lost first.
+    pub fn loss(&self) -> Option<Loss> {
+        self.cell.loss()
+    }
+
+    /// The screen's preparation deadline has passed (L5): unless its first
+    /// frame was staged, it is absent or lost already, it is lost. Called
+    /// by the game thread, without waiting.
+    pub fn expire(&self) {
+        self.cell.expire();
+    }
+
+    /// Whether it reached a terminal outcome for readiness: its first frame
+    /// staged, absent, or lost.
+    pub fn settled(&self) -> bool {
+        self.cell.settled()
+    }
+
+    /// The render side staged a frame of run 1.
+    pub fn staged_first(&self) {
+        self.cell.staged_first();
+    }
+
+    /// The render side's reader has freed `total` slots over the ring's
+    /// life ([`Reader::freed`]): the count the session's progress rule
+    /// reads. A rise signals the worker's event.
+    pub fn freed(&self, total: u64) {
+        let before = self.freed.swap(total, Ordering::AcqRel);
+        if total != before
+            && let Some(live) = self.live()
+        {
+            live.ring.signal();
+        }
+    }
+}
+
+/// A live video's ring and what its probe said.
+pub struct Live {
+    pub ring: Ring,
+    /// The render side's reader, taken once.
+    pub reader: Mutex<Option<Reader>>,
+    pub width: u32,
+    pub height: u32,
+    pub duration: i64,
+    pub matrix: Matrix,
+    pub range: Range,
+}
+
+/// A frame ring as the game makes it: a section of its own, mapped here,
+/// and its free-slot event.
+pub struct Ring {
+    section: OwnedHandle,
+    event: OwnedHandle,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+}
+
+// SAFETY: the view is touched only through the atomics `words` gives; the
+// handles are values any thread may use.
+unsafe impl Send for Ring {}
+// SAFETY: as above.
+unsafe impl Sync for Ring {}
+
+impl Ring {
+    /// A ring for frames of `geometry`.
+    fn new(geometry: Geometry) -> windows::core::Result<Self> {
+        let (section, event) =
+            super::ring_objects(u64::try_from(geometry.bytes()).unwrap_or(u64::MAX))?;
+        // SAFETY: the section just made, mapped whole.
+        let view = unsafe {
+            MapViewOfFile(
+                HANDLE(section.as_raw_handle()),
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                0,
+            )
+        };
+        if view.Value.is_null() {
+            return Err(windows::core::Error::from_thread());
+        }
+        Ok(Self {
+            section,
+            event,
+            view,
+            len: geometry.words(),
+        })
+    }
+
+    /// The ring's words.
+    pub fn words(&self) -> &[std::sync::atomic::AtomicU64] {
+        // SAFETY: the view holds `len` words, mapped while this value
+        // lives, and every access goes through the atomics.
+        unsafe { std::slice::from_raw_parts(self.view.Value.cast(), self.len) }
+    }
+
+    /// Tells the worker a slot is free.
+    pub fn signal(&self) {
+        // SAFETY: the ring's event.
+        let _ = unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) };
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        // SAFETY: the view this ring mapped, unused after this.
+        let _ = unsafe { UnmapViewOfFile(self.view) };
+    }
+}
+
+/// What a screen asks of the session.
+enum Request {
+    /// Play `file` as `movie`, looping when asked.
+    Open {
+        movie: Arc<Movie>,
+        file: std::fs::File,
+        looping: bool,
+    },
+    /// End the session.
+    Quit,
+    /// Fill the worker's command pipe with `len` bytes written apart from
+    /// the writer, so the writer's next command waits (a test's).
+    #[cfg(test)]
+    Stuff(usize),
+}
+
+/// What the session tells itself from its other threads.
+enum Inner {
+    Launched(Result<Worker, LaunchError>),
+}
+
+/// How the worker is launched.
+#[derive(Clone)]
+pub struct Launching {
+    pub installation: PathBuf,
+    pub data: PathBuf,
+    pub setup: Setup,
+}
+
+/// What a test reads of the session.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A worker launched, its process id.
+    Launched { pid: u32 },
+    /// A video lost, for `why`.
+    Lost { why: Loss },
+    /// A worker's job terminated for a hang (`why`).
+    Terminated { pid: u32, why: Loss },
+    /// A worker reaped.
+    Reaped { pid: u32 },
+    /// An open handed to the worker.
+    Opened,
+    /// A player's close answered.
+    Closed,
+    /// A beat reached the reply queue.
+    QueuedBeat,
+}
+
+/// What the session shares with the game's handle.
+struct Shared {
+    /// The generation of the screen being shown.
+    generation: AtomicU64,
+    /// The worker's process id, 0 without one.
+    pid: AtomicU32,
+    /// Videos the game's hand-offs lost (L1), for the session to log.
+    queue_lost: AtomicU32,
+    #[cfg(test)]
+    events: Mutex<Vec<(Duration, Event)>>,
+    #[cfg(test)]
+    origin: Instant,
+    /// The worker's beats so far ([`Worker::beats`]).
+    #[cfg(test)]
+    beats: Mutex<Vec<Duration>>,
+}
+
+impl Shared {
+    #[cfg(test)]
+    fn event(&self, event: Event) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push((self.origin.elapsed(), event));
+        }
+    }
+}
+
+/// Records `event` for a test.
+macro_rules! event {
+    ($shared:expr, $event:expr) => {
+        #[cfg(test)]
+        $shared.event($event);
+    };
+}
+
+/// The game's handle on the session. Dropping it ends the session without
+/// waiting: its thread ends its worker as it goes.
+pub struct Session {
+    tx: SyncSender<Request>,
+    shared: Arc<Shared>,
+}
+
+impl Session {
+    /// Starts the session, which launches its worker as `launching` says
+    /// when a screen first asks for a video.
+    ///
+    /// # Errors
+    ///
+    /// When its thread does not start.
+    pub fn start(launching: Launching, deadlines: Deadlines) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(REQUESTS);
+        let shared = Arc::new(Shared {
+            generation: AtomicU64::new(0),
+            pid: AtomicU32::new(0),
+            queue_lost: AtomicU32::new(0),
+            #[cfg(test)]
+            events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            origin: Instant::now(),
+            #[cfg(test)]
+            beats: Mutex::new(Vec::new()),
+        });
+        {
+            let shared = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("media session".to_owned())
+                .spawn(move || Supervisor::new(launching, deadlines, shared).run(&rx))?;
+        }
+        Ok(Self { tx, shared })
+    }
+
+    /// Shows the screen of `generation`: the videos of other generations
+    /// are closed. Never waits.
+    pub fn enter(&self, generation: u64) {
+        // The cancellation of the screen left: ordered with the session's
+        // reads after an answer (`movie::confirm`).
+        self.shared.generation.store(generation, Ordering::SeqCst);
+    }
+
+    /// Asks for `file` to be played as `movie`, looping when asked. Never
+    /// waits: a full or gone queue loses the video (L1).
+    pub fn open(&self, movie: &Arc<Movie>, file: std::fs::File, looping: bool) {
+        let request = Request::Open {
+            movie: Arc::clone(movie),
+            file,
+            looping,
+        };
+        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
+            self.tx.try_send(request)
+            && movie.lose(Loss::Queue)
+        {
+            self.shared.queue_lost.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The worker's process id, 0 without one.
+    pub fn pid(&self) -> u32 {
+        self.shared.pid.load(Ordering::Acquire)
+    }
+
+    /// The beats of the worker so far, after its launch's handshake began.
+    #[cfg(test)]
+    pub fn beats(&self) -> Vec<Duration> {
+        self.shared
+            .beats
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default()
+    }
+
+    /// Has the session fill its worker's command pipe with `len` bytes
+    /// written apart from the writer, which then waits on its next command
+    /// while the worker reads nothing.
+    #[cfg(test)]
+    pub fn stuff(&self, len: usize) {
+        let _ = self.tx.try_send(Request::Stuff(len));
+    }
+
+    /// What the session did so far.
+    #[cfg(test)]
+    pub fn events(&self) -> Vec<(Duration, Event)> {
+        self.shared
+            .events
+            .lock()
+            .map(|e| e.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(Request::Quit);
+    }
+}
+
+/// A player of the session's.
+struct Player {
+    id: u8,
+    movie: Arc<Movie>,
+    file: Option<std::fs::File>,
+    looping: bool,
+    stage: Stage,
+    /// When the command the stage waits on was queued.
+    queued: Instant,
+    /// When that command was written whole, once the session has seen it
+    /// written: each answer's deadline runs from its own command's write.
+    written: Option<Instant>,
+    /// The progress word's last value and when it rose (or the window last
+    /// restarted).
+    progress: (u64, Instant),
+    /// Its video's loss has been logged.
+    noted: bool,
+}
+
+impl Player {
+    /// Whether it still counts as live for the worker's marked end.
+    fn live(&self) -> bool {
+        !matches!(self.stage, Stage::Closing(_) | Stage::Idle)
+            && self.movie.status() != Status::Lost
+    }
+
+    /// The command its stage waits on, and how long its answer may take.
+    fn awaited(&self, deadlines: &Deadlines) -> Option<(u32, Duration)> {
+        match self.stage {
+            Stage::Opening(id) | Stage::Playing(id) => Some((id, deadlines.answer)),
+            Stage::Closing(id) => Some((id, deadlines.close)),
+            Stage::Queued | Stage::Live | Stage::Idle => None,
+        }
+    }
+
+    /// Its stage waits on command `id`, queued now.
+    fn wait_on(&mut self, stage: Stage) {
+        self.stage = stage;
+        self.queued = Instant::now();
+        self.written = None;
+    }
+}
+
+/// The session's log lines, written by a thread of their own: no loss, no
+/// deadline and no answer waits on the log's file.
+struct Notes {
+    tx: SyncSender<String>,
+    /// Lines dropped since the last one queued, the queue being full.
+    dropped: u32,
+}
+
+impl Notes {
+    /// The lines the queue holds.
+    const LINES: usize = 64;
+
+    fn start() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<String>(Self::LINES);
+        let spawned = std::thread::Builder::new()
+            .name("media session log".to_owned())
+            .spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    log::warn!("media session: {line}");
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("media session: its log's thread did not start ({e})");
+        }
+        Self { tx, dropped: 0 }
+    }
+
+    /// Queues `line`, never waiting.
+    fn note(&mut self, line: String) {
+        if self.dropped > 0 {
+            let dropped = format!("{} lines dropped", self.dropped);
+            if self.tx.try_send(dropped).is_err() {
+                self.dropped = self.dropped.saturating_add(1);
+                return;
+            }
+            self.dropped = 0;
+        }
+        if self.tx.try_send(line).is_err() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+}
+
+/// The session's thread.
+struct Supervisor {
+    launching: Launching,
+    deadlines: Deadlines,
+    shared: Arc<Shared>,
+    inner_tx: SyncSender<Inner>,
+    inner_rx: Receiver<Inner>,
+    worker: Option<Worker>,
+    launching_now: bool,
+    /// The worker is marked: it is terminated once no player is live.
+    marked: bool,
+    players: Vec<Player>,
+    /// Workers terminated and not yet reaped.
+    dying: Vec<Worker>,
+    strikes: Strikes,
+    notes: Notes,
+    /// The game's hand-off losses logged so far.
+    queue_noted: u32,
+}
+
+impl Supervisor {
+    fn new(launching: Launching, deadlines: Deadlines, shared: Arc<Shared>) -> Self {
+        let (inner_tx, inner_rx) = mpsc::sync_channel(4);
+        Self {
+            launching,
+            deadlines,
+            shared,
+            inner_tx,
+            inner_rx,
+            worker: None,
+            launching_now: false,
+            marked: false,
+            players: Vec::new(),
+            dying: Vec::new(),
+            strikes: Strikes::default(),
+            notes: Notes::start(),
+            queue_noted: 0,
+        }
+    }
+
+    fn run(mut self, rx: &Receiver<Request>) {
+        loop {
+            match rx.recv_timeout(self.deadlines.tick) {
+                Ok(Request::Open {
+                    movie,
+                    file,
+                    looping,
+                }) => self.queue(movie, file, looping),
+                #[cfg(test)]
+                Ok(Request::Stuff(len)) => self.stuff(len),
+                Ok(Request::Quit) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            // Every request waiting, before the look.
+            loop {
+                match rx.try_recv() {
+                    Ok(Request::Open {
+                        movie,
+                        file,
+                        looping,
+                    }) => self.queue(movie, file, looping),
+                    #[cfg(test)]
+                    Ok(Request::Stuff(len)) => self.stuff(len),
+                    Ok(Request::Quit) | Err(TryRecvError::Disconnected) => return self.quit(),
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            self.look();
+            self.note_losses();
+        }
+        self.quit();
+    }
+
+    /// Writes `len` bytes on the worker's command pipe from a thread of its
+    /// own, apart from the writer (a test's).
+    #[cfg(test)]
+    fn stuff(&self, len: usize) {
+        use std::io::Write as _;
+        if let Some(worker) = &self.worker {
+            let mut pipe = worker.commands_again();
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(&vec![0; len]);
+            });
+        }
+    }
+
+    /// Queues an open until the worker can take it.
+    fn queue(&mut self, movie: Arc<Movie>, file: std::fs::File, looping: bool) {
+        if movie.status() == Status::Lost {
+            return;
+        }
+        let now = Instant::now();
+        self.players.push(Player {
+            id: 0,
+            movie,
+            file: Some(file),
+            looping,
+            stage: Stage::Queued,
+            queued: now,
+            written: None,
+            progress: (0, now),
+            noted: false,
+        });
+    }
+
+    /// One look at everything.
+    fn look(&mut self) {
+        self.take_launch();
+        self.reap();
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        // Queued players of another screen, or lost, are dropped.
+        self.players.retain(|p| {
+            !(p.stage == Stage::Queued
+                && (p.movie.generation() != generation || p.movie.status() == Status::Lost))
+        });
+        if self.players.iter().any(|p| p.stage == Stage::Queued)
+            && self.worker.is_none()
+            && !self.launching_now
+        {
+            self.launch();
+        }
+        if self.worker.is_none() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(worker) = &self.worker
+            && let Ok(mut beats) = self.shared.beats.lock()
+        {
+            *beats = worker.beats();
+        }
+        if let Some(why) = self.worker_failure() {
+            self.fail_worker(why);
+            return;
+        }
+        // One order for answers and their deadlines: the deadlines are
+        // judged at `now`, after every reply that arrived before `now` is
+        // taken, each judged late or in time by its own arrival. A reply
+        // the reader holds between its stamp and its queue defers the
+        // deadlines to the next look.
+        let now = Instant::now();
+        self.take_replies();
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        let settled = !worker.in_hand();
+        self.take_replies();
+        if self.worker.is_none() {
+            return;
+        }
+        self.start_queued();
+        self.judge(generation, now, settled);
+        if self.marked && !self.players.iter().any(Player::live) {
+            self.fail_worker(Loss::Answer);
+        }
+    }
+
+    /// Logs the losses not logged yet: the session's own, the game's and
+    /// the render side's, after the look that judged them.
+    fn note_losses(&mut self) {
+        let queue = self.shared.queue_lost.load(Ordering::Relaxed);
+        if queue != self.queue_noted {
+            let n = queue.wrapping_sub(self.queue_noted);
+            self.queue_noted = queue;
+            self.notes.note(format!(
+                "{n} videos lost at the hand-off ({:?})",
+                Loss::Queue
+            ));
+        }
+        for p in &mut self.players {
+            if !p.noted
+                && let Some(why) = p.movie.loss()
+            {
+                p.noted = true;
+                self.notes.note(format!("a video is lost ({why:?})"));
+            }
+        }
+    }
+
+    /// Starts the launch on a thread of its own.
+    fn launch(&mut self) {
+        let launching = self.launching.clone();
+        let tx = self.inner_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("media worker launch".to_owned())
+            .spawn(move || {
+                let launched =
+                    Worker::launch(&launching.installation, &launching.data, &launching.setup);
+                let _ = tx.send(Inner::Launched(launched));
+            });
+        match spawned {
+            Ok(_) => self.launching_now = true,
+            Err(e) => {
+                self.lose_queued(Loss::Launch);
+                self.notes
+                    .note(format!("the launch's thread did not start ({e})"));
+            }
+        }
+    }
+
+    /// Takes a finished launch.
+    fn take_launch(&mut self) {
+        let Ok(Inner::Launched(launched)) = self.inner_rx.try_recv() else {
+            return;
+        };
+        self.launching_now = false;
+        match launched {
+            Ok(worker) => {
+                self.shared.pid.store(worker.pid(), Ordering::Release);
+                event!(self.shared, Event::Launched { pid: worker.pid() });
+                self.notes.note(format!("worker {} launched", worker.pid()));
+                self.worker = Some(worker);
+                self.marked = false;
+            }
+            Err(e) => {
+                self.lose_queued(Loss::Launch);
+                self.notes
+                    .note(format!("the worker could not be launched ({e})"));
+            }
+        }
+    }
+
+    /// Loses every queued player, then drops them, logged.
+    fn lose_queued(&mut self, why: Loss) {
+        for p in &self.players {
+            if p.stage == Stage::Queued && p.movie.lose(why) {
+                event!(self.shared, Event::Lost { why });
+            }
+        }
+        self.note_losses();
+        self.players.retain(|p| p.stage != Stage::Queued);
+    }
+
+    /// Why the whole worker fails, if it does (L1, L4, its end).
+    fn worker_failure(&self) -> Option<Loss> {
+        let worker = self.worker.as_ref()?;
+        if worker.end().is_some() {
+            return Some(Loss::Ended);
+        }
+        if worker.overflowed() {
+            return Some(Loss::Transport);
+        }
+        match worker.transport() {
+            Some(t) if t.ended() => return Some(Loss::Transport),
+            Some(t) if t.stuck_for().is_some_and(|d| d > self.deadlines.transport) => {
+                return Some(Loss::Transport);
+            }
+            Some(_) => {}
+            None => return Some(Loss::Transport),
+        }
+        if worker.since_beat() > self.deadlines.heartbeat {
+            return Some(Loss::Heartbeat);
+        }
+        None
+    }
+
+    /// Fails the whole worker: every player of it lost first, each by one
+    /// atomic step, then its job terminated, to be reaped; the losses are
+    /// logged after.
+    fn fail_worker(&mut self, why: Loss) {
+        for p in &self.players {
+            if p.stage != Stage::Queued && p.movie.lose(why) {
+                event!(self.shared, Event::Lost { why });
+            }
+        }
+        let pid = self.worker.as_ref().map(Worker::pid);
+        if let Some(worker) = self.worker.take() {
+            worker.terminate_hung();
+            event!(
+                self.shared,
+                Event::Terminated {
+                    pid: worker.pid(),
+                    why
+                }
+            );
+            self.shared.pid.store(0, Ordering::Release);
+            self.dying.push(worker);
+        }
+        self.marked = false;
+        self.note_losses();
+        self.players.retain(|p| p.stage == Stage::Queued);
+        if let Some(pid) = pid {
+            self.notes.note(format!("worker {pid} fails ({why:?})"));
+        }
+    }
+
+    /// Reaps the workers that have ended.
+    fn reap(&mut self) {
+        let strikes = &mut self.strikes;
+        self.dying.retain_mut(|w| {
+            let reaped = w.reap(strikes, |_| {}).is_some();
+            if reaped {
+                event!(self.shared, Event::Reaped { pid: w.pid() });
+            }
+            !reaped
+        });
+    }
+
+    /// A free player id.
+    fn free_id(&self) -> Option<u8> {
+        (1..=PLAYERS).find(|id| self.players.iter().all(|p| p.id != *id))
+    }
+
+    /// Hands the queued players to the worker.
+    fn start_queued(&mut self) {
+        let mut failure = None;
+        for i in 0..self.players.len() {
+            let Some(p) = self.players.get(i) else { break };
+            if p.stage != Stage::Queued {
+                continue;
+            }
+            let Some(id) = self.free_id() else { break };
+            let (Some(worker), Some(p)) = (self.worker.as_mut(), self.players.get_mut(i)) else {
+                break;
+            };
+            let Some(file) = p.file.take() else { continue };
+            match worker.open(id, &file, &self.strikes) {
+                Ok(open) => {
+                    p.id = id;
+                    p.wait_on(Stage::Opening(open));
+                    event!(self.shared, Event::Opened);
+                }
+                Err(OpenError::Struck) => {
+                    p.movie.lose(Loss::Struck);
+                    p.stage = Stage::Idle;
+                }
+                Err(OpenError::Pipe(_)) => {
+                    // The handle is the worker's; the queue would not take
+                    // the command.
+                    p.id = id;
+                    p.stage = Stage::Idle;
+                    p.movie.lose(Loss::Transport);
+                    failure = Some(Loss::Transport);
+                }
+                Err(OpenError::Occupied | OpenError::System(_)) => {
+                    p.movie.lose(Loss::Open);
+                    p.stage = Stage::Idle;
+                }
+            }
+        }
+        // Players that never reached the worker go, logged.
+        self.note_losses();
+        self.players
+            .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
+        if let Some(why) = failure {
+            self.fail_worker(why);
+        }
+    }
+
+    /// Takes every reply that has come; the replies' end fails the worker
+    /// (L1).
+    fn take_replies(&mut self) {
+        loop {
+            let Some(worker) = self.worker.as_ref() else {
+                return;
+            };
+            match worker.take_reply() {
+                Taken::Reply(at, reply) => {
+                    if let Err(why) = self.take(at, &reply) {
+                        self.fail_worker(why);
+                        return;
+                    }
+                    self.forget_freed();
+                }
+                Taken::Empty => return,
+                Taken::Ended => {
+                    let why = if worker.exited() {
+                        Loss::Ended
+                    } else {
+                        Loss::Transport
+                    };
+                    self.fail_worker(why);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// When command `id`, which player `i` waits on, was written whole,
+    /// kept from the first look that sees it: `None` while it is not. A
+    /// time no longer kept is taken as the command's queuing, earlier.
+    fn written(&mut self, i: usize, id: u32) -> Option<Instant> {
+        let transport = self.worker.as_ref().and_then(Worker::transport).cloned();
+        let p = self.players.get_mut(i)?;
+        if p.written.is_none() {
+            p.written = match transport.map(|t| t.written(id)) {
+                Some(Ok(at)) => at,
+                Some(Err(())) => Some(p.queued),
+                None => None,
+            };
+        }
+        p.written
+    }
+
+    /// Takes one reply, which arrived at `at`.
+    fn take(&mut self, at: Instant, reply: &Reply) -> Result<(), Loss> {
+        #[cfg(test)]
+        if matches!(reply, Reply::Beat) {
+            self.shared.event(Event::QueuedBeat);
+        }
+        let (player, outcome) = match *reply {
+            Reply::Probed { player, id, .. } => (player, Some(Outcome::Probed(id))),
+            Reply::Refused { player, id, .. } => (player, Some(Outcome::Refused(id))),
+            Reply::Playing { player, id, .. } => (player, Some(Outcome::Playing(id))),
+            Reply::Rejected { player, id, .. } => (player, Some(Outcome::Rejected(id))),
+            Reply::Failed { player, .. } => (player, Some(Outcome::Failed)),
+            Reply::Closed { player, id, .. } => {
+                self.closed(player, id, at);
+                return Ok(());
+            }
+            Reply::Sought { .. }
+            | Reply::Ended { .. }
+            | Reply::Hello { .. }
+            | Reply::Log { .. }
+            | Reply::Beat => return Ok(()),
+        };
+        let Some(outcome) = outcome else {
+            return Ok(());
+        };
+        let Some(i) = self.players.iter().position(|p| p.id == player) else {
+            return Ok(());
+        };
+        let late = self.late(i, at);
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        let Some(p) = self.players.get_mut(i) else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        let before = p.movie.status();
+        let (stage, then) = super::movie::answer(p.stage, &p.movie.cell, generation, outcome, late);
+        // The screen shown, read again after the answer's step.
+        let generation = self.shared.generation.load(Ordering::SeqCst);
+        let (stage, then) = super::movie::confirm(stage, &p.movie.cell, generation, then);
+        if stage == Stage::Live && p.stage != Stage::Live {
+            // The progress window starts when playback does.
+            p.progress = (0, Instant::now());
+        }
+        p.stage = stage;
+        #[cfg(test)]
+        if before != Status::Lost
+            && let Some(why) = p.movie.loss()
+        {
+            self.shared.event(Event::Lost { why });
+        }
+        match then {
+            Then::Nothing => Ok(()),
+            Then::Close => self.close(i),
+            Then::Mark => {
+                self.marked = true;
+                Ok(())
+            }
+            Then::Late => {
+                // A missed answer on a working transport: the worker is
+                // ended once nothing of it is live.
+                self.marked = true;
+                self.close(i)
+            }
+            Then::Play => match *reply {
+                Reply::Probed {
+                    width,
+                    height,
+                    duration,
+                    matrix,
+                    range,
+                    ..
+                } => self.play(i, width, height, duration, matrix, range),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Whether the answer to the command player `i` waits on, arriving at
+    /// `at`, came past its deadline.
+    fn late(&mut self, i: usize, at: Instant) -> bool {
+        let Some((id, limit)) = self.players.get(i).and_then(|p| p.awaited(&self.deadlines)) else {
+            return false;
+        };
+        self.written(i, id)
+            .is_some_and(|written| at.saturating_duration_since(written) > limit)
+    }
+
+    /// Close `id` of `player` was answered at `at`: past its deadline, the
+    /// video is lost and the worker marked. The player itself goes when the
+    /// worker's tracker frees its id ([`Self::forget_freed`]).
+    fn closed(&mut self, player: u8, id: u32, at: Instant) {
+        let Some(i) = self
+            .players
+            .iter()
+            .position(|p| p.id == player && p.stage == Stage::Closing(id))
+        else {
+            return;
+        };
+        if self.late(i, at) {
+            self.marked = true;
+            if let Some(p) = self.players.get(i)
+                && p.movie.lose(Loss::Answer)
+            {
+                event!(self.shared, Event::Lost { why: Loss::Answer });
+            }
+        }
+    }
+
+    /// Drops the players whose ids the worker's tracker has freed (their
+    /// close answered by its own id, or their open rejected): a video of
+    /// the screen shown whose player is gone is lost.
+    fn forget_freed(&mut self) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        let mut any = false;
+        for p in &mut self.players {
+            if p.stage == Stage::Queued || worker.holds(p.id) {
+                continue;
+            }
+            any = true;
+            if matches!(p.stage, Stage::Closing(_)) {
+                event!(self.shared, Event::Closed);
+            }
+            if p.movie.generation() == generation
+                && p.movie.status() != Status::Absent
+                && p.movie.lose(Loss::Failed)
+            {
+                event!(self.shared, Event::Lost { why: Loss::Failed });
+            }
+            p.stage = Stage::Idle;
+            p.id = 0;
+        }
+        if any {
+            self.note_losses();
+            self.players
+                .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
+        }
+    }
+
+    /// Sets up player `i`'s ring for a probe of `width` × `height` and
+    /// sends its play.
+    fn play(
+        &mut self,
+        i: usize,
+        width: u32,
+        height: u32,
+        duration: i64,
+        matrix: Matrix,
+        range: Range,
+    ) -> Result<(), Loss> {
+        let Some(geometry) = Geometry::new(width, height) else {
+            if let Some(p) = self.players.get_mut(i) {
+                p.movie.lose(Loss::Failed);
+            }
+            return self.close(i);
+        };
+        let made = Ring::new(geometry).ok().and_then(|ring| {
+            let reader = Reader::new(
+                ring.words(),
+                geometry,
+                Window {
+                    first: 0,
+                    last: i64::MAX,
+                },
+            )
+            .ok()?;
+            Some(Live {
+                ring,
+                reader: Mutex::new(Some(reader)),
+                width,
+                height,
+                duration,
+                matrix,
+                range,
+            })
+        });
+        let (Some(p), Some(worker)) = (self.players.get_mut(i), self.worker.as_mut()) else {
+            return Ok(());
+        };
+        let Some(live) = made else {
+            p.movie.lose(Loss::Failed);
+            return self.close(i);
+        };
+        let handles = worker
+            .hand_in(HANDLE(live.ring.section.as_raw_handle()), Kind::Section)
+            .and_then(|s| {
+                worker
+                    .hand_in(HANDLE(live.ring.event.as_raw_handle()), Kind::Event)
+                    .map(|e| (s, e))
+            });
+        let Ok((section, event)) = handles else {
+            p.movie.lose(Loss::Failed);
+            return self.close(i);
+        };
+        if p.movie.live.set(live).is_err() {
+            p.movie.lose(Loss::Failed);
+            return self.close(i);
+        }
+        let looping = p.looping;
+        let id = p.id;
+        match worker.send(&Command::Play {
+            player: id,
+            section,
+            event,
+            looping,
+        }) {
+            Ok(play) => {
+                p.wait_on(Stage::Playing(play));
+                Ok(())
+            }
+            Err(_) => Err(Loss::Transport),
+        }
+    }
+
+    /// Sends player `i` its close.
+    fn close(&mut self, i: usize) -> Result<(), Loss> {
+        let (Some(p), Some(worker)) = (self.players.get_mut(i), self.worker.as_mut()) else {
+            return Ok(());
+        };
+        if matches!(p.stage, Stage::Closing(_)) {
+            return Ok(());
+        }
+        match worker.close(p.id) {
+            Ok(close) => {
+                p.wait_on(Stage::Closing(close));
+                Ok(())
+            }
+            Err(_) => Err(Loss::Transport),
+        }
+    }
+
+    /// Judges every player's deadlines at `now` (L2; only when `settled`,
+    /// every reply that arrived before `now` taken) and progress (L3),
+    /// closing the ones of other screens and the lost.
+    fn judge(&mut self, generation: u64, now: Instant, settled: bool) {
+        let mut lost = Vec::new();
+        let mut close = Vec::new();
+        for i in 0..self.players.len() {
+            if !settled {
+                break;
+            }
+            let Some(awaited) = self.players.get(i).and_then(|p| p.awaited(&self.deadlines)) else {
+                continue;
+            };
+            let (id, limit) = awaited;
+            if self
+                .written(i, id)
+                .is_some_and(|at| now.saturating_duration_since(at) > limit)
+            {
+                lost.push((i, Loss::Answer));
+            }
+        }
+        for (i, p) in self.players.iter_mut().enumerate() {
+            if lost.iter().any(|(l, _)| *l == i) {
+                continue;
+            }
+            if p.stage == Stage::Live
+                && p.movie.generation() == generation
+                && p.movie.status() != Status::Lost
+                && let Some(why) = progress(p, now, self.deadlines.progress)
+            {
+                lost.push((i, why));
+                continue;
+            }
+            if super::movie::unwanted(p.stage, &p.movie.cell, generation) {
+                close.push(i);
+            }
+        }
+        for (i, why) in lost {
+            let Some(p) = self.players.get(i) else {
+                continue;
+            };
+            if p.movie.lose(why) {
+                event!(self.shared, Event::Lost { why });
+            }
+            if why == Loss::Answer {
+                // A missed answer on a working transport: the worker is
+                // ended once nothing of it is live.
+                self.marked = true;
+            }
+            if !matches!(p.stage, Stage::Closing(_)) {
+                close.push(i);
+            }
+        }
+        close.sort_unstable();
+        close.dedup();
+        for i in close {
+            if let Err(why) = self.close(i) {
+                self.fail_worker(why);
+                return;
+            }
+        }
+    }
+
+    /// Ends the session: every video lost, the workers dropped (their jobs
+    /// end after a grace, without waiting).
+    fn quit(&mut self) {
+        for p in &self.players {
+            p.movie.lose(Loss::Ended);
+        }
+        self.players.clear();
+        self.worker = None;
+        self.dying.clear();
+        self.shared.pid.store(0, Ordering::Release);
+    }
+}
+
+/// Judges a live player's progress (L3): why it is lost, if it is.
+fn progress(p: &mut Player, now: Instant, limit: Duration) -> Option<Loss> {
+    let live = p.movie.live()?;
+    let words = live.ring.words();
+    let (progress, state) = media::supervision(words)?;
+    let seen = Seen {
+        progress,
+        state,
+        published: media::watermark(words).unwrap_or(0),
+        freed: p.movie.freed.load(Ordering::Acquire),
+    };
+    stalled(&mut p.progress, seen, p.looping, now, limit)
+}
+
+/// What the session reads of a live player's ring and of the game's frees.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    /// The progress word: frames the decoder returned.
+    progress: u64,
+    state: Option<State>,
+    /// The watermark: the newest frame published.
+    published: u64,
+    /// The slots the game freed.
+    freed: u64,
+}
+
+/// The progress rule (L3) on `seen`, `last` being the progress word's last
+/// value and when it rose or the window last restarted: lost when the word
+/// has not risen for more than `limit`, unless every slot holds a frame the
+/// game has not freed (published frames past the slots it freed) or a
+/// play that is not looping has ended, either of which restarts the window.
+fn stalled(
+    last: &mut (u64, Instant),
+    seen: Seen,
+    looping: bool,
+    now: Instant,
+    limit: Duration,
+) -> Option<Loss> {
+    if seen.progress != last.0 {
+        *last = (seen.progress, now);
+        return None;
+    }
+    let excused = match seen.state {
+        Some(State::Waiting) => {
+            let slots = u64::try_from(media::SLOTS).unwrap_or(u64::MAX);
+            seen.freed.saturating_add(slots) <= seen.published
+        }
+        Some(State::Ended) => !looping,
+        Some(State::Decoding) | None => false,
+    };
+    if excused {
+        last.1 = now;
+        return None;
+    }
+    (now.duration_since(last.1) > limit).then_some(Loss::Progress)
+}
+
+/// The deadline of a screen's preparation that began at `start`.
+pub fn preparation_deadline(start: Instant) -> Instant {
+    start + PREPARATION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIMIT: Duration = Deadlines::GAME.progress;
+
+    /// The rule's verdict at each of `steps` (the time since the start, what
+    /// is seen then), from a word of 0 seen at the start.
+    fn verdicts(steps: &[(Duration, Seen)], looping: bool) -> Vec<Option<Loss>> {
+        let start = Instant::now();
+        let mut last = (0, start);
+        steps
+            .iter()
+            .map(|(at, seen)| stalled(&mut last, *seen, looping, start + *at, LIMIT))
+            .collect()
+    }
+
+    fn seen(progress: u64, state: State, published: u64, freed: u64) -> Seen {
+        Seen {
+            progress,
+            state: Some(state),
+            published,
+            freed,
+        }
+    }
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    // Covers: T02
+    #[test]
+    fn a_stalled_decoder_is_lost_just_past_the_deadline() {
+        // The word frozen while decoding: still there at the deadline, lost
+        // just past it, however many frames were published before.
+        let frozen = seen(0, State::Decoding, 9, 9);
+        assert_eq!(
+            verdicts(&[(LIMIT, frozen), (LIMIT + MS(1), frozen)], true),
+            [None, Some(Loss::Progress)]
+        );
+        // A word that rises restarts the window from its rise.
+        let rose = seen(1, State::Decoding, 9, 9);
+        assert_eq!(
+            verdicts(
+                &[(MS(1_500), rose), (MS(3_500), rose), (MS(3_501), rose)],
+                true
+            ),
+            [None, None, Some(Loss::Progress)]
+        );
+        // The watermark rising alone is not progress: frames published
+        // while the decoder returns none leave the window running.
+        assert_eq!(
+            verdicts(
+                &[
+                    (LIMIT, seen(0, State::Decoding, 10, 10)),
+                    (LIMIT + MS(1), seen(0, State::Decoding, 11, 11))
+                ],
+                true
+            ),
+            [None, Some(Loss::Progress)]
+        );
+    }
+
+    // Covers: T02
+    #[test]
+    fn a_wait_on_the_game_is_excused_across_the_deadline_and_then_rearms() {
+        let slots = u64::try_from(media::SLOTS).unwrap();
+        // Every slot holds a frame the game has not freed (published 10,
+        // freed 10 - SLOTS): excused for as long as it lasts, past the
+        // deadline; once the game frees one, the window runs again from the
+        // last look that excused it, and the frozen word is lost a deadline
+        // after that look.
+        let held = seen(0, State::Waiting, 10, 10 - slots);
+        let freed = seen(0, State::Waiting, 10, 11 - slots);
+        assert_eq!(
+            verdicts(
+                &[
+                    (MS(1_000), held),
+                    (MS(5_000), held),
+                    (MS(5_900), held),
+                    (MS(6_000), freed),
+                    (MS(7_900), freed),
+                    (MS(7_901), freed),
+                ],
+                true
+            ),
+            [None, None, None, None, None, Some(Loss::Progress)]
+        );
+        // The watermark alone, without the game's count, excuses nothing:
+        // a wait whose slots the game has freed is a stall.
+        let free = seen(0, State::Waiting, 10, 10);
+        assert_eq!(
+            verdicts(&[(LIMIT + MS(1), free)], true),
+            [Some(Loss::Progress)]
+        );
+    }
+
+    // Covers: T02
+    #[test]
+    fn only_an_end_for_good_is_excused() {
+        let ended = seen(0, State::Ended, 4, 4);
+        assert_eq!(verdicts(&[(MS(10_000), ended)], false), [None]);
+        assert_eq!(
+            verdicts(&[(LIMIT + MS(1), ended)], true),
+            [Some(Loss::Progress)]
+        );
+    }
+}

@@ -31,7 +31,6 @@ use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::Path;
-#[cfg(feature = "dev-tools")]
 use std::path::PathBuf;
 #[cfg(feature = "dev-tools")]
 use std::process::Command;
@@ -44,7 +43,7 @@ use media_support::media_host::strikes::{FileId, Strikes};
 use media_support::media_host::verdict;
 use media_support::media_host::watch::{self, End, Event, LINE};
 use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
-use skin_model::media::control::{Command as Order, Reply};
+use skin_model::media::control::{Command as Order, Matrix, Range, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -145,12 +144,18 @@ impl Worker {
 
     /// Hands player `player` its ring.
     fn play(&mut self, player: u8, ring: &Ring) -> Reply {
+        self.play_as(player, ring, false)
+    }
+
+    /// Hands player `player` its ring, the video looping when `looping`.
+    fn play_as(&mut self, player: u8, ring: &Ring, looping: bool) -> Reply {
         let section = self.give(HANDLE(ring.section.as_raw_handle()), Kind::Section);
         let event = self.give(HANDLE(ring.event.as_raw_handle()), Kind::Event);
         self.send(&Order::Play {
             player,
             section,
             event,
+            looping,
         });
         self.reply()
     }
@@ -626,6 +631,333 @@ fn worker_seek_lands_on_target_after_back_off() {
         assert_eq!((taken.stamp, painted(&taken.bytes, 320)), (due, i));
     }
     worker.close(3);
+}
+
+/// A committed colour clip (`xtask/src/media.rs`).
+fn colour_clip(name: &str) -> PathBuf {
+    root().join("crates/player/tests/media").join(name)
+}
+
+/// The colour the solid colour clips are made of, Y, U and V, decoded
+/// exactly (lossless H.264).
+const SOLID: [u8; 3] = [100, 90, 190];
+
+/// `yuv` of matrix and range `from`, as matrix and range `to` give the same
+/// colour: through R'G'B' in floating point, with no rounding or clipping,
+/// independent of FFmpeg's conversion.
+fn converted(yuv: [u8; 3], from: (Matrix, Range), to: (Matrix, Range)) -> [f64; 3] {
+    let k = |m| match m {
+        Matrix::Bt709 => (0.2126, 0.0722),
+        Matrix::Bt601 => (0.299, 0.114),
+    };
+    let [y, u, v] = yuv.map(f64::from);
+    let (y, pb, pr) = match from.1 {
+        Range::Limited => ((y - 16.0) / 219.0, (u - 128.0) / 224.0, (v - 128.0) / 224.0),
+        Range::Full => (y / 255.0, (u - 128.0) / 255.0, (v - 128.0) / 255.0),
+    };
+    let (kr, kb) = k(from.0);
+    let r = y + 2.0 * (1.0 - kr) * pr;
+    let b = y + 2.0 * (1.0 - kb) * pb;
+    let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    let (kr, kb) = k(to.0);
+    let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+    let pb = (b - y) / (2.0 * (1.0 - kb));
+    let pr = (r - y) / (2.0 * (1.0 - kr));
+    match to.1 {
+        Range::Limited => [16.0 + 219.0 * y, 128.0 + 224.0 * pb, 128.0 + 224.0 * pr],
+        Range::Full => [255.0 * y, 128.0 + 255.0 * pb, 128.0 + 255.0 * pr],
+    }
+}
+
+/// Asserts every byte of each plane of an I420 frame `width` × `height` is
+/// within 1 of `want`'s value for that plane.
+#[track_caller]
+fn assert_planes(bytes: &[u8], width: usize, height: usize, want: [f64; 3], what: &str) {
+    let luma = width * height;
+    let chroma = width.div_ceil(2) * height.div_ceil(2);
+    let planes = [
+        &bytes[..luma],
+        &bytes[luma..luma + chroma],
+        &bytes[luma + chroma..luma + 2 * chroma],
+    ];
+    for ((plane, want), name) in planes.into_iter().zip(want).zip(["Y", "U", "V"]) {
+        let worst = plane
+            .iter()
+            .map(|b| (f64::from(*b) - want).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            worst <= 1.0,
+            "{what}: a {name} byte {worst:.2} from {want:.2} (first {})",
+            plane[0]
+        );
+    }
+}
+
+// Covers: T02
+#[test]
+fn probed_reports_the_colour_contract() {
+    use Matrix::{Bt601, Bt709};
+    use Range::{Full, Limited};
+
+    // A matrix tag wins over the size; without one, the size guesses (709
+    // from 1280 wide or over 576 high); a range tag wins; a JPEG format is
+    // full range and an unsignalled range limited.
+    let cases = [
+        ("colour/bt709-640x480.mkv", Bt709, Limited),
+        ("colour/bt601-1920x1080.mkv", Bt601, Limited),
+        ("colour/untagged-1280x720.mkv", Bt709, Limited),
+        ("colour/untagged-640x480.mkv", Bt601, Limited),
+        ("colour/full-320x240.mkv", Bt601, Full),
+        ("colour/mjpeg-320x240.avi", Bt601, Full),
+        ("zlib/plain.mov", Bt601, Limited),
+    ];
+    let mut worker = Worker::start(&[]);
+    for (player, (name, matrix, range)) in (1..).zip(cases) {
+        match worker.open(player, &colour_clip(name)) {
+            Reply::Probed {
+                matrix: m,
+                range: r,
+                ..
+            } => assert_eq!((m, r), (matrix, range), "{name}"),
+            other => panic!("{name}: {other:?}; the worker's log:\n{}", worker.log()),
+        }
+    }
+    for player in 1..=7 {
+        worker.close(player);
+    }
+}
+
+// Covers: T02
+#[test]
+fn full_range_i420_reaches_the_ring_as_reported() {
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &colour_clip("colour/full-320x240.mkv"));
+    assert!(
+        matches!(
+            probe,
+            Reply::Probed {
+                range: Range::Full,
+                ..
+            }
+        ),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    // Full-range white: luma 255, not squeezed to 235.
+    let taken = take_one(&worker, &mut ring, 0);
+    assert_planes(&taken.bytes, 320, 240, [255.0, 128.0, 128.0], "white");
+    assert!(taken.bytes[..320 * 240].iter().all(|b| *b == 255));
+    worker.close(1);
+}
+
+// Covers: T02
+#[test]
+fn colour_changes_mid_stream_are_converted_to_the_contract() {
+    use Matrix::{Bt601, Bt709};
+    use Range::{Full, Limited};
+
+    // Two frames of one colour, then two whose range alone or matrix alone
+    // differs. The stream's tags, which the container carries and the
+    // probe reports, are the second half's (its parameter sets came last),
+    // so the first two frames differ from the contract: those reach the
+    // ring converted to it, the others as decoded. The gamut clip's colour
+    // is outside the R'G'B' cube, its G' negative: converted with nothing
+    // clipped before the end, it is (53, 59, 180), clipped first about
+    // (62, 101, 173).
+    for (name, solid, probed, first) in [
+        (
+            "colour/range-change-128x96.mkv",
+            SOLID,
+            (Bt601, Full),
+            (Bt601, Limited),
+        ),
+        (
+            "colour/matrix-change-128x96.mkv",
+            SOLID,
+            (Bt601, Limited),
+            (Bt709, Limited),
+        ),
+        (
+            "colour/gamut-change-128x96.mkv",
+            [50, 64, 176],
+            (Bt601, Limited),
+            (Bt709, Limited),
+        ),
+    ] {
+        let mut worker = Worker::start(&[]);
+        match worker.open(1, &colour_clip(name)) {
+            Reply::Probed { matrix, range, .. } => {
+                assert_eq!((matrix, range), probed, "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        let mut ring = Ring::new(128, 96);
+        assert_eq!(
+            worker.play(1, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player: 1
+            }
+        );
+        let same = solid.map(f64::from);
+        let into = converted(solid, first, probed);
+        assert!(
+            into.iter().zip(same).any(|(a, b)| (a - b).abs() > 3.0),
+            "{name}: the change must show"
+        );
+        for (i, want) in [into, into, same, same].into_iter().enumerate() {
+            let due = i64::try_from(i).unwrap() * 100_000;
+            let taken = take_one(&worker, &mut ring, due);
+            assert_eq!(taken.stamp, due, "{name}");
+            assert_planes(&taken.bytes, 128, 96, want, &format!("{name}, frame {i}"));
+        }
+        worker.close(1);
+    }
+}
+
+/// The clip the looping tests play: two seconds at 24 fps, whose last frame
+/// carries its own stamp (as in
+/// `worker_fails_a_player_refused_while_its_decoder_parks_at_the_end`).
+#[cfg(feature = "dev-tools")]
+const LOOPED: &str = "mpeg1video mpeg 320x240 24 48 12";
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn looping_play_restarts_with_rising_stamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "l.mpg", LOOPED);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play_as(1, &ring, true),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    // Three passes in one run: each frame shows its index in the clip, and
+    // each pass's stamps follow the last's by the clip's length, 2 s.
+    for pass in 0..3 {
+        for i in 0..48 {
+            let due = pass * 2_000_000 + stamp_of(i, 24);
+            let taken = take_one(&worker, &mut ring, due);
+            assert_eq!(
+                (taken.stamp, painted(&taken.bytes, 320)),
+                (due, u32::try_from(i).unwrap()),
+                "pass {pass}; the worker's log:\n{}",
+                worker.log()
+            );
+        }
+    }
+    // A looping play never ends.
+    while let Some(reply) = worker.try_reply() {
+        assert!(!matches!(reply, Reply::Ended { .. }), "{reply:?}");
+    }
+    worker.close(1);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn looping_play_starts_each_pass_at_the_first_usable_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = std::fs::read(gen_clip(dir.path(), "l.mpg", LOOPED)).unwrap();
+    // The clip from its third pack on: the stream starts 6 frames before
+    // its first key frame with frames that need the group of pictures
+    // before them, so the first the decoder gives is frame 24, the key
+    // frame, 6 frames after the stream's start.
+    let packs: Vec<usize> = whole
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == [0, 0, 1, 0xBA])
+        .map(|(i, _)| i)
+        .collect();
+    let path = dir.path().join("cut.mpg");
+    std::fs::write(&path, &whole[packs[2]..]).unwrap();
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play_as(1, &ring, true),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    // Three passes of frames 24 to 47: each pass's first frame follows the
+    // last pass's last frame by one frame, with no gap for the frames
+    // before the first usable one, and shows frame 24 again.
+    for m in 0..72 {
+        let due = stamp_of(6 + m, 24);
+        let taken = take_one(&worker, &mut ring, due);
+        assert_eq!(
+            (taken.stamp, painted(&taken.bytes, 320)),
+            (due, u32::try_from(24 + m % 24).unwrap()),
+            "frame {m}; the worker's log:\n{}",
+            worker.log()
+        );
+    }
+    worker.close(1);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn looping_play_parks_and_reports_a_refusal_before_the_next_pass() {
+    use skin_model::media::control::Failure;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "l.mpg", LOOPED);
+    // A refusal recorded at the park seam, where the decoder parks at the
+    // clip's end before the loop seeks back.
+    let mut worker = Worker::start(&["--dev-refuse-at-park"]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play_as(1, &ring, true),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    // The first pass whole, then the refusal, and no frame of the next.
+    let (taken, last) = take_to_last(&worker, &mut ring, 1, 0, stamp_of(1, 24));
+    let taken: Vec<i64> = taken.iter().map(|t| t.stamp).collect();
+    let pass: Vec<i64> = (0..48).map(|i| stamp_of(i, 24)).collect();
+    assert_eq!(taken, pass, "{last:?}; the worker's log:\n{}", worker.log());
+    assert_eq!(
+        last,
+        Reply::Failed {
+            player: 1,
+            why: Failure::Memory,
+            code: -12,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    assert_eq!(ring.poll(4_000_000), None);
+    worker.close(1);
 }
 
 // Covers: T02
