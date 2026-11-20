@@ -585,13 +585,19 @@ impl Rig {
         let drawn = Arc::new(Mutex::new(Vec::new()));
         let (g, f, d) = (Arc::clone(&gate), Arc::clone(&faults), Arc::clone(&drawn));
         let make: MakeScreen = Box::new(move || {
-            let r = render::Renderer::new(
+            let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
                     height: 1_080,
                 },
                 render::AdapterChoice::Warp,
             )?;
+            // The tests count the frames drawn and read what they
+            // acknowledged: a frame skipped past the renderer's 100 ms
+            // wait for the one before on WARP would be recorded here yet
+            // acknowledge nothing, which a loaded machine would decide.
+            // Faults inject the outcomes a test needs.
+            r.set_offscreen_frame_wait(None);
             Ok(Box::new(Recorded {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
                 gate: Arc::clone(&g),
