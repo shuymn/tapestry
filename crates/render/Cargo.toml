@@ -36,6 +36,7 @@ wgpu-hal.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
+    "Win32_Security",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

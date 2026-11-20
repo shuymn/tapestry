@@ -351,6 +351,9 @@ impl Screen for Recorder {
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
     }
+    fn upload_waited(&self) -> bool {
+        self.menu.upload_waited()
+    }
     fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
         self.menu.wait_step(timeout)
     }

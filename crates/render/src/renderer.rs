@@ -18,7 +18,10 @@ use skin_model::{
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
-use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::System::Threading::{
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
+    TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
+};
 
 use crate::chart_pool::{ChartPool, Grid, PoolLayout, PoolWriteError};
 use crate::decision_labels::{
@@ -1561,6 +1564,9 @@ pub struct Renderer {
     pending: Option<Pending>,
     /// The result kind's pages-only installation, in place of its slot.
     result_pages: Option<PagesRes>,
+    /// The timer the passes between frames wait on beside the swap
+    /// chain's grant, made at the first such wait.
+    pace_timer: Option<PaceTimer>,
     /// What is retired, each until its destruction, and the entries held
     /// for what will retire (design.md "Memory Budget").
     retire: Retirements,
@@ -1889,6 +1895,7 @@ impl Renderer {
             resource_ids: 0,
             pending: None,
             result_pages: None,
+            pace_timer: None,
             retire,
             staging_entry: None,
             watch: None,
@@ -5846,6 +5853,14 @@ impl Renderer {
         out
     }
 
+    /// Whether a payload READY waits for is in hand (design.md "Memory
+    /// Budget", the uploader's passes between frames): the staging's pages,
+    /// a BGA batch or the result pages; never the loading text alone.
+    #[must_use]
+    pub fn waited_upload(&self) -> bool {
+        self.staging_steps() || self.bga_upload.is_some() || self.pages_steps()
+    }
+
     /// Whether a payload is in hand: the staging's pages, or a BGA batch.
     fn uploading(&self) -> bool {
         self.staging_steps()
@@ -6635,6 +6650,48 @@ impl Renderer {
                 WaitForSingleObject(HANDLE(h as *mut _), timeout_ms) == WAIT_OBJECT_0
             },
             None => true,
+        }
+    }
+
+    /// Waits for the swap chain to take another frame or for `pace` to
+    /// pass, whichever comes first (design.md "Memory Budget", the
+    /// uploader's passes between frames): the frame latency waitable object
+    /// and a high-resolution waitable timer together, the input thread's
+    /// technique, since a plain wait's timeout runs in the system timer's
+    /// ticks. [`GrantWait::NoWaitable`] at once for an offscreen target or
+    /// a swap chain without the object. Allocates nothing once its timer
+    /// is made.
+    pub fn wait_grant_or_pace(&mut self, pace: Duration) -> GrantWait {
+        let Some(h) = (match &self.output {
+            Output::Window(w) => w.waitable,
+            Output::Offscreen { .. } => None,
+        }) else {
+            return GrantWait::NoWaitable;
+        };
+        let waitable = HANDLE(h as *mut _);
+        if self.pace_timer.is_none() {
+            self.pace_timer = PaceTimer::new();
+        }
+        let us = i64::try_from(pace.as_micros()).unwrap_or(i64::MAX);
+        let timer = self
+            .pace_timer
+            .as_ref()
+            .filter(|t| t.set(us).is_ok())
+            .map(|t| t.0);
+        let woken = match timer {
+            // SAFETY: both handles are live: the swap chain's, only
+            // reconfigured through `&mut self`, and the timer this renderer
+            // owns. The wait's own bound is a guard should the timer fail.
+            Some(timer) => unsafe {
+                WaitForMultipleObjects(&[waitable, timer], false, pace_bound(pace))
+            },
+            // SAFETY: as above, the swap chain's live handle.
+            None => unsafe { WaitForSingleObject(waitable, pace_bound(pace)) },
+        };
+        if woken == WAIT_OBJECT_0 {
+            GrantWait::Granted
+        } else {
+            GrantWait::Paced
         }
     }
 
@@ -8849,6 +8906,65 @@ impl Renderer {
             out.extend_from_slice(&data[start..start + row as usize]);
         }
         out
+    }
+}
+
+/// How [`Renderer::wait_grant_or_pace`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantWait {
+    /// The swap chain takes another frame.
+    Granted,
+    /// The pace passed first.
+    Paced,
+    /// No frame latency waitable object to wait on.
+    NoWaitable,
+}
+
+/// The milliseconds a wait for `pace` is bounded by, rounded up: a guard
+/// behind the high-resolution timer.
+fn pace_bound(pace: Duration) -> u32 {
+    u32::try_from(pace.as_millis().saturating_add(1)).unwrap_or(u32::MAX)
+}
+
+/// A high-resolution waitable timer, closed on drop; the system timer
+/// resolution is left alone.
+struct PaceTimer(HANDLE);
+
+impl PaceTimer {
+    /// `None` where the system makes none: the wait then uses its own
+    /// bound alone.
+    fn new() -> Option<Self> {
+        // SAFETY: plain timer creation; the handle is owned by the value.
+        unsafe {
+            CreateWaitableTimerExW(
+                None,
+                windows::core::PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        }
+        .ok()
+        .map(Self)
+    }
+
+    /// Fires once, `us` from now; setting it clears an earlier signal.
+    fn set(&self, us: i64) -> windows::core::Result<()> {
+        let due = -us.saturating_mul(10);
+        // SAFETY: a valid timer handle and no completion routine.
+        unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) }
+    }
+}
+
+// SAFETY: a waitable timer handle may be set, waited on and closed from any
+// thread; the renderer that owns it is moved to its thread whole.
+unsafe impl Send for PaceTimer {}
+
+impl Drop for PaceTimer {
+    fn drop(&mut self) {
+        // SAFETY: the handle is this value's, closed once.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
     }
 }
 

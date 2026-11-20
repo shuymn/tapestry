@@ -257,6 +257,12 @@ pub trait Screen: Send {
     fn upload_state(&self) -> render::UploadState {
         render::UploadState::Idle
     }
+    /// Whether the uploader holds a payload READY waits for: the attempt's
+    /// staging, its chart-image publication, the result pages or a BGA
+    /// batch ([`render::Renderer::waited_upload`]); none by default.
+    fn upload_waited(&self) -> bool {
+        false
+    }
     /// Waits for the uploader's step in flight at most `timeout`
     /// ([`render::Renderer::wait_step`]): whether it was seen.
     ///
@@ -792,6 +798,14 @@ pub trait Screen: Send {
     fn wait(&self) -> bool;
     /// Whether [`wait`](Self::wait) paces frames.
     fn paced(&self) -> bool;
+    /// Waits for the swap chain's grant or for `pace`, whichever comes
+    /// first ([`render::Renderer::wait_grant_or_pace`]): `Some(true)`
+    /// granted, `Some(false)` paced, `None` with nothing to wait on. By
+    /// default [`wait`](Self::wait)'s answer.
+    fn wait_grant(&mut self, pace: Duration) -> Option<bool> {
+        let _ = pace;
+        Some(self.wait())
+    }
     /// Builds one play frame from `f`: the app's own work, which calls
     /// nothing in wgpu. [`draw`](Self::draw) follows a frame built.
     ///
@@ -1823,6 +1837,10 @@ struct Shared {
     /// The commits answered and given up on, which the game thread and the
     /// render thread settle under its lock.
     commits: Mutex<Commits>,
+    /// Passes that presented nothing while an upload stepped between
+    /// frames (tests).
+    #[cfg(test)]
+    between: AtomicU32,
     /// The result pages uploads published and withdrawn, under a lock of
     /// their own: no commit's lock is waited on.
     pages: Mutex<PageMarks>,
@@ -2092,6 +2110,8 @@ impl Shared {
             epochs: [AtomicU64::new(0), AtomicU64::new(0)],
             producer: Mutex::new(None),
             commits: Mutex::new(Commits::default()),
+            #[cfg(test)]
+            between: AtomicU32::new(0),
             pages: Mutex::new(PageMarks::default()),
             #[cfg(test)]
             commit_timed_out: AtomicBool::new(false),
@@ -4902,6 +4922,7 @@ pub fn spawn(
                 rf_armed: 0,
                 granted: false,
                 chart_hand: None,
+                pace_deadline: None,
                 pages_hand: None,
                 released: None,
                 #[cfg(feature = "dev-tools")]
@@ -6122,6 +6143,25 @@ fn text_unsettled(skinned: bool, screen: &dyn Screen) -> bool {
     !skinned && !screen.text_settled()
 }
 
+/// `pace` as a duration; 0 for a negative one.
+const fn pace_of(pace: TimeUs) -> Duration {
+    Duration::from_micros(pace.0.unsigned_abs())
+}
+
+/// What a pass does before its frame while an upload is in hand
+/// ((r2)'s passes between frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Between {
+    /// Paced as every frame: no upload in hand, a grant held, or nothing
+    /// to wait on.
+    Frame,
+    /// The grant came, or the frame's deadline passed: the frame draws.
+    Granted,
+    /// The pace or a step's wait passed first: the next pass runs its
+    /// boundary, presenting nothing.
+    Pass,
+}
+
 /// The first frame's hold bound: [`FIRST_FRAME_HOLD`], or a test's.
 fn first_frame_bound(shared: &Shared) -> TimeUs {
     #[cfg(test)]
@@ -6338,6 +6378,9 @@ struct Run {
     /// The attempt's chart-image publication in hand, its bands stepped
     /// by the uploader (design.md "Rendering and Skins", chart images).
     chart_hand: Option<ChartHand>,
+    /// Offscreen or minimized with an upload in hand: the frame's deadline,
+    /// until which passes wait for the step and present nothing.
+    pace_deadline: Option<Instant>,
     /// The result pages upload in hand: its ticket and where its answer
     /// goes.
     pages_hand: Option<(u64, mpsc::SyncSender<PagesAnswer>)>,
@@ -7515,8 +7558,56 @@ impl Run {
             let minimized = screen.minimized();
             let swap_paced = screen.paced();
             let filled = screen.filled();
+            // An upload in hand steps in passes between frames ((r2)):
+            // each pass waits for the grant or a HELD_PACE timer, never
+            // for the GPU; offscreen or minimized, for its step until the
+            // frame's deadline (design.md "Memory Budget", the uploader).
+            let stepping = screen.upload_waited();
             self.mark_waiting(filled);
-            let granted = if swap_paced && !minimized {
+            let Some(screen) = self.screen.as_mut() else {
+                self.mark_running();
+                continue;
+            };
+            let between = if !stepping {
+                self.pace_deadline = None;
+                Between::Frame
+            } else if swap_paced && !minimized {
+                if self.granted {
+                    Between::Frame
+                } else {
+                    match screen.wait_grant(pace_of(HELD_PACE)) {
+                        Some(true) => Between::Granted,
+                        Some(false) => Between::Pass,
+                        None => Between::Frame,
+                    }
+                }
+            } else {
+                let now = Instant::now();
+                let deadline = *self.pace_deadline.get_or_insert(now + CLOCK_PACE);
+                if now < deadline {
+                    let _ = screen.wait_step(
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(pace_of(HELD_PACE)),
+                    );
+                }
+                if Instant::now() < deadline {
+                    Between::Pass
+                } else {
+                    self.pace_deadline = None;
+                    Between::Granted
+                }
+            };
+            if between == Between::Pass {
+                // The next pass runs its boundary's step.
+                self.mark_running();
+                #[cfg(test)]
+                self.shared.between.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let granted = if between == Between::Granted {
+                true
+            } else if swap_paced && !minimized {
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("wait0", i64::from(self.granted));
                 self.granted || self.screen.as_ref().is_some_and(|s| s.wait())
@@ -11555,10 +11646,10 @@ impl Run {
         if let Some(s) = self.screen.as_mut() {
             s.withdraw_pages();
         }
+        self.reconcile_result();
         if let Some((_, reply)) = self.pages_hand.take() {
             let _ = reply.send(PagesAnswer::Cancelled);
         }
-        self.reconcile_result();
     }
 
     /// How the upload in hand ended at a boundary: written, it is
@@ -11594,10 +11685,11 @@ impl Run {
             }
             render::PagesStep::Withdrawn(t) => (t, PagesAnswer::Cancelled),
         };
+        // The result kind's record first: its owner reads it once answered.
+        self.reconcile_result();
         if let Some((_, reply)) = self.pages_hand.take_if(|(h, _)| *h == ticket) {
             let _ = reply.send(answer);
         }
-        self.reconcile_result();
     }
 
     /// The screen failed: what the result kind keeps is read from it one
@@ -16195,6 +16287,152 @@ pub(crate) mod tests {
         assert_eq!(fig.press_to_screen_unavailable, 1);
         assert_eq!(fig.press_to_screen, None);
         link.exit();
+    }
+
+    /// A swap-paced screen with an upload of `steps` steps in hand, one
+    /// written at each boundary, whose grant comes at every fourth wait
+    /// for it; it counts its menu frames.
+    struct Stepping {
+        steps: Arc<AtomicU32>,
+        draws: Arc<AtomicU32>,
+        waits: Arc<AtomicU32>,
+        /// The frames drawn when the last step was written.
+        at_end: Arc<AtomicU32>,
+        /// Swap-paced; else paced by the clock, as offscreen.
+        swap: bool,
+    }
+
+    impl Screen for Stepping {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            self.swap
+        }
+        fn wait_grant(&mut self, _pace: Duration) -> Option<bool> {
+            Some((self.waits.fetch_add(1, Ordering::AcqRel) + 1).is_multiple_of(4))
+        }
+        fn upload_state(&self) -> render::UploadState {
+            if self.steps.load(Ordering::Acquire) > 0 {
+                render::UploadState::Ready
+            } else {
+                render::UploadState::Idle
+            }
+        }
+        fn upload_waited(&self) -> bool {
+            self.steps.load(Ordering::Acquire) > 0
+        }
+        fn upload_boundary(&mut self, _past: &mut dyn FnMut() -> bool) -> render::Uploaded {
+            if self
+                .steps
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                == Ok(1)
+            {
+                self.at_end
+                    .store(self.draws.load(Ordering::Acquire), Ordering::Release);
+            }
+            render::Uploaded {
+                bga: render::BgaStep::Idle,
+                staged: None,
+                text: None,
+                chart: None,
+                pages: None,
+            }
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.draws.fetch_add(1, Ordering::AcqRel);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// V10e, (r2): with an upload in hand, a swap-paced screen's passes
+    /// wait for the grant or the pace, and a pass the pace ends presents
+    /// nothing and runs the next boundary's step, so the upload steps
+    /// several times a frame; with none in hand, every pass is a frame.
+    #[test]
+    fn an_upload_steps_in_passes_between_frames() {
+        let (drawn, between, waits) = stepped_frames(true);
+        assert!(
+            drawn <= 10,
+            "{drawn} frames for 20 steps, {between} between, {waits} waits"
+        );
+        assert!(between >= 10, "{between} passes between frames");
+    }
+
+    /// V10e, (r2) offscreen: with an upload in hand, a clock-paced screen's
+    /// passes wait for the step until the frame's 16 ms deadline and
+    /// present nothing before it, so the upload steps many times a frame.
+    #[test]
+    fn an_offscreen_upload_steps_until_the_frames_deadline() {
+        let (drawn, between, waits) = stepped_frames(false);
+        assert_eq!(waits, 0, "no grant to wait for");
+        assert!(drawn <= 5, "{drawn} frames for 20 steps, {between} between");
+        assert!(between >= 15, "{between} passes between frames");
+    }
+
+    /// 20 steps of an upload stepped on a [`Stepping`] screen, swap-paced
+    /// (`swap`) or clock-paced: the frames drawn while they were written,
+    /// the passes between frames, and the waits for a grant.
+    fn stepped_frames(swap: bool) -> (u32, u32, u32) {
+        let steps = Arc::new(AtomicU32::new(0));
+        let draws = Arc::new(AtomicU32::new(0));
+        let waits = Arc::new(AtomicU32::new(0));
+        let at_end = Arc::new(AtomicU32::new(0));
+        let (s, d, w, e) = (
+            Arc::clone(&steps),
+            Arc::clone(&draws),
+            Arc::clone(&waits),
+            Arc::clone(&at_end),
+        );
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Stepping {
+                steps: Arc::clone(&s),
+                draws: Arc::clone(&d),
+                waits: Arc::clone(&w),
+                at_end: Arc::clone(&e),
+                swap,
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        link.send(RenderMsg::Menu(Box::new(one_line("menu"))));
+        assert!(wait_until(|| draws.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            waits.load(Ordering::Acquire),
+            0,
+            "no upload: no pass between"
+        );
+        assert_eq!(link.shared.between.load(Ordering::SeqCst), 0);
+        let from = draws.load(Ordering::Acquire);
+        steps.store(20, Ordering::Release);
+        assert!(wait_until(|| steps.load(Ordering::Acquire) == 0));
+        let drawn = at_end.load(Ordering::Acquire) - from;
+        let between = link.shared.between.load(Ordering::SeqCst);
+        link.exit();
+        (drawn, between, waits.load(Ordering::Acquire))
     }
 
     /// Play frames the [`Stalling`] screen draws before it stalls.
@@ -21468,6 +21706,9 @@ pub(crate) mod tests {
         fn upload_state(&self) -> render::UploadState {
             self.menu.upload_state()
         }
+        fn upload_waited(&self) -> bool {
+            self.menu.upload_waited()
+        }
         fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
             self.menu.wait_step(timeout)
         }
@@ -21899,6 +22140,25 @@ pub(crate) mod tests {
                 return render::UploadState::Idle;
             }
             self.menu.upload_state()
+        }
+        fn upload_waited(&self) -> bool {
+            !self.hold_up.load(Ordering::Acquire) && self.menu.upload_waited()
+        }
+        fn begin_pages(
+            &mut self,
+            pages: &Arc<skin_model::PackedPages>,
+            ticket: u64,
+        ) -> Result<Option<render::PagesBegun>, RenderError> {
+            self.menu.begin_pages(pages, ticket)
+        }
+        fn publish_pages(&mut self) -> Option<u64> {
+            self.menu.publish_pages()
+        }
+        fn withdraw_pages(&mut self) -> Option<u64> {
+            self.menu.withdraw_pages()
+        }
+        fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
+            self.menu.installed_pages(kind)
         }
         fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
             self.menu.wait_step(timeout)
@@ -22465,6 +22725,50 @@ pub(crate) mod tests {
             s.text == 3 && s.red.is_some_and(|r| r.title && r.artist)
         });
         link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// The result pages upload's answer follows the result kind's record
+    /// (§5.3): its owner reads the status once answered, so the status
+    /// held from before the last step, no answer comes until it is free,
+    /// and the record then names the published pages.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_pages_answer_follows_the_results_record() {
+        let (link, rec) = Recording::new();
+        let (_dir, skin) = result::fixed_skin();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        // The upload begun and kept in hand.
+        rec.hold_up.store(true, Ordering::Release);
+        let mut t = link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+        assert!(link.fence(Duration::from_secs(10)));
+        assert!(t.poll(Duration::ZERO).is_none(), "in hand");
+        // The status held while the upload completes.
+        let holding = Arc::new(AtomicBool::new(false));
+        let freed = Arc::new(AtomicBool::new(false));
+        let hold = link.result_status_hold();
+        let (h, f) = (Arc::clone(&holding), Arc::clone(&freed));
+        let holder = std::thread::spawn(move || {
+            hold(&mut || {
+                h.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_secs(2));
+                f.store(true, Ordering::Release);
+            });
+        });
+        assert!(wait_until(|| holding.load(Ordering::Acquire)));
+        rec.hold_up.store(false, Ordering::Release);
+        // A fence wakes the loop, which read the uploader idle.
+        let (woke, _fenced) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::Fence(woke));
+        let answer = result::pages_answer(&mut t);
+        assert!(
+            freed.load(Ordering::Acquire),
+            "answered with the status held"
+        );
+        assert_eq!(answer, super::PagesAnswer::Ready);
+        assert_eq!(link.result_status().installed, Some(skin.atlas_id()));
+        holder.join().unwrap();
         link.exit();
     }
 

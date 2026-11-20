@@ -1051,6 +1051,10 @@ impl Screen for MenuScreen {
         }
     }
 
+    fn upload_waited(&self) -> bool {
+        self.chart.is_some() || self.renderer.waited_upload()
+    }
+
     fn loading_text(
         &mut self,
         lifetime: u64,
@@ -1219,6 +1223,14 @@ impl Screen for MenuScreen {
         self.renderer
             .take_result_release()
             .then(|| self.renderer.release_figures())
+    }
+
+    fn wait_grant(&mut self, pace: std::time::Duration) -> Option<bool> {
+        match self.renderer.wait_grant_or_pace(pace) {
+            render::GrantWait::Granted => Some(true),
+            render::GrantWait::Paced => Some(false),
+            render::GrantWait::NoWaitable => None,
+        }
     }
 
     fn restore_pages(

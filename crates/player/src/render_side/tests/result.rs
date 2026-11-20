@@ -262,6 +262,9 @@ impl Screen for Recorded {
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
     }
+    fn upload_waited(&self) -> bool {
+        self.menu.upload_waited()
+    }
     fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
         self.menu.wait_step(timeout)
     }
@@ -4093,7 +4096,9 @@ fn a_first_frame_lost_is_acknowledged_after_its_recovery() {
 }
 
 /// The pages ticket's answer, polled as the game thread does.
-fn pages_answer(t: &mut crate::render_side::PendingPages) -> crate::render_side::PagesAnswer {
+pub(crate) fn pages_answer(
+    t: &mut crate::render_side::PendingPages,
+) -> crate::render_side::PagesAnswer {
     let end = Instant::now() + Duration::from_secs(30);
     while Instant::now() < end {
         if let Some(a) = t.poll(Duration::from_millis(5)) {
