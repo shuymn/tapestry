@@ -38,7 +38,11 @@ struct RunSpec {
     set: Option<&'static str>,
     inner: Option<Value>,
     files: Vec<(&'static str, Vec<u8>)>,
+    /// Files written without the runner's seal.
+    unsealed: Vec<(&'static str, Vec<u8>)>,
     exits: Vec<Value>,
+    /// Records after the exits (a survivor's seals).
+    after: Vec<Value>,
     end: Option<Value>,
 }
 
@@ -56,7 +60,9 @@ impl RunSpec {
                 ("recorder.jsonl", recorder(200, &[])),
                 ("shot-a.png", format!("png of {run}").into_bytes()),
             ],
+            unsealed: vec![],
             exits: vec![exit("recorder", (200, 2000), 0, false)],
+            after: vec![],
             end: Some(json!({"t": "end", "exit": 0, "errors": []})),
         }
     }
@@ -73,7 +79,10 @@ impl RunSpec {
                 "t": "seal", "run": self.run, "role": self.role, "path": path, "sha256": sha(bytes),
             }));
         }
-        for x in &self.exits {
+        for (path, bytes) in &self.unsealed {
+            write(&folder.join(path), bytes);
+        }
+        for x in self.exits.iter().chain(&self.after) {
             out += &line(x);
         }
         if let Some(end) = &self.end {
@@ -107,13 +116,18 @@ fn recorder(pid: u32, errors: &[(i64, i64)]) -> Vec<u8> {
     out.into_bytes()
 }
 
+fn survivor_seal(run: &str, role: &str, path: &str, bytes: &[u8]) -> Value {
+    json!({"t": "seal", "run": run, "role": role, "path": path, "sha256": sha(bytes)})
+}
+
 fn exit(name: &str, (pid, created): (u32, u64), code: i32, killed: bool) -> Value {
-    json!({"t": "exit", "name": name, "process": {"pid": pid, "created": created}, "code": code, "killed": killed})
+    json!({"t": "exit", "q": 100, "name": name, "process": {"pid": pid, "created": created}, "code": code, "killed": killed})
 }
 
 /// A verdict line reading `inputs` (role, path, file) with the files'
 /// current digests.
 fn verdict(
+    run: &str,
     row: &str,
     check: &str,
     outcome: &str,
@@ -125,7 +139,7 @@ fn verdict(
         .map(|(role, path, file)| json!({"role": role, "path": path, "sha256": sha(&fs::read(file).unwrap())}))
         .collect();
     line(&json!({
-        "row": row, "check": check, "outcome": outcome, "detail": "",
+        "row": row, "run": run, "check": check, "outcome": outcome, "detail": "",
         "inputs": inputs, "producer": {"name": producer, "version": BUILD},
     }))
 }
@@ -168,11 +182,13 @@ impl Single {
                 ExitRule {
                     role: SINGLE,
                     process: RUNNER,
+                    writes: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: SINGLE,
                     process: "recorder",
+                    writes: Some(file(SINGLE, RECORDER)),
                     exit: Exit::Code(0),
                 },
             ],
@@ -238,6 +254,7 @@ impl Single {
                 _ => "shot-a.png",
             };
             out += &verdict(
+                RUN_A,
                 "sink",
                 check,
                 outcome,
@@ -292,6 +309,7 @@ fn a_duplicate_check_fails() {
     let s = Single::new();
     s.write();
     let shot = verdict(
+        RUN_A,
         "sink",
         "n1.shot",
         "pass",
@@ -308,7 +326,7 @@ fn a_duplicate_check_fails() {
 #[test]
 fn an_extra_check_fails() {
     let s = Single::new();
-    let extra = verdict("sink", "n1.extra", "pass", "judge", &[]);
+    let extra = verdict(RUN_A, "sink", "n1.extra", "pass", "judge", &[]);
     let mut bytes = fs::read(s.path("verdicts-judge.jsonl")).unwrap();
     bytes.extend_from_slice(extra.as_bytes());
     write(&s.path("verdicts-judge.jsonl"), &bytes);
@@ -353,7 +371,7 @@ fn a_missing_record_fails() {
     s.write();
     mismatch(
         &s.check(),
-        "link.jsonl holds Some(0) `ans` records, the row expects AtLeast(1)",
+        "link.jsonl holds 0 `ans` records, the row expects AtLeast(1)",
     );
 }
 
@@ -402,7 +420,10 @@ fn a_file_unlike_its_seal_fails() {
         .unwrap()
         .replace("\"q\":2", "\"q\":4");
     write(&s.path(LINK), replaced.as_bytes());
-    mismatch(&s.check(), "run/link.jsonl has sha256");
+    mismatch(
+        &s.check(),
+        "run/link.jsonl is not evidence: its bytes have sha256",
+    );
     mismatch(&s.check(), "unlike its seal");
 }
 
@@ -410,6 +431,7 @@ fn a_file_unlike_its_seal_fails() {
 fn an_input_outside_the_declared_files_fails() {
     let s = Single::new();
     let mut out = verdict(
+        RUN_A,
         "sink",
         "provenance",
         "pass",
@@ -420,6 +442,7 @@ fn an_input_outside_the_declared_files_fails() {
         ],
     );
     out += &verdict(
+        RUN_A,
         "sink",
         "n1.neutral",
         "pass",
@@ -427,6 +450,7 @@ fn an_input_outside_the_declared_files_fails() {
         &[(SINGLE, RECORDER, &s.path(RECORDER))],
     );
     out += &verdict(
+        RUN_A,
         "sink",
         "n1.shot",
         "pass",
@@ -495,21 +519,25 @@ impl Outer {
                 ExitRule {
                     role: SINGLE,
                     process: RUNNER,
+                    writes: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: SINGLE,
                     process: "recorder",
+                    writes: Some(file(SINGLE, RECORDER)),
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: SINGLE,
                     process: "inner",
+                    writes: Some(file(INNER, RUN)),
                     exit: Exit::Killed,
                 },
                 ExitRule {
                     role: INNER,
                     process: RUNNER,
+                    writes: None,
                     exit: Exit::Killed,
                 },
             ],
@@ -539,9 +567,13 @@ impl Outer {
         let mut inner = RunSpec::new(RUN_B, "sink", INNER);
         inner.process = (500, 5000);
         inner.set = Some(RUN_A);
-        inner.files.truncate(1);
+        // Killed, the inner seals nothing: the outer seals its link after
+        // it saw it end.
+        inner.unsealed = vec![("link.jsonl", link())];
+        inner.files.clear();
         inner.exits.clear();
         inner.end = None;
+        outer.after.push(survivor_seal(RUN_B, INNER, LINK, &link()));
         let o = Self {
             dir: tempfile::tempdir().unwrap(),
             outer,
@@ -555,6 +587,7 @@ impl Outer {
         self.outer.write(self.dir.path());
         self.inner.write(&self.dir.path().join(INNER));
         let mut out = verdict(
+            RUN_A,
             "sink-kill",
             "provenance",
             "pass",
@@ -562,6 +595,7 @@ impl Outer {
             &[(SINGLE, LINK, &self.dir.path().join(LINK))],
         );
         out += &verdict(
+            RUN_A,
             "sink-kill",
             "n2.neutral",
             "pass",
@@ -713,21 +747,25 @@ impl SetDir {
                 ExitRule {
                     role: "A1",
                     process: RUNNER,
+                    writes: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: "A1",
                     process: "recorder",
+                    writes: Some(file("A1", RECORDER)),
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: "R1",
                     process: RUNNER,
+                    writes: None,
                     exit: Exit::Code(0),
                 },
                 ExitRule {
                     role: "R1",
                     process: "recorder",
+                    writes: Some(file("R1", RECORDER)),
                     exit: Exit::Code(0),
                 },
             ],
@@ -783,6 +821,7 @@ impl SetDir {
     fn write_verdict(&self) {
         let d = self.dir.path();
         let out = verdict(
+            self.set,
             "p1-compare",
             "mask-17",
             "pass",
@@ -794,6 +833,7 @@ impl SetDir {
         );
         write(&d.join("verdicts-compare.jsonl"), out.as_bytes());
         let provenance = verdict(
+            self.set,
             "p1-compare",
             "provenance",
             "pass",
@@ -968,6 +1008,7 @@ fn a_process_cannot_observe_its_own_kill() {
     e.exits.push(ExitRule {
         role: INNER,
         process: "inner",
+        writes: Some(file(INNER, RUN)),
         exit: Exit::Killed,
     });
     let report = check(&e, o.dir.path());
@@ -1010,4 +1051,273 @@ fn a_recorder_event_read_from_an_errored_stream_is_incomplete() {
         &check(&e, s.dir.path()),
         "check `n1.shot` is Pass, but its evidence is incomplete: role `run`'s recorder.jsonl has 1 recorder errors",
     );
+}
+
+/// A stream counts for a record rule or an event only when sealed: a
+/// complete recorder stream left in the folder without its seal (another
+/// run's, or one the runner never finished) supplies no `ready`.
+#[test]
+fn a_stream_counts_only_when_sealed() {
+    let s = Single::new();
+    let mut e = Single::expectation();
+    e.records.push(RecordRule {
+        role: SINGLE,
+        stream: RECORDER,
+        kind: "ready",
+        count: Count::Exactly(1),
+    });
+    e.checks[1].inputs.clear();
+    s.write_with(&[
+        ("provenance", "pass"),
+        ("n1.neutral", "pass"),
+        ("n1.shot", "pass"),
+    ]);
+    // The verdict reads no file now; the event still reads the recorder.
+    let verdicts = fs::read_to_string(s.path("verdicts-judge.jsonl")).unwrap();
+    let rewritten: String = verdicts
+        .lines()
+        .map(|l| {
+            if l.contains("n1.neutral") {
+                let mut v: Value = serde_json::from_str(l).unwrap();
+                v["inputs"] = json!([]);
+                format!("{v}\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    write(&s.path("verdicts-judge.jsonl"), rewritten.as_bytes());
+    // The control: sealed, it counts.
+    let report = check(&e, s.dir.path());
+    assert!(report.ok(), "{report:#?}");
+    let text = fs::read_to_string(s.path(RUN)).unwrap();
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.contains("recorder.jsonl"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    write(&s.path(RUN), kept.as_bytes());
+    let report = check(&e, s.dir.path());
+    mismatch(
+        &report,
+        "role `run`'s recorder.jsonl is not evidence (unsealed), the row expects Exactly(1) `ready` records",
+    );
+    mismatch(
+        &report,
+        "check `n1.neutral` is Pass, but its evidence is incomplete: role `run`'s recorder.jsonl is not evidence: unsealed",
+    );
+}
+
+/// A verdict names the run or set it judges: one copied from another set
+/// whose files are byte-identical does not count.
+#[test]
+fn a_verdict_of_another_run_fails() {
+    let s = SetDir::new("set-1", RUN_A, RUN_B);
+    let other = SetDir::new("set-2", RUN_A, RUN_B);
+    fs::copy(
+        other.dir.path().join("verdicts-compare.jsonl"),
+        s.dir.path().join("verdicts-compare.jsonl"),
+    )
+    .unwrap();
+    mismatch(
+        &s.check(),
+        "verdicts-compare.jsonl: check `mask-17` judges run `set-2`, not this run's `set-1`",
+    );
+}
+
+/// The outer seals the killed inner's link only after it saw the inner
+/// end; every arrangement of the outer's kill record and its seal, with the
+/// seal's digest and role right or wrong, against an oracle.
+#[test]
+fn a_survivor_seals_only_what_it_saw_end() {
+    for seal_after_kill in [true, false] {
+        for digest_right in [true, false] {
+            for role_right in [true, false] {
+                let mut o = Outer::new();
+                let bytes = if digest_right {
+                    link()
+                } else {
+                    b"other".to_vec()
+                };
+                let role = if role_right { INNER } else { SINGLE };
+                let seal = survivor_seal(RUN_B, role, LINK, &bytes);
+                o.outer.after.clear();
+                if seal_after_kill {
+                    o.outer.after.push(seal);
+                } else {
+                    o.outer.exits.insert(0, seal);
+                }
+                o.write();
+                let report = check(&Outer::expectation(), o.dir.path());
+                let want = seal_after_kill && digest_right && role_right;
+                assert_eq!(
+                    report.ok(),
+                    want,
+                    "after kill {seal_after_kill}, digest {digest_right}, role {role_right}: {report:#?}"
+                );
+                if !want {
+                    assert!(
+                        report
+                            .mismatches
+                            .iter()
+                            .any(|m| m.contains("inner/link.jsonl is not evidence")
+                                || m.contains("a seal not of this run's files")),
+                        "{report:#?}"
+                    );
+                }
+            }
+        }
+    }
+    // Nor does a survivor seal the file of a run nobody killed.
+    let mut o = Outer::new();
+    o.outer.exits.retain(|x| x["name"] != "inner");
+    o.outer.exits.push(exit("inner", (500, 5000), 0, false));
+    o.write();
+    mismatch(
+        &check(&Outer::expectation(), o.dir.path()),
+        "a seal not of this run's files",
+    );
+}
+
+/// The inner's recorder writes `ready` as process 600 and no `end`.
+fn cut_recorder() -> Vec<u8> {
+    line(&json!({"t": "ready", "q": 1, "process": {"pid": 600, "created": 6000}})).into_bytes()
+}
+
+/// A recorder its own runner saw end by itself, without its `end`, is not
+/// excused by the runner's later kill, nor by the killer's observation.
+#[test]
+fn a_recorder_its_runner_saw_end_is_not_excused_by_a_later_kill() {
+    let mut o = Outer::new();
+    o.inner.unsealed.push((RECORDER, cut_recorder()));
+    o.inner.exits = vec![exit("recorder", (600, 6000), 0, false)];
+    o.outer
+        .exits
+        .push(exit("inner-recorder", (600, 6000), 0, false));
+    o.write();
+    mismatch(
+        &check(&Outer::expectation(), o.dir.path()),
+        "role `inner`: recorder.jsonl: the stream has no end record, and its writer was not cut short",
+    );
+}
+
+/// An exit rule's process is the writer its stream names: an exit of
+/// another process under the recorder's name does not stand for it.
+#[test]
+fn an_exit_of_another_process_does_not_match() {
+    let mut s = Single::new();
+    s.spec.exits = vec![exit("recorder", (201, 2010), 0, false)];
+    s.write();
+    mismatch(
+        &s.check(),
+        "role `run`'s recorder's exit names process Process { pid: 201, created: 2010 }, not run/recorder.jsonl's writer",
+    );
+}
+
+/// Every arrangement of the observations of the inner's recorder (cut
+/// short, no `end`): by its own runner (none, ended, killed), by the outer
+/// (none, before or after its kill of the inner, ended or killed), at a
+/// counter before or after the recorder's last record; the stream is
+/// excused exactly when an oracle says so. The canonical arrangement (the
+/// outer sees it end after the kill) is the positive control.
+#[test]
+fn a_cut_stream_is_excused_only_by_its_writer_s_bound_end() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum By {
+        None,
+        Ended,
+        Killed,
+    }
+    let mut excused_seen = false;
+    for own in [By::None, By::Ended, By::Killed] {
+        for outer in [By::None, By::Ended, By::Killed] {
+            for outer_after_kill in [true, false] {
+                for late in [true, false] {
+                    let mut o = Outer::new();
+                    o.inner.unsealed.push((RECORDER, cut_recorder()));
+                    let q = if late { 100 } else { 0 };
+                    let obs = |by: By| {
+                        let mut x = exit("inner-recorder", (600, 6000), 0, by == By::Killed);
+                        x["q"] = json!(q);
+                        x
+                    };
+                    if own != By::None {
+                        let mut x = obs(own);
+                        x["name"] = json!("recorder");
+                        o.inner.exits = vec![x];
+                    }
+                    if outer != By::None {
+                        if outer_after_kill {
+                            o.outer.exits.push(obs(outer));
+                        } else {
+                            o.outer.exits.insert(0, obs(outer));
+                        }
+                    }
+                    o.write();
+                    let report = check(&Outer::expectation(), o.dir.path());
+                    let flagged = report
+                        .mismatches
+                        .iter()
+                        .any(|m| m.starts_with("role `inner`: recorder.jsonl:"));
+                    // The oracle.
+                    let killed_obs = own == By::Killed || outer == By::Killed;
+                    let disagree = own != By::None && outer != By::None && own != outer;
+                    let excused = late
+                        && !disagree
+                        && (killed_obs
+                            || (own == By::None && outer == By::Ended && outer_after_kill));
+                    assert_eq!(
+                        flagged, !excused,
+                        "own {own:?}, outer {outer:?}, after kill {outer_after_kill}, late {late}: {report:#?}"
+                    );
+                    excused_seen |= excused && !killed_obs;
+                }
+            }
+        }
+    }
+    assert!(excused_seen, "the positive control never matched");
+}
+
+/// A sealed link that recorded an error fails the run though the runner's
+/// `end` names none: each kind of error, and none as the control.
+#[test]
+fn a_link_error_fails_the_run() {
+    let open = json!({"t": "open", "q": 1, "freq": 1, "location": "L", "com": "COM4", "path": "P"});
+    let ans = json!({"t": "ans", "q": 2, "line": HELLO});
+    let cases = [
+        (None, json!({"t": "end", "q": 3, "problems": []}), None),
+        (
+            Some(json!({"t": "lost", "q": 3, "error": "gone"})),
+            json!({"t": "end", "q": 4, "problems": []}),
+            Some("lost: gone"),
+        ),
+        (
+            Some(json!({"t": "refused", "q": 3, "error": "build"})),
+            json!({"t": "end", "q": 4, "problems": []}),
+            Some("refused: build"),
+        ),
+        (
+            None,
+            json!({"t": "end", "q": 3, "problems": ["a ping went unanswered"]}),
+            Some("problems at its end: a ping went unanswered"),
+        ),
+    ];
+    for (error, end, want) in cases {
+        let mut s = Single::new();
+        let mut text = line(&open) + &line(&ans);
+        if let Some(e) = &error {
+            text += &line(e);
+        }
+        text += &line(&end);
+        s.spec.files[0].1 = text.into_bytes();
+        s.write();
+        let report = s.check();
+        match want {
+            None => assert!(report.ok(), "{report:#?}"),
+            Some(w) => mismatch(
+                &report,
+                &format!("role `run`: link.jsonl records an error: {w}"),
+            ),
+        }
+    }
 }
