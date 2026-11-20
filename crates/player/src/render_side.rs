@@ -438,6 +438,38 @@ pub trait Screen: Send {
         let _ = (kind, pages, request);
         Ok(refusal("this screen draws no declarative skin"))
     }
+    /// Begins the result pages upload of `pages` for `ticket` (design.md
+    /// "Memory Budget", the uploader): [`render::PagesBegun::Installed`]
+    /// for the pages installed, which take nothing. `None` by default: the
+    /// screen draws no pages.
+    ///
+    /// # Errors
+    ///
+    /// As [`render::Renderer::begin_pages`].
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, RenderError> {
+        let _ = (pages, ticket);
+        Ok(None)
+    }
+    /// Publishes the written result pages upload as the result kind's
+    /// pages-only installation: its ticket. `None` by default.
+    fn publish_pages(&mut self) -> Option<u64> {
+        None
+    }
+    /// Withdraws the result pages upload in hand, its array retired: its
+    /// ticket. `None` by default.
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        None
+    }
+    /// Whether play's admission released the result kind's installation
+    /// since the last call, with its figures: play's need, the result's
+    /// charge and the limit. `None` by default.
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        None
+    }
     /// Restores the result kind's pages-only installation of `pages` on a
     /// screen built again. The default restores nothing.
     ///
@@ -1332,6 +1364,15 @@ pub enum RenderMsg {
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
     },
+    /// Upload the result's `pages` for `ticket` (design.md "Memory Budget",
+    /// the result pages upload), of its own sequence: answered once
+    /// published, withdrawn, refused, released or lost. It supersedes no
+    /// attempt and changes no request.
+    ResultPages {
+        ticket: u64,
+        pages: Arc<PackedPages>,
+        reply: mpsc::SyncSender<PagesAnswer>,
+    },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
     /// Draw the decision screen: its built-in presentation `page`, or
@@ -1782,6 +1823,9 @@ struct Shared {
     /// The commits answered and given up on, which the game thread and the
     /// render thread settle under its lock.
     commits: Mutex<Commits>,
+    /// The result pages uploads published and withdrawn, under a lock of
+    /// their own: no commit's lock is waited on.
+    pages: Mutex<PageMarks>,
     /// Set when the game thread stopped waiting for a commit's answer,
     /// before it takes the commits' lock (tests).
     #[cfg(test)]
@@ -2048,6 +2092,7 @@ impl Shared {
             epochs: [AtomicU64::new(0), AtomicU64::new(0)],
             producer: Mutex::new(None),
             commits: Mutex::new(Commits::default()),
+            pages: Mutex::new(PageMarks::default()),
             #[cfg(test)]
             commit_timed_out: AtomicBool::new(false),
             #[cfg(test)]
@@ -2413,6 +2458,16 @@ struct Commits {
     receipt: Receipt,
 }
 
+/// The newest result pages ticket published and the newest withdrawn: a
+/// publication happens only while its ticket is not withdrawn, and a
+/// withdrawal finds a publication already made, so the two never
+/// disagree. Never compared with request numbers.
+#[derive(Debug, Default)]
+struct PageMarks {
+    published: u64,
+    withdrawn: u64,
+}
+
 /// What an attempt's commit gives the game thread: the request and what
 /// the declarative installation the committed attempt draws with, the one
 /// it staged or the one already in use, declares ([`Declared`]). A
@@ -2583,6 +2638,10 @@ impl Shared {
 
     fn commits(&self) -> std::sync::MutexGuard<'_, Commits> {
         self.commits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn pages(&self) -> std::sync::MutexGuard<'_, PageMarks> {
+        self.pages.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn loading_slot(&self) -> std::sync::MutexGuard<'_, LoadingSlot> {
@@ -2839,6 +2898,9 @@ pub struct RenderLink {
     end_pages: AtomicU64,
     /// The number of the last attempt's preparation requested.
     requests: AtomicU64,
+    /// The number of the last result pages upload begun, of its own
+    /// sequence.
+    page_uploads: AtomicU64,
     /// The loading clock, the render thread's: a loading lifetime's
     /// origin is stamped on it.
     clock: QpcClock,
@@ -3092,6 +3154,25 @@ impl RenderLink {
     /// register.
     pub fn result_status(&self) -> ResultReport {
         self.shared.result_status().clone()
+    }
+
+    /// Begins the result's pages upload of `pages` (design.md "Memory
+    /// Budget", the result pages upload), numbered apart from every
+    /// request: the ticket to poll, withdrawn when dropped unanswered.
+    pub fn begin_result_pages(&self, pages: Arc<PackedPages>) -> PendingPages {
+        let ticket = self.page_uploads.fetch_add(1, Ordering::Relaxed) + 1;
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::ResultPages {
+            ticket,
+            pages,
+            reply,
+        });
+        PendingPages {
+            ticket,
+            rx,
+            shared: Arc::clone(&self.shared),
+            settled: false,
+        }
     }
 
     /// Starts the result's upload after an attempt's commit (the S10-09i
@@ -4569,6 +4650,84 @@ impl Drop for PendingSelect {
     }
 }
 
+/// How a result pages upload ended (design.md "Memory Budget", the
+/// result pages upload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagesAnswer {
+    /// Published: the result kind's pages-only installation.
+    Ready,
+    /// Withdrawn before its publication, by its owner or by the result
+    /// kind's own operation.
+    Cancelled,
+    /// Refused, with why: nothing published.
+    Refused(String),
+    /// The screen holding it was dropped: never published.
+    Lost,
+}
+
+/// A result pages upload's ticket ([`RenderLink::begin_result_pages`]),
+/// polled by the game thread in short slices. Dropped unanswered, it is
+/// withdrawn: a publication after that installs nothing.
+#[derive(Debug)]
+pub struct PendingPages {
+    ticket: u64,
+    rx: Receiver<PagesAnswer>,
+    shared: Arc<Shared>,
+    /// Answered or withdrawn.
+    settled: bool,
+}
+
+impl PendingPages {
+    /// Waits at most `slice` for the answer: `None` while it is on its
+    /// way, or once settled.
+    ///
+    /// # Errors
+    ///
+    /// [`ScreenError::Ended`] when the render thread is gone.
+    pub fn poll(&mut self, slice: Duration) -> Option<Result<PagesAnswer, ScreenError>> {
+        if self.settled {
+            return None;
+        }
+        match self.rx.recv_timeout(slice) {
+            Ok(answer) => {
+                self.settled = true;
+                Some(Ok(answer))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.settled = true;
+                Some(Err(ended(&self.shared)))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+        }
+    }
+
+    /// Whether it is answered or withdrawn.
+    pub const fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Withdraws the ticket unless it was published: whether it was. Under
+    /// the pages' lock, so the render thread either published before or
+    /// sees the withdrawal at its publication. Final either way.
+    pub fn withdraw(&mut self) -> bool {
+        if std::mem::replace(&mut self.settled, true) {
+            return false;
+        }
+        let mut marks = self.shared.pages();
+        if marks.published >= self.ticket {
+            return true;
+        }
+        marks.withdrawn = marks.withdrawn.max(self.ticket);
+        false
+    }
+}
+
+impl Drop for PendingPages {
+    fn drop(&mut self) {
+        self.withdraw();
+    }
+}
+
 /// How long the game thread waits for a selection's answer at each look:
 /// the menus, quit and cancellation are served between looks.
 pub(crate) const SELECT_SLICE: Duration = Duration::from_millis(1);
@@ -4743,6 +4902,10 @@ pub fn spawn(
                 rf_armed: 0,
                 granted: false,
                 chart_hand: None,
+                pages_hand: None,
+                released: None,
+                #[cfg(feature = "dev-tools")]
+                pages_retained: 0,
                 staged_seen: false,
                 image: Image::default(),
                 first_frame: None,
@@ -4843,6 +5006,7 @@ pub fn spawn(
             finish_timeout: FINISH_TIMEOUT,
             end_pages: AtomicU64::new(0),
             requests: AtomicU64::new(0),
+            page_uploads: AtomicU64::new(0),
             clock,
             scripts,
             result_lifetimes: AtomicU64::new(0),
@@ -6174,6 +6338,16 @@ struct Run {
     /// The attempt's chart-image publication in hand, its bands stepped
     /// by the uploader (design.md "Rendering and Skins", chart images).
     chart_hand: Option<ChartHand>,
+    /// The result pages upload in hand: its ticket and where its answer
+    /// goes.
+    pages_hand: Option<(u64, mpsc::SyncSender<PagesAnswer>)>,
+    /// The request of the play staging whose admission released the
+    /// result kind's installation last.
+    released: Option<u64>,
+    /// The result's atlases retained when the pages upload in hand began
+    /// (development builds: G1's sample).
+    #[cfg(feature = "dev-tools")]
+    pages_retained: usize,
     /// The uploader's boundary saw a staging's last step complete: the
     /// attempt is asked again in that pass.
     staged_seen: bool,
@@ -6942,6 +7116,14 @@ impl Run {
                     } else {
                         write.answer(Err(render::PoolWriteError::Stale));
                     }
+                    continue;
+                }
+                Ok(RenderMsg::ResultPages {
+                    ticket,
+                    pages,
+                    reply,
+                }) => {
+                    self.begin_pages(ticket, &pages, reply);
                     continue;
                 }
                 Ok(RenderMsg::Select {
@@ -7723,10 +7905,6 @@ impl Run {
                             l,
                         )
                     });
-                    #[cfg(feature = "dev-tools")]
-                    {
-                        frame_presented = presented;
-                    }
                     // Before the lifetime's first skinned frame, a skin whose
                     // loading text is not settled draws the pending
                     // presentation, declaring its own time.
@@ -7735,6 +7913,16 @@ impl Run {
                         .is_some_and(|f| loading_frame == Some(f.lifetime) && f.skinned);
                     let pending = presented == Some(Presented::Placeholder)
                         || (presented.is_some() && text_unsettled(skinned, &**screen));
+                    // What the frame drew: the pending presentation while the
+                    // skin's text keeps it from drawing (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        frame_presented = if pending {
+                            Some(Presented::Placeholder)
+                        } else {
+                            presented
+                        };
+                    }
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -8751,6 +8939,10 @@ impl Run {
     /// what only the dropped renderer held (design.md "Memory Budget",
     /// the result's atlas report).
     fn screen_dropped(&mut self) {
+        // The pages upload went with the screen: never published.
+        if let Some((_, reply)) = self.pages_hand.take() {
+            let _ = reply.send(PagesAnswer::Lost);
+        }
         let word = self.shared.cutoff.load(Ordering::Acquire);
         if !self.cut_off && word & cutoff::ASKED != 0 && word & cutoff::PHASE != cutoff::CUT_OFF {
             self.shared
@@ -9513,7 +9705,22 @@ impl Run {
         };
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
-        let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
+        let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
+        // Play's admission released the result's installation: recorded
+        // with the staging's request and published before its answer
+        // (design.md "Memory Budget", R5).
+        let released = screen.take_result_release();
+        if let Some([need, result, limit]) = released {
+            eprintln!(
+                "render: play's admission released the result's installation for request {}: play needs {need} texels with the result's {result}, of {limit}",
+                p.request
+            );
+            self.released = Some(p.request);
+        }
+        let Some(answer) = answer else {
+            if released.is_some() {
+                self.reconcile_result();
+            }
             return;
         };
         if matches!(answer, Ok(Preparation::Ready)) {
@@ -10017,15 +10224,18 @@ impl Run {
             s.cancel_bga_upload();
         }
         self.check_chart_hand();
+        self.check_pages_hand();
+        let mut pages_end = None;
         let step = match self.screen.as_mut() {
             Some(s) => {
-                let up = match held {
+                let mut up = match held {
                     Some(shown_at) => {
                         s.upload_boundary(&mut Self::hold_past(self.clock, &self.shared, shown_at))
                     }
                     None => s.upload_boundary(&mut || false),
                 };
                 self.staged_seen |= up.staged.is_some();
+                pages_end = up.pages.take();
                 if let Some(end) = up.chart
                     && let Some(hand) = self.chart_hand.take()
                 {
@@ -10045,6 +10255,9 @@ impl Run {
             }
             None => stale,
         };
+        if let Some(end) = pages_end {
+            self.pages_end(end);
+        }
         if self.bga_reply.is_none() {
             return;
         }
@@ -11240,6 +11453,153 @@ impl Run {
         self.publish_result_status();
     }
 
+    /// The result pages begin of `ticket` (design.md "Memory Budget", the
+    /// result pages upload): at or below the withdrawn mark it does
+    /// nothing; else it withdraws the upload in hand and begins its own,
+    /// with no request taken, no attempt superseded and the mode kept.
+    /// Pages already installed publish at once; a begun upload is in hand
+    /// until a boundary ends it; a refusal answers with why; a device
+    /// failure drops the screen, its answer lost.
+    fn begin_pages(
+        &mut self,
+        ticket: u64,
+        pages: &Arc<PackedPages>,
+        reply: mpsc::SyncSender<PagesAnswer>,
+    ) {
+        if ticket <= self.shared.pages().withdrawn {
+            let _ = reply.send(PagesAnswer::Cancelled);
+            return;
+        }
+        if let Some((_, old)) = self.pages_hand.take() {
+            if let Some(s) = self.screen.as_mut() {
+                s.withdraw_pages();
+            }
+            let _ = old.send(PagesAnswer::Cancelled);
+        }
+        let Some(screen) = self.screen.as_mut() else {
+            let _ = reply.send(PagesAnswer::Lost);
+            return;
+        };
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::hold_result_upload();
+            if crate::dev::refuse_result_select() {
+                let _ = reply.send(PagesAnswer::Refused(
+                    "dev: the result's upload was refused".to_owned(),
+                ));
+                return;
+            }
+        }
+        #[cfg(feature = "dev-tools")]
+        let retained = screen
+            .retained_atlases(ScreenKind::Result)
+            .iter()
+            .flatten()
+            .count();
+        #[cfg(feature = "dev-tools")]
+        let _ = screen.take_upload_timing();
+        let begun = screen.begin_pages(pages, ticket);
+        #[cfg(feature = "dev-tools")]
+        if let Ok(Some(b)) = &begun {
+            crate::dev::result_staged(u64::from(*b == render::PagesBegun::Begun));
+            self.pages_retained = retained;
+        }
+        match begun {
+            Ok(None) => {
+                let _ = reply.send(PagesAnswer::Refused(
+                    "this screen draws no declarative skin".to_owned(),
+                ));
+            }
+            Ok(Some(render::PagesBegun::Installed)) => {
+                let answer = self.publish_marks(ticket);
+                let _ = reply.send(answer);
+            }
+            Ok(Some(render::PagesBegun::Begun)) => {
+                self.pages_hand = Some((ticket, reply));
+                // Its begin released the earlier installation.
+                self.reconcile_result();
+            }
+            Err(e) if e.is_refusal() => {
+                self.reconcile_result();
+                let _ = reply.send(PagesAnswer::Refused(game::Chain(&e).to_string()));
+            }
+            Err(_) => {
+                let _ = reply.send(PagesAnswer::Lost);
+                self.drop_screen();
+                self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// The pages' marks for `ticket`'s publication: withdrawn, nothing;
+    /// else published.
+    fn publish_marks(&self, ticket: u64) -> PagesAnswer {
+        let mut marks = self.shared.pages();
+        if marks.withdrawn >= ticket {
+            return PagesAnswer::Cancelled;
+        }
+        marks.published = marks.published.max(ticket);
+        PagesAnswer::Ready
+    }
+
+    /// The upload in hand, read once a pass: withdrawn by its owner, it
+    /// steps no further and its array retires.
+    fn check_pages_hand(&mut self) {
+        let Some(ticket) = self.pages_hand.as_ref().map(|(t, _)| *t) else {
+            return;
+        };
+        if ticket > self.shared.pages().withdrawn {
+            return;
+        }
+        if let Some(s) = self.screen.as_mut() {
+            s.withdraw_pages();
+        }
+        if let Some((_, reply)) = self.pages_hand.take() {
+            let _ = reply.send(PagesAnswer::Cancelled);
+        }
+        self.reconcile_result();
+    }
+
+    /// How the upload in hand ended at a boundary: written, it is
+    /// published under the pages' lock unless withdrawn, and the result
+    /// kind's record follows; refused or withdrawn by the renderer, it is
+    /// answered so.
+    fn pages_end(&mut self, end: render::PagesStep) {
+        let (ticket, answer) = match end {
+            render::PagesStep::Written(t) => {
+                let Some(screen) = self.screen.as_mut() else {
+                    return;
+                };
+                let shared = Arc::clone(&self.shared);
+                let mut marks = shared.pages();
+                let answer = if marks.withdrawn >= t {
+                    drop(marks);
+                    screen.withdraw_pages();
+                    PagesAnswer::Cancelled
+                } else {
+                    screen.publish_pages();
+                    marks.published = marks.published.max(t);
+                    drop(marks);
+                    PagesAnswer::Ready
+                };
+                #[cfg(feature = "dev-tools")]
+                if let Some(timing) = screen.take_upload_timing() {
+                    crate::dev::print_upload(false, self.pages_retained, timing);
+                }
+                (t, answer)
+            }
+            render::PagesStep::Refused(t, e) => {
+                (t, PagesAnswer::Refused(game::Chain(&e).to_string()))
+            }
+            render::PagesStep::Withdrawn(t) => (t, PagesAnswer::Cancelled),
+        };
+        if let Some((_, reply)) = self.pages_hand.take_if(|(h, _)| *h == ticket) {
+            let _ = reply.send(answer);
+        }
+        self.reconcile_result();
+    }
+
     /// The screen failed: what the result kind keeps is read from it one
     /// last time, then it is dropped.
     fn drop_screen(&mut self) {
@@ -11970,6 +12330,7 @@ impl Run {
         let same_holders = true;
         let same = same_holders
             && status.installed == installed
+            && status.released == self.released
             && status.menus == menus
             && status.disabled == self.result_disabled
             && status.lifetime == lifetime
@@ -12010,6 +12371,7 @@ impl Run {
             None
         };
         status.installed = installed;
+        status.released = self.released;
         status.menus = menus;
         status.disabled.clone_from(&self.result_disabled);
         status.lifetime = lifetime;

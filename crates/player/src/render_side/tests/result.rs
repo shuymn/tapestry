@@ -373,6 +373,22 @@ impl Screen for Recorded {
     ) -> Result<Preparation, render::RenderError> {
         self.menu.install_pages(kind, pages, request)
     }
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<skin_model::PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, render::RenderError> {
+        self.menu.begin_pages(pages, ticket)
+    }
+    fn publish_pages(&mut self) -> Option<u64> {
+        self.menu.publish_pages()
+    }
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        self.menu.withdraw_pages()
+    }
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        self.menu.take_result_release()
+    }
     fn restore_pages(
         &mut self,
         kind: ScreenKind,
@@ -2035,7 +2051,7 @@ fn a_panic_in_the_upload_fails_the_screen_before_its_teardown() {
             .image_stage(ResultChart::default(), None, || false, || false);
         faults.hold_drop.store(true, Ordering::Release);
         faults.panic_install.store(true, Ordering::Release);
-        p.upload_result();
+        p.result_step();
         let failed = p.render.failed();
         let preflight_stops = p.screen_failed();
         assert!(failed, "the failure is seen when the wait returns");
@@ -2271,7 +2287,7 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
                     }
                     at
                 });
-                p.upload_result();
+                p.result_step();
                 let returned = Instant::now();
                 let at = stopper.join().unwrap();
                 returned.duration_since(at)
@@ -4073,5 +4089,174 @@ fn a_first_frame_lost_is_acknowledged_after_its_recovery() {
     rig.link.prepare().unwrap();
     assert!(rig.until(|d| skin_frame(d).is_some()));
     assert!(wait_until(|| rig.link.result_acknowledged() == entry));
+    rig.link.exit();
+}
+
+/// The pages ticket's answer, polled as the game thread does.
+fn pages_answer(t: &mut crate::render_side::PendingPages) -> crate::render_side::PagesAnswer {
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end {
+        if let Some(a) = t.poll(Duration::from_millis(5)) {
+            return a.unwrap();
+        }
+    }
+    panic!("the pages ticket was never answered");
+}
+
+/// V16a, the publication first: the pages published before the owner's
+/// withdrawal are the result's pages-only installation, and the
+/// withdrawal reports them published, which is final.
+#[test]
+fn a_pages_ticket_published_first_is_reported_published() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    assert!(wait_until(
+        || rig.link.result_status().installed == Some(skin.atlas_id())
+    ));
+    assert!(t.withdraw(), "published before the withdrawal");
+    assert!(!t.withdraw(), "final");
+    assert!(t.poll(Duration::ZERO).is_none(), "settled");
+    rig.link.exit();
+}
+
+/// V16a, before the begin: a ticket withdrawn before the render thread
+/// takes it releases, reserves and creates nothing; the earlier
+/// installation stays installed.
+#[test]
+fn a_pages_ticket_withdrawn_before_its_begin_releases_nothing() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_a_dir, a) = fixed_skin();
+    let (_b_dir, b) = fixed_skin();
+    let rig = Rig::new();
+    let mut first = rig.link.begin_result_pages(Arc::clone(a.atlas_pages()));
+    assert_eq!(
+        pages_answer(&mut first),
+        crate::render_side::PagesAnswer::Ready
+    );
+    // The render thread held in a selection of `a`'s pages (installed: it
+    // keeps them), `b`'s ticket queued behind it and withdrawn.
+    crate::dev::hold_result_uploads(true);
+    let held = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+            a.atlas_pages(),
+        )));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    let mut late = rig.link.begin_result_pages(Arc::clone(b.atlas_pages()));
+    assert!(!late.withdraw(), "nothing published");
+    crate::dev::hold_result_uploads(false);
+    assert_eq!(held.wait().unwrap(), Preparation::Ready);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, Some(a.atlas_id()), "{status:?}");
+    assert!(!status.retained.contains(&b.atlas_id()), "{status:?}");
+    rig.link.exit();
+}
+
+/// V16a, after the begin: the begin's release stands, nothing is
+/// published, the ticket answers cancelled, and both arrays retire.
+#[test]
+fn a_pages_ticket_withdrawn_after_its_begin_keeps_the_release() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_a_dir, a) = fixed_skin();
+    let (_b_dir, b) = fixed_skin();
+    let rig = Rig::new();
+    let mut first = rig.link.begin_result_pages(Arc::clone(a.atlas_pages()));
+    assert_eq!(
+        pages_answer(&mut first),
+        crate::render_side::PagesAnswer::Ready
+    );
+    // Held after the withdrawn mark was read: the begin then runs.
+    crate::dev::hold_result_uploads(true);
+    let mut t = rig.link.begin_result_pages(Arc::clone(b.atlas_pages()));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    assert!(!t.withdraw(), "nothing published");
+    crate::dev::hold_result_uploads(false);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, None, "{status:?}");
+    assert!(
+        wait_until(|| {
+            let s = rig.link.result_status();
+            !s.retained.contains(&a.atlas_id()) && !s.retained.contains(&b.atlas_id())
+        }),
+        "{:?}",
+        rig.link.result_status()
+    );
+    rig.link.exit();
+}
+
+/// Recovery: the screen dropped with the upload in hand answers its
+/// ticket lost, never published.
+#[test]
+fn a_pages_ticket_in_hand_when_the_screen_drops_is_lost() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    crate::dev::hold_result_uploads(true);
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    // Queued behind the begin, which the hold lets go meanwhile: a chart
+    // load that fails on the device.
+    rig.faults.fail_load.store(1, Ordering::Release);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::dev::hold_result_uploads(false);
+        });
+        // Built again after the failure, the load answers as it may.
+        let _ = rig.link.load(Arc::clone(&chart), None);
+    });
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Lost);
+    rig.link.exit();
+}
+
+/// §5.3: a pages begin taken while the attempt is staged takes no request
+/// and supersedes nothing: the attempt answers ready and commits, and
+/// the pages publish beside it.
+#[test]
+fn a_pages_begin_leaves_the_attempts_staging() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    let (_staged_dir, staged) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.link.loading().show(super::one_line("loading"));
+    let mut attempt = rig.link.begin_attempt(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(staged),
+    );
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Ready);
+    rig.link.commit_attempt().unwrap();
+    assert!(rig.faults.commit_found.load(Ordering::Acquire));
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    rig.link.end_loading().unwrap();
     rig.link.exit();
 }

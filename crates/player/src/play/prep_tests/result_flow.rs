@@ -1002,3 +1002,55 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     // Nothing lost for want of room.
     assert_eq!(crate::dev::loop_probe::tests::dropped(), 0);
 }
+
+/// §5.1's step 3 (design.md "Memory Budget", the result pages upload):
+/// the attempt's own pages ticket is begun after its PrepareAttempt, its
+/// array uploaded before the commit, and the commit waits for its
+/// publication instead of selecting the pages; the result draws on them.
+/// A retry whose pages are installed begins no ticket and uploads
+/// nothing (step 5, V10g).
+#[test]
+fn the_attempts_pages_are_its_own_ticket_and_a_retry_sends_nothing() {
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    // A pending skin reading a result fact: its layout is the view's, so
+    // the attempt uploads its pages.
+    let skin = lua_result(
+        "local nr = ms.number(154)",
+        &format!("d[#d + 1] = {MARK_DST}"),
+    );
+    let p = result::pending(skin.path(), result::LIMITS);
+    on_warp(l.chart(), true, |rig, seen| {
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))))
+            .with_scripts(rig.render.scripts().clone());
+        let u0 = crate::dev::result_uploads();
+        let mut h = begin(rig, &l);
+        readied(rig, &mut h);
+        assert!(rig.pages_ticket.is_some(), "begun with the preparation");
+        assert_eq!(
+            crate::dev::result_uploads() - u0,
+            1,
+            "its array uploaded before the commit"
+        );
+        rig.commit_attempt().unwrap();
+        assert!(rig.pages_ticket.is_none(), "settled at the commit");
+        let (atlas, _) = uploaded(rig);
+        assert_eq!(rig.render.result_status().installed, Some(atlas));
+        let first = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+        assert!(
+            first.is_some_and(|[_, m]| near(m, MARK)),
+            "drawn: {first:?}"
+        );
+        // The retry: its pages installed, nothing begun or uploaded.
+        let mut h = begin(rig, &l);
+        readied(rig, &mut h);
+        assert!(rig.pages_ticket.is_none(), "installed: no ticket");
+        rig.commit_attempt().unwrap();
+        assert_eq!(
+            crate::dev::result_uploads() - u0,
+            1,
+            "nothing uploaded again"
+        );
+        assert_eq!(rig.render.result_status().installed, Some(atlas));
+    });
+}

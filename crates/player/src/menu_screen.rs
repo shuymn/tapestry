@@ -1199,6 +1199,28 @@ impl Screen for MenuScreen {
         }
     }
 
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<skin_model::PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, RenderError> {
+        self.renderer.begin_pages(pages, ticket).map(Some)
+    }
+
+    fn publish_pages(&mut self) -> Option<u64> {
+        self.renderer.publish_pages()
+    }
+
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        self.renderer.withdraw_pages()
+    }
+
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        self.renderer
+            .take_result_release()
+            .then(|| self.renderer.release_figures())
+    }
+
     fn restore_pages(
         &mut self,
         kind: ScreenKind,

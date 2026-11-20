@@ -326,6 +326,22 @@ impl Screen for Noted {
     ) -> Result<Preparation, RenderError> {
         self.menu.install_pages(kind, pages, request)
     }
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<skin_model::PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, RenderError> {
+        self.menu.begin_pages(pages, ticket)
+    }
+    fn publish_pages(&mut self) -> Option<u64> {
+        self.menu.publish_pages()
+    }
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        self.menu.withdraw_pages()
+    }
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        self.menu.take_result_release()
+    }
     fn restore_pages(
         &mut self,
         kind: ScreenKind,

@@ -1604,6 +1604,10 @@ pub struct Renderer {
     /// Play's admission released the result's installation
     /// ([`take_result_release`](Self::take_result_release)).
     result_released: bool,
+    /// At the last release for play: play's need with the pool at its
+    /// firm layer and the result's charge counted, the result's charge,
+    /// and the limit.
+    release_figures: [u64; 3],
     /// The result kind is disabled for the run ([`disable_result`](Self::disable_result)).
     result_disabled: bool,
     /// The result's lines prepared and not yet drawn, with the pages
@@ -1901,6 +1905,7 @@ impl Renderer {
             #[cfg(test)]
             pool_write_fault: None,
             result_released: false,
+            release_figures: [0; 3],
             result_disabled: false,
             staged_result_text: None,
             #[cfg(any(test, feature = "dev-tools"))]
@@ -2552,6 +2557,11 @@ impl Renderer {
             Reclaim::ReleaseResult => {
                 self.destroy_charged()?;
                 self.reduce_pool(1, kind)?;
+                self.release_figures = [
+                    self.needed(kind, charge),
+                    self.charge(ScreenKind::Result),
+                    SHARED_TEXELS,
+                ];
                 self.remove(ScreenKind::Result);
                 // The release only retires the result's arrays (`rel:*`);
                 // their destruction is marked where the retirement list
@@ -6272,6 +6282,14 @@ impl Renderer {
     #[must_use]
     pub const fn destructions_recorded(&self) -> usize {
         self.retire.recorded()
+    }
+
+    /// At the last release for play (design.md "Memory Budget", R5):
+    /// play's need with the pool at its firm layer and the result's charge
+    /// counted, the result's charge, and the limit.
+    #[must_use]
+    pub const fn release_figures(&self) -> [u64; 3] {
+        self.release_figures
     }
 
     /// Whether play's admission released the result's installation since

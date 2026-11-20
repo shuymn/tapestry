@@ -30,6 +30,9 @@ pub(super) struct PagesUpload {
     entry: Option<usize>,
     /// Every page written and the last step's completion seen.
     pub(super) written: bool,
+    /// When it began and when its last step was submitted (G1's timing).
+    #[cfg(any(test, feature = "dev-tools"))]
+    timing: (Instant, Instant),
 }
 
 /// How a result pages begin was taken.
@@ -85,11 +88,18 @@ impl Renderer {
         if self.committed_atlas(kind) == Some(pages.id()) {
             return Ok(PagesBegun::Installed);
         }
+        #[cfg(any(test, feature = "dev-tools"))]
+        let began = Instant::now();
         let entry = self.reserve_room(Hold::Staging(kind), kind)?;
         self.release(kind);
         self.staging_entry = Some(entry);
         let res = self.pages_array(pages);
         self.staging_entry = None;
+        // Its timing is taken at its last step's completion.
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            self.upload_timing = None;
+        }
         match res {
             Ok(res) => {
                 self.pages_upload = Some(PagesUpload {
@@ -98,6 +108,8 @@ impl Renderer {
                     writes: skin_atlas::AtlasWrites::new(Arc::clone(pages)),
                     entry: Some(entry),
                     written: false,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    timing: (began, began),
                 });
                 Ok(PagesBegun::Begun)
             }
@@ -192,7 +204,18 @@ impl Renderer {
             return None;
         }
         up.written = true;
-        Some(up.ticket)
+        let ticket = up.ticket;
+        // G1's timing for a stepped upload: from its begin to its last
+        // step's submission, then to the completion seen.
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            let (began, last) = up.timing;
+            self.upload_timing = Some(super::UploadTiming {
+                written: last.duration_since(began),
+                done: Some(last.elapsed()),
+            });
+        }
+        Some(ticket)
     }
 
     /// One step of the upload's pages, as a staging's
@@ -261,6 +284,10 @@ impl Renderer {
             gpu.submit([])
         });
         atlas.mark(number);
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            up.timing.1 = Instant::now();
+        }
         self.step = Some(crate::upload::InFlight::register(&self.gpu, index));
         if let Some(e) = refused
             && let Some(up) = self.pages_upload.take()
