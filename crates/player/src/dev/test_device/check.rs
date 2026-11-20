@@ -20,11 +20,11 @@ fn expectation(rows: &[Row], row: &str) -> Option<Expectation> {
 }
 
 /// Prints every note and mismatch, then `CONTRACT <row> ok` or
-/// `CONTRACT <row> mismatch <n>`.
+/// `CONTRACT <row> mismatch <n>`, on standard output only.
 ///
 /// # Errors
 ///
-/// An unknown row, or any mismatch (the error is the last line).
+/// An unknown row, or any mismatch.
 pub fn check(row: &str, dir: &Path) -> anyhow::Result<()> {
     run(ROWS, row, dir)
 }
@@ -42,7 +42,11 @@ fn run(rows: &[Row], row: &str, dir: &Path) -> anyhow::Result<()> {
     }
     let last = report.last_line(row);
     println!("{last}");
-    if report.ok() { Ok(()) } else { bail!("{last}") }
+    if report.ok() {
+        Ok(())
+    } else {
+        bail!("the run does not match row `{row}`'s expectation")
+    }
 }
 
 #[cfg(test)]
@@ -63,6 +67,7 @@ mod tests {
             exits: vec![ExitRule {
                 role: SINGLE,
                 process: RUNNER,
+                writes: None,
                 exit: Exit::Code(0),
             }],
             records: vec![],
@@ -90,16 +95,17 @@ mod tests {
         let rows: &[Row] = &[("bare", bare)];
         // An empty folder: no run.jsonl.
         let e = run(rows, "bare", dir.path()).unwrap_err().to_string();
-        assert_eq!(e, "CONTRACT bare mismatch 1");
+        assert_eq!(e, "the run does not match row `bare`'s expectation");
         let start = r#"{"t":"start","run":"0123456789abcdef0123456789abcdef","row":"bare","role":"run","build":"0123456789ab","process":{"pid":1,"created":2},"args":[]}"#;
         let end = r#"{"t":"end","exit":0,"errors":[]}"#;
         std::fs::write(dir.path().join("run.jsonl"), format!("{start}\n{end}\n")).unwrap();
-        let e = run(rows, "bare", dir.path()).unwrap_err().to_string();
+        let report = test_device::contract::check(&bare(), dir.path());
         assert_eq!(
-            e, "CONTRACT bare mismatch 1",
-            "the provenance check is missing"
+            report.last_line("bare"),
+            "CONTRACT bare mismatch 1",
+            "the provenance check is missing: {report:?}"
         );
-        let verdict = r#"{"row":"bare","check":"provenance","outcome":"incomplete","detail":"no hello recorded","inputs":[],"producer":{"name":"judge","version":"0123456789ab"}}"#;
+        let verdict = r#"{"row":"bare","run":"0123456789abcdef0123456789abcdef","check":"provenance","outcome":"incomplete","detail":"no hello recorded","inputs":[],"producer":{"name":"judge","version":"0123456789ab"}}"#;
         std::fs::write(
             dir.path().join("verdicts-judge.jsonl"),
             format!("{verdict}\n"),
