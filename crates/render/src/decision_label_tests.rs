@@ -1436,3 +1436,58 @@ fn decision_region_survives_play_text_pressure() {
         "the pinned labels draw otherwise"
     );
 }
+
+/// V8a with a decision label row: a row queued with no submission, the
+/// newest seen covering every submission so far, then the decision
+/// removed: its array is not destroyed before a completion covering the
+/// row's submission is seen.
+// Revert: a decision label row's write left unmarked on its array, the
+// write still queued -> the removed decision's entry is due at once, and
+// `destroy_due` destroys it before any poll, its row still queued:
+// "destroyed before its row's completion was seen".
+#[test]
+fn a_removed_decision_waits_for_its_queued_label_row() {
+    let dir = decision_folder(
+        &[("ttf.ttf", font_support::build(&font_support::latin("Skin")))],
+        &[ttf()],
+        &[text("f", 256, Value::Ref(10), [0, 100, 1_900, 256])],
+    );
+    let (mut r, b) = installed(&dir);
+    super::wait_for_gpu(&r.gpu).unwrap();
+    let s = r.gpu.latest();
+    let mut store = store_for();
+    store.offer(stage(&b, job(&r, 1, "a", "ABCDEFGHIJKLMNOPQRST")));
+    let _slot = store.claim().unwrap();
+    // One boundary of a fill that takes more: its rows queued, none
+    // submitted.
+    assert!(matches!(
+        r.write_decision_labels(&mut store),
+        FillStep::Wrote
+    ));
+    assert!(r.gpu.write_queued());
+    assert_eq!((r.gpu.latest(), r.gpu.seen()), (s, s));
+    r.remove(ScreenKind::Decision);
+    assert_eq!(r.filled(), 1);
+    assert_eq!(
+        r.destroy_due(true),
+        super::Destroyed::default(),
+        "destroyed before its row's completion was seen"
+    );
+    assert!(r.pending_completion());
+    let from = r.destructions_recorded();
+    let began = std::time::Instant::now();
+    while r.filled() > 0 {
+        assert!(began.elapsed() < Duration::from_secs(10), "still filled");
+        r.poll_completion().unwrap();
+        let _ = r.destroy_due(true);
+        std::thread::yield_now();
+    }
+    assert_eq!(r.destructions_recorded(), from + 1);
+    let d = r.destructions().last().copied().unwrap();
+    assert_eq!(
+        (d.kind, d.id, d.part),
+        (ScreenKind::Decision, Some(b.atlas_id()), super::Part::Array)
+    );
+    assert_eq!(d.last_use, s + 1, "the row's submission");
+    assert!(d.seen > s, "no completion covering the row seen: {d:?}");
+}

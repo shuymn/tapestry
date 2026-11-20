@@ -24,7 +24,27 @@ windows-only = true
 [features]
 default = []
 # Development features. Never enabled in production builds (R3).
-dev-tools = ["game/dev-tools", "input/dev-tools", "render/dev-tools", "skin-beatoraja/dev-tools", "dep:serde", "dep:toml"]
+dev-tools = [
+    "game/dev-tools",
+    "input/dev-tools",
+    "render/dev-tools",
+    "skin-beatoraja/dev-tools",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:test-device",
+    "dep:toml",
+    # `tapestry test-device` (docs/test-device.md "Host Commands").
+    "windows/Win32_Devices_Communication",
+    "windows/Win32_Devices_DeviceAndDriverInstallation",
+    "windows/Win32_Devices_HumanInterfaceDevice",
+    "windows/Win32_Devices_Properties",
+    "windows/Win32_Devices_Usb",
+    "windows/Win32_Security",
+    "windows/Win32_System_IO",
+    "windows/Win32_System_Performance",
+    "windows/Win32_System_Registry",
+    "windows/Win32_UI_Input",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -45,6 +65,8 @@ rules.workspace = true
 skin-beatoraja.workspace = true
 skin-model.workspace = true
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+test-device = { workspace = true, optional = true }
 thiserror.workspace = true
 toml = { workspace = true, optional = true }
 windows = { workspace = true, features = [

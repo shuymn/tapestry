@@ -98,11 +98,14 @@ pub use renderer::UploadTiming;
 #[cfg(feature = "dev-tools")]
 pub use renderer::take_build_start;
 pub use renderer::{
-    Admission, ChartOutcome, ChartTarget, CommitError, FrameOutcome, FrameTiming, LoadingOn,
-    LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness, PreparedToken,
-    RESULT_STRIP_SPRITES, RenderError, Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES,
+    Admission, ChartOutcome, ChartTarget, Class, CommitError, CpuParts, Destroyed, Destruction,
+    FrameOutcome, FrameTiming, Handoff, HeavyOps, LoadingOn, LoadingTextError, LoadingTextKey,
+    MAX_SPRITES, MemoryWitness, Part, PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES,
+    RETIREMENT_ENTRIES, RenderError, Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES,
     Target, VM_TEXELS, letterbox,
 };
+#[cfg(any(test, feature = "dev-tools"))]
+pub use renderer::{DestroyRecord, RECORD_LEN};
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,

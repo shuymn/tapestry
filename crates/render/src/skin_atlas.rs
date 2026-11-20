@@ -205,15 +205,20 @@ pub(crate) struct AtlasTexture {
     /// set by a whole write, cleared before any write and by a failed one.
     /// An id, never the set (it keeps no pixels alive).
     chart_set: Option<u64>,
+    /// The number of the last submission that uses the array, a draw's or
+    /// a write's ([`Gpu::submit`]): its retirement waits until a
+    /// completion covering it is seen.
+    last_use: std::sync::atomic::AtomicU64,
 }
 
 /// The next [`AtlasTexture::serial`].
 static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// An array dropped before any frame sampled it, whatever drops it (a
-/// staging replaced or refused after its upload, a release, a drain), ends
-/// its first use's wait (`fu:discarded`, dev-tools); one drawn or replaced
-/// by a newer upload is no longer awaited, and nothing is marked.
+/// An array dropped before any frame sampled it, whatever drops it (its
+/// retirement entry's destruction, after a staging replaced or refused
+/// after its upload or a release retired it), ends its first use's wait
+/// (`fu:discarded`, dev-tools); one drawn or replaced by a newer upload is
+/// no longer awaited, and nothing is marked.
 #[cfg(feature = "dev-tools")]
 impl Drop for AtlasTexture {
     fn drop(&mut self) {
@@ -228,7 +233,7 @@ impl AtlasTexture {
     pub(crate) fn builtin(gpu: &Gpu) -> Self {
         let texture = create(gpu.device(), ATLAS_SIZE, 1, 1);
         write(gpu.queue(), &texture, 0, 0, ATLAS_SIZE, &build_atlas());
-        Self::of(&texture, ATLAS_SIZE, 1, 1)
+        Self::of(&texture, ATLAS_SIZE, 1, 1, gpu.queued_use())
     }
 
     /// The array of `pages`, of `layers` layers as [`check_pages`] gave
@@ -286,13 +291,13 @@ impl AtlasTexture {
             crate::probe::us(writing.elapsed()),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let mut atlas = Self::of(&texture, side, layers, levels);
+        let mut atlas = Self::of(&texture, side, layers, levels, gpu.queued_use());
         atlas.text_layer = text_layer;
         atlas.chart_layer = chart_layer;
         atlas
     }
 
-    fn of(texture: &wgpu::Texture, side: u32, layers: u32, levels: u32) -> Self {
+    fn of(texture: &wgpu::Texture, side: u32, layers: u32, levels: u32, used: u64) -> Self {
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("atlas"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -308,7 +313,21 @@ impl AtlasTexture {
             chart_layer: None,
             serial: SERIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             chart_set: None,
+            last_use: std::sync::atomic::AtomicU64::new(used),
         }
+    }
+
+    /// Records `number` as the array's last use, when later than the one
+    /// recorded.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn mark(&self, number: u64) {
+        self.last_use
+            .fetch_max(number, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The number of the last submission that uses the array.
+    pub(crate) fn last_use(&self) -> u64 {
+        self.last_use.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// This array's number, unique in the process.

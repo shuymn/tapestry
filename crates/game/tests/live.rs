@@ -104,6 +104,46 @@ fn key(at: i64, control: ControlId, value: i32) -> ScriptItem {
 #[error("the surface cannot be made again")]
 struct SurfaceLost;
 
+/// How a scripted cutoff ends ([`CutoffScript`]).
+#[derive(Clone, Copy, Debug)]
+enum CutoffEnd {
+    /// The render thread acknowledges it.
+    CutOff,
+    /// A renderer dropped under it: the phase lost, with the screen's
+    /// failure latched as the drop latches it.
+    Lost,
+    /// Never acknowledged.
+    Waits,
+}
+
+/// The render side's cutoff for one attempt (from 1, counted by its
+/// commits), scripted ([`Rig::cutoff`]): every ask is logged as `cutoff`,
+/// with its clock time in `asks`, and answers `Waiting` until its
+/// `slices`-th park, where it ends as `end` and `with` happens; each park
+/// is a production slice (10 ms) of waits.
+#[derive(Clone, Debug)]
+struct CutoffScript {
+    attempt: usize,
+    slices: usize,
+    end: CutoffEnd,
+    with: Option<FirstPoll>,
+    parked: usize,
+    asks: Vec<i64>,
+}
+
+impl CutoffScript {
+    fn new(attempt: usize, slices: usize, end: CutoffEnd, with: Option<FirstPoll>) -> Self {
+        Self {
+            attempt,
+            slices,
+            end,
+            with,
+            parked: 0,
+            asks: Vec::new(),
+        }
+    }
+}
+
 /// A rig on a virtual clock: each wait moves it 1 ms and feeds the
 /// script's batches at their clock times, as the input thread receives
 /// them.
@@ -327,6 +367,9 @@ struct Fake {
     /// audio's cuts asked so far, and the Closing start the play's view
     /// then published.
     closings: Vec<(usize, Option<TimeUs>)>,
+    /// The render side's cutoff: for every attempt it does not script,
+    /// cut off at once, logging nothing.
+    cutoff: Option<CutoffScript>,
 }
 
 /// What happens during a preparation's first poll ([`Fake::in_first_poll`])
@@ -514,6 +557,7 @@ impl Fake {
             menu_pressed: std::sync::Arc::default(),
             readies: 0,
             closings: Vec::new(),
+            cutoff: None,
         }
     }
 
@@ -772,6 +816,52 @@ impl Rig for Fake {
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
         self.steps.push("end loading");
         Ok(())
+    }
+
+    fn cutoff(&mut self) -> Result<game::Cutoff, SurfaceLost> {
+        let attempt = self.steps.iter().filter(|&&s| s == "commit").count();
+        let now = self.clock.now().0;
+        let Some(script) = self.cutoff.as_mut().filter(|c| c.attempt == attempt) else {
+            return Ok(game::Cutoff::CutOff);
+        };
+        script.asks.push(now);
+        let answer = if script.parked < script.slices {
+            Ok(game::Cutoff::Waiting)
+        } else {
+            match script.end {
+                CutoffEnd::CutOff => Ok(game::Cutoff::CutOff),
+                CutoffEnd::Lost => Err(SurfaceLost),
+                CutoffEnd::Waits => Ok(game::Cutoff::Waiting),
+            }
+        };
+        self.steps.push("cutoff");
+        answer
+    }
+
+    /// A production slice of waits; the script ends at its last. The wait
+    /// is bounded: a second of slices without leaving fails.
+    fn cutoff_park(&mut self) {
+        let script = self.cutoff.as_ref().expect("a park with no cutoff asked");
+        assert!(
+            self.clock.now().0 < script.asks[0] + 1_000_000,
+            "the cutoff's wait did not leave: {:?}",
+            self.steps
+        );
+        for _ in 0..10 {
+            self.wait();
+        }
+        let script = self.cutoff.as_mut().expect("a park with no cutoff asked");
+        script.parked += 1;
+        if script.parked != script.slices {
+            return;
+        }
+        let (end, with) = (script.end, script.with);
+        if matches!(end, CutoffEnd::Lost) {
+            self.happen(FirstPoll::ScreenFails);
+        }
+        if let Some(what) = with {
+            self.happen(what);
+        }
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -3869,6 +3959,146 @@ fn an_immediate_play_retry_uses_the_standard_opening() {
     };
     assert!(prep > rig.origins[1].0, "{prep} {:?}", rig.origins);
     assert!(rig.accepted.is_empty(), "{:?}", rig.accepted);
+}
+
+/// A first play retried at once, its retry's cutoff scripted: the rig and
+/// the run's end.
+fn retried_with_cutoff(
+    script: CutoffScript,
+) -> (Fake, Result<game::Leave, LiveError<SurfaceLost>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 20_000_000);
+    rig.cutoff = Some(script);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    (rig, ran)
+}
+
+/// The retry's steps up to its end of loading.
+const RETRY_TO_END_LOADING: [&str; 7] = [
+    "screen",
+    "before play",
+    "audio",
+    "attempt",
+    "ready",
+    "commit",
+    "end loading",
+];
+
+/// The scripted cutoff's asks, each a production slice (10 ms) after the
+/// one before, `n` of them.
+fn assert_sliced(rig: &Fake, n: usize) -> Vec<i64> {
+    let asks = rig.cutoff.as_ref().unwrap().asks.clone();
+    assert_eq!(asks.len(), n, "{:?}", rig.steps);
+    assert!(asks.windows(2).all(|w| w[1] - w[0] == 10_000), "{asks:?}");
+    asks
+}
+
+// Revert: the cutoff asked before the end of loading -> the retry's
+// steps put `cutoff` before `end loading`, the order assertion fails.
+// Revert: the last look before the cutoff's wait -> the quit that comes
+// with the cutoff is not looked at and the retry opens, fails.
+/// A retry, a standard attempt, waits after its end of loading for the
+/// render side's cutoff, in production slices, and opens once it is cut
+/// off, after the last look: a quit that came with the cutoff leaves the
+/// retry there. The first attempt, unscripted, is cut off at once.
+#[test]
+fn a_retry_waits_for_the_cutoff_then_looks_last() {
+    for quit in [false, true] {
+        let with = quit.then_some(FirstPoll::Command(Command::Quit));
+        let (rig, ran) = retried_with_cutoff(CutoffScript::new(2, 3, CutoffEnd::CutOff, with));
+        // Left at the retry's last look, or played to the window's close.
+        let left = if quit {
+            game::Leave::Back
+        } else {
+            game::Leave::Quit
+        };
+        assert_eq!(ran.unwrap(), left, "{quit}");
+        let waited = [
+            &RETRY_TO_END_LOADING[..],
+            &["cutoff", "cutoff", "cutoff", "cutoff"],
+        ]
+        .concat();
+        let asks = assert_sliced(&rig, 4);
+        if quit {
+            assert_eq!(rig.steps, [&STANDARD_ATTEMPT[..], &waited[..]].concat());
+            assert_eq!(rig.opens, 1);
+        } else {
+            assert_eq!(
+                rig.steps,
+                [&STANDARD_ATTEMPT[..], &waited[..], &["open"]].concat()
+            );
+            // Opened at the answer that cut off.
+            assert_eq!(rig.origins[1].0, asks[3] + 1_000_000);
+        }
+    }
+}
+
+// Revert: the wait parked until a zero count's wake, with no slice looks
+// -> neither case leaves while the cutoff waits on, and the rig's second
+// of slices fails.
+/// A quit key or a close while a retry's cutoff is waited for leaves the
+/// retry at the next slice's look, before recording opens.
+#[test]
+fn a_quit_or_close_while_a_retrys_cutoff_waits_leaves_it() {
+    for (case, what, left) in [
+        (
+            "quit key",
+            FirstPoll::Command(Command::Quit),
+            game::Leave::Back,
+        ),
+        ("close", FirstPoll::Close, game::Leave::Quit),
+    ] {
+        let script = CutoffScript::new(2, 2, CutoffEnd::Waits, Some(what));
+        let (rig, ran) = retried_with_cutoff(script);
+        assert_eq!(ran.unwrap(), left, "{case}");
+        assert_sliced(&rig, 3);
+        assert!(
+            rig.steps
+                .ends_with(&["end loading", "cutoff", "cutoff", "cutoff"]),
+            "{case}: {:?}",
+            rig.steps
+        );
+        assert_eq!(rig.opens, 1, "{case}");
+        if case == "quit key" {
+            assert!(rig.commands.is_empty(), "the quit was not taken");
+        }
+    }
+}
+
+// Revert: the wait parked until a zero count's wake, with no slice looks
+// -> the failed screen never ends the wait, and the rig's second of
+// slices fails. Revert: the slice's looks before the cutoff's answer ->
+// the lost cutoff ends the run as `ScreenLost`, fails.
+/// A screen lost under a retry's asked cutoff ends the run with the
+/// screen's error, though the drop also latched the screen's failure; a
+/// screen failed while the cutoff waits on ends it as lost at the next
+/// slice's look. The retry's recording never opens.
+#[test]
+fn a_lost_or_failed_screen_while_a_retrys_cutoff_waits_ends_the_run() {
+    for (case, end, with) in [
+        ("lost", CutoffEnd::Lost, None),
+        ("failed", CutoffEnd::Waits, Some(FirstPoll::ScreenFails)),
+    ] {
+        let (rig, ran) = retried_with_cutoff(CutoffScript::new(2, 2, end, with));
+        if case == "lost" {
+            assert!(
+                matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+                "{case}: {ran:?}"
+            );
+        } else {
+            assert!(matches!(ran, Err(LiveError::ScreenLost)), "{case}: {ran:?}");
+        }
+        assert_sliced(&rig, 3);
+        assert!(
+            rig.steps
+                .ends_with(&["end loading", "cutoff", "cutoff", "cutoff"]),
+            "{case}: {:?}",
+            rig.steps
+        );
+        assert_eq!(rig.opens, 1, "{case}");
+    }
 }
 
 /// `live::play`, which `Session::play` runs, is one attempt: prepared,

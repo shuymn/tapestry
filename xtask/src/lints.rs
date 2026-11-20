@@ -435,6 +435,9 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/render/src/presentation.rs"),
     Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
+    // The retirement list: filled, destroyed and handed on at frame
+    // boundaries.
+    Site::File("crates/render/src/retire.rs"),
     Site::File("crates/render/src/simple.rs"),
     Site::File("crates/render/src/skin.rs"),
     Site::File("crates/render/src/sprite.rs"),
@@ -547,11 +550,35 @@ pub const IN_PLAY: &[Site] = &[
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
     ),
-    Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
-    // A result frame's live chart key reads its array's number.
-    Site::Fns("crates/render/src/skin_atlas.rs", &["AtlasTexture::serial"]),
+    // The numbered submissions: every submission and queued write records
+    // its use, and each pass looks at the completion watched.
+    Site::Fns(
+        "crates/render/src/gpu.rs",
+        &[
+            "Gpu::device",
+            "Gpu::queue",
+            "Gpu::submit",
+            "Gpu::queued_use",
+            "Gpu::write_queued",
+            "Gpu::latest",
+            "Gpu::seen",
+            "Gpu::saw",
+            "Gpu::latest_index",
+            "Gpu::poll_watch",
+        ],
+    ),
+    // A result frame's live chart key reads its array's number, and a
+    // use stamps its array's last submission.
+    Site::Fns(
+        "crates/render/src/skin_atlas.rs",
+        &["AtlasTexture::serial", "AtlasTexture::mark"],
+    ),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The retirement worker's handoff table: the release reads and the
+    // sends at each pass outside READY's cutoff, and the table's ids the
+    // result's report reads.
+    Site::File("crates/player/src/retire_worker.rs"),
     // The chart images' currency, which the render thread asks per frame.
     Site::File("crates/player/src/chart_currency.rs"),
     // The application clock: each frame's readouts and every present.
@@ -593,6 +620,26 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",
             "MenuScreen::allocate_in_next_decision",
+            // Each pass's retirement work (design.md "Memory Budget"):
+            // the destruction's permission and the heavy operations' count
+            // in every pass, play's included; the rest outside READY's
+            // cutoff, at the boundary and around the frame's pacing.
+            "MenuScreen::retained_atlases",
+            "MenuScreen::entries_holding_pages",
+            "MenuScreen::poll_completion",
+            "MenuScreen::set_destroy_allowed",
+            "MenuScreen::filled",
+            "MenuScreen::destroy_due",
+            "MenuScreen::due_heavy",
+            "MenuScreen::pending_completion",
+            "MenuScreen::pool_owed",
+            "MenuScreen::make_owed_pool",
+            "MenuScreen::take_handoff",
+            "MenuScreen::return_handoff",
+            "MenuScreen::result_changes",
+            "MenuScreen::heavy_ops",
+            "MenuScreen::grant_ready",
+            "MenuScreen::bga_in_use",
             "strip_sprites",
         ],
     ),

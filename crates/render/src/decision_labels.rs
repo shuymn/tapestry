@@ -1796,7 +1796,7 @@ fn scoped<T>(t: &LabelTarget<'_>, work: impl FnOnce() -> T) -> (T, Option<wgpu::
 /// Registers one flag-only completion for the work submitted so far on
 /// `gpu`'s queue, after submitting what is queued.
 pub(crate) fn watch(gpu: &Gpu) -> Arc<AtomicBool> {
-    gpu.queue().submit([]);
+    gpu.submit([]);
     let done = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&done);
     gpu.queue()
@@ -1857,6 +1857,9 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
             if let Some(data) = level.get(from..to) {
                 let y = ((origin + line.y) >> k) + c.row;
                 text_upload::write(queue, texture, layer, k, [0, y, w, n], data);
+                // Queued: the next submission, whatever makes it, carries
+                // the row.
+                t.atlas.mark(t.gpu.queued_use());
                 fill.progress.wrote = true;
                 bytes += row * u64::from(n);
             }
@@ -1876,7 +1879,7 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
                 l.levels = Default::default();
             }
             if fill.progress.wrote {
-                queue.submit([]);
+                t.gpu.submit([]);
                 submitted = true;
             }
         }

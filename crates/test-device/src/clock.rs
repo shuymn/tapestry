@@ -279,6 +279,30 @@ impl Bounds {
         let (lo, hi) = self.map(t);
         hi.saturating_sub(lo)
     }
+
+    /// The device times host time `h` may be: the least t whose mapped
+    /// interval ends at `h` or later and the greatest whose interval
+    /// starts at `h` or earlier. Both ends of [`Self::map`] grow with t, so
+    /// each is a binary search.
+    #[must_use]
+    pub fn unmap(&self, h: i64) -> (u64, u64) {
+        const TOP: u64 = 1 << 62;
+        let first = |pred: &dyn Fn(u64) -> bool| {
+            let (mut lo, mut hi) = (0, TOP);
+            while lo < hi {
+                let m = lo + (hi - lo) / 2;
+                if pred(m) {
+                    hi = m;
+                } else {
+                    lo = m + 1;
+                }
+            }
+            lo
+        };
+        let least = first(&|t| self.map(t).1 >= h);
+        let greatest = first(&|t| self.map(t).0 > h).saturating_sub(1);
+        (least, greatest)
+    }
 }
 
 #[cfg(test)]
@@ -422,6 +446,20 @@ pub(crate) mod tests {
         pings[3].device = pings[2].device;
         assert_eq!(Bounds::fit(&pings).unwrap_err(), Error::Order { index: 3 });
         assert_eq!(Bounds::fit(&[]).unwrap_err(), Error::NoPings);
+    }
+
+    #[test]
+    fn a_host_time_maps_back_to_device_times_around_the_truth() {
+        let truth = Truth { k: 1 };
+        let bounds = Bounds::fit(&truth.pings(200, |_| (300, 200))).unwrap();
+        for d in [DEVICE0 + 1_000_000, DEVICE0 + 12_345_678] {
+            let (lo, hi) = bounds.unmap(truth.host(d));
+            assert!(lo <= d && d <= hi, "{d} not in [{lo}, {hi}]");
+            assert!(hi - lo < 1_000, "width {}", hi - lo);
+            // Each end maps back over the host time.
+            assert!(bounds.map(lo).1 >= truth.host(d));
+            assert!(bounds.map(hi).0 <= truth.host(d));
+        }
     }
 
     #[test]

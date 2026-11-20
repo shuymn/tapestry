@@ -570,8 +570,10 @@ fn a_restored_bundle_needs_no_file() {
 
 /// What a replacement holds at its peak, between its staging and its
 /// commit: the installed bundle's CPU description and resources and the
-/// staged ones together, and the upload's staging; after the commit only
-/// the new ones, and after a discard only the installed.
+/// staged ones together, and the upload's staging; after the commit the
+/// new ones, the replaced ones kept in their retirement entry until its
+/// destruction, and after a discard the installed, the discarded staging
+/// likewise kept until its entry's destruction.
 #[test]
 fn a_replacement_peaks_with_both_installations() {
     let chart = chart();
@@ -607,7 +609,10 @@ fn a_replacement_peaks_with_both_installations() {
     assert!(peak.total() > installed.total());
 
     r.commit(token).unwrap();
+    assert!(r.memory().retired > 0, "the replaced resources dropped");
+    common::settle(&mut r);
     let after = r.memory();
+    assert_eq!(after.retired, 0);
     assert_eq!(after.committed_cpu, b.resident_bytes());
     assert_eq!(
         (
@@ -624,8 +629,16 @@ fn a_replacement_peaks_with_both_installations() {
     );
 
     let token = stage(&mut r, &a, &chart, 3).unwrap();
-    assert!(r.memory().staged_atlas > 0);
+    let staged = r.memory();
+    assert!(staged.staged_atlas > 0);
     r.discard();
+    let discarded = r.memory();
+    assert_eq!(discarded.staged_atlas, 0);
+    assert!(
+        discarded.retired >= staged.staged_atlas,
+        "the discarded array dropped"
+    );
+    common::settle(&mut r);
     assert_eq!(r.memory(), after);
     assert_eq!(r.commit(token), Err(CommitError::NothingStaged));
 }

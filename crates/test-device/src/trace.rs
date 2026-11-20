@@ -207,9 +207,9 @@ impl fmt::Display for Record {
 }
 
 impl Record {
-    /// The record a line holds (without its line ending).
-    #[must_use]
-    pub fn parse(line: &str) -> Option<Self> {
+    /// The record a line's words hold, whatever their spacing and number
+    /// form.
+    fn parse(line: &str) -> Option<Self> {
         let mut w = line.split_ascii_whitespace();
         let kind = w.next()?;
         let n = w.next()?.parse().ok()?;
@@ -275,6 +275,13 @@ impl Record {
             _ => return None,
         };
         w.next().is_none().then_some(Self { n, body })
+    }
+
+    /// The record a line (without its line feed) holds in the one form the
+    /// device writes; any other line is malformed: `None`.
+    #[must_use]
+    pub fn parse_canonical(line: &str) -> Option<Self> {
+        Self::parse(line).filter(|r| crate::protocol::writes_back(r, line))
     }
 }
 
@@ -344,6 +351,14 @@ impl<const N: usize> Ring<N> {
         self.head = (self.head + 1) % N;
         self.len -= 1;
         r
+    }
+
+    /// Drops every buffered record and the count of dropped ones; the
+    /// numbers go on from where they were.
+    pub const fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+        self.lost = 0;
     }
 
     /// Whether no record waits.
@@ -668,10 +683,41 @@ mod tests {
         ];
         for (n, body) in (0..).zip(bodies) {
             let r = Record { n, body };
-            assert_eq!(Record::parse(&r.to_string()), Some(r), "{r}");
+            assert_eq!(Record::parse_canonical(&r.to_string()), Some(r), "{r}");
         }
-        assert_eq!(Record::parse("C 1 p 2 3 4"), None, "trailing field");
-        assert_eq!(Record::parse("T 1 q 2 R 3 H 4"), None, "unknown endpoint");
+        assert_eq!(
+            Record::parse_canonical("C 1 p 2 3 4"),
+            None,
+            "trailing field"
+        );
+        assert_eq!(
+            Record::parse_canonical("T 1 q 2 R 3 H 4"),
+            None,
+            "unknown endpoint"
+        );
+    }
+
+    /// The device's records are read in the one form it writes: a second
+    /// form of a valid record is malformed.
+    #[test]
+    fn a_non_canonical_record_is_malformed() {
+        let bad = [
+            "T 1 p 7 R 10 H 12 ",
+            " C 1 k 2 3",
+            "C 1 k 2 3\r",
+            "C 1  k 2 3",
+            "C\t1 k 2 3",
+            "C 01 k 2 3",
+            "C 1 k +2 3",
+            "X 1 p 3 1 018 5",
+            "F 1 ",
+        ];
+        for line in bad {
+            assert_eq!(Record::parse_canonical(line), None, "{line:?}");
+            // Each stands for a valid record read leniently.
+            assert!(Record::parse(line).is_some(), "{line:?}");
+        }
+        assert!(Record::parse_canonical("C 1 k 2 3").is_some());
     }
 
     #[test]
