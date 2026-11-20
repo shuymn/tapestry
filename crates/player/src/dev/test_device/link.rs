@@ -430,6 +430,11 @@ impl Connection {
         self.unanswered_pings
     }
 
+    /// The connection's newest round trips.
+    pub fn pings(&self) -> Vec<clock::Ping> {
+        self.pings.iter().copied().collect()
+    }
+
     /// The clock bounds of the connection's newest round trips.
     ///
     /// # Errors
@@ -833,6 +838,8 @@ pub mod fake {
         pub held: Vec<String>,
         /// Reads lines with the lenient parse.
         pub lenient: bool,
+        /// Lines starting with one of these are refused `err stale`.
+        pub refuse: Vec<String>,
         /// The number its next grant gets.
         pub lease_n: u32,
         pub touched: bool,
@@ -876,6 +883,9 @@ pub mod fake {
                     Command::parse_canonical(t)
                 }
             });
+            if text.is_some_and(|t| self.refuse.iter().any(|r| t.starts_with(r.as_str()))) {
+                return "err stale".to_owned();
+            }
             let Some(cmd) = cmd else {
                 return if line.len() > MAX_LINE {
                     "err overlong".to_owned()

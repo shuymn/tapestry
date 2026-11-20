@@ -230,6 +230,13 @@ pub enum Run {
     Stop(RunNote),
     /// A step of the recovery after the end found no release evidence.
     Recovery(RunNote),
+    /// A `SendInput` call about to be made: its tag and what it sends.
+    Call(RunCall),
+    /// The release evidence the end took: the `hello` answer (as the link
+    /// recorded it) that read the run's token and `quiet 1`.
+    Quiet(RunLine),
+    /// The runner closed its sink window.
+    Close(RunWindow),
     Exit(Exit),
     End(RunEnd),
 }
@@ -294,6 +301,23 @@ pub struct RunQ {
     pub q: i64,
 }
 
+/// A `SendInput` call: its 32-bit tag and what it sends (`move`, `click`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCall {
+    pub q: i64,
+    pub tag: u32,
+    pub what: String,
+}
+
+/// A line the runner observed, with its host counter.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunLine {
+    pub q: i64,
+    pub line: String,
+}
+
 /// A cause or a step, with its host counter.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +362,9 @@ impl Kinds for Run {
             Self::Held(_) => "held",
             Self::Stop(_) => "stop",
             Self::Recovery(_) => "recovery",
+            Self::Call(_) => "call",
+            Self::Quiet(_) => "quiet",
+            Self::Close(_) => "close",
             Self::Exit(_) => "exit",
             Self::End(_) => "end",
         }
@@ -346,7 +373,9 @@ impl Kinds for Run {
     fn q(&self) -> Option<i64> {
         match self {
             Self::Spawn(r) => Some(r.q),
-            Self::Sink(r) => Some(r.q),
+            Self::Sink(r) | Self::Close(r) => Some(r.q),
+            Self::Call(r) => Some(r.q),
+            Self::Quiet(r) => Some(r.q),
             Self::Held(r) => Some(r.q),
             Self::Stop(r) | Self::Recovery(r) => Some(r.q),
             Self::Exit(e) => Some(e.q),
@@ -374,8 +403,6 @@ pub enum Link {
     /// The fence: no hold-bearing write begun before holds stopped is in
     /// progress.
     Fence(LinkQ),
-    /// The runner closed its sink window.
-    Close(LinkQ),
     /// An answer read; `sent` and `cmd` name the command it answers (none
     /// for the `hello` read while the link opens).
     Ans(LinkAnswer),
@@ -476,7 +503,6 @@ impl Kinds for Link {
             Self::Check(_) => "check",
             Self::Dropped(_) => "dropped",
             Self::Fence(_) => "fence",
-            Self::Close(_) => "close",
             Self::Ans(_) => "ans",
             Self::Ping(_) => "ping",
             Self::Rec(_) => "rec",
@@ -492,7 +518,7 @@ impl Kinds for Link {
             Self::Open(r) => r.q,
             Self::Cmd(r) => r.q,
             Self::Rec(r) | Self::Check(r) | Self::Dropped(r) => r.q,
-            Self::Fence(r) | Self::Close(r) => r.q,
+            Self::Fence(r) => r.q,
             Self::Ans(r) => r.q,
             Self::Ping(r) => r.recv,
             Self::Malformed(r) => r.q,

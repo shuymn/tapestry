@@ -25,6 +25,7 @@ dev-tools = [
     "skin-beatoraja/dev-tools",
     "dep:serde",
     "dep:serde_json",
+    "dep:sha2",
     "dep:test-device",
     "dep:toml",
     # `tapestry test-device` (docs/test-device.md "Host Commands").
@@ -33,11 +34,17 @@ dev-tools = [
     "windows/Win32_Devices_HumanInterfaceDevice",
     "windows/Win32_Devices_Properties",
     "windows/Win32_Devices_Usb",
+    "windows/Win32_Graphics_Gdi",
     "windows/Win32_Security",
+    "windows/Win32_Security_Cryptography",
     "windows/Win32_System_IO",
+    "windows/Win32_System_JobObjects",
+    "windows/Win32_System_Pipes",
     "windows/Win32_System_Performance",
     "windows/Win32_System_Registry",
+    "windows/Win32_UI_HiDpi",
     "windows/Win32_UI_Input",
+    "windows/Win32_UI_Input_KeyboardAndMouse",
 ]
 
 [dependencies]
@@ -59,6 +66,7 @@ skin-beatoraja.workspace = true
 skin-model.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 test-device = { workspace = true, optional = true }
 thiserror.workspace = true
 toml = { workspace = true, optional = true }

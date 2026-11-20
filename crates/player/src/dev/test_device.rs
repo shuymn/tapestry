@@ -7,9 +7,14 @@
 //! files.
 
 mod check;
+mod click;
+mod desktop;
 mod devices;
 mod flash;
+mod job;
 mod link;
+mod owner;
+mod release;
 mod trace;
 mod win;
 
