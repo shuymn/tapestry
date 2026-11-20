@@ -1824,7 +1824,6 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
         return FillStep::Complete;
     };
     let origin = region.band_origin(fill.slot);
-    let queue = t.gpu.queue();
     let texture = t.atlas.texture();
     let mut bytes = 0_u64;
     let mut submitted = false;
@@ -1856,7 +1855,17 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
             let to = from + usize::try_from(n).unwrap_or(0) * stride;
             if let Some(data) = level.get(from..to) {
                 let y = ((origin + line.y) >> k) + c.row;
-                text_upload::write(queue, texture, layer, k, [0, y, w, n], data);
+                crate::upload::write_unpaced(
+                    t.gpu,
+                    &crate::upload::Band {
+                        texture,
+                        layer,
+                        level: u32::try_from(k).unwrap_or(0),
+                        origin: [0, y],
+                        size: [w, n],
+                        bytes: data,
+                    },
+                );
                 // Queued: the next submission, whatever makes it, carries
                 // the row.
                 t.atlas.mark(t.gpu.queued_use());
@@ -1905,7 +1914,9 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
         }
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
-        queue.on_submitted_work_done(move || flag.store(true, Ordering::Release));
+        t.gpu
+            .queue()
+            .on_submitted_work_done(move || flag.store(true, Ordering::Release));
         fill.progress.done = Some(done);
         #[cfg(test)]
         store.steps.push(LabelStep::Watched);

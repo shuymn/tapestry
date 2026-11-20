@@ -728,9 +728,8 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
         subartist: "",
         genre: "E",
     };
-    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &labels)
-        .unwrap();
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &labels);
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let mut skin = DeclSkin::of(&r.installation(ScreenKind::Play).unwrap());
     let mut staging = Staging::with_runs(
         skin.capacity(),
@@ -1006,12 +1005,11 @@ fn loading_frames() {
         subartist: "",
         genre: "G",
     };
-    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chart)
-        .unwrap();
+    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chart);
     // The chart text's lines rasterized into the text layer: the title,
     // the artist, the genre and the full title.
     assert_eq!(r.text_report().counts.placements, 4);
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let mut skin = DeclSkin::of(&r.installation(ScreenKind::Play).unwrap());
     // Built against the renderer's live array, as its own frames are.
     skin.set_chart_live(r.chart_key());
@@ -1596,12 +1594,11 @@ fn outline_frames(chart: &Chart, overlay: &[&str]) {
         title: "Chosen",
         ..labels
     };
-    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chosen)
-        .unwrap();
+    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chosen);
     // The new title placed; the artist and the literal hits.
     let counts = r.text_report().counts;
     assert_eq!((counts.placements, counts.hits), (1, 2), "{counts:?}");
-    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(common::settle_text(&mut r), Ok(true));
     let at = |k: i64| common::loading_frame(1, TimeUs(k * FRAME_US), TimeUs(0));
     let (first, first_allocs) = counted(|| r.build_loading(&at(0)));
     first.unwrap();

@@ -232,15 +232,29 @@ impl AtlasTexture {
     /// The built-in atlas alone: one 128-texel layer without mips.
     pub(crate) fn builtin(gpu: &Gpu) -> Self {
         let texture = create(gpu.device(), ATLAS_SIZE, 1, 1);
-        write(gpu.queue(), &texture, 0, 0, ATLAS_SIZE, &build_atlas());
+        crate::upload::write_unpaced(gpu, &square(&texture, 0, 0, ATLAS_SIZE, &build_atlas()));
         Self::of(&texture, ATLAS_SIZE, 1, 1, gpu.queued_use())
     }
 
     /// The array of `pages`, of `layers` layers as [`check_pages`] gave
-    /// them, with the built-in atlas in layer 0. The uploads are queued,
-    /// not yet submitted; what the device refuses is reported to its error
-    /// scopes ([`scoped`]).
+    /// them, created with nothing written: its initialization (the
+    /// built-in atlas in layer 0 and a zero texel at each level of each
+    /// kept layer) and its pages are [`AtlasWrites`]' writes, made in
+    /// steps through the uploader. What the device refuses is reported to
+    /// its error scopes ([`scoped`]).
+    pub(crate) fn create(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
+        Self::make(gpu, pages, layers, false)
+    }
+
+    /// [`create`](Self::create) with its initialization and every page
+    /// written too, whole, in writes queued at once, not yet submitted: an
+    /// upload not made in steps (a renderer built again restoring its
+    /// installations inline).
     pub(crate) fn upload(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
+        Self::make(gpu, pages, layers, true)
+    }
+
+    fn make(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32, whole: bool) -> Self {
         let device = gpu.device();
         let side = pages.side;
         let levels = u32::try_from(MIP_LEVELS).unwrap_or(1);
@@ -255,35 +269,40 @@ impl AtlasTexture {
             );
             crate::probe::Span::start()
         };
-        // The built-in atlas at the top left of layer 0's level 0; the
-        // shader samples nothing else of layer 0.
-        write(gpu.queue(), &texture, 0, 0, ATLAS_SIZE, &build_atlas());
-        for (layer, page) in (RESERVED_LAYERS..).zip(pages.pages) {
-            for (level, bytes) in (0..).zip(page) {
-                #[cfg(feature = "dev-tools")]
-                let p_w = crate::probe::Span::start();
-                write(gpu.queue(), &texture, layer, level, side >> level, bytes);
-                #[cfg(feature = "dev-tools")]
-                {
-                    use crate::probe::{cmark, us};
-                    cmark!("wt", "bytes", i64::try_from(bytes.len()).unwrap_or(-1));
-                    cmark!("wt", "level", i64::from(level));
-                    cmark!("wt", "call_us", us(p_w.elapsed()));
-                }
-            }
-        }
-        // The kept layers, after the pages: one zero texel written to each
-        // level of each, so the device zeroes the rest of each level now,
-        // with the upload, and not at the first text or image written into
-        // it.
         let after = RESERVED_LAYERS.saturating_add(u32::try_from(pages.pages.len()).unwrap_or(0));
         let text_layer = pages.text_layer.then_some(after);
         let chart_layer = pages
             .chart_layer
             .then(|| after.saturating_add(u32::from(pages.text_layer)));
-        for layer in text_layer.into_iter().chain(chart_layer) {
-            for level in 0..levels {
-                write(gpu.queue(), &texture, layer, level, 1, &[0; 4]);
+        if whole {
+            // The built-in atlas at the top left of layer 0's level 0; the
+            // shader samples nothing else of layer 0.
+            crate::upload::write_unpaced(gpu, &square(&texture, 0, 0, ATLAS_SIZE, &build_atlas()));
+            for (layer, page) in (RESERVED_LAYERS..).zip(pages.pages) {
+                for (level, bytes) in (0..).zip(page) {
+                    #[cfg(feature = "dev-tools")]
+                    let p_w = crate::probe::Span::start();
+                    crate::upload::write_unpaced(
+                        gpu,
+                        &square(&texture, layer, level, side >> level, bytes),
+                    );
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        use crate::probe::{cmark, us};
+                        cmark!("wt", "bytes", i64::try_from(bytes.len()).unwrap_or(-1));
+                        cmark!("wt", "level", i64::from(level));
+                        cmark!("wt", "call_us", us(p_w.elapsed()));
+                    }
+                }
+            }
+            // The kept layers, after the pages: one zero texel written to
+            // each level of each, so the device zeroes the rest of each
+            // level now, with the upload, and not at the first text or
+            // image written into it.
+            for layer in text_layer.into_iter().chain(chart_layer) {
+                for level in 0..levels {
+                    crate::upload::write_unpaced(gpu, &square(&texture, layer, level, 1, &ZERO));
+                }
             }
         }
         #[cfg(feature = "dev-tools")]
@@ -410,6 +429,195 @@ impl AtlasTexture {
     }
 }
 
+/// An atlas array's writes still to make, in steps through the uploader
+/// (design.md "Memory Budget", the uploader): first its initialization,
+/// the built-in atlas in layer 0 and a zero texel at each level of each
+/// kept layer, then its pages a level's rows at a time. The array's layer
+/// of page `n` is `RESERVED_LAYERS + n`.
+pub(crate) struct AtlasWrites {
+    pages: std::sync::Arc<skin_model::PackedPages>,
+    /// The built-in atlas's texels, until written.
+    builtin: Vec<u8>,
+    /// The initialization's writes made, of `init_total`: the built-in
+    /// atlas, then each kept layer's levels in order.
+    init: u32,
+    init_total: u32,
+    /// The kept layers (text, then chart) and the levels of each.
+    kept: [Option<u32>; 2],
+    levels: u32,
+    page: usize,
+    level: usize,
+    row: u32,
+}
+
+/// The texel a kept layer's level is initialized with.
+static ZERO: [u8; 4] = [0; 4];
+
+impl AtlasWrites {
+    /// Every write of `atlas`, made of `pages`, still to make: its
+    /// initialization and every page. Allocates the built-in atlas's
+    /// texels.
+    pub(crate) fn new(
+        pages: std::sync::Arc<skin_model::PackedPages>,
+        atlas: &AtlasTexture,
+    ) -> Self {
+        let kept = [atlas.text_layer(), atlas.chart_layer()];
+        let levels = atlas.levels();
+        let kept_count = u32::try_from(kept.iter().flatten().count()).unwrap_or(0);
+        Self {
+            pages,
+            builtin: build_atlas(),
+            init: 0,
+            init_total: 1 + kept_count * levels,
+            kept,
+            levels,
+            page: 0,
+            level: 0,
+            row: 0,
+        }
+    }
+
+    /// Whether every write is made: the initialization and every level of
+    /// every page.
+    pub(crate) fn written(&self) -> bool {
+        self.init >= self.init_total && self.page >= self.pages.pages().len()
+    }
+
+    /// Moves past what has nothing to write: a level past the pages' mips,
+    /// a level written, a page written.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn settle(&mut self) {
+        let side = self.pages.side();
+        while let Some(page) = self.pages.pages().get(self.page) {
+            if self.level >= MIP_LEVELS || page.level(self.level).is_none() {
+                self.page += 1;
+                self.level = 0;
+                self.row = 0;
+            } else if self.row >= side >> self.level {
+                self.level += 1;
+                self.row = 0;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// The bytes its next write stages, rows padded: 0 once every write is
+    /// made.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn next_staged(&mut self) -> u64 {
+        if self.init < self.init_total {
+            return if self.init == 0 {
+                crate::text_upload::padded(ATLAS_SIZE) * u64::from(ATLAS_SIZE)
+            } else {
+                crate::text_upload::padded(1)
+            };
+        }
+        self.settle();
+        if self.page >= self.pages.pages().len() {
+            return 0;
+        }
+        let s = self.pages.side() >> self.level;
+        let padded = crate::text_upload::padded(s).max(1);
+        let rows = (crate::UPLOAD_WRITE / padded)
+            .max(1)
+            .min(u64::from(s.saturating_sub(self.row)));
+        padded * rows
+    }
+
+    /// Makes its next write into `atlas` for `payload` through the
+    /// uploader's write function, `gate` read immediately before it: the
+    /// initialization's next, or the current level's next rows, at most
+    /// [`UPLOAD_WRITE`](crate::UPLOAD_WRITE) bytes as the queue stages
+    /// them (rows padded to `COPY_BYTES_PER_ROW_ALIGNMENT`), at least one
+    /// row. It moves on only once the write is made. The bytes staged, 0
+    /// once every write is made.
+    ///
+    /// # Errors
+    ///
+    /// The gate's refusal: nothing written, the band kept for a later step.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn write_one(
+        &mut self,
+        gpu: &Gpu,
+        atlas: &AtlasTexture,
+        gate: &mut dyn crate::UploadGate,
+        payload: crate::Payload,
+    ) -> Result<u64, crate::Refused> {
+        if self.init < self.init_total {
+            let band = if self.init == 0 {
+                square(atlas.texture(), 0, 0, ATLAS_SIZE, &self.builtin)
+            } else {
+                let k = self.init - 1;
+                let levels = self.levels.max(1);
+                let layer = self
+                    .kept
+                    .iter()
+                    .flatten()
+                    .nth(usize::try_from(k / levels).unwrap_or(usize::MAX))
+                    .copied()
+                    .unwrap_or(0);
+                square(atlas.texture(), layer, k % levels, 1, &ZERO)
+            };
+            let staged = crate::upload::write(gpu, gate, payload, &band)?;
+            if self.init == 0 {
+                self.builtin = Vec::new();
+            }
+            self.init += 1;
+            return Ok(staged);
+        }
+        self.settle();
+        let side = self.pages.side();
+        let Some(bytes) = self
+            .pages
+            .pages()
+            .get(self.page)
+            .and_then(|p| p.level(self.level))
+        else {
+            return Ok(0);
+        };
+        let s = side >> self.level;
+        let padded = crate::text_upload::padded(s).max(1);
+        let rows = u32::try_from((crate::UPLOAD_WRITE / padded).max(1))
+            .unwrap_or(u32::MAX)
+            .min(s.saturating_sub(self.row));
+        let stride = usize::try_from(s).unwrap_or(0) * 4;
+        let from = usize::try_from(self.row).unwrap_or(0) * stride;
+        let to = from + usize::try_from(rows).unwrap_or(0) * stride;
+        let layer = RESERVED_LAYERS.saturating_add(u32::try_from(self.page).unwrap_or(u32::MAX));
+        let level = u32::try_from(self.level).unwrap_or(0);
+        if let Some(texels) = bytes.get(from..to) {
+            #[cfg(feature = "dev-tools")]
+            let p_w = crate::probe::Span::start();
+            crate::upload::write(
+                gpu,
+                gate,
+                payload,
+                &crate::upload::Band {
+                    texture: atlas.texture(),
+                    layer,
+                    level,
+                    origin: [0, self.row],
+                    size: [s, rows],
+                    bytes: texels,
+                },
+            )?;
+            #[cfg(feature = "dev-tools")]
+            {
+                use crate::probe::{cmark, us};
+                cmark!("wt", "bytes", i64::try_from(texels.len()).unwrap_or(-1));
+                cmark!("wt", "level", i64::from(level));
+                cmark!("wt", "call_us", us(p_w.elapsed()));
+            }
+        }
+        self.row += rows;
+        // Moved on past a level, and a page, it finished, so `written`
+        // holds once the last row is queued.
+        self.settle();
+        Ok(padded * u64::from(rows))
+    }
+}
+
 /// The bytes of one `side`-texel-square RGBA8 level.
 fn level_bytes(side: u32) -> u64 {
     u64::from(side) * u64::from(side) * 4
@@ -439,71 +647,23 @@ fn create(device: &wgpu::Device, side: u32, layers: u32, levels: u32) -> wgpu::T
     })
 }
 
-/// Writes `side`-texel-square `bytes` at the top left of `layer`'s
+/// A write of `side`-texel-square `bytes` at the top left of `layer`'s
 /// `level`.
-fn write(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
+fn square<'a>(
+    texture: &'a wgpu::Texture,
     layer: u32,
     level: u32,
     side: u32,
-    bytes: &[u8],
-) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: level,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y: 0,
-                z: layer,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
+    bytes: &'a [u8],
+) -> crate::upload::Band<'a> {
+    crate::upload::Band {
+        texture,
+        layer,
+        level,
+        origin: [0, 0],
+        size: [side, side],
         bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(side * 4),
-            rows_per_image: Some(side),
-        },
-        wgpu::Extent3d {
-            width: side,
-            height: side,
-            depth_or_array_layers: 1,
-        },
-    );
-}
-
-/// Writes `size` texels of `bytes`, rows tightly packed, at `origin` of
-/// `layer`'s `level`: a chart image's level into its slot (S10-12). The
-/// write is queued, not yet submitted.
-pub(crate) fn write_region(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    (layer, level): (u32, u32),
-    [x, y]: [u32; 2],
-    [w, h]: [u32; 2],
-    bytes: &[u8],
-) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: level,
-            origin: wgpu::Origin3d { x, y, z: layer },
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(w * 4),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
+    }
 }
 
 #[cfg(test)]

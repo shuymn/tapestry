@@ -345,6 +345,18 @@ impl Screen for Recorder {
     ) -> Option<Result<Preparation, RenderError>> {
         self.menu.prepare_attempt(a, skin, request)
     }
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        self.menu.upload_boundary(past)
+    }
+    fn upload_state(&self) -> render::UploadState {
+        self.menu.upload_state()
+    }
+    fn upload_waited(&self) -> bool {
+        self.menu.upload_waited()
+    }
+    fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+        self.menu.wait_step(timeout)
+    }
     fn device(&self) -> u64 {
         self.menu.device()
     }

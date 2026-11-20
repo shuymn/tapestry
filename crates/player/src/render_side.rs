@@ -188,6 +188,26 @@ pub trait Screen: Send {
         let _ = (target, images);
         Err(RenderError::NoChartLayer)
     }
+    /// Takes the attempt's chart-image publication of `set` into `target`
+    /// in hand (design.md "Rendering and Skins", chart images): `None`
+    /// while its bands step at the boundaries
+    /// ([`upload_boundary`](Self::upload_boundary) answers its end), or
+    /// its table at once. The default publishes at once
+    /// ([`publish_chart_images`](Self::publish_chart_images)).
+    ///
+    /// # Errors
+    ///
+    /// As [`render::Renderer::begin_chart_upload`].
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, RenderError> {
+        self.publish_chart_images(target, set.fitted()).map(Some)
+    }
+    /// Drops the chart-image publication in hand, if any, writing nothing
+    /// more and publishing no table. The default holds none.
+    fn cancel_chart_images(&mut self) {}
     /// Publishes the chart's images absent into `target`
     /// ([`render::Renderer::publish_chart_absent`]).
     ///
@@ -218,10 +238,40 @@ pub trait Screen: Send {
         let _ = (key, cells);
         Err(render::BgaFault::Refused)
     }
-    /// One frame boundary's step of the batch in hand
-    /// ([`render::Renderer::bga_boundary`]); none in hand by default.
-    fn bga_boundary(&mut self) -> render::BgaStep {
-        render::BgaStep::Idle
+    /// One frame boundary's steps of the uploader
+    /// ([`render::Renderer::upload_boundary_within`]), `past` answering
+    /// whether the pass's hold's bound has passed; nothing in hand by
+    /// default.
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        let _ = past;
+        render::Uploaded {
+            bga: render::BgaStep::Idle,
+            staged: None,
+            text: None,
+            chart: None,
+            pages: None,
+        }
+    }
+    /// What the uploader can do now ([`render::Renderer::upload_state`]);
+    /// nothing in hand by default.
+    fn upload_state(&self) -> render::UploadState {
+        render::UploadState::Idle
+    }
+    /// Whether the uploader holds a payload READY waits for: the attempt's
+    /// staging, its chart-image publication, the result pages or a BGA
+    /// batch ([`render::Renderer::waited_upload`]); none by default.
+    fn upload_waited(&self) -> bool {
+        false
+    }
+    /// Waits for the uploader's step in flight at most `timeout`
+    /// ([`render::Renderer::wait_step`]): whether it was seen.
+    ///
+    /// # Errors
+    ///
+    /// The device's failure.
+    fn wait_step(&mut self, timeout: Duration) -> Result<bool, RenderError> {
+        let _ = timeout;
+        Ok(true)
     }
     /// Drops the batch in hand ([`render::Renderer::cancel_bga_upload`]).
     fn cancel_bga_upload(&mut self) {}
@@ -394,6 +444,38 @@ pub trait Screen: Send {
         let _ = (kind, pages, request);
         Ok(refusal("this screen draws no declarative skin"))
     }
+    /// Begins the result pages upload of `pages` for `ticket` (design.md
+    /// "Memory Budget", the uploader): [`render::PagesBegun::Installed`]
+    /// for the pages installed, which take nothing. `None` by default: the
+    /// screen draws no pages.
+    ///
+    /// # Errors
+    ///
+    /// As [`render::Renderer::begin_pages`].
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, RenderError> {
+        let _ = (pages, ticket);
+        Ok(None)
+    }
+    /// Publishes the written result pages upload as the result kind's
+    /// pages-only installation: its ticket. `None` by default.
+    fn publish_pages(&mut self) -> Option<u64> {
+        None
+    }
+    /// Withdraws the result pages upload in hand, its array retired: its
+    /// ticket. `None` by default.
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        None
+    }
+    /// Whether play's admission released the result kind's installation
+    /// since the last call, with its figures: play's need, the result's
+    /// charge and the limit. `None` by default.
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        None
+    }
     /// Restores the result kind's pages-only installation of `pages` on a
     /// screen built again. The default restores nothing.
     ///
@@ -507,6 +589,31 @@ pub trait Screen: Send {
     fn grant_ready(&self) -> bool {
         false
     }
+    /// The swap chain's grant, looked at without waiting, while frames
+    /// are paced by it ([`render::Renderer::grant_probe`]); none by
+    /// default.
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        None
+    }
+    /// [`install`](Self::install) in steps: `None` while the uploader's
+    /// boundaries write it; asked again with the same request it answers
+    /// that staging. By default the whole installation at once.
+    fn install_stepped(
+        &mut self,
+        kind: ScreenKind,
+        skin: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Option<Result<Preparation, RenderError>> {
+        Some(self.install(kind, skin, request))
+    }
+    /// Whether a loading text is in the uploader's hand; none by default.
+    fn loading_text_held(&self) -> bool {
+        false
+    }
+    /// Drops the loading text in the uploader's hand, if any, so nothing
+    /// of a loading that ended is written (READY's cutoff). The default
+    /// holds none.
+    fn drop_loading_text(&mut self) {}
     /// Whether a BGA array is in use ([`render::Renderer::bga_key`]);
     /// never by default.
     fn bga_in_use(&self) -> bool {
@@ -716,6 +823,14 @@ pub trait Screen: Send {
     fn wait(&self) -> bool;
     /// Whether [`wait`](Self::wait) paces frames.
     fn paced(&self) -> bool;
+    /// Waits for the swap chain's grant or for `pace`, whichever comes
+    /// first ([`render::Renderer::wait_grant_or_pace`]): `Some(true)`
+    /// granted, `Some(false)` paced, `None` with nothing to wait on. By
+    /// default [`wait`](Self::wait)'s answer.
+    fn wait_grant(&mut self, pace: Duration) -> Option<bool> {
+        let _ = pace;
+        Some(self.wait())
+    }
     /// Builds one play frame from `f`: the app's own work, which calls
     /// nothing in wgpu. [`draw`](Self::draw) follows a frame built.
     ///
@@ -883,6 +998,26 @@ pub trait Screen: Send {
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
         let _ = token;
         self.loading(page, update, changed, frame)
+    }
+    /// Brings the play skin's loading text to the chosen chart `chart` of
+    /// `revision` for loading lifetime `lifetime`, on the staging `on`
+    /// names or the installed skin for `None`, once per pass after the
+    /// newest size (design.md "Rendering and Skins"): settled or in
+    /// progress, nothing; else its slots are cleared and prepared into the
+    /// uploader's hand. Nothing by default.
+    fn loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        chart: &Arc<crate::loading_text::ChosenChart>,
+        on: Option<PreparedToken>,
+    ) {
+        let _ = (lifetime, revision, chart, on);
+    }
+    /// Whether the loading text last asked ([`loading_text`](Self::loading_text))
+    /// is settled: installed in every slot, or refused. True by default.
+    fn text_settled(&self) -> bool {
+        true
     }
     /// The play staging the screen holds, if any: what a staged loading
     /// frame may draw. None by default.
@@ -1267,6 +1402,15 @@ pub enum RenderMsg {
         skin: Selected,
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    },
+    /// Upload the result's `pages` for `ticket` (design.md "Memory Budget",
+    /// the result pages upload), of its own sequence: answered once
+    /// published, withdrawn, refused, released or lost. It supersedes no
+    /// attempt and changes no request.
+    ResultPages {
+        ticket: u64,
+        pages: Arc<PackedPages>,
+        reply: mpsc::SyncSender<PagesAnswer>,
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
@@ -1718,6 +1862,13 @@ struct Shared {
     /// The commits answered and given up on, which the game thread and the
     /// render thread settle under its lock.
     commits: Mutex<Commits>,
+    /// Passes that presented nothing while an upload stepped between
+    /// frames (tests).
+    #[cfg(test)]
+    between: AtomicU32,
+    /// The result pages uploads published and withdrawn, under a lock of
+    /// their own: no commit's lock is waited on.
+    pages: Mutex<PageMarks>,
     /// Set when the game thread stopped waiting for a commit's answer,
     /// before it takes the commits' lock (tests).
     #[cfg(test)]
@@ -1903,6 +2054,28 @@ struct Shared {
     /// in µs; `i64::MIN` reads the clock (tests).
     #[cfg(test)]
     hold_elapsed: AtomicI64,
+    /// How far each write of a held pass's step after its first moves
+    /// `hold_elapsed`, in µs; 0 moves nothing (tests).
+    #[cfg(test)]
+    write_clock_step: AtomicI64,
+    /// The loop's passes that reached the boundary (tests).
+    #[cfg(test)]
+    passes: AtomicU64,
+    /// The loop's waits by kind ([`WaitKind`]), counted as each begins
+    /// (tests).
+    #[cfg(test)]
+    waits: [AtomicU64; 4],
+    /// The pass whose boundary last saw a staging's last step complete,
+    /// and the pass that last answered an attempt, by `passes` (tests).
+    #[cfg(test)]
+    staged_pass: AtomicU64,
+    #[cfg(test)]
+    answered_pass: AtomicU64,
+    /// The loop's waits by kind when the last attempt was taken (0) and
+    /// answered (1), and when the last chart-image publication was taken
+    /// (2) and answered (3) (tests).
+    #[cfg(test)]
+    attempt_waits: [[AtomicU64; 4]; 4],
     /// The lifetime whose first frame was visited last, and its showing
     /// (tests).
     #[cfg(test)]
@@ -1914,6 +2087,9 @@ struct Shared {
     /// The frames paced by the clock so far (tests).
     #[cfg(test)]
     clock_paced: AtomicU64,
+    /// The clock's pacing of each pass while it records (tests).
+    #[cfg(test)]
+    pacing: Mutex<Vec<Pace>>,
     /// The stamps so far, and whether the last left the image valid,
     /// right after it (tests).
     #[cfg(test)]
@@ -1962,6 +2138,9 @@ impl Shared {
             epochs: [AtomicU64::new(0), AtomicU64::new(0)],
             producer: Mutex::new(None),
             commits: Mutex::new(Commits::default()),
+            #[cfg(test)]
+            between: AtomicU32::new(0),
+            pages: Mutex::new(PageMarks::default()),
             #[cfg(test)]
             commit_timed_out: AtomicBool::new(false),
             #[cfg(test)]
@@ -2056,11 +2235,25 @@ impl Shared {
             #[cfg(test)]
             hold_elapsed: AtomicI64::new(i64::MIN),
             #[cfg(test)]
+            write_clock_step: AtomicI64::new(0),
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Default::default(),
+            #[cfg(test)]
+            staged_pass: AtomicU64::new(0),
+            #[cfg(test)]
+            answered_pass: AtomicU64::new(0),
+            #[cfg(test)]
+            attempt_waits: Default::default(),
+            #[cfg(test)]
             first_shown: Mutex::new(None),
             #[cfg(test)]
             answer_gate: TestGate::default(),
             #[cfg(test)]
             clock_paced: AtomicU64::new(0),
+            #[cfg(test)]
+            pacing: Mutex::new(Vec::new()),
             #[cfg(test)]
             stamps: [AtomicU64::new(0), AtomicU64::new(0)],
         }
@@ -2315,6 +2508,16 @@ struct Commits {
     receipt: Receipt,
 }
 
+/// The newest result pages ticket published and the newest withdrawn: a
+/// publication happens only while its ticket is not withdrawn, and a
+/// withdrawal finds a publication already made, so the two never
+/// disagree. Never compared with request numbers.
+#[derive(Debug, Default)]
+struct PageMarks {
+    published: u64,
+    withdrawn: u64,
+}
+
 /// What an attempt's commit gives the game thread: the request and what
 /// the declarative installation the committed attempt draws with, the one
 /// it staged or the one already in use, declares ([`Declared`]). A
@@ -2485,6 +2688,10 @@ impl Shared {
 
     fn commits(&self) -> std::sync::MutexGuard<'_, Commits> {
         self.commits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn pages(&self) -> std::sync::MutexGuard<'_, PageMarks> {
+        self.pages.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn loading_slot(&self) -> std::sync::MutexGuard<'_, LoadingSlot> {
@@ -2741,6 +2948,9 @@ pub struct RenderLink {
     end_pages: AtomicU64,
     /// The number of the last attempt's preparation requested.
     requests: AtomicU64,
+    /// The number of the last result pages upload begun, of its own
+    /// sequence.
+    page_uploads: AtomicU64,
     /// The loading clock, the render thread's: a loading lifetime's
     /// origin is stamped on it.
     clock: QpcClock,
@@ -2994,6 +3204,25 @@ impl RenderLink {
     /// register.
     pub fn result_status(&self) -> ResultReport {
         self.shared.result_status().clone()
+    }
+
+    /// Begins the result's pages upload of `pages` (design.md "Memory
+    /// Budget", the result pages upload), numbered apart from every
+    /// request: the ticket to poll, withdrawn when dropped unanswered.
+    pub fn begin_result_pages(&self, pages: Arc<PackedPages>) -> PendingPages {
+        let ticket = self.page_uploads.fetch_add(1, Ordering::Relaxed) + 1;
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::ResultPages {
+            ticket,
+            pages,
+            reply,
+        });
+        PendingPages {
+            ticket,
+            rx,
+            shared: Arc::clone(&self.shared),
+            settled: false,
+        }
     }
 
     /// Starts the result's upload after an attempt's commit (the S10-09i
@@ -4109,6 +4338,28 @@ impl RenderLink {
         self.shared.bga_ops_held.load(Ordering::Acquire)
     }
 
+    /// Notes each pass's pacing by the clock from now, `room` at most, the
+    /// record kept so far dropped (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn record_pacing(&self, room: usize) {
+        *self
+            .shared
+            .pacing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Vec::with_capacity(room);
+    }
+
+    /// The passes' pacing since [`record_pacing`](Self::record_pacing)
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn pacing(&self) -> Vec<Pace> {
+        self.shared
+            .pacing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Notes each heavy operation a boundary runs from now, `room` at
     /// most, the record kept so far dropped (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -4471,6 +4722,84 @@ impl Drop for PendingSelect {
     }
 }
 
+/// How a result pages upload ended (design.md "Memory Budget", the
+/// result pages upload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagesAnswer {
+    /// Published: the result kind's pages-only installation.
+    Ready,
+    /// Withdrawn before its publication, by its owner or by the result
+    /// kind's own operation.
+    Cancelled,
+    /// Refused, with why: nothing published.
+    Refused(String),
+    /// The screen holding it was dropped: never published.
+    Lost,
+}
+
+/// A result pages upload's ticket ([`RenderLink::begin_result_pages`]),
+/// polled by the game thread in short slices. Dropped unanswered, it is
+/// withdrawn: a publication after that installs nothing.
+#[derive(Debug)]
+pub struct PendingPages {
+    ticket: u64,
+    rx: Receiver<PagesAnswer>,
+    shared: Arc<Shared>,
+    /// Answered or withdrawn.
+    settled: bool,
+}
+
+impl PendingPages {
+    /// Waits at most `slice` for the answer: `None` while it is on its
+    /// way, or once settled.
+    ///
+    /// # Errors
+    ///
+    /// [`ScreenError::Ended`] when the render thread is gone.
+    pub fn poll(&mut self, slice: Duration) -> Option<Result<PagesAnswer, ScreenError>> {
+        if self.settled {
+            return None;
+        }
+        match self.rx.recv_timeout(slice) {
+            Ok(answer) => {
+                self.settled = true;
+                Some(Ok(answer))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.settled = true;
+                Some(Err(ended(&self.shared)))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+        }
+    }
+
+    /// Whether it is answered or withdrawn.
+    pub const fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Withdraws the ticket unless it was published: whether it was. Under
+    /// the pages' lock, so the render thread either published before or
+    /// sees the withdrawal at its publication. Final either way.
+    pub fn withdraw(&mut self) -> bool {
+        if std::mem::replace(&mut self.settled, true) {
+            return false;
+        }
+        let mut marks = self.shared.pages();
+        if marks.published >= self.ticket {
+            return true;
+        }
+        marks.withdrawn = marks.withdrawn.max(self.ticket);
+        false
+    }
+}
+
+impl Drop for PendingPages {
+    fn drop(&mut self) {
+        self.withdraw();
+    }
+}
+
 /// How long the game thread waits for a selection's answer at each look:
 /// the menus, quit and cancellation are served between looks.
 pub(crate) const SELECT_SLICE: Duration = Duration::from_millis(1);
@@ -4644,6 +4973,16 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 rf_armed: 0,
                 granted: false,
+                chart_hand: None,
+                pace_deadline: None,
+                pages_hand: None,
+                pages_owed: None,
+                select_hand: None,
+                creation_answered: false,
+                released: None,
+                #[cfg(feature = "dev-tools")]
+                pages_retained: 0,
+                staged_seen: false,
                 image: Image::default(),
                 first_frame: None,
                 extent: None,
@@ -4743,6 +5082,7 @@ pub fn spawn(
             finish_timeout: FINISH_TIMEOUT,
             end_pages: AtomicU64::new(0),
             requests: AtomicU64::new(0),
+            page_uploads: AtomicU64::new(0),
             clock,
             scripts,
             result_lifetimes: AtomicU64::new(0),
@@ -5680,6 +6020,10 @@ struct Preparing {
     /// The declarative skin it stages, if one is chosen.
     skin: Option<Arc<SkinBundle>>,
     reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+    /// The screen took it (its staging, which may create play's array):
+    /// only at a boundary whose heavy-operation allowance admits it
+    /// (design.md "Load Pipeline", one heavy operation a frame interval).
+    taken: bool,
 }
 
 /// How an attempt's preparation ended on the render thread, with the
@@ -5817,6 +6161,9 @@ struct FirstFrame {
     lifetime: u64,
     shown_at: TimeUs,
     ended: bool,
+    /// A presented frame of the lifetime was drawn by the play skin: from
+    /// then on its loading text is no longer waited for.
+    skinned: bool,
     /// The time the render thread held the frame, once it has (dev-tools:
     /// a scenario's transition record).
     #[cfg(feature = "dev-tools")]
@@ -5845,6 +6192,210 @@ impl FirstFrame {
             h.ended_by = Some(why);
         }
     }
+}
+
+/// Whether the play skin's loading text keeps it from drawing a loading
+/// frame: before the lifetime's first skinned frame (`skinned`), while the
+/// text the pass last asked is not settled on `screen` (design.md
+/// "Rendering and Skins").
+fn text_unsettled(skinned: bool, screen: &dyn Screen) -> bool {
+    !skinned && !screen.text_settled()
+}
+
+/// `pace` as a duration; 0 for a negative one.
+const fn pace_of(pace: TimeUs) -> Duration {
+    Duration::from_micros(pace.0.unsigned_abs())
+}
+
+/// What makes a pass's frame due before its boundary's work ends.
+#[derive(Clone, Copy, Debug)]
+enum FrameDue {
+    /// Nothing: the pass draws no frame, or its pacing is the clock's.
+    Never,
+    /// A grant kept from before.
+    Now,
+    /// The swap chain's grant, looked at before each heavy operation and
+    /// write.
+    Grant(render::GrantProbe),
+    /// The frame's clock deadline.
+    At(Instant),
+}
+
+/// What the gate knows when it is asked (design.md "Memory Budget", the
+/// uploader's admission gate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GateState {
+    /// The pass's frame is due: its grant found or its deadline passed.
+    frame_due: bool,
+    /// READY's cutoff holds.
+    cut_off: bool,
+    /// A held pass reached the hold's bound.
+    hold_past: bool,
+    /// The interval's heavy operation ran.
+    heavy_spent: bool,
+}
+
+/// What the gate is asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ask {
+    Heavy,
+    Write,
+}
+
+/// The boundary's one admission rule, in its order: a frame due draws
+/// first, nothing runs under READY's cutoff, a heavy operation needs the
+/// interval's allowance, and nothing begins in a held pass at or past the
+/// hold's bound.
+const fn admits(s: GateState, ask: Ask) -> bool {
+    if s.frame_due || s.cut_off {
+        return false;
+    }
+    if matches!(ask, Ask::Heavy) && s.heavy_spent {
+        return false;
+    }
+    !s.hold_past
+}
+
+/// The admission gate's clock: the system's, or a test's when it set one.
+fn gate_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = GATE_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The admission gate's clock on this thread (tests).
+    static GATE_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The gate a boundary's uploader asks before each write and band
+/// ([`render::UploadGate`]): [`admits`] over the pass's sources, read at
+/// each ask, a frame found due kept so for the rest of the pass; and the
+/// chart publication's generation against its owner's.
+struct PassGate<'a, H: FnMut() -> bool> {
+    frame: FrameDue,
+    /// READY's cutoff as the render thread found it.
+    cut_off: bool,
+    /// READY's cutoff word, read live: asked, the boundary begins nothing.
+    cutoff: Option<&'a AtomicU32>,
+    /// The hold's bound, in a held pass.
+    hold: Option<H>,
+    /// The chart publication in hand: its owner's generation, read live,
+    /// and its own.
+    chart: Option<(&'a AtomicU64, u64)>,
+    /// The BGA batch in hand: its owner's generation, read live, and its
+    /// own.
+    bga: Option<(&'a AtomicU64, u64)>,
+    /// The loading lifetime drawn and the newest revision the render
+    /// thread took, if any.
+    loading: Option<(u64, u64)>,
+    /// The loading slot, read live: the lifetime current and the newest
+    /// revision the game put there.
+    slot: Option<&'a Mutex<LoadingSlot>>,
+    /// Set when the gate took the swap chain's grant: the frame keeps it.
+    granted: &'a mut bool,
+}
+
+impl<H: FnMut() -> bool> render::UploadGate for PassGate<'_, H> {
+    fn past(&mut self) -> bool {
+        let frame_due = match self.frame {
+            FrameDue::Never => false,
+            FrameDue::Now => true,
+            FrameDue::Grant(g) => {
+                if g.ready() {
+                    *self.granted = true;
+                    self.frame = FrameDue::Now;
+                    true
+                } else {
+                    false
+                }
+            }
+            FrameDue::At(at) => {
+                let due = gate_now() >= at;
+                if due {
+                    self.frame = FrameDue::Now;
+                }
+                due
+            }
+        };
+        let hold_past = self.hold.as_mut().is_some_and(|h| h());
+        let cut_off = self.cut_off
+            || self
+                .cutoff
+                .is_some_and(|w| w.load(Ordering::Acquire) & cutoff::ASKED != 0);
+        !admits(
+            GateState {
+                frame_due,
+                cut_off,
+                hold_past,
+                heavy_spent: false,
+            },
+            Ask::Write,
+        )
+    }
+
+    fn current(&mut self, payload: render::Payload) -> bool {
+        match payload {
+            render::Payload::Chart => self
+                .chart
+                .is_none_or(|(now, g)| now.load(Ordering::SeqCst) == g),
+            render::Payload::Bga => self
+                .bga
+                .is_none_or(|(now, g)| now.load(Ordering::SeqCst) == g),
+            render::Payload::LoadingText { lifetime, revision } => {
+                self.loading
+                    .is_none_or(|(l, r)| l != lifetime || r == revision)
+                    && self.slot.is_none_or(|m| {
+                        let slot = m.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.lifetime == lifetime
+                            && slot.update.as_ref().is_none_or(|u| u.revision == revision)
+                    })
+            }
+            render::Payload::Staging | render::Payload::Pages => true,
+        }
+    }
+}
+
+/// A creation owed to the boundary's heavy-operation allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Creation {
+    /// Play's staging: the attempt's first take.
+    Play,
+    /// The result pages' begin.
+    Pages,
+    /// A result skin's selection: its staging's first take.
+    Select,
+}
+
+/// A result skin's selection in hand ([`Run::begin_select`]).
+struct SelectHand {
+    request: u64,
+    kind: ScreenKind,
+    bundle: Arc<SkinBundle>,
+    script: ScriptSlot,
+    reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    /// Its staging was taken at a boundary.
+    taken: bool,
+    /// Development builds: the atlas uploads its staging made.
+    #[cfg(feature = "dev-tools")]
+    uploads: u64,
+}
+
+/// What a pass does before its frame while an upload is in hand
+/// ((r2)'s passes between frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Between {
+    /// Paced as every frame: no upload in hand, a grant held, or nothing
+    /// to wait on.
+    Frame,
+    /// The grant came, or the frame's deadline passed: the frame draws.
+    Granted,
+    /// The pace or a step's wait passed first: the next pass runs its
+    /// boundary, presenting nothing.
+    Pass,
 }
 
 /// The first frame's hold bound: [`FIRST_FRAME_HOLD`], or a test's.
@@ -5895,6 +6446,76 @@ const fn held_wait(now: TimeUs, shown_at: TimeUs, bound: TimeUs) -> Option<TimeU
         Some(TimeUs(remaining))
     } else {
         Some(HELD_PACE)
+    }
+}
+
+/// The attempt's chart-image publication in hand: what its answer names
+/// and where it goes, and the screen it is stepped on.
+struct ChartHand {
+    key: crate::chart_images::PublicationKey,
+    /// Into the committed installation (a staging without its own array
+    /// included), not the staging's own.
+    committed: bool,
+    /// The committed installation's chart key when it was taken.
+    now_committed: Option<skin_model::chart_image::ChartKey>,
+    /// The screen's device it was taken on.
+    device: u64,
+    reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    /// When it was taken (the probe's answer time).
+    #[cfg(feature = "dev-tools")]
+    at: render::probe::Span,
+}
+
+/// A kind of the loop's wait (tests: the no-sleep rule's counters).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitKind {
+    /// A blocking wait for the next message.
+    Message = 0,
+    /// A message wait bounded by [`CANCEL_POLL`] or the clock's pace.
+    CancelPoll = 1,
+    /// A held pass's sleep.
+    HeldPace = 2,
+    /// A bounded wait for the uploader's step in flight.
+    Completion = 3,
+}
+
+/// Copies the loop's waits into `attempt_waits[at]` (tests).
+#[cfg(test)]
+fn snapshot_waits(shared: &Shared, at: usize) {
+    if let Some(to) = shared.attempt_waits.get(at) {
+        for (to, from) in to.iter().zip(&shared.waits) {
+            to.store(from.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+}
+
+/// How the clock paced a pass (tests): a stepping pass waiting for the
+/// frame's deadline, or reaching it; a frame after an upload keeping the
+/// deadline it was paced to; a frame paced afresh.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pace {
+    Step(Instant),
+    StepDue(Instant),
+    Kept(Instant),
+    Fresh,
+}
+
+/// Notes a pass's pacing while the record has room (tests).
+#[cfg(test)]
+fn note_pace(shared: &Shared, pace: Pace) {
+    let mut v = shared.pacing.lock().unwrap_or_else(PoisonError::into_inner);
+    if v.len() < v.capacity() {
+        v.push(pace);
+    }
+}
+
+/// Counts a wait of `kind` as it begins (tests).
+#[cfg(test)]
+fn count_wait(shared: &Shared, kind: WaitKind) {
+    if let Some(n) = shared.waits.get(kind as usize) {
+        n.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -5970,6 +6591,12 @@ pub(crate) enum HeavyKind {
     Bga,
     OwedPool,
     Destruction,
+    /// Play's staging taken, its array created.
+    PlayCreation,
+    /// The result pages' begin, their array created.
+    PagesCreation,
+    /// A result skin's selection taken, its array created.
+    SelectCreation,
 }
 
 /// The regime a boundary read (design.md "Load Pipeline", the
@@ -6011,6 +6638,32 @@ struct Run {
     /// frame of latency), so the next frame takes it instead of waiting
     /// again, which would never end; until a new screen is built.
     granted: bool,
+    /// The attempt's chart-image publication in hand, its bands stepped
+    /// by the uploader (design.md "Rendering and Skins", chart images).
+    chart_hand: Option<ChartHand>,
+    /// Offscreen or minimized with an upload in hand: the frame's deadline,
+    /// until which passes wait for the step and present nothing.
+    pace_deadline: Option<Instant>,
+    /// The result pages upload in hand: its ticket and where its answer
+    /// goes.
+    pages_hand: Option<(u64, mpsc::SyncSender<PagesAnswer>)>,
+    /// A result skin's selection in hand, stepped by the uploader.
+    select_hand: Option<SelectHand>,
+    /// The boundary's creation answered the attempt's preparation.
+    creation_answered: bool,
+    /// A result pages begin owed to the boundary's allowance: its ticket,
+    /// its pages and its reply.
+    pages_owed: Option<(u64, Arc<PackedPages>, mpsc::SyncSender<PagesAnswer>)>,
+    /// The request of the play staging whose admission released the
+    /// result kind's installation last.
+    released: Option<u64>,
+    /// The result's atlases retained when the pages upload in hand began
+    /// (development builds: G1's sample).
+    #[cfg(feature = "dev-tools")]
+    pages_retained: usize,
+    /// The uploader's boundary saw a staging's last step complete: the
+    /// attempt is asked again in that pass.
+    staged_seen: bool,
     /// The image on the screen and its validity.
     image: Image,
     /// The current loading lifetime's first frame, once visited.
@@ -6323,15 +6976,31 @@ impl Run {
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
             let msg = if idle {
                 match self.idle_wait() {
-                    // A heavy operation due and allowed: the boundary at
-                    // once.
+                    // A heavy operation due and allowed, or a step ready to
+                    // write: the boundary at once.
                     Some(wait) if wait.is_zero() => rx.try_recv(),
+                    // A step in flight: its completion, bounded, then the
+                    // message if one came (design.md "Memory Budget", the
+                    // uploader).
+                    Some(_) if self.step_in_flight() => {
+                        self.wait_step(Duration::from_micros(HELD_PACE.0.unsigned_abs()));
+                        rx.try_recv()
+                    }
                     // READY's cutoff is marked waiting around the wait, as
                     // around a frame's pacing, so the game's request taken
                     // meanwhile with no entry filled is acknowledged at
                     // once by its swap, with no message's turn.
                     wait => {
                         self.mark_waiting(self.screen.as_ref().map_or(0, |s| s.filled()));
+                        #[cfg(test)]
+                        count_wait(
+                            &self.shared,
+                            if wait.is_some() {
+                                WaitKind::CancelPoll
+                            } else {
+                                WaitKind::Message
+                            },
+                        );
                         let msg = match wait {
                             // A preparation not yet answered, or work of
                             // the boundary's, is looked at again between
@@ -6606,6 +7275,10 @@ impl Run {
                     }
                     #[cfg(test)]
                     self.shared.loading_end_gate.pass();
+                    // Nothing of the loading is written from here (READY's cutoff).
+                    if let Some(s) = self.screen.as_mut() {
+                        s.drop_loading_text();
+                    }
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -6650,6 +7323,10 @@ impl Run {
                     self.paused = None;
                     #[cfg(test)]
                     self.shared.loading_end_gate.pass();
+                    // Nothing of the loading is written from here (READY's cutoff).
+                    if let Some(s) = self.screen.as_mut() {
+                        s.drop_loading_text();
+                    }
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -6684,8 +7361,6 @@ impl Run {
                     self.turntable.begin_presentation();
                     self.begin_attempt(request, lifetime, attempt, skin, reply);
                     mode = self.after_preparing(mode);
-                    #[cfg(test)]
-                    self.shared.answer_gate.pass();
                     continue;
                 }
                 Ok(RenderMsg::PlayState(state)) => {
@@ -6738,8 +7413,9 @@ impl Run {
                     set,
                     reply,
                 }) => {
-                    let ack = self.publish_chart(generation, request, set.as_deref());
-                    let _ = reply.send(ack);
+                    // Taken in hand and stepped at the boundaries; this
+                    // pass goes on to its boundary at once.
+                    self.take_chart(generation, request, set, reply);
                     continue;
                 }
                 Ok(RenderMsg::Bga { generation, msg }) => {
@@ -6761,6 +7437,14 @@ impl Run {
                     }
                     continue;
                 }
+                Ok(RenderMsg::ResultPages {
+                    ticket,
+                    pages,
+                    reply,
+                }) => {
+                    self.owe_pages(ticket, pages, reply);
+                    continue;
+                }
                 Ok(RenderMsg::Select {
                     request,
                     kind,
@@ -6773,6 +7457,17 @@ impl Run {
                         i64::from(matches!(skin, Selected::Pages(_))),
                     );
                     let answer = match skin {
+                        Selected::Skin(Some(skin), script) if kind == ScreenKind::Result => {
+                            // Stepped by the uploader's boundaries, answered
+                            // when staged (design.md "Memory Budget").
+                            if let Some(answer) =
+                                self.begin_select(request, kind, skin, script, reply.clone())
+                            {
+                                let _ = reply.send(answer);
+                            }
+                            mode = self.after_preparing(mode);
+                            continue;
+                        }
                         Selected::Skin(skin, script) => {
                             #[cfg(feature = "dev-tools")]
                             let _caller =
@@ -6966,9 +7661,23 @@ impl Run {
             // hold ending later in the pass included.
             let held = self.held(&mode);
             let regrow = std::mem::take(&mut self.regrow_due);
+            #[cfg(test)]
+            self.shared.passes.fetch_add(1, Ordering::SeqCst);
             if self.boundary(&mode, held, regrow) {
                 mode = Mode::Idle;
                 continue;
+            }
+            // A preparation its boundary's creation answered: the messages
+            // first, as when it is answered in its own turn, so a discard
+            // sent on its answer is taken before any frame.
+            if std::mem::take(&mut self.creation_answered) {
+                continue;
+            }
+            // A staging whose last step this boundary saw complete answers
+            // in this pass (design.md "Memory Budget", the uploader).
+            if std::mem::take(&mut self.staged_seen) {
+                self.poll_attempt();
+                self.poll_select();
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -7001,6 +7710,10 @@ impl Run {
             if matches!(mode, Mode::Idle) {
                 continue;
             }
+            // The play skin's loading text, once per pass after the newest
+            // size: brought to the lifetime's chart and the target applied
+            // (design.md "Rendering and Skins").
+            self.loading_text_pass(&mode);
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -7042,20 +7755,22 @@ impl Run {
                             lifetime,
                             shown_at,
                             ended: false,
+                            skinned: false,
                             #[cfg(feature = "dev-tools")]
                             hold: None,
                         }
                     }
                 };
                 let pending = !first.ended
-                    && presentation_of(
+                    && (presentation_of(
                         &self.committed,
                         self.specialized_in,
                         self.prepared.as_ref().map(Prepared::candidate),
                         self.requested,
                         (screen.staged_token(), screen.device()),
                         lifetime,
-                    ) == Presented::Placeholder;
+                    ) == Presented::Placeholder
+                        || text_unsettled(first.skinned, &**screen));
                 if pending && screen.device_lost() {
                     // The screen's failure, as a frame's.
                     first.ended = true;
@@ -7089,7 +7804,18 @@ impl Run {
                                 .store(crate::alloc_count::this_thread(), Ordering::SeqCst);
                             #[cfg(test)]
                             self.shared.held[0].fetch_add(1, Ordering::SeqCst);
-                            std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
+                            let wait = Duration::from_micros(wait.0.unsigned_abs());
+                            match self.screen.as_ref().map(|s| s.upload_state()) {
+                                // A step ready to write: the next pass at
+                                // once.
+                                Some(render::UploadState::Ready) => {}
+                                Some(render::UploadState::InFlight) => self.wait_step(wait),
+                                _ => {
+                                    #[cfg(test)]
+                                    count_wait(&self.shared, WaitKind::HeldPace);
+                                    std::thread::sleep(wait);
+                                }
+                            }
                             #[cfg(feature = "dev-tools")]
                             first.held(from, self.clock.now());
                             self.first_frame = Some(first);
@@ -7126,14 +7852,80 @@ impl Run {
             let minimized = screen.minimized();
             let swap_paced = screen.paced();
             let filled = screen.filled();
+            // An upload in hand steps in passes between frames ((r2)):
+            // each pass waits for the grant or a HELD_PACE timer, never
+            // for the GPU; offscreen or minimized, for its step until the
+            // frame's deadline (design.md "Memory Budget", the uploader).
+            let stepping = screen.upload_waited();
             self.mark_waiting(filled);
-            let granted = if swap_paced && !minimized {
+            let Some(screen) = self.screen.as_mut() else {
+                self.mark_running();
+                continue;
+            };
+            let between = if !stepping {
+                // An upload that ended mid-interval: its frame keeps the
+                // deadline it was paced to, not a fresh pace.
+                match self.pace_deadline.take() {
+                    Some(deadline) if !(swap_paced && !minimized) => {
+                        #[cfg(test)]
+                        note_pace(&self.shared, Pace::Kept(deadline));
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if !left.is_zero() {
+                            std::thread::sleep(left);
+                        }
+                        Between::Granted
+                    }
+                    _ => Between::Frame,
+                }
+            } else if swap_paced && !minimized {
+                if self.granted {
+                    Between::Frame
+                } else {
+                    match screen.wait_grant(pace_of(HELD_PACE)) {
+                        Some(true) => Between::Granted,
+                        Some(false) => Between::Pass,
+                        None => Between::Frame,
+                    }
+                }
+            } else {
+                let now = Instant::now();
+                let deadline = *self.pace_deadline.get_or_insert(now + CLOCK_PACE);
+                if now < deadline {
+                    let _ = screen.wait_step(
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(pace_of(HELD_PACE)),
+                    );
+                }
+                if Instant::now() < deadline {
+                    #[cfg(test)]
+                    note_pace(&self.shared, Pace::Step(deadline));
+                    Between::Pass
+                } else {
+                    #[cfg(test)]
+                    note_pace(&self.shared, Pace::StepDue(deadline));
+                    self.pace_deadline = None;
+                    Between::Granted
+                }
+            };
+            if between == Between::Pass {
+                // The next pass runs its boundary's step.
+                self.mark_running();
+                #[cfg(test)]
+                self.shared.between.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let granted = if between == Between::Granted {
+                true
+            } else if swap_paced && !minimized {
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("wait0", i64::from(self.granted));
                 self.granted || self.screen.as_ref().is_some_and(|s| s.wait())
             } else {
                 #[cfg(test)]
                 self.shared.clock_paced.fetch_add(1, Ordering::SeqCst);
+                #[cfg(test)]
+                note_pace(&self.shared, Pace::Fresh);
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("sleep0", 0);
                 std::thread::sleep(CLOCK_PACE);
@@ -7516,11 +8308,24 @@ impl Run {
                             l,
                         )
                     });
+                    // Before the lifetime's first skinned frame, a skin whose
+                    // loading text is not settled draws the pending
+                    // presentation, declaring its own time.
+                    let skinned = self
+                        .first_frame
+                        .is_some_and(|f| loading_frame == Some(f.lifetime) && f.skinned);
+                    let pending = presented == Some(Presented::Placeholder)
+                        || (presented.is_some() && text_unsettled(skinned, &**screen));
+                    // What the frame drew: the pending presentation while the
+                    // skin's text keeps it from drawing (dev-tools).
                     #[cfg(feature = "dev-tools")]
                     {
-                        frame_presented = presented;
+                        frame_presented = if pending {
+                            Some(Presented::Placeholder)
+                        } else {
+                            presented
+                        };
                     }
-                    let pending = presented == Some(Presented::Placeholder);
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -7592,11 +8397,13 @@ impl Run {
                         let clock = self.clock;
                         self.shared
                             .presented_loading(lifetime, loadend, || clock.now());
-                        // Presented: the hold has ended for the lifetime.
+                        // Presented: the hold has ended for the lifetime, and
+                        // a frame the skin drew is its first skinned one.
                         if let Some(f) = &mut self.first_frame
                             && f.lifetime == lifetime
                         {
                             f.ended = true;
+                            f.skinned |= !pending;
                         }
                     }
                     #[cfg(feature = "dev-tools")]
@@ -8535,6 +9342,18 @@ impl Run {
     /// what only the dropped renderer held (design.md "Memory Budget",
     /// the result's atlas report).
     fn screen_dropped(&mut self) {
+        // The pages upload went with the screen: never published.
+        if let Some((_, reply)) = self.pages_hand.take() {
+            let _ = reply.send(PagesAnswer::Lost);
+        }
+        // A staging in hand went with it too: its one end, so the
+        // preparation waiting for it is asked again (design.md "Memory
+        // Budget", the uploader).
+        if self.attempt.as_ref().is_some_and(|p| p.taken)
+            || self.select_hand.as_ref().is_some_and(|h| h.taken)
+        {
+            self.staged_seen = true;
+        }
         let word = self.shared.cutoff.load(Ordering::Acquire);
         if !self.cut_off && word & cutoff::ASKED != 0 && word & cutoff::PHASE != cutoff::CUT_OFF {
             self.shared
@@ -8595,6 +9414,7 @@ impl Run {
             return;
         }
         let word = self.shared.cutoff.load(Ordering::Acquire);
+        self.settle_for_cutoff(word);
         match word & cutoff::PHASE {
             cutoff::CUT_OFF => self.found_cut_off(),
             cutoff::LOST => {}
@@ -8604,6 +9424,18 @@ impl Run {
                 self.cut_off_now();
             }
             _ => {}
+        }
+    }
+
+    /// READY's cutoff asked (`word`): the loading text in hand is cancelled
+    /// before the render thread can acknowledge it, by cutting off or by
+    /// marking itself waiting, so no upload is kept under it (design.md
+    /// "Scope of No Allocation").
+    fn settle_for_cutoff(&mut self, word: u32) {
+        if word & cutoff::ASKED != 0
+            && let Some(s) = &mut self.screen
+        {
+            s.drop_loading_text();
         }
     }
 
@@ -8636,6 +9468,15 @@ impl Run {
         if self.cut_off {
             return;
         }
+        // Not waiting with a loading text in hand: the game's swap would
+        // cut off over it, so its request is left to the render thread's
+        // own look, which settles the text first.
+        if self.screen.as_ref().is_some_and(|s| s.loading_text_held()) {
+            self.settle_for_cutoff(self.shared.cutoff.load(Ordering::Acquire));
+            if self.screen.as_ref().is_some_and(|s| s.loading_text_held()) {
+                return;
+            }
+        }
         let mut word = self.shared.cutoff.load(Ordering::Acquire);
         loop {
             match word & cutoff::PHASE {
@@ -8646,6 +9487,7 @@ impl Run {
                 cutoff::LOST => return,
                 _ => {}
             }
+            self.settle_for_cutoff(word);
             if word & cutoff::ASKED != 0 && filled == 0 {
                 self.cut_off_now();
                 return;
@@ -8727,6 +9569,29 @@ impl Run {
         }
     }
 
+    /// Whether the uploader's step is in flight, its completion unseen.
+    fn step_in_flight(&self) -> bool {
+        self.screen
+            .as_ref()
+            .is_some_and(|s| s.upload_state() == render::UploadState::InFlight)
+    }
+
+    /// Waits for the uploader's step in flight at most `bound` (design.md
+    /// "Memory Budget", the uploader); a device failing its poll drops the
+    /// screen, as the boundary's poll does.
+    fn wait_step(&mut self, bound: Duration) {
+        #[cfg(test)]
+        count_wait(&self.shared, WaitKind::Completion);
+        if let Some(s) = &mut self.screen
+            && let Err(e) = s.wait_step(bound)
+        {
+            eprintln!("render: {}", Chain(&e));
+            self.drop_screen();
+            self.granted = false;
+            self.shared.failed.store(true, Ordering::Release);
+        }
+    }
+
     /// Whether a heavy operation is due at a boundary of `destroy_ok`:
     /// the BGA operation held, a filled entry's heavy part, or the pool
     /// owed once no filled entry stands in its way. None under READY's
@@ -8735,7 +9600,7 @@ impl Run {
         if self.cut_off {
             return false;
         }
-        if self.bga_op.is_some() {
+        if self.bga_op.is_some() || self.creation_owed().is_some() {
             return true;
         }
         self.screen.as_ref().is_some_and(|s| {
@@ -8755,7 +9620,17 @@ impl Run {
         // Idle: no play, no loading frame; the allowance's clock is its
         // regime's.
         let destroy_ok = !self.cut_off && !self.result_unacked;
+        let upload = self
+            .screen
+            .as_ref()
+            .map_or(render::UploadState::Idle, |s| s.upload_state());
+        if upload == render::UploadState::Ready {
+            return Some(Duration::ZERO);
+        }
         let work = self.attempt.is_some()
+            || self.pages_owed.is_some()
+            || self.select_hand.is_some()
+            || upload == render::UploadState::InFlight
             || self.decision_busy()
             || self.bga_reply.is_some()
             || self.bga_op.is_some()
@@ -8781,7 +9656,7 @@ impl Run {
     /// draws would be the pending presentation, its hold has not ended,
     /// the image held is valid and the bound has not passed. Changes
     /// nothing.
-    fn held(&self, mode: &Mode) -> bool {
+    fn held(&self, mode: &Mode) -> Option<TimeUs> {
         let (
             Mode::Menu {
                 loading: Some(lifetime),
@@ -8791,16 +9666,16 @@ impl Run {
             Some(screen),
         ) = (mode, &self.screen)
         else {
-            return false;
+            return None;
         };
         if !self.shared.loading_current(*lifetime) {
-            return false;
+            return None;
         }
         let now = self.clock.now();
-        let shown_at = match self.first_frame {
-            Some(f) if f.lifetime == *lifetime && f.ended => return false,
-            Some(f) if f.lifetime == *lifetime => f.shown_at,
-            _ => update.as_deref().map_or(now, |u| u.origin),
+        let (shown_at, skinned) = match self.first_frame {
+            Some(f) if f.lifetime == *lifetime && f.ended => return None,
+            Some(f) if f.lifetime == *lifetime => (f.shown_at, f.skinned),
+            _ => (update.as_deref().map_or(now, |u| u.origin), false),
         };
         let pending = presentation_of(
             &self.committed,
@@ -8809,12 +9684,84 @@ impl Run {
             self.requested,
             (screen.staged_token(), screen.device()),
             *lifetime,
-        ) == Presented::Placeholder;
+        ) == Presented::Placeholder
+            || text_unsettled(skinned, &**screen);
         #[cfg(test)]
         let now = hold_now(&self.shared, now, shown_at);
-        pending
+        (pending
             && held_wait(now, shown_at, first_frame_bound(&self.shared)).is_some()
-            && self.image.valid(notices_of(self.extent.as_ref()))
+            && self.image.valid(notices_of(self.extent.as_ref())))
+        .then_some(shown_at)
+    }
+
+    /// The play skin's loading text once per pass after the newest size
+    /// (design.md "Rendering and Skins"): for a loading lifetime whose frame
+    /// the skin draws (staged, committed or installed), its text is brought
+    /// to the lifetime's chart and revision on that installation; the
+    /// pending presentation asks nothing.
+    fn loading_text_pass(&mut self, mode: &Mode) {
+        // Nothing is prepared once READY's cutoff is asked, nor under it;
+        // the next pass after it lifts asks again.
+        if self.cut_off || self.shared.cutoff.load(Ordering::Acquire) & cutoff::ASKED != 0 {
+            return;
+        }
+        let Mode::Menu {
+            loading: Some(lifetime),
+            update: Some(update),
+            ..
+        } = mode
+        else {
+            return;
+        };
+        let Some(screen) = &mut self.screen else {
+            return;
+        };
+        let on = match presentation_of(
+            &self.committed,
+            self.specialized_in,
+            self.prepared.as_ref().map(Prepared::candidate),
+            self.requested,
+            (screen.staged_token(), screen.device()),
+            *lifetime,
+        ) {
+            Presented::Placeholder => return,
+            Presented::Staged { token, .. } => Some(token),
+            Presented::Ordinary | Presented::Committed => None,
+        };
+        screen.loading_text(*lifetime, update.revision, &update.chart, on);
+    }
+
+    /// Whether the loading hold shown at `shown_at` has reached its bound
+    /// on the hold's clock (design.md "The pending presentation's hold"),
+    /// read by the uploader before each write of a held pass. Tests: each
+    /// look after the first moves the hold's clock by the write step set.
+    fn hold_past(
+        clock: QpcClock,
+        shared: &Arc<Shared>,
+        shown_at: TimeUs,
+    ) -> impl FnMut() -> bool + use<'_> {
+        let bound = first_frame_bound(shared);
+        #[cfg(test)]
+        let mut looks = 0_u32;
+        move || {
+            #[cfg(test)]
+            {
+                let step = shared.write_clock_step.load(Ordering::SeqCst);
+                if looks > 0 && step > 0 {
+                    let _ =
+                        shared
+                            .hold_elapsed
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |e| {
+                                (e != i64::MIN).then(|| e.saturating_add(step))
+                            });
+                }
+                looks += 1;
+            }
+            let now = clock.now();
+            #[cfg(test)]
+            let now = hold_now(shared, now, shown_at);
+            held_wait(now, shown_at, bound).is_none()
+        }
     }
 
     /// How the boundary of `mode` admits a heavy operation, `held` its
@@ -8823,7 +9770,8 @@ impl Run {
     /// held) once [`CLOCK_PACE`] passed since the last one ended; a
     /// stalled boundary that draws may run one by that clock but keeps the
     /// field; a presenting one waits for a frame shown or invisible.
-    fn admit(&mut self, mode: &Mode, held: bool) -> Admit {
+    fn admit(&mut self, mode: &Mode, held: Option<TimeUs>) -> Admit {
+        let held = held.is_some();
         let Some(end) = self.allowance else {
             return Admit::Free;
         };
@@ -8868,7 +9816,7 @@ impl Run {
     /// when it changed; READY's cutoff given with no entry filled.
     /// `regrow` when the pass took a selection entry. Whether the screen
     /// was dropped (the device failed its poll).
-    fn boundary(&mut self, mode: &Mode, held: bool, regrow: bool) -> bool {
+    fn boundary(&mut self, mode: &Mode, held: Option<TimeUs>, regrow: bool) -> bool {
         #[cfg(test)]
         self.take_handoff_seed();
         let mut dropped = false;
@@ -8923,7 +9871,7 @@ impl Run {
             }
             self.heavy_op(mode, held, regrow, destroy_ok);
         }
-        self.bga_boundary();
+        self.upload_boundary(mode, held);
         #[cfg(all(test, feature = "dev-tools"))]
         let published_from = crate::alloc_count::this_thread();
         if !self.cut_off {
@@ -8956,14 +9904,15 @@ impl Run {
     /// pool owed, then a filled entry's heavy part; the last two only
     /// where `destroy_ok`. The BGA operation held is answered stale, or
     /// run when light, first, whatever the allowance.
-    fn heavy_op(&mut self, mode: &Mode, held: bool, regrow: bool, destroy_ok: bool) {
+    fn heavy_op(&mut self, mode: &Mode, held: Option<TimeUs>, regrow: bool, destroy_ok: bool) {
         let bga = self.bga_op_boundary(false);
         let Some(s) = &self.screen else {
             return;
         };
         let owed = destroy_ok && s.pool_owed();
         let destroy = destroy_ok && s.due_heavy();
-        if !(regrow || bga || owed || destroy) {
+        let creation = self.creation_owed();
+        if !(regrow || bga || owed || destroy || creation.is_some()) {
             return;
         }
         match self.admit(mode, held) {
@@ -8971,20 +9920,103 @@ impl Run {
             Admit::ByStall if self.grant_found() => return,
             Admit::ByStall | Admit::Free => {}
         }
+        #[cfg(test)]
+        let regime = if self.screen.is_none() || matches!(mode, Mode::Idle) || held.is_some() {
+            Regime::Clock
+        } else if self.stalled {
+            Regime::Stalled
+        } else {
+            Regime::Presenting
+        };
+        // A selection entry's regrowth itself runs at the pass that takes
+        // the entry, before the entry's first frame (design.md "Load
+        // Pipeline", the priority), with no look at the frame; one with
+        // nothing to do leaves the other operations to the frame's check.
+        if regrow {
+            if !admits(self.heavy_state(FrameDue::Never, held), Ask::Heavy) {
+                return;
+            }
+            let Some(before) = self.screen.as_ref().map(|s| s.heavy_ops().count) else {
+                return;
+            };
+            #[cfg(test)]
+            let (start, refills) = (
+                Instant::now(),
+                self.shared.refilling_frames.load(Ordering::SeqCst),
+            );
+            if let Some(s) = &mut self.screen {
+                s.regrow_pool();
+            }
+            if self
+                .screen
+                .as_ref()
+                .is_some_and(|s| s.heavy_ops().count != before)
+            {
+                #[cfg(test)]
+                self.note_heavy_record(HeavyRec {
+                    kind: HeavyKind::Regrowth,
+                    start,
+                    end: Instant::now(),
+                    regime,
+                    refills,
+                });
+                self.note_heavy();
+                return;
+            }
+        }
+        // Every other operation waits for a frame due.
+        let frame = self.frame_due_by(mode, held);
+        if !admits(self.heavy_state(frame, held), Ask::Heavy) {
+            return;
+        }
+        // An owed creation first, play's before the pages' and a result
+        // skin's selection (design.md "Load Pipeline", the priority): it is
+        // the interval's operation.
+        if let Some(c) = creation {
+            #[cfg(test)]
+            let start = Instant::now();
+            match c {
+                Creation::Play => {
+                    if let Some(p) = &mut self.attempt {
+                        p.taken = true;
+                    }
+                    self.poll_attempt();
+                    self.creation_answered = self.attempt.is_none();
+                }
+                Creation::Pages => {
+                    if let Some((ticket, pages, reply)) = self.pages_owed.take() {
+                        self.begin_pages(ticket, &pages, reply);
+                    }
+                }
+                Creation::Select => {
+                    if let Some(h) = &mut self.select_hand {
+                        h.taken = true;
+                    }
+                    self.poll_select();
+                }
+            }
+            #[cfg(test)]
+            self.note_heavy_record(HeavyRec {
+                kind: match c {
+                    Creation::Play => HeavyKind::PlayCreation,
+                    Creation::Pages => HeavyKind::PagesCreation,
+                    Creation::Select => HeavyKind::SelectCreation,
+                },
+                start,
+                end: Instant::now(),
+                regime,
+                refills: self.shared.refilling_frames.load(Ordering::SeqCst),
+            });
+            self.note_heavy();
+            return;
+        }
         let Some(before) = self.screen.as_ref().map(|s| s.heavy_ops().count) else {
             return;
         };
         #[cfg(test)]
-        let (start, refills, regime) = (
+        let (start, refills) = (
             Instant::now(),
             self.shared.refilling_frames.load(Ordering::SeqCst),
-            if self.screen.is_none() || matches!(mode, Mode::Idle) || held {
-                Regime::Clock
-            } else if self.stalled {
-                Regime::Stalled
-            } else {
-                Regime::Presenting
-            },
         );
         let ran = |r: &Self| {
             r.screen
@@ -8993,13 +10025,6 @@ impl Run {
         };
         #[cfg(test)]
         let mut kind = None;
-        if regrow && let Some(s) = &mut self.screen {
-            s.regrow_pool();
-            #[cfg(test)]
-            {
-                kind = Some(HeavyKind::Regrowth);
-            }
-        }
         if bga && !ran(self) {
             self.bga_op_boundary(true);
             #[cfg(test)]
@@ -9038,6 +10063,68 @@ impl Run {
             });
         }
         self.note_heavy();
+    }
+
+    /// The admission gate's state for a heavy operation (design.md "Memory
+    /// Budget", the uploader's admission gate): `frame` looked at (a grant
+    /// found is kept for the frame), READY's cutoff as found (a cutoff
+    /// asked with entries filled waits for their destruction, a heavy
+    /// operation), and the hold's bound in a held pass.
+    fn heavy_state(&mut self, frame: FrameDue, held: Option<TimeUs>) -> GateState {
+        GateState {
+            frame_due: match frame {
+                FrameDue::Never => false,
+                FrameDue::Now => true,
+                FrameDue::Grant(g) => {
+                    let found = g.ready();
+                    if found {
+                        self.granted = true;
+                        self.stalled = false;
+                    }
+                    found
+                }
+                FrameDue::At(at) => gate_now() >= at,
+            },
+            cut_off: self.cut_off,
+            hold_past: held
+                .is_some_and(|shown_at| Self::hold_past(self.clock, &self.shared, shown_at)()),
+            heavy_spent: false,
+        }
+    }
+
+    /// What makes a frame due before the boundary's work ends, for a pass
+    /// that draws one (design.md "Memory Budget", the uploader's admission
+    /// gate): the swap chain's grant where frames are paced by it, or the
+    /// frame's clock deadline while an upload steps offscreen or
+    /// minimized. Nothing in an Idle or a held pass, or with a grant kept.
+    fn frame_due_by(&self, mode: &Mode, held: Option<TimeUs>) -> FrameDue {
+        let Some(s) = &self.screen else {
+            return FrameDue::Never;
+        };
+        if held.is_some() || matches!(mode, Mode::Idle) {
+            return FrameDue::Never;
+        }
+        if self.granted {
+            return FrameDue::Now;
+        }
+        if s.paced() && !s.minimized() {
+            return s.grant_probe().map_or(FrameDue::Never, FrameDue::Grant);
+        }
+        self.pace_deadline.map_or(FrameDue::Never, FrameDue::At)
+    }
+
+    /// The creation owed to the boundary's allowance, if any: play's
+    /// staging not yet taken, else a result pages begin.
+    fn creation_owed(&self) -> Option<Creation> {
+        if self.attempt.as_ref().is_some_and(|p| !p.taken) {
+            Some(Creation::Play)
+        } else if self.pages_owed.is_some() {
+            Some(Creation::Pages)
+        } else if self.select_hand.as_ref().is_some_and(|h| !h.taken) {
+            Some(Creation::Select)
+        } else {
+            None
+        }
     }
 
     /// Notes a boundary's heavy operation while the record has room
@@ -9123,6 +10210,8 @@ impl Run {
         skin: AttemptSkin,
         reply: mpsc::SyncSender<Result<Answered, RenderError>>,
     ) {
+        #[cfg(test)]
+        snapshot_waits(&self.shared, 0);
         // An older request than one asked already changes nothing.
         if !self.newest(request) {
             let _ = reply.send(Ok(self.answered(refusal("a newer request superseded it"))));
@@ -9146,6 +10235,7 @@ impl Run {
             attempt,
             skin,
             reply,
+            taken: false,
         };
         if let Err(e) = self.recover() {
             let _ = p.reply.send(Err(e));
@@ -9194,9 +10284,28 @@ impl Run {
             text: &text,
             target: screen.target(),
         };
+        // Its first take waits for the boundary's allowance.
+        if !p.taken {
+            return;
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
-        let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
+        let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
+        // Play's admission released the result's installation: recorded
+        // with the staging's request and published before its answer
+        // (design.md "Memory Budget", R5).
+        let released = screen.take_result_release();
+        if let Some([need, result, limit]) = released {
+            eprintln!(
+                "render: play's admission released the result's installation for request {}: play needs {need} texels with the result's {result}, of {limit}",
+                p.request
+            );
+            self.released = Some(p.request);
+        }
+        let Some(answer) = answer else {
+            if released.is_some() {
+                self.reconcile_result();
+            }
             return;
         };
         if matches!(answer, Ok(Preparation::Ready)) {
@@ -9235,10 +10344,20 @@ impl Run {
 
     /// Sends the preparation in progress its `answer`, and ends it.
     fn answer(&mut self, answer: Result<Preparation, RenderError>) {
+        #[cfg(test)]
+        {
+            self.shared
+                .answered_pass
+                .store(self.shared.passes.load(Ordering::SeqCst), Ordering::SeqCst);
+            snapshot_waits(&self.shared, 1);
+        }
         let answer = answer.map(|preparation| self.answered(preparation));
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(answer);
         }
+        // Tests: held right after the answer, wherever it is sent.
+        #[cfg(test)]
+        self.shared.answer_gate.pass();
     }
 
     /// `preparation` with the screen's structural inputs: those the
@@ -9345,22 +10464,40 @@ impl Run {
         }
     }
 
-    /// Publishes `set` (absent when `None`) of `generation` for the
-    /// attempt of `request`: for `None` into the committed play
-    /// installation; for a staging, into its array, or, when it has none of
-    /// its own (a pending skin's specialization reused on the installation
-    /// in use), into the committed installation it draws from (S10-12
-    /// design §5.3). The publication is admitted only while its key is
-    /// current ([`crate::chart_images::PublicationKey::current`]): another
-    /// generation, or a request whose staging is gone, publishes nothing
-    /// anywhere. The answer says what it was for and where it went.
-    fn publish_chart(
+    /// Takes `set` (absent when `None`) of `generation` for the attempt of
+    /// `request` (design.md "Rendering and Skins", chart images): for
+    /// `None` into the committed play installation; for a staging, into
+    /// its array, or, when it has none of its own (a pending skin's
+    /// specialization reused on the installation in use), into the
+    /// committed installation it draws from. It is admitted only while its
+    /// key is current ([`crate::chart_images::PublicationKey::current`]):
+    /// another generation, or a request whose staging is gone, publishes
+    /// nothing anywhere. Absent, refused at the take, or published at once
+    /// (a screen without the uploader), it is answered here. Otherwise it
+    /// is held in hand, its target unavailable, its bands written at the
+    /// boundaries that follow; it is answered in the pass whose boundary
+    /// ends it ([`Self::chart_answer`]) or that finds it no longer current
+    /// ([`Self::check_chart_hand`]). One still in hand is replaced,
+    /// answered Unavailable.
+    fn take_chart(
         &mut self,
         generation: u64,
         request: Option<u64>,
-        set: Option<&crate::chart_images::ChartImages>,
-    ) -> crate::chart_images::Ack {
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+        reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    ) {
         use crate::chart_images::{Ack, PublicationKey, PublishedTo};
+        #[cfg(test)]
+        snapshot_waits(&self.shared, 2);
+        if let Some(old) = self.chart_hand.take() {
+            if let Some(screen) = &mut self.screen {
+                screen.cancel_chart_images();
+            }
+            let _ = old.reply.send(Ack {
+                key: old.key,
+                answer: Err(render::ChartOutcome::Unavailable),
+            });
+        }
         #[cfg(test)]
         self.chart_held();
         self.sync_chart();
@@ -9378,31 +10515,37 @@ impl Run {
             answer: Err(render::ChartOutcome::Unavailable),
         };
         if !key.current(&now, request) {
-            return unpublished;
+            let _ = reply.send(unpublished);
+            return;
         }
         let target = match (request, self.prepared.as_ref()) {
             (None, _) => render::ChartTarget::Committed,
             (Some(_), Some(p)) => render::ChartTarget::Staged(p.token),
-            (Some(_), None) => return unpublished,
+            (Some(_), None) => {
+                let _ = reply.send(unpublished);
+                return;
+            }
         };
         let Some(screen) = &mut self.screen else {
-            return unpublished;
+            let _ = reply.send(unpublished);
+            return;
         };
-        let publish = |screen: &mut Box<dyn Screen>, target| match set {
-            Some(set) => screen.publish_chart_images(target, set.fitted()),
-            None => screen.publish_chart_absent(target),
+        let begin = |screen: &mut Box<dyn Screen>, target| match &set {
+            Some(set) => screen.begin_chart_images(target, set),
+            None => screen.publish_chart_absent(target).map(Some),
         };
         #[cfg(feature = "dev-tools")]
         let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
         #[cfg(feature = "dev-tools")]
         let p_t = render::probe::Span::start();
-        let mut answer = publish(screen, target);
+        let mut begun = begin(screen, target);
         // The admitted staging draws from the committed installation when
         // it has no array of its own: its table is published there.
-        let committed = request.is_none() || matches!(answer, Err(RenderError::NoChartLayer));
+        let committed = request.is_none() || matches!(begun, Err(RenderError::NoChartLayer));
         if request.is_some() && committed {
-            answer = publish(screen, render::ChartTarget::Committed);
+            begun = begin(screen, render::ChartTarget::Committed);
         }
+        let device = screen.device();
         #[cfg(feature = "dev-tools")]
         {
             crate::dev::loop_probe::mark(
@@ -9410,30 +10553,105 @@ impl Run {
                 crate::dev::loop_probe::us(p_t.elapsed()),
             );
             crate::dev::loop_probe::mark("ci:att:staged", i64::from(!committed));
-            crate::dev::loop_probe::mark("ci:att:ok", i64::from(answer.is_ok()));
             drop(p_caller);
         }
+        let hand = ChartHand {
+            key,
+            committed,
+            now_committed: now.committed,
+            device,
+            reply,
+            #[cfg(feature = "dev-tools")]
+            at: p_t,
+        };
+        match begun {
+            // In hand: its bands step at the boundaries.
+            Ok(None) => self.chart_hand = Some(hand),
+            Ok(Some(table)) => self.chart_answer(hand, Ok(table)),
+            Err(e) => self.chart_answer(hand, Err(e)),
+        }
+    }
+
+    /// Ends the chart-image publication in hand when it is no longer
+    /// current, before each boundary that would write its next band: its
+    /// key ([`crate::chart_images::PublicationKey::current`], after
+    /// [`Self::sync_chart`]), the committed installation it was taken on
+    /// when it goes there, and the screen's device (the same, not lost).
+    /// Nothing more is written, no table published, and it is answered
+    /// Unavailable.
+    fn check_chart_hand(&mut self) {
+        if self.chart_hand.is_none() {
+            return;
+        }
+        self.sync_chart();
+        let now = self.chart_now();
+        let device = self
+            .screen
+            .as_ref()
+            .filter(|s| !s.device_lost())
+            .map(|s| s.device());
+        let current = self.chart_hand.as_ref().is_some_and(|h| {
+            h.key.current(&now, h.key.request)
+                && (!h.committed || now.committed == h.now_committed)
+                && device == Some(h.device)
+        });
+        if current {
+            return;
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.cancel_chart_images();
+        }
+        if let Some(hand) = self.chart_hand.take() {
+            self.chart_answer(hand, Err(RenderError::ChartChanged));
+        }
+    }
+
+    /// Answers the chart-image publication `hand` with how it ended,
+    /// checked again here: a table or an all-absent one left in a target
+    /// still current is recorded as the committed or the staged table
+    /// ([`Self::sync_chart`] keeps them current); for anything else
+    /// nothing is recorded. The game thread logs what it left; this
+    /// thread draws frames and logs nothing.
+    fn chart_answer(
+        &mut self,
+        hand: ChartHand,
+        end: Result<skin_model::chart_image::ChartTable, RenderError>,
+    ) {
+        use crate::chart_images::{Ack, PublicationKey, PublishedTo};
+        self.sync_chart();
+        let now = self.chart_now();
+        let current = hand.key.current(&now, hand.key.request)
+            && (!hand.committed || now.committed == hand.now_committed);
+        let answer = match end {
+            _ if !current => Err(render::ChartOutcome::Unavailable),
+            end => end.map_err(|e| e.chart_outcome()),
+        };
         // What a publication left in its target: a table, or an all-absent
         // one; nothing for the other failures.
-        let left = answer.is_ok()
-            || answer
-                .as_ref()
-                .is_err_and(|e| e.chart_outcome() == render::ChartOutcome::Absent);
-        if left && committed {
+        let left = answer.is_ok() || answer == Err(render::ChartOutcome::Absent);
+        if left && hand.committed {
             self.chart_table = Some(PublicationKey {
-                generation,
+                generation: hand.key.generation,
                 request: None,
-                target: PublishedTo::Committed(now.committed),
+                target: PublishedTo::Committed(hand.now_committed),
             });
         } else if left {
-            self.staged_table = Some(key);
+            self.staged_table = Some(hand.key);
         }
-        // The game thread logs what it left; this thread draws frames and
-        // logs nothing.
-        Ack {
-            key,
-            answer: answer.map_err(|e| e.chart_outcome()),
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::loop_probe::mark("ci:att:ok", i64::from(answer.is_ok()));
+            crate::dev::loop_probe::mark(
+                "ci:att:answer_us",
+                crate::dev::loop_probe::us(hand.at.elapsed()),
+            );
         }
+        #[cfg(test)]
+        snapshot_waits(&self.shared, 3);
+        let _ = hand.reply.send(Ack {
+            key: hand.key,
+            answer,
+        });
     }
 
     /// Takes a step of the BGA pictures' publication of `generation`:
@@ -9582,20 +10800,103 @@ impl Run {
     /// ([`render::Renderer::bga_boundary`]), its job answered once they
     /// end. A batch the screen no longer holds (a screen built again) is
     /// answered stale.
-    fn bga_boundary(&mut self) {
-        let Some((generation, _)) = &self.bga_reply else {
-            return;
-        };
-        let current = self.shared.bga_generation.load(Ordering::SeqCst) == *generation;
+    fn upload_boundary(&mut self, mode: &Mode, held: Option<TimeUs>) {
         let stale = render::BgaStep::Done(Err(render::BgaFault::Stale));
+        let current = self
+            .bga_reply
+            .as_ref()
+            .map(|(g, _)| self.shared.bga_generation.load(Ordering::SeqCst) == *g);
+        if current == Some(false)
+            && let Some(s) = self.screen.as_mut()
+        {
+            s.cancel_bga_upload();
+        }
+        self.check_chart_hand();
+        self.check_pages_hand();
+        // A result skin's selection in hand: its steps' figures are its own
+        // (development builds).
+        #[cfg(feature = "dev-tools")]
+        let _caller = self
+            .select_hand
+            .as_ref()
+            .filter(|h| h.taken)
+            .map(|_| crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN));
+        let mut pages_end = None;
+        let frame = self.frame_due_by(mode, held);
+        let chart = self
+            .chart_hand
+            .as_ref()
+            .map(|h| (&*self.shared.chart_generation, h.key.generation));
+        let loading = match mode {
+            Mode::Menu {
+                loading: Some(lifetime),
+                update: Some(update),
+                ..
+            } => Some((*lifetime, update.revision)),
+            _ => None,
+        };
+        let bga = self
+            .bga_reply
+            .as_ref()
+            .map(|(g, _)| (&*self.shared.bga_generation, *g));
+        let mut granted = false;
         let step = match self.screen.as_mut() {
-            Some(s) if current => s.bga_boundary(),
             Some(s) => {
-                s.cancel_bga_upload();
-                stale
+                let mut up = match held {
+                    Some(shown_at) => s.upload_boundary(&mut PassGate {
+                        frame,
+                        cut_off: self.cut_off,
+                        cutoff: Some(&self.shared.cutoff),
+                        hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
+                        chart,
+                        bga,
+                        loading,
+                        slot: Some(&self.shared.loading),
+                        granted: &mut granted,
+                    }),
+                    None => s.upload_boundary(&mut PassGate::<fn() -> bool> {
+                        frame,
+                        cut_off: self.cut_off,
+                        cutoff: Some(&self.shared.cutoff),
+                        hold: None,
+                        chart,
+                        bga,
+                        loading,
+                        slot: Some(&self.shared.loading),
+                        granted: &mut granted,
+                    }),
+                };
+                self.staged_seen |= up.staged.is_some();
+                pages_end = up.pages.take();
+                if granted {
+                    self.granted = true;
+                    self.stalled = false;
+                }
+                if let Some(end) = up.chart
+                    && let Some(hand) = self.chart_hand.take()
+                {
+                    self.chart_answer(hand, end);
+                }
+                #[cfg(test)]
+                if up.staged.is_some() {
+                    self.shared
+                        .staged_pass
+                        .store(self.shared.passes.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                if current == Some(false) {
+                    stale
+                } else {
+                    up.bga
+                }
             }
             None => stale,
         };
+        if let Some(end) = pages_end {
+            self.pages_end(end);
+        }
+        if self.bga_reply.is_none() {
+            return;
+        }
         let answer = match step {
             render::BgaStep::Pending => return,
             render::BgaStep::Idle => Err(render::BgaFault::Stale),
@@ -9826,6 +11127,22 @@ impl Run {
         if kind == ScreenKind::Result {
             crate::dev::result_staged(screen.atlas_uploads() - uploads);
         }
+        self.select_installed(request, kind, bundle, script, installed)
+    }
+
+    /// The rest of a selection once its staging answered `installed`:
+    /// committed unless withdrawn, its runtime parked, or refused.
+    fn select_installed(
+        &mut self,
+        request: u64,
+        kind: ScreenKind,
+        bundle: Arc<SkinBundle>,
+        script: ScriptSlot,
+        installed: Result<Preparation, RenderError>,
+    ) -> Result<Preparation, RenderError> {
+        let Some(screen) = &mut self.screen else {
+            return Err(RenderError::SurfaceLost);
+        };
         match installed {
             Ok(Preparation::Ready) => {
                 // Held through the commit: a withdrawal waits for it, or
@@ -9890,6 +11207,16 @@ impl Run {
     /// is discarded with whatever the screen staged for it, whether or not
     /// it answered: one still preparing is answered refused, for `why`.
     fn supersede_attempts(&mut self, why: &str) {
+        if let Some(h) = self.select_hand.take() {
+            if let Some(screen) = &mut self.screen {
+                screen.discard_token(PreparedToken {
+                    request: h.request,
+                    device: screen.device(),
+                    kind: h.kind,
+                });
+            }
+            let _ = h.reply.send(Ok(refusal(why)));
+        }
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(Ok(self.answered(refusal(why))));
             if let Some(screen) = &mut self.screen {
@@ -9934,6 +11261,105 @@ impl Run {
         self.specialized_in = None;
         commits.committed = commits.committed.max(request);
         Ok(Preparation::Ready)
+    }
+
+    /// A result skin's selection, stepped (design.md "Memory Budget", the
+    /// uploader): refused or superseded as [`select`](Self::select) would
+    /// be, answered at once (`Some`); else in hand, its staging taken at a
+    /// boundary whose allowance admits its creation, after play's and the
+    /// pages'.
+    fn begin_select(
+        &mut self,
+        request: u64,
+        kind: ScreenKind,
+        bundle: Arc<SkinBundle>,
+        script: ScriptSlot,
+        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    ) -> Option<Result<Preparation, RenderError>> {
+        if !self.newest(request) {
+            return Some(Ok(refusal("a newer request superseded it")));
+        }
+        self.supersede_attempts("a newer skin selection superseded it");
+        if let Err(e) = self.recover() {
+            self.shared.failed.store(true, Ordering::Release);
+            return Some(Err(e));
+        }
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::hold_result_upload();
+            if crate::dev::refuse_result_select() {
+                return Some(Ok(refusal("dev: the result's selection was refused")));
+            }
+        }
+        self.select_hand = Some(SelectHand {
+            request,
+            kind,
+            bundle,
+            script,
+            reply,
+            taken: false,
+            #[cfg(feature = "dev-tools")]
+            uploads: 0,
+        });
+        None
+    }
+
+    /// The stepped selection in hand asked again: answered, committed and
+    /// replied once its staging answers; withdrawn, discarded and
+    /// answered cancelled.
+    fn poll_select(&mut self) {
+        let Some(h) = self.select_hand.as_ref().filter(|h| h.taken) else {
+            return;
+        };
+        let request = h.request;
+        if self.shared.commits().withdrawn >= request {
+            if let Some(h) = self.select_hand.take() {
+                if let Some(s) = &mut self.screen {
+                    s.discard_token(PreparedToken {
+                        request,
+                        device: s.device(),
+                        kind: h.kind,
+                    });
+                }
+                let _ = h.reply.send(Ok(Preparation::Cancelled));
+            }
+            return;
+        }
+        if self.screen.is_none()
+            && let Err(e) = self.recover()
+        {
+            if let Some(h) = self.select_hand.take() {
+                let _ = h.reply.send(Err(e));
+            }
+            return;
+        }
+        let (Some(h), Some(screen)) = (self.select_hand.as_mut(), self.screen.as_mut()) else {
+            return;
+        };
+        #[cfg(feature = "dev-tools")]
+        let before = screen.atlas_uploads();
+        #[cfg(feature = "dev-tools")]
+        let caller = crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN);
+        let installed = screen.install_stepped(h.kind, &h.bundle, h.request);
+        #[cfg(feature = "dev-tools")]
+        drop(caller);
+        #[cfg(feature = "dev-tools")]
+        {
+            h.uploads += screen.atlas_uploads() - before;
+        }
+        let Some(installed) = installed else {
+            return;
+        };
+        let Some(h) = self.select_hand.take() else {
+            return;
+        };
+        #[cfg(feature = "dev-tools")]
+        if h.kind == ScreenKind::Result {
+            crate::dev::result_staged(h.uploads);
+        }
+        let answer = self.select_installed(h.request, h.kind, h.bundle, h.script, installed);
+        self.reconcile_result();
+        let _ = h.reply.send(answer);
     }
 
     /// Removes `kind`'s installation for request `request`, recovering
@@ -10788,6 +12214,177 @@ impl Run {
         self.publish_result_status();
     }
 
+    /// The result pages begin of `ticket`, owed to a boundary whose
+    /// heavy-operation allowance admits its creation, after play's
+    /// (design.md "Load Pipeline"): at or below the withdrawn mark it does
+    /// nothing; an earlier owed begin is answered cancelled.
+    fn owe_pages(
+        &mut self,
+        ticket: u64,
+        pages: Arc<PackedPages>,
+        reply: mpsc::SyncSender<PagesAnswer>,
+    ) {
+        if ticket <= self.shared.pages().withdrawn {
+            let _ = reply.send(PagesAnswer::Cancelled);
+            return;
+        }
+        if let Some((_, _, old)) = self.pages_owed.replace((ticket, pages, reply)) {
+            let _ = old.send(PagesAnswer::Cancelled);
+        }
+    }
+
+    /// The result pages begin of `ticket` (design.md "Memory Budget", the
+    /// result pages upload): at or below the withdrawn mark it does
+    /// nothing; else it withdraws the upload in hand and begins its own,
+    /// with no request taken, no attempt superseded and the mode kept.
+    /// Pages already installed publish at once; a begun upload is in hand
+    /// until a boundary ends it; a refusal answers with why; a device
+    /// failure drops the screen, its answer lost.
+    fn begin_pages(
+        &mut self,
+        ticket: u64,
+        pages: &Arc<PackedPages>,
+        reply: mpsc::SyncSender<PagesAnswer>,
+    ) {
+        if ticket <= self.shared.pages().withdrawn {
+            let _ = reply.send(PagesAnswer::Cancelled);
+            return;
+        }
+        if let Some((_, old)) = self.pages_hand.take() {
+            if let Some(s) = self.screen.as_mut() {
+                s.withdraw_pages();
+            }
+            let _ = old.send(PagesAnswer::Cancelled);
+        }
+        let Some(screen) = self.screen.as_mut() else {
+            let _ = reply.send(PagesAnswer::Lost);
+            return;
+        };
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::hold_result_upload();
+            if crate::dev::refuse_result_select() {
+                let _ = reply.send(PagesAnswer::Refused(
+                    "dev: the result's upload was refused".to_owned(),
+                ));
+                return;
+            }
+        }
+        #[cfg(feature = "dev-tools")]
+        let retained = screen
+            .retained_atlases(ScreenKind::Result)
+            .iter()
+            .flatten()
+            .count();
+        #[cfg(feature = "dev-tools")]
+        let _ = screen.take_upload_timing();
+        let begun = screen.begin_pages(pages, ticket);
+        #[cfg(feature = "dev-tools")]
+        if let Ok(Some(b)) = &begun {
+            crate::dev::result_staged(u64::from(*b == render::PagesBegun::Begun));
+            self.pages_retained = retained;
+        }
+        match begun {
+            Ok(None) => {
+                let _ = reply.send(PagesAnswer::Refused(
+                    "this screen draws no declarative skin".to_owned(),
+                ));
+            }
+            Ok(Some(render::PagesBegun::Installed)) => {
+                let answer = self.publish_marks(ticket);
+                let _ = reply.send(answer);
+            }
+            Ok(Some(render::PagesBegun::Begun)) => {
+                self.pages_hand = Some((ticket, reply));
+                // Its begin released the earlier installation.
+                self.reconcile_result();
+            }
+            Err(e) if e.is_refusal() => {
+                self.reconcile_result();
+                let _ = reply.send(PagesAnswer::Refused(game::Chain(&e).to_string()));
+            }
+            Err(_) => {
+                let _ = reply.send(PagesAnswer::Lost);
+                self.drop_screen();
+                self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// The pages' marks for `ticket`'s publication: withdrawn, nothing;
+    /// else published.
+    fn publish_marks(&self, ticket: u64) -> PagesAnswer {
+        let mut marks = self.shared.pages();
+        if marks.withdrawn >= ticket {
+            return PagesAnswer::Cancelled;
+        }
+        marks.published = marks.published.max(ticket);
+        PagesAnswer::Ready
+    }
+
+    /// The upload in hand, read once a pass: withdrawn by its owner, it
+    /// steps no further and its array retires.
+    fn check_pages_hand(&mut self) {
+        let withdrawn = self.shared.pages().withdrawn;
+        if let Some((_, _, reply)) = self.pages_owed.take_if(|(t, _, _)| *t <= withdrawn) {
+            let _ = reply.send(PagesAnswer::Cancelled);
+        }
+        let Some(ticket) = self.pages_hand.as_ref().map(|(t, _)| *t) else {
+            return;
+        };
+        if ticket > self.shared.pages().withdrawn {
+            return;
+        }
+        if let Some(s) = self.screen.as_mut() {
+            s.withdraw_pages();
+        }
+        self.reconcile_result();
+        if let Some((_, reply)) = self.pages_hand.take() {
+            let _ = reply.send(PagesAnswer::Cancelled);
+        }
+    }
+
+    /// How the upload in hand ended at a boundary: written, it is
+    /// published under the pages' lock unless withdrawn, and the result
+    /// kind's record follows; refused or withdrawn by the renderer, it is
+    /// answered so.
+    fn pages_end(&mut self, end: render::PagesStep) {
+        let (ticket, answer) = match end {
+            render::PagesStep::Written(t) => {
+                let Some(screen) = self.screen.as_mut() else {
+                    return;
+                };
+                let shared = Arc::clone(&self.shared);
+                let mut marks = shared.pages();
+                let answer = if marks.withdrawn >= t {
+                    drop(marks);
+                    screen.withdraw_pages();
+                    PagesAnswer::Cancelled
+                } else {
+                    screen.publish_pages();
+                    marks.published = marks.published.max(t);
+                    drop(marks);
+                    PagesAnswer::Ready
+                };
+                #[cfg(feature = "dev-tools")]
+                if let Some(timing) = screen.take_upload_timing() {
+                    crate::dev::print_upload(false, self.pages_retained, timing);
+                }
+                (t, answer)
+            }
+            render::PagesStep::Refused(t, e) => {
+                (t, PagesAnswer::Refused(game::Chain(&e).to_string()))
+            }
+            render::PagesStep::Withdrawn(t) => (t, PagesAnswer::Cancelled),
+        };
+        // The result kind's record first: its owner reads it once answered.
+        self.reconcile_result();
+        if let Some((_, reply)) = self.pages_hand.take_if(|(h, _)| *h == ticket) {
+            let _ = reply.send(answer);
+        }
+    }
+
     /// The screen failed: what the result kind keeps is read from it one
     /// last time, then it is dropped.
     fn drop_screen(&mut self) {
@@ -11518,6 +13115,7 @@ impl Run {
         let same_holders = true;
         let same = same_holders
             && status.installed == installed
+            && status.released == self.released
             && status.menus == menus
             && status.disabled == self.result_disabled
             && status.lifetime == lifetime
@@ -11558,6 +13156,7 @@ impl Run {
             None
         };
         status.installed = installed;
+        status.released = self.released;
         status.menus = menus;
         status.disabled.clone_from(&self.result_disabled);
         status.lifetime = lifetime;
@@ -12058,6 +13657,109 @@ pub(crate) mod tests {
         assert_eq!(&seen[..3], [(1, true), (1, false), (1, false)]);
         assert_eq!(seen[3], (2, true), "{seen:?}");
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A menu screen with a loading text in its uploader's hand until it
+    /// is dropped; each drop counted.
+    struct Texting {
+        held: Arc<AtomicBool>,
+        drops: Arc<AtomicU32>,
+    }
+
+    impl Screen for Texting {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn loading_text_held(&self) -> bool {
+            self.held.load(Ordering::SeqCst)
+        }
+        fn drop_loading_text(&mut self) {
+            if self.held.swap(false, Ordering::SeqCst) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// H5 (design.md "Scope of No Allocation"): READY's cutoff asked while
+    /// a loading text is in the uploader's hand is acknowledged only after
+    /// that text is dropped, whether the render thread runs or waits for
+    /// its frame when it is asked; the control, no text in hand, is cut
+    /// off as before.
+    // Revert: the cutoff acknowledged with the text in hand (no settling
+    // in `mark_waiting` and `check_cutoff`) -> "cut off over a loading
+    // text in hand".
+    #[test]
+    fn the_cutoff_is_acknowledged_only_after_the_loading_text_is_dropped() {
+        for in_hand in [false, true] {
+            let held = Arc::new(AtomicBool::new(in_hand));
+            let drops = Arc::new(AtomicU32::new(0));
+            let (h, d) = (Arc::clone(&held), Arc::clone(&drops));
+            let make: MakeScreen = Box::new(move || {
+                Ok(Box::new(Texting {
+                    held: Arc::clone(&h),
+                    drops: Arc::clone(&d),
+                }) as Box<dyn Screen>)
+            });
+            let clock = QpcClock::start();
+            let link = spawn(
+                make,
+                None,
+                None,
+                clock,
+                view(),
+                measure(clock),
+                Box::new(NoFrames),
+            )
+            .unwrap();
+            link.send(RenderMsg::Menu(Box::default()));
+            let frames = link.shared.clock_paced.load(Ordering::SeqCst);
+            assert!(wait_until(|| link
+                .shared
+                .clock_paced
+                .load(Ordering::SeqCst)
+                > frames + 2));
+            assert_eq!(held.load(Ordering::SeqCst), in_hand, "kept until asked");
+            link.ask_cutoff();
+            assert!(wait_until(
+                || link.cutoff_phase() == super::CutoffPhase::CutOff
+            ));
+            assert!(
+                !held.load(Ordering::SeqCst),
+                "cut off over a loading text in hand"
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), u32::from(in_hand));
+            link.exit();
+        }
     }
 
     /// The loading state is drawn on through a chart's load and a
@@ -15383,6 +17085,152 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// A swap-paced screen with an upload of `steps` steps in hand, one
+    /// written at each boundary, whose grant comes at every fourth wait
+    /// for it; it counts its menu frames.
+    struct Stepping {
+        steps: Arc<AtomicU32>,
+        draws: Arc<AtomicU32>,
+        waits: Arc<AtomicU32>,
+        /// The frames drawn when the last step was written.
+        at_end: Arc<AtomicU32>,
+        /// Swap-paced; else paced by the clock, as offscreen.
+        swap: bool,
+    }
+
+    impl Screen for Stepping {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            self.swap
+        }
+        fn wait_grant(&mut self, _pace: Duration) -> Option<bool> {
+            Some((self.waits.fetch_add(1, Ordering::AcqRel) + 1).is_multiple_of(4))
+        }
+        fn upload_state(&self) -> render::UploadState {
+            if self.steps.load(Ordering::Acquire) > 0 {
+                render::UploadState::Ready
+            } else {
+                render::UploadState::Idle
+            }
+        }
+        fn upload_waited(&self) -> bool {
+            self.steps.load(Ordering::Acquire) > 0
+        }
+        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
+            if self
+                .steps
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                == Ok(1)
+            {
+                self.at_end
+                    .store(self.draws.load(Ordering::Acquire), Ordering::Release);
+            }
+            render::Uploaded {
+                bga: render::BgaStep::Idle,
+                staged: None,
+                text: None,
+                chart: None,
+                pages: None,
+            }
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.draws.fetch_add(1, Ordering::AcqRel);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// V10e, (r2): with an upload in hand, a swap-paced screen's passes
+    /// wait for the grant or the pace, and a pass the pace ends presents
+    /// nothing and runs the next boundary's step, so the upload steps
+    /// several times a frame; with none in hand, every pass is a frame.
+    #[test]
+    fn an_upload_steps_in_passes_between_frames() {
+        let (drawn, between, waits) = stepped_frames(true);
+        assert!(
+            drawn <= 10,
+            "{drawn} frames for 20 steps, {between} between, {waits} waits"
+        );
+        assert!(between >= 10, "{between} passes between frames");
+    }
+
+    /// V10e, (r2) offscreen: with an upload in hand, a clock-paced screen's
+    /// passes wait for the step until the frame's 16 ms deadline and
+    /// present nothing before it, so the upload steps many times a frame.
+    #[test]
+    fn an_offscreen_upload_steps_until_the_frames_deadline() {
+        let (drawn, between, waits) = stepped_frames(false);
+        assert_eq!(waits, 0, "no grant to wait for");
+        assert!(drawn <= 5, "{drawn} frames for 20 steps, {between} between");
+        assert!(between >= 15, "{between} passes between frames");
+    }
+
+    /// 20 steps of an upload stepped on a [`Stepping`] screen, swap-paced
+    /// (`swap`) or clock-paced: the frames drawn while they were written,
+    /// the passes between frames, and the waits for a grant.
+    fn stepped_frames(swap: bool) -> (u32, u32, u32) {
+        let steps = Arc::new(AtomicU32::new(0));
+        let draws = Arc::new(AtomicU32::new(0));
+        let waits = Arc::new(AtomicU32::new(0));
+        let at_end = Arc::new(AtomicU32::new(0));
+        let (s, d, w, e) = (
+            Arc::clone(&steps),
+            Arc::clone(&draws),
+            Arc::clone(&waits),
+            Arc::clone(&at_end),
+        );
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Stepping {
+                steps: Arc::clone(&s),
+                draws: Arc::clone(&d),
+                waits: Arc::clone(&w),
+                at_end: Arc::clone(&e),
+                swap,
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        link.send(RenderMsg::Menu(Box::new(one_line("menu"))));
+        assert!(wait_until(|| draws.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            waits.load(Ordering::Acquire),
+            0,
+            "no upload: no pass between"
+        );
+        assert_eq!(link.shared.between.load(Ordering::SeqCst), 0);
+        let from = draws.load(Ordering::Acquire);
+        steps.store(20, Ordering::Release);
+        assert!(wait_until(|| steps.load(Ordering::Acquire) == 0));
+        let drawn = at_end.load(Ordering::Acquire) - from;
+        let between = link.shared.between.load(Ordering::SeqCst);
+        link.exit();
+        (drawn, between, waits.load(Ordering::Acquire))
+    }
+
     /// Play frames the [`Stalling`] screen draws before it stalls.
     const DRAWN_FRAMES: u32 = 2;
 
@@ -16982,24 +18830,40 @@ pub(crate) mod tests {
             b.pending = Some((key.array, cells.len(), bytes, boundaries));
             Ok(())
         }
-        fn bga_boundary(&mut self) -> render::BgaStep {
-            let mut b = self.shared.bga.lock().unwrap();
-            let Some((array, cells, bytes, left)) = b.pending else {
-                return render::BgaStep::Idle;
-            };
-            b.boundaries += 1;
-            if b.live != Some(array) {
+        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
+            let bga = (|| {
+                let mut b = self.shared.bga.lock().unwrap();
+                let Some((array, cells, bytes, left)) = b.pending else {
+                    return render::BgaStep::Idle;
+                };
+                b.boundaries += 1;
+                if b.live != Some(array) {
+                    b.pending = None;
+                    return render::BgaStep::Done(Err(render::BgaFault::Stale));
+                }
+                if left > 0 {
+                    b.pending = Some((array, cells, bytes, left - 1));
+                    return render::BgaStep::Pending;
+                }
                 b.pending = None;
-                return render::BgaStep::Done(Err(render::BgaFault::Stale));
+                b.cells += u32::try_from(cells).unwrap();
+                b.batches.push((cells, bytes));
+                render::BgaStep::Done(Ok(()))
+            })();
+            render::Uploaded {
+                bga,
+                staged: None,
+                text: None,
+                chart: None,
+                pages: None,
             }
-            if left > 0 {
-                b.pending = Some((array, cells, bytes, left - 1));
-                return render::BgaStep::Pending;
+        }
+        fn upload_state(&self) -> render::UploadState {
+            if self.shared.bga.lock().unwrap().pending.is_some() {
+                render::UploadState::Ready
+            } else {
+                render::UploadState::Idle
             }
-            b.pending = None;
-            b.cells += u32::try_from(cells).unwrap();
-            b.batches.push((cells, bytes));
-            render::BgaStep::Done(Ok(()))
         }
         fn cancel_bga_upload(&mut self) {
             let mut b = self.shared.bga.lock().unwrap();
@@ -20642,6 +22506,18 @@ pub(crate) mod tests {
             }
             answer
         }
+        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+            self.menu.upload_boundary(past)
+        }
+        fn upload_state(&self) -> render::UploadState {
+            self.menu.upload_state()
+        }
+        fn upload_waited(&self) -> bool {
+            self.menu.upload_waited()
+        }
+        fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+            self.menu.wait_step(timeout)
+        }
         fn device(&self) -> u64 {
             self.menu.device()
         }
@@ -20663,6 +22539,19 @@ pub(crate) mod tests {
         ) -> Result<Preparation, RenderError> {
             let answer = self.menu.install(kind, skin, request);
             if matches!(answer, Ok(Preparation::Ready)) {
+                let staged = self.menu.renderer_mut().memory().staged_atlas;
+                self.probed().installs.push(staged);
+            }
+            answer
+        }
+        fn install_stepped(
+            &mut self,
+            kind: ScreenKind,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            let answer = self.menu.install_stepped(kind, skin, request);
+            if matches!(answer, Some(Ok(Preparation::Ready))) {
                 let staged = self.menu.renderer_mut().memory().staged_atlas;
                 self.probed().installs.push(staged);
             }
@@ -20713,6 +22602,27 @@ pub(crate) mod tests {
                 return Err(RenderError::SurfaceLost);
             }
             self.menu.menu(page, changed)
+        }
+        fn loading_text(
+            &mut self,
+            lifetime: u64,
+            revision: u64,
+            chart: &std::sync::Arc<crate::loading_text::ChosenChart>,
+            on: Option<render::PreparedToken>,
+        ) {
+            self.menu.loading_text(lifetime, revision, chart, on);
+        }
+        fn text_settled(&self) -> bool {
+            self.menu.text_settled()
+        }
+        fn drop_loading_text(&mut self) {
+            self.menu.drop_loading_text();
+        }
+        fn loading_text_held(&self) -> bool {
+            self.menu.loading_text_held()
+        }
+        fn grant_probe(&self) -> Option<render::GrantProbe> {
+            self.menu.grant_probe()
         }
         fn loading(
             &mut self,
@@ -20955,6 +22865,9 @@ pub(crate) mod tests {
         builds: Arc<AtomicU32>,
         resize: Resize,
         fail: Arc<AtomicBool>,
+        /// Set: no boundary steps the uploader, which reads as idle, so
+        /// what it holds stays in hand.
+        hold_up: Arc<AtomicBool>,
         /// Taken by the next loading frame: its renderer's next text
         /// preparation fails waiting for the GPU.
         #[cfg(feature = "dev-tools")]
@@ -21038,6 +22951,46 @@ pub(crate) mod tests {
         ) -> Option<Result<Preparation, RenderError>> {
             self.menu.prepare_attempt(a, skin, request)
         }
+        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+            if self.hold_up.load(Ordering::Acquire) {
+                return render::Uploaded {
+                    bga: render::BgaStep::Idle,
+                    staged: None,
+                    text: None,
+                    chart: None,
+                    pages: None,
+                };
+            }
+            self.menu.upload_boundary(past)
+        }
+        fn upload_state(&self) -> render::UploadState {
+            if self.hold_up.load(Ordering::Acquire) {
+                return render::UploadState::Idle;
+            }
+            self.menu.upload_state()
+        }
+        fn upload_waited(&self) -> bool {
+            !self.hold_up.load(Ordering::Acquire) && self.menu.upload_waited()
+        }
+        fn begin_pages(
+            &mut self,
+            pages: &Arc<skin_model::PackedPages>,
+            ticket: u64,
+        ) -> Result<Option<render::PagesBegun>, RenderError> {
+            self.menu.begin_pages(pages, ticket)
+        }
+        fn publish_pages(&mut self) -> Option<u64> {
+            self.menu.publish_pages()
+        }
+        fn withdraw_pages(&mut self) -> Option<u64> {
+            self.menu.withdraw_pages()
+        }
+        fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
+            self.menu.installed_pages(kind)
+        }
+        fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+            self.menu.wait_step(timeout)
+        }
         fn device(&self) -> u64 {
             self.menu.device()
         }
@@ -21054,6 +23007,14 @@ pub(crate) mod tests {
             request: u64,
         ) -> Result<Preparation, RenderError> {
             self.menu.install(kind, skin, request)
+        }
+        fn install_stepped(
+            &mut self,
+            kind: ScreenKind,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            self.menu.install_stepped(kind, skin, request)
         }
         fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
             self.menu.installation(kind)
@@ -21090,6 +23051,27 @@ pub(crate) mod tests {
             changed: bool,
         ) -> Result<FrameTiming, RenderError> {
             self.menu.menu(page, changed)
+        }
+        fn loading_text(
+            &mut self,
+            lifetime: u64,
+            revision: u64,
+            chart: &std::sync::Arc<crate::loading_text::ChosenChart>,
+            on: Option<render::PreparedToken>,
+        ) {
+            self.menu.loading_text(lifetime, revision, chart, on);
+        }
+        fn text_settled(&self) -> bool {
+            self.menu.text_settled()
+        }
+        fn drop_loading_text(&mut self) {
+            self.menu.drop_loading_text();
+        }
+        fn loading_text_held(&self) -> bool {
+            self.menu.loading_text_held()
+        }
+        fn grant_probe(&self) -> Option<render::GrantProbe> {
+            self.menu.grant_probe()
         }
         fn loading(
             &mut self,
@@ -21137,6 +23119,7 @@ pub(crate) mod tests {
         builds: Arc<AtomicU32>,
         resize: Resize,
         fail: Arc<AtomicBool>,
+        hold_up: Arc<AtomicBool>,
         made: Arc<AtomicU32>,
         /// Set: the next loading frame's renderer fails its next text
         /// preparation's wait for the GPU.
@@ -21152,6 +23135,8 @@ pub(crate) mod tests {
             let builds = Arc::new(AtomicU32::new(0));
             let resize: Resize = Arc::new(std::sync::Mutex::new(None));
             let fail = Arc::new(AtomicBool::new(false));
+            let hold_up = Arc::new(AtomicBool::new(false));
+            let h = Arc::clone(&hold_up);
             let made = Arc::new(AtomicU32::new(0));
             #[cfg(feature = "dev-tools")]
             let text_fault = Arc::new(AtomicBool::new(false));
@@ -21182,6 +23167,7 @@ pub(crate) mod tests {
                     builds: Arc::clone(&b),
                     resize: Arc::clone(&r),
                     fail: Arc::clone(&f),
+                    hold_up: Arc::clone(&h),
                     #[cfg(feature = "dev-tools")]
                     text_fault: Arc::clone(&t),
                 }) as Box<dyn Screen>)
@@ -21191,6 +23177,7 @@ pub(crate) mod tests {
                 builds,
                 resize,
                 fail,
+                hold_up,
                 made,
                 #[cfg(feature = "dev-tools")]
                 text_fault,
@@ -21421,15 +23408,23 @@ pub(crate) mod tests {
         assert!(all[first_hard..].iter().all(|s| s.gauge == hard), "{all:?}");
         assert!(all[..first_hard].iter().all(|s| !s.red.unwrap().gauge));
         assert!(all[first_hard..].iter().all(|s| s.red.unwrap().gauge));
-        // Revision 2: the artist's slot cleared on its first frame, the
-        // title kept; from the next frame on its replacement.
+        // Revision 2: the artist's slot cleared from its first frame, the
+        // title kept, while its text is in the uploader's hand; from the
+        // frame after the boundary that installed it, its replacement.
         let r2: Vec<&Shot> = all.iter().filter(|s| s.text == 2).collect();
+        let installed = r2
+            .iter()
+            .position(|s| s.red.unwrap().artist)
+            .expect("the replacement drawn");
+        assert!(installed >= 1, "{r2:?}");
         assert!(
-            !r2[0].red.unwrap().artist && r2[0].red.unwrap().title,
+            r2[..installed].iter().all(|s| {
+                let r = s.red.unwrap();
+                !r.artist && r.title && s.staged > 0
+            }),
             "{r2:?}"
         );
-        assert!(r2[0].staged > 0, "{r2:?}");
-        assert!(r2[1..].iter().all(|s| {
+        assert!(r2[installed..].iter().all(|s| {
             let r = s.red.unwrap();
             r.artist && r.title && s.staged == 0
         }));
@@ -21502,6 +23497,167 @@ pub(crate) mod tests {
         let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
         assert!(r2.iter().all(|s| s.target == [1_920, 1_080]), "{r2:?}");
         assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
+    }
+
+    /// V14: the play skin's first loading frame of each lifetime has every
+    /// text slot filled, whether the lifetime was a chart chosen to play,
+    /// held at a choice and revealed, a practice Start of the same chart,
+    /// or revealed right after it was held; the frames before it are the
+    /// outgoing picture or the pending presentation, never the skin.
+    #[test]
+    fn each_lifetimes_first_skin_frame_has_its_text() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        let mut lifetimes = Vec::new();
+        let mut seen = 0;
+        for (title, artist, held) in [
+            ("T", "x", false),
+            ("U", "y", true),
+            ("U", "y", false),
+            ("V", "z", true),
+        ] {
+            if held {
+                link.begin_loading_held(&chosen_by(title, Some(artist)), None);
+            } else {
+                link.begin_loading(&chosen_by(title, Some(artist)), None);
+            }
+            let lifetime = link.loading_lifetime();
+            if held {
+                link.reveal_loading();
+            }
+            link.loading()
+                .report(LoadInput::Stage(Stage::Chart), Some(one_line(title)));
+            seen = rec.until(seen, |s| s.lifetime == lifetime);
+            lifetimes.push(lifetime);
+        }
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        for lifetime in lifetimes {
+            let first = shots.iter().find(|s| s.lifetime == lifetime).unwrap();
+            assert!(
+                first.red.is_some_and(|r| r.title && r.artist),
+                "{lifetime}: {first:?}"
+            );
+        }
+    }
+
+    /// V14b: text installed for chart A, then B asked (its artist slot
+    /// cleared, its text kept in the uploader's hand), then A again: what
+    /// the slots hold after the clear is unknown, so A is prepared again in
+    /// every slot and its artist drawn, never taken as still installed.
+    #[test]
+    fn a_request_back_to_the_installed_text_after_a_clear_is_prepared_again() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        let by = |artist: &str| {
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some(artist.to_owned()),
+                ..ChosenChart::default()
+            })
+        };
+        rec.hold_up.store(true, Ordering::Release);
+        sink.report(by("y"), None);
+        let cleared = rec.until(shown, |s| s.text == 2 && s.red.is_some_and(|r| !r.artist));
+        sink.report(by("x"), None);
+        let back = rec.until(cleared, |s| s.text == 3);
+        rec.hold_up.store(false, Ordering::Release);
+        rec.until(back, |s| {
+            s.text == 3 && s.red.is_some_and(|r| r.title && r.artist)
+        });
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// The result pages upload's answer follows the result kind's record
+    /// (§5.3): its owner reads the status once answered, so the status
+    /// held from before the last step, no answer comes until it is free,
+    /// and the record then names the published pages.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_pages_answer_follows_the_results_record() {
+        let (link, rec) = Recording::new();
+        let (_dir, skin) = result::fixed_skin();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        // The upload begun and kept in hand.
+        rec.hold_up.store(true, Ordering::Release);
+        let mut t = link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+        assert!(link.fence(Duration::from_secs(10)));
+        assert!(t.poll(Duration::ZERO).is_none(), "in hand");
+        // The status held while the upload completes.
+        let holding = Arc::new(AtomicBool::new(false));
+        let freed = Arc::new(AtomicBool::new(false));
+        let hold = link.result_status_hold();
+        let (h, f) = (Arc::clone(&holding), Arc::clone(&freed));
+        let holder = std::thread::spawn(move || {
+            hold(&mut || {
+                h.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_secs(2));
+                f.store(true, Ordering::Release);
+            });
+        });
+        assert!(wait_until(|| holding.load(Ordering::Acquire)));
+        rec.hold_up.store(false, Ordering::Release);
+        // A fence wakes the loop, which read the uploader idle.
+        let (woke, _fenced) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::Fence(woke));
+        let answer = result::pages_answer(&mut t);
+        assert!(
+            freed.load(Ordering::Acquire),
+            "answered with the status held"
+        );
+        assert_eq!(answer, super::PagesAnswer::Ready);
+        assert_eq!(link.result_status().installed, Some(skin.atlas_id()));
+        holder.join().unwrap();
+        link.exit();
+    }
+
+    /// V14b: a lifetime whose text has not installed when the hold ends
+    /// draws the pending presentation, never the skin, and each such frame
+    /// declares the loading time the skin would have declared; the skin
+    /// draws from the pass after the text installs, every slot filled.
+    #[test]
+    fn a_frame_pending_on_the_text_declares_the_skins_time() {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, _) = crate::render_decl::bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &crate::render_decl::Look {
+                loadend: Some(TimeUs(2_000_000)),
+                ..bridge_look()
+            },
+        );
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Play, Some(skin)).wait().unwrap(),
+            Preparation::Ready
+        );
+        rec.hold_up.store(true, Ordering::Release);
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        // The hold ends at its bound: the pending presentation is drawn.
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        assert_eq!(rec.count(), 0, "{:?}", rec.shots());
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_000_000)));
+        rec.hold_up.store(false, Ordering::Release);
+        let filled = rec.until(0, |s| s.red.is_some());
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        assert!(
+            shots[0].red.is_some_and(|r| r.title && r.artist),
+            "{:?}",
+            &shots[..filled]
+        );
     }
 
     /// A revision the producer refuses leaves its fields empty and is not
@@ -22191,6 +24347,17 @@ pub(crate) mod tests {
     // operation held, the Idle loop's wait.
     #[cfg(feature = "dev-tools")]
     mod allowance;
+    // The uploader's steps on a real screen: a staging stepped by the
+    // passes that present nothing, with no sleep while it can act.
+    #[cfg(feature = "dev-tools")]
+    mod upload;
+    // The uploader's writes against the boundary's admission gate on the
+    // production path, every event before every write (the grant's
+    // stand-in exists with dev-tools).
+    #[cfg(feature = "dev-tools")]
+    mod admission_gate;
+    #[cfg(feature = "dev-tools")]
+    mod chart_fixture;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,

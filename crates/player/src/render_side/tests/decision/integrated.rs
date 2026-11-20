@@ -237,6 +237,16 @@ impl Screen for Noted {
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         self.menu.publish_chart_images(target, images)
     }
+    fn begin_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        set: &Arc<crate::chart_images::ChartImages>,
+    ) -> Result<Option<skin_model::chart_image::ChartTable>, RenderError> {
+        self.menu.begin_chart_images(target, set)
+    }
+    fn cancel_chart_images(&mut self) {
+        self.menu.cancel_chart_images();
+    }
     fn publish_chart_absent(
         &mut self,
         target: render::ChartTarget,
@@ -259,8 +269,17 @@ impl Screen for Noted {
     ) -> Result<(), render::BgaFault> {
         self.menu.stage_bga_cells(key, cells)
     }
-    fn bga_boundary(&mut self) -> render::BgaStep {
-        self.menu.bga_boundary()
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        self.menu.upload_boundary(past)
+    }
+    fn upload_state(&self) -> render::UploadState {
+        self.menu.upload_state()
+    }
+    fn upload_waited(&self) -> bool {
+        self.menu.upload_waited()
+    }
+    fn wait_step(&mut self, timeout: std::time::Duration) -> Result<bool, render::RenderError> {
+        self.menu.wait_step(timeout)
     }
     fn cancel_bga_upload(&mut self) {
         self.menu.cancel_bga_upload();
@@ -309,6 +328,22 @@ impl Screen for Noted {
         request: u64,
     ) -> Result<Preparation, RenderError> {
         self.menu.install_pages(kind, pages, request)
+    }
+    fn begin_pages(
+        &mut self,
+        pages: &Arc<skin_model::PackedPages>,
+        ticket: u64,
+    ) -> Result<Option<render::PagesBegun>, RenderError> {
+        self.menu.begin_pages(pages, ticket)
+    }
+    fn publish_pages(&mut self) -> Option<u64> {
+        self.menu.publish_pages()
+    }
+    fn withdraw_pages(&mut self) -> Option<u64> {
+        self.menu.withdraw_pages()
+    }
+    fn take_result_release(&mut self) -> Option<[u64; 3]> {
+        self.menu.take_result_release()
     }
     fn restore_pages(
         &mut self,
@@ -538,6 +573,27 @@ impl Screen for Noted {
     }
     fn splash(&mut self, elapsed: Duration) -> Option<Result<render::FrameOutcome, RenderError>> {
         self.menu.splash(elapsed)
+    }
+    fn loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        chart: &std::sync::Arc<crate::loading_text::ChosenChart>,
+        on: Option<render::PreparedToken>,
+    ) {
+        self.menu.loading_text(lifetime, revision, chart, on);
+    }
+    fn text_settled(&self) -> bool {
+        self.menu.text_settled()
+    }
+    fn drop_loading_text(&mut self) {
+        self.menu.drop_loading_text();
+    }
+    fn loading_text_held(&self) -> bool {
+        self.menu.loading_text_held()
+    }
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        self.menu.grant_probe()
     }
     fn loading(
         &mut self,
