@@ -7,8 +7,9 @@ use skin_model::media::control::{
     Command, Failure, MAX_FRAME, MAX_TEXT, Malformed, Refusal, Reply, frame, frame_len,
 };
 
-fn commands() -> Vec<Command> {
-    vec![
+/// Commands, each with an id of its own.
+fn commands() -> Vec<(u32, Command)> {
+    let all = vec![
         Command::Open {
             player: 3,
             file: 0x0123_4567_89ab_cdef,
@@ -25,7 +26,11 @@ fn commands() -> Vec<Command> {
         },
         Command::Close { player: 77 },
         Command::Quit,
-    ]
+    ];
+    (1..)
+        .zip(all)
+        .map(|(i, c)| (0x8000_0001_u32 ^ i, c))
+        .collect()
 }
 
 fn replies() -> Vec<Reply> {
@@ -35,6 +40,7 @@ fn replies() -> Vec<Reply> {
             configuration: "--enable-shared --disable-static ÿ".to_owned(),
         },
         Reply::Probed {
+            id: 0xdead_beef,
             player: 2,
             width: 2_560,
             height: 1_080,
@@ -42,15 +48,21 @@ fn replies() -> Vec<Reply> {
             codec: "h264".to_owned(),
             container: "mov,mp4,m4a,3gp,3g2,mj2".to_owned(),
         },
-        Reply::Playing { player: 5 },
+        Reply::Playing { id: 5, player: 5 },
         Reply::Sought {
+            id: u32::MAX,
             player: 6,
             run: 4,
             landed: 1_500_000,
             attempts: 2,
         },
         Reply::Ended { player: 7, run: 12 },
-        Reply::Closed { player: 8 },
+        Reply::Closed { id: 8, player: 8 },
+        Reply::Rejected {
+            id: 9,
+            player: 9,
+            code: -5,
+        },
         Reply::Log {
             text: "ffmpeg: [h263 @ 0000] Codec (h263) not on whitelist".to_owned(),
         },
@@ -67,13 +79,13 @@ fn replies() -> Vec<Reply> {
     .enumerate()
     {
         all.push(Reply::Refused {
+            id: 100 + u32::try_from(i).unwrap(),
             player: u8::try_from(i).unwrap() + 10,
             why,
             code: -1_094_995_529 - i32::try_from(i).unwrap(),
         });
     }
     for (i, why) in [
-        Failure::Command,
         Failure::Ring,
         Failure::Read,
         Failure::Memory,
@@ -95,9 +107,9 @@ fn replies() -> Vec<Reply> {
 // Covers: T02
 #[test]
 fn control_messages_round_trip() {
-    for c in commands() {
-        let bytes = c.encode();
-        assert_eq!(Command::decode(&bytes), Ok(c.clone()), "{c:?}");
+    for (id, c) in commands() {
+        let bytes = c.encode(id);
+        assert_eq!(Command::decode(&bytes), Ok((id, c.clone())), "{c:?}");
         let framed = frame(&bytes).unwrap();
         let len = frame_len([framed[0], framed[1]]).unwrap();
         assert_eq!(&framed[2..], &bytes[..]);
@@ -108,12 +120,14 @@ fn control_messages_round_trip() {
         let bytes = r.encode();
         assert_eq!(Reply::decode(&bytes), Ok(r.clone()), "{r:?}");
         assert!(frame(&bytes).is_some(), "{r:?}");
-        if let Reply::Refused { .. } | Reply::Failed { .. } = r {
-            codes.insert((bytes[0], bytes[2]));
-        }
+        match r {
+            Reply::Refused { .. } => codes.insert((bytes[0], bytes[6])),
+            Reply::Failed { .. } => codes.insert((bytes[0], bytes[2])),
+            _ => false,
+        };
     }
     // Each reason has a code of its own.
-    assert_eq!(codes.len(), 12);
+    assert_eq!(codes.len(), 11);
     // A string longer than the cap is cut at the character boundary before
     // the cap, which falls inside the two bytes of an "é".
     let long = format!("a{}", "é".repeat(MAX_TEXT));
@@ -136,6 +150,7 @@ fn control_messages_round_trip() {
             configuration: second.clone(),
         },
         Reply::Probed {
+            id: 1,
             player: 1,
             width: 2,
             height: 3,
@@ -166,8 +181,8 @@ fn control_messages_round_trip() {
 #[test]
 fn control_refuses_malformed_messages() {
     // Every message cut short, and with a byte after it.
-    for c in commands() {
-        let bytes = c.encode();
+    for (id, c) in commands() {
+        let bytes = c.encode(id);
         for n in 1..bytes.len() {
             assert_eq!(
                 Command::decode(&bytes[..n]),
@@ -195,27 +210,28 @@ fn control_refuses_malformed_messages() {
     // No message, and one longer than a frame.
     assert_eq!(Command::decode(&[]), Err(Malformed::Length(0)));
     assert_eq!(Reply::decode(&[]), Err(Malformed::Length(0)));
-    let mut big = Command::Quit.encode();
+    let mut big = Command::Quit.encode(1);
     big.resize(MAX_FRAME + 1, 0);
     assert_eq!(Command::decode(&big), Err(Malformed::Length(MAX_FRAME + 1)));
     // A command's tag is no reply, and a reply's no command.
     assert_eq!(
-        Reply::decode(&Command::Quit.encode()),
+        Reply::decode(&Command::Quit.encode(1)),
         Err(Malformed::Tag(5))
     );
     assert_eq!(
-        Command::decode(&Reply::Playing { player: 1 }.encode()),
+        Command::decode(&Reply::Playing { id: 1, player: 1 }.encode()),
         Err(Malformed::Tag(67))
     );
     assert_eq!(Command::decode(&[0]), Err(Malformed::Tag(0)));
     // A reason the protocol does not have.
     let mut refused = Reply::Refused {
+        id: 1,
         player: 1,
         why: Refusal::Size,
         code: 0,
     }
     .encode();
-    refused[2] = 6;
+    refused[6] = 6;
     assert_eq!(Reply::decode(&refused), Err(Malformed::Reason(6)));
     let mut failed = Reply::Failed {
         player: 1,
@@ -223,6 +239,8 @@ fn control_refuses_malformed_messages() {
         code: 0,
     }
     .encode();
+    failed[2] = 5;
+    assert_eq!(Reply::decode(&failed), Err(Malformed::Reason(5)));
     failed[2] = 200;
     assert_eq!(Reply::decode(&failed), Err(Malformed::Reason(200)));
     // A string that is not UTF-8, and one longer than the cap though it

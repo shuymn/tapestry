@@ -11,10 +11,15 @@
 //! recorded while a decoder parks at a video's end, the refused secondary
 //! open, the decoded frames' stamps, the seek's back-off and the
 //! zlib-compressed containers (`media_sandbox.rs` checks the sandbox
-//! itself).
+//! itself). They check the game's supervision of the worker too: the job
+//! watcher's two paths to ending a worker at its memory cap, each apart, a
+//! job for each launch, the peak of the four largest players, and the
+//! strikes that keep a file from being opened again once it has been open
+//! in two workers that ended without the game asking.
 //!
 //! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), run
-//! as a command of its own, so those tests need dev-tools; the committed
+//! as a command of its own, and the memory the job's cap is tested with by
+//! its `--dev-balloon`, so those tests need dev-tools; the committed
 //! fixtures (`tests/media/`), the files built here and the handshake do
 //! not.
 
@@ -22,6 +27,7 @@
 
 mod media_support;
 
+use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::Path;
@@ -34,7 +40,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "dev-tools")]
 use media_support::WORKER;
-use media_support::{Kind, Launched, Stage, media_host, recipe, root};
+use media_support::media_host::strikes::{FileId, Strikes};
+use media_support::media_host::verdict;
+use media_support::media_host::watch::{self, End, Event, LINE};
+use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
 use skin_model::media::control::{Command as Order, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
@@ -46,28 +55,37 @@ use windows::Win32::System::Threading::SetEvent;
 /// How long a reply may take.
 const REPLY: Duration = Duration::from_secs(30);
 
+/// Three and a half of the job watcher's periods: three of its reads.
+const WATCHED: Duration = Duration::from_millis(350);
+
 /// A worker the game's host launched under the recipe, staged in a
 /// directory of its own, and the replies on its control pipe.
 struct Worker {
     launched: Launched,
     _stage: Stage,
+    /// The id of the last command sent.
+    last: u32,
 }
 
 impl Worker {
     /// Launches the worker with `args` and reads its hello.
     fn start(args: &[&str]) -> Self {
-        let stage = Stage::new();
-        let launched = stage
-            .launch(&recipe().args_of(args))
-            .unwrap_or_else(|e| panic!("{e}"));
+        Self::on(Stage::new(), &recipe().args_of(args))
+    }
+
+    /// Launches the worker staged in `stage` under `setup` and reads its
+    /// hello.
+    fn on(stage: Stage, setup: &Setup) -> Self {
+        let launched = stage.launch(setup).unwrap_or_else(|e| panic!("{e}"));
         Self {
             launched,
             _stage: stage,
+            last: 0,
         }
     }
 
     fn send(&mut self, order: &Order) {
-        self.launched.send(order).unwrap();
+        self.last = self.launched.send(order).unwrap();
     }
 
     /// The next reply.
@@ -142,7 +160,7 @@ impl Worker {
         self.send(&Order::Close { player });
         loop {
             match self.reply() {
-                Reply::Closed { player: p } if p == player => return,
+                Reply::Closed { id, player: p } if p == player && id == self.last => return,
                 Reply::Ended { player: p, .. } if p == player => {}
                 other => panic!("{other:?} while player {player} closes"),
             }
@@ -219,6 +237,11 @@ impl Ring {
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
         poll.staged
+    }
+
+    /// The ring's section's size in bytes.
+    fn bytes(&self) -> usize {
+        self.reader.geometry().bytes()
     }
 
     /// Starts the next run, its stamps from `first`: the run's id.
@@ -408,7 +431,13 @@ fn worker_operations_succeed_under_the_recipe() {
         panic!("{probe:?}; the worker's log:\n{}", worker.log());
     };
     let mut ring = Ring::new(width, height);
-    assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
     let frames = take_all(&worker, &mut ring, 1, 0, 33_333);
     assert_eq!(frames.len(), 120);
     let run = ring.start_run(2_000_000);
@@ -526,7 +555,13 @@ fn worker_decodes_generated_mpeg1_with_exact_stamps() {
         assert_eq!((*p, *w, *h), (player, width, height), "{name}");
         assert_eq!((c.as_str(), f.as_str()), (codec, container), "{name}");
         let mut ring = Ring::new(width, height);
-        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        assert_eq!(
+            worker.play(player, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player
+            }
+        );
         let interval = stamp_of(1, rate);
         let taken = take_all(&worker, &mut ring, player, 0, interval);
         let stamps: Vec<i64> = taken.iter().map(|t| t.stamp).collect();
@@ -556,7 +591,13 @@ fn worker_seek_lands_on_target_after_back_off() {
         "{probe:?}"
     );
     let mut ring = Ring::new(320, 240);
-    assert_eq!(worker.play(3, &ring), Reply::Playing { player: 3 });
+    assert_eq!(
+        worker.play(3, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 3
+        }
+    );
     let first = take_one(&worker, &mut ring, 0);
     assert_eq!((first.stamp, painted(&first.bytes, 320)), (0, 0));
 
@@ -571,6 +612,7 @@ fn worker_seek_lands_on_target_after_back_off() {
     assert_eq!(
         worker.reply(),
         Reply::Sought {
+            id: worker.last,
             player: 3,
             run,
             landed: 1_500_000,
@@ -619,7 +661,13 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
             "{probe:?}"
         );
         let mut ring = Ring::new(320, 240);
-        assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+        assert_eq!(
+            worker.play(1, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player: 1
+            }
+        );
         let (taken, last) = take_to_last(&worker, &mut ring, 1, 0, stamp_of(1, 24));
         let taken: Vec<i64> = taken.iter().map(|t| t.stamp).collect();
         assert_eq!(
@@ -642,7 +690,13 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
             "{probe:?}"
         );
         let mut ring = Ring::new(320, 240);
-        assert_eq!(worker.play(2, &ring), Reply::Playing { player: 2 });
+        assert_eq!(
+            worker.play(2, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player: 2
+            }
+        );
         let run = ring.start_run(10_000_000);
         worker.send(&Order::Seek {
             player: 2,
@@ -751,7 +805,13 @@ fn worker_refuses_unlisted_codec_container_and_oversize() {
         "{probe:?}"
     );
     let mut ring = Ring::new(96, 64);
-    assert_eq!(worker.play(5, &ring), Reply::Playing { player: 5 });
+    assert_eq!(
+        worker.play(5, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 5
+        }
+    );
     assert_eq!(take_one(&worker, &mut ring, 0).stamp, 0);
     worker.close(5);
 }
@@ -794,7 +854,13 @@ fn worker_caps_the_pixels_of_frames_after_the_probe() {
     );
     let mut ring = Ring::new(64, 48);
     let before = worker.peak_commit();
-    assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
     let deadline = Instant::now() + REPLY;
     let mut taken = Vec::new();
     // The newest frame due each time, until the video ends or fails.
@@ -902,7 +968,13 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
             worker.log()
         );
         let ring = Ring::new(64, 48);
-        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        assert_eq!(
+            worker.play(player, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player
+            }
+        );
         rings.push(ring);
     }
     let [one, two] = &mut rings[..] else {
@@ -954,6 +1026,13 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
     for player in [1, 2, 3] {
         worker.close(player);
     }
+    // The refusal was FFmpeg's own: the job refused nothing, and no job
+    // message came.
+    let events = worker.launched.watch_events();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
 }
 
 // Covers: T02
@@ -992,7 +1071,13 @@ fn worker_plays_every_listed_container() {
         assert_eq!((*width, *height), (256, 144), "{name}");
         assert_eq!((c.as_str(), f.as_str()), (codec, container), "{name}");
         let mut ring = Ring::new(256, 144);
-        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        assert_eq!(
+            worker.play(player, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player
+            }
+        );
         for i in 0..2 {
             let due = stamp_of(i, 25);
             let taken = take_one(&worker, &mut ring, due);
@@ -1058,7 +1143,13 @@ fn worker_decodes_zlib_compressed_containers() {
         };
         assert_eq!((width, height), (320, 240), "{name}");
         let mut ring = Ring::new(width, height);
-        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        assert_eq!(
+            worker.play(player, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player
+            }
+        );
         let frames = take_all(&worker, &mut ring, player, 0, interval);
         let run = ring.start_run(2_000_000);
         worker.send(&Order::Seek {
@@ -1555,6 +1646,7 @@ fn worker_refuses_a_coded_size_over_the_cap_behind_a_crop() {
     assert_eq!(
         worker.open(1, &path),
         Reply::Refused {
+            id: worker.last,
             player: 1,
             why: Refusal::Size,
             code: 0,
@@ -1607,6 +1699,7 @@ fn worker_caps_a_decoder_ffmpeg_opens_again_for_a_new_sample_description() {
     assert_eq!(
         reply,
         Reply::Refused {
+            id: worker.last,
             player: 1,
             why: Refusal::Size,
             code: 0,
@@ -1650,7 +1743,13 @@ fn worker_caps_the_coded_size_of_h264_frames_after_the_probe() {
     );
     let mut ring = Ring::new(64, 48);
     let before = worker.peak_commit();
-    assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
     let deadline = Instant::now() + REPLY;
     let mut taken = Vec::new();
     let end = loop {
@@ -1734,7 +1833,13 @@ fn h264_decoder_enomem_fails_one_player_and_the_worker_lives() {
             worker.log()
         );
         let ring = Ring::new(64, 48);
-        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        assert_eq!(
+            worker.play(player, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player
+            }
+        );
         rings.push(ring);
     }
     let [one, two] = &mut rings[..] else {
@@ -1818,6 +1923,7 @@ fn worker_refuses_a_probe_past_its_read_budget() {
     assert_eq!(
         worker.open(1, &long),
         Reply::Refused {
+            id: worker.last,
             player: 1,
             why: Refusal::Read,
             code: -27,
@@ -1894,7 +2000,13 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
             worker.log()
         );
         let ring = Ring::new(64, 48);
-        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        assert_eq!(
+            worker.play(player, &ring),
+            Reply::Playing {
+                id: worker.last,
+                player
+            }
+        );
         rings.push(ring);
     }
     let [one, two] = &mut rings[..] else {
@@ -1938,6 +2050,13 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
     for player in [1, 2] {
         worker.close(player);
     }
+    // The refusal was the worker's own: the job refused nothing, and no job
+    // message came.
+    let events = worker.launched.watch_events();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
 }
 
 // Covers: T02
@@ -1956,6 +2075,7 @@ fn worker_refuses_an_unlisted_decoder_without_the_codec_whitelist() {
     assert_eq!(
         worker.open(1, &h263),
         Reply::Refused {
+            id: worker.last,
             player: 1,
             why: Refusal::Codec,
             code: 0,
@@ -1967,4 +2087,856 @@ fn worker_refuses_an_unlisted_decoder_without_the_codec_whitelist() {
     assert!(log.contains("refused a decoder for h263"), "{log}");
     assert!(!log.contains("not on whitelist"), "{log}");
     worker.close(1);
+}
+
+/// A worker committing memory with `--dev-balloon args` (MiB), staged in
+/// `stage`, its job's watcher changed as `variation` says.
+#[cfg(feature = "dev-tools")]
+fn balloon(stage: &Stage, args: &str, variation: watch::Variation) -> Launched {
+    let mut all = vec!["--dev-balloon"];
+    all.extend(args.split(' '));
+    stage
+        .launch(&recipe().args_of(&all).watching_as(variation))
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Waits until `worker` has logged a line holding `text`, or its watcher
+/// has seen it end: its log.
+#[cfg(feature = "dev-tools")]
+fn logged(worker: &Launched, text: &str) -> String {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        let log = worker.log();
+        if log.contains(text) || worker.end().is_some() {
+            return log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {text:?} in the worker's log:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Waits until `worker`'s watcher has seen it end: how it ended.
+fn ended(worker: &Launched) -> End {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        if let Some(end) = worker.end() {
+            return end;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker did not end; its watcher saw {:?}; its log:\n{}",
+            worker.watch_events(),
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The peaks the watcher's reads found, in order.
+#[cfg(feature = "dev-tools")]
+fn reads(events: &[Event]) -> Vec<usize> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Read { peak, .. } => Some(*peak),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Checks that the watcher's reads keep to its schedule of one every
+/// 100 ms from its start: each read is due at a tick of that schedule,
+/// counted from 1, the ticks rise from read to read (a packet's wake adds
+/// no read), and no read comes before its tick. How late a read comes is
+/// the scheduler's and is not checked: a loaded machine delays it.
+#[cfg(feature = "dev-tools")]
+fn on_schedule(events: &[Event]) {
+    let reads: Vec<(Duration, u32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Read { at, tick, .. } => Some((*at, *tick)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reads
+            .iter()
+            .all(|&(at, tick)| tick >= 1 && at >= Duration::from_millis(100) * tick)
+            && reads.windows(2).all(|w| w[0].1 < w[1].1),
+        "{events:?}"
+    );
+}
+
+/// The commit `process` holds now, in bytes.
+#[cfg(feature = "dev-tools")]
+fn commit_now(process: HANDLE) -> usize {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    // SAFETY: the worker's process handle, which has every access, and a
+    // buffer of the size given.
+    unsafe {
+        GetProcessMemoryInfo(
+            process,
+            &raw mut counters,
+            u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap(),
+        )
+    }
+    .unwrap();
+    counters.PagefileUsage
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_cap_refuses_and_the_parent_terminates() {
+    let stage = Stage::new();
+    // Both of the watcher's paths off: the job refuses the commit that
+    // would take the worker past its cap (ERROR_COMMITMENT_LIMIT), and the
+    // worker goes on.
+    let off = watch::Variation {
+        no_message: true,
+        no_accounting: true,
+        ..watch::Variation::default()
+    };
+    let worker = balloon(&stage, "32 640", off);
+    let log = logged(&worker, "refused with");
+    assert!(log.contains("balloon: 32 MiB refused with 1455"), "{log}");
+    std::thread::sleep(WATCHED);
+    assert!(!worker.ended(), "{}", worker.log());
+    assert_eq!(worker.end(), None);
+    let peak = worker.job_peak().unwrap();
+    assert!((LINE..=512 << 20).contains(&peak), "{peak}");
+    drop(worker);
+    // Both on: the watcher ends the worker once its peak has reached the
+    // line, on the job's message if that came before the next scheduled
+    // read, else at that read.
+    let worker = balloon(&stage, "32 640", watch::Variation::default());
+    let end = ended(&worker);
+    let code = worker.wait_exit(REPLY);
+    let events = worker.watch_events();
+    let peak = worker.job_peak().unwrap();
+    assert!(peak >= LINE, "ended at a peak of {peak}: {events:?}");
+    let message = events.iter().any(|e| matches!(e, Event::Message { .. }));
+    let over = reads(&events).iter().any(|&p| p >= LINE);
+    match end {
+        End::Message => {
+            assert_eq!(code, Some(verdict::ENDED_BY_MESSAGE));
+            assert!(message && !over, "{events:?}");
+        }
+        End::Line => {
+            assert_eq!(code, Some(verdict::ENDED_AT_LINE));
+            assert!(!message && over, "{events:?}");
+        }
+        End::Exited(c) => panic!("the worker ended by itself ({c:#x}): {events:?}"),
+    }
+    eprintln!("ended on {end:?} at a peak of {peak}; the watcher saw {events:?}");
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_message_alone_terminates_below_the_line() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+
+    let stage = Stage::new();
+    // The handler: below the line, where the accounting read cannot act,
+    // the job's message, posted to the job's port as the job posts it,
+    // ends the worker.
+    let worker = balloon(&stage, "32 384", watch::Variation::default());
+    let log = logged(&worker, "balloon: done");
+    assert!(log.contains("balloon: committed 384 MiB"), "{log}");
+    let peak = worker.job_peak().unwrap();
+    assert!(peak < LINE, "{peak}");
+    // The same message about another process wakes the watcher and ends
+    // nothing, nor moves its reads.
+    worker
+        .post_job_message_about(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, worker.pid() ^ 4)
+        .unwrap();
+    std::thread::sleep(WATCHED);
+    let events = worker.watch_events();
+    assert!(!worker.ended() && worker.end().is_none(), "{events:?}");
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    assert_eq!(ended(&worker), End::Message);
+    assert_eq!(worker.wait_exit(REPLY), Some(verdict::ENDED_BY_MESSAGE));
+    let events = worker.watch_events();
+    assert!(reads(&events).iter().all(|&p| p < LINE), "{events:?}");
+    on_schedule(&events);
+    drop(worker);
+    // The system's own message, observed rather than required: 128 MiB at
+    // once past the cap is refused, and the peak stays below the line,
+    // which a refused commit does not raise. A message that comes ends the
+    // worker, maybe before it logs the refusal, which the message itself
+    // then reports.
+    let worker = balloon(&stage, "32 384 128", watch::Variation::default());
+    let log = logged(&worker, "balloon: done");
+    std::thread::sleep(WATCHED);
+    let peak = worker.job_peak().unwrap();
+    let events = worker.watch_events();
+    assert!(peak < LINE, "{peak}: {events:?}");
+    assert!(reads(&events).iter().all(|&p| p < LINE), "{events:?}");
+    match worker.end() {
+        Some(End::Message) => {
+            let at = events.iter().find_map(|e| match e {
+                Event::Message { at, .. } => Some(*at),
+                _ => None,
+            });
+            eprintln!("the job's own message came at {at:?} and ended the worker");
+        }
+        None => {
+            assert!(log.contains("balloon: 128 MiB refused with 1455"), "{log}");
+            eprintln!("the job's own message did not come; the worker lives");
+        }
+        other => panic!("{other:?}: {events:?}"),
+    }
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_cap_terminates_when_the_message_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = gen_clip(dir.path(), "steady.mpg", "mpeg1video mpeg 64x48 24 240 12");
+    let file = std::fs::File::open(&clip).unwrap();
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    // The job's message discarded before the watcher sees it: the first
+    // scheduled read at or past the line ends the worker.
+    let lost = watch::Variation {
+        discard_message: true,
+        ..watch::Variation::default()
+    };
+    let mut worker = balloon(&stage, "32 640", lost);
+    worker.open(1, &file, &strikes).unwrap();
+    assert_eq!(ended(&worker), End::Line);
+    assert_eq!(worker.wait_exit(REPLY), Some(verdict::ENDED_AT_LINE));
+    let events = worker.watch_events();
+    let peaks = reads(&events);
+    let (last, before) = peaks.split_last().unwrap();
+    assert!(
+        *last >= LINE && before.iter().all(|&p| p < LINE),
+        "{events:?}"
+    );
+    let watched: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e,
+                Event::Message {
+                    discarded: true,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(watched.last(), Some(Event::Ended { end: End::Line, .. })),
+        "{events:?}"
+    );
+    assert!(
+        !watched.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
+    on_schedule(&events);
+    eprintln!("the watcher saw {events:?}");
+    // The game records what it records on the message: the player failed,
+    // and its file has a strike.
+    let mut failed = Vec::new();
+    assert_eq!(
+        worker.reap(&mut strikes, |p| failed.push(p)),
+        Some(End::Line)
+    );
+    assert_eq!(failed, [1]);
+    assert_eq!(strikes.of(FileId::of(&file).unwrap()), 1);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_launch_gets_a_job_of_its_own() {
+    let stage = Stage::new();
+    let first = balloon(&stage, "32 640", watch::Variation::default());
+    assert!(matches!(ended(&first), End::Message | End::Line));
+    assert!(first.job_peak().unwrap() >= LINE);
+    drop(first);
+    // The next launch's worker is in a job of its own: its reads find its
+    // own peak, below the line, and it survives them and decodes.
+    let mut worker = Worker::on(stage, &recipe());
+    std::thread::sleep(WATCHED);
+    let events = worker.launched.watch_events();
+    let peaks = reads(&events);
+    assert!(
+        peaks.len() >= 3 && peaks.iter().all(|&p| p < LINE),
+        "{events:?}"
+    );
+    on_schedule(&events);
+    let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let probe = worker.open(1, &fixture);
+    let Reply::Probed { width, height, .. } = probe else {
+        panic!("{probe:?}; the worker's log:\n{}", worker.log());
+    };
+    let mut ring = Ring::new(width, height);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    assert_eq!(take_all(&worker, &mut ring, 1, 0, 33_333).len(), 120);
+    worker.close(1);
+    assert_eq!(worker.launched.end(), None);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_cap_terminates_on_a_crossing_released_between_reads() {
+    let stage = Stage::new();
+    // The watcher's reads an hour apart, so it reads only when the test
+    // asks it to. 416 MiB, below the line, then 64 MiB at once, past it,
+    // released at once; once the release is logged and the worker's commit
+    // is back below the line, the read the test asks for finds the peak at
+    // the line and ends the worker.
+    let slow = watch::Variation {
+        period: Some(Duration::from_secs(3600)),
+        ..watch::Variation::default()
+    };
+    let worker = balloon(&stage, "32 416 64 free", slow);
+    let log = logged(&worker, "balloon: done");
+    assert!(
+        log.contains("balloon: committed 480 MiB and released 64 MiB (Ok(()))"),
+        "{log}"
+    );
+    let now = commit_now(worker.process());
+    assert!(now < LINE, "{now}");
+    assert!(worker.job_peak().unwrap() >= 480 << 20);
+    assert_eq!(worker.end(), None, "{:?}", worker.watch_events());
+    worker.read_now().unwrap();
+    assert_eq!(ended(&worker), End::Line);
+    assert_eq!(worker.wait_exit(REPLY), Some(verdict::ENDED_AT_LINE));
+    let events = worker.watch_events();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                Event::Read { tick: 0, peak, .. },
+                Event::Ended { end: End::Line, .. }
+            ] if *peak >= 480 << 20
+        ),
+        "{events:?}"
+    );
+}
+
+/// Ends the worker whose process `process` is, as a crash does, and waits
+/// until it has ended: the hook a test runs just before the watcher ends
+/// the worker's job.
+#[cfg(feature = "dev-tools")]
+fn crash_now(process: HANDLE) {
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    // SAFETY: the watcher's handle to the worker's process, which has
+    // every access.
+    unsafe {
+        let _ = TerminateProcess(process, CRASH);
+        let _ = WaitForSingleObject(process, 30_000);
+    }
+}
+
+// Covers: T02
+#[test]
+fn a_memory_message_after_a_crash_records_the_crash() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    // The watcher's reads an hour apart, so none comes while the test acts:
+    // the job's memory message, queued after the worker crashed, is the
+    // first thing the watcher takes. Its termination finds the worker
+    // ended, and the end recorded is the crash.
+    let stage = Stage::new();
+    let slow = watch::Variation {
+        period: Some(Duration::from_secs(3600)),
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(slow)).unwrap();
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+    assert_eq!(worker.wait_exit(REPLY), Some(CRASH));
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    assert_eq!(ended(&worker), End::Exited(CRASH));
+    let events = worker.watch_events();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                Event::Message {
+                    discarded: false,
+                    ..
+                },
+                Event::Ended {
+                    end: End::Exited(CRASH),
+                    ..
+                }
+            ]
+        ),
+        "{events:?}"
+    );
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_crash_before_the_line_termination_records_the_crash() {
+    // The job's message discarded, a read finds the peak at the line, and
+    // the worker crashes after the watcher last looked at it and before the
+    // watcher ends its job (a hook the watcher runs there): the end
+    // recorded is the crash.
+    let stage = Stage::new();
+    let racing = watch::Variation {
+        discard_message: true,
+        before_terminate: Some(crash_now),
+        ..watch::Variation::default()
+    };
+    let worker = balloon(&stage, "32 640", racing);
+    assert_eq!(ended(&worker), End::Exited(CRASH));
+    assert_eq!(worker.wait_exit(REPLY), Some(CRASH));
+    let events = worker.watch_events();
+    assert!(
+        reads(&events).last().is_some_and(|&p| p >= LINE),
+        "{events:?}"
+    );
+}
+
+// Covers: T02
+#[test]
+fn a_failed_termination_keeps_the_worker_watched() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    let stage = Stage::new();
+    // The watcher's first termination fails: the worker lives, and the
+    // watcher's next read asks again, which ends it with the message's exit
+    // code, the end recorded.
+    let once = watch::Variation {
+        failed_terminations: 1,
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(once)).unwrap();
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    assert_eq!(ended(&worker), End::Message);
+    assert_eq!(worker.wait_exit(REPLY), Some(verdict::ENDED_BY_MESSAGE));
+    drop(worker);
+    // Every termination fails: nothing is recorded while the worker lives,
+    // and the end it comes to by itself is recorded as its own.
+    let never = watch::Variation {
+        failed_terminations: u8::MAX,
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(never)).unwrap();
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    std::thread::sleep(WATCHED);
+    let events = worker.watch_events();
+    assert!(!worker.ended() && worker.end().is_none(), "{events:?}");
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+    assert_eq!(ended(&worker), End::Exited(CRASH));
+}
+
+// Covers: T02
+#[test]
+fn a_watch_whose_stop_packet_is_lost_still_stops() {
+    // Neither stop packet is posted, to the watcher's port or to the port
+    // the job's messages are discarded from: both threads stop at their
+    // next timed wake, close their handles, and closing the job ends the
+    // worker.
+    let stage = Stage::new();
+    let lost = watch::Variation {
+        discard_message: true,
+        failed_stop_post: true,
+        ..watch::Variation::default()
+    };
+    let mut launched = stage.launch(&recipe().watching_as(lost)).unwrap();
+    let mut worker = launched.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        worker.close_job();
+        let _ = tx.send(worker);
+    });
+    let worker = rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|e| panic!("the watcher did not stop ({e})"));
+    assert!(
+        launched.wait_exit(REPLY).is_some(),
+        "the job kept the worker"
+    );
+    drop(worker);
+}
+
+/// How many views of a section `bytes` long `process` has mapped.
+fn views(process: HANDLE, bytes: usize) -> usize {
+    use windows::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+
+    let mut mapped: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut at = 0_usize;
+    loop {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the worker's process handle, which has every access, and
+        // a struct of the size given.
+        let n = unsafe {
+            VirtualQueryEx(
+                process,
+                Some(std::ptr::without_provenance(at)),
+                &raw mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if n == 0 {
+            break;
+        }
+        if info.Type == MEM_MAPPED {
+            *mapped.entry(info.AllocationBase.addr()).or_default() += info.RegionSize;
+        }
+        at = info.BaseAddress.addr() + info.RegionSize;
+    }
+    let size = bytes.next_multiple_of(4096);
+    mapped.values().filter(|&&s| s == size).count()
+}
+
+/// Opens `path` as player `player` and hands it a ring of its size.
+fn played(worker: &mut Worker, player: u8, path: &Path) -> Ring {
+    let probe = worker.open(player, path);
+    let Reply::Probed { width, height, .. } = probe else {
+        panic!("{probe:?}; the worker's log:\n{}", worker.log());
+    };
+    let ring = Ring::new(width, height);
+    assert_eq!(
+        worker.play(player, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player
+        }
+    );
+    ring
+}
+
+/// Empties every ring as fast as the worker fills it until each player's
+/// video has ended: the frames each staged.
+fn drain(worker: &Worker, rings: &mut BTreeMap<u8, Ring>) -> BTreeMap<u8, usize> {
+    let mut shown: BTreeMap<u8, usize> = rings.keys().map(|&p| (p, 0)).collect();
+    let mut playing: Vec<u8> = rings.keys().copied().collect();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !playing.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "{playing:?} still playing; the worker's log:\n{}",
+            worker.log()
+        );
+        for (player, ring) in rings.iter_mut() {
+            if ring.poll(i64::MAX).is_some() {
+                *shown.get_mut(player).unwrap() += 1;
+            }
+        }
+        match worker.try_reply() {
+            Some(Reply::Ended { player, .. }) if playing.contains(&player) => {
+                playing.retain(|&p| p != player);
+            }
+            Some(other) => panic!("{other:?} while {playing:?} play"),
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    shown
+}
+
+// Covers: T02
+#[test]
+fn four_largest_players_stay_below_the_termination_line() {
+    let h264 = root().join("crates/player/tests/media/h264");
+    let wide = h264.join("h264-2560x1080.mp4");
+    let full = h264.join("h264-1920x1080.mp4");
+    let mut worker = Worker::start(&[]);
+    // Two players at 2 560 × 1 080 and two at 1 920 × 1 080, in H.264 with
+    // B-frames, each decoding into its ring, all four at once.
+    let mut rings = BTreeMap::new();
+    for (player, path) in [(1, &wide), (2, &wide), (3, &full), (4, &full)] {
+        rings.insert(player, played(&mut worker, player, path));
+    }
+    let shown = drain(&worker, &mut rings);
+    assert!(shown.values().all(|&n| n > 0), "{shown:?}");
+    let process = worker.launched.process();
+    let bytes = rings[&1].bytes();
+    assert_eq!(views(process, bytes), 2);
+    // One closed and opened again: the worker holds no view of the closed
+    // player's section, and the new one decodes beside the others.
+    worker.close(1);
+    rings.remove(&1);
+    assert_eq!(views(process, bytes), 1);
+    let mut again = BTreeMap::from([(1, played(&mut worker, 1, &wide))]);
+    drain(&worker, &mut again);
+    assert_eq!(views(process, bytes), 2);
+    let peak = worker.launched.job_peak().unwrap();
+    eprintln!("the job's peak: {peak} bytes ({} MiB)", peak >> 20);
+    assert!(peak <= LINE - (32 << 20), "{peak}");
+    for player in [1, 2, 3, 4] {
+        worker.close(player);
+    }
+}
+
+/// The exit code the strikes test ends its workers with: an access
+/// violation's, as a crash's.
+const CRASH: u32 = 0xc000_0005;
+
+// Covers: T02
+#[test]
+fn a_file_with_two_strikes_is_not_reopened_that_run() {
+    use media_host::OpenError;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    // Each open opens its file anew, as the game does: duplicates of one
+    // handle share its position.
+    let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let other_fixture = root().join("crates/player/tests/media/zlib/plain.mov");
+    let open = |path: &Path| std::fs::File::open(path).unwrap();
+    let id = FileId::of(&open(&fixture)).unwrap();
+    let other_id = FileId::of(&open(&other_fixture)).unwrap();
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    // The file is open in two workers that crash, in each as two players
+    // through handles of their own: a strike for each worker, and both
+    // players fail. Another, which each closed before it crashed, gets
+    // none.
+    for strike in 1..=2 {
+        let mut worker = stage.launch(&recipe()).unwrap();
+        worker.open(1, &open(&fixture), &strikes).unwrap();
+        worker.open(2, &open(&other_fixture), &strikes).unwrap();
+        worker.open(3, &open(&fixture), &strikes).unwrap();
+        worker.close(2).unwrap();
+        loop {
+            match worker.recv(REPLY).unwrap() {
+                Reply::Closed { player: 2, .. } => break,
+                Reply::Probed { .. } => {}
+                reply => panic!("{reply:?}"),
+            }
+        }
+        // SAFETY: the worker's process handle, which has every access.
+        unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+        let deadline = Instant::now() + REPLY;
+        let mut failed = Vec::new();
+        let end = loop {
+            if let Some(end) = worker.reap(&mut strikes, |p| failed.push(p)) {
+                break end;
+            }
+            assert!(Instant::now() < deadline, "{:?}", worker.watch_events());
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(end, End::Exited(CRASH));
+        assert_eq!(failed, [1, 3]);
+        assert_eq!(strikes.of(id), strike);
+        assert_eq!(strikes.of(other_id), 0);
+    }
+    // It is not opened again in the run, whatever handle opens it; the other
+    // file is.
+    let mut worker = stage.launch(&recipe()).unwrap();
+    assert!(matches!(
+        worker.open(1, &open(&fixture), &strikes),
+        Err(OpenError::Struck)
+    ));
+    worker.open(2, &open(&other_fixture), &strikes).unwrap();
+    let probe = worker.recv(REPLY).unwrap();
+    assert!(
+        matches!(probe, Reply::Probed { player: 2, .. }),
+        "{probe:?}"
+    );
+}
+
+/// Ends `worker` as a crash does and reaps it: the players that failed.
+fn crash_and_reap(worker: &mut Launched, strikes: &mut Strikes) -> Vec<u8> {
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+    let deadline = Instant::now() + REPLY;
+    let mut failed = Vec::new();
+    loop {
+        if let Some(end) = worker.reap(strikes, |p| failed.push(p)) {
+            assert_eq!(end, End::Exited(CRASH));
+            return failed;
+        }
+        assert!(Instant::now() < deadline, "{:?}", worker.watch_events());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Covers: T02
+#[test]
+fn a_refused_open_strikes_only_the_file_open() {
+    use media_host::OpenError;
+
+    let a_path = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let b_path = root().join("crates/player/tests/media/zlib/plain.mov");
+    let open = |path: &Path| std::fs::File::open(path).unwrap();
+    let a = FileId::of(&open(&a_path)).unwrap();
+    let b = FileId::of(&open(&b_path)).unwrap();
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    // An open under a player's id while that player is open is refused by
+    // the host, and the player keeps its file: a crash strikes it, and not
+    // the file refused.
+    let mut worker = stage.launch(&recipe()).unwrap();
+    worker.open(1, &open(&a_path), &strikes).unwrap();
+    let probe = worker.recv(REPLY).unwrap();
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    assert!(matches!(
+        worker.open(1, &open(&b_path), &strikes),
+        Err(OpenError::Occupied)
+    ));
+    assert_eq!(crash_and_reap(&mut worker, &mut strikes), [1]);
+    assert_eq!((strikes.of(a), strikes.of(b)), (1, 0));
+    // An open the worker refuses before its probe, past the eight players
+    // it holds, frees its id once the game takes the refusal: a crash
+    // strikes the file the eight have open, once, and not the one refused.
+    let mut worker = stage.launch(&recipe()).unwrap();
+    for player in 1..=8 {
+        worker.open(player, &open(&a_path), &strikes).unwrap();
+    }
+    worker.open(9, &open(&b_path), &strikes).unwrap();
+    let mut probed = std::collections::BTreeSet::new();
+    let mut refused = false;
+    while probed.len() < 8 || !refused {
+        match worker.recv(REPLY).unwrap() {
+            Reply::Probed { player, .. } => {
+                probed.insert(player);
+            }
+            Reply::Rejected { player: 9, .. } => refused = true,
+            reply => panic!("{reply:?}"),
+        }
+    }
+    assert_eq!(
+        crash_and_reap(&mut worker, &mut strikes),
+        [1, 2, 3, 4, 5, 6, 7, 8]
+    );
+    assert_eq!((strikes.of(a), strikes.of(b)), (2, 0));
+}
+
+// Covers: T02
+#[test]
+fn a_second_close_keeps_the_player_closing() {
+    use media_host::players::State;
+
+    // A second close of a player that is closing is rejected; its
+    // rejection answers that close, not the open, so the player stays
+    // closing with its file open in the worker until the first close's
+    // answer.
+    let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let file = std::fs::File::open(&fixture).unwrap();
+    let a = FileId::of(&file).unwrap();
+    let strikes = Strikes::default();
+    let stage = Stage::new();
+    let mut worker = stage.launch(&recipe()).unwrap();
+    let open = worker.open(1, &file, &strikes).unwrap();
+    let first = worker.close(1).unwrap();
+    let second = worker.close(1).unwrap();
+    let mut rejected = false;
+    loop {
+        match worker.recv(REPLY).unwrap() {
+            Reply::Rejected { id, player: 1, .. } if id == second => {
+                rejected = true;
+                assert_eq!(
+                    worker.player_state(1),
+                    Some(State::Closing {
+                        open,
+                        close: first,
+                        file: Some(a)
+                    })
+                );
+            }
+            Reply::Probed { id, player: 1, .. } if id == open => {}
+            Reply::Closed { id, player: 1 } if id == first => break,
+            reply => panic!("{reply:?}"),
+        }
+    }
+    assert!(
+        rejected,
+        "the second close's rejection came after the first's answer"
+    );
+    assert_eq!(worker.player_state(1), None);
+}
+
+// Covers: T02
+#[test]
+fn a_refused_file_is_not_struck_and_its_id_stays_taken() {
+    use media_host::OpenError;
+    use media_host::players::State;
+
+    // A file refused at its probe is closed in the worker: workers that
+    // crash afterwards give it no strike, and fail its player, whose id
+    // stays taken until it is closed.
+    let dir = tempfile::tempdir().unwrap();
+    let text = dir.path().join("not-a-video.txt");
+    std::fs::write(&text, "not a video\n".repeat(64)).unwrap();
+    let id = FileId::of(&std::fs::File::open(&text).unwrap()).unwrap();
+    let other = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    for _ in 0..2 {
+        let mut worker = stage.launch(&recipe()).unwrap();
+        let file = std::fs::File::open(&text).unwrap();
+        let open = worker.open(1, &file, &strikes).unwrap();
+        let reply = worker.recv(REPLY).unwrap();
+        assert!(
+            matches!(reply, Reply::Refused { id, player: 1, .. } if id == open),
+            "{reply:?}"
+        );
+        assert_eq!(worker.player_state(1), Some(State::Refused { open }));
+        let again = std::fs::File::open(&other).unwrap();
+        assert!(matches!(
+            worker.open(1, &again, &strikes),
+            Err(OpenError::Occupied)
+        ));
+        assert_eq!(crash_and_reap(&mut worker, &mut strikes), [1]);
+        assert_eq!(strikes.of(id), 0);
+    }
+}
+
+// Covers: T02
+#[test]
+fn a_worker_ending_with_the_watchers_code_is_its_own_end() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    // Every termination the watcher asks for fails, and the worker then
+    // ends with the code the watcher would have ended it with: no
+    // termination of the watcher's was accepted, so the end is recorded as
+    // the worker's own.
+    let stage = Stage::new();
+    let never = watch::Variation {
+        failed_terminations: u8::MAX,
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(never)).unwrap();
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    std::thread::sleep(WATCHED);
+    assert_eq!(worker.end(), None, "{:?}", worker.watch_events());
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), verdict::ENDED_BY_MESSAGE) }.unwrap();
+    assert_eq!(ended(&worker), End::Exited(verdict::ENDED_BY_MESSAGE));
 }

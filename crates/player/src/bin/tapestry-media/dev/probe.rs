@@ -120,7 +120,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     crate::say("probe done");
     let mut input = std::io::stdin().lock();
-    while let Some(command) = crate::read_command(&mut input) {
+    while let Some((_, command)) = crate::read_command(&mut input) {
         match command {
             Command::Open { file, .. } => file_handle(file),
             Command::Play { section, event, .. } => {

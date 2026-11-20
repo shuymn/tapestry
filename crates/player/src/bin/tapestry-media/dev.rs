@@ -27,6 +27,12 @@
 //! - `--dev-flood <n>`: answers the hello and, at the game's first
 //!   command, sends `n` replies the game never asked for, as fast as the
 //!   pipe takes them, then waits.
+//! - `--dev-balloon <step> <total> [<last> [free]]`: answers the hello and
+//!   serves the control pipe while a thread commits memory the worker never
+//!   frees, `step` MiB at a time about 10 ms apart up to `total` MiB and
+//!   then `last` MiB at once, which `free` releases at once, logging each
+//!   commit, release and a refusal's error code, after which it commits no
+//!   more ([`balloon`]).
 
 mod probe;
 
@@ -82,6 +88,7 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
             });
         }
         "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-balloon" => return Some(balloon(rest)),
         "--dev-deaf" => {
             let _ = crate::hello(ffmpeg::MAX_ALLOC);
             wait_for_ever()
@@ -94,7 +101,10 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
                     // After the launch has taken the hello.
                     let _ = crate::read_command(&mut std::io::stdin().lock());
                     for _ in 0..n {
-                        out.send(&skin_model::media::control::Reply::Closed { player: 0 });
+                        out.send(&skin_model::media::control::Reply::Closed {
+                            id: skin_model::media::control::NO_COMMAND,
+                            player: 0,
+                        });
                     }
                     wait_for_ever()
                 })
@@ -114,6 +124,87 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e),
     })
+}
+
+/// `--dev-balloon`: the memory the job's cap and its watcher are tested
+/// with. The worker's own limits bound single operations, the pixel cap a
+/// frame and the allocation cap each of FFmpeg's allocations, while the
+/// job's cap bounds the worker's commit in all (design.md "Threat Model"
+/// T02); the tests reach that cap by committing memory directly.
+fn balloon(args: &[String]) -> ExitCode {
+    let mib = |s: &String| s.parse::<usize>().map_err(|e| format!("{s}: {e}"));
+    let parsed = match args {
+        [step, total] => mib(step).and_then(|step| Ok((step, mib(total)?, 0))),
+        [step, total, last] => mib(step).and_then(|step| Ok((step, mib(total)?, mib(last)?))),
+        [step, total, last, free] if free == "free" => {
+            mib(step).and_then(|step| Ok((step, mib(total)?, mib(last)?)))
+        }
+        _ => Err("--dev-balloon <step> <total> [<last> [free]]".to_owned()),
+    };
+    let free = args.len() == 4;
+    let (step, total, last) = match parsed {
+        Ok((0, ..)) => return usage("--dev-balloon: a step of 0 MiB"),
+        Ok(sizes) => sizes,
+        Err(e) => return usage(&e),
+    };
+    let out = crate::hello(ffmpeg::MAX_ALLOC);
+    let inflating = std::thread::Builder::new()
+        .name("balloon".to_owned())
+        .spawn(move || inflate(step, total, last, free));
+    if let Err(e) = inflating {
+        crate::say(&format!("balloon: its thread did not start: {e}"));
+    }
+    crate::serve_on(&out)
+}
+
+/// Commits `step` MiB at a time up to `total`, then `last` at once,
+/// released at once when `free` says so, stopping at the first refusal.
+fn inflate(step: usize, total: usize, last: usize, free: bool) {
+    use windows::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+    let mut committed = 0;
+    while committed < total {
+        let n = step.min(total - committed);
+        if commit(n).is_none() {
+            return;
+        }
+        committed += n;
+        crate::say(&format!("balloon: committed {committed} MiB"));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if last > 0
+        && let Some(region) = commit(last)
+    {
+        if free {
+            // SAFETY: the region just committed, which nothing else uses.
+            let freed = unsafe { VirtualFree(region, 0, MEM_RELEASE) };
+            crate::say(&format!(
+                "balloon: committed {} MiB and released {last} MiB ({freed:?})",
+                committed + last
+            ));
+        } else {
+            committed += last;
+            crate::say(&format!("balloon: committed {committed} MiB"));
+        }
+    }
+    crate::say("balloon: done");
+}
+
+/// Commits `mib` MiB the worker never touches: the region, or `None` when
+/// the commit was refused, the refusal logged with its error code.
+fn commit(mib: usize) -> Option<*mut std::ffi::c_void> {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    // SAFETY: a new private region, which nothing reads.
+    let region = unsafe { VirtualAlloc(None, mib << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    if region.is_null() {
+        // SAFETY: the calling thread's last error, which the refusal set.
+        let code = unsafe { GetLastError() }.0;
+        crate::say(&format!("balloon: {mib} MiB refused with {code}"));
+        return None;
+    }
+    Some(region)
 }
 
 /// Waits until the game ends the worker.
