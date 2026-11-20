@@ -18070,13 +18070,17 @@ pub(crate) mod tests {
     #[test]
     fn the_drawn_skin_s_loadend_governs_the_minimum() {
         let (chart, screens, link) = pending_link();
-        let staged = || screens.staged_frames.lock().unwrap().len();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
         link.loading().show(one_line("one"));
         assert!(wait_until(|| link.loading_acked() >= 2));
         let (_, at) = link.loading_ack().unwrap();
         let minimum = || game::minimum_ends(at, link.loading_loadend()).0 - at.0;
+        // Two frames of the new staging: the first's declaration is
+        // published before the second is drawn. A frame of the earlier
+        // staging, begun before the request and recorded after the count
+        // was read, counts for nothing.
         let stage = |ms: i64| {
-            let n = staged();
+            let earlier: Vec<u64> = staged().iter().map(|&(_, r)| r).collect();
             assert_eq!(
                 specialized(
                     &link,
@@ -18086,7 +18090,13 @@ pub(crate) mod tests {
                 .unwrap(),
                 Preparation::Ready
             );
-            assert!(wait_until(|| staged() >= n + 2));
+            assert!(wait_until(|| {
+                staged()
+                    .iter()
+                    .filter(|(_, r)| !earlier.contains(r))
+                    .count()
+                    >= 2
+            }));
         };
         stage(2_700);
         assert_eq!(minimum(), 2_700_000);
