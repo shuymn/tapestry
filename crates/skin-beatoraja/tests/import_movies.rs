@@ -20,6 +20,18 @@ fn movies(
     extra: &str,
     files: &[&str],
 ) -> (tempfile::TempDir, skin_beatoraja::Imported) {
+    movies_in(ty, kind, sources, extra, files, |_| {})
+}
+
+/// [`movies`] with `prepare` run on the folder before the import.
+fn movies_in(
+    ty: u32,
+    kind: ScreenKind,
+    sources: &[&str],
+    extra: &str,
+    files: &[&str],
+    prepare: impl FnOnce(&std::path::Path),
+) -> (tempfile::TempDir, skin_beatoraja::Imported) {
     let source: Vec<String> = sources
         .iter()
         .enumerate()
@@ -42,6 +54,7 @@ fn movies(
     for f in files {
         common::write(dir.path(), f, b"not read");
     }
+    prepare(dir.path());
     let (mut def, h) = read_header(dir.path(), "s.json").unwrap();
     let imported = import(&mut def, &h, &Config::defaults(&h), kind).unwrap();
     (dir, imported)
@@ -131,6 +144,54 @@ fn a_movie_pattern_resolves_through_its_file_choice_or_is_refused() {
         common::kinds(&i.report).contains(&NoteKind::UnsupportedField {
             field: "source glob"
         }),
+        "{:?}",
+        i.report.notes
+    );
+}
+
+/// Two names of one file take one slot: an alias through a junction
+/// inside the folder shares the first name's slot, so the next file
+/// still plays.
+#[test]
+fn an_alias_of_a_movie_shares_its_slot() {
+    let (_d, i) = movies_in(
+        0,
+        ScreenKind::Play,
+        &["real/a.mp4", "alias/a.mp4", "b.mp4"],
+        "",
+        &["real/a.mp4", "b.mp4"],
+        |d| common::link_dir(&d.join("alias"), &d.join("real")),
+    );
+    assert_eq!(names(&i), ["real/a.mp4", "b.mp4"]);
+    assert!(
+        !common::kinds(&i.report)
+            .iter()
+            .any(|k| matches!(k, NoteKind::OverCap { .. })),
+        "{:?}",
+        i.report.notes
+    );
+}
+
+/// A movie file that cannot be opened takes no slot and is noted
+/// missing; the valid files after it keep theirs.
+#[test]
+fn a_missing_movie_takes_no_slot() {
+    let (_d, i) = movies(
+        0,
+        ScreenKind::Play,
+        &["gone.mp4", "a.mp4", "b.mp4"],
+        "",
+        &["a.mp4", "b.mp4"],
+    );
+    assert_eq!(names(&i), ["a.mp4", "b.mp4"]);
+    let kinds = common::kinds(&i.report);
+    assert!(
+        kinds.contains(&NoteKind::MissingAsset),
+        "{:?}",
+        i.report.notes
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(k, NoteKind::OverCap { .. })),
         "{:?}",
         i.report.notes
     );

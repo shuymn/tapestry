@@ -141,7 +141,9 @@ impl MovieSet {
                     }
                 },
                 Err(e) => {
-                    log::warn!("skin movie {name}: cannot be opened: {e}");
+                    log::warn!(
+                        "skin movie {name}: a missing or unreadable file ({e}), so it is not played"
+                    );
                     continue;
                 }
             };

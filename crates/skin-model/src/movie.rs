@@ -12,6 +12,15 @@ pub const MAX_MOVIES: usize = 2;
 /// "Threat Model" T02).
 pub const MAX_MOVIE_PIXELS: u64 = crate::media::MAX_PIXELS;
 
+/// Why a skin movie's file takes no slot of its screen.
+#[derive(Debug)]
+pub enum MovieRefusal {
+    /// It cannot be opened inside the skin folder.
+    Missing(crate::RootError),
+    /// The screen has [`MAX_MOVIES`] files already.
+    OverCap,
+}
+
 /// What a movie's destinations show in a frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum MovieShow {

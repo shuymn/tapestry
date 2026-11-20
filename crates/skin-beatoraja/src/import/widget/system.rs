@@ -145,9 +145,11 @@ impl Cx<'_> {
     }
 
     /// Whether image source `s` is a movie: its slot among the screen's
-    /// movies, the same file's shared; or why it is refused: a pattern no
-    /// file choice covers (the source plays a match picked at random), or
-    /// a third movie on the screen. `None` for any other source.
+    /// movies, the same file's shared whatever name reaches it; or why it
+    /// is refused: a pattern no file choice covers (the source plays a
+    /// match picked at random), a file that cannot be opened inside the
+    /// skin folder, or a third movie file on the screen. `None` for any
+    /// other source.
     pub(in super::super) fn movie_source(
         &mut self,
         s: &super::SrcImage,
@@ -161,8 +163,11 @@ impl Cx<'_> {
         };
         Ok(match self.resolve_path(&path, at)? {
             super::super::prepare::Resolved::Movie(Some(name)) => {
-                Some(self.assets.add_movie(&name).ok_or(NoteKind::OverCap {
-                    cap: "two movies a screen",
+                Some(self.assets.add_movie(&name).map_err(|why| match why {
+                    skin_model::movie::MovieRefusal::Missing(_) => NoteKind::MissingAsset,
+                    skin_model::movie::MovieRefusal::OverCap => NoteKind::OverCap {
+                        cap: "two movies a screen",
+                    },
                 }))
             }
             super::super::prepare::Resolved::Movie(None) => Some(Err(NoteKind::UnsupportedField {

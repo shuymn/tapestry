@@ -701,7 +701,7 @@ impl Supervisor {
                 && let Some(why) = p.movie.loss()
             {
                 p.noted = true;
-                self.notes.note(format!("a video is lost ({why:?})"));
+                self.notes.note(why.line());
             }
         }
     }

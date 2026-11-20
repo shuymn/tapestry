@@ -72,6 +72,17 @@ pub enum Loss {
 }
 
 impl Loss {
+    /// The log's line for a video lost for this reason: a refusal at the
+    /// screen's pixel total is noted over its cap, as an import notes a
+    /// cap it passes; any other loss by its reason.
+    pub fn line(self) -> String {
+        match self {
+            Self::OverTotal => "a video is refused: over cap (the screen's movies pass                                 their 2048×2048 luma pixels)"
+                .to_owned(),
+            why => format!("a video is lost ({why:?})"),
+        }
+    }
+
     const ALL: [Self; 13] = [
         Self::Queue,
         Self::Launch,
@@ -340,5 +351,18 @@ pub fn unwanted(stage: Stage, movie: &Cell, current: u64) -> bool {
         Stage::Live | Stage::Idle => gone,
         Stage::Opening(_) | Stage::Playing(_) => movie.generation() != current,
         Stage::Queued | Stage::Closing(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Loss;
+
+    /// A refusal at the pixel total is noted over its cap; another loss
+    /// by its reason.
+    #[test]
+    fn a_pixel_total_refusal_is_noted_over_its_cap() {
+        assert!(Loss::OverTotal.line().contains("over cap"));
+        assert_eq!(Loss::Fault.line(), "a video is lost (Fault)");
     }
 }

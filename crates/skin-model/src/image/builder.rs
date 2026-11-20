@@ -18,7 +18,7 @@ use super::fnt::{
     MAX_FONT_KERNINGS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
 };
 use super::font::{self, FontDef, FontError, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
-use super::path::{PathError, Root};
+use super::path::{FileId, PathError, Root};
 use super::source::FileSource;
 use super::{
     Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
@@ -231,7 +231,10 @@ pub struct SheetBuilder {
     frames: Vec<u32>,
     cell_ids: BTreeMap<Cell, u32>,
     fonts: Vec<String>,
-    movies: Vec<String>,
+    /// The skin folder, which a movie's file is opened in.
+    folder: Root,
+    /// The skin movies' files, by slot.
+    movies: Vec<FileId>,
     font_bytes: Total,
     fnts: Vec<Fnt>,
     bitmap_fonts: Vec<Box<[u16]>>,
@@ -258,6 +261,7 @@ impl SheetBuilder {
             frames: Vec::new(),
             cell_ids: BTreeMap::new(),
             fonts: Vec::new(),
+            folder: root.clone(),
             movies: Vec::new(),
             font_bytes: Total {
                 sum: 0,
@@ -790,18 +794,29 @@ impl SheetBuilder {
         (self.glyphs, self.kernings)
     }
 
-    /// The slot of the skin movie in file `name` (inside the skin
-    /// folder): its slot when the name is already the sheet's, else the
-    /// next one; `None` past [`MAX_MOVIES`](crate::movie::MAX_MOVIES).
-    pub fn add_movie(&mut self, name: &str) -> Option<u8> {
-        if let Some(i) = self.movies.iter().position(|m| m == name) {
-            return u8::try_from(i).ok();
+    /// The slot of the skin movie in file `name`, opened inside the skin
+    /// folder ([`Root::open`]) before any slot is given: the slot of the
+    /// same file when the sheet has it under any name (its [`FileId`]),
+    /// else the next one.
+    ///
+    /// # Errors
+    ///
+    /// [`MovieRefusal::Missing`](crate::movie::MovieRefusal::Missing)
+    /// when the file cannot be opened there, and
+    /// [`MovieRefusal::OverCap`](crate::movie::MovieRefusal::OverCap)
+    /// past [`MAX_MOVIES`](crate::movie::MAX_MOVIES) files; neither takes
+    /// a slot.
+    pub fn add_movie(&mut self, name: &str) -> Result<u8, crate::movie::MovieRefusal> {
+        use crate::movie::MovieRefusal;
+        let (_, id) = self.folder.open(name).map_err(MovieRefusal::Missing)?;
+        if let Some(i) = self.movies.iter().position(|m| *m == id) {
+            return u8::try_from(i).map_err(|_| MovieRefusal::OverCap);
         }
         if self.movies.len() >= crate::movie::MAX_MOVIES {
-            return None;
+            return Err(MovieRefusal::OverCap);
         }
-        self.movies.push(name.to_owned());
-        u8::try_from(self.movies.len() - 1).ok()
+        self.movies.push(id);
+        u8::try_from(self.movies.len() - 1).map_err(|_| MovieRefusal::OverCap)
     }
 
     /// The sheet, with the cells renumbered in file and rectangle order as
@@ -819,7 +834,7 @@ impl SheetBuilder {
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
             fonts: self.fonts.into_boxed_slice(),
-            movies: self.movies.into_boxed_slice(),
+            movies: self.movies.iter().map(|m| m.name().to_owned()).collect(),
             fnts: self.fnts.into_boxed_slice(),
             bitmap_fonts: self.bitmap_fonts.into_boxed_slice(),
             #[cfg(any(test, feature = "dev-tools"))]
