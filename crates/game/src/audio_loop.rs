@@ -501,6 +501,11 @@ struct Shared {
     /// bit, with bit 0 set when it loops; 0 when silent (dev-tools).
     #[cfg(feature = "dev-tools")]
     reserved: [AtomicU64; RESERVED_KINDS.len()],
+    /// Per kind of [`RESERVED_KINDS`], the latest reserved voice any
+    /// control step saw, as `reserved` writes it, kept once it is silent:
+    /// 0 before any (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    sounded: [AtomicU64; RESERVED_KINDS.len()],
     /// Steps so far whose system requests waited behind a blocked install.
     system_install_waits: AtomicU64,
     /// The latest report that the sealed play's audio has ended: its
@@ -636,6 +641,20 @@ impl OutputProbe {
     pub fn reserved(&self, kind: SystemKind) -> Option<(GenId, bool)> {
         let at = RESERVED_KINDS.iter().position(|&k| k == kind)?;
         let word = self.0.reserved.get(at)?.load(Ordering::Acquire);
+        (word != 0).then_some((GenId(word >> 1), word & 1 == 1))
+    }
+
+    /// The latest voice reserved for `kind` that a control step of the
+    /// audio thread saw sounding, as [`reserved`](Self::reserved) gives
+    /// it, kept after it ends: a one-shot that a test reads after the audio
+    /// thread played it through (a thread that fell behind the clock mixes
+    /// the periods it missed at once) is still seen; `None` before any
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn sounded(&self, kind: SystemKind) -> Option<(GenId, bool)> {
+        let at = RESERVED_KINDS.iter().position(|&k| k == kind)?;
+        let word = self.0.sounded.get(at)?.load(Ordering::Acquire);
         (word != 0).then_some((GenId(word >> 1), word & 1 == 1))
     }
 }
@@ -1801,11 +1820,19 @@ impl AudioWorker {
             shared
                 .tones_started
                 .store(system.tones_started(), Ordering::Release);
-            for (word, kind) in shared.reserved.iter().zip(RESERVED_KINDS) {
+            for ((word, sounded), kind) in shared
+                .reserved
+                .iter()
+                .zip(&shared.sounded)
+                .zip(RESERVED_KINDS)
+            {
                 let voice = system
                     .reserved_voice(kind)
                     .map_or(0, |(id, looped)| (id.0 << 1) | u64::from(looped));
                 word.store(voice, Ordering::Release);
+                if voice != 0 {
+                    sounded.store(voice, Ordering::Release);
+                }
             }
         }
     }

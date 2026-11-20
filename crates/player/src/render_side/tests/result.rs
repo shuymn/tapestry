@@ -585,13 +585,19 @@ impl Rig {
         let drawn = Arc::new(Mutex::new(Vec::new()));
         let (g, f, d) = (Arc::clone(&gate), Arc::clone(&faults), Arc::clone(&drawn));
         let make: MakeScreen = Box::new(move || {
-            let r = render::Renderer::new(
+            let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
                     height: 1_080,
                 },
                 render::AdapterChoice::Warp,
             )?;
+            // The tests count the frames drawn and read what they
+            // acknowledged: a frame skipped past the renderer's 100 ms
+            // wait for the one before on WARP would be recorded here yet
+            // acknowledge nothing, which a loaded machine would decide.
+            // Faults inject the outcomes a test needs.
+            r.set_offscreen_frame_wait(None);
             Ok(Box::new(Recorded {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
                 gate: Arc::clone(&g),
@@ -1459,6 +1465,10 @@ fn a_refused_first_presentation_draws_its_own_page() {
         "{page:?}"
     );
     assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
+    // The refusal publishes the disabled kind before the page's frame is
+    // counted, and the frame is recorded before it returns: what it shows
+    // is published after both.
+    assert!(wait_until(|| rig.link.result_status().shown.is_some()));
     assert_eq!(rig.link.result_status().shown, Some((1, false)));
     rig.link.exit();
 }
