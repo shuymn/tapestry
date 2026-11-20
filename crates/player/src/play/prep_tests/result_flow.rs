@@ -910,27 +910,43 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         );
     }
     // Each upload's figures are marked once it was waited for, so no probe
-    // work overlaps the GPU's copy its wait times: the first of them comes
-    // after the wait began (for the waits long enough to tell).
-    let waits: Vec<(u64, i64)> = marks
-        .iter()
-        .filter(|m| m.1 == "up:selskin:gpu_wait_us")
-        .map(|m| (m.0, m.2))
-        .collect();
-    assert_eq!(waits.len(), begins.len(), "{waits:?}");
-    let long: Vec<_> = begins
-        .iter()
-        .zip(&waits)
-        .filter(|(_, (_, w))| *w >= 1_000)
-        .collect();
-    assert!(!long.is_empty(), "no upload waited 1 ms: {waits:?}");
-    for (&begin, &(at, wait)) in long {
-        let began = at.saturating_sub(u64::try_from(wait).unwrap_or(0));
-        assert!(
-            begin >= began,
-            "an upload's figures marked before its wait: {begin} < {began}"
-        );
+    // work overlaps the GPU's copy its wait times. The result uploads are
+    // written in the uploader's steps, which add no wait (design.md "Load
+    // Pipeline"): they record a wait of none and no wait marks. Only the
+    // play skin's (upload 0) waits for the GPU: in the marks' order (one
+    // thread's marks keep its order), its wait begins and ends, then its
+    // figures and its wait's time are marked, before the next upload's.
+    let order = |tag: &str| -> Vec<usize> {
+        marks
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.1 == tag)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let [starts, ends, figures, waited] = [
+        "up:selskin:wait_begin",
+        "up:selskin:wait_end",
+        "up:selskin:begin",
+        "up:selskin:gpu_wait_us",
+    ]
+    .map(order);
+    assert_eq!((starts.len(), ends.len()), (1, 1), "{starts:?} {ends:?}");
+    for o in [&figures, &waited] {
+        assert_eq!(o.len(), begins.len(), "{o:?}");
     }
+    let chain: Vec<usize> = starts
+        .iter()
+        .chain(&ends)
+        .copied()
+        .chain(figures.iter().zip(&waited).flat_map(|(&f, &w)| [f, w]))
+        .collect();
+    assert!(
+        chain.is_sorted(),
+        "an upload's figures outside its wait: {chain:?}"
+    );
+    let waits = values("up:selskin:gpu_wait_us");
+    assert_eq!(waits.get(1..), Some(&[0, 0][..]), "{waits:?}");
     // The first result's installation: none before (0); the second's: one
     // installed, another asked for (2).
     assert_eq!(values("res:installed"), [0, 2]);

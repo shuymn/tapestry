@@ -3912,19 +3912,32 @@ impl Renderer {
             self.retire_refused(pages, atlas, atlas_bind, buffer);
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        #[cfg(feature = "dev-tools")]
-        let p_wait = crate::probe::Span::start();
         // In steps, its pages are written by the uploader, which never
-        // waits for the GPU; its creation's writes complete with them.
+        // waits for the GPU; its creation's writes complete with them. Its
+        // wait is recorded as none, untimed (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let mut p_wait = std::time::Duration::ZERO;
         let p_waited = if stepped {
             Ok(())
         } else {
-            wait_for_gpu(&self.gpu)
+            // The wait's start and end, so a reading can place the
+            // summary after it.
+            #[cfg(feature = "dev-tools")]
+            crate::probe::cmark!("up", "wait_begin", 0);
+            #[cfg(feature = "dev-tools")]
+            let p_span = crate::probe::Span::start();
+            let waited = wait_for_gpu(&self.gpu);
+            #[cfg(feature = "dev-tools")]
+            {
+                p_wait = p_span.elapsed();
+                crate::probe::cmark!("up", "wait_end", 0);
+            }
+            waited
         };
         #[cfg(feature = "dev-tools")]
         {
             use crate::probe::{cmark, us};
-            let (wait, total) = (p_wait.elapsed(), p_began.elapsed());
+            let (wait, total) = (p_wait, p_began.elapsed());
             p_summary(false);
             cmark!("up", "gpu_wait_us", us(wait));
             cmark!("up", "total_us", us(total));
