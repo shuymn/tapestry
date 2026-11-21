@@ -138,6 +138,10 @@ pub(super) struct Faults {
     pub(super) samples: Mutex<Vec<(usize, Vec<[u8; 3]>)>>,
     /// Stagings discarded.
     pub(super) discards: AtomicU32,
+    /// The page font reads as not in hand, as a screen made for plays only
+    /// whose read has not ended: the pending presentation draws its
+    /// bitmap line.
+    pub(super) no_font: AtomicBool,
     /// The renderer's result chart writes that wrote pixels, after the
     /// last write asked, and each write's table.
     pub(super) chart_writes: std::sync::atomic::AtomicU64,
@@ -723,6 +727,15 @@ impl Screen for Recorded {
     }
     fn text(&mut self, lines: &[&str]) -> Result<bool, render::RenderError> {
         self.menu.text(lines)
+    }
+    fn text_frame(&mut self, lines: &[&str]) -> Result<render::FrameTiming, render::RenderError> {
+        self.menu.text_frame(lines)
+    }
+    fn page_font_ready(&mut self) -> bool {
+        !self.faults.no_font.load(Ordering::Acquire) && self.menu.page_font_ready()
+    }
+    fn minimized(&self) -> bool {
+        self.menu.minimized()
     }
     fn resize(&mut self, width: u32, height: u32) {
         self.menu.resize(width, height);
@@ -4628,6 +4641,92 @@ fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
         "a frame not the shown view's while the switch staged: {seen:?}"
     );
     assert_eq!(presenting, Vec::new(), "a blocking wait presenting");
+    rig.link.exit();
+}
+
+/// A swap-paced window minimized past the result's hold bound, the menu
+/// font not in hand: the pending presentation's bitmap frames end
+/// invisible, so each refills the frame interval's allowance as a shown
+/// one does. The first view's creation spends it; a view superseding it,
+/// whose own creation waits for a refill, is created while the window
+/// stays minimized (design.md "Load Pipeline", the allowance; "Rendering
+/// and Skins", the result's hold).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_minimized_bitmap_frame_refills_the_allowance_for_a_second_creation() {
+    use crate::render_side::{Extent, HeavyKind};
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let rig = Rig::new();
+    rig.faults.step_creations.store(true, Ordering::Release);
+    let lifetime = installed(&rig, &x0);
+    let extent = Arc::new(Extent::default());
+    extent.publish(1_920, 1_080);
+    rig.link.follow(&extent);
+    // Paced as a swap chain, every grant given.
+    rig.gate.permits.store(u32::MAX, Ordering::Release);
+    rig.gate.pace.store(true, Ordering::Release);
+    rig.faults.no_font.store(true, Ordering::Release);
+    // A cleared page drawing as the outgoing screen, then the hold, past
+    // its bound at once: the bitmap line.
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_first_frame_hold(TimeUs(200_000));
+    rig.link.set_hold_clock(Some(200_001));
+    rig.link.hold_result(bms_model::TimeSource::now(&rig.clock));
+    let bitmap = rig.link.bitmap_frames();
+    assert!(
+        wait_until(|| rig.link.bitmap_frames() > bitmap + 2),
+        "no bitmap frame past the bound"
+    );
+    extent.publish(0, 0);
+    let bitmap = rig.link.bitmap_frames();
+    assert!(
+        wait_until(|| rig.link.bitmap_frames() > bitmap + 2),
+        "no bitmap frame minimized"
+    );
+    rig.link.record_heavy(64);
+    rig.link.pause_result_staging(true);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    let creations = |rig: &Rig| {
+        rig.link
+            .heavy_record()
+            .iter()
+            .filter(|r| r.kind == HeavyKind::ResultCreation)
+            .count()
+    };
+    assert!(
+        wait_until(|| creations(&rig) >= 1),
+        "the first view's creation"
+    );
+    let bitmap = rig.link.bitmap_frames();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while creations(&rig) < 2 {
+        assert!(
+            Instant::now() < end,
+            "the superseding view's creation never admitted, {} bitmap frames drawn minimized since: {:?}",
+            rig.link.bitmap_frames() - bitmap,
+            rig.link.heavy_record()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(rig.link.bitmap_frames() > bitmap, "no bitmap frame between");
+    rig.link.pause_result_staging(false);
+    rig.gate.release();
     rig.link.exit();
 }
 

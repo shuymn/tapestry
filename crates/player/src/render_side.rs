@@ -979,6 +979,17 @@ pub trait Screen: Send {
     ///
     /// As [`draw`](Self::draw).
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError>;
+    /// [`text`](Self::text), with what became of the frame: a minimized
+    /// window's frame ends invisible, which refills the frame interval's
+    /// allowance as a shown one does (design.md "Load Pipeline"). A screen
+    /// that tells only whether it presented ends any other frame `Retry`.
+    ///
+    /// # Errors
+    ///
+    /// As [`draw`](Self::draw).
+    fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
+        self.text(lines).map(|p| timing_of(shown_or_retry(p)))
+    }
     /// Draws the end screen's `page`, its lines and its graphs, as
     /// [`draw`](Self::draw), and says what became of the frame. A screen
     /// that draws no graphs draws the lines as [`text`](Self::text), a
@@ -14632,8 +14643,8 @@ const fn shown_or_retry(presented: bool) -> FrameOutcome {
 /// cleared canvas (design.md "Rendering and Skins", the result's hold).
 fn pending_bitmap(screen: &mut dyn Screen) -> Result<(FrameTiming, Option<TimeUs>), RenderError> {
     screen
-        .text(&[crate::ui_text::Label::NowLoading.text()])
-        .map(|p| (timing_of(shown_or_retry(p)), None))
+        .text_frame(&[crate::ui_text::Label::NowLoading.text()])
+        .map(|t| (t, None))
 }
 
 const fn timing_of(outcome: FrameOutcome) -> FrameTiming {

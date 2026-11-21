@@ -1996,8 +1996,13 @@ impl Screen for MenuScreen {
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
-        let presented = self.renderer.text_frame(lines)?.presented();
-        Ok(self.shown(presented))
+        self.text_frame(lines).map(|t| t.presented())
+    }
+
+    fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
+        let timing = self.renderer.text_frame(lines)?;
+        self.shown(timing.presented());
+        Ok(timing)
     }
 
     fn end(&mut self, page: &crate::render_side::EndPage) -> Result<FrameOutcome, RenderError> {
