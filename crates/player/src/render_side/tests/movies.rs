@@ -110,3 +110,37 @@ fn a_cancelled_start_drops_its_movies_and_a_committed_one_keeps_them() {
         link.exit();
     }
 }
+
+/// A practice Start committed and then quit before READY: the game's
+/// abandonment of its request, through the render thread, retires the
+/// committed movies before the practice page draws, so the page holds
+/// none of them; the abandonment of a later request than the one
+/// committed leaves them.
+// Revert: the render thread's `RenderMsg::Abandon` arm doing nothing ->
+// "retired by the abandonment".
+#[test]
+fn an_abandoned_committed_start_drops_its_movies() {
+    let _turn = crate::warp_turn::take();
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let hub = MediaHub::with(None);
+    let link = on_menu(&hub, &chart);
+    let mut pending = link.begin_attempt(titled(&chart), AttemptSkin::InUse);
+    let answer = loop {
+        if let Some(a) = pending.wait_until(None, || false) {
+            break a;
+        }
+    };
+    assert_eq!(answer.unwrap().preparation, Preparation::Ready);
+    link.commit_attempt().unwrap();
+    let committed = link.requests.load(Ordering::Relaxed);
+    link.send(RenderMsg::Abandon(committed + 1));
+    assert!(link.fence(Duration::from_secs(20)));
+    assert_eq!(hub.open_sets(), 1, "another request's abandonment");
+    link.abandon_attempt();
+    link.send(RenderMsg::PracticePage(Box::default()));
+    assert!(
+        wait_until(|| hub.open_sets() == 0),
+        "retired by the abandonment"
+    );
+    link.exit();
+}

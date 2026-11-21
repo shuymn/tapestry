@@ -155,11 +155,11 @@ fn a_screen_s_movies_never_outlive_it() {
     assert_eq!(hub.open_sets(), 0);
 }
 
-/// A practice Start quit after its commit and before READY, then another
-/// Start: the second's loading lifetime publishes before its preparation
-/// opens its movies, and its loading frames show none of the first
-/// Start's (neither its frame nor its loss) and take no clock from them;
-/// its own preparation's movies then show in them.
+/// A committed play's movies show only in the loading frames of the
+/// lifetime its request was published in: a loading frame of another
+/// lifetime (a later Start's, drawn while the committed set is still held)
+/// shows none of them (neither its frame nor its loss) and takes no clock
+/// from them; the later Start's own preparation's movies then show in it.
 #[test]
 fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     let _turn = crate::warp_turn::take();
@@ -178,9 +178,6 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
         [MovieShow::Frame { .. }, MovieShow::Lost]
     ));
     s.commit(token(&s, 1)).unwrap();
-    // Quit before READY: the practice page, then the next Start's loading
-    // state, its preparation not begun.
-    let _ = s.menu(&super::MenuPage::default(), true);
     assert!(matches!(s.movies.get(), Some((Holder::Committed(1), _))));
     s.loading_movies(&loading_frame(2, 3_000_000));
     assert_eq!(
@@ -203,6 +200,49 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
         [MovieShow::Frame { .. }, MovieShow::Nothing]
     ));
     assert_eq!(hub.open_sets(), 1);
+}
+
+/// A practice Start quit after its commit and before READY, back on the
+/// practice page: the game's abandonment of its request retires the
+/// committed set (its generation left, its planes released, its loading
+/// shows gone) before the page draws, and nothing of it waits for a later
+/// screen. The controls: an abandonment of another request, and one of a
+/// preparation not committed (kept for a local retry), leave the set.
+// Revert: `ScreenMovies::abandon` retiring nothing -> "the abandoned set
+// retired".
+#[test]
+fn an_abandoned_committed_start_retires_its_movies() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    hub.supply([Some(clip(&[0])), None]);
+    s.open_play_movies(Some(&play), 1, Some(1));
+    s.movie_boundary();
+    s.loading_movies(&loading_frame(1, 0));
+    // Not committed: a local retry keeps its preparation's movies.
+    s.abandon(1);
+    assert!(
+        matches!(s.movies.get(), Some((Holder::Preparing(1), _))),
+        "a preparation kept"
+    );
+    s.commit(token(&s, 1)).unwrap();
+    s.abandon(2);
+    assert!(
+        matches!(s.movies.get(), Some((Holder::Committed(1), _))),
+        "another request's abandonment"
+    );
+    assert!(s.renderer.video_bytes().0 > 0, "its planes");
+    let generation = hub.generation();
+    // The quit: the game abandons the request, then the practice page.
+    s.abandon(1);
+    let _ = s.menu(&super::MenuPage::default(), true);
+    assert!(s.movies.get().is_none(), "the abandoned set retired");
+    assert_eq!(hub.open_sets(), 0, "the set left");
+    assert!(hub.generation() > generation, "its generation left");
+    assert_eq!(s.renderer.video_bytes(), (0, 0), "its planes left");
+    assert_eq!(s.renderer.loading_movies(), [MovieShow::Nothing; 2]);
 }
 
 /// A selection entry whose render loop never finds slack for the

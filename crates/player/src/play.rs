@@ -2976,6 +2976,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn end_presentation(&mut self) {
+        // A play committed and left before it began takes its movies
+        // with it; a preparation kept for a local retry keeps them.
+        self.render.abandon_attempt();
         #[cfg(feature = "dev-tools")]
         self.input.end_loading_script();
         if let Some(driver) = &mut self.adjust {

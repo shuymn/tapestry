@@ -645,8 +645,11 @@ fn a_press_in_the_closed_gap_is_discarded_and_rearms() {
 
 /// A14: a quit at the last look, after the commit and the end of
 /// loading: the run is left for the page, the committed installation
-/// stays, and acceptance is open again on both sides: on the practice
-/// page a settings key steps and START with SELECT act.
+/// stays, its play abandoned on the render thread after the commit (its
+/// movies go), and acceptance is open again on both sides: on the
+/// practice page a settings key steps and START with SELECT act.
+// Revert: the abandonment dropped from `PlayerRig::end_presentation` ->
+// "the committed request abandoned".
 #[test]
 fn a_quit_at_the_last_look_reopens_tuning_on_the_page() {
     let (_dir, mut loaded) = plain();
@@ -655,9 +658,19 @@ fn a_quit_at_the_last_look_reopens_tuning_on_the_page() {
         let ended = open_with(loaded, rig, side, || side.quit_at_the_end_of_loading());
         assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
         assert!(rig.render.epochs().1 > 0, "committed");
+        let log = side.screens.log();
+        // The attempt's commit, the last (the play skin's installation
+        // commits first).
+        let commit = log
+            .iter()
+            .rposition(|l| l.contains(" commit "))
+            .expect("the installation stays");
+        let request = log[commit].rsplit(' ').next().unwrap().to_owned();
         assert!(
-            side.screens.log().iter().any(|l| l.contains(" commit ")),
-            "the installation stays"
+            log[commit..]
+                .iter()
+                .any(|l| l.ends_with(&format!(" abandon {request}"))),
+            "the committed request abandoned: {log:?}"
         );
         let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
         rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));

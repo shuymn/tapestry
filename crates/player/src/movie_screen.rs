@@ -25,7 +25,8 @@
 //! the loading frames' shows go together, when the instance ends by
 //! whichever path: another set opened, a frame of another screen drawn
 //! ([`Drawn`]), its preparation cancelled or discarded before its commit,
-//! its skin's installation removed. A screen dropped (its device lost, or
+//! its committed play left before it began
+//! ([`abandon`](ScreenMovies::abandon)), its skin's installation removed. A screen dropped (its device lost, or
 //! the run's end) drops its set with its renderer; the screen built again
 //! opens new sets, whose movies start again, a movie lost before included.
 //!
@@ -390,6 +391,16 @@ impl ScreenMovies {
         if let Some((Holder::Preparing(r), _)) = &self.held
             && request.is_none_or(|q| q == *r)
         {
+            self.retire(renderer);
+        }
+    }
+
+    /// The committed play of preparation `request` is left before it
+    /// began (a quit after its commit and before READY): the set it holds
+    /// is retired. A set of another request, or one not committed (a
+    /// preparation kept for a local retry), is left as it is.
+    pub fn abandon(&mut self, request: u64, renderer: &mut Renderer) {
+        if matches!(&self.held, Some((Holder::Committed(r), _)) if *r == request) {
             self.retire(renderer);
         }
     }

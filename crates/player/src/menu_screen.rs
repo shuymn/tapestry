@@ -1763,6 +1763,10 @@ impl Screen for MenuScreen {
         }
     }
 
+    fn abandon(&mut self, request: u64) {
+        self.movies.abandon(request, &mut self.renderer);
+    }
+
     fn begin_play(&mut self, anchor: i64) {
         self.movies.begin_play(anchor, &mut self.renderer);
     }

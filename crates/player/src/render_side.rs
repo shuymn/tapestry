@@ -861,6 +861,12 @@ pub trait Screen: Send {
     /// movie the boundary found no slack for in a frame's interval is
     /// admitted here, once. Nothing by default.
     fn movie_turn(&mut self) {}
+    /// The game left the committed play of preparation `request` before
+    /// it began (a quit after its commit and before READY): its movies
+    /// are retired. Nothing by default.
+    fn abandon(&mut self, request: u64) {
+        let _ = request;
+    }
     /// The committed play begins (its play message), its READY at `anchor`
     /// µs on the frame clock less the play skin's loading minimum: its
     /// movies' clock starts there unless its loading frames started it.
@@ -1383,6 +1389,10 @@ pub enum RenderMsg {
     /// Drop the preparation of this request, answered or not, unless
     /// committed: it was cancelled, refused or timed out.
     Discard(u64),
+    /// The game left the play of this request before it began, after its
+    /// commit (a quit before READY): its movies are retired. The
+    /// installation stays; a request not committed is left as it is.
+    Abandon(u64),
     /// Publish the chart's images (S10-12): into the staged array of the
     /// attempt `request` prepared when it has one of its own, else into the
     /// committed play installation; `set` `None` publishes them absent.
@@ -3699,6 +3709,13 @@ impl RenderLink {
     /// committed; it never installs.
     pub fn discard_attempt(&self) {
         self.send(RenderMsg::Discard(self.requests.load(Ordering::Relaxed)));
+    }
+
+    /// The last attempt's play is left before it began: once committed,
+    /// its movies are retired ([`RenderMsg::Abandon`]); its installation
+    /// stays.
+    pub fn abandon_attempt(&self) {
+        self.send(RenderMsg::Abandon(self.requests.load(Ordering::Relaxed)));
     }
 
     /// Starts installing the declarative `skin` for screen `kind`, as a
@@ -7091,6 +7108,7 @@ impl Run {
                         | RenderMsg::Commit { .. }
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
+                        | RenderMsg::Abandon(_)
                         | RenderMsg::ChartImages { .. }
                         | RenderMsg::Bga { .. }
                         | RenderMsg::PoolWrite(_)
@@ -7432,6 +7450,12 @@ impl Run {
                 }
                 Ok(RenderMsg::Discard(request)) => {
                     self.discard(request);
+                    continue;
+                }
+                Ok(RenderMsg::Abandon(request)) => {
+                    if let Some(screen) = &mut self.screen {
+                        screen.abandon(request);
+                    }
                     continue;
                 }
                 Ok(RenderMsg::ChartImages {
@@ -18875,6 +18899,9 @@ pub(crate) mod tests {
                 self.shared.committed_paces.lock().unwrap().push(pace);
             }
             Ok(())
+        }
+        fn abandon(&mut self, request: u64) {
+            self.note(&format!("abandon {request}"));
         }
         fn discard(&mut self) {
             self.note("discard");
