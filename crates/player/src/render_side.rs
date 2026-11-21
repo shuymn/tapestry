@@ -10932,7 +10932,10 @@ impl Run {
     /// that draws one (design.md "Memory Budget", the uploader's admission
     /// gate): the swap chain's grant where frames are paced by it, or the
     /// frame's clock deadline while an upload steps offscreen or
-    /// minimized. Nothing in an Idle or a held pass, or with a grant kept.
+    /// minimized. Nothing in an Idle or a held pass. A grant kept makes
+    /// the frame due only while the target is visible and paced by it: a
+    /// grant kept across a minimize waits for the restore, and the clock
+    /// paces the frames meanwhile.
     fn frame_due_by(&self, mode: &Mode, held: Option<TimeUs>) -> FrameDue {
         let Some(s) = &self.screen else {
             return FrameDue::Never;
@@ -10940,10 +10943,10 @@ impl Run {
         if held.is_some() || matches!(mode, Mode::Idle) {
             return FrameDue::Never;
         }
-        if self.granted {
-            return FrameDue::Now;
-        }
         if s.paced() && !s.minimized() {
+            if self.granted {
+                return FrameDue::Now;
+            }
             return s.grant_probe().map_or(FrameDue::Never, FrameDue::Grant);
         }
         self.pace_deadline.map_or(FrameDue::Never, FrameDue::At)

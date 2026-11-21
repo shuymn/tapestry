@@ -27,6 +27,12 @@ pub(super) enum Drawn {
     Page(Vec<String>),
 }
 
+/// The swap chain's grant a boundary looks at without waiting while the
+/// frames are paced and the target visible: set by a test, taken by the
+/// look that finds it (one test uses it; each test runs in a process of
+/// its own).
+static GRANT: AtomicBool = AtomicBool::new(false);
+
 /// The frames' pacing: while `pace` is set each frame wait takes one of
 /// `permits`, holding until there is one.
 #[derive(Default)]
@@ -718,6 +724,10 @@ impl Screen for Recorded {
     }
     fn paced(&self) -> bool {
         self.gate.pace.load(Ordering::Acquire) || self.menu.paced()
+    }
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        (self.gate.pace.load(Ordering::Acquire) && !self.menu.minimized())
+            .then_some(render::GrantProbe::Flag(&GRANT))
     }
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
         self.menu.build(f)
@@ -4745,6 +4755,92 @@ fn a_minimized_bitmap_frame_refills_the_allowance_for_a_second_creation() {
     assert!(rig.link.bitmap_frames() > bitmap, "no bitmap frame between");
     rig.link.pause_result_staging(false);
     rig.gate.release();
+    rig.link.exit();
+}
+
+/// Waits until the render loop waits at `gate`, at most 20 s.
+#[cfg(feature = "dev-tools")]
+fn held_at(gate: &crate::render_side::TestGate, what: &str) {
+    assert!(
+        wait_until(|| gate.waiting()),
+        "the render thread never held {what}"
+    );
+}
+
+/// A swap-paced window drawing the loading state, the result's pages
+/// owed: the pass's boundary takes the swap chain's grant, and a minimize
+/// applies in the same pass, after that boundary. The grant is kept for
+/// the restore, and the pages are created and written while the window
+/// stays minimized, paced by the clock (design.md "Memory Budget", the
+/// uploader's admission gate; "Resize").
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_grant_kept_across_a_minimize_lets_the_pages_stage_while_minimized() {
+    use crate::render_side::{Extent, HeavyKind, PagesAnswer};
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let extent = Arc::new(Extent::default());
+    extent.publish(1_920, 1_080);
+    rig.link.follow(&extent);
+    // Paced as a swap chain, every frame granted.
+    rig.gate.permits.store(u32::MAX, Ordering::Release);
+    rig.gate.pace.store(true, Ordering::Release);
+    rig.link.loading().show(super::one_line("loading"));
+    let [after_boundary, _, after_draw] = &rig.link.shared.frame_gates;
+    // The pages owed from the next pass on.
+    after_boundary.hold(true);
+    held_at(after_boundary, "after a boundary");
+    rig.link.record_heavy(64);
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    // This pass draws; the next one's boundary takes the pages and finds
+    // the grant, then holds before its frame reads the window's size.
+    after_draw.hold(true);
+    after_boundary.hold(false);
+    held_at(after_draw, "after its frame");
+    after_boundary.hold(true);
+    GRANT.store(true, Ordering::SeqCst);
+    after_draw.hold(false);
+    held_at(after_boundary, "after the next boundary");
+    assert!(
+        !GRANT.load(Ordering::SeqCst),
+        "the boundary never looked at the grant"
+    );
+    // Minimized from this pass's frame on.
+    extent.publish(0, 0);
+    let minimized = Instant::now();
+    after_boundary.hold(false);
+    let end = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        if let Some(a) = t.poll(Duration::from_millis(5)) {
+            break a.unwrap();
+        }
+        assert!(
+            Instant::now() < end,
+            "minimized, the pages never staged: {:?}",
+            rig.link.heavy_record()
+        );
+    };
+    assert_eq!(answer, PagesAnswer::Ready);
+    assert!(
+        rig.link
+            .heavy_record()
+            .iter()
+            .any(|r| r.kind == HeavyKind::PagesCreation && r.start >= minimized),
+        "the pages not created while minimized: {:?}",
+        rig.link.heavy_record()
+    );
+    // The pages' steps are the uploader's only ones here (none of a
+    // staging's atlas).
+    assert!(
+        rig.link.step_records().iter().any(|r| r.at >= minimized),
+        "no step of the pages written while minimized: {:?}",
+        rig.link.step_records()
+    );
+    extent.publish(1_920, 1_080);
+    rig.gate.release();
+    rig.link.end_loading().unwrap();
     rig.link.exit();
 }
 
