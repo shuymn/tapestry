@@ -1759,6 +1759,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let ime = window_thread.as_ref().map(window::WindowThread::ime);
     let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
+    // The window's own shots, asked for on a runner's pipe
+    // (`--dev-shot-pipe`): every window renderer made copies for the tap.
+    #[cfg(feature = "dev-tools")]
+    let shot_tap = s.dev.shot_pipe.clone().map(|name| {
+        let tap = dev::present_shot::Tap::new();
+        dev::present_shot::start(name, Arc::clone(&tap));
+        tap
+    });
     let make: MakeScreen = match (surface, link) {
         (Some(surface), Some(link)) => Box::new(move || {
             let target = Target::Window {
@@ -1766,7 +1774,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 width: surface.width,
                 height: surface.height,
             };
-            let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+            let mut r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            #[cfg(feature = "dev-tools")]
+            if let Some(tap) = &shot_tap
+                && let Err(e) = r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>)
+            {
+                eprintln!("dev: the window's shots: {e}");
+            }
             let fonts = render::text::Fonts::runtime()?;
             let screen = MenuScreen::new(r, Some(fonts)).with_sink(Box::new(link.clone()));
             Ok(Box::new(screen) as Box<dyn Screen>)

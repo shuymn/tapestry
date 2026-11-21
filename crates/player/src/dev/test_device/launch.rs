@@ -207,18 +207,15 @@ impl Player {
 
     /// Starts the player in the run's `job` with the scratch data root and
     /// a 1920×1080 window, its output in files of the run's folder `dir`
-    /// (never pipes, so it meets no broken pipe when the runner ends).
+    /// (never pipes, so it meets no broken pipe when the runner ends), and
+    /// its window's shots asked for on the runner's pipe `shot_pipe`.
     ///
     /// # Errors
     ///
     /// The output files exist, or the player cannot start or is not in the
     /// job.
-    pub fn spawn(&self, job: &Job, dir: &Path) -> anyhow::Result<Child> {
-        let args = [
-            "--dev-window".to_owned(),
-            format!("{}x{}", CLIENT[0], CLIENT[1]),
-        ];
-        self.spawn_with(job, dir, &args)
+    pub fn spawn(&self, job: &Job, dir: &Path, shot_pipe: &str) -> anyhow::Result<Child> {
+        self.spawn_with(job, dir, &args(shot_pipe))
     }
 
     /// [`Self::spawn`] with `args`.
@@ -231,6 +228,17 @@ impl Player {
         let data = self.data.to_string_lossy();
         job::spawn(job, &self.exe, args, &[("LOCALAPPDATA", &data)], &stdio)
     }
+}
+
+/// The player's arguments: a 1920×1080 window, its shots asked for on the
+/// runner's pipe `shot_pipe`.
+fn args(shot_pipe: &str) -> Vec<String> {
+    vec![
+        "--dev-window".to_owned(),
+        format!("{}x{}", CLIENT[0], CLIENT[1]),
+        "--dev-shot-pipe".to_owned(),
+        shot_pipe.to_owned(),
+    ]
 }
 
 /// The player a run starts: a private copy of its executable and the files
@@ -618,6 +626,29 @@ mod tests {
         assert_eq!(stdout.trim_end(), format!("out {}", data.display()));
         let stderr = std::fs::read_to_string(tmp.path().join(STDERR)).unwrap();
         assert_eq!(stderr.trim_end(), "err");
+    }
+
+    /// The player is started in a window of the rows' size, its shots asked
+    /// for on the run's pipe, and the player's own parser takes them so.
+    #[test]
+    fn the_player_takes_its_window_and_its_shot_pipe() {
+        let pipe = super::super::shot::pipe_name("0123");
+        let a = args(&pipe);
+        assert_eq!(
+            a,
+            [
+                "--dev-window",
+                "1920x1080",
+                "--dev-shot-pipe",
+                pipe.as_str()
+            ]
+        );
+        let parsed = crate::args::parse(a.iter().map(std::ffi::OsString::from)).unwrap();
+        let crate::args::Command::Select(s) = parsed else {
+            panic!("{parsed:?}");
+        };
+        assert_eq!(s.dev.window, Some((1920, 1080)));
+        assert_eq!(s.dev.shot_pipe.as_deref(), Some(pipe.as_str()));
     }
 
     #[test]

@@ -392,6 +392,27 @@ mod tests {
             select(&["--dev-window", "8192x8192"]).dev.window,
             Some((8192, 8192))
         );
+        // The shot pipe: a pipe name, with a window to shoot.
+        assert_eq!(
+            select(&[
+                "--dev-window",
+                "1920x1080",
+                "--dev-shot-pipe",
+                r"\\.\pipe\t-1"
+            ])
+            .dev
+            .shot_pipe
+            .as_deref(),
+            Some(r"\\.\pipe\t-1")
+        );
+        assert_eq!(
+            parsed(&["--dev-shot-pipe", r"\\.\pipe\t-1"]).unwrap_err(),
+            UsageError::Usage("--dev-shot-pipe needs --dev-window".to_owned())
+        );
+        assert_eq!(
+            parsed(&["--dev-window", "1920x1080", "--dev-shot-pipe", r"C:\t"]).unwrap_err(),
+            UsageError::Usage(r"--dev-shot-pipe takes a pipe name, \\.\pipe\<name>".to_owned())
+        );
         assert_eq!(
             parsed(&[
                 "--auto",

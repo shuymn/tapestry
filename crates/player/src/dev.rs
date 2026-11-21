@@ -35,6 +35,7 @@ use crate::render_side::{FrameSink, Screen};
 pub mod checkpoints;
 mod decision_faults;
 pub mod loop_probe;
+pub mod present_shot;
 pub mod scenario;
 pub mod test_device;
 pub mod transitions;
@@ -829,6 +830,10 @@ pub struct SelectOptions {
     /// only while speculation is on: the select screen measured at caps 1
     /// and 2 (design.md "Load Pipeline", System friendliness).
     pub speculative_permits: Option<usize>,
+    /// The named pipe a test device's runner asks for the window's own
+    /// shots on (`--dev-shot-pipe <name>`, [`present_shot`]): each answered
+    /// with a frame the render thread copied as it presented it.
+    pub shot_pipe: Option<String>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -863,6 +868,15 @@ impl SelectOptions {
                 })?;
                 self.stop_timeout = Some(std::time::Duration::from_secs(secs));
             }
+            "dev-shot-pipe" => {
+                let name = p.value()?.to_string_lossy().into_owned();
+                if !name.starts_with(r"\\.\pipe\") {
+                    return Err(UsageError::Usage(
+                        r"--dev-shot-pipe takes a pipe name, \\.\pipe\<name>".to_owned(),
+                    ));
+                }
+                self.shot_pipe = Some(name);
+            }
             "dev-speculative-permits" => {
                 let n = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-speculative-permits takes a count".to_owned())
@@ -884,6 +898,11 @@ impl SelectOptions {
         if self.headless && !(auto && self.script.is_some()) {
             return Err(UsageError::Usage(
                 "--dev-headless needs --auto and --dev-select".to_owned(),
+            ));
+        }
+        if self.shot_pipe.is_some() && self.window.is_none() {
+            return Err(UsageError::Usage(
+                "--dev-shot-pipe needs --dev-window".to_owned(),
             ));
         }
         if self.headless && self.window.is_some() {

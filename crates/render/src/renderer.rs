@@ -1499,6 +1499,10 @@ struct Window {
     waitable: Option<usize>,
     /// The swap chain itself, for its present count and frame statistics.
     chain: Option<IDXGISwapChain3>,
+    /// Development builds: whether the surface's images can be copied from,
+    /// for a present tap ([`Renderer::set_present_tap`]).
+    #[cfg(feature = "dev-tools")]
+    copy_src: bool,
 }
 
 impl Window {
@@ -1628,6 +1632,10 @@ pub struct Renderer {
     /// long after its submission ([`delay_steps`](Self::delay_steps)).
     #[cfg(feature = "dev-tools")]
     step_delay: Option<Duration>,
+    /// Development builds: the tap that copies window frames as they are
+    /// presented ([`set_present_tap`](Self::set_present_tap)).
+    #[cfg(feature = "dev-tools")]
+    present_tap: Option<Arc<dyn crate::present_tap::PresentTap>>,
     /// Development builds: the chart-image bands written
     /// ([`chart_bands`](Self::chart_bands)).
     #[cfg(feature = "dev-tools")]
@@ -1952,6 +1960,8 @@ impl Renderer {
                     config,
                     waitable: None,
                     chain: None,
+                    #[cfg(feature = "dev-tools")]
+                    copy_src: caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
                 };
                 w.configure(device);
                 (Output::Window(w), format)
@@ -2001,6 +2011,8 @@ impl Renderer {
             stage_failed: None,
             #[cfg(feature = "dev-tools")]
             step_delay: None,
+            #[cfg(feature = "dev-tools")]
+            present_tap: None,
             #[cfg(feature = "dev-tools")]
             chart_bands: 0,
             #[cfg(feature = "dev-tools")]
@@ -9371,6 +9383,22 @@ impl Renderer {
             });
             text.render(&mut pass).map_err(RenderError::Text)?;
         }
+        // A frame the present tap wants: its swap chain image copied after
+        // every pass drew into it, in its own command buffer, before its
+        // present.
+        #[cfg(feature = "dev-tools")]
+        let tapped = match (&frame, &self.present_tap) {
+            (Some(t), Some(tap)) if tap.wanted() => Some((
+                Arc::clone(tap),
+                crate::present_tap::record(
+                    self.gpu.device(),
+                    &mut encoder,
+                    &t.texture,
+                    self.format,
+                ),
+            )),
+            _ => None,
+        };
         #[cfg(feature = "dev-tools")]
         let p_s = crate::probe::Span::start();
         let (number, submitted) = self.gpu.submit([encoder.finish()]);
@@ -9400,6 +9428,15 @@ impl Renderer {
                     // SAFETY: a plain query of the live swap chain.
                     unsafe { c.GetLastPresentCount() }.ok()
                 });
+                #[cfg(feature = "dev-tools")]
+                if let Some((tap, copy)) = tapped {
+                    tap.presented(out.present_count);
+                    tap.deliver(
+                        copy.and_then(|c| {
+                            crate::present_tap::read(self.gpu.device(), &c, submitted)
+                        }),
+                    );
+                }
             }
             None => {
                 // Offscreen: this frame is the one left pending, so a later
@@ -9437,6 +9474,30 @@ impl Renderer {
                 _ => self.atlas.mark(number),
             },
         }
+    }
+
+    /// Development builds: copies window frames for `tap` as they are
+    /// presented, from now on ([`crate::present_tap`]): the surface is
+    /// configured again so its images can be copied from.
+    ///
+    /// # Errors
+    ///
+    /// An offscreen target, or a surface whose images cannot be copied.
+    #[cfg(feature = "dev-tools")]
+    pub fn set_present_tap(
+        &mut self,
+        tap: Arc<dyn crate::present_tap::PresentTap>,
+    ) -> Result<(), String> {
+        let Output::Window(w) = &mut self.output else {
+            return Err("an offscreen target presents no frame".into());
+        };
+        if !w.copy_src {
+            return Err("the surface's images cannot be copied from".into());
+        }
+        w.config.usage |= wgpu::TextureUsages::COPY_SRC;
+        w.configure(self.gpu.device());
+        self.present_tap = Some(tap);
+        Ok(())
     }
 
     fn chain(&self) -> Option<&IDXGISwapChain3> {

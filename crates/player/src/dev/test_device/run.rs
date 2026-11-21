@@ -42,7 +42,7 @@ use super::launch;
 use super::link::{Connection, hello_facts};
 use super::owner::{self, Stream};
 use super::release::{Refused, Writer};
-use super::shot::Shots;
+use super::shot::{self, Shots};
 use super::sink::{self, Sink};
 use super::win::{qpc, qpc_freq};
 
@@ -83,6 +83,10 @@ pub enum Step {
     /// Waits until the recorder shows every press held, from the device's
     /// bound handles, and records `held`.
     AwaitHeld,
+    /// Waits until the recorder shows the device's buttons all up, from
+    /// its bound handles, after `held`, and records `released` with that
+    /// report's counter.
+    AwaitReleased,
     Wait {
         ms: u64,
     },
@@ -103,8 +107,8 @@ pub enum Step {
         x: i32,
         y: i32,
     },
-    /// A shot of the run's window's client area, as `name` in the run's
-    /// folder.
+    /// A shot of the player's window, as `name` in the run's folder: the
+    /// player's own copy of a frame it presented after the request.
     Shot(&'static str),
     /// Writes `barrier` and waits there, holding, for the outer to end
     /// the run: [`BARRIER_WAIT`] later it fails.
@@ -175,7 +179,11 @@ pub fn panel_steps(buttons: &[u8], barrier: bool) -> Vec<Step> {
         steps.push(Step::Barrier);
     }
     steps.extend(buttons.iter().map(|&b| set(b, 0)));
-    steps.extend([Step::Wait { ms: 800 }, Step::Shot(SHOT_B)]);
+    steps.extend([
+        Step::AwaitReleased,
+        Step::Wait { ms: 800 },
+        Step::Shot(SHOT_B),
+    ]);
     steps
 }
 
@@ -298,6 +306,7 @@ pub trait Exec {
     fn lease(&mut self, ms: u32) -> Result<(), String>;
     fn hold(&mut self, change: Change) -> Result<(), String>;
     fn await_held(&mut self) -> Result<(), String>;
+    fn await_released(&mut self) -> Result<(), String>;
     fn wait(&mut self, ms: u64) -> Result<(), String>;
     fn launch(&mut self) -> Result<(), String>;
     fn focus_at(&mut self, point: (i32, i32)) -> Result<(), String>;
@@ -319,6 +328,7 @@ pub fn perform(steps: &[Step], x: &mut dyn Exec) -> Result<(), String> {
             Step::Lease { ms } => x.lease(ms),
             Step::Hold(c) => x.hold(c),
             Step::AwaitHeld => x.await_held(),
+            Step::AwaitReleased => x.await_released(),
             Step::Wait { ms } => x.wait(ms),
             Step::Launch => x.launch(),
             Step::FocusAt { x: px, y } => x.focus_at((px, y)),
@@ -412,6 +422,17 @@ pub fn pad_buttons(hex: &str) -> Option<u16> {
     PadReport::decode(body).map(|r| r.buttons)
 }
 
+/// Whether recorder record `v` is a neutral report of the device's pad (no
+/// button down), from its bound handles.
+fn neutral(v: &Value) -> bool {
+    v["ours"] == true
+        && v["t"] == "pad"
+        && v["bytes"]
+            .as_str()
+            .and_then(pad_buttons)
+            .is_some_and(|b| b == 0)
+}
+
 /// The run's live state: what the steps and the guard act on.
 struct Live {
     writer: Writer,
@@ -439,6 +460,9 @@ struct Live {
     player: Option<launch::Player>,
     /// The player once started, and its main window once shown.
     launched: Option<Launched>,
+    /// The pipe the player's shots are asked for on, for a row that starts
+    /// the player.
+    shot_pipe: Option<shot::Pipe>,
     shots: Shots,
 }
 
@@ -451,6 +475,17 @@ struct Launched {
 impl Live {
     fn beat(&self) {
         self.beat.beat(qpc());
+    }
+
+    /// The pad buttons the row holds, as report bits.
+    fn held_buttons(&self) -> u16 {
+        self.held
+            .iter()
+            .filter_map(|c| match c.control {
+                Control::Button(n) => Some(1 << (n - 1)),
+                _ => None,
+            })
+            .fold(0, |a, b| a | b)
     }
 
     /// A guarded click (`focus`: a focus click) of the run's window at
@@ -581,14 +616,7 @@ impl Exec for Live {
     }
 
     fn await_held(&mut self) -> Result<(), String> {
-        let buttons: u16 = self
-            .held
-            .iter()
-            .filter_map(|c| match c.control {
-                Control::Button(n) => Some(1 << (n - 1)),
-                _ => None,
-            })
-            .fold(0, |a, b| a | b);
+        let buttons = self.held_buttons();
         let key = self.held.iter().any(|c| c.control == Control::Key(F24));
         let (mut pad_seen, mut key_seen) = (buttons == 0, !key);
         let end = Instant::now() + HELD_WAIT;
@@ -623,6 +651,26 @@ impl Exec for Live {
         Ok(())
     }
 
+    fn await_released(&mut self) -> Result<(), String> {
+        let end = Instant::now() + HELD_WAIT;
+        loop {
+            self.beat();
+            self.lost()?;
+            if Instant::now() >= end {
+                return Err(format!(
+                    "the recorder did not show the buttons released within {HELD_WAIT:?}"
+                ));
+            }
+            self.read_recorder()?;
+            let up = self.backlog.drain(..).find(neutral);
+            if let Some(v) = up {
+                self.log.put(json!({ "t": "released", "report": v["q"] }));
+                return Ok(());
+            }
+            std::thread::sleep(LOOK);
+        }
+    }
+
     fn wait(&mut self, ms: u64) -> Result<(), String> {
         self.idle(Duration::from_millis(ms))
     }
@@ -635,8 +683,13 @@ impl Exec for Live {
         if desktop::foreground() != self.window {
             return Err("the sink is not in front as the player starts".into());
         }
+        let pipe = self
+            .shot_pipe
+            .as_ref()
+            .map(|p| p.name.clone())
+            .ok_or("the row starts a player, and the run has no shot pipe")?;
         let child = spec
-            .spawn(self.job, &self.dir)
+            .spawn(self.job, &self.dir, &pipe)
             .map_err(|e| format!("starting the player: {e:#}"))?;
         self.log.put(json!({
             "t": "spawn", "name": "player",
@@ -698,48 +751,70 @@ impl Exec for Live {
     fn shot(&mut self, name: &'static str) -> Result<(), String> {
         self.lost()?;
         self.beat();
-        // The player's own window, captured by its handle: no other
-        // window's pixels are in it, and a window that is not the player's
-        // is refused before and after the capture.
-        let (window, player) = self
+        // The player's own copy of a frame it presented after the request,
+        // from the player the run started (the pipe's client process).
+        let player = self
             .launched
             .as_ref()
-            .and_then(|l| Some((l.window?, l.child.process)))
+            .filter(|l| l.window.is_some())
+            .map(|l| l.child.process)
             .ok_or_else(|| format!("the shot {name}: the run shows no player window"))?;
-        if window != self.window {
-            return Err(format!(
-                "the shot {name}: the run's window {:#x} is not the player's {window:#x}",
-                self.window
-            ));
-        }
         let alive = || {
             self.launched
                 .as_ref()
                 .is_some_and(|l| l.child.wait(Duration::ZERO) == Ok(None))
         };
-        let owned = || -> Result<(), String> {
-            if !alive() {
-                return Err("the player has ended".into());
+        if !alive() {
+            return Err(format!("the shot {name}: the player has ended"));
+        }
+        let pipe = self
+            .shot_pipe
+            .as_mut()
+            .ok_or_else(|| format!("the shot {name}: the run has no shot pipe"))?;
+        let requested = qpc();
+        let serial = pipe
+            .request()
+            .map_err(|e| format!("the shot {name}: {e}"))?;
+        let end = Instant::now() + shot::SHOT_WAIT;
+        let answer = loop {
+            self.beat();
+            self.lost()?;
+            if Instant::now() >= end {
+                return Err(format!(
+                    "the shot {name}: the player answered no frame within {:?}",
+                    shot::SHOT_WAIT
+                ));
             }
-            desktop::owned_by(window, player.pid)
+            let Some(pipe) = self.shot_pipe.as_ref() else {
+                return Err(format!("the shot {name}: the run has no shot pipe"));
+            };
+            if let Some(a) = pipe
+                .answer(LOOK)
+                .map_err(|e| format!("the shot {name}: {e}"))?
+            {
+                break a;
+            }
         };
-        owned().map_err(|e| format!("the shot {name}: {e}"))?;
         self.beat();
-        let (size, bgra) =
-            desktop::capture_window(window).map_err(|e| format!("the shot {name}: {e:#}"))?;
-        self.beat();
-        owned().map_err(|e| format!("the shot {name}, after its capture: {e}"))?;
+        let client = answer.client;
+        let frame = shot::check_answer(answer, serial, player.pid, requested)
+            .map_err(|e| format!("the shot {name}: {e}"))?;
+        if !alive() {
+            return Err(format!("the shot {name}: the player has ended"));
+        }
         self.log.put(json!({
-            "t": "shot", "what": name, "window": window,
+            "t": "shot", "what": name,
             "process": { "pid": player.pid, "created": player.created },
-            "size": size,
+            "client": client,
+            "size": [frame.width, frame.height],
+            "requested": requested,
+            "frame": {
+                "present": frame.present, "acquired": frame.acquired, "presented": frame.presented,
+            },
         }));
         self.beat();
-        let (w, h) = (
-            u32::try_from(size[0]).unwrap_or(0),
-            u32::try_from(size[1]).unwrap_or(0),
-        );
-        self.shots.write(self.dir.join(name), w, h, bgra)
+        self.shots
+            .write(self.dir.join(name), frame.width, frame.height, frame.rgba)
     }
 
     fn barrier(&mut self) -> Result<(), String> {
@@ -1608,6 +1683,10 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         job: b.job,
         player: player.clone(),
         launched: None,
+        shot_pipe: match &player {
+            Some(_) => Some(shot::Pipe::create(shot::pipe_name(&b.run))?),
+            None => None,
+        },
         shots: Shots::start(
             b.dir.clone(),
             b.run.clone(),
@@ -1996,6 +2075,10 @@ mod tests {
             self.did.push("held".into());
             Ok(())
         }
+        fn await_released(&mut self) -> Result<(), String> {
+            self.did.push("released".into());
+            Ok(())
+        }
         fn launch(&mut self) -> Result<(), String> {
             self.did.push("launch".into());
             Ok(())
@@ -2326,6 +2409,25 @@ mod tests {
         assert_eq!(pad_buttons("0102"), None);
     }
 
+    /// Shot B waits for a neutral report of the device's own pad: a report
+    /// with a button down, another device's report or a key is not one.
+    #[test]
+    fn only_the_device_s_pad_with_no_button_is_neutral() {
+        let pad = |buttons: u16, ours: bool| {
+            let r = PadReport {
+                buttons,
+                ..PadReport::default()
+            }
+            .encode();
+            let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+            json!({"t": "pad", "q": 5, "bytes": format!("00{hex}"), "ours": ours})
+        };
+        assert!(neutral(&pad(0, true)));
+        assert!(!neutral(&pad(1 << 8, true)));
+        assert!(!neutral(&pad(0, false)));
+        assert!(!neutral(&json!({"t": "key", "ours": true, "bytes": "00"})));
+    }
+
     /// `p1-kill`'s inner reaches its barrier after shot A with START and
     /// SELECT both held: every press before it, no release before it; the
     /// releases follow it, then shot B. `p1` itself has no barrier, and
@@ -2346,6 +2448,12 @@ mod tests {
             assert!(at(&format!("hold b{b}-")) > barrier);
         }
         assert!(at("shot shot-a.png") < barrier && barrier < at("shot shot-b.png"));
+        // Shot B waits for the recorder's neutral report after both
+        // releases.
+        for b in [START, SELECT] {
+            assert!(at(&format!("hold b{b}-")) < at("released"));
+        }
+        assert!(at("released") < at("shot shot-b.png"));
         // Every target is clicked once, after the calibration, under the
         // held buttons.
         for t in test_device::panel::TARGETS {

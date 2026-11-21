@@ -229,6 +229,9 @@ pub enum Run {
     /// The runner's recorder shows every press the row holds, from the
     /// device's bound handles.
     Held(RunQ),
+    /// The runner's recorder shows the device's buttons all up after
+    /// `held`: the counter of that report.
+    Released(RunReleased),
     /// `stop_holds`: no hold-bearing command is admitted after it, and the
     /// one `release` is requested; its cause.
     Stop(RunNote),
@@ -251,7 +254,7 @@ pub enum Run {
     /// recorded it: the mode the run's reports come in.
     Mode(RunLine),
     /// A shot of the player's window: its file in the run's folder, sealed
-    /// once written, and the window and process it was captured from.
+    /// once written; the player's own copy of a frame it presented.
     Shot(RunShot),
     /// The kill barrier: the run waits here, holding, for its outer to end
     /// it.
@@ -348,17 +351,39 @@ pub struct RunCall {
     pub point: [i32; 2],
 }
 
-/// A shot: its file, the player's window it captured by its handle (the
-/// window's own pixels, whatever covered it), that window's process, as
-/// checked before and after the capture, and the captured size.
+/// A shot: its file, the player's process that made it and the process
+/// id of the shot pipe's client that sent it (the system's), the frame's
+/// size, the host counter when the runner sent the request, and the frame.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunShot {
     pub q: i64,
     pub what: String,
-    pub window: u64,
     pub process: Process,
+    pub client: u32,
     pub size: [i32; 2],
+    pub requested: i64,
+    pub frame: RunFrame,
+}
+
+/// A frame the player copied as it presented it: the swap chain's present
+/// count after its present, and the host counter when the render thread
+/// took it for the copy and right after its present returned.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFrame {
+    pub present: Option<u32>,
+    pub acquired: i64,
+    pub presented: i64,
+}
+
+/// The recorder's neutral report the runner saw: the record's own counter
+/// and the report's.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunReleased {
+    pub q: i64,
+    pub report: i64,
 }
 
 /// A line the runner observed, with its host counter.
@@ -443,6 +468,7 @@ impl Kinds for Run {
             Self::Spawn(_) => "spawn",
             Self::Sink(_) => "sink",
             Self::Held(_) => "held",
+            Self::Released(_) => "released",
             Self::Stop(_) => "stop",
             Self::Recovery(_) => "recovery",
             Self::Call(_) => "call",
@@ -469,6 +495,7 @@ impl Kinds for Run {
             Self::Held(r) | Self::Barrier(r) => Some(r.q),
             Self::Stop(r) | Self::Recovery(r) => Some(r.q),
             Self::Shot(r) => Some(r.q),
+            Self::Released(r) => Some(r.q),
             Self::Player(p) => Some(p.q),
             Self::Exit(e) => Some(e.q),
             Self::Start(_) | Self::Seal(_) | Self::End(_) => None,

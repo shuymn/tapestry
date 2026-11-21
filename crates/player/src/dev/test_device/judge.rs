@@ -2119,10 +2119,13 @@ pub mod tests {
         }
         run.extend([
             json!({"t": "held", "q": 1700}),
-            json!({"t": "shot", "q": 2500, "what": "shot-a.png", "window": 99,
-                   "process": {"pid": 8, "created": 80}, "size": [1920, 1080]}),
-            json!({"t": "shot", "q": 3500, "what": "shot-b.png", "window": 99,
-                   "process": {"pid": 8, "created": 80}, "size": [1920, 1080]}),
+            json!({"t": "shot", "q": 2500, "what": "shot-a.png",
+                   "process": {"pid": 8, "created": 80}, "client": 8, "size": [1920, 1080],
+                   "requested": 2400, "frame": {"present": 30, "acquired": 2410, "presented": 2420}}),
+            json!({"t": "released", "q": 3010, "report": 3000}),
+            json!({"t": "shot", "q": 3500, "what": "shot-b.png",
+                   "process": {"pid": 8, "created": 80}, "client": 8, "size": [1920, 1080],
+                   "requested": 3400, "frame": {"present": 80, "acquired": 3410, "presented": 3420}}),
             json!({"t": "stop", "q": 5000, "what": "end"}),
             json!({"t": "quiet", "q": 5600, "line": hello(true, "released", "-")}),
             json!({"t": "close", "q": 5800, "window": SINK}),

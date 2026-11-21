@@ -21,10 +21,10 @@ mod listen;
 mod owner;
 mod release;
 mod run;
-mod shot;
+pub(crate) mod shot;
 mod sink;
 mod trace;
-mod win;
+pub(crate) mod win;
 
 use std::path::PathBuf;
 

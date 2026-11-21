@@ -3022,6 +3022,7 @@ fn select_args(
             render_timeout,
             stop_timeout: None,
             speculative_permits: None,
+            shot_pipe: None,
             size: None,
             window: None,
             scenario: Some(session),

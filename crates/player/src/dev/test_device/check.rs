@@ -374,6 +374,7 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
             rule(role, RUN, "window", Exactly(1)),
             rule(role, RUN, "call", AtLeast(9)),
             rule(role, RUN, "held", Exactly(1)),
+            rule(role, RUN, "released", Exactly(1)),
             rule(role, RUN, "shot", Exactly(2)),
             rule(role, RUN, "barrier", Exactly(0)),
             rule(role, RUN, "stop", Exactly(1)),
@@ -440,11 +441,11 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[run, link],
                 &[ev(SINGLE, RUN, "close"), ev(SINGLE, LINK, "fence")],
             ),
-            private("panel.drawn-a", &[run, f(SHOT_A)]),
-            private("panel.knobs", &[run, f(SHOT_A)]),
-            private("panel.graphs", &[run, f(SHOT_A)]),
-            private("panel.numbers", &[run, f(SHOT_A)]),
-            private("panel.closed-b", &[run, f(SHOT_B)]),
+            private("panel.drawn-a", &[run, rec, f(SHOT_A)]),
+            private("panel.knobs", &[run, rec, f(SHOT_A)]),
+            private("panel.graphs", &[run, rec, f(SHOT_A)]),
+            private("panel.numbers", &[run, rec, f(SHOT_A)]),
+            private("panel.closed-b", &[run, rec, f(SHOT_B)]),
         ]
         .into_iter()
         .chain(match row {
@@ -454,8 +455,8 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[ev(SINGLE, RUN, "exit")],
             )]
             .into_iter()
-            .chain(P4_PANEL_1.map(|id| private(id, &[run, f(SHOT_A)])))
-            .chain(P4_ABSENT.map(|id| private(id, &[run, f(SHOT_A)])))
+            .chain(P4_PANEL_1.map(|id| private(id, &[run, rec, f(SHOT_A)])))
+            .chain(P4_ABSENT.map(|id| private(id, &[run, rec, f(SHOT_A)])))
             .collect(),
             "p5" => [
                 judge(
@@ -466,7 +467,7 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 judge("p5.mutation-build", &[run], &[ev(SINGLE, RUN, "player")]),
             ]
             .into_iter()
-            .chain(P5_FULL.map(|id| private(id, &[run, f(SHOT_A)])))
+            .chain(P5_FULL.map(|id| private(id, &[run, rec, f(SHOT_A)])))
             .collect(),
             _ => Vec::new(),
         })
@@ -628,16 +629,32 @@ fn p1_kill() -> Expectation {
     }
 }
 
-/// A panel run's shots bound to the player: its run stream holds exactly
-/// one `shot` record of each shot, naming the player's window (the run's
-/// `window` record), the player's process (its `spawn` record) and the
-/// client size the rows run at. Each mismatch, named; a run stream that
-/// does not read is the contract's to name.
-fn shots_bound(dir: &Path) -> Vec<String> {
-    use super::run::{SHOT_A, SHOT_B};
-    let run = super::judge::Files::read(dir).run;
-    let Ok(records) = run.records.as_deref() else {
+/// A panel run's shots bound to the player and to their phases, from the
+/// run's and the recorder's records alone, not from the runner's steps: the
+/// run stream holds exactly one `shot` record of each shot, naming the
+/// player's process (its `spawn` record) as the shot's maker and its pid as
+/// the pipe's client, at the client size the rows run at, its frame
+/// acquired after the request and presented after its acquisition. Shot A
+/// is requested after the run's last call (the last target click), and its
+/// frame acquired after the recorder's first report of the row's buttons
+/// all held and presented before its next report that releases any of
+/// them; shot B is requested and its frame acquired after the recorder's
+/// first neutral report (no button) after that, and presented before the
+/// run's end begins (its `stop`). Each mismatch, named; a stream that does
+/// not read is the contract's to name.
+fn shots_bound(dir: &Path, row: &str) -> Vec<String> {
+    use super::run::{SHOT_A, SHOT_B, pad_buttons};
+    let files = super::judge::Files::read(dir);
+    let (Ok(records), Ok(reports)) = (
+        files.run.records.as_deref(),
+        files.recorder.records.as_deref(),
+    ) else {
         return Vec::new();
+    };
+    let Some(mask) =
+        super::judge::held_by(row).map(|b| b.iter().fold(0_u16, |m, &n| m | 1 << (n - 1)))
+    else {
+        return vec![format!("row {row} holds no buttons")];
     };
     let one =
         |kind: &str, pick: &dyn Fn(&serde_json::Value) -> bool| -> Option<serde_json::Value> {
@@ -650,24 +667,50 @@ fn shots_bound(dir: &Path) -> Vec<String> {
                 _ => None,
             }
         };
-    let window = one("window", &|_| true).map(|v| v["window"].clone());
     let player = one("spawn", &|v| v["name"] == "player").map(|v| v["process"].clone());
+    // The device's own pad reports, in the recorder's order.
+    let pads: Vec<(i64, u16)> = reports
+        .iter()
+        .filter(|v| v["t"] == "pad" && v["ours"] == true)
+        .filter_map(|v| Some((v["q"].as_i64()?, pad_buttons(v["bytes"].as_str()?)?)))
+        .collect();
+    let held = pads.iter().position(|&(_, b)| b & mask == mask);
+    let after = |pick: &dyn Fn(u16) -> bool| {
+        held.and_then(|h| {
+            pads.iter()
+                .skip(h + 1)
+                .find(|&&(_, b)| pick(b))
+                .map(|&(q, _)| q)
+        })
+    };
+    let held_q = held.and_then(|h| pads.get(h)).map(|&(q, _)| q);
+    let release_q = after(&|b| b & mask != mask);
+    let neutral_q = after(&|b| b == 0);
+    let last_call = records
+        .iter()
+        .filter(|v| v["t"] == "call")
+        .filter_map(|v| v["q"].as_i64())
+        .max();
+    let stop_q = records
+        .iter()
+        .find(|v| v["t"] == "stop")
+        .and_then(|v| v["q"].as_i64());
     let mut out = Vec::new();
-    for name in [SHOT_A, SHOT_B] {
+    for (name, phase) in [(SHOT_A, "held"), (SHOT_B, "released")] {
         let Some(shot) = one("shot", &|v| v["what"] == name) else {
             out.push(format!("{name} has not exactly one `shot` record"));
             continue;
         };
-        if window.as_ref() != Some(&shot["window"]) {
-            out.push(format!(
-                "{name} was captured from window {}, not the player's window {window:?}",
-                shot["window"]
-            ));
-        }
         if player.as_ref() != Some(&shot["process"]) {
             out.push(format!(
-                "{name} was captured from process {}, not the player's {player:?}",
+                "{name} was made by process {}, not the player's {player:?}",
                 shot["process"]
+            ));
+        }
+        if player.as_ref().map(|p| &p["pid"]) != Some(&shot["client"]) {
+            out.push(format!(
+                "{name} came from pipe client {}, not the player's {player:?}",
+                shot["client"]
             ));
         }
         if shot["size"] != serde_json::json!(test_device::panel::CLIENT) {
@@ -676,6 +719,52 @@ fn shots_bound(dir: &Path) -> Vec<String> {
                 shot["size"],
                 test_device::panel::CLIENT
             ));
+        }
+        let (Some(requested), Some(acquired), Some(presented)) = (
+            shot["requested"].as_i64(),
+            shot["frame"]["acquired"].as_i64(),
+            shot["frame"]["presented"].as_i64(),
+        ) else {
+            out.push(format!("{name}'s record has no request or frame counters"));
+            continue;
+        };
+        let mut order = |ok: bool, what: String| {
+            if !ok {
+                out.push(format!("{name} ({phase}): {what}"));
+            }
+        };
+        order(
+            acquired > requested,
+            format!("its frame was acquired at {acquired}, not after its request at {requested}"),
+        );
+        order(
+            presented >= acquired,
+            format!("its frame was presented at {presented}, before its acquisition at {acquired}"),
+        );
+        if name == SHOT_A {
+            order(
+                last_call.is_some_and(|c| requested > c),
+                format!("requested at {requested}, not after the last click at {last_call:?}"),
+            );
+            order(
+                held_q.is_some_and(|h| acquired > h),
+                format!("acquired at {acquired}, not after the buttons held at {held_q:?}"),
+            );
+            order(
+                release_q.is_some_and(|r| presented < r),
+                format!("presented at {presented}, not before a button's release at {release_q:?}"),
+            );
+        } else {
+            order(
+                neutral_q.is_some_and(|n| requested > n && acquired > n),
+                format!(
+                    "requested at {requested} and acquired at {acquired}, not both after the neutral report at {neutral_q:?}"
+                ),
+            );
+            order(
+                stop_q.is_some_and(|s| presented < s),
+                format!("presented at {presented}, not before the run's end at {stop_q:?}"),
+            );
         }
     }
     out
@@ -708,7 +797,7 @@ fn run(rows: &[Row], row: &str, dir: &Path, out: &mut dyn Write) -> anyhow::Resu
     };
     let mut report = contract::check(&e, dir, super::COMMIT);
     if super::judge::held_by(row).is_some() {
-        report.mismatches.extend(shots_bound(dir));
+        report.mismatches.extend(shots_bound(dir, row));
     }
     for n in &report.notes {
         writeln!(out, "note: {n}")?;
@@ -1129,36 +1218,61 @@ mod tests {
         std::fs::write(dir.join(RUN), lines(&run)).unwrap();
         super::super::judge::judge(row, dir).unwrap();
         let sha = |p: &str| super::super::owner::digest(&dir.join(p)).unwrap();
-        // The panel judge's lines: one per private check the row's
-        // expectation declares, reading the files it declares (the run's
+        // The panel judge's lines, as that judge writes them for the row
+        // (its own table, not the expectation under test): each check
+        // reading the run's stream, the recorder's and its shot (the run's
         // stream left out when `unbound`).
-        let e = expectation_of(row).unwrap();
-        let panel: String = e
-            .checks
-            .iter()
-            .filter(|c| c.producer == PANEL)
-            .map(|c| {
-                let outcome = if failing.contains(&c.id) {
+        let panel: String = panel_judge_checks(row)
+            .into_iter()
+            .map(|(id, shot)| {
+                let outcome = if failing.contains(&id) {
                     "fail"
                 } else {
                     "pass"
                 };
-                let inputs: Vec<serde_json::Value> = c
-                    .inputs
-                    .iter()
-                    .filter(|f| !(how.unbound && f.path == RUN))
-                    .map(|f| json!({"role": f.role, "path": f.path, "sha256": sha(f.path)}))
+                let inputs: Vec<serde_json::Value> = ["run.jsonl", "recorder.jsonl", shot]
+                    .into_iter()
+                    .filter(|p| !(how.unbound && *p == "run.jsonl"))
+                    .map(|p| json!({"role": "run", "path": p, "sha256": sha(p)}))
                     .collect();
                 format!(
                     "{}\n",
                     json!({
-                        "row": row, "run": run_id, "check": c.id, "outcome": outcome, "detail": "",
-                        "inputs": inputs, "producer": {"name": PANEL, "version": "0"},
+                        "row": row, "run": run_id, "check": id, "outcome": outcome, "detail": "",
+                        "inputs": inputs, "producer": {"name": "panel", "version": "0"},
                     })
                 )
             })
             .collect();
         std::fs::write(dir.join("verdicts-panel.jsonl"), panel).unwrap();
+    }
+
+    /// The private panel judge's checks of `row` and the shot each reads,
+    /// written out as that judge names them.
+    fn panel_judge_checks(row: &str) -> Vec<(&'static str, &'static str)> {
+        let a = "shot-a.png";
+        let mut out = vec![
+            ("panel.drawn-a", a),
+            ("panel.knobs", a),
+            ("panel.graphs", a),
+            ("panel.numbers", a),
+            ("panel.closed-b", "shot-b.png"),
+        ];
+        match row {
+            "p4" => out.extend([
+                ("panel.panel1-a", a),
+                ("panel.absent-17", a),
+                ("panel.absent-18", a),
+                ("panel.absent-19", a),
+            ]),
+            "p5" => out.extend([
+                ("panel.full-17", a),
+                ("panel.full-18", a),
+                ("panel.full-19", a),
+            ]),
+            _ => {}
+        }
+        out
     }
 
     fn recs_line(s: &super::super::judge::Stream) -> String {
@@ -1176,35 +1290,83 @@ mod tests {
         (r.is_ok(), String::from_utf8(out).unwrap())
     }
 
-    /// Each panel verdict reads the run's stream and its shot, and the shot
-    /// is the player's: a folder whose shot record names another window,
-    /// another process or another size, has no record of a shot or two of
-    /// it, is a mismatch naming that shot; so is a panel verdict that leaves
-    /// the run's stream out of its inputs. The control matches.
+    /// Each panel verdict reads the run's and the recorder's streams and
+    /// its shot, and each shot is the player's frame of its phase: a folder
+    /// whose shot record names another process or pipe client, another
+    /// size, or has no record of a shot or two of it, is a mismatch naming that shot; so is a shot A requested before the
+    /// last click, acquired before the buttons were held or presented after
+    /// a release, a shot B requested or acquired before the neutral report
+    /// or presented after the run's end began, and a frame acquired before
+    /// its request or presented before its acquisition. A panel verdict
+    /// that leaves the run's stream out of its inputs is a mismatch. The
+    /// control matches.
     #[test]
     fn a_panel_verdict_binds_the_run_and_the_player_s_shot() {
         use super::super::run::{SHOT_A, SHOT_B};
         let (ok, out) = verdict("p1", &Folder::default());
         assert!(ok, "{out}");
         type Edit = fn(&mut Vec<serde_json::Value>);
-        let edits: [(&str, &str, Edit); 5] = [
-            ("another window", SHOT_B, |r| {
-                let at = r.iter().position(|v| v["what"] == SHOT_B).unwrap();
-                r[at]["window"] = serde_json::json!(100);
-            }),
+        fn at(r: &mut [serde_json::Value], shot: &str) -> usize {
+            r.iter().position(|v| v["what"] == shot).unwrap()
+        }
+        // The good folder: calls up to q 330, held 1500, shot A requested
+        // 2400 (frame 2410-2420), the neutral report 3000, shot B requested
+        // 3400 (frame 3410-3420), the end's stop 5000.
+        let edits: [(&str, &str, Edit); 13] = [
             ("another process", SHOT_A, |r| {
-                let at = r.iter().position(|v| v["what"] == SHOT_A).unwrap();
-                r[at]["process"]["created"] = serde_json::json!(81);
+                let i = at(r, SHOT_A);
+                r[i]["process"]["created"] = serde_json::json!(81);
+            }),
+            ("another pipe client", SHOT_B, |r| {
+                let i = at(r, SHOT_B);
+                r[i]["client"] = serde_json::json!(9);
             }),
             ("another size", SHOT_A, |r| {
-                let at = r.iter().position(|v| v["what"] == SHOT_A).unwrap();
-                r[at]["size"] = serde_json::json!([2560, 1440]);
+                let i = at(r, SHOT_A);
+                r[i]["size"] = serde_json::json!([2560, 1440]);
             }),
             ("no record", SHOT_B, |r| r.retain(|v| v["what"] != SHOT_B)),
             ("two records", SHOT_A, |r| {
-                let at = r.iter().position(|v| v["what"] == SHOT_A).unwrap();
-                let again = r[at].clone();
-                r.insert(at, again);
+                let i = at(r, SHOT_A);
+                let again = r[i].clone();
+                r.insert(i, again);
+            }),
+            ("A before the last click", SHOT_A, |r| {
+                let i = at(r, SHOT_A);
+                r[i]["requested"] = serde_json::json!(300);
+                r[i]["frame"]["acquired"] = serde_json::json!(310);
+            }),
+            ("A before the buttons held", SHOT_A, |r| {
+                let i = at(r, SHOT_A);
+                r[i]["requested"] = serde_json::json!(1400);
+                r[i]["frame"]["acquired"] = serde_json::json!(1450);
+            }),
+            ("A presented after a release", SHOT_A, |r| {
+                let i = at(r, SHOT_A);
+                r[i]["frame"]["presented"] = serde_json::json!(3005);
+            }),
+            ("B before the neutral report", SHOT_B, |r| {
+                let i = at(r, SHOT_B);
+                r[i]["requested"] = serde_json::json!(2900);
+                r[i]["frame"]["acquired"] = serde_json::json!(2950);
+            }),
+            ("B taken while held (stale)", SHOT_B, |r| {
+                let i = at(r, SHOT_B);
+                r[i]["requested"] = serde_json::json!(2430);
+                r[i]["frame"] =
+                    serde_json::json!({"present": 31, "acquired": 2440, "presented": 2450});
+            }),
+            ("B presented after the end began", SHOT_B, |r| {
+                let i = at(r, SHOT_B);
+                r[i]["frame"]["presented"] = serde_json::json!(5001);
+            }),
+            ("a frame acquired before its request", SHOT_B, |r| {
+                let i = at(r, SHOT_B);
+                r[i]["frame"]["acquired"] = serde_json::json!(3400);
+            }),
+            ("a frame presented before its acquisition", SHOT_A, |r| {
+                let i = at(r, SHOT_A);
+                r[i]["frame"]["presented"] = serde_json::json!(2409);
             }),
         ];
         for (what, shot, edit) in edits {
@@ -1216,8 +1378,23 @@ mod tests {
                 },
             );
             assert!(!ok, "{what}: {out}");
-            assert!(out.contains(&format!("{shot} ")), "{what}: {out}");
+            assert!(
+                out.lines()
+                    .any(|l| l.starts_with(&format!("{shot} "))
+                        || l.starts_with(&format!("{shot}'s "))),
+                "{what}: {out}"
+            );
         }
+        // The runner's record of the neutral report it waited for.
+        let (ok, out) = verdict(
+            "p1",
+            &Folder {
+                shots: Some(|r| r.retain(|v| v["t"] != "released")),
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("`released`"), "{out}");
         let (ok, out) = verdict(
             "p1",
             &Folder {
