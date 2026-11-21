@@ -112,6 +112,10 @@ pub struct Guard {
     /// The check the last grant or renewal queued came from.
     last: Option<i64>,
     lost: bool,
+    /// The oldest heartbeat a judged look read (µs), and how many looks
+    /// were judged: the measured margin under [`BEAT_MAX_US`].
+    beat_max_us: i64,
+    judged: u64,
 }
 
 impl Guard {
@@ -121,7 +125,15 @@ impl Guard {
             until: None,
             last: None,
             lost: false,
+            beat_max_us: 0,
+            judged: 0,
         }
+    }
+
+    /// The oldest heartbeat a judged look read (µs) and the number of
+    /// looks judged.
+    pub const fn heartbeat(&self) -> (i64, u64) {
+        (self.beat_max_us, self.judged)
     }
 
     /// The row asks for a lease lasting until `until` (host counter ticks).
@@ -145,6 +157,10 @@ impl Guard {
         let Some(until) = self.until else {
             return Act::Idle;
         };
+        self.judged += 1;
+        self.beat_max_us = self
+            .beat_max_us
+            .max(ticks_to_us(look.at.saturating_sub(look.beat), self.freq));
         if let Some(why) = look.bad(self.freq) {
             self.lost = true;
             return Act::Stop(why);
@@ -239,6 +255,11 @@ impl Handle {
 
     pub fn end(&self) {
         self.end.store(true, Ordering::Release);
+    }
+
+    /// [`Guard::heartbeat`].
+    pub fn heartbeat(&self) -> (i64, u64) {
+        self.lock().heartbeat()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Guard> {
@@ -486,6 +507,12 @@ mod tests {
             500_000 + BEAT_MAX_US + 5_000 - (BEAT_MAX_US + 5_000) % 5_000
         );
         assert!(renewals >= 5, "the beating stretch renewed: {renewals}");
+        // The guard kept the oldest heartbeat it judged: the stopping
+        // look's, and one look per 5 ms until then.
+        assert_eq!(
+            g.heartbeat(),
+            (at - 500_000, 1 + u64::try_from(at / 5_000).unwrap())
+        );
     }
 
     struct Full {

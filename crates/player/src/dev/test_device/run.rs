@@ -1522,6 +1522,11 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     }));
     if let Some((guard, guard_thread)) = live.guard.take() {
         guard.end();
+        let (age, looks) = guard.heartbeat();
+        eprintln!(
+            "guard: the step thread's heartbeat was at most {age} µs old over {looks} judged looks (bound {} µs)",
+            guard::BEAT_MAX_US
+        );
         if let Err(e) = owner::join_within(guard_thread, "the guard's thread", GUARD_WAIT) {
             errors.push(e);
         }
