@@ -35,8 +35,8 @@ const HELD_PACE_US: u64 = 4_000;
 /// the frame before (100 ms, after which that frame is skipped) and the
 /// frame's own work on WARP.
 const PACER_BOUND: Duration = Duration::from_millis(150);
-/// The scheduler's lateness a measured wait is allowed past its bound.
-const SLACK_US: u64 = 3_000;
+/// The rounding a counted wait is allowed past its bound.
+const SLACK_US: u64 = 100;
 
 /// One frame drawn while armed.
 #[derive(Clone, Copy, Debug)]

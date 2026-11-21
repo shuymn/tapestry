@@ -429,7 +429,9 @@ pub fn gpu_waits() -> Vec<(u8, u64)> {
 }
 
 /// Counts a blocking GPU wait of `took` that began `pacing` (the frame's
-/// own) or not, while counting is on and its scope takes it.
+/// own) or not, while counting is on and its scope takes it. A bounded
+/// wait is counted at most its bound: a thread descheduled past it is the
+/// scheduler's lateness, not a longer wait.
 pub(crate) fn gpu_wait(took: Duration, pacing: bool) {
     let scope = GPU_WAITS.load(Ordering::Relaxed);
     if scope == 0 || (pacing && scope < 2) {
