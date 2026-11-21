@@ -31,10 +31,12 @@ const BOUND: i64 = 200_000;
 const LIT: usize = 100;
 /// The held pass's longest wait for a step in flight, in µs.
 const HELD_PACE_US: u64 = 4_000;
-/// The longest frame interval the offscreen pacer allows: its wait for
-/// the frame before (100 ms, after which that frame is skipped) and the
-/// frame's own work on WARP.
-const PACER_BOUND: Duration = Duration::from_millis(150);
+/// The longest frame interval the offscreen pacer allows here: its wait
+/// for the frame before (100 ms, after which that frame is skipped) and
+/// the frame's own work on WARP in a debug build, beside other WARP tests
+/// (up to about 80 ms). A step's writes waited for in the frame (one
+/// step of 2048² cells takes about 700 ms on WARP) exceed it.
+const PACER_BOUND: Duration = Duration::from_millis(250);
 /// The rounding a counted wait is allowed past its bound.
 const SLACK_US: u64 = 100;
 
@@ -68,6 +70,8 @@ struct Frames {
     armed: Arc<AtomicBool>,
     /// No frame is read back while set: its texels count as lit.
     blind: Arc<AtomicBool>,
+    /// The result's hold's outgoing phases ended, as the record marks them.
+    holds: Arc<Mutex<Vec<crate::measure::HoldStamp>>>,
     log: Arc<Mutex<Vec<Frame>>>,
 }
 
@@ -84,6 +88,11 @@ impl Frames {
 
     fn len(&self) -> usize {
         self.log.lock().unwrap().len()
+    }
+
+    /// The result's hold's outgoing phases ended so far.
+    fn holds(&self) -> Vec<crate::measure::HoldStamp> {
+        self.holds.lock().unwrap().clone()
     }
 
     fn since(&self, from: usize) -> Vec<Frame> {
@@ -115,6 +124,10 @@ impl Frames {
 struct Recorder(Frames);
 
 impl FrameSink for Recorder {
+    fn result_hold(&mut self, hold: crate::measure::HoldStamp) {
+        self.0.holds.lock().unwrap().push(hold);
+    }
+
     fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
         if !self.0.armed.load(Ordering::Acquire) {
             return;
@@ -242,6 +255,11 @@ fn a_result_held_past_its_bound_draws_the_pending_presentation() {
         assert!(
             after[first..].iter().all(|f| f.pending()),
             "every frame past the bound pending: {after:?}"
+        );
+        let holds = frames.holds();
+        assert!(
+            matches!(holds.as_slice(), [h] if h.ended_by == Some(crate::measure::HoldEnd::Bound) && h.to >= h.from),
+            "the record's mark: the outgoing phase ended by the bound: {holds:?}"
         );
         assert_eq!(
             rig.render.presented_origin(),
@@ -392,6 +410,11 @@ fn a_first_view_staged_within_the_bound_holds_without_a_pending_frame() {
         assert!(
             !held_waits.is_empty(),
             "the held passes' bounded wait counted"
+        );
+        let holds = frames.holds();
+        assert!(
+            matches!(holds.as_slice(), [h] if h.ended_by == Some(crate::measure::HoldEnd::Skin)),
+            "the record's mark: the outgoing phase ended by the first view: {holds:?}"
         );
         assert!(
             held_waits.iter().all(|&us| us <= HELD_PACE_US + SLACK_US),

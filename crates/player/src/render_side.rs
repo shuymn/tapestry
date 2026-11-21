@@ -1718,6 +1718,14 @@ pub trait FrameSink: Send {
         let _ = at;
     }
 
+    /// The result's hold's outgoing phase ended: from the preparation's
+    /// start (`from`) to its end (`to`), why, the hold's number as its
+    /// lifetime (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn result_hold(&mut self, hold: crate::measure::HoldStamp) {
+        let _ = hold;
+    }
+
     /// A loading lifetime's hold ended by its device's loss: the screen is
     /// dropped, so no frame of that lifetime may follow to carry it
     /// (dev-tools).
@@ -7595,11 +7603,15 @@ impl Run {
                     // A result lifetime draws on from what it presented.
                     if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
-                    } else if let Some(h) = &mut self.result_hold {
+                    } else if let Some(h) = self.result_hold {
                         // The outgoing picture went with the old target:
                         // the pending presentation draws from the rebuilt
                         // screen's first frame.
-                        h.held = false;
+                        #[cfg(feature = "dev-tools")]
+                        if h.held {
+                            self.result_held_ended(h, crate::measure::HoldEnd::Image);
+                        }
+                        self.result_hold = Some(ResultHold { held: false, ..h });
                         mode = Mode::ResultPending;
                     }
                     continue;
@@ -8157,6 +8169,22 @@ impl Run {
                         continue;
                     }
                     None => {
+                        #[cfg(feature = "dev-tools")]
+                        if let Some(h) = self.result_hold {
+                            let now = self.clock.now();
+                            #[cfg(test)]
+                            let now = hold_now(&self.shared, now, h.from);
+                            let why = if lost {
+                                crate::measure::HoldEnd::DeviceLost
+                            } else if held_wait(now, h.from, first_frame_bound(&self.shared))
+                                .is_none()
+                            {
+                                crate::measure::HoldEnd::Bound
+                            } else {
+                                crate::measure::HoldEnd::Image
+                            };
+                            self.result_held_ended(h, why);
+                        }
                         if let Some(h) = &mut self.result_hold {
                             h.held = false;
                         }
@@ -8960,6 +8988,15 @@ impl Run {
                         .then_some(entry);
                     // The lifetime's first committed view ends the hold.
                     if result_picture.is_some() {
+                        #[cfg(feature = "dev-tools")]
+                        if let Some(h) = self.result_hold.filter(|h| h.held) {
+                            self.frames.result_hold(crate::measure::HoldStamp {
+                                lifetime: h.number,
+                                from: h.from,
+                                to: self.clock.now(),
+                                ended_by: Some(crate::measure::HoldEnd::Skin),
+                            });
+                        }
                         self.result_hold = None;
                     }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
@@ -9819,7 +9856,25 @@ impl Run {
             return false;
         }
         h.held = false;
+        #[cfg(feature = "dev-tools")]
+        {
+            let h = *h;
+            self.result_held_ended(h, crate::measure::HoldEnd::Bound);
+        }
         true
+    }
+
+    /// Records the end of the result's hold's outgoing phase, for `why`
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn result_held_ended(&mut self, h: ResultHold, why: crate::measure::HoldEnd) {
+        let to = self.clock.now();
+        self.frames.result_hold(crate::measure::HoldStamp {
+            lifetime: h.number,
+            from: h.from,
+            to,
+            ended_by: Some(why),
+        });
     }
 
     fn ends_cutoff(&self, msg: &Result<RenderMsg, TryRecvError>) -> bool {

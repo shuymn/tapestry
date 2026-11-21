@@ -2380,6 +2380,10 @@ impl FrameSink for ScenarioFrames {
         self.recorder.hold(hold);
     }
 
+    fn result_hold(&mut self, hold: crate::measure::HoldStamp) {
+        self.recorder.result_hold(hold);
+    }
+
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
         if !drawn.timing.presented() {
             self.recorder.unpresented();
