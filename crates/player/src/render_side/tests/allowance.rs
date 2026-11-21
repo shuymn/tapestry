@@ -2270,6 +2270,70 @@ fn a_staging_ending_with_a_grant_reserves_after_its_frame() {
     assert_eq!(answer.unwrap().preparation, Preparation::Ready);
 }
 
+/// A grant kept as a result is left during its wait (design.md "Load
+/// Pipeline", skin movies' planes): the loop turns Idle holding it, and a
+/// play prepared there (a retry) has its live movie admitted at the Idle
+/// pass's boundary all the same, live at the answer before its deadline;
+/// the grant stays for the next frame, which the page draws with it, the
+/// gate letting no frame through.
+// Revert: the Idle boundary vetoed by the grant held (`!matches!(mode,
+// Mode::Idle) &&` dropped) -> "the movie live at the answer".
+#[test]
+fn an_idle_preparation_admits_its_movie_with_a_grant_kept() {
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let r = Rig::new();
+    r.link.load(Arc::new(chart.clone()), None).unwrap();
+    r.select(1);
+    r.until_frames(|f| f.iter().any(|(k, _, _)| *k == Kind::Selection));
+    r.fake.gate.hold();
+    // Left during the grant's wait: the grant taken, then the departure
+    // seen, the loop Idle with the grant kept.
+    r.link.leave_selection();
+    r.fake.gate.step_into(|| r.link.mode() == "idle");
+    let ready_before = r.fake.gate.lock().taken_ready;
+    let movie = clip();
+    let start = Instant::now();
+    r.fake.movie_prep.store(true, Ordering::SeqCst);
+    r.fake.staged.store(true, Ordering::SeqCst);
+    *r.fake.movies.lock().unwrap() = Some(Movies::new([Some(Arc::clone(&movie)), None], start));
+    let ready = r.link.prepare_attempt(attempt(&chart, None), || false);
+    assert_eq!(ready.unwrap(), Preparation::Ready);
+    assert_eq!(
+        movie.status(),
+        crate::media_host::session::Status::Live,
+        "the movie live at the answer"
+    );
+    assert!(start.elapsed() < Duration::from_secs(3));
+    // Reserved at the Idle pass's boundary with the grant held: no frame
+    // to draw.
+    let reserves = r.reserves();
+    assert_eq!(reserves.len(), 1, "{reserves:?}");
+    assert!(
+        reserves
+            .iter()
+            .all(|&(_, _, held, at)| held && at == "boundary"),
+        "{reserves:?}"
+    );
+    // The next frame uses the grant kept: the page draws while the gate
+    // lets none through.
+    r.link.send(RenderMsg::Menu(Box::default()));
+    assert!(
+        wait_until(|| r
+            .fake
+            .state()
+            .frames
+            .iter()
+            .any(|(k, _, _)| *k == Kind::Page)),
+        "the page drawn with the grant kept"
+    );
+    let gate = r.fake.gate.lock();
+    assert_eq!(
+        (gate.permits, gate.taken_ready),
+        (0, ready_before),
+        "no grant taken for the page"
+    );
+}
+
 /// A play prepared while the render thread draws nothing (an Idle pass,
 /// no frame due): its live movie is admitted at the Idle pass's boundary,
 /// so its first frame is taken by a poll and the preparation answers

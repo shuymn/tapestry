@@ -7763,8 +7763,8 @@ impl Run {
             }
             // An Idle pass ends here, before any frame's pacing (design.md
             // "Load Pipeline", the Idle loop): its wait is the message's.
-            // It draws no frame, so the skin movies' admission runs unless
-            // a grant is held.
+            // It draws no frame, so the skin movies' admission runs, a
+            // grant held kept for the next frame.
             if matches!(mode, Mode::Idle) {
                 self.movie_admission(&mode);
                 continue;
@@ -10164,11 +10164,14 @@ impl Run {
     /// due, never with a grant held (taken by this pass's boundary, or kept
     /// from a pass whose lifetime was left during its wait) nor once one is
     /// found, which is kept for the frame, nor past the offscreen deadline;
-    /// a reservation never delays a granted frame. An Idle pass looks for
-    /// no grant: it draws none.
+    /// a reservation never delays a granted frame. An Idle pass draws no
+    /// frame, so it reserves whatever grant it holds (kept from a lifetime
+    /// left during its wait), which stays for the next presenting pass's
+    /// frame: a play prepared while the loop is Idle is admitted there.
     fn movie_admission(&mut self, mode: &Mode) {
         let frame = self.frame_due_by(mode, None);
-        let due = self.granted || self.heavy_state(frame, None).frame_due;
+        let due = !matches!(mode, Mode::Idle)
+            && (self.granted || self.heavy_state(frame, None).frame_due);
         if !due && let Some(screen) = &mut self.screen {
             screen.movie_boundary();
         }
