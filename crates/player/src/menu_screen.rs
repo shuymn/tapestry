@@ -565,6 +565,11 @@ pub(crate) static HOLD_FONT_READ: std::sync::atomic::AtomicBool =
 pub(crate) static FAIL_FONT_READ: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// While set, the font's thread cannot be started (tests).
+#[cfg(test)]
+pub(crate) static FAIL_FONT_SPAWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Waits while [`HOLD_FONT_READ`] is set, at most 20 s (tests).
 #[cfg(test)]
 fn hold_font_read() {
@@ -1631,24 +1636,41 @@ impl Screen for MenuScreen {
         if self.fonts.is_some() || self.font_ahead.is_some() || self.font_failed {
             return;
         }
-        self.font_ahead = std::thread::Builder::new()
-            .name("font".to_owned())
-            .spawn(|| {
-                #[cfg(test)]
-                hold_font_read();
-                #[cfg(test)]
-                if FAIL_FONT_READ.load(Ordering::SeqCst) {
+        #[cfg(test)]
+        let refused = FAIL_FONT_SPAWN.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let refused = false;
+        let spawned = if refused {
+            Err(std::io::Error::other("a test's refused spawn"))
+        } else {
+            std::thread::Builder::new()
+                .name("font".to_owned())
+                .spawn(|| {
+                    #[cfg(test)]
+                    hold_font_read();
+                    #[cfg(test)]
+                    if FAIL_FONT_READ.load(Ordering::SeqCst) {
+                        FONT_READS[1].fetch_add(1, Ordering::SeqCst);
+                        return Err(render::text::TextError::NoFamily {
+                            family: "a test's failed read".to_owned(),
+                        });
+                    }
+                    let fonts = Fonts::runtime();
+                    #[cfg(test)]
                     FONT_READS[1].fetch_add(1, Ordering::SeqCst);
-                    return Err(render::text::TextError::NoFamily {
-                        family: "a test's failed read".to_owned(),
-                    });
-                }
-                let fonts = Fonts::runtime();
-                #[cfg(test)]
-                FONT_READS[1].fetch_add(1, Ordering::SeqCst);
-                fonts
-            })
-            .ok();
+                    fonts
+                })
+        };
+        // A thread that could not be started is a failed read: latched
+        // here, at the hold's start, so nothing tries it again for this
+        // screen.
+        match spawned {
+            Ok(job) => self.font_ahead = Some(job),
+            Err(e) => {
+                eprintln!("render: the menu font's thread could not be started: {e}");
+                self.font_failed = true;
+            }
+        }
     }
 
     fn begin_result_view(
@@ -2670,6 +2692,54 @@ mod tests {
         let page = SelectScreen::new(Vec::new()).page("");
         screen.menu(&page, true).unwrap();
         assert_eq!(sent.0.lock().unwrap().last(), Some(&None));
+    }
+
+    /// The font a screen made for plays only reads on its own thread holds
+    /// every face in memory: the render thread's first shaping with it (a
+    /// pending frame's line after the swap it arrives on, a strip's
+    /// preparation or deferred settlement) opens and maps no file
+    /// (design.md "Rendering and Skins", the result's hold).
+    #[test]
+    fn the_font_read_ahead_is_held_in_memory() {
+        use crate::render_side::Screen;
+        let mut screen = MenuScreen::new(warp(), None);
+        screen.read_font_ahead();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !screen.page_font_ready() {
+            assert!(!screen.font_failed, "the font's read failed");
+            assert!(std::time::Instant::now() < end, "the font never read");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let fonts = screen.fonts.as_ref().expect("the font in hand");
+        assert!(fonts.in_memory(), "a face of the font read from its file");
+    }
+
+    /// The font's thread not started at the hold's start is a failed read
+    /// at once: the screen keeps the bitmap line and starts no thread
+    /// later, even once one could be started.
+    #[test]
+    fn a_font_thread_not_started_is_a_failed_read() {
+        use super::{FAIL_FONT_SPAWN, FONT_READS};
+        use crate::render_side::Screen;
+        let mut screen = MenuScreen::new(warp(), None);
+        FAIL_FONT_SPAWN.store(true, Ordering::SeqCst);
+        screen.read_font_ahead();
+        FAIL_FONT_SPAWN.store(false, Ordering::SeqCst);
+        assert!(screen.font_failed, "the spawn's failure not latched");
+        let reads = FONT_READS[1].load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(!screen.page_font_ready(), "a font after the failure");
+        }
+        assert!(
+            screen.font_ahead.is_none(),
+            "a thread started after the failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            FONT_READS[1].load(Ordering::SeqCst),
+            reads,
+            "the font read after the failure"
+        );
     }
 
     #[cfg(feature = "dev-tools")]
