@@ -1928,13 +1928,12 @@ fn a_font_read_ending_across_a_resize_places_the_strip_for_the_new_size() {
         // both found by the next turn.
         frames.meet();
         HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        // Counted once the read is sent: the next turn takes it.
         let end = Instant::now() + Duration::from_secs(20);
         while reads(1) == ahead {
             assert!(Instant::now() < end, "the font never read");
             std::thread::sleep(Duration::from_millis(1));
         }
-        // The read's thread ended after its count.
-        std::thread::sleep(Duration::from_millis(50));
         extent.publish(1_000, 1_000);
         let at = frames.len();
         frames.part();

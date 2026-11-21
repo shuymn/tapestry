@@ -551,7 +551,8 @@ fn fields_changed(old: &ChosenChart, new: &ChosenChart) -> TextSlots {
 }
 
 /// The runtime fonts read when a page needed one (`[0]`), and those read
-/// ahead on their own thread (`[1]`) (tests).
+/// ahead on their own thread (`[1]`), each counted once its read is sent
+/// to the screen (tests).
 #[cfg(test)]
 pub(crate) static FONT_READS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -583,8 +584,9 @@ fn hold_font_read() {
     }
 }
 
-/// The font read on a thread of its own.
-type FontJob = std::thread::JoinHandle<Result<Fonts, render::text::TextError>>;
+/// The font read on a thread of its own: its read, sent once it ends;
+/// the thread gone with nothing sent is a read that panicked.
+type FontJob = std::sync::mpsc::Receiver<Result<Fonts, render::text::TextError>>;
 
 /// A screen's page font, read or being read, carried to the screen that
 /// replaces it ([`Screen::take_page_font`]).
@@ -599,7 +601,7 @@ pub(crate) enum PageFont {
 /// (`ahead`) once its thread ends, else read here, in the frame.
 fn read_font(ahead: &mut Option<FontJob>) -> Result<Fonts, render::text::TextError> {
     if let Some(job) = ahead.take()
-        && let Ok(fonts) = job.join()
+        && let Ok(fonts) = job.recv()
     {
         return fonts;
     }
@@ -609,8 +611,8 @@ fn read_font(ahead: &mut Option<FontJob>) -> Result<Fonts, render::text::TextErr
 }
 
 /// Whether the page font is in hand, never waiting for its thread and
-/// never reading it here: a thread that ended is joined at once and its
-/// font taken; a read that failed, or a thread that could not be started,
+/// never reading it here: a read the thread sent is taken at once; a read
+/// that failed or panicked, or a thread that could not be started,
 /// sets `failed`, and nothing reads it again for this screen.
 fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut bool) -> bool {
     if fonts.is_some() {
@@ -620,7 +622,7 @@ fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut
         return false;
     }
     match ahead.take() {
-        Some(job) if job.is_finished() => match job.join() {
+        Some(job) => match job.try_recv() {
             Ok(Ok(read)) => {
                 *fonts = Some(read);
                 true
@@ -630,16 +632,16 @@ fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut
                 *failed = true;
                 false
             }
-            Err(_) => {
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 eprintln!("render: the menu font's read panicked");
                 *failed = true;
                 false
             }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                *ahead = Some(job);
+                false
+            }
         },
-        Some(job) => {
-            *ahead = Some(job);
-            false
-        }
         None => {
             eprintln!("render: the menu font's thread could not be started");
             *failed = true;
@@ -1669,32 +1671,37 @@ impl Screen for MenuScreen {
         let refused = FAIL_FONT_SPAWN.load(Ordering::SeqCst);
         #[cfg(not(test))]
         let refused = false;
+        let (tx, job) = std::sync::mpsc::sync_channel(1);
         let spawned = if refused {
             Err(std::io::Error::other("a test's refused spawn"))
         } else {
+            // The thread ends on its own once its read is sent.
             std::thread::Builder::new()
                 .name("font".to_owned())
-                .spawn(|| {
+                .spawn(move || {
                     #[cfg(test)]
                     hold_font_read();
                     #[cfg(test)]
-                    if FAIL_FONT_READ.load(Ordering::SeqCst) {
-                        FONT_READS[1].fetch_add(1, Ordering::SeqCst);
-                        return Err(render::text::TextError::NoFamily {
+                    let fonts = if FAIL_FONT_READ.load(Ordering::SeqCst) {
+                        Err(render::text::TextError::NoFamily {
                             family: "a test's failed read".to_owned(),
-                        });
-                    }
+                        })
+                    } else {
+                        Fonts::runtime()
+                    };
+                    #[cfg(not(test))]
                     let fonts = Fonts::runtime();
+                    let _ = tx.send(fonts);
+                    // Counted once the read is in hand for the screen.
                     #[cfg(test)]
                     FONT_READS[1].fetch_add(1, Ordering::SeqCst);
-                    fonts
                 })
         };
         // A thread that could not be started is a failed read: latched
         // here, at the hold's start, so nothing tries it again for this
         // screen.
         match spawned {
-            Ok(job) => self.font_ahead = Some(job),
+            Ok(_) => self.font_ahead = Some(job),
             Err(e) => {
                 eprintln!("render: the menu font's thread could not be started: {e}");
                 self.font_failed = true;
