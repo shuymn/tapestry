@@ -116,12 +116,15 @@ mod tests {
         let (now2, t2, _) = frozen(started([Some(9_000), None, None]));
         assert_eq!(now2, NOW);
         assert_eq!(t2.panels, [aged, None, None]);
-        // Not frozen: the frame's own.
+        // Not frozen: the frame's own; frozen: the frozen frame's.
         let real = started([None, Some(3), None]);
-        assert_eq!(
-            apply(TimeUs(123), real, app),
-            (TimeUs(123), real, app),
-            "the clock is not frozen in a test process"
-        );
+        assert_eq!(apply(TimeUs(123), real, app), (TimeUs(123), real, app));
+        freeze();
+        let got = apply(TimeUs(123), real, app);
+        // The process's other tests draw on the real clock (nextest runs
+        // each test in a process of its own).
+        FROZEN.store(false, Ordering::Release);
+        assert_eq!(got, frozen(real));
+        assert_ne!(got.0, TimeUs(123));
     }
 }

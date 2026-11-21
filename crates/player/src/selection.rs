@@ -5334,6 +5334,29 @@ pub(crate) mod tests {
         taken
     }
 
+    /// The pointer's volume arm leaves its witness for a test device's
+    /// shots (dev-tools): the slider's number and the percent it took.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_volume_arm_leaves_its_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["c1.bms"]]);
+        let from = crate::dev::present_shot::volumes_reached().unwrap().len();
+        sel.pointer_act(
+            crate::pointer::PointerAct::Volume(game::Channel::Background, 75),
+            None,
+            TimeUs(0),
+        );
+        let got = crate::dev::present_shot::volumes_reached().unwrap();
+        let got: Vec<(u8, u32)> = got
+            .get(from..)
+            .unwrap()
+            .iter()
+            .map(|v| (v.slider, v.percent))
+            .collect();
+        assert_eq!(got, [(19, 75)]);
+    }
+
     /// C24-5, C24-6, C24-8 (design.md "State Model", system sounds,
     /// Selection): over five charts in the all-chart list, each input path
     /// asks for the cues where the source plays them. A one-row step sounds

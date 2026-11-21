@@ -100,7 +100,7 @@ pub fn volume_reached(channel: game::Channel, percent: u32) {
 /// # Errors
 ///
 /// More settings than it keeps.
-fn volumes_reached() -> Result<Vec<VolumeSet>, String> {
+pub(crate) fn volumes_reached() -> Result<Vec<VolumeSet>, String> {
     let n = VOLUME_N.load(Ordering::Acquire);
     if n > VOLUME_LOG {
         return Err(format!(
