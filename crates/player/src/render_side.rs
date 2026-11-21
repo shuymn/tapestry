@@ -7909,6 +7909,17 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     self.frames.result_taken(self.clock.now());
                     let shows = self.current_result().is_some_and(ResultSide::shows);
+                    // A leaving command pinned the current lifetime's hold
+                    // before its first view: the hold stays, the outgoing
+                    // picture or the pending presentation drawn until the
+                    // next screen's message, never the built-in page.
+                    let pinned = self.result_hold.is_some()
+                        && self.result.as_ref().is_some_and(|side| {
+                            side.presented.is_none() && {
+                                let b = self.shared.barrier();
+                                b.lifetime == side.lifetime && b.fadeout.is_some()
+                            }
+                        });
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {
@@ -7917,9 +7928,13 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if shows { Mode::Result } else { Mode::End };
+                    mode = if shows || pinned {
+                        Mode::Result
+                    } else {
+                        Mode::End
+                    };
                     // The built-in page with no lifetime ends the hold.
-                    if !shows {
+                    if !shows && !pinned {
                         self.result_hold = None;
                     }
                 }
@@ -9098,6 +9113,27 @@ impl Run {
                         .as_ref()
                         .is_some_and(|s| s.presented.is_some())
                         .then_some(entry);
+                    // No view presented after the commit point while the
+                    // hold's outgoing phase lasts (a leaving command
+                    // pinned during the frame's pacing discarded the view
+                    // prepared there): the hold decides this frame at the
+                    // barrier, so nothing is presented and the outgoing
+                    // picture stays; past the bound the pending
+                    // presentation draws (design.md "Rendering and
+                    // Skins", the result's hold).
+                    if result_picture.is_none()
+                        && fadeout.is_some()
+                        && Self::hold_within(
+                            self.result_hold,
+                            self.clock,
+                            &self.shared,
+                            &self.image,
+                            self.extent.as_ref(),
+                        )
+                        .is_some()
+                    {
+                        continue;
+                    }
                     // The lifetime's first committed view ends the hold.
                     if result_picture.is_some() {
                         #[cfg(feature = "dev-tools")]
@@ -9915,16 +9951,36 @@ impl Run {
     /// not passed and the image on screen is valid, the pass presents
     /// nothing; the preparation's start, then.
     fn result_held(&self) -> Option<TimeUs> {
-        let h = self.result_hold.filter(|h| h.held)?;
         let side = self.result.as_ref()?;
         if !self.first_view_waits(side) || self.screen.is_none() {
             return None;
         }
-        let now = self.clock.now();
+        Self::hold_within(
+            self.result_hold,
+            self.clock,
+            &self.shared,
+            &self.image,
+            self.extent.as_ref(),
+        )
+    }
+
+    /// Whether the result's hold `hold` is in its outgoing phase now: held,
+    /// its bound not passed and the image on screen valid; the
+    /// preparation's start, then. Reads only the fields it is given, so a
+    /// frame that holds the screen can ask it.
+    fn hold_within(
+        hold: Option<ResultHold>,
+        clock: QpcClock,
+        shared: &Shared,
+        image: &Image,
+        extent: Option<&Arc<Extent>>,
+    ) -> Option<TimeUs> {
+        let h = hold.filter(|h| h.held)?;
+        let now = clock.now();
         #[cfg(test)]
-        let now = hold_now(&self.shared, now, h.from);
-        (held_wait(now, h.from, first_frame_bound(&self.shared)).is_some()
-            && self.image.valid(notices_of(self.extent.as_ref())))
+        let now = hold_now(shared, now, h.from);
+        (held_wait(now, h.from, first_frame_bound(shared)).is_some()
+            && image.valid(notices_of(extent)))
         .then_some(h.from)
     }
 

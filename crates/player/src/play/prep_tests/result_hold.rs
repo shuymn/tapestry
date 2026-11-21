@@ -1293,6 +1293,75 @@ fn a_leaving_pinned_while_held_keeps_the_outgoing_picture() {
     });
 }
 
+/// A leaving command pins the result during the pacing of the frame whose
+/// commit point would commit a first view prepared at once (the attempt
+/// fell back to the built-in view), with the built-in rows' message
+/// queued behind it: the commit discards that view and the hold decides
+/// the frame at the barrier, so nothing presents before the bound, and
+/// the pinned hold survives the rows' message: no built-in page, no
+/// pending frame before the bound, the pending presentation after it.
+#[test]
+fn a_leaving_pinned_during_pacing_keeps_the_hold_through_the_rows() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held(rig, frames, &a, &report, &screen);
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.presenter
+            .attempt_fallback("the test's fallback".to_owned());
+        // The render thread held at a frame's end: the view and the rows
+        // queued behind each other, taken one a turn.
+        frames.meet();
+        rig.show_end(&report, &screen);
+        let gate = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+        let g = Arc::clone(&gate);
+        rig.render.after_next_pacing(
+            1,
+            Box::new(move || {
+                let [reached, go] = &*g;
+                reached.store(true, Ordering::SeqCst);
+                let end = Instant::now() + Duration::from_secs(20);
+                while !go.load(Ordering::SeqCst) && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }),
+        );
+        let at = frames.len();
+        frames.part();
+        let [reached, go] = &*gate;
+        let end = Instant::now() + Duration::from_secs(20);
+        while !reached.load(Ordering::SeqCst) {
+            assert!(Instant::now() < end, "the frame's pacing never reached");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The leaving pinned after the frame's held check, before its
+        // commit point.
+        let pinned = rig.now();
+        assert_eq!(rig.begin_outro(pinned, None), game::Outro::Begun(None));
+        go.store(true, Ordering::SeqCst);
+        let passes = rig.render.held_passes();
+        until_true(rig, "held passes after the rows", |rig| {
+            rig.render.held_passes() > passes + 3
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let before = frames.since(at);
+        assert!(
+            before.is_empty(),
+            "a frame presented before the bound after the pin: {before:?}"
+        );
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        let after = frames.until(rig, at, "pending frames past the bound", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        assert!(
+            after.iter().all(|f| f.pending()),
+            "a frame other than the pending presentation: {after:?}"
+        );
+        rig.leave_result();
+    });
+}
+
 /// A device loss after the hand-over while the first view stages (the
 /// flag set): the view is staged again on the rebuilt screen, and pending
 /// frames draw until it commits (V19 (g), its second half, past the
