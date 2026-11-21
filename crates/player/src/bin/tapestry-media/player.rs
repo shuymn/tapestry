@@ -9,6 +9,12 @@
 //! the ring; a seek drops the frame it held for the run before), publishing
 //! each frame whose stamp is not below the run's start and rises above the
 //! last it published, and waits on the event while every slot is full. It
+//! decodes one frame ahead, so it publishes each frame with its
+//! successor's stamp, until which it is shown (a video's last frame with
+//! none), and drops a frame whose successor the game's due time has
+//! already reached rather than publish it: at the start, after a wait for
+//! a slot and whenever its decoding falls behind, the ring receives no
+//! frame behind the game's clock. It
 //! answers the end of the video, a seek and a failure; a failed or refused
 //! player only waits to be closed. A looping play starts again at the
 //! video's start at each end, in the same run, its stamps rising on, and
@@ -22,7 +28,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
-use skin_model::media::{PROGRESS_WORD, State, Writer};
+use skin_model::media::{PROGRESS_WORD, State, UNTIL_END, Writer, behind, shown};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
@@ -185,11 +191,13 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         event,
         writer,
         frame: vec![0; writer.geometry().frame_bytes()],
+        next: vec![0; writer.geometry().frame_bytes()],
         run: 1,
         floor: 0,
         last: None,
         seq: 0,
         pending: None,
+        until: None,
         ended: false,
     };
     let stopped = playing.play(rx, out);
@@ -215,6 +223,8 @@ struct Playing {
     writer: Writer,
     /// The next frame to publish, I420 at the ring's size.
     frame: Vec<u8>,
+    /// The frame after it, decoded ahead: its stamp is `frame`'s `until`.
+    next: Vec<u8>,
     /// The run the frames go out in.
     run: u64,
     /// The run's start: an earlier frame is not published.
@@ -223,8 +233,12 @@ struct Playing {
     last: Option<i64>,
     /// The sequence of the last frame published in the ring.
     seq: u64,
-    /// The stamp of the frame in `frame`, while it waits for a slot.
+    /// The stamp of the frame in `frame`, while it waits for its successor
+    /// or a slot.
     pending: Option<i64>,
+    /// The stamp of the frame in `next` once decoded ([`UNTIL_END`] when
+    /// the video ended after `frame`): `frame`'s `until`.
+    until: Option<i64>,
     /// The run's video has ended.
     ended: bool,
 }
@@ -274,6 +288,7 @@ impl Playing {
         self.floor = at;
         self.last = None;
         self.pending = None;
+        self.until = None;
         self.ended = false;
         self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
@@ -299,33 +314,69 @@ impl Playing {
         Ok(())
     }
 
-    /// Decodes the next frame to publish, or publishes the one waiting, or
-    /// waits a while for a free slot.
+    /// Decodes the next frame, into `next` when `ahead` and else into
+    /// `frame`: a frame to publish when it is not below the run's start
+    /// and rises above `after`, one skipped otherwise, or the video's end
+    /// (a looping play starts again instead).
+    fn decode(&mut self, ahead: bool, after: Option<i64>) -> Result<Decoded, (Failure, i32)> {
+        let into = if ahead {
+            &mut self.next
+        } else {
+            &mut self.frame
+        };
+        let keep = |stamp: i64| stamp >= self.floor && after.is_none_or(|l| stamp > l);
+        Ok(match self.input.next(into)? {
+            Some(stamp) if keep(stamp) => Decoded::Frame(stamp),
+            Some(_) => Decoded::Skipped,
+            None if self.looping => {
+                let stamp = self.input.restart(into)?;
+                if keep(stamp) {
+                    Decoded::Frame(stamp)
+                } else {
+                    Decoded::Skipped
+                }
+            }
+            None => Decoded::End,
+        })
+    }
+
+    /// The run's video ended: said once, in its state word and a reply.
+    fn end(&mut self, out: &Out) {
+        self.ended = true;
+        self.writer.state(self.view.words(), State::Ended);
+        out.send(&Reply::Ended {
+            player: self.player,
+            run: self.run,
+        });
+    }
+
+    /// Decodes the next frame to publish or its successor, drops a frame
+    /// behind the game's due time, publishes the one waiting with its
+    /// successor's stamp, or waits a while for a free slot.
     fn step(&mut self, out: &Out) -> Result<(), (Failure, i32)> {
         let Some(stamp) = self.pending else {
-            match self.input.next(&mut self.frame)? {
-                Some(stamp) if stamp >= self.floor && self.last.is_none_or(|l| stamp > l) => {
-                    self.pending = Some(stamp);
-                }
-                Some(_) => {}
-                None if self.looping => {
-                    let stamp = self.input.restart(&mut self.frame)?;
-                    if stamp >= self.floor && self.last.is_none_or(|l| stamp > l) {
-                        self.pending = Some(stamp);
-                    }
-                }
-                None => {
-                    self.ended = true;
-                    self.writer.state(self.view.words(), State::Ended);
-                    out.send(&Reply::Ended {
-                        player: self.player,
-                        run: self.run,
-                    });
-                }
+            match self.decode(false, self.last)? {
+                Decoded::Frame(stamp) => self.pending = Some(stamp),
+                Decoded::Skipped => {}
+                Decoded::End => self.end(out),
             }
             return Ok(());
         };
+        let Some(until) = self.until else {
+            self.until = match self.decode(true, Some(stamp))? {
+                Decoded::Frame(next) => Some(next),
+                Decoded::Skipped => None,
+                Decoded::End => Some(UNTIL_END),
+            };
+            return Ok(());
+        };
         let words = self.view.words();
+        // Its successor already due: behind the game's clock, dropped
+        // unpublished, the successor next.
+        if shown(words).is_some_and(|due| behind(until, due)) {
+            self.advance(until);
+            return Ok(());
+        }
         let Some(slot) = self.writer.claim(words) else {
             self.writer.state(words, State::Waiting);
             if self.seq > 0 {
@@ -337,14 +388,42 @@ impl Playing {
         self.writer.state(words, State::Decoding);
         let seq = self.seq.saturating_add(1);
         self.writer
-            .publish(words, slot, &self.frame, seq, self.run, stamp)
+            .publish_until(words, slot, &self.frame, seq, self.run, stamp, until)
             .map_err(|_| (Failure::Ring, 0))?;
         self.seq = seq;
         self.last = Some(stamp);
-        self.pending = None;
+        if until == UNTIL_END {
+            self.pending = None;
+            self.until = None;
+            self.end(out);
+        } else {
+            self.advance(until);
+        }
         freeze_at(self.player, Freeze::Decoding);
         Ok(())
     }
+
+    /// The frame decoded ahead, stamped `until`, becomes the next to
+    /// publish; at the video's end nothing is left.
+    fn advance(&mut self, until: i64) {
+        self.until = None;
+        if until == UNTIL_END {
+            self.pending = None;
+            return;
+        }
+        std::mem::swap(&mut self.frame, &mut self.next);
+        self.pending = Some(until);
+    }
+}
+
+/// What a decode gave.
+enum Decoded {
+    /// A frame to publish, by its stamp.
+    Frame(i64),
+    /// A frame not to publish (below the run's start, or not rising).
+    Skipped,
+    /// The video's end.
+    End,
 }
 
 /// Answers a player's failure, once it holds nothing.

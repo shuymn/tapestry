@@ -601,3 +601,74 @@ fn movie_upload_hook_alloc() {
     assert!(this_thread() > after);
     drop(v);
 }
+
+impl Fake {
+    /// Publishes a frame of run 1 whose every byte is `id`, stamped
+    /// `stamp` and shown until `until`.
+    fn publish_until(&self, seq: u64, stamp: i64, until: i64, id: u8) {
+        let writer = Writer::attach(self.words.as_slice()).unwrap();
+        let slot = writer.claim(self.words.as_slice()).unwrap();
+        let frame = vec![id; self.geometry.frame_bytes()];
+        writer
+            .publish_until(self.words.as_slice(), slot, &frame, seq, 1, stamp, until)
+            .unwrap();
+    }
+}
+
+/// A movie admitted with its clock several frame periods in, its ring
+/// holding the video's first frames (design.md "Rendering and Skins",
+/// skin movies: the due frame only): no frame earlier than the due one is
+/// drawn. The stale frames are freed unread and the movie shows nothing
+/// until the frame due at 780 ms is taken; later, a ring refilled after a
+/// stall with frames behind the clock shows nothing again rather than the
+/// frame its planes still hold, until its due frame comes.
+// Revert: the reader's behind check dropped -> "a frame behind the clock
+// drawn"; the hook keeping its shown frame when behind -> "the old frame
+// after the stall".
+#[test]
+fn a_movie_admitted_behind_its_clock_draws_no_earlier_frame() {
+    let start = Instant::now();
+    let a = Fake::new(16, 8);
+    a.set(Status::Live);
+    let period = 16_667;
+    for (seq, id) in (1..=4).zip(1..) {
+        let i = i64::try_from(seq - 1).unwrap();
+        a.publish_until(seq, i * period, (i + 1) * period, id);
+    }
+    let mut m = movies(Some(&a), None, start);
+    let mut planes = Kept::default();
+    m.admit(&mut planes, start);
+    for due in [780_000, 790_000] {
+        assert_eq!(
+            m.frame(&mut planes, due, start)[0],
+            MovieShow::Nothing,
+            "a frame behind the clock drawn at {due}"
+        );
+    }
+    assert!(planes.luma[0].is_empty(), "nothing taken");
+    assert!(m.stamps()[0].is_none());
+    // The due frame at 766 667 µs, shown until 800 ms.
+    a.publish_until(5, 766_667, 800_000, 46);
+    assert!(matches!(
+        m.frame(&mut planes, 790_000, start)[0],
+        MovieShow::Frame { .. }
+    ));
+    assert_eq!(m.stamps()[0], Some(766_667));
+    // A stall: the clock runs on to 2 s while the ring refills with frames
+    // from 800 ms.
+    for (seq, id) in (6..=9).zip(50..) {
+        let i = i64::try_from(seq - 6).unwrap();
+        a.publish_until(seq, 800_000 + i * period, 800_000 + (i + 1) * period, id);
+    }
+    assert_eq!(
+        m.frame(&mut planes, 2_000_000, start)[0],
+        MovieShow::Nothing,
+        "the old frame after the stall"
+    );
+    a.publish_until(10, 1_983_333, 2_000_001, 60);
+    assert!(matches!(
+        m.frame(&mut planes, 2_000_000, start)[0],
+        MovieShow::Frame { .. }
+    ));
+    assert_eq!(m.stamps()[0], Some(1_983_333));
+}

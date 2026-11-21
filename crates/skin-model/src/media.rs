@@ -51,14 +51,24 @@
 //! with plausible words are shown, and the first slot that breaks a check
 //! fails its player.
 //!
+//! A frame is shown until its successor is due: the worker publishes each
+//! frame with the stamp of the frame after it (its `until`, once it has
+//! decoded that frame; [`UNTIL_END`] for a video's last), and the game
+//! writes the media time it shows at each peek in [`DUE_WORD`]. A frame
+//! whose successor is already due is behind the clock: the worker drops
+//! it rather than publish it, and a peek frees one still in the ring
+//! unread and finds nothing due ([`Peek::behind`]), so a frame behind the
+//! clock is never shown, at a video's start, after a stall, or ever.
+//!
 //! The layout, in words: a header of [`HEADER_WORDS`] (a magic word, the
 //! version, the slot count, the width, the height, a frame's bytes and, at
 //! [`WATERMARK_WORD`], the watermark, then the worker's supervision words,
 //! the decoder's progress at [`PROGRESS_WORD`] and its [`State`] at
 //! [`STATE_WORD`], which the game reads only to supervise the worker
-//! ([`supervision`])), then the slots,
-//! each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its own
-//! index and its frame's bytes) followed by its frame: the luma plane, then
+//! ([`supervision`]), then the game's due time at [`DUE_WORD`]), then the
+//! slots, each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its
+//! own index, its frame's bytes and its `until`) followed by its frame: the
+//! luma plane, then
 //! the two chroma planes, each half the width and height rounded up (I420),
 //! packed little-endian into words, the last word's spare bytes zero.
 
@@ -89,7 +99,7 @@ pub const SLOT_HEADER_WORDS: usize = 8;
 pub const CHUNK_WORDS: usize = 8_192;
 
 /// The layout's version, in the header.
-pub const VERSION: u64 = 2;
+pub const VERSION: u64 = 3;
 
 /// The header's first word.
 const MAGIC: u64 = u64::from_le_bytes(*b"TAPRING1");
@@ -116,6 +126,34 @@ pub const PROGRESS_WORD: usize = 7;
 /// The header word holding the player's [`State`], which the worker
 /// writes and the game reads only to supervise it.
 pub const STATE_WORD: usize = 8;
+
+/// The header word holding the media time the game showed last (µs, as
+/// a two's-complement `i64`): the game writes it at each peek, before it
+/// looks at the slots, and never reads it back; the worker reads it to drop
+/// a frame whose successor is already due rather than publish it.
+/// [`NOTHING_DUE`] until the first peek.
+pub const DUE_WORD: usize = 9;
+
+/// [`DUE_WORD`]'s value before the game's first peek: no frame is due.
+pub const NOTHING_DUE: i64 = i64::MIN;
+
+/// The `until` of a video's last frame: no frame follows it.
+pub const UNTIL_END: i64 = i64::MAX;
+
+/// The media time the game showed last, from `ring`'s [`DUE_WORD`];
+/// `None` when the ring does not hold the header.
+#[must_use]
+pub fn shown<W: Words + ?Sized>(ring: &W) -> Option<i64> {
+    Some(word(ring, DUE_WORD)?.load(Ordering::Acquire).cast_signed())
+}
+
+/// Whether a frame shown `until` its successor's stamp is behind the media
+/// time `due`: its successor is due, so it is not the frame due. A video's
+/// last frame ([`UNTIL_END`]) has no successor and is never behind.
+#[must_use]
+pub const fn behind(until: i64, due: i64) -> bool {
+    until != UNTIL_END && until <= due
+}
 
 /// What a player is doing, as its worker says in [`STATE_WORD`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +215,7 @@ const S_RUN: usize = 2;
 const S_STAMP: usize = 3;
 const S_INDEX: usize = 4;
 const S_BYTES: usize = 5;
+const S_UNTIL: usize = 6;
 
 /// A slot holding no frame, which the worker may claim.
 const FREE: u64 = 0;
@@ -306,9 +345,13 @@ pub struct Frame {
 pub struct Peek {
     /// The frame due, if any, for [`Reader::take`].
     pub due: Option<Due>,
-    /// Whether it freed slots of earlier runs: the game then signals the
-    /// worker, which may be waiting for one.
+    /// Whether it freed slots (of earlier runs, or behind the clock): the
+    /// game then signals the worker, which may be waiting for one.
     pub freed: bool,
+    /// Whether the newest frame at or before the time was behind it (its
+    /// successor due) and was freed unread with the frames before it: no
+    /// frame is due, and the game shows none of this video until one is.
+    pub behind: bool,
 }
 
 /// A frame [`Reader::peek`] found due, which [`Reader::take`] copies.
@@ -360,6 +403,9 @@ pub enum Fault {
     /// A stamp outside the run's window.
     #[error("slot {slot}: stamp {value} outside the run")]
     Stamp { slot: u8, value: i64 },
+    /// An `until` not above the frame's own stamp.
+    #[error("slot {slot}: shown until {value}, not after its stamp")]
+    Until { slot: u8, value: i64 },
     /// A slot that changed while its frame was copied.
     #[error("slot {slot}: changed while it was read")]
     Changed { slot: u8 },
@@ -380,6 +426,7 @@ struct Found {
     seq: u64,
     run: u64,
     stamp: i64,
+    until: i64,
 }
 
 impl Found {
@@ -450,6 +497,7 @@ impl Reader {
             (WATERMARK_WORD, 0),
             (PROGRESS_WORD, 0),
             (STATE_WORD, 0),
+            (DUE_WORD, NOTHING_DUE.cast_unsigned()),
         ];
         for (i, v) in header {
             if let Some(w) = word(ring, i) {
@@ -536,6 +584,9 @@ impl Reader {
         if let Some(f) = self.fault {
             return Err(f);
         }
+        if let Some(w) = word(ring, DUE_WORD) {
+            w.store(due.cast_unsigned(), Ordering::Release);
+        }
         let peeked = self.scan(ring, due);
         match peeked {
             Ok(p) => self.peeked = p.due.map(|d| d.chosen),
@@ -606,6 +657,7 @@ impl Reader {
     }
 
     fn scan<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Peek, Fault> {
+        let peek_due = due;
         // Every frame at or below it was published before this load, so the
         // scan finds each one still in its slot: none is passed over while a
         // later one is taken.
@@ -653,7 +705,7 @@ impl Reader {
             self.free(ring, a)?;
             freed = true;
         }
-        let due = current()
+        let mut due = current()
             .filter(|a| a.seq <= committed && a.stamp <= due)
             .max_by_key(|a| a.seq)
             .copied()
@@ -664,7 +716,18 @@ impl Reader {
                 }
                 Due { chosen, up_to }
             });
-        Ok(Peek { due, freed })
+        // Its successor due: behind the clock, freed unread with the frames
+        // before it, and nothing is due.
+        let behind = due
+            .as_ref()
+            .is_some_and(|d| behind(d.chosen.until, peek_due));
+        if behind && let Some(d) = due.take() {
+            for a in d.up_to.iter().flatten() {
+                self.free(ring, a)?;
+            }
+            freed = true;
+        }
+        Ok(Peek { due, freed, behind })
     }
 
     /// Slot `slot`'s published frame, checked, or `None` while it holds
@@ -700,11 +763,20 @@ impl Reader {
                 value: run,
             });
         }
+        let stamp = load(S_STAMP)?.cast_signed();
+        let until = load(S_UNTIL)?.cast_signed();
+        if until <= stamp {
+            return Err(Fault::Until {
+                slot: index,
+                value: until,
+            });
+        }
         Ok(Some(Found {
             slot,
             seq: load(S_SEQ)?,
             run,
-            stamp: load(S_STAMP)?.cast_signed(),
+            stamp,
+            until,
         }))
     }
 
@@ -783,6 +855,7 @@ impl Reader {
             && load(S_SEQ) == Some(c.seq)
             && load(S_RUN) == Some(c.run)
             && load(S_STAMP) == Some(c.stamp.cast_unsigned())
+            && load(S_UNTIL) == Some(c.until.cast_unsigned())
             && load(S_INDEX) == Some(wide(c.slot))
             && load(S_BYTES) == Some(wide(self.geometry.frame_bytes()));
         if same {
@@ -927,7 +1000,28 @@ impl Writer {
     }
 
     /// Publishes `frame` in `slot` as sequence `seq` of run `run`, stamped
-    /// `stamp`: writes its bytes and then the slot's words, marks it ready
+    /// `stamp`, its successor not known ([`UNTIL_END`]): as
+    /// [`publish_until`](Self::publish_until).
+    ///
+    /// # Errors
+    ///
+    /// As [`publish_until`](Self::publish_until).
+    pub fn publish<W: Words + ?Sized>(
+        self,
+        ring: &W,
+        slot: Slot,
+        frame: &[u8],
+        seq: u64,
+        run: u64,
+        stamp: i64,
+    ) -> Result<(), Refused> {
+        self.publish_until(ring, slot, frame, seq, run, stamp, UNTIL_END)
+    }
+
+    /// Publishes `frame` in `slot` as sequence `seq` of run `run`, stamped
+    /// `stamp` and shown until `until`, the next frame's stamp
+    /// ([`UNTIL_END`] for the video's last): writes its bytes and then the
+    /// slot's words, marks it ready
     /// once all are written, and then raises the watermark to `seq`. Frames
     /// are published in sequence order, a run's after the command that
     /// starts it and never one of an earlier run after it (the module's
@@ -937,7 +1031,11 @@ impl Writer {
     ///
     /// When `frame` is not the ring's frame size, or the section does not
     /// hold the slot; the slot stays claimed.
-    pub fn publish<W: Words + ?Sized>(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a frame's slot words, each its own field of the protocol"
+    )]
+    pub fn publish_until<W: Words + ?Sized>(
         self,
         ring: &W,
         slot: Slot,
@@ -945,6 +1043,7 @@ impl Writer {
         seq: u64,
         run: u64,
         stamp: i64,
+        until: i64,
     ) -> Result<(), Refused> {
         if frame.len() != self.geometry.frame_bytes() {
             return Err(Refused::Frame(frame.len()));
@@ -976,6 +1075,7 @@ impl Writer {
             (S_STAMP, stamp.cast_unsigned()),
             (S_INDEX, wide(slot.0)),
             (S_BYTES, wide(frame.len())),
+            (S_UNTIL, until.cast_unsigned()),
         ];
         for (i, v) in fields {
             word(ring, base + i)

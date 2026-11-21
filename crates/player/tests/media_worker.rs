@@ -825,6 +825,80 @@ fn colour_changes_mid_stream_are_converted_to_the_contract() {
 /// carries its own stamp (as in
 /// `worker_fails_a_player_refused_while_its_decoder_parks_at_the_end`).
 #[cfg(feature = "dev-tools")]
+/// Polls `ring` at `due` until a frame is staged: its sequence, stamp and
+/// painted index.
+#[cfg(feature = "dev-tools")]
+fn take_seq(worker: &Worker, ring: &mut Ring, due: i64) -> (u64, i64, u32) {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        if let Some(frame) = ring.poll(due) {
+            return (frame.seq, frame.stamp, painted(&ring.staged(), 320));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no frame due at {due}, slots {:?}; the worker's log:
+{}",
+            ring.slots(),
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A play whose clock is already a second in when the game first polls,
+/// and that jumps on after a stall (design.md "Rendering and Skins", skin
+/// movies: the due frame only): the first frame the game takes is the one
+/// due, and the worker dropped the frames behind the clock rather than
+/// publish each for the game to free, so at most a ring's slots of them
+/// (published before it saw the clock) came before it; after the stall
+/// likewise.
+// Revert: the worker publishing every frame -> "frames behind the clock
+// published".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_drops_frames_behind_the_game_s_clock() {
+    use skin_model::media::SLOTS;
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "b.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let slots = u64::try_from(SLOTS).unwrap();
+    let first = take_seq(&worker, &mut ring, stamp_of(24, 24));
+    assert_eq!((first.1, first.2), (stamp_of(24, 24), 24));
+    assert!(
+        first.0 <= slots + 1,
+        "frames behind the clock published: frame 24 is sequence {}; the worker's log:
+{}",
+        first.0,
+        worker.log()
+    );
+    // A stall: the ring refills from frame 25 while the clock runs to 40.
+    std::thread::sleep(Duration::from_millis(300));
+    let later = take_seq(&worker, &mut ring, stamp_of(40, 24));
+    assert_eq!((later.1, later.2), (stamp_of(40, 24), 40));
+    assert!(
+        later.0 <= first.0 + slots + 1,
+        "frames behind the clock published: frame 40 is sequence {} after {}; the worker's log:
+{}",
+        later.0,
+        first.0,
+        worker.log()
+    );
+    worker.close(1);
+}
+
 const LOOPED: &str = "mpeg1video mpeg 320x240 24 48 12";
 
 // Covers: T02

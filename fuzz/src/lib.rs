@@ -4021,7 +4021,8 @@ impl skin_model::media::Words for LoggedRing<'_> {
 /// # Panics
 ///
 /// If a worker accepts a header whose ring is larger than the section; if a
-/// read asks for a word outside the slots other than the watermark, or a
+/// read asks for a word outside the slots other than the watermark and the
+/// due time, or a
 /// run of words other than one slot's frame; if a take writes outside the
 /// frame or not each of its bytes once; if a frame taken is not due, lies
 /// outside the window, or does not follow the frame taken before it; or if
@@ -4029,7 +4030,9 @@ impl skin_model::media::Words for LoggedRing<'_> {
 /// ring.
 #[must_use]
 pub fn ring_bytes(data: &[u8]) -> RingOutcome {
-    use skin_model::media::{Geometry, HEADER_WORDS, Reader, SLOTS, WATERMARK_WORD, Writer};
+    use skin_model::media::{
+        DUE_WORD, Geometry, HEADER_WORDS, Reader, SLOTS, WATERMARK_WORD, Writer,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     let (size, rest) = data.split_first().unwrap_or((&0, &[]));
     let (due, words) = rest.split_at_checked(8).unwrap_or((&[0; 8], rest));
@@ -4080,6 +4083,7 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
         for (start, len) in logged.log.take() {
             assert!(
                 (start, len) == (WATERMARK_WORD, 1)
+                    || (start, len) == (DUE_WORD, 1)
                     || (start >= HEADER_WORDS && start + len <= g.words()),
                 "a request outside the slots: {start}+{len}"
             );
