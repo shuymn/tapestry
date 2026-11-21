@@ -8334,6 +8334,8 @@ impl Run {
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
+                    #[cfg(feature = "dev-tools")]
+                    let app_before = crate::alloc_count::app_allocations();
                     let presented = loading_frame.map(|l| {
                         presentation_of(
                             &self.committed,
@@ -8451,6 +8453,7 @@ impl Run {
                             &mut self.menu_stats
                         };
                         stats.frame(t.cpu, after - before, *changed);
+                        stats.app(crate::alloc_count::app_allocations().saturating_sub(app_before));
                         if loading_frame.is_some() && t.presented() {
                             self.shared.loading_drawn.fetch_add(1, Ordering::Relaxed);
                         }
