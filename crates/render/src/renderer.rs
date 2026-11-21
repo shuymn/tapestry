@@ -1681,6 +1681,11 @@ pub struct Renderer {
     /// long after its submission ([`delay_steps`](Self::delay_steps)).
     #[cfg(feature = "dev-tools")]
     step_delay: Option<Duration>,
+    /// Development builds: the time a staging step's writes have taken on
+    /// the boundary's slice clock, read instead of the real clock
+    /// ([`set_write_slice_clock`](Self::set_write_slice_clock)).
+    #[cfg(feature = "dev-tools")]
+    write_slice_clock: Option<Duration>,
     /// Development builds: the chart-image bands written
     /// ([`chart_bands`](Self::chart_bands)).
     #[cfg(feature = "dev-tools")]
@@ -2057,6 +2062,8 @@ impl Renderer {
             stage_failed: None,
             #[cfg(feature = "dev-tools")]
             step_delay: None,
+            #[cfg(feature = "dev-tools")]
+            write_slice_clock: None,
             #[cfg(feature = "dev-tools")]
             chart_bands: 0,
             #[cfg(feature = "dev-tools")]
@@ -6597,6 +6604,8 @@ impl Renderer {
         );
         #[cfg(feature = "dev-tools")]
         let refuse = std::mem::take(&mut self.step_refusal);
+        #[cfg(feature = "dev-tools")]
+        let slice_clock = self.write_slice_clock;
         let gpu = &self.gpu;
         let Some(p) = self.pending.as_mut() else {
             return AtlasStep::Nothing;
@@ -6613,6 +6622,10 @@ impl Renderer {
             #[cfg(test)]
             if let Some(each) = cost {
                 return each.saturating_mul(steps);
+            }
+            #[cfg(feature = "dev-tools")]
+            if let Some(at) = slice_clock {
+                return at;
             }
             started.elapsed()
         };
@@ -6741,6 +6754,15 @@ impl Renderer {
     #[cfg(feature = "dev-tools")]
     pub const fn delay_steps(&mut self, delay: Option<Duration>) {
         self.step_delay = delay;
+    }
+
+    /// Development builds: a staging step's writes read `elapsed` as the
+    /// time they took on the boundary's slice clock instead of the real
+    /// clock (`None`: the real one), so a test decides where the slice
+    /// closes a step whatever the machine's load.
+    #[cfg(feature = "dev-tools")]
+    pub const fn set_write_slice_clock(&mut self, elapsed: Option<Duration>) {
+        self.write_slice_clock = elapsed;
     }
 
     /// Development builds: the writes of the staging's first

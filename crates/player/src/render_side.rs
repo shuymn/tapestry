@@ -732,6 +732,10 @@ pub trait Screen: Send {
     /// submission (tests). Nothing by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn delay_steps(&mut self, _delay: Option<Duration>) {}
+    /// While `on`, a staging step's writes read no time passed on the
+    /// uploader's slice clock (dev-tools tests). Nothing by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn freeze_write_slice(&mut self, _on: bool) {}
     /// Has the device refuse the next staging step (tests). Nothing by
     /// default.
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2161,6 +2165,10 @@ struct Shared {
     /// submission, in µs; 0 none (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     step_delay_us: AtomicU64,
+    /// While set, a staging step's writes read no time passed on the
+    /// uploader's slice clock (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    write_slice_frozen: AtomicBool,
     /// The next result view's creation lasts this much longer, in µs, and
     /// at its end moves the hold's clock to the second value (tests).
     #[cfg(test)]
@@ -2386,6 +2394,8 @@ impl Shared {
             result_staging_paused: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
             step_delay_us: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            write_slice_frozen: AtomicBool::new(false),
             #[cfg(test)]
             creation_hook: [AtomicI64::new(0), AtomicI64::new(i64::MIN)],
             #[cfg(test)]
@@ -4094,6 +4104,14 @@ impl RenderLink {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn delay_steps(&self, us: u64) {
         self.shared.step_delay_us.store(us, Ordering::SeqCst);
+    }
+
+    /// While `on`, a staging step's writes read no time passed on the
+    /// uploader's slice clock from the next boundary on, so only the
+    /// step's size and the hold's bound close it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn freeze_write_slice(&self, on: bool) {
+        self.shared.write_slice_frozen.store(on, Ordering::SeqCst);
     }
 
     /// Makes the next result view's creation last `us` µs longer and, at
@@ -11628,6 +11646,7 @@ impl Run {
         if let Some(s) = self.screen.as_mut() {
             let us = self.shared.step_delay_us.load(Ordering::SeqCst);
             s.delay_steps((us > 0).then(|| Duration::from_micros(us)));
+            s.freeze_write_slice(self.shared.write_slice_frozen.load(Ordering::SeqCst));
         }
         if self.result_staging_paused() {
             return;

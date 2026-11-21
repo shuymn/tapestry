@@ -945,10 +945,11 @@ fn a_creation_ending_past_the_bound_draws_the_pending_presentation_next() {
 
 /// A step begun just before the bound, its cells 2048² so the union's
 /// first atlas step spans at least four writes, each write moving the
-/// hold's clock 400 µs: the held pass closes and submits the step after
-/// its third write, no held pass begins after it, the next frame is the
-/// pending presentation, and the remaining writes run between pending
-/// frames (V19 (d2)).
+/// hold's clock 400 µs and none moving the uploader's slice clock (so the
+/// hold's bound alone closes the step, whatever the machine's load): the
+/// held pass closes and submits the step after its third write, no held
+/// pass begins after it, the next frame is the pending presentation, and
+/// the remaining writes run between pending frames (V19 (d2)).
 #[test]
 fn a_step_crossing_the_bound_closes_at_it() {
     let _serial = imports::serial();
@@ -981,9 +982,11 @@ fn a_step_crossing_the_bound_closes_at_it() {
         // clock at each look after that one.
         rig.render.set_hold_clock(Some(BOUND - 1_400));
         rig.render.set_write_clock_step(400);
+        rig.render.freeze_write_slice(true);
         rig.render.pause_result_staging(false);
         let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
         rig.render.set_write_clock_step(0);
+        rig.render.freeze_write_slice(false);
         let records: Vec<_> = rig
             .render
             .step_records()

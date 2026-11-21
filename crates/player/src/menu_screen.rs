@@ -1601,6 +1601,12 @@ impl Screen for MenuScreen {
     }
 
     #[cfg(all(test, feature = "dev-tools"))]
+    fn freeze_write_slice(&mut self, on: bool) {
+        self.renderer
+            .set_write_slice_clock(on.then_some(std::time::Duration::ZERO));
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
     fn refuse_next_step(&mut self) {
         self.renderer.refuse_next_step();
     }
