@@ -1886,6 +1886,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         preset_steps: std::collections::VecDeque::new(),
         covers_turned: [false; 3],
         volumes_set: [None; 3],
+        #[cfg(feature = "dev-tools")]
+        act_origin: crate::dev::present_shot::VolumeOrigin::Other,
         cues: crate::select::SelectCues::default(),
         feed: selection_skin::SkinFeed::default(),
         ime,

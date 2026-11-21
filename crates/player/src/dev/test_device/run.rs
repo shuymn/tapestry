@@ -812,11 +812,7 @@ impl Exec for Live {
                 "previous": frame.previous, "present": frame.present,
                 "acquired": frame.acquired, "presented": frame.presented,
             },
-            "volumes": frame
-                .volumes
-                .iter()
-                .map(|v| [i64::from(v.slider), i64::from(v.percent), v.at])
-                .collect::<Vec<_>>(),
+            "volumes": crate::dev::present_shot::volumes_json(&frame.volumes),
         }));
         self.beat();
         self.shots

@@ -1094,14 +1094,15 @@ fn mutation_build(run: &[Value]) -> Result<Result<String, String>, String> {
     })
 }
 
-/// The player's witness in shot A's record (its pointer volume arm's
-/// settings, docs/test-device.md "Run Guard", shots): before shot A's frame
-/// was taken, the arm reached each target's slider with its percent, and
-/// it reached no other slider or percent at any time; so every click's
-/// press was dispatched to the arm with its value, whatever the player did
-/// with it after. Outer error (incomplete): not exactly one shot A record,
-/// or one whose witness does not read.
-fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
+/// One entry of the volume arm's witness: the slider, the percent, the
+/// counter and the pointer input that brought it.
+type ArmEntry = (u64, u64, i64, String);
+
+/// Shot A's record and its frame's counter, and the volume arm's witness
+/// in it (docs/test-device.md "Run Guard", shots): each entry's slider,
+/// percent, counter and the pointer input that brought it. Error: not
+/// exactly one shot A record, or one whose witness does not read.
+fn arm_witness(run: &[Value]) -> Result<(i64, Vec<ArmEntry>), String> {
     let shots: Vec<&Value> = run
         .iter()
         .filter(|v| v["t"] == "shot" && v["what"] == "shot-a.png")
@@ -1112,38 +1113,85 @@ fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
     let acquired = shot["frame"]["acquired"]
         .as_i64()
         .ok_or("shot A's record has no frame counter")?;
-    let reached: Vec<(u64, u64, i64)> = shot["volumes"]
+    let reached = shot["volumes"]
         .as_array()
         .ok_or("shot A's record has no volume witness")?
         .iter()
-        .map(|v| Some((v[0].as_u64()?, v[1].as_u64()?, v[2].as_i64()?)))
-        .collect::<Option<_>>()
+        .map(|v| {
+            (v.as_array().map(Vec::len) == Some(4)).then_some(())?;
+            Some((
+                v[0].as_u64()?,
+                v[1].as_u64()?,
+                v[2].as_i64()?,
+                v[3].as_str()?.to_owned(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
         .ok_or("a volume in shot A's witness does not read")?;
-    let target = |slider: u64| {
-        test_device::panel::TARGETS
-            .iter()
-            .find(|t| u64::from(t.slider) == slider)
-    };
-    let mut wrong = Vec::new();
-    for &(slider, percent, at) in &reached {
-        match target(slider) {
-            Some(t) if u64::from(t.percent) == percent && at < acquired => {}
-            Some(t) if u64::from(t.percent) == percent => wrong.push(format!(
-                "slider {slider} reached at {at}, not before shot A's frame at {acquired}"
-            )),
-            _ => wrong.push(format!(
-                "the arm reached slider {slider} at {percent} %, which no target sets"
-            )),
-        }
+    Ok((acquired, reached))
+}
+
+/// The witness's press entries bound to the target clicks (`p1.volume-arm`):
+/// the entries a press brought to the arm (a drag's are other evidence and
+/// not counted) are exactly one per target, in the target table's order,
+/// each the target's slider and percent, each taken after its target's
+/// click call and before shot A's frame; so each target's own press reached
+/// the arm with its value, whatever the player did with it after. Outer
+/// error (incomplete): the witness does not read, or the run's click calls
+/// at the targets are not one per target in order.
+fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
+    let (acquired, reached) = arm_witness(run)?;
+    let targets = test_device::panel::TARGETS;
+    let calls: Vec<i64> = run
+        .iter()
+        .filter(|v| v["t"] == "call" && v["what"] == "click")
+        .filter_map(|v| {
+            let point = (v["point"][0].as_i64()?, v["point"][1].as_i64()?);
+            let q = v["q"].as_i64()?;
+            targets
+                .iter()
+                .any(|t| (i64::from(t.x), i64::from(t.y)) == point)
+                .then_some((point, q))
+        })
+        .map(|(_, q)| q)
+        .collect();
+    let in_order = run
+        .iter()
+        .filter(|v| v["t"] == "call" && v["what"] == "click")
+        .filter_map(|v| Some((v["point"][0].as_i64()?, v["point"][1].as_i64()?)))
+        .filter(|p| {
+            targets
+                .iter()
+                .any(|t| (i64::from(t.x), i64::from(t.y)) == *p)
+        })
+        .eq(targets.iter().map(|t| (i64::from(t.x), i64::from(t.y))));
+    if !in_order {
+        return Err("the run's click calls at the targets are not one per target, in order".into());
     }
-    for t in test_device::panel::TARGETS {
-        if !reached
-            .iter()
-            .any(|&(s, p, _)| s == u64::from(t.slider) && p == u64::from(t.percent))
-        {
+    let presses: Vec<&ArmEntry> = reached.iter().filter(|(_, _, _, o)| o == "press").collect();
+    if presses.len() != targets.len() {
+        return Ok(Err(format!(
+            "{} presses reached the volume arm, not one per target ({}): {reached:?}",
+            presses.len(),
+            targets.len()
+        )));
+    }
+    let mut wrong = Vec::new();
+    for ((t, call), &&(slider, percent, at, _)) in targets.iter().zip(&calls).zip(&presses) {
+        if (slider, percent) != (u64::from(t.slider), u64::from(t.percent)) {
             wrong.push(format!(
-                "slider {} at {} % never reached the volume arm",
+                "the press for slider {} at {} % reached the arm as slider {slider} at {percent} %",
                 t.slider, t.percent
+            ));
+        }
+        if at <= *call {
+            wrong.push(format!(
+                "slider {slider}'s press reached the arm at {at}, not after its click call at {call}"
+            ));
+        }
+        if at >= acquired {
+            wrong.push(format!(
+                "slider {slider}'s press reached the arm at {at}, not before shot A's frame at {acquired}"
             ));
         }
     }
@@ -1152,6 +1200,45 @@ fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
     } else {
         Err(wrong.join("; "))
     })
+}
+
+/// P4's affirmative absence (`p4.no-volume-arm`): no press, drag or other
+/// input brought any volume to the arm by shot A, so its clicks set nothing,
+/// not even a wrong slider. Outer error (incomplete): the witness does not
+/// read.
+fn no_volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
+    let (_, reached) = arm_witness(run)?;
+    Ok(if reached.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the volume arm was reached: {reached:?}"))
+    })
+}
+
+/// Every panel row's starting volumes (`p1.volumes-start`): the
+/// `device.toml` written before the run holds each of the three volumes at
+/// exactly [`START_VOLUME`].
+pub fn volumes_start(before: &[u8]) -> Result<(), String> {
+    let table: toml::Table = std::str::from_utf8(before)
+        .map_err(|e| e.to_string())
+        .and_then(|t| toml::from_str(t).map_err(|e| e.to_string()))
+        .map_err(|e| format!("device.toml before the run does not read: {e}"))?;
+    let off: Vec<String> = VOLUME_KEYS
+        .iter()
+        .filter_map(
+            |(_, key)| match table.get(*key).and_then(toml::Value::as_float) {
+                Some(got) if got == START_VOLUME => None,
+                got => Some(format!(
+                    "{key} = {got:?} before the run, not {START_VOLUME}"
+                )),
+            },
+        )
+        .collect();
+    if off.is_empty() {
+        Ok(())
+    } else {
+        Err(off.join("; "))
+    }
 }
 
 /// Every byte of `device.toml` but the three volumes' lines is unchanged:
@@ -1350,6 +1437,11 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
             bytes(&x.device_before).and_then(|b| Ok(volumes(&b, &bytes(&x.device_after)?))),
         ),
         verdict(
+            "p1.volumes-start",
+            &[file(DEVICE_BEFORE)],
+            bytes(&x.device_before).map(|b| volumes_start(&b)),
+        ),
+        verdict(
             "p1.volume-arm",
             &[RUN_RUN],
             recs(&f.run).and_then(volume_arm),
@@ -1431,7 +1523,14 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
         )
     };
     match row {
-        "p4" => out.push(kept("p4.volumes-kept")),
+        "p4" => {
+            out.push(kept("p4.volumes-kept"));
+            out.push(verdict(
+                "p4.no-volume-arm",
+                &[RUN_RUN],
+                recs(&f.run).and_then(no_volume_arm),
+            ));
+        }
         "p5" => {
             out.push(kept("p5.volumes-kept"));
             let (outcome, detail) = match recs(&f.run).and_then(mutation_build) {
@@ -2179,7 +2278,11 @@ pub mod tests {
         let n1 = good();
         // The volume arm's witness: each target's slider and percent,
         // reached after its click and before shot A's frame (2410).
-        let arm = json!([[17, 25, 230], [18, 50, 240], [19, 75, 250]]);
+        let arm = json!([
+            [17, 25, 295, "press"],
+            [18, 50, 315, "press"],
+            [19, 75, 335, "press"]
+        ]);
         // Calls: the sink's focus (move, click), the player's focus (move,
         // click), four calibrations, three targets (move, click), tagged
         // 0xABCD0000 on, at 10-tick steps from 200.
@@ -2265,7 +2368,7 @@ pub mod tests {
     fn a_good_panel_run_passes_every_check() {
         let (f, x) = panel_good();
         let all = panel(Some("0123456789ab"), &f, &x, "p1");
-        assert_eq!(all.len(), 12);
+        assert_eq!(all.len(), 13);
         for j in &all {
             assert_eq!(j.outcome, Outcome::Pass, "{j:?}");
         }
@@ -2273,7 +2376,12 @@ pub mod tests {
 
     /// The volumes as P4's and P5's players leave them: all three at 1.0.
     fn kept() -> PanelFiles {
-        let (_, mut x) = panel_good();
+        let (_, x) = panel_good();
+        kept_of(x)
+    }
+
+    /// `x` with the file after the run as the file before it.
+    fn kept_of(mut x: PanelFiles) -> PanelFiles {
         x.device_after = x.device_before.clone();
         x
     }
@@ -2554,15 +2662,18 @@ pub mod tests {
         );
     }
 
-    /// Shot A's witness of the player's volume arm: each target reached it
-    /// with its slider and percent before shot A's frame. A press dropped
-    /// before dispatch (one target missing), a percent no target sets, or a
-    /// target reached only after the frame fails; P5's player, whose arm
-    /// drops the values it reached, passes; P4's, whose clicks reach no
-    /// slider, fails; a run with no shot A record or a witness that does not
-    /// read is incomplete.
+    /// Shot A's witness of the player's volume arm (`p1.volume-arm`): the
+    /// press entries, one per target in the target table's order, each the
+    /// target's slider and percent, after its click call (290, 310, 330)
+    /// and before shot A's frame (2410). A drag entry besides them is not
+    /// counted. A press entry before its call (stale), two presses swapped,
+    /// a drag in place of a press (drag only), a target's press missing, a
+    /// percent no target sets, or a press reached only after the frame
+    /// fails; P5's player, whose arm drops the values it reached, passes;
+    /// a witness that does not read, a run with no shot A record, or click
+    /// calls at the targets out of order is incomplete.
     #[test]
-    fn each_target_must_reach_the_volume_arm_before_shot_a() {
+    fn each_target_s_press_must_reach_the_volume_arm_in_order() {
         let arm = |vols: Value| {
             let (mut f, x) = panel_good();
             edit(&mut f.run, |r| {
@@ -2572,38 +2683,86 @@ pub mod tests {
             });
             panel_outcome(&f, &x, "p1", "p1.volume-arm")
         };
-        assert_eq!(
-            arm(json!([[17, 25, 230], [18, 50, 240], [19, 75, 250]])).0,
-            Outcome::Pass
-        );
-        // Dragged on the same value: reached twice, still each target's.
+        let good = json!([
+            [17, 25, 295, "press"],
+            [18, 50, 315, "press"],
+            [19, 75, 335, "press"]
+        ]);
+        assert_eq!(arm(good).0, Outcome::Pass);
+        // Dispatched after all three calls: each still after its own.
         assert_eq!(
             arm(json!([
-                [17, 25, 230],
-                [17, 25, 231],
-                [18, 50, 240],
-                [19, 75, 250]
+                [17, 25, 340, "press"],
+                [18, 50, 341, "press"],
+                [19, 75, 342, "press"]
             ]))
             .0,
             Outcome::Pass
         );
-        let (o, d) = arm(json!([[17, 25, 230], [19, 75, 250]]));
-        assert_eq!(o, Outcome::Fail);
-        assert!(
-            d.contains("slider 18 at 50 % never reached the volume arm"),
-            "{d}"
+        // A drag besides the presses is not counted.
+        assert_eq!(
+            arm(json!([
+                [17, 25, 295, "press"],
+                [17, 30, 296, "drag"],
+                [18, 50, 315, "press"],
+                [19, 75, 335, "press"]
+            ]))
+            .0,
+            Outcome::Pass
         );
-        let (o, d) = arm(json!([[17, 25, 230], [18, 51, 240], [19, 75, 250]]));
-        assert_eq!(o, Outcome::Fail);
-        assert!(d.contains("slider 18 at 51 %, which no target sets"), "{d}");
-        let (o, d) = arm(json!([[17, 25, 230], [18, 50, 240], [19, 75, 2410]]));
-        assert_eq!(o, Outcome::Fail);
-        assert!(
-            d.contains("slider 19 reached at 2410, not before shot A"),
-            "{d}"
+        let fails = |vols: Value, want: &str| {
+            let (o, d) = arm(vols);
+            assert_eq!(o, Outcome::Fail, "{d}");
+            assert!(d.contains(want), "{want}: {d}");
+        };
+        // Stale: slider 17's entry before its call at 290.
+        fails(
+            json!([
+                [17, 25, 230, "press"],
+                [18, 50, 315, "press"],
+                [19, 75, 335, "press"]
+            ]),
+            "slider 17's press reached the arm at 230, not after its click call at 290",
         );
-        assert_eq!(arm(json!([])).0, Outcome::Fail, "P4: no slider reached");
-        assert_eq!(arm(json!([[17, 25]])).0, Outcome::Incomplete);
+        // Swapped: the first two presses' results in each other's place.
+        fails(
+            json!([
+                [18, 50, 295, "press"],
+                [17, 25, 315, "press"],
+                [19, 75, 335, "press"]
+            ]),
+            "the press for slider 17 at 25 % reached the arm as slider 18 at 50 %",
+        );
+        // Drag only: the values arrive, none by a press.
+        fails(
+            json!([
+                [17, 25, 295, "drag"],
+                [18, 50, 315, "drag"],
+                [19, 75, 335, "drag"]
+            ]),
+            "0 presses reached the volume arm, not one per target (3)",
+        );
+        fails(
+            json!([[17, 25, 295, "press"], [19, 75, 335, "press"]]),
+            "2 presses reached the volume arm",
+        );
+        fails(
+            json!([
+                [17, 25, 295, "press"],
+                [18, 51, 315, "press"],
+                [19, 75, 335, "press"]
+            ]),
+            "the press for slider 18 at 50 % reached the arm as slider 18 at 51 %",
+        );
+        fails(
+            json!([
+                [17, 25, 295, "press"],
+                [18, 50, 315, "press"],
+                [19, 75, 2410, "press"]
+            ]),
+            "not before shot A's frame at 2410",
+        );
+        assert_eq!(arm(json!([[17, 25, 295]])).0, Outcome::Incomplete);
         assert_eq!(arm(Value::Null).0, Outcome::Incomplete);
         let (f, x) = p5_good();
         assert_eq!(
@@ -2616,6 +2775,91 @@ pub mod tests {
             panel_outcome(&f, &x, "p1", "p1.volume-arm").0,
             Outcome::Incomplete
         );
+        // The second target's click call moved last: out of order.
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| {
+            let at = r
+                .iter()
+                .position(|v| v["what"] == "click" && v["point"] == json!([300, 657]))
+                .unwrap();
+            let call = r.remove(at);
+            let last = r.iter().rposition(|v| v["t"] == "call").unwrap();
+            r.insert(last + 1, call);
+        });
+        assert_eq!(
+            panel_outcome(&f, &x, "p1", "p1.volume-arm").0,
+            Outcome::Incomplete
+        );
+    }
+
+    /// P4's clicks bring nothing to the volume arm (`p4.no-volume-arm`): an
+    /// empty witness passes; one press, even to a slider at 100 % that
+    /// leaves the settings and the frame as P4's, fails; so does a drag; a
+    /// witness that does not read is incomplete.
+    #[test]
+    fn p4_s_clicks_reach_no_volume_arm() {
+        let p4 = |vols: Value| {
+            let (mut f, x) = panel_good();
+            edit(&mut f.run, |r| {
+                for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+                    v["volumes"] = vols.clone();
+                }
+            });
+            panel_outcome(&f, &kept_of(x), "p4", "p4.no-volume-arm")
+        };
+        assert_eq!(p4(json!([])).0, Outcome::Pass);
+        let (o, d) = p4(json!([[17, 100, 295, "press"]]));
+        assert_eq!(o, Outcome::Fail);
+        assert!(d.contains("the volume arm was reached"), "{d}");
+        assert_eq!(p4(json!([[17, 100, 295, "drag"]])).0, Outcome::Fail);
+        assert_eq!(p4(Value::Null).0, Outcome::Incomplete);
+        let (f, x) = panel_good();
+        assert!(
+            panel(Some("0123456789ab"), &f, &x, "p1")
+                .iter()
+                .all(|j| j.check != "p4.no-volume-arm"),
+            "P4's alone"
+        );
+    }
+
+    /// Every panel row's starting volumes (`p1.volumes-start`): 1.0 each in
+    /// `device.toml` before the run. In P1, P4 and P5 alike, one volume off
+    /// 1.0 before the run fails it, though the file after the run (all
+    /// 1.0, as a negative leaves it) passes the row's kept-volumes check;
+    /// an unreadable file is incomplete.
+    #[test]
+    fn every_panel_row_starts_at_full_volume() {
+        for row in ["p1", "p4", "p5"] {
+            let (f, x) = panel_good();
+            assert_eq!(
+                panel_outcome(&f, &x, row, "p1.volumes-start").0,
+                Outcome::Pass,
+                "{row}"
+            );
+            let mut x = kept_of(x);
+            let b = String::from_utf8(x.device_before.clone().unwrap()).unwrap();
+            x.device_before = Ok(b
+                .replace("system_volume = 1.0", "system_volume = 0.25")
+                .into_bytes());
+            let (o, d) = panel_outcome(&f, &x, row, "p1.volumes-start");
+            assert_eq!(o, Outcome::Fail, "{row}");
+            assert!(
+                d.contains("system_volume = Some(0.25) before the run, not 1"),
+                "{d}"
+            );
+            if row != "p1" {
+                assert_eq!(
+                    panel_outcome(&f, &x, row, &format!("{row}.volumes-kept")).0,
+                    Outcome::Pass,
+                    "{row}: the after file alone keeps 1.0"
+                );
+            }
+            x.device_before = Err("missing".into());
+            assert_eq!(
+                panel_outcome(&f, &x, row, "p1.volumes-start").0,
+                Outcome::Incomplete
+            );
+        }
     }
 
     #[test]

@@ -28,8 +28,12 @@ const ROWS: &[Row] = &[
     ("p1-kill", p1_kill),
 ];
 
-/// The private panel judge's name: it writes `verdicts-panel.jsonl`.
-pub const PANEL: &str = "panel";
+/// The private panel judge's name: it writes `verdicts-panel-exact.jsonl`.
+/// The name is the judging policy's: each shot equal to its pinned
+/// reference at every pixel, with no mask. A judge of another policy (an
+/// earlier one that masked regions, `panel`) writes under its own name, and
+/// its verdicts do not stand for these checks.
+pub const PANEL: &str = "panel-exact";
 
 const fn file(role: &'static str, path: &'static str) -> File {
     File { role, path }
@@ -314,9 +318,9 @@ fn sink_kill() -> Expectation {
 }
 
 /// The private panel judge's checks, each a shot compared with a pinned
-/// reference frame by exact equality outside the reference's declared mask:
-/// shot A with P1's (panel 3 open, the sliders at their targets), shot B
-/// with the closed screen's.
+/// reference frame by exact equality at every pixel of the whole frame, no
+/// region masked: shot A with P1's (panel 3 open, the sliders at their
+/// targets), shot B with the closed screen's.
 pub const FRAME_A: &str = "panel.frame-a";
 pub const FRAME_B: &str = "panel.frame-b";
 /// A negative's own declared frame, which must pass: shot A equal to the
@@ -405,6 +409,11 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[f(DEVICE_BEFORE), f(DEVICE_AFTER)],
                 &[ev(SINGLE, RUN, "exit")],
             ),
+            judge(
+                "p1.volumes-start",
+                &[f(DEVICE_BEFORE)],
+                &[ev(SINGLE, RUN, "exit")],
+            ),
             judge("p1.volume-arm", &[run], &[ev(SINGLE, RUN, "shot")]),
             judge(
                 "p1.device-toml",
@@ -451,11 +460,14 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
         ]
         .into_iter()
         .chain(match row {
-            "p4" => [judge(
-                "p4.volumes-kept",
-                &[f(DEVICE_AFTER)],
-                &[ev(SINGLE, RUN, "exit")],
-            )]
+            "p4" => [
+                judge(
+                    "p4.volumes-kept",
+                    &[f(DEVICE_AFTER)],
+                    &[ev(SINGLE, RUN, "exit")],
+                ),
+                judge("p4.no-volume-arm", &[run], &[ev(SINGLE, RUN, "shot")]),
+            ]
             .into_iter()
             .chain([private(DECLARED_A, &[run, rec, f(SHOT_A)])])
             .collect(),
@@ -899,7 +911,10 @@ mod tests {
         // A negative's checks are its positive row's, in the same order,
         // then its own, which pass.
         for (neg, own) in [
-            (p4(), vec!["p4.volumes-kept", DECLARED_A]),
+            (
+                p4(),
+                vec!["p4.volumes-kept", "p4.no-volume-arm", DECLARED_A],
+            ),
             (
                 p5(),
                 vec!["p5.volumes-kept", "p5.mutation-build", DECLARED_A],
@@ -1088,6 +1103,10 @@ mod tests {
         left: bool,
         /// `device.toml` after the run, as given.
         after: Option<&'a str>,
+        /// `device.toml` before the run, as given.
+        before: Option<&'a str>,
+        /// The private judge's name, in place of [`PANEL`].
+        producer: Option<&'a str>,
         /// The private judge's checks that failed.
         failing: &'a [&'a str],
         /// The player's executable is another than the declared one.
@@ -1206,7 +1225,11 @@ mod tests {
             (LINK, lines(&link).into_bytes()),
             (RECORDER, lines(&recorder).into_bytes()),
             (MODE_LINK, lines(&mode).into_bytes()),
-            (DEVICE_BEFORE, x.device_before.unwrap()),
+            (
+                DEVICE_BEFORE,
+                how.before
+                    .map_or_else(|| x.device_before.unwrap(), |b| b.as_bytes().to_vec()),
+            ),
             (PLAYER_BEFORE, x.player_before.unwrap()),
             (DEVICE_AFTER, device_after),
             (PLAYER_AFTER, x.player_after.unwrap()),
@@ -1230,6 +1253,7 @@ mod tests {
         // (its own table, not the expectation under test): each check
         // reading the run's stream, the recorder's and its shot (the run's
         // stream left out when `unbound`).
+        let producer = how.producer.unwrap_or(PANEL);
         let panel: String = panel_judge_checks(row)
             .into_iter()
             .map(|(id, shot)| {
@@ -1247,12 +1271,12 @@ mod tests {
                     "{}\n",
                     json!({
                         "row": row, "run": run_id, "check": id, "outcome": outcome, "detail": "",
-                        "inputs": inputs, "producer": {"name": "panel", "version": "0"},
+                        "inputs": inputs, "producer": {"name": producer, "version": "0"},
                     })
                 )
             })
             .collect();
-        std::fs::write(dir.join("verdicts-panel.jsonl"), panel).unwrap();
+        std::fs::write(dir.join(format!("verdicts-{producer}.jsonl")), panel).unwrap();
     }
 
     /// The private panel judge's checks of `row` and the shot each reads,
@@ -1265,6 +1289,138 @@ mod tests {
         }
         out.push(("panel.frame-b", "shot-b.png"));
         out
+    }
+
+    /// The frame checks' verdicts must come from the whole-frame judge: the
+    /// same lines (row, run, outcomes, inputs and their digests) written by
+    /// the earlier masked judge (`panel`) are a mismatch, in every panel
+    /// row.
+    #[test]
+    fn the_frame_checks_are_the_whole_frame_judge_s() {
+        for (row, failing) in [
+            ("p1", &[][..]),
+            ("p4", &[FRAME_A][..]),
+            ("p5", &[FRAME_A][..]),
+        ] {
+            let left = row != "p1";
+            let (ok, out) = verdict(
+                row,
+                &Folder {
+                    left,
+                    failing,
+                    ..Folder::default()
+                },
+            );
+            assert!(ok, "{row}: {out}");
+            let (ok, out) = verdict(
+                row,
+                &Folder {
+                    left,
+                    failing,
+                    producer: Some("panel"),
+                    ..Folder::default()
+                },
+            );
+            assert!(!ok, "{row}: {out}");
+            assert!(
+                out.contains(
+                    "check `panel.frame-a` is produced by `panel`, the row declares `panel-exact`"
+                ),
+                "{row}: {out}"
+            );
+        }
+    }
+
+    /// The volume arm's witness binds each target's press: in a P1 folder, a
+    /// press entry before its click call (stale), two presses swapped, or
+    /// only drags is a mismatch on `p1.volume-arm`. In a P4 folder whose
+    /// captures and settings are P4's, one press reaching the arm is a
+    /// mismatch on `p4.no-volume-arm`. In P4 and P5 folders whose settings
+    /// after the run keep 1.0, a volume off 1.0 before it is a mismatch on
+    /// `p1.volumes-start`.
+    #[test]
+    fn a_panel_row_binds_its_presses_and_its_starting_volumes() {
+        type Edit = fn(&mut Vec<serde_json::Value>);
+        fn witness(r: &mut [serde_json::Value], vols: &serde_json::Value) {
+            for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+                v["volumes"] = vols.clone();
+            }
+        }
+        let cases: [(&str, Edit); 3] = [
+            ("stale", |r| {
+                witness(
+                    r,
+                    &serde_json::json!([
+                        [17, 25, 230, "press"],
+                        [18, 50, 315, "press"],
+                        [19, 75, 335, "press"]
+                    ]),
+                );
+            }),
+            ("swapped", |r| {
+                witness(
+                    r,
+                    &serde_json::json!([
+                        [18, 50, 295, "press"],
+                        [17, 25, 315, "press"],
+                        [19, 75, 335, "press"]
+                    ]),
+                );
+            }),
+            ("drag-only", |r| {
+                witness(
+                    r,
+                    &serde_json::json!([
+                        [17, 25, 295, "drag"],
+                        [18, 50, 315, "drag"],
+                        [19, 75, 335, "drag"]
+                    ]),
+                );
+            }),
+        ];
+        for (why, edit) in cases {
+            let (ok, out) = verdict(
+                "p1",
+                &Folder {
+                    shots: Some(edit),
+                    ..Folder::default()
+                },
+            );
+            assert!(!ok, "{why}: {out}");
+            assert!(
+                out.contains("check `p1.volume-arm` is Fail"),
+                "{why}: {out}"
+            );
+        }
+        let (ok, out) = verdict(
+            "p4",
+            &Folder {
+                left: true,
+                failing: &[FRAME_A],
+                shots: Some(|r| witness(r, &serde_json::json!([[17, 100, 295, "press"]]))),
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("check `p4.no-volume-arm` is Fail"), "{out}");
+        let before = super::super::judge::tests::DEVICE_TOML
+            .replace("system_volume = 1.0", "system_volume = 0.25");
+        for row in ["p4", "p5"] {
+            let (ok, out) = verdict(
+                row,
+                &Folder {
+                    left: true,
+                    failing: &[FRAME_A],
+                    before: Some(before.as_str()),
+                    ..Folder::default()
+                },
+            );
+            assert!(!ok, "{row}: {out}");
+            assert!(
+                out.contains("check `p1.volumes-start` is Fail"),
+                "{row}: {out}"
+            );
+        }
     }
 
     fn recs_line(s: &super::super::judge::Stream) -> String {

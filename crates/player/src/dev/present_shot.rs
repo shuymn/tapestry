@@ -67,6 +67,52 @@ pub struct VolumeSet {
     pub percent: u32,
     /// The host counter when the arm took it.
     pub at: i64,
+    /// The pointer input that brought it to the arm.
+    pub origin: VolumeOrigin,
+}
+
+/// Which pointer input brought a volume to the arm: a press answered by
+/// the render thread, a drag of the held press, or another call of the arm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VolumeOrigin {
+    Press,
+    Drag,
+    #[default]
+    Other,
+}
+
+impl VolumeOrigin {
+    /// Its name in an answer and a `shot` record.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Press => "press",
+            Self::Drag => "drag",
+            Self::Other => "other",
+        }
+    }
+
+    const fn code(self) -> u32 {
+        match self {
+            Self::Press => 1,
+            Self::Drag => 2,
+            Self::Other => 0,
+        }
+    }
+
+    const fn of_code(code: u32) -> Self {
+        match code {
+            1 => Self::Press,
+            2 => Self::Drag,
+            _ => Self::Other,
+        }
+    }
+
+    fn of_name(name: &str) -> Option<Self> {
+        [Self::Press, Self::Drag, Self::Other]
+            .into_iter()
+            .find(|o| o.name() == name)
+    }
 }
 
 /// The most volume settings the witness keeps: far more than a panel row's
@@ -79,9 +125,10 @@ static VOLUME_AT: [AtomicI64; VOLUME_LOG] = [const { AtomicI64::new(0) }; VOLUME
 static VOLUME_WHAT: [AtomicU32; VOLUME_LOG] = [const { AtomicU32::new(0) }; VOLUME_LOG];
 static VOLUME_N: AtomicUsize = AtomicUsize::new(0);
 
-/// The select screen's pointer volume arm took `percent` for `channel`
-/// (dev-tools): kept for the shots' answers. Allocates nothing.
-pub fn volume_reached(channel: game::Channel, percent: u32) {
+/// The select screen's pointer volume arm took `percent` for `channel`,
+/// brought by `origin` (dev-tools): kept for the shots' answers. Allocates
+/// nothing.
+pub fn volume_reached(channel: game::Channel, percent: u32, origin: VolumeOrigin) {
     let slider: u32 = match channel {
         game::Channel::System => 17,
         game::Channel::Key => 18,
@@ -90,7 +137,10 @@ pub fn volume_reached(channel: game::Channel, percent: u32) {
     let i = VOLUME_N.load(Ordering::Relaxed);
     if let (Some(at), Some(what)) = (VOLUME_AT.get(i), VOLUME_WHAT.get(i)) {
         at.store(qpc(), Ordering::Relaxed);
-        what.store(slider << 8 | percent.min(0xff), Ordering::Relaxed);
+        what.store(
+            origin.code() << 16 | slider << 8 | percent.min(0xff),
+            Ordering::Relaxed,
+        );
     }
     VOLUME_N.store(i.saturating_add(1), Ordering::Release);
 }
@@ -114,9 +164,10 @@ pub(crate) fn volumes_reached() -> Result<Vec<VolumeSet>, String> {
         .map(|(at, what)| {
             let what = what.load(Ordering::Relaxed);
             VolumeSet {
-                slider: u8::try_from(what >> 8).unwrap_or(0),
+                slider: u8::try_from(what >> 8 & 0xff).unwrap_or(0),
                 percent: what & 0xff,
                 at: at.load(Ordering::Relaxed),
+                origin: VolumeOrigin::of_code(what >> 16),
             }
         })
         .collect())
@@ -312,7 +363,7 @@ pub fn write_answer(
             "serial": serial, "width": s.width, "height": s.height,
             "previous": s.previous, "present": s.present,
             "acquired": s.acquired, "presented": s.presented,
-            "volumes": s.volumes.iter().map(|v| [i64::from(v.slider), i64::from(v.percent), v.at]).collect::<Vec<_>>(),
+            "volumes": volumes_json(&s.volumes),
             "bytes": s.rgba.len(),
         }),
         Err(e) => json!({ "serial": serial, "error": e }),
@@ -322,6 +373,18 @@ pub fn write_answer(
         out.write_all(&s.rgba)?;
     }
     out.flush()
+}
+
+/// The witness as an answer and a `shot` record carry it: one array per
+/// volume, `[slider, percent, counter, origin]`.
+#[must_use]
+pub fn volumes_json(volumes: &[VolumeSet]) -> Value {
+    Value::Array(
+        volumes
+            .iter()
+            .map(|v| json!([v.slider, v.percent, v.at, v.origin.name()]))
+            .collect(),
+    )
 }
 
 /// The longest answer a runner reads: a frame of 8192×8192.
@@ -375,11 +438,19 @@ pub fn read_answer(
         .map(|v| {
             let slider = v[0].as_u64().and_then(|n| u8::try_from(n).ok());
             let percent = v[1].as_u64().and_then(|n| u32::try_from(n).ok());
-            match (slider, percent, v[2].as_i64(), v.as_array().map(Vec::len)) {
-                (Some(slider), Some(percent), Some(at), Some(3)) => Ok(VolumeSet {
+            let origin = v[3].as_str().and_then(VolumeOrigin::of_name);
+            match (
+                slider,
+                percent,
+                v[2].as_i64(),
+                origin,
+                v.as_array().map(Vec::len),
+            ) {
+                (Some(slider), Some(percent), Some(at), Some(origin), Some(4)) => Ok(VolumeSet {
                     slider,
                     percent,
                     at,
+                    origin,
                 }),
                 _ => Err(format!("the answer's volume {v} does not read")),
             }
@@ -600,19 +671,26 @@ mod tests {
     #[test]
     fn the_volume_witness_keeps_each_setting_in_order() {
         let from = VOLUME_N.load(Ordering::Acquire);
-        volume_reached(game::Channel::Key, 50);
-        volume_reached(game::Channel::System, 25);
-        volume_reached(game::Channel::Background, 75);
+        volume_reached(game::Channel::Key, 50, VolumeOrigin::Press);
+        volume_reached(game::Channel::System, 25, VolumeOrigin::Drag);
+        volume_reached(game::Channel::Background, 75, VolumeOrigin::Other);
         let got = volumes_reached().unwrap();
-        let got: Vec<(u8, u32)> = got
+        let got: Vec<(u8, u32, VolumeOrigin)> = got
             .get(from..)
             .unwrap()
             .iter()
-            .map(|v| (v.slider, v.percent))
+            .map(|v| (v.slider, v.percent, v.origin))
             .collect();
-        assert_eq!(got, [(18, 50), (17, 25), (19, 75)]);
+        assert_eq!(
+            got,
+            [
+                (18, 50, VolumeOrigin::Press),
+                (17, 25, VolumeOrigin::Drag),
+                (19, 75, VolumeOrigin::Other)
+            ]
+        );
         while VOLUME_N.load(Ordering::Acquire) <= VOLUME_LOG {
-            volume_reached(game::Channel::Key, 1);
+            volume_reached(game::Channel::Key, 1, VolumeOrigin::Press);
         }
         assert!(volumes_reached().unwrap_err().contains("more than the 64"));
     }
@@ -634,11 +712,13 @@ mod tests {
                     slider: 17,
                     percent: 25,
                     at: 90,
+                    origin: VolumeOrigin::Press,
                 },
                 VolumeSet {
                     slider: 19,
                     percent: 75,
                     at: 95,
+                    origin: VolumeOrigin::Drag,
                 },
             ],
         };
