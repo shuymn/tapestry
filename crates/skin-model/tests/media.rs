@@ -18,9 +18,9 @@ use std::thread;
 use std::time::Duration;
 
 use skin_model::media::{
-    CHUNK_WORDS, DUE_WORD, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Reader, Refused,
-    SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window, Words, Writer,
-    supervision, watermark,
+    CHUNK_WORDS, DUE_RUN_WORD, DUE_WORD, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD,
+    Reader, Refused, SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window,
+    Words, Writer, supervision, watermark,
 };
 
 /// Run 1's window: the first minute.
@@ -297,16 +297,18 @@ fn copy_chunks(g: Geometry, slot: usize) -> [(usize, usize); 2] {
     ]
 }
 
-/// Whether a request is the watermark's word, the due time's (which a peek
-/// writes) or lies inside `g`'s slots, the only words a reader asks for.
+/// Whether a request is the watermark's word, the due time's or its run's
+/// (which a peek writes) or lies inside `g`'s slots, the only words a
+/// reader asks for.
 fn in_ring(g: Geometry, (start, len): (usize, usize)) -> bool {
     (start, len) == (WATERMARK_WORD, 1)
         || (start, len) == (DUE_WORD, 1)
+        || (start, len) == (DUE_RUN_WORD, 1)
         || (start >= HEADER_WORDS && start + len <= g.words())
 }
 
-/// Asserts every request in `log` is the watermark, the due time or lies inside `g`'s
-/// slots, and every run of more than one word inside slot `slot`'s frame.
+/// Asserts every request in `log` is the watermark, the due time and its
+/// run, or lies inside `g`'s slots, and every run of more than one word inside slot `slot`'s frame.
 #[track_caller]
 fn assert_bounded(log: &[(usize, usize)], g: Geometry, slot: usize) {
     let frame = g.frame_start(slot)..g.frame_start(slot) + g.frame_words();
@@ -984,8 +986,9 @@ fn publish_until(ring: &[AtomicU64], seq: u64, at: i64, until: i64) {
 /// frames and the time 780 ms in, the newest at or before it (its
 /// successor at 133 ms due) is behind the clock, so the peek takes
 /// nothing, frees all four unread and says so, and writes the time for
-/// the worker; the frame due then is taken, and a video's last frame
-/// (`UNTIL_END`) is never behind.
+/// the worker, for its run alone; the frame due then is taken, and a
+/// video's last frame (`UNTIL_END`) is never behind. A later run's time is
+/// not the earlier run's until its first peek.
 // Revert: the peek's behind check dropped -> "a frame behind the clock
 // taken"; a last frame counted behind at the latest time -> the last
 // read fails.
@@ -995,7 +998,8 @@ fn ring_frees_a_frame_behind_the_clock_unread() {
     let g = Geometry::new(16, 9).unwrap();
     let mem = section(g);
     let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
-    assert_eq!(shown(&*mem), Some(NOTHING_DUE));
+    assert_eq!(shown(&*mem, 1), None, "no peek yet");
+    assert_eq!(shown(&*mem, 0), Some(NOTHING_DUE));
     for seq in 1..=4 {
         publish_until(&mem, seq, stamp(seq - 1), stamp(seq));
     }
@@ -1003,13 +1007,18 @@ fn ring_frees_a_frame_behind_the_clock_unread() {
     assert!(peek.due.is_none(), "a frame behind the clock taken");
     assert!(peek.behind && peek.freed, "{peek:?}");
     assert_eq!(reader.freed(), 4, "the four freed unread");
-    assert_eq!(shown(&*mem), Some(780_000), "the time written");
+    assert_eq!(shown(&*mem, 1), Some(780_000), "the time written");
     publish_until(&mem, 5, 766_667, 800_000);
     let r = read(&mut reader, &*mem, 780_000).unwrap();
     assert_whole(&r, g, 5);
     publish_until(&mem, 6, 800_000, UNTIL_END);
     let r = read(&mut reader, &*mem, i64::MAX).unwrap();
     assert_whole(&r, g, 6);
+    let run = reader.start_run(WINDOW);
+    assert_eq!(shown(&*mem, run), None, "an earlier run's time");
+    reader.peek(&*mem, 2_000).unwrap();
+    assert_eq!(shown(&*mem, run), Some(2_000));
+    assert_eq!(shown(&*mem, 1), None);
 }
 
 /// A frame shown until no later than its own stamp breaks the protocol:

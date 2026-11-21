@@ -825,6 +825,8 @@ fn colour_changes_mid_stream_are_converted_to_the_contract() {
 /// carries its own stamp (as in
 /// `worker_fails_a_player_refused_while_its_decoder_parks_at_the_end`).
 #[cfg(feature = "dev-tools")]
+const LOOPED: &str = "mpeg1video mpeg 320x240 24 48 12";
+
 /// Polls `ring` at `due` until a frame is staged: its sequence, stamp and
 /// painted index.
 #[cfg(feature = "dev-tools")]
@@ -898,8 +900,6 @@ fn worker_drops_frames_behind_the_game_s_clock() {
     );
     worker.close(1);
 }
-
-const LOOPED: &str = "mpeg1video mpeg 320x240 24 48 12";
 
 // Covers: T02
 #[cfg(feature = "dev-tools")]
@@ -1333,6 +1333,15 @@ fn concat(dir: &Path, name: &str, parts: &[PathBuf]) -> PathBuf {
 #[cfg(feature = "dev-tools")]
 const HOLD: i64 = 30_000_000;
 
+/// Player 2's media time once player 1 has failed: on from [`HOLD`] in
+/// real time since `resumed`, so its frames come due one by one rather than
+/// all behind the clock and dropped (design.md "Rendering and Skins", video
+/// frames).
+#[cfg(feature = "dev-tools")]
+fn after_hold(resumed: Instant) -> i64 {
+    HOLD + i64::try_from(resumed.elapsed().as_micros()).unwrap()
+}
+
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -1413,13 +1422,14 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
     // The worker goes on: player 2's frames keep coming, and it answers a
     // new open.
     let before = frames[1];
+    let resumed = Instant::now();
     while frames[1] < before + 24 {
         assert!(
             Instant::now() < deadline,
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(after_hold(resumed)).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
     assert!(!worker.launched.ended());
@@ -2277,13 +2287,14 @@ fn h264_decoder_enomem_fails_one_player_and_the_worker_lives() {
     assert!(frames[0] > 0, "player 1 showed no frame before it failed");
     // Player 2's frames keep coming.
     let before = frames[1];
+    let resumed = Instant::now();
     while frames[1] < before + 24 {
         assert!(
             Instant::now() < deadline,
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(after_hold(resumed)).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
     for player in [1, 2] {
@@ -2443,13 +2454,14 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
     );
     assert!(frames[0] > 0, "player 1 showed no frame before it failed");
     let before = frames[1];
+    let resumed = Instant::now();
     while frames[1] < before + 24 {
         assert!(
             Instant::now() < deadline,
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(after_hold(resumed)).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
     for player in [1, 2] {

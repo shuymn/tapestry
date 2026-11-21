@@ -646,14 +646,13 @@ fn a_movie_admitted_behind_its_clock_draws_no_earlier_frame() {
         );
     }
     assert!(planes.luma[0].is_empty(), "nothing taken");
-    assert!(m.stamps()[0].is_none());
     // The due frame at 766 667 µs, shown until 800 ms.
     a.publish_until(5, 766_667, 800_000, 46);
     assert!(matches!(
         m.frame(&mut planes, 790_000, start)[0],
         MovieShow::Frame { .. }
     ));
-    assert_eq!(m.stamps()[0], Some(766_667));
+    assert!(planes.luma[0].iter().all(|&v| v == 46), "the due frame");
     // A stall: the clock runs on to 2 s while the ring refills with frames
     // from 800 ms.
     for (seq, id) in (6..=9).zip(50..) {
@@ -670,5 +669,5 @@ fn a_movie_admitted_behind_its_clock_draws_no_earlier_frame() {
         m.frame(&mut planes, 2_000_000, start)[0],
         MovieShow::Frame { .. }
     ));
-    assert_eq!(m.stamps()[0], Some(1_983_333));
+    assert!(planes.luma[0].iter().all(|&v| v == 60), "the due frame");
 }

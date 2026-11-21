@@ -54,7 +54,10 @@
 //! A frame is shown until its successor is due: the worker publishes each
 //! frame with the stamp of the frame after it (its `until`, once it has
 //! decoded that frame; [`UNTIL_END`] for a video's last), and the game
-//! writes the media time it shows at each peek in [`DUE_WORD`]. A frame
+//! writes the media time it shows at each peek in [`DUE_WORD`], then the
+//! run it shows in [`DUE_RUN_WORD`], so the worker reads a time only of
+//! the run it plays (a seek's run never drops frames by the time an
+//! earlier run reached). A frame
 //! whose successor is already due is behind the clock: the worker drops
 //! it rather than publish it, and a peek frees one still in the ring
 //! unread and finds nothing due ([`Peek::behind`]), so a frame behind the
@@ -65,7 +68,8 @@
 //! [`WATERMARK_WORD`], the watermark, then the worker's supervision words,
 //! the decoder's progress at [`PROGRESS_WORD`] and its [`State`] at
 //! [`STATE_WORD`], which the game reads only to supervise the worker
-//! ([`supervision`]), then the game's due time at [`DUE_WORD`]), then the
+//! ([`supervision`]), then the game's due time at [`DUE_WORD`] and its
+//! run at [`DUE_RUN_WORD`]), then the
 //! slots, each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its
 //! own index, its frame's bytes and its `until`) followed by its frame: the
 //! luma plane, then
@@ -134,16 +138,26 @@ pub const STATE_WORD: usize = 8;
 /// [`NOTHING_DUE`] until the first peek.
 pub const DUE_WORD: usize = 9;
 
+/// The header word holding the run of the time in [`DUE_WORD`]: the game
+/// writes it after that time at each peek, 0 until the first.
+pub const DUE_RUN_WORD: usize = 10;
+
 /// [`DUE_WORD`]'s value before the game's first peek: no frame is due.
 pub const NOTHING_DUE: i64 = i64::MIN;
 
 /// The `until` of a video's last frame: no frame follows it.
 pub const UNTIL_END: i64 = i64::MAX;
 
-/// The media time the game showed last, from `ring`'s [`DUE_WORD`];
-/// `None` when the ring does not hold the header.
+/// The media time the game showed last in run `run`, from `ring`'s
+/// [`DUE_WORD`]; `None` when the game's last peek was of another run (or
+/// none yet) or the ring does not hold the header. The game writes the
+/// time before its run, so a run read here is never older than the time
+/// read after it.
 #[must_use]
-pub fn shown<W: Words + ?Sized>(ring: &W) -> Option<i64> {
+pub fn shown<W: Words + ?Sized>(ring: &W, run: u64) -> Option<i64> {
+    if word(ring, DUE_RUN_WORD)?.load(Ordering::Acquire) != run {
+        return None;
+    }
     Some(word(ring, DUE_WORD)?.load(Ordering::Acquire).cast_signed())
 }
 
@@ -498,6 +512,7 @@ impl Reader {
             (PROGRESS_WORD, 0),
             (STATE_WORD, 0),
             (DUE_WORD, NOTHING_DUE.cast_unsigned()),
+            (DUE_RUN_WORD, 0),
         ];
         for (i, v) in header {
             if let Some(w) = word(ring, i) {
@@ -586,6 +601,9 @@ impl Reader {
         }
         if let Some(w) = word(ring, DUE_WORD) {
             w.store(due.cast_unsigned(), Ordering::Release);
+        }
+        if let Some(w) = word(ring, DUE_RUN_WORD) {
+            w.store(self.run, Ordering::Release);
         }
         let peeked = self.scan(ring, due);
         match peeked {

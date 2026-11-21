@@ -255,10 +255,14 @@ struct Drawn {
     staged: AtomicU64,
     /// When it first freed a slot.
     first_free: Mutex<Option<Instant>>,
+    /// How many times slower than real time its media time runs (0 and 1
+    /// alike: real time).
+    slow: AtomicU64,
 }
 
 /// The render side's stand-in for one movie: a reader polling its ring
-/// every 4 ms (240 Hz) at the media time since its first poll, taking the
+/// every 4 ms (240 Hz) at the media time since its first poll (slowed
+/// when told), taking the
 /// frame due, telling the session the slots it freed and the movie its
 /// first frame; a fault loses the movie, a lost movie is no more read.
 struct Render {
@@ -279,6 +283,15 @@ impl Render {
             drawn,
             thread: Some(thread),
         }
+    }
+
+    /// Draws `movie` with its media time running `slow` times slower than
+    /// real time.
+    fn start_slow(movie: &Arc<Movie>, slow: u64) -> Self {
+        let render = Self::start(movie, true);
+        render.drawn.slow.store(slow, Ordering::Release);
+        render.release();
+        render
     }
 
     fn staged(&self) -> u64 {
@@ -325,7 +338,8 @@ fn draw(movie: &Movie, drawn: &Drawn) {
         }
         let Some(r) = reader.as_mut() else { continue };
         let origin = *origin.get_or_insert_with(Instant::now);
-        let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
+        let slow = drawn.slow.load(Ordering::Acquire).max(1);
+        let due = i64::try_from(origin.elapsed().as_micros() / u128::from(slow)).unwrap();
         match read_tight(r, live.ring.words(), due, &mut frame) {
             Ok((taken, freed)) => {
                 if taken.is_some() {
@@ -701,12 +715,14 @@ fn a_decoder_with_no_first_frame_is_lost_from_its_play() {
 #[test]
 fn skipped_frames_count_as_progress() {
     // Each frame's conversion takes 1 s: the progress word rises at each
-    // decoded frame, a second before the frame is published.
+    // decoded frame, a second before the frame is published. The media
+    // time runs 100 times slower, so no frame is behind it and dropped
+    // (design.md "Rendering and Skins", video frames).
     let rig = Rig::serving(&["slow-convert=1000"]);
     rig.session.enter(1);
     let movie = Movie::new(1);
     rig.open(&movie, true);
-    let render = Render::start(&movie, false);
+    let render = Render::start_slow(&movie, 100);
     let live = until(LAUNCH, || movie.live().is_some()).expect("no ring");
     let words = movie.live().unwrap().ring.words();
     // When the progress word and the watermark reached each count.

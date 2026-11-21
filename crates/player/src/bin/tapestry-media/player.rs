@@ -12,9 +12,12 @@
 //! decodes one frame ahead, so it publishes each frame with its
 //! successor's stamp, until which it is shown (a video's last frame with
 //! none), and drops a frame whose successor the game's due time has
-//! already reached rather than publish it: at the start, after a wait for
-//! a slot and whenever its decoding falls behind, the ring receives no
-//! frame behind the game's clock. It
+//! already reached in the run it plays rather than publish it: at the
+//! start, after a wait for a slot and whenever its decoding falls behind,
+//! the ring receives no frame behind the game's clock. A decode ahead that
+//! fails (a decoder error, a frame over the caps, a refused restart) ends
+//! the frames: the frame held is published as the last, and the failure is
+//! answered after it, as before a frame was decoded ahead. It
 //! answers the end of the video, a seek and a failure; a failed or refused
 //! player only waits to be closed. A looping play starts again at the
 //! video's start at each end, in the same run, its stamps rising on, and
@@ -198,6 +201,7 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         seq: 0,
         pending: None,
         until: None,
+        failing: None,
         ended: false,
     };
     let stopped = playing.play(rx, out);
@@ -239,6 +243,9 @@ struct Playing {
     /// The stamp of the frame in `next` once decoded ([`UNTIL_END`] when
     /// the video ended after `frame`): `frame`'s `until`.
     until: Option<i64>,
+    /// The failure of the decode ahead, answered once the frame held is
+    /// published (with [`UNTIL_END`]) or a seek drops it.
+    failing: Option<(Failure, i32)>,
     /// The run's video has ended.
     ended: bool,
 }
@@ -284,6 +291,9 @@ impl Playing {
     /// Positions the video at `at` µs for run `run` and answers seek `id`
     /// with where it landed, or that nothing is at or after it.
     fn seek(&mut self, id: u32, run: u64, at: i64, out: &Out) -> Result<(), (Failure, i32)> {
+        if let Some(failed) = self.failing.take() {
+            return Err(failed);
+        }
         self.run = run;
         self.floor = at;
         self.last = None;
@@ -363,17 +373,22 @@ impl Playing {
             return Ok(());
         };
         let Some(until) = self.until else {
-            self.until = match self.decode(true, Some(stamp))? {
-                Decoded::Frame(next) => Some(next),
-                Decoded::Skipped => None,
-                Decoded::End => Some(UNTIL_END),
+            self.until = match self.decode(true, Some(stamp)) {
+                Ok(Decoded::Frame(next)) => Some(next),
+                Ok(Decoded::Skipped) => None,
+                Ok(Decoded::End) => Some(UNTIL_END),
+                // The frame held goes out as the last; the failure after it.
+                Err(failed) => {
+                    self.failing = Some(failed);
+                    Some(UNTIL_END)
+                }
             };
             return Ok(());
         };
         let words = self.view.words();
         // Its successor already due: behind the game's clock, dropped
         // unpublished, the successor next.
-        if shown(words).is_some_and(|due| behind(until, due)) {
+        if shown(words, self.run).is_some_and(|due| behind(until, due)) {
             self.advance(until);
             return Ok(());
         }
@@ -395,6 +410,9 @@ impl Playing {
         if until == UNTIL_END {
             self.pending = None;
             self.until = None;
+            if let Some(failed) = self.failing.take() {
+                return Err(failed);
+            }
             self.end(out);
         } else {
             self.advance(until);
