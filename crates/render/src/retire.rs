@@ -514,6 +514,11 @@ impl Retirements {
         Some(i)
     }
 
+    /// Whether an entry is free to reserve.
+    pub(super) fn has_free(&self) -> bool {
+        self.entries.iter().any(|e| matches!(e, Entry::Free))
+    }
+
     /// The entry reserved for `hold`, if one is.
     pub(super) fn reserved(&self, hold: Hold) -> Option<usize> {
         self.entries

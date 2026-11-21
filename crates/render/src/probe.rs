@@ -389,8 +389,19 @@ static PASS: AtomicU8 = AtomicU8::new(PASS_OTHER);
 /// The counter's scope: 0 off, 1 the uploader's and stagings' blocking
 /// waits, 2 those and the frame's own pacing (a control).
 static GPU_WAITS: AtomicU8 = AtomicU8::new(0);
-/// The waits counted: each one's pass kind and length in µs.
-static GPU_WAIT_LOG: std::sync::Mutex<Vec<(u8, u64)>> = std::sync::Mutex::new(Vec::new());
+/// A blocking GPU wait counted ([`count_gpu_waits`]): its pass's kind,
+/// how long it took, and the bound it was asked with (`None` unbounded),
+/// both in µs. The two are kept apart: a wait past its bound is the
+/// scheduler's lateness or a stall, which a test judges, never clipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuWait {
+    pub pass: u8,
+    pub elapsed_us: u64,
+    pub bound_us: Option<u64>,
+}
+
+/// The waits counted.
+static GPU_WAIT_LOG: std::sync::Mutex<Vec<GpuWait>> = std::sync::Mutex::new(Vec::new());
 /// Room the log is given as counting starts; a wait past it is dropped.
 const GPU_WAIT_ROOM: usize = 65_536;
 
@@ -420,19 +431,18 @@ pub fn count_gpu_waits(scope: Option<bool>) {
     );
 }
 
-/// The waits counted so far: each one's pass kind and length in µs.
-pub fn gpu_waits() -> Vec<(u8, u64)> {
+/// The waits counted so far.
+pub fn gpu_waits() -> Vec<GpuWait> {
     GPU_WAIT_LOG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 
-/// Counts a blocking GPU wait of `took` that began `pacing` (the frame's
-/// own) or not, while counting is on and its scope takes it. A bounded
-/// wait is counted at most its bound: a thread descheduled past it is the
-/// scheduler's lateness, not a longer wait.
-pub(crate) fn gpu_wait(took: Duration, pacing: bool) {
+/// Counts a blocking GPU wait of `took`, asked with `bound` (`None`
+/// unbounded), that began `pacing` (the frame's own) or not, while
+/// counting is on and its scope takes it.
+pub(crate) fn gpu_wait(took: Duration, bound: Option<Duration>, pacing: bool) {
     let scope = GPU_WAITS.load(Ordering::Relaxed);
     if scope == 0 || (pacing && scope < 2) {
         return;
@@ -440,10 +450,12 @@ pub(crate) fn gpu_wait(took: Duration, pacing: bool) {
     let mut log = GPU_WAIT_LOG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
     if log.len() < log.capacity() {
-        log.push((
-            PASS.load(Ordering::Relaxed),
-            u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
-        ));
+        log.push(GpuWait {
+            pass: PASS.load(Ordering::Relaxed),
+            elapsed_us: us(took),
+            bound_us: bound.map(us),
+        });
     }
 }

@@ -174,6 +174,11 @@ pub(super) struct Faults {
     pub(crate) lose_in_staging: AtomicBool,
     /// A result-kind staging was left stepping by its last look.
     pub(crate) result_stepping: AtomicBool,
+    /// A result-kind staging that creates an array of its own is taken
+    /// first at a boundary its allowance admits, once it has room, as the
+    /// menu screen's renderer answers (`install_creates`, `install_room`);
+    /// at once otherwise.
+    pub(crate) step_creations: AtomicBool,
 }
 
 impl Recorded {
@@ -392,6 +397,12 @@ impl Screen for Recorded {
             return answer;
         }
         self.menu.install(kind, skin, request)
+    }
+    fn install_creates(&self, kind: ScreenKind, skin: &Arc<render::SkinBundle>) -> bool {
+        self.faults.step_creations.load(Ordering::Acquire) && self.menu.install_creates(kind, skin)
+    }
+    fn install_room(&self, kind: ScreenKind, skin: &Arc<render::SkinBundle>) -> bool {
+        !self.faults.step_creations.load(Ordering::Acquire) || self.menu.install_room(kind, skin)
     }
     fn install_stepped(
         &mut self,
@@ -4482,5 +4493,118 @@ fn a_result_bundle_is_staged_in_the_uploaders_steps() {
     assert!(wait_until(
         || rig.link.result_status().installed == Some(skin.atlas_id())
     ));
+    rig.link.exit();
+}
+
+/// The result frames' paths a sink saw, in order.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct Paths(Arc<Mutex<Vec<Option<crate::measure::ResultPath>>>>);
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for Paths {
+    fn frame(&mut self, _screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if drawn.timing.presented() {
+            self.0.lock().unwrap().push(drawn.result.map(|r| r.path));
+        }
+    }
+}
+
+/// A view switch whose union fits only once a retired array is destroyed
+/// (the installation before the lifetime, charged the whole shared limit,
+/// retired at the first view's commit): its creation is not taken while
+/// that entry stands, so it waits on no destruction in its call; the
+/// shown view draws on every frame meanwhile, with no pending
+/// presentation or built-in page; the entry is destroyed at a boundary of
+/// its own, the creation comes at a later one, and no presenting pass
+/// waits for the GPU (V19 (k), the switch; V9b (c)).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
+    use crate::measure::ResultPath;
+    use crate::render_side::HeavyKind;
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let paths = Paths::default();
+    let rig = Rig::with_sink(Box::new(paths.clone()));
+    rig.faults.step_creations.store(true, Ordering::Release);
+    rig.faults
+        .charge_result
+        .store(render::SHARED_TEXELS, Ordering::Release);
+    rig.link.hold_destruction(true);
+    let lifetime = installed(&rig, &x0);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((1, true))),
+        "the first view: {:?}",
+        rig.link.result_status()
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.link.record_heavy(256);
+    render::probe::count_gpu_waits(Some(false));
+    let from = paths.0.lock().unwrap().len();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    // The retired entry stands: no creation, the first view drawn.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        rig.link.result_status().shown,
+        Some((1, true)),
+        "the switch committed while its admission needed a destruction no boundary made"
+    );
+    assert!(
+        rig.link
+            .heavy_record()
+            .iter()
+            .all(|r| r.kind != HeavyKind::ResultCreation),
+        "the switch's creation taken with no room: {:?}",
+        rig.link.heavy_record()
+    );
+    let waiting = paths.0.lock().unwrap().len();
+    assert!(waiting > from + 3, "frames stopped while the switch waited");
+    // The boundaries destroy it, then the creation follows.
+    rig.link.hold_destruction(false);
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "the switch: {:?}",
+        rig.link.result_status()
+    );
+    let presenting: Vec<_> = render::probe::gpu_waits()
+        .into_iter()
+        .filter(|w| w.pass == render::probe::PASS_PRESENTING)
+        .collect();
+    render::probe::count_gpu_waits(None);
+    let heavy = rig.link.heavy_record();
+    let destroyed = heavy
+        .iter()
+        .position(|r| r.kind == HeavyKind::Destruction)
+        .expect("the retired entry destroyed at a boundary");
+    let created = heavy
+        .iter()
+        .position(|r| r.kind == HeavyKind::ResultCreation)
+        .expect("the switch's creation at a boundary");
+    assert!(
+        destroyed < created && heavy[created].start >= heavy[destroyed].end,
+        "the creation before the destruction, or in its boundary: {heavy:?}"
+    );
+    let seen = paths.0.lock().unwrap().clone();
+    let seen = seen.get(from..).unwrap_or(&[]);
+    assert!(
+        seen.iter().all(|p| *p == Some(ResultPath::Skin)),
+        "a frame not the shown view's while the switch staged: {seen:?}"
+    );
+    assert_eq!(presenting, Vec::new(), "a blocking wait presenting");
     rig.link.exit();
 }

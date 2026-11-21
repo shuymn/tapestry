@@ -337,8 +337,11 @@ pub struct MenuScreen {
     result_table: Option<Result<skin_model::chart_image::ChartTable, RenderError>>,
     /// The font, read once per screen: when it is built on a screen that
     /// draws menus, and on a screen for plays only when its first page
-    /// comes.
+    /// comes, or ahead of a page known to come ([`Screen::read_font_ahead`]).
     fonts: Option<Fonts>,
+    /// The font being read on a thread of its own, ahead of the page that
+    /// needs it.
+    font_ahead: Option<FontJob>,
     /// The text prepared for this renderer, and the page it shows.
     text: Option<MenuText>,
     /// The cursor's line of the prepared page.
@@ -500,6 +503,30 @@ fn fields_changed(old: &ChosenChart, new: &ChosenChart) -> TextSlots {
     })
 }
 
+/// The runtime fonts read when a page needed one (`[0]`), and those read
+/// ahead on their own thread (`[1]`) (tests).
+#[cfg(test)]
+pub(crate) static FONT_READS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// The font read on a thread of its own.
+type FontJob = std::thread::JoinHandle<Result<Fonts, render::text::TextError>>;
+
+/// The runtime font for a page that needs it now: the one read ahead
+/// (`ahead`) once its thread ends, else read here, in the frame.
+fn read_font(ahead: &mut Option<FontJob>) -> Result<Fonts, render::text::TextError> {
+    if let Some(job) = ahead.take()
+        && let Ok(fonts) = job.join()
+    {
+        return fonts;
+    }
+    #[cfg(test)]
+    FONT_READS[0].fetch_add(1, Ordering::SeqCst);
+    Fonts::runtime()
+}
+
 impl MenuScreen {
     /// `renderer`, drawing menus in `fonts`; a screen for plays only has
     /// none, draws a black launch screen, and reads the font when it first
@@ -511,6 +538,7 @@ impl MenuScreen {
             result_chart: None,
             result_table: None,
             fonts,
+            font_ahead: None,
             text: None,
             cursor: None,
             underline: None,
@@ -826,7 +854,7 @@ impl MenuScreen {
     ) -> Result<Option<[f32; 4]>, RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
-            none => none.insert(Fonts::runtime()?),
+            none => none.insert(read_font(&mut self.font_ahead)?),
         };
         let (blocks, area) = lay_out(fonts, page, left, top);
         let refs: Vec<&TextBlock> = blocks.iter().collect();
@@ -871,7 +899,7 @@ impl MenuScreen {
     ) -> Result<(), RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
-            none => none.insert(Fonts::runtime()?),
+            none => none.insert(read_font(&mut self.font_ahead)?),
         };
         let mut page = strip.page();
         if let Some(text) = script
@@ -1427,6 +1455,25 @@ impl Screen for MenuScreen {
         self.renderer.install_creates(kind, skin)
     }
 
+    fn install_room(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        self.renderer.install_room(kind, skin)
+    }
+
+    fn read_font_ahead(&mut self) {
+        if self.fonts.is_some() || self.font_ahead.is_some() {
+            return;
+        }
+        self.font_ahead = std::thread::Builder::new()
+            .name("font".to_owned())
+            .spawn(|| {
+                let fonts = Fonts::runtime();
+                #[cfg(test)]
+                FONT_READS[1].fetch_add(1, Ordering::SeqCst);
+                fonts
+            })
+            .ok();
+    }
+
     fn begin_result_view(
         &mut self,
         skin: &Arc<SkinBundle>,
@@ -1504,7 +1551,7 @@ impl Screen for MenuScreen {
     fn prepare_result_strip(&mut self, which: usize, lines: &[&str]) -> Result<(), RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
-            none => none.insert(Fonts::runtime()?),
+            none => none.insert(read_font(&mut self.font_ahead)?),
         };
         let page = MenuPage {
             lines: lines

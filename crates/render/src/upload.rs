@@ -374,7 +374,7 @@ impl InFlight {
             });
             #[cfg(feature = "dev-tools")]
             if delay.is_none() {
-                crate::probe::gpu_wait(start.elapsed().min(timeout), false);
+                crate::probe::gpu_wait(start.elapsed(), Some(timeout), false);
             }
             match polled {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
@@ -386,7 +386,7 @@ impl InFlight {
             let due = d.saturating_sub(self.at.elapsed());
             let left = timeout.saturating_sub(start.elapsed());
             std::thread::sleep(due.min(left));
-            crate::probe::gpu_wait(start.elapsed().min(timeout), false);
+            crate::probe::gpu_wait(start.elapsed(), Some(timeout), false);
             return Ok(self.seen(Some(d)));
         }
         let _ = start;

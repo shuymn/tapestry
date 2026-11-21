@@ -612,6 +612,16 @@ pub trait Screen: Send {
         let _ = (kind, skin);
         false
     }
+    /// Whether staging `skin` as `kind`'s now would destroy no filled
+    /// retirement entry in its call ([`render::Renderer::install_room`]);
+    /// always by default.
+    fn install_room(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        let _ = (kind, skin);
+        true
+    }
+    /// Begins reading the font a page will need, off the frame, when the
+    /// screen has none (a screen for plays only); nothing by default.
+    fn read_font_ahead(&mut self) {}
     /// Whether a loading text is in the uploader's hand; none by default.
     fn loading_text_held(&self) -> bool {
         false
@@ -2147,6 +2157,23 @@ struct Shared {
     /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     step_records: Mutex<Vec<StepRecord>>,
+    /// The messages the render thread took, each counted before its
+    /// handler runs (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    messages: AtomicU64,
+    /// Each result view's staging withdrawn with its side (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    withdrawals: Mutex<Vec<Withdrawal>>,
+    /// The result view stagings ended, ready or not (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    stagings_ended: AtomicU64,
+    /// No boundary destroys a filled entry while set (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    destruction_held: AtomicBool,
+    /// After the next frame's pacing, the hold's clock set to this and
+    /// the call made (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    after_pacing: PacingHook,
     /// The render thread's own allocations so far, read as each held
     /// iteration begins (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2346,6 +2373,16 @@ impl Shared {
             refuse_step: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
             step_records: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "dev-tools"))]
+            messages: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            withdrawals: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "dev-tools"))]
+            stagings_ended: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            destruction_held: AtomicBool::new(false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            after_pacing: PacingHook::default(),
             #[cfg(all(test, feature = "dev-tools"))]
             held_allocations: AtomicU64::new(0),
             #[cfg(test)]
@@ -4074,6 +4111,49 @@ impl RenderLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The messages the render thread took so far, each counted before
+    /// its handler runs (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn messages_taken(&self) -> u64 {
+        self.shared.messages.load(Ordering::SeqCst)
+    }
+
+    /// The result view stagings withdrawn with their side so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn withdrawals(&self) -> Vec<Withdrawal> {
+        self.shared
+            .withdrawals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The result view stagings ended so far, ready or not (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn stagings_ended(&self) -> u64 {
+        self.shared.stagings_ended.load(Ordering::SeqCst)
+    }
+
+    /// After the next frame's pacing, before what it draws is chosen,
+    /// sets the hold's clock to `elapsed` and calls `then` on the render
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn after_next_pacing(&self, elapsed: i64, then: Box<dyn FnOnce() + Send>) {
+        *self
+            .shared
+            .after_pacing
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((elapsed, then));
+    }
+
+    /// Holds every boundary's destruction of a filled entry while `on`
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn hold_destruction(&self, on: bool) {
+        self.shared.destruction_held.store(on, Ordering::SeqCst);
     }
 
     /// The held iterations so far, each counted as it begins (tests).
@@ -7290,6 +7370,23 @@ impl Run {
                     i64::from(idle),
                 );
             }
+            // A result left (its lifetime ended, or another begun) is
+            // withdrawn before anything else of this turn: its staging
+            // retires into its own entry before the next screen's message
+            // is handled or a boundary writes it (design.md "Rendering and
+            // Skins", the result's hold). Outside Result it is `None`: one
+            // test.
+            if self
+                .result
+                .as_ref()
+                .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+            {
+                self.drop_result();
+            }
+            #[cfg(all(test, feature = "dev-tools"))]
+            if msg.is_ok() {
+                self.shared.messages.fetch_add(1, Ordering::SeqCst);
+            }
             // The game's next screen or attempt ends READY's cutoff before
             // its handler runs, and the result's wait for its first
             // picture (design.md "Memory Budget", READY's condition).
@@ -7465,6 +7562,11 @@ impl Run {
                         from,
                         held: true,
                     });
+                    // The pending presentation's font, read off the frame
+                    // before its first frame needs it.
+                    if let Some(s) = &mut self.screen {
+                        s.read_font_ahead();
+                    }
                     continue;
                 }
                 Ok(RenderMsg::ResultChanged) => {
@@ -8137,9 +8239,10 @@ impl Run {
             // change or a lost device, never to resume.
             if matches!(mode, Mode::Result)
                 && self.result_hold.is_some_and(|h| h.held)
-                && self.result.as_ref().is_some_and(|s| {
-                    s.presented.is_none() && s.prepared.is_none() && s.staging.is_some()
-                })
+                && self
+                    .result
+                    .as_ref()
+                    .is_some_and(|s| self.first_view_waits(s))
             {
                 let lost = self.screen.as_ref().is_some_and(|s| s.device_lost());
                 match self.result_held().filter(|_| !lost) {
@@ -8383,6 +8486,15 @@ impl Run {
                 self.drop_result();
                 mode = Mode::Idle;
                 continue;
+            }
+            // The result's hold's bound passed during the frame's pacing:
+            // this frame draws the pending presentation, never one more
+            // outgoing frame (design.md "Rendering and Skins", the
+            // result's hold). In play it is `None`: one test.
+            #[cfg(all(test, feature = "dev-tools"))]
+            self.after_pacing();
+            if !matches!(mode, Mode::Result | Mode::ResultPending) && self.result_hold_passed() {
+                mode = Mode::ResultPending;
             }
             // A test holds a result frame here, after its lifetime's
             // check: a new lifetime may begin before its commit point.
@@ -9306,12 +9418,13 @@ impl Run {
             self.wait_laid = pending_frame && drawn.is_ok();
             #[cfg(feature = "dev-tools")]
             crate::dev::loop_probe::mark("draw1", 0);
-            // A result or end frame lost as a device loss (dev-tools: a
-            // recovery while a result shows).
+            // A result or end frame, or the result's pending presentation,
+            // lost as a device loss (dev-tools: a recovery while a result
+            // shows or is prepared).
             #[cfg(feature = "dev-tools")]
             let drawn = match drawn {
                 Ok(_)
-                    if matches!(mode, Mode::Result | Mode::End)
+                    if matches!(mode, Mode::Result | Mode::End | Mode::ResultPending)
                         && crate::dev::lose_result_frame() =>
                 {
                     Err(RenderError::SurfaceLost)
@@ -9803,7 +9916,7 @@ impl Run {
     fn result_held(&self) -> Option<TimeUs> {
         let h = self.result_hold.filter(|h| h.held)?;
         let side = self.result.as_ref()?;
-        if side.presented.is_some() || side.prepared.is_some() || self.screen.is_none() {
+        if !self.first_view_waits(side) || self.screen.is_none() {
             return None;
         }
         let now = self.clock.now();
@@ -9812,6 +9925,35 @@ impl Run {
         (held_wait(now, h.from, first_frame_bound(&self.shared)).is_some()
             && self.image.valid(notices_of(self.extent.as_ref())))
         .then_some(h.from)
+    }
+
+    /// Whether `side`'s first view is still to come: none presented, and
+    /// none prepared that its commit point would commit (a leaving command
+    /// pinned before the first commit discards the view prepared, which is
+    /// then never presented). The outgoing picture or the pending
+    /// presentation stays meanwhile, never the built-in end page.
+    fn first_view_waits(&self, side: &ResultSide) -> bool {
+        side.presented.is_none()
+            && (side.prepared.is_none() || {
+                let b = self.shared.barrier();
+                b.lifetime == side.lifetime && b.fadeout.is_some()
+            })
+    }
+
+    /// The hook after a frame's pacing, if one is set (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn after_pacing(&self) {
+        let hook = self
+            .shared
+            .after_pacing
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((elapsed, then)) = hook {
+            self.shared.hold_elapsed.store(elapsed, Ordering::SeqCst);
+            then();
+        }
     }
 
     /// Whether a test holds the result view's staging unwritten (tests):
@@ -10052,6 +10194,10 @@ impl Run {
     /// staging may, and not before a loading lifetime's first presented
     /// frame.
     fn destroy_ok(&self, mode: &Mode) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.shared.destruction_held.load(Ordering::SeqCst) {
+            return false;
+        }
         !self.cut_off
             && !matches!(mode, Mode::Play { .. })
             && !self.result_unacked
@@ -10658,7 +10804,17 @@ impl Run {
             .result
             .as_ref()
             .and_then(|r| r.staging.as_ref())
-            .is_some_and(|s| !s.taken)
+            .is_some_and(|s| {
+                // Owed once it can be admitted with no destruction in its
+                // call: until then the boundaries' retirement path frees
+                // the room it needs (design.md "Memory Budget").
+                !s.taken
+                    && s.held.payload.skin.as_ref().is_none_or(|b| {
+                        self.screen
+                            .as_ref()
+                            .is_some_and(|sc| sc.install_room(ScreenKind::Result, b))
+                    })
+            })
         {
             Some(Creation::ResultView)
         } else {
@@ -12547,6 +12703,33 @@ pub struct StepRecord {
     pub at: Instant,
 }
 
+/// A hook run after a frame's pacing (tests): the hold's clock to set,
+/// and the call.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Default)]
+struct PacingHook(Mutex<Option<(i64, PacingCall)>>);
+
+/// The call a [`PacingHook`] makes (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+type PacingCall = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl std::fmt::Debug for PacingHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PacingHook")
+    }
+}
+
+/// A result view's staging withdrawn with its side (tests): the messages
+/// the render thread had taken before, and the filled retirement entries
+/// before and after.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Withdrawal {
+    pub messages: u64,
+    pub filled: [u32; 2],
+}
+
 /// How a result view's staging ended.
 enum StagingEnd {
     /// Its steps completed: its text staged, or the skin's refusal of it.
@@ -12831,7 +13014,18 @@ impl Run {
             && let Some(screen) = &mut self.screen
         {
             if let Some(st) = side.staging {
+                #[cfg(all(test, feature = "dev-tools"))]
+                let filled = screen.filled();
                 st.withdraw(screen.as_mut());
+                #[cfg(all(test, feature = "dev-tools"))]
+                self.shared
+                    .withdrawals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Withdrawal {
+                        messages: self.shared.messages.load(Ordering::SeqCst),
+                        filled: [filled, screen.filled()],
+                    });
             }
             if let Some(token) = side.prepared.and_then(|p| p.token) {
                 screen.discard_token(token);
@@ -13450,6 +13644,8 @@ impl Run {
         if let Some(end) = ended
             && let Some(st) = side.staging.take()
         {
+            #[cfg(all(test, feature = "dev-tools"))]
+            self.shared.stagings_ended.fetch_add(1, Ordering::SeqCst);
             let StagingView {
                 mut held,
                 request,
@@ -13771,12 +13967,12 @@ impl Run {
             return ResultDrawn::BuiltIn;
         };
         let origin = side.origin;
+        // No view presented: the first one stages, or a leaving command
+        // pinned before it was committed. The pending presentation, never
+        // the built-in end page (design.md "Rendering and Skins", the
+        // result's hold).
         let Some(h) = side.presented.as_mut() else {
-            return if side.staging.is_some() {
-                ResultDrawn::Pending
-            } else {
-                ResultDrawn::BuiltIn
-            };
+            return ResultDrawn::Pending;
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
             let frame = skin_model::ResultFrame {

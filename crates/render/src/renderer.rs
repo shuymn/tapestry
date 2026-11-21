@@ -2616,6 +2616,34 @@ impl Renderer {
             && self.committed_atlas(kind) != Some(bundle.atlas_id())
     }
 
+    /// Whether staging `bundle` as `kind`'s now would destroy no filled
+    /// retirement entry in its call: neither its admission (the first step
+    /// of its order, or the pool's reduction after it) nor its entry's
+    /// reservation needs one destroyed where destruction is allowed. A
+    /// stepped staging that does waits until the boundaries' retirement
+    /// path has destroyed what it needs, each destruction at its own
+    /// boundary once its last use completes, never waiting for the GPU in
+    /// its call (design.md "Memory Budget", "Load Pipeline"). Reads only.
+    #[must_use]
+    pub fn install_room(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        if !self.destroy_allowed
+            || self
+                .committed_installation(kind)
+                .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return true;
+        }
+        let charged = self.retire.oldest(true).is_some();
+        let admits = match self.reclaim(kind, self.candidate_charge(kind, bundle), true) {
+            Reclaim::Fits | Reclaim::Refused(_) => true,
+            Reclaim::Destroy | Reclaim::Reduce(_) | Reclaim::ReleaseResult => !charged,
+        };
+        let reserves = !self.install_creates(kind, bundle)
+            || self.retire.has_free()
+            || self.retire.oldest(false).is_none();
+        admits && reserves
+    }
+
     /// Writes the staging of `request` to its end, waiting for each step,
     /// for a caller that answers at once ([`stage`](Self::stage),
     /// [`install`](Self::install)): only the staging's steps, never
@@ -9779,7 +9807,7 @@ impl Renderer {
                         Err(wgpu::PollError::Timeout)
                     );
                     #[cfg(feature = "dev-tools")]
-                    crate::probe::gpu_wait(p_paced.elapsed(), true);
+                    crate::probe::gpu_wait(p_paced.elapsed(), wait, true);
                     done
                 });
                 #[cfg(feature = "dev-tools")]
@@ -10371,7 +10399,7 @@ pub(crate) fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
         .map(|_| gpu.saw(made))
         .map_err(RenderError::Poll);
     #[cfg(feature = "dev-tools")]
-    crate::probe::gpu_wait(start.elapsed(), false);
+    crate::probe::gpu_wait(start.elapsed(), None, false);
     waited
 }
 
