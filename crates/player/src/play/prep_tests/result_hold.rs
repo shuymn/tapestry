@@ -77,6 +77,9 @@ struct Frames {
     armed: Arc<AtomicBool>,
     /// No frame is read back while set: its texels count as lit.
     blind: Arc<AtomicBool>,
+    /// Each frame read back is searched for the strip's glyphs while set
+    /// (the search costs every frame's sink, so only the test asking).
+    glyphs: Arc<AtomicBool>,
     /// The result's hold's outgoing phases ended, as the record marks them.
     holds: Arc<Mutex<Vec<crate::measure::HoldStamp>>>,
     log: Arc<Mutex<Vec<Frame>>>,
@@ -193,14 +196,17 @@ impl FrameSink for Recorder {
         let lit = if blind {
             usize::MAX
         } else {
+            let glyphs = self.0.glyphs.load(Ordering::Acquire);
             screen.read_back().map_or(0, |(w, h, pixels)| {
                 size = (w, h);
-                for (i, p) in pixels.chunks(4).enumerate() {
-                    if is_notice(p) {
-                        let (x, y) = (i as u32 % w, i as u32 / w);
-                        let b = &mut notice.1;
-                        *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
-                        notice.0 += 1;
+                if glyphs {
+                    for (i, p) in pixels.chunks(4).enumerate() {
+                        if is_notice(p) {
+                            let (x, y) = (i as u32 % w, i as u32 / w);
+                            let b = &mut notice.1;
+                            *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+                            notice.0 += 1;
+                        }
                     }
                 }
                 pixels
@@ -1885,6 +1891,7 @@ fn a_font_read_ending_across_a_resize_places_the_strip_for_the_new_size() {
     let (dir, a) = chart(Some(RED));
     on_warp_fonts(a.chart(), false, |rig, frames| {
         let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        frames.glyphs.store(true, Ordering::Release);
         let extent = Arc::new(crate::render_side::Extent::default());
         extent.publish(1_920, 1_080);
         rig.render.follow(&extent);
