@@ -120,9 +120,12 @@ struct Fake {
     /// A grant the render thread took (a frame wait or a grant check
     /// answered so) that no frame has drawn yet.
     granted: AtomicBool,
+    /// The test put a grant in [`GRANT`]: a frame is due from then until
+    /// the first frame drawn after the grant was taken, whoever took it.
+    armed: AtomicBool,
     /// Each movie boundary the render thread ran: the frames drawn before
-    /// it, and whether a frame was due then (a grant held, or the probe's
-    /// grant there to be found).
+    /// it, and whether a frame was due then (a grant held, or the test's
+    /// grant there to be found or taken and not drawn yet).
     boundaries: Mutex<Vec<(usize, bool)>>,
 }
 
@@ -168,6 +171,9 @@ impl Fake {
     fn frame(&self, kind: Kind) -> FrameTiming {
         let presented = !self.unpresented.load(Ordering::SeqCst);
         self.granted.store(false, Ordering::SeqCst);
+        if !GRANT.load(Ordering::SeqCst) {
+            self.armed.store(false, Ordering::SeqCst);
+        }
         let mut s = self.state();
         s.frames.push((kind, Instant::now(), presented));
         if presented {
@@ -212,8 +218,7 @@ impl Screen for Timed {
         granted
     }
     fn movie_boundary(&mut self) {
-        let due = self.0.granted.load(Ordering::SeqCst)
-            || (self.0.probe.load(Ordering::SeqCst) && GRANT.load(Ordering::SeqCst));
+        let due = self.0.granted.load(Ordering::SeqCst) || self.0.armed.load(Ordering::SeqCst);
         let frames = self.0.state().frames.len();
         self.0
             .boundaries
@@ -1929,6 +1934,7 @@ fn a_retained_grant_draws_its_frame_before_any_movie_boundary() {
 fn a_grant_found_draws_its_frame_before_any_movie_boundary() {
     let r = Rig::page();
     r.fake.probe.store(true, Ordering::SeqCst);
+    r.fake.armed.store(true, Ordering::SeqCst);
     GRANT.store(true, Ordering::SeqCst);
     let n = r.fake.state().frames.len();
     let f = Arc::clone(&r.fake);
