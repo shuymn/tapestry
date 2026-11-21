@@ -1754,6 +1754,15 @@ impl Screen for MenuScreen {
         }
     }
 
+    /// The movies' admission turn after a frame: the set held, whichever
+    /// screen's, admits a live movie that waited a turn
+    /// ([`crate::movie_frame::Movies::turn`]).
+    fn movie_turn(&mut self) {
+        if let Some((_, m)) = self.movies.get_mut() {
+            m.movies.turn(&mut self.renderer, std::time::Instant::now());
+        }
+    }
+
     fn begin_play(&mut self, anchor: i64) {
         self.movies.begin_play(anchor, &mut self.renderer);
     }

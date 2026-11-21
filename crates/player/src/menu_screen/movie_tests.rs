@@ -205,6 +205,43 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     assert_eq!(hub.open_sets(), 1);
 }
 
+/// A selection entry whose render loop never finds slack for the
+/// boundary (a grant ready at every pass): its live movie is admitted at
+/// the admission turn after its second frame, once, and shows from the
+/// third frame on, within its preparation deadline, never through the
+/// boundary.
+// Revert: `MenuScreen::movie_turn` admitting nothing -> "shown by the
+// third frame".
+#[test]
+fn a_selection_movie_without_slack_shows_after_its_admission_turn() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let selection = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    hub.supply([Some(clip(&[0])), None]);
+    let start = std::time::Instant::now();
+    s.enter_selection_movies(&selection, 7, TimeUs(0));
+    let mut shows = Vec::new();
+    for k in 0..6_i64 {
+        shows.push(s.selection_movies(TimeUs(k * 16_667))[0]);
+        s.movie_turn();
+    }
+    assert!(
+        start.elapsed() < crate::media_host::session::preparation_deadline(start) - start,
+        "within the deadline"
+    );
+    assert_eq!(shows[..2], [MovieShow::Nothing; 2], "{shows:?}");
+    assert!(
+        shows[2..]
+            .iter()
+            .all(|s| matches!(s, MovieShow::Frame { .. })),
+        "shown by the third frame: {shows:?}"
+    );
+    let (texels, _) = s.renderer.video_bytes();
+    assert_eq!(texels, 64 * 32 + 2 * 32 * 16, "its planes");
+}
+
 /// A WARP screen playing movies through `hub`, with the fixture
 /// selection skin installed when `installed` (kept alive by the folder
 /// returned).

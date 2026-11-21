@@ -22,7 +22,9 @@ use skin_model::bga::{BgaKey, BgaTable};
 use super::gate::Gate;
 use super::*;
 use crate::bga::{Answer, BgaMsg};
-use crate::render_side::{CutoffPhase, HeavyKind, Regime};
+use crate::media_host::session::Movie;
+use crate::movie_frame::Movies;
+use crate::render_side::{AttemptSkin, CutoffPhase, HeavyKind, Regime};
 
 /// Hang detection only.
 const BOUND: Duration = Duration::from_secs(20);
@@ -127,6 +129,32 @@ struct Fake {
     /// it, and whether a frame was due then (a grant held, or the test's
     /// grant there to be found or taken and not drawn yet).
     boundaries: Mutex<Vec<(usize, bool)>>,
+    /// The skin movies the screen holds (the movie tests'): polled by its
+    /// preparation, admitted at its boundary and its turn, drawn by its
+    /// selection frames.
+    movies: Mutex<Option<Movies>>,
+    /// Movies the next staging boundary puts in place, live with it.
+    staging_movies: Mutex<Option<Movies>>,
+    /// The next upload boundary looks for the frame's grant through its
+    /// gate, then ends a staging.
+    stage: AtomicBool,
+    /// A staging ended: the preparation may answer once its movies
+    /// settle.
+    staged: AtomicBool,
+    /// The preparation answers only once staged and its movies settled.
+    movie_prep: AtomicBool,
+    /// Each movie plane reservation: the frames drawn before it, whether
+    /// a frame was due then, whether a grant was held then, and where it
+    /// ran.
+    reserves: Mutex<Vec<(usize, bool, bool, &'static str)>>,
+    /// Each preparation poll: the frames drawn before it, whether a frame
+    /// was due then, and whether it polled movies.
+    polls: Mutex<Vec<(usize, bool, bool)>>,
+    /// When a selection frame first showed a movie frame.
+    movie_shown: Mutex<Option<Instant>>,
+    /// Every frame drawn puts the swap chain's grant back: every pass
+    /// finds one ready.
+    starve: AtomicBool,
 }
 
 /// The fake's swap chain grant while `Fake::probe` (one test uses it).
@@ -174,6 +202,10 @@ impl Fake {
         if !GRANT.load(Ordering::SeqCst) {
             self.armed.store(false, Ordering::SeqCst);
         }
+        if self.starve.load(Ordering::SeqCst) {
+            GRANT.store(true, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
         let mut s = self.state();
         s.frames.push((kind, Instant::now(), presented));
         if presented {
@@ -187,6 +219,73 @@ impl Fake {
             render::FrameOutcome::Retry
         };
         crate::render_side::timing_of(outcome)
+    }
+
+    /// Whether a frame is due: a grant held, or the test's grant there to
+    /// be found or taken and not drawn yet.
+    fn due(&self) -> bool {
+        self.granted.load(Ordering::SeqCst) || self.armed.load(Ordering::SeqCst)
+    }
+
+    /// Whether a grant is held: taken by a frame wait or a grant check, or
+    /// the test's taken, and no frame drawn since.
+    fn held(&self) -> bool {
+        self.granted.load(Ordering::SeqCst)
+            || (self.armed.load(Ordering::SeqCst) && !GRANT.load(Ordering::SeqCst))
+    }
+
+    /// `f` on the movies held, if any, with planes that note each
+    /// reservation as made `at`: what it returned.
+    fn with_movies<R>(
+        &self,
+        at: &'static str,
+        f: impl FnOnce(&mut Movies, &mut Noted<'_>) -> R,
+    ) -> Option<R> {
+        let mut movies = self.movies.lock().unwrap_or_else(PoisonError::into_inner);
+        let m = movies.as_mut()?;
+        Some(f(m, &mut Noted { fake: self, at }))
+    }
+}
+
+/// Movie planes that note each reservation on the fake: the frames
+/// drawn before it, whether a frame was due, and where it ran.
+struct Noted<'a> {
+    fake: &'a Fake,
+    at: &'static str,
+}
+
+impl crate::movie_frame::Planes for Noted<'_> {
+    fn reserve(&mut self, _slot: u32, _width: u32, _height: u32) {
+        let frames = self.fake.state().frames.len();
+        self.fake
+            .reserves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((frames, self.fake.due(), self.fake.held(), self.at));
+    }
+
+    fn release(&mut self, _slot: u32) {}
+
+    fn write(
+        &mut self,
+        _slot: u32,
+        width: u32,
+        height: u32,
+        fill: &mut crate::movie_frame::Fill<'_>,
+    ) -> bool {
+        let pitch = [width as usize, width.div_ceil(2) as usize];
+        let len = pitch[0] * height as usize + 2 * pitch[1] * height.div_ceil(2) as usize;
+        let mut bytes = vec![0_u8; len];
+        fill(
+            &mut |at, b| match bytes.get_mut(at..at + b.len()) {
+                Some(d) => {
+                    d.copy_from_slice(b);
+                    true
+                }
+                None => false,
+            },
+            pitch,
+        )
     }
 }
 
@@ -218,13 +317,69 @@ impl Screen for Timed {
         granted
     }
     fn movie_boundary(&mut self) {
-        let due = self.0.granted.load(Ordering::SeqCst) || self.0.armed.load(Ordering::SeqCst);
+        let due = self.0.due();
         let frames = self.0.state().frames.len();
         self.0
             .boundaries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((frames, due));
+        self.0
+            .with_movies("boundary", |m, p| m.admit(p, Instant::now()));
+    }
+    fn movie_turn(&mut self) {
+        self.0.with_movies("turn", |m, p| m.turn(p, Instant::now()));
+    }
+    fn prepare_attempt(
+        &mut self,
+        _a: &render::AttemptInput<'_>,
+        _skin: Option<&Arc<render::SkinBundle>>,
+        _request: u64,
+        _lifetime: Option<u64>,
+    ) -> Option<Result<Preparation, RenderError>> {
+        if !self.0.movie_prep.load(Ordering::SeqCst) {
+            return Some(Ok(Preparation::Ready));
+        }
+        let frames = self.0.state().frames.len();
+        let due = self.0.due();
+        let settled = self
+            .0
+            .with_movies("poll", |m, p| m.prepare(p, Instant::now()).0);
+        self.0
+            .polls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((frames, due, settled.is_some()));
+        (settled? && self.0.staged.load(Ordering::SeqCst)).then_some(Ok(Preparation::Ready))
+    }
+    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        let mut up = render::Uploaded {
+            bga: render::BgaStep::Idle,
+            staged: None,
+            text: None,
+            chart: None,
+            pages: None,
+        };
+        if self.0.stage.swap(false, Ordering::SeqCst) {
+            // The uploader checks its next step's write: a grant found
+            // there is the pass's, and the staging completes in the same
+            // pass, its movies live with it.
+            let _ = past.past();
+            let staged = self
+                .0
+                .staging_movies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            *self.0.movies.lock().unwrap_or_else(PoisonError::into_inner) = staged;
+            self.0.staged.store(true, Ordering::SeqCst);
+            up.staged = Some(render::StagingEnd::Ready(render::PreparedToken {
+                request: 1,
+                device: 0,
+                kind: ScreenKind::Play,
+            }));
+        }
+        up
     }
     fn grant_probe(&self) -> Option<render::GrantProbe> {
         self.0
@@ -259,6 +414,20 @@ impl Screen for Timed {
         _now: TimeUs,
         _app: skin_model::AppReadouts,
     ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
+        let now = Instant::now();
+        let shown = self.0.with_movies("frame", |m, p| {
+            matches!(
+                m.frame(p, i64::MAX, now)[0],
+                skin_model::movie::MovieShow::Frame { .. }
+            )
+        });
+        if shown == Some(true) {
+            self.0
+                .movie_shown
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(now);
+        }
         Ok(crate::selection_skin::SelectionDrawn {
             timing: self.0.frame(Kind::Selection),
             refused: None,
@@ -1953,4 +2122,190 @@ fn a_grant_found_draws_its_frame_before_any_movie_boundary() {
         "the grant's frame drawn before the boundary: {b:?}"
     );
     r.fake.probe.store(false, Ordering::SeqCst);
+}
+
+// ---- Skin movie planes reserved at one guarded place on the real loop ----
+
+/// A live 64 × 32 clip with one frame, stamped 0.
+fn clip() -> Arc<Movie> {
+    let movie = Movie::live_here(1, 64, 32);
+    let live = movie.live().unwrap();
+    let words = live.ring.words();
+    let geometry = skin_model::media::Geometry::new(live.width, live.height).unwrap();
+    let writer = skin_model::media::Writer::attach(words).unwrap();
+    let slot = writer.claim(words).unwrap();
+    let frame = vec![9; geometry.frame_bytes()];
+    writer.publish(words, slot, &frame, 1, 1, 0).unwrap();
+    movie
+}
+
+impl Rig {
+    fn reserves(&self) -> Vec<(usize, bool, bool, &'static str)> {
+        self.fake
+            .reserves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn polls(&self) -> Vec<(usize, bool, bool)> {
+        self.fake
+            .polls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// A selection whose every pass finds the swap chain's grant ready, so
+/// the boundary never finds slack (design.md "Scope of No Allocation",
+/// the admission turn): its live movie is admitted at the admission turn
+/// after a frame, once, with no grant held, and a selection frame shows it
+/// before its preparation deadline.
+// Revert: the loop's call of `movie_turn` deleted -> "shown before its
+// deadline".
+#[test]
+fn a_selection_movie_without_slack_is_admitted_after_a_frame() {
+    let r = Rig::selection();
+    let start = Instant::now();
+    *r.fake.movies.lock().unwrap() = Some(Movies::new([Some(clip()), None], start));
+    r.fake.probe.store(true, Ordering::SeqCst);
+    r.fake.starve.store(true, Ordering::SeqCst);
+    GRANT.store(true, Ordering::SeqCst);
+    r.fake.armed.store(true, Ordering::SeqCst);
+    // One frame through the gate; from there every pass finds a grant.
+    r.fake.gate.step_into(|| true);
+    let deadline = crate::media_host::session::preparation_deadline(start);
+    let bound = deadline + Duration::from_secs(1);
+    while r.fake.movie_shown.lock().unwrap().is_none() && Instant::now() < bound {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let shown = *r.fake.movie_shown.lock().unwrap();
+    r.fake.starve.store(false, Ordering::SeqCst);
+    r.fake.gate.hold();
+    GRANT.store(false, Ordering::SeqCst);
+    r.fake.probe.store(false, Ordering::SeqCst);
+    assert!(
+        shown.is_some_and(|at| at < deadline),
+        "shown before its deadline"
+    );
+    let reserves = r.reserves();
+    assert_eq!(reserves.len(), 1, "admitted once: {reserves:?}");
+    // After the frame its grant drew, the next grant ready but not taken.
+    assert!(
+        reserves
+            .iter()
+            .all(|&(_, _, held, at)| !held && at == "turn"),
+        "at the turn, no grant held: {reserves:?}"
+    );
+}
+
+/// A staging whose last step completes in the pass whose uploader found
+/// the frame's grant, its movies live with it: the pass's preparation poll
+/// runs with the grant held and reserves nothing, the pass draws its frame
+/// first, and the movie's planes are reserved after that frame, with no
+/// frame due; the preparation then answers ready.
+// Revert: the boundary run in `Movies::prepare` -> "a reservation with a
+// frame due".
+#[test]
+fn a_staging_ending_with_a_grant_reserves_after_its_frame() {
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let r = Rig::new();
+    r.link.load(Arc::new(chart.clone()), None).unwrap();
+    // The decision screen's built-in page, which draws on through the
+    // play's preparation.
+    r.link
+        .show_decision(crate::menu_screen::MenuPage::default(), None);
+    r.until_frames(|f| f.iter().any(|(k, _, _)| *k == Kind::Page));
+    r.fake.gate.hold();
+    r.fake.movie_prep.store(true, Ordering::SeqCst);
+    *r.fake.staging_movies.lock().unwrap() =
+        Some(Movies::new([Some(clip()), None], Instant::now()));
+    let mut pending = r
+        .link
+        .begin_attempt(attempt(&chart, None), AttemptSkin::InUse);
+    // Taken by a boundary's creation and polled, no movie live yet; the
+    // render thread parked at its next frame wait.
+    for _ in 0..20 {
+        if !r.polls().is_empty() {
+            break;
+        }
+        r.fake.gate.step();
+    }
+    assert!(!r.polls().is_empty(), "the attempt polled");
+    r.fake.probe.store(true, Ordering::SeqCst);
+    GRANT.store(true, Ordering::SeqCst);
+    r.fake.armed.store(true, Ordering::SeqCst);
+    r.fake.stage.store(true, Ordering::SeqCst);
+    // The frame let through; the staging's pass draws with its grant, and
+    // the pass after reserves, then parks.
+    r.fake.gate.step();
+    r.fake.probe.store(false, Ordering::SeqCst);
+    GRANT.store(false, Ordering::SeqCst);
+    let polls = r.polls();
+    let staged = polls
+        .iter()
+        .find(|&&(_, due, movies)| due && movies)
+        .copied();
+    let reserves = r.reserves();
+    assert!(
+        staged.is_some(),
+        "a poll of the live movies with the grant held: {polls:?}"
+    );
+    assert!(
+        !reserves.is_empty() && reserves.iter().all(|&(_, due, _, _)| !due),
+        "a reservation with a frame due: {reserves:?}"
+    );
+    let (frames, _, _) = staged.unwrap();
+    assert!(
+        reserves[0].0 > frames,
+        "the grant's frame drawn before the reservation: {reserves:?}, {polls:?}"
+    );
+    r.fake.gate.release();
+    let answer = loop {
+        if let Some(a) = pending.wait_until(None, || false) {
+            break a;
+        }
+    };
+    assert_eq!(answer.unwrap().preparation, Preparation::Ready);
+}
+
+/// A play prepared while the render thread draws nothing (an Idle pass,
+/// no frame due): its live movie is admitted at the Idle pass's boundary,
+/// so its first frame is taken by a poll and the preparation answers
+/// ready with the movie live, well before its deadline.
+// Revert: the Idle pass's `movie_admission` deleted -> "the movie live
+// at the answer".
+#[test]
+fn an_idle_preparation_admits_its_movie() {
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let r = Rig::new();
+    r.link.load(Arc::new(chart.clone()), None).unwrap();
+    r.select(1);
+    r.until_frames(|f| f.iter().any(|(k, _, _)| *k == Kind::Selection));
+    r.link.leave_selection();
+    assert!(wait_until(|| r.link.mode() == "idle"));
+    let movie = clip();
+    let start = Instant::now();
+    r.fake.movie_prep.store(true, Ordering::SeqCst);
+    r.fake.staged.store(true, Ordering::SeqCst);
+    *r.fake.movies.lock().unwrap() = Some(Movies::new([Some(Arc::clone(&movie)), None], start));
+    let frames = r.fake.state().frames.len();
+    let ready = r.link.prepare_attempt(attempt(&chart, None), || false);
+    assert_eq!(ready.unwrap(), Preparation::Ready);
+    assert_eq!(
+        movie.status(),
+        crate::media_host::session::Status::Live,
+        "the movie live at the answer"
+    );
+    assert!(start.elapsed() < Duration::from_secs(3));
+    let reserves = r.reserves();
+    assert_eq!(reserves.len(), 1, "{reserves:?}");
+    assert_eq!(r.fake.state().frames.len(), frames, "no frame drawn");
+    assert!(
+        reserves
+            .iter()
+            .all(|&(_, due, _, at)| !due && at == "boundary"),
+        "{reserves:?}"
+    );
 }

@@ -352,6 +352,7 @@ fn a_take_crossing_the_preparation_deadline_is_lost() {
             slow: Some(if crosses { left * 2 } else { Duration::ZERO }),
             ..Kept::default()
         };
+        m.admit(&mut planes, now);
         let (settled, shows) = m.prepare(&mut planes, now);
         if crosses {
             assert_eq!(shows[0], MovieShow::Lost, "crossing");
@@ -381,6 +382,7 @@ fn a_preparation_never_holds_a_frame_ahead_of_the_screen_clock() {
     let start = now - Duration::from_millis(2_500);
     let mut m = movies(Some(&a), None, start).floored(1_000_000);
     let mut planes = Kept::default();
+    m.admit(&mut planes, now);
     let (settled, shows) = m.prepare(&mut planes, now);
     assert!(settled);
     assert!(matches!(shows[0], MovieShow::Frame { .. }));
@@ -412,6 +414,7 @@ fn a_take_crossing_the_deadline_expires_a_pending_peer_in_the_same_poll() {
         slow: Some(left * 2),
         ..Kept::default()
     };
+    m.admit(&mut planes, now);
     let (settled, shows) = m.prepare(&mut planes, now);
     assert_eq!(a.loss(), Some(Loss::Preparation));
     assert_eq!(b.loss(), Some(Loss::Preparation), "the pending peer");
@@ -438,6 +441,76 @@ fn a_lost_movie_s_planes_go_at_the_next_boundary() {
     assert!(matches!(shows[1], MovieShow::Frame { .. }));
     assert_eq!(planes.released, [0]);
     assert!(planes.luma[1].iter().all(|&v| v == 4), "the peer's frame");
+}
+
+/// A preparation's polls are readiness only (design.md "Scope of No
+/// Allocation", the admission boundary): a live movie not admitted shows
+/// nothing and stays unsettled however often it is polled, and no planes
+/// are reserved; once a boundary admitted it, the next poll takes its
+/// first frame.
+// Revert: the boundary run in `Movies::prepare` -> "a poll reserved".
+#[test]
+fn a_preparation_poll_reserves_no_planes() {
+    let start = Instant::now();
+    let a = Fake::new(16, 8);
+    a.set(Status::Live);
+    a.publish(1, 0, 6);
+    let mut m = movies(Some(&a), None, start);
+    let mut planes = Kept::default();
+    for _ in 0..3 {
+        let (settled, shows) = m.prepare(&mut planes, start);
+        assert!(planes.reserved.is_empty(), "a poll reserved");
+        assert!(!settled);
+        assert_eq!(shows[0], MovieShow::Nothing);
+    }
+    m.admit(&mut planes, start);
+    assert_eq!(planes.reserved, [[0, 16, 8]]);
+    let (settled, shows) = m.prepare(&mut planes, start);
+    assert!(settled);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }));
+}
+
+/// A movie whose screen never finds slack for the boundary is admitted at
+/// the turn after the one that first saw it waiting, once: the first turn
+/// leaves the boundary a frame's interval, the second reserves its
+/// planes, and later turns reserve nothing more. A movie still pending at
+/// a turn is not marked, so it too waits one turn once live.
+// Revert: a turn admitting at first sight (`std::mem::replace(..)`
+// dropped) -> "the first turn left it to the boundary".
+#[test]
+fn a_movie_without_slack_is_admitted_at_its_second_turn() {
+    let start = Instant::now();
+    let (a, b) = (Fake::new(16, 8), Fake::new(32, 16));
+    a.set(Status::Live);
+    a.publish(1, 0, 7);
+    let mut m = movies(Some(&a), Some(&b), start);
+    let mut planes = Kept::default();
+    m.turn(&mut planes, start);
+    assert!(
+        planes.reserved.is_empty(),
+        "the first turn left it to the boundary"
+    );
+    assert_eq!(m.frame(&mut planes, 0, start)[0], MovieShow::Nothing);
+    m.turn(&mut planes, start);
+    assert_eq!(planes.reserved, [[0, 16, 8]], "admitted at the second");
+    assert!(matches!(
+        m.frame(&mut planes, 0, start)[0],
+        MovieShow::Frame { .. }
+    ));
+    // The peer goes live now: one turn to see it, one to admit it.
+    b.set(Status::Live);
+    b.publish(1, 0, 8);
+    m.turn(&mut planes, start);
+    assert_eq!(planes.reserved, [[0, 16, 8]]);
+    m.turn(&mut planes, start);
+    for _ in 0..5 {
+        m.turn(&mut planes, start);
+    }
+    assert_eq!(
+        planes.reserved,
+        [[0, 16, 8], [1, 32, 16]],
+        "each admitted once"
+    );
 }
 
 #[test]

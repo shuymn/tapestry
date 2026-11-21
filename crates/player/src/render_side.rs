@@ -851,10 +851,16 @@ pub trait Screen: Send {
     }
     /// The skin movies' admission boundary, in each pass that finds no
     /// frame due (no grant held or found, no clock deadline passed),
-    /// before it waits for the frame's grant
+    /// before it waits for the frame's grant, an Idle pass's included
     /// ([`crate::movie_frame::Movies::admit`]): a movie's planes are
-    /// reserved or released here, never in a frame. Nothing by default.
+    /// reserved or released here, never in a frame or a preparation's
+    /// poll. Nothing by default.
     fn movie_boundary(&mut self) {}
+    /// The skin movies' admission turn, after each frame drawn and before
+    /// the next grant is taken ([`crate::movie_frame::Movies::turn`]): a
+    /// movie the boundary found no slack for in a frame's interval is
+    /// admitted here, once. Nothing by default.
+    fn movie_turn(&mut self) {}
     /// The committed play begins (its play message), its READY at `anchor`
     /// µs on the frame clock less the play skin's loading minimum: its
     /// movies' clock starts there unless its loading frames started it.
@@ -7733,7 +7739,10 @@ impl Run {
             }
             // An Idle pass ends here, before any frame's pacing (design.md
             // "Load Pipeline", the Idle loop): its wait is the message's.
+            // It draws no frame, so the skin movies' admission runs unless
+            // a grant is held.
             if matches!(mode, Mode::Idle) {
+                self.movie_admission(&mode);
                 continue;
             }
             // The play skin's loading text, once per pass after the newest
@@ -7866,20 +7875,11 @@ impl Run {
                 }
                 self.first_frame = Some(first);
             }
-            // The skin movies' admission, behind the admission gate's frame
-            // check and before the grant is waited for: it reserves planes
-            // only while no frame is due, never with a grant held (taken by
-            // this pass's boundary, or kept from a pass whose lifetime was
-            // left during its wait) nor once one is found, which is kept
-            // for the frame; a reservation never delays a granted frame.
-            let frame = self.frame_due_by(&mode, None);
-            let frame_due = self.heavy_state(frame, None).frame_due;
+            // The skin movies' admission, before the grant is waited for.
+            self.movie_admission(&mode);
             let Some(screen) = &mut self.screen else {
                 continue;
             };
-            if !frame_due {
-                screen.movie_boundary();
-            }
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
             // instead, and a frame granted before stays granted. READY's
@@ -9068,6 +9068,12 @@ impl Run {
             if !minimized {
                 self.granted = false;
             }
+            // The skin movies' admission turn: after the frame its grant
+            // drew, before the next is taken; it admits only a movie the
+            // boundary found no slack for since the frame before.
+            if let Some(screen) = &mut self.screen {
+                screen.movie_turn();
+            }
             // A frame that ended shown or invisible refills the frame
             // interval's allowance and ends a stall (design.md "Load
             // Pipeline"); an offscreen frame that ended `Retry` stalls the
@@ -10126,6 +10132,22 @@ impl Run {
             });
         }
         self.note_heavy();
+    }
+
+    /// The skin movies' admission boundary, the one place a pass reserves
+    /// their planes (design.md "Scope of No Allocation"): behind the
+    /// uploader's admission gate's frame check, so only while no frame is
+    /// due, never with a grant held (taken by this pass's boundary, or kept
+    /// from a pass whose lifetime was left during its wait) nor once one is
+    /// found, which is kept for the frame, nor past the offscreen deadline;
+    /// a reservation never delays a granted frame. An Idle pass looks for
+    /// no grant: it draws none.
+    fn movie_admission(&mut self, mode: &Mode) {
+        let frame = self.frame_due_by(mode, None);
+        let due = self.granted || self.heavy_state(frame, None).frame_due;
+        if !due && let Some(screen) = &mut self.screen {
+            screen.movie_boundary();
+        }
     }
 
     /// The admission gate's state for a heavy operation (design.md "Memory

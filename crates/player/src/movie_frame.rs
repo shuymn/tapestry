@@ -12,12 +12,16 @@
 //! or not, and so do the planes made for it.
 //!
 //! Admission is a boundary of its own ([`Movies::admit`]), never part of a
-//! frame: a play's preparation polls, and the render thread's pass before
-//! it waits for each frame's grant. There, in slot order, a lost movie's
-//! planes are released, and each live movie not admitted yet takes its
-//! ring's reader once and has its planes reserved at its size, never
-//! another slot's: that allocates on the GPU, and a peer's admission leaves
-//! a movie's planes and its shown frame as they are.
+//! frame nor of a preparation's poll: the render thread's pass that finds
+//! no frame due, before it waits for the frame's grant. There, in slot
+//! order, a lost movie's planes are released, and each live movie not
+//! admitted yet takes its ring's reader once and has its planes reserved
+//! at its size, never another slot's: that allocates on the GPU, and a
+//! peer's admission leaves a movie's planes and its shown frame as they
+//! are. A pass that never finds that slack (a grant ready at every pass)
+//! gives a movie one admission turn ([`Movies::turn`]) after a frame is
+//! drawn and before the next grant is taken: a live movie seen waiting at
+//! one turn is admitted at the next, once.
 //!
 //! The frame's hook ([`Movies::frame`]), per slot: a lost movie shows
 //! [`MovieShow::Lost`], a refused one nothing. An admitted movie whose
@@ -180,6 +184,9 @@ struct Slot<S> {
     shown: bool,
     /// Its first frame was staged.
     staged: bool,
+    /// Seen live and not admitted at an admission turn: the next turn
+    /// admits it.
+    waited: bool,
     /// The stamp of the frame its planes hold (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     stamp: Option<i64>,
@@ -196,6 +203,7 @@ impl<S: Source> Slot<S> {
             full: false,
             shown: false,
             staged: false,
+            waited: false,
             #[cfg(all(test, feature = "dev-tools"))]
             stamp: None,
         }
@@ -240,11 +248,11 @@ impl<S: Source> Movies<S> {
         self
     }
 
-    /// A preparation poll at `now`: the admission boundary, then
-    /// [`poll`](Self::poll) at the time since the movies opened, bounded by
-    /// the floor.
+    /// A preparation poll at `now`: [`poll`](Self::poll) at the time since
+    /// the movies opened, bounded by the floor. Readiness only: it admits
+    /// and reserves nothing, so a poll made with a frame's grant held
+    /// never allocates before that frame.
     pub fn prepare(&mut self, planes: &mut dyn Planes, now: Instant) -> (bool, MovieShows) {
-        self.admit(planes, now);
         let since = i64::try_from(now.saturating_duration_since(self.start).as_micros())
             .unwrap_or(i64::MAX);
         self.poll(planes, since.min(self.floor), now)
@@ -290,6 +298,29 @@ impl<S: Source> Movies<S> {
         let _ = self.settle(now);
         for i in 0..MAX_MOVIES {
             self.slot_admit(planes, i);
+        }
+    }
+
+    /// The admission turn at `now`, after a frame drawn and before the
+    /// next grant is taken, for a render loop whose passes found no slack
+    /// for the boundary: each live movie not admitted is admitted if it was
+    /// seen so at the turn before, and marked seen otherwise, so the
+    /// boundary has a frame's interval to admit it first. Once admitted,
+    /// a movie takes no turn again. It releases nothing.
+    pub fn turn(&mut self, planes: &mut dyn Planes, now: Instant) {
+        let _ = self.settle(now);
+        for i in 0..MAX_MOVIES {
+            let Some(slot) = self.slots.get_mut(i) else {
+                continue;
+            };
+            let waiting = !slot.admitted
+                && slot
+                    .movie
+                    .as_ref()
+                    .is_some_and(|m| m.status() == Status::Live);
+            if waiting && std::mem::replace(&mut slot.waited, true) {
+                self.slot_admit(planes, i);
+            }
         }
     }
 
