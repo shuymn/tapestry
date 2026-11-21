@@ -1474,6 +1474,17 @@ impl Screen for MenuScreen {
         })
     }
 
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn delay_steps(&mut self, delay: Option<std::time::Duration>) {
+        self.renderer.delay_steps(delay);
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn steps_logged(&self) -> (Vec<u64>, usize) {
+        let (log, logged) = self.renderer.step_log();
+        (log.to_vec(), logged)
+    }
+
     fn cancel_result_view(&mut self) {
         self.result_chart = None;
         self.result_table = None;

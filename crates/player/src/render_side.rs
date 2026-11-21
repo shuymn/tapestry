@@ -703,6 +703,16 @@ pub trait Screen: Send {
     /// Drops the result view's staging in hand, if any. Nothing by
     /// default.
     fn cancel_result_view(&mut self) {}
+    /// Holds each uploader step's completion unseen `delay` after its
+    /// submission (tests). Nothing by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn delay_steps(&mut self, _delay: Option<Duration>) {}
+    /// The writes of the first staging atlas steps, each step's count in
+    /// order, and how many steps were written (tests). None by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn steps_logged(&self) -> (Vec<u64>, usize) {
+        (Vec::new(), 0)
+    }
     /// Installs the result's staged lines, at the commit point: whether
     /// they were. Allocates nothing. Never by default.
     fn install_result_text(&mut self) -> bool {
@@ -2102,6 +2112,25 @@ struct Shared {
     /// The held iterations, and their waits (tests).
     #[cfg(test)]
     held: [AtomicU64; 2],
+    /// The uploader writes no step while a result view's staging is in
+    /// hand, its staging answering not ready, while set (tests).
+    #[cfg(test)]
+    result_staging_paused: AtomicBool,
+    /// Each uploader step's completion held unseen this long after its
+    /// submission, in µs; 0 none (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    step_delay_us: AtomicU64,
+    /// The next result view's creation lasts this much longer, in µs, and
+    /// at its end moves the hold's clock to the second value (tests).
+    #[cfg(test)]
+    creation_hook: [AtomicI64; 2],
+    /// The pass a result view's creation ran in, 0 none (tests).
+    #[cfg(test)]
+    creation_pass: AtomicU64,
+    /// Each staging atlas step the uploader wrote, as its boundary ends
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    step_records: Mutex<Vec<StepRecord>>,
     /// The render thread's own allocations so far, read as each held
     /// iteration begins (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2289,6 +2318,16 @@ impl Shared {
             hold_bound: AtomicI64::new(FIRST_FRAME_HOLD.0),
             #[cfg(test)]
             held: [AtomicU64::new(0), AtomicU64::new(0)],
+            #[cfg(test)]
+            result_staging_paused: AtomicBool::new(false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            step_delay_us: AtomicU64::new(0),
+            #[cfg(test)]
+            creation_hook: [AtomicI64::new(0), AtomicI64::new(i64::MIN)],
+            #[cfg(test)]
+            creation_pass: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            step_records: Mutex::new(Vec::new()),
             #[cfg(all(test, feature = "dev-tools"))]
             held_allocations: AtomicU64::new(0),
             #[cfg(test)]
@@ -3957,11 +3996,67 @@ impl RenderLink {
     /// The hold's clock: `Some(elapsed)` µs since the hold's start (the
     /// loading state's showing, the result preparation's start) in place
     /// of the clock's reading, `None` the clock's (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn set_hold_clock(&self, elapsed: Option<i64>) {
         self.shared
             .hold_elapsed
             .store(elapsed.unwrap_or(i64::MIN), Ordering::SeqCst);
+    }
+
+    /// Holds every step of a result view's staging unwritten from now on
+    /// (`true`), its staging answering not ready while the loop goes on,
+    /// or lets it step (`false`) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn pause_result_staging(&self, on: bool) {
+        self.shared
+            .result_staging_paused
+            .store(on, Ordering::SeqCst);
+    }
+
+    /// Holds each uploader step's completion unseen `us` µs after its
+    /// submission from the next boundary on; 0 none (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn delay_steps(&self, us: u64) {
+        self.shared.step_delay_us.store(us, Ordering::SeqCst);
+    }
+
+    /// Makes the next result view's creation last `us` µs longer and, at
+    /// its end, sets the hold's clock to `then` (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn delay_result_creation(&self, us: i64, then: i64) {
+        let [delay, clock] = &self.shared.creation_hook;
+        clock.store(then, Ordering::SeqCst);
+        delay.store(us, Ordering::SeqCst);
+    }
+
+    /// Moves the hold's clock `us` µs as each write of a held pass's step
+    /// after its first begins; 0 moves nothing (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_write_clock_step(&self, us: i64) {
+        self.shared.write_clock_step.store(us, Ordering::SeqCst);
+    }
+
+    /// The pass the last result view's creation ran in, 0 none (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn creation_pass(&self) -> u64 {
+        self.shared.creation_pass.load(Ordering::SeqCst)
+    }
+
+    /// The staging atlas steps the uploader wrote so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn step_records(&self) -> Vec<StepRecord> {
+        self.shared
+            .step_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The held iterations so far, each counted as it begins (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn held_passes(&self) -> u64 {
+        let [passes, _] = &self.shared.held;
+        passes.load(Ordering::SeqCst)
     }
 
     /// The first frame's held iterations' waits so far, read from any
@@ -7818,6 +7913,13 @@ impl Run {
             let regrow = std::mem::take(&mut self.regrow_due);
             #[cfg(test)]
             self.shared.passes.fetch_add(1, Ordering::SeqCst);
+            // The pass's kind for the blocking-wait counter (tests).
+            #[cfg(all(test, feature = "dev-tools"))]
+            render::probe::set_pass(match (&held, &mode) {
+                (Some(_), _) => render::probe::PASS_HELD,
+                (None, Mode::Idle) => render::probe::PASS_OTHER,
+                (None, _) => render::probe::PASS_PRESENTING,
+            });
             if self.boundary(&mode, held, regrow) {
                 mode = Mode::Idle;
                 continue;
@@ -8023,9 +8125,10 @@ impl Run {
                             });
                         #[cfg(test)]
                         self.shared.held[0].fetch_add(1, Ordering::SeqCst);
+                        let paused = self.result_staging_paused();
                         match self.screen.as_ref().map(|s| s.upload_state()) {
                             // A step ready to write: the next pass at once.
-                            Some(render::UploadState::Ready) => {}
+                            Some(render::UploadState::Ready) if !paused => {}
                             Some(render::UploadState::InFlight) => self.wait_step(wait),
                             _ => {
                                 #[cfg(test)]
@@ -8095,11 +8198,17 @@ impl Run {
                 let now = Instant::now();
                 let deadline = *self.pace_deadline.get_or_insert(now + CLOCK_PACE);
                 if now < deadline {
+                    // The frame's pacing until its deadline (tests: the
+                    // blocking-wait counter's kind).
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    render::probe::set_pass(render::probe::PASS_BETWEEN);
                     let _ = screen.wait_step(
                         deadline
                             .saturating_duration_since(now)
                             .min(pace_of(HELD_PACE)),
                     );
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    render::probe::set_pass(render::probe::PASS_PRESENTING);
                 }
                 if Instant::now() < deadline {
                     #[cfg(test)]
@@ -9652,6 +9761,18 @@ impl Run {
         .then_some(h.from)
     }
 
+    /// Whether a test holds the result view's staging unwritten (tests):
+    /// its flag set and a staging in hand.
+    fn result_staging_paused(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.shared.result_staging_paused.load(Ordering::SeqCst)
+                && self.result.as_ref().is_some_and(|s| s.staging.is_some())
+        }
+        #[cfg(not(test))]
+        false
+    }
+
     /// The result's hold's own lifetime check, at the top of a loop turn
     /// while one lasts: a mark that no longer names it (released, or a
     /// newer hold begun) drops it, and its pending presentation turns
@@ -10318,6 +10439,20 @@ impl Run {
                         }
                     }
                     self.prepare_result();
+                    #[cfg(test)]
+                    {
+                        let [delay, clock] = &self.shared.creation_hook;
+                        let us = delay.swap(0, Ordering::SeqCst);
+                        if us > 0 {
+                            std::thread::sleep(Duration::from_micros(us.unsigned_abs()));
+                            self.shared
+                                .hold_elapsed
+                                .store(clock.load(Ordering::SeqCst), Ordering::SeqCst);
+                        }
+                        self.shared
+                            .creation_pass
+                            .store(self.shared.passes.load(Ordering::SeqCst), Ordering::SeqCst);
+                    }
                 }
             }
             #[cfg(test)]
@@ -11154,6 +11289,16 @@ impl Run {
             .as_ref()
             .filter(|h| h.taken)
             .map(|_| crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN));
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(s) = self.screen.as_mut() {
+            let us = self.shared.step_delay_us.load(Ordering::SeqCst);
+            s.delay_steps((us > 0).then(|| Duration::from_micros(us)));
+        }
+        if self.result_staging_paused() {
+            return;
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        let logged = self.screen.as_ref().map_or(0, |s| s.steps_logged().1);
         let mut pages_end = None;
         let frame = self.frame_due_by(mode, held);
         let chart = self
@@ -11224,6 +11369,8 @@ impl Run {
             }
             None => stale,
         };
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.record_steps(logged, held.is_some());
         if let Some(end) = pages_end {
             self.pages_end(end);
         }
@@ -11237,6 +11384,29 @@ impl Run {
         };
         if let Some((_, reply)) = self.bga_reply.take() {
             let _ = reply.send(answer);
+        }
+    }
+
+    /// Records the staging atlas steps this boundary wrote past the
+    /// `logged` before it, with whether its pass was held (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn record_steps(&self, logged: usize, held: bool) {
+        let Some(s) = self.screen.as_ref() else {
+            return;
+        };
+        let (log, now) = s.steps_logged();
+        let mut records = self
+            .shared
+            .step_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for n in logged..now {
+            records.push(StepRecord {
+                writes: log.get(n).copied(),
+                held,
+                pass: self.shared.passes.load(Ordering::SeqCst),
+                at: Instant::now(),
+            });
         }
     }
 
@@ -12269,6 +12439,18 @@ struct StagingView {
     /// The atlas uploads counted before its first take (dev-tools).
     #[cfg(feature = "dev-tools")]
     uploads: u64,
+}
+
+/// A staging atlas step the uploader wrote (tests): its writes, when the
+/// log kept them; whether its pass was held; its pass; when its boundary
+/// ended.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug)]
+pub struct StepRecord {
+    pub writes: Option<u64>,
+    pub held: bool,
+    pub pass: u64,
+    pub at: Instant,
 }
 
 /// How a result view's staging ended.

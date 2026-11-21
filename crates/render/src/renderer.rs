@@ -9121,9 +9121,7 @@ impl Renderer {
         &mut self,
         res: &mut ResultScreen,
     ) -> Option<Result<(), RenderError>> {
-        if self.result_text_up.as_ref()?.done.is_none() {
-            return None;
-        }
+        self.result_text_up.as_ref()?.done.as_ref()?;
         let up = self.result_text_up.take()?;
         let (table, holder) = match up.done? {
             Err(e) => return Some(Err(e)),
@@ -9771,13 +9769,18 @@ impl Renderer {
                     {
                         p_polled = true;
                     }
-                    !matches!(
+                    #[cfg(feature = "dev-tools")]
+                    let p_paced = Instant::now();
+                    let done = !matches!(
                         device.poll(wgpu::PollType::Wait {
                             submission_index: Some(previous.clone()),
                             timeout: wait,
                         }),
                         Err(wgpu::PollError::Timeout)
-                    )
+                    );
+                    #[cfg(feature = "dev-tools")]
+                    crate::probe::gpu_wait(p_paced.elapsed(), true);
+                    done
                 });
                 #[cfg(feature = "dev-tools")]
                 if crate::probe::POST.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -10360,10 +10363,16 @@ fn write_chart_set(
 /// records them all as seen complete.
 pub(crate) fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
     let made = gpu.latest();
-    gpu.device()
+    #[cfg(feature = "dev-tools")]
+    let start = Instant::now();
+    let waited = gpu
+        .device()
         .poll(wgpu::PollType::wait_indefinitely())
         .map(|_| gpu.saw(made))
-        .map_err(RenderError::Poll)
+        .map_err(RenderError::Poll);
+    #[cfg(feature = "dev-tools")]
+    crate::probe::gpu_wait(start.elapsed(), false);
+    waited
 }
 
 /// The viewport `[x, y, width, height]` that fits the 1920×1080 layout

@@ -15,7 +15,7 @@ use input::QpcClock;
 use skin_model::ScreenKind;
 
 use super::result_flow::{RED, chart, fixed_skin, prepared};
-use super::{LetGo, imports, settings};
+use super::{LetGo, imports, result, settings};
 use crate::measure::ResultPath;
 use crate::menu_screen::MenuScreen;
 use crate::play::PlayerRig;
@@ -29,6 +29,10 @@ const BOUND: i64 = 200_000;
 /// A frame of the wait page lights more texels than this; a cleared
 /// canvas none.
 const LIT: usize = 100;
+/// The held pass's longest wait for a step in flight, in µs.
+const HELD_PACE_US: u64 = 4_000;
+/// The scheduler's lateness a measured wait is allowed past its bound.
+const SLACK_US: u64 = 3_000;
 
 /// One frame drawn while armed.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +41,10 @@ struct Frame {
     path: Option<ResultPath>,
     /// Its texels with a channel above 200.
     lit: usize,
+    /// The instant a result frame evaluated its skin at.
+    sampled: Option<TimeUs>,
+    /// When the sink saw it.
+    at: Instant,
 }
 
 impl Frame {
@@ -105,6 +113,8 @@ impl FrameSink for Recorder {
         self.0.log.lock().unwrap().push(Frame {
             path: drawn.result.map(|r| r.path),
             lit,
+            sampled: drawn.result.map(|r| r.sampled),
+            at: Instant::now(),
         });
     }
 }
@@ -301,5 +311,401 @@ fn a_screen_built_again_while_held_draws_the_pending_presentation() {
             after.iter().all(|f| f.pending()),
             "the pending presentation from the rebuilt screen's first frame: {after:?}"
         );
+    });
+}
+
+/// The blocking GPU waits counted so far: those of held passes and those
+/// of presenting passes, each one's length in µs.
+fn gpu_waits() -> (Vec<u64>, Vec<u64>) {
+    let all = render::probe::gpu_waits();
+    let of = |k| {
+        all.iter()
+            .filter(|(p, _)| *p == k)
+            .map(|&(_, us)| us)
+            .collect()
+    };
+    (
+        of(render::probe::PASS_HELD),
+        of(render::probe::PASS_PRESENTING),
+    )
+}
+
+/// A hit's first view whose steps are delayed within the bound: held
+/// passes only from the hand-over, each waiting at most `HELD_PACE`,
+/// then the first view with no pending frame; no blocking GPU wait in a
+/// presenting pass, and the held passes' bounded wait counted (V19 (b);
+/// V9b (a)).
+#[test]
+fn a_first_view_staged_within_the_bound_holds_without_a_pending_frame() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held(rig, frames, &a, &report, &screen);
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.render.delay_steps(3 * HELD_PACE_US);
+        render::probe::count_gpu_waits(Some(false));
+        let passes = rig.render.held_passes();
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        let shown = frames.until(rig, handed, "the skin's view", |f| {
+            f.iter().any(|f| f.path == Some(ResultPath::Skin))
+        });
+        let (held_waits, presenting) = gpu_waits();
+        render::probe::count_gpu_waits(None);
+        rig.render.delay_steps(0);
+        let skin = shown
+            .iter()
+            .position(|f| f.path == Some(ResultPath::Skin))
+            .unwrap();
+        assert!(
+            shown[..skin].iter().all(|f| f.path.is_none()),
+            "no pending frame before the first view: {shown:?}"
+        );
+        assert!(
+            rig.render.held_passes() > passes,
+            "held passes from the hand-over"
+        );
+        assert!(
+            !held_waits.is_empty(),
+            "the held passes' bounded wait counted"
+        );
+        assert!(
+            held_waits.iter().all(|&us| us <= HELD_PACE_US + SLACK_US),
+            "each held wait at most HELD_PACE: {held_waits:?}"
+        );
+        assert_eq!(presenting, Vec::<u64>::new(), "no blocking wait presenting");
+        rig.leave_result();
+    });
+}
+
+/// A pending result skin whose view's cell needs a build (154's residue
+/// at the attempt differs from the view's), the attempt prepared and
+/// committed, a cleared page drawn as the outgoing screen, then the
+/// result's preparation begun: a miss whose layout the result builds. The
+/// frames' count at the begin, and the skin's folder.
+fn held_miss(
+    rig: &mut PlayerRig<'_>,
+    frames: &Frames,
+    a: &game::Loaded,
+    report: &game::PlayReport,
+    screen: &game::ResultScreen,
+) -> (usize, tempfile::TempDir) {
+    held_miss_of(rig, frames, a, report, screen, 8, false)
+}
+
+/// [`held_miss`] with cells of `side` texels a side, cut from a source
+/// image of three; with `gated`, the result's layout build held at the
+/// layout gate from the result's preparation on.
+fn held_miss_of(
+    rig: &mut PlayerRig<'_>,
+    frames: &Frames,
+    a: &game::Loaded,
+    report: &game::PlayReport,
+    screen: &game::ResultScreen,
+    side: u32,
+    gated: bool,
+) -> (usize, tempfile::TempDir) {
+    let d = result::skin(
+        "",
+        &format!(
+            "{{ {{ id = \"dot\", src = \"s\", x = {side} * (nr % 3), y = 0, w = {side}, h = {side} }} }}"
+        ),
+    );
+    if side > 8 {
+        let file = std::fs::File::create(d.path().join("s.png")).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), 3 * side, side);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let texels = [90, 90, 90, 255].repeat(usize::try_from(3 * side * side).unwrap());
+        e.write_header().unwrap().write_image_data(&texels).unwrap();
+    }
+    let p = result::pending(d.path(), result::LIMITS);
+    rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(p)));
+    prepared(rig, a);
+    rig.render.send(RenderMsg::Menu(Box::default()));
+    frames.arm();
+    let at = frames.len();
+    if gated {
+        result::hold_builds(true);
+    }
+    rig.begin_result(report, screen);
+    rig.result_compared(report, screen);
+    (at, d)
+}
+
+/// The result's layout landed, as the flow waits for it in
+/// ResultPreparing before the hand-over; at most 20 s.
+fn laid_out(rig: &mut PlayerRig<'_>) {
+    let end = Instant::now() + Duration::from_secs(20);
+    while !rig.land_result() {
+        assert!(Instant::now() < end, "the result's layout never landed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The skin's view drawn: the frames until then, the first view's index.
+fn first_view(frames: &[Frame]) -> Option<usize> {
+    frames.iter().position(|f| f.path == Some(ResultPath::Skin))
+}
+
+/// The blocking GPU waits [`staged_past_the_bound`] counted from the
+/// bound to the first view's commit: those of held passes and those of
+/// presenting passes.
+type Waits = (Vec<u64>, Vec<u64>);
+
+/// A miss's first view whose staging steps past the bound after the
+/// hand-over, its writes held by the test's flag, then let go with each
+/// step's completion delayed; the counter's scope the uploader's and
+/// stagings' waits, or with `pacing` the frame's own pacing too. Asserts
+/// V19 (c)'s frames; the waits counted from the bound on.
+fn staged_past_the_bound(pacing: bool) -> Waits {
+    let (dir, a) = chart(Some(RED));
+    let mut waits = None;
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held_miss(rig, frames, &a, &report, &screen);
+        laid_out(rig);
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.render.pause_result_staging(true);
+        let acked = rig.render.result_acknowledged();
+        let uploads = crate::dev::result_uploads();
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        // Held passes until the bound: nothing presents.
+        let passes = rig.render.held_passes();
+        let end = Instant::now() + Duration::from_secs(20);
+        while rig.render.held_passes() < passes + 10 {
+            assert!(Instant::now() < end, "no held passes after the hand-over");
+            rig.land_result();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The frames the render thread drew before it took the hand-over
+        // are the outgoing screen's; none after it.
+        let held_at = frames.len();
+        let before = frames.since(handed);
+        assert!(
+            before.iter().all(|f| f.path.is_none()),
+            "only the outgoing screen until held: {before:?}"
+        );
+        let passes = rig.render.held_passes();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rig.render.held_passes() > passes, "the held passes stopped");
+        assert_eq!(frames.len(), held_at, "a frame presented while held");
+        // Past the bound: the pending presentation while the flag holds.
+        render::probe::count_gpu_waits(Some(pacing));
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        let pending = frames.until(rig, held_at, "ten pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 10
+        });
+        let after_bound = rig.render.held_passes();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            rig.render.held_passes(),
+            after_bound,
+            "a held pass after the bound"
+        );
+        assert!(
+            pending.iter().all(|f| f.pending()),
+            "every frame after the hand-over pending: {pending:?}"
+        );
+        assert_eq!(
+            rig.render.presented_origin(),
+            None,
+            "an origin while pending"
+        );
+        assert_eq!(
+            rig.render.presented_timing(),
+            None,
+            "a timing while pending"
+        );
+        assert_eq!(
+            rig.render.result_acknowledged(),
+            acked,
+            "the entry's first picture acknowledged while pending"
+        );
+        // The flag cleared: the steps complete, each seen late, and the
+        // view commits.
+        rig.render.delay_steps(3 * HELD_PACE_US);
+        rig.render.pause_result_staging(false);
+        let shown = frames.until(rig, held_at, "the skin's view", |f| first_view(f).is_some());
+        waits = Some(gpu_waits());
+        render::probe::count_gpu_waits(None);
+        rig.render.delay_steps(0);
+        let at = first_view(&shown).unwrap();
+        assert!(
+            shown[..at].iter().all(|f| f.pending()),
+            "pending until the first view: {shown:?}"
+        );
+        assert!(
+            crate::dev::result_uploads() > uploads,
+            "the first view's staging uploaded no array: not a miss"
+        );
+        assert_eq!(
+            rig.render.presented_origin(),
+            shown[at].sampled,
+            "the origin at the first view's frame"
+        );
+        assert!(
+            rig.render.result_acknowledged() > acked,
+            "the entry's first picture acknowledged at the first view"
+        );
+        rig.leave_result();
+    });
+    waits.unwrap()
+}
+
+/// A first view whose staging steps past the bound after the hand-over
+/// (its writes held by the test's flag): held passes until the bound and
+/// none after it, then the pending presentation on every frame while the
+/// flag stays set, with no built-in page, no origin, no timing and no
+/// acknowledgement of the entry's first picture; the flag cleared, the
+/// view commits, its frame the origin and the acknowledgement's (V19 (c);
+/// V13's second result case). Past the bound no pass waits for the GPU
+/// (V9b (b)).
+#[test]
+fn a_first_view_staging_past_the_bound_draws_the_pending_presentation() {
+    let _serial = imports::serial();
+    let (held, presenting) = staged_past_the_bound(false);
+    assert_eq!(held, Vec::<u64>::new(), "a held wait after the bound");
+    assert_eq!(presenting, Vec::<u64>::new(), "a blocking wait presenting");
+}
+
+/// The control of V9b's counter: widened to the frame's own pacing, the
+/// same run counts waits in presenting passes, so the zero above is the
+/// counter's scope, not frames that never paced.
+#[test]
+fn the_blocking_wait_counter_widened_counts_the_frames_pacing() {
+    let _serial = imports::serial();
+    let (_, presenting) = staged_past_the_bound(true);
+    assert!(!presenting.is_empty(), "no pacing wait counted presenting");
+}
+
+/// Waits until `done`, at most 20 s, landing the result's layouts.
+fn until_true(rig: &mut PlayerRig<'_>, what: &str, done: impl Fn(&PlayerRig<'_>) -> bool) {
+    let end = Instant::now() + Duration::from_secs(20);
+    while !done(rig) {
+        assert!(Instant::now() < end, "never {what}");
+        rig.land_result();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A hand-over just before the bound whose union's creation ends past
+/// it: no frame presents from the hand-over to the creation's end, the
+/// first frame after it is the pending presentation, no held pass runs
+/// after the bound, and the boundary whose creation ended past the bound
+/// begins no write (V19 (d)).
+#[test]
+fn a_creation_ending_past_the_bound_draws_the_pending_presentation_next() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held_miss_of(rig, frames, &a, &report, &screen, 8, true);
+        until_true(rig, "the layout at its build", |_| result::build_reached());
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.render.set_hold_clock(Some(BOUND - 1_000));
+        result::hold_builds(false);
+        laid_out(rig);
+        rig.render.delay_result_creation(50_000, BOUND + 1);
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        until_true(rig, "the view's creation", |rig| {
+            rig.render.creation_pass() > 0
+        });
+        let created = rig.render.creation_pass();
+        let passes = rig.render.held_passes();
+        let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
+        assert_eq!(
+            rig.render.held_passes(),
+            passes,
+            "a held pass after the bound"
+        );
+        let first = shown.iter().position(|f| f.path.is_some()).unwrap();
+        assert!(
+            shown[..first].iter().all(|f| f.path.is_none()),
+            "only the outgoing screen before the creation's end: {shown:?}"
+        );
+        assert!(
+            shown[first].pending(),
+            "the pending presentation first after the creation: {shown:?}"
+        );
+        let records = rig.render.step_records();
+        assert!(
+            records.iter().all(|r| r.pass != created),
+            "a write in the boundary whose creation ended past the bound: {records:?} at {created}"
+        );
+        assert!(
+            records.iter().all(|r| !r.held),
+            "a held step after the bound: {records:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// A step begun just before the bound, its cells 2048² so the union's
+/// first atlas step spans at least four writes, each write moving the
+/// hold's clock 400 µs: the held pass closes and submits the step after
+/// its third write, no held pass begins after it, the next frame is the
+/// pending presentation, and the remaining writes run between pending
+/// frames (V19 (d2)).
+#[test]
+fn a_step_crossing_the_bound_closes_at_it() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held_miss_of(rig, frames, &a, &report, &screen, 2_048, false);
+        laid_out(rig);
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.render.pause_result_staging(true);
+        rig.show_end(&report, &screen);
+        until_true(rig, "the view's creation", |rig| {
+            rig.render.creation_pass() > 0
+        });
+        let handed = frames.len();
+        let passes = rig.render.held_passes();
+        until_true(rig, "held passes", |rig| {
+            rig.render.held_passes() > passes + 3
+        });
+        assert!(
+            rig.render.step_records().is_empty(),
+            "a step written while paused"
+        );
+        // 1 ms before the bound as the first write ends: the boundary looks
+        // at the bound once before its first write, and the hook moves the
+        // clock at each look after that one.
+        rig.render.set_hold_clock(Some(BOUND - 1_400));
+        rig.render.set_write_clock_step(400);
+        rig.render.pause_result_staging(false);
+        let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
+        rig.render.set_write_clock_step(0);
+        let records = rig.render.step_records();
+        let first = records.first().copied().expect("a step written");
+        assert!(first.held, "the first step in a held pass: {records:?}");
+        assert_eq!(
+            first.writes,
+            Some(3),
+            "the held step closed after its third write: {records:?}"
+        );
+        assert!(
+            records[1..].iter().all(|r| !r.held),
+            "a held step after the bound: {records:?}"
+        );
+        let pending = shown
+            .iter()
+            .position(|f| f.path.is_some())
+            .expect("a result frame");
+        assert!(
+            shown[pending].pending(),
+            "the next frame the pending presentation: {shown:?}"
+        );
+        let first_pending = shown[pending].at;
+        assert!(
+            records[1..].iter().any(|r| r.at > first_pending),
+            "no write after the first pending frame: {records:?}"
+        );
+        rig.leave_result();
     });
 }

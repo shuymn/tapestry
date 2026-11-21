@@ -366,10 +366,15 @@ impl InFlight {
     ) -> Result<bool, wgpu::PollError> {
         let start = std::time::Instant::now();
         if !self.done.load(Ordering::Acquire) {
-            match gpu.device().poll(wgpu::PollType::Wait {
+            let polled = gpu.device().poll(wgpu::PollType::Wait {
                 submission_index: Some(self.index.clone()),
                 timeout: Some(timeout),
-            }) {
+            });
+            #[cfg(feature = "dev-tools")]
+            if delay.is_none() {
+                crate::probe::gpu_wait(start.elapsed(), false);
+            }
+            match polled {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
                 Err(e) => return Err(e),
             }
@@ -379,6 +384,7 @@ impl InFlight {
             let due = d.saturating_sub(self.at.elapsed());
             let left = timeout.saturating_sub(start.elapsed());
             std::thread::sleep(due.min(left));
+            crate::probe::gpu_wait(start.elapsed(), false);
             return Ok(self.seen(Some(d)));
         }
         let _ = start;
