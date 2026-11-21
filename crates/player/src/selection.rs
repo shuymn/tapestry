@@ -982,6 +982,9 @@ impl Selection {
                 return None;
             }
             crate::pointer::PointerAct::Volume(channel, percent) => {
+                // The arm's witness for a test device's shots (dev-tools).
+                #[cfg(feature = "dev-tools")]
+                crate::dev::present_shot::volume_reached(channel, percent);
                 // The newest of a channel's settings counts.
                 if let Some(set) = self.volumes_set.get_mut(channel.index()) {
                     *set = Some(percent);

@@ -599,6 +599,11 @@ impl MenuScreen {
         now: bms_model::TimeUs,
         app: skin_model::AppReadouts,
     ) -> Result<(), BuildError> {
+        let timers = u.events.timers();
+        // What the skin reads of the frame, frozen for a test device's
+        // shots (dev-tools, `--dev-freeze-skin-clock`).
+        #[cfg(feature = "dev-tools")]
+        let (now, timers, app) = crate::dev::skin_clock::apply(now, timers, app);
         #[cfg(all(test, feature = "dev-tools"))]
         self.probe_alloc();
         let mut sprites = [Sprite::default(); render::STRIP_SPRITES];
@@ -611,7 +616,7 @@ impl MenuScreen {
             now,
             target: self.renderer.target(),
             layout: &skin_model::Layout::AUTHOR,
-            timers: u.events.timers(),
+            timers,
             app,
             pointer: logic.pointer,
         };
@@ -1707,6 +1712,11 @@ impl Screen for MenuScreen {
                 skinned: false,
             });
         };
+        let timers = u.events.timers();
+        // What the skin reads of the frame, frozen for a test device's
+        // shots (dev-tools, `--dev-freeze-skin-clock`).
+        #[cfg(feature = "dev-tools")]
+        let (now, timers, app) = crate::dev::skin_clock::apply(now, timers, app);
         let refused = match self.prepare_selection(u, logic, changed)? {
             // The frame's timers, then the runtime over that state, then
             // the build from it (docs/stage3.md S7-07).
@@ -1715,7 +1725,7 @@ impl Screen for MenuScreen {
                 logic.bundle.skin(),
                 &mut logic.sel,
                 now,
-                &u.events.timers(),
+                &timers,
                 &app,
             ) {
                 Ok(stop) => {

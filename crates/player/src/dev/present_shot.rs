@@ -14,8 +14,14 @@
 //! Allocation") is refused there without a copy, and the refusal is
 //! answered and logged from the pipe's thread. A copy whose present did not
 //! advance the swap chain's present count is not a shot.
+//!
+//! Each answer also carries the volume arm's witness: every volume the
+//! select screen's pointer dispatch reached (the slider's number, its
+//! percent, and the host counter when it was dispatched), so a check can
+//! tell a press that reached the arm from one lost before it.
 
 use std::io::{BufReader, Read as _};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -46,6 +52,74 @@ pub struct Shot {
     pub acquired: i64,
     /// The host counter right after its present returned.
     pub presented: i64,
+    /// Every volume the pointer's volume arm reached in the run so far, in
+    /// order, read when the answer is written.
+    pub volumes: Vec<VolumeSet>,
+}
+
+/// A volume the select screen's pointer volume arm reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VolumeSet {
+    /// The skin's slider number of its channel: 17 system, 18 key, 19
+    /// background.
+    pub slider: u8,
+    /// The whole percent it set.
+    pub percent: u32,
+    /// The host counter when the arm took it.
+    pub at: i64,
+}
+
+/// The most volume settings the witness keeps: far more than a panel row's
+/// three clicks and their drags make; past it, answers are errors.
+const VOLUME_LOG: usize = 64;
+// The witness, written by the one thread that dispatches the select
+// screen's pointer acts and read by the pipe's thread: each entry is
+// written before the count that publishes it.
+static VOLUME_AT: [AtomicI64; VOLUME_LOG] = [const { AtomicI64::new(0) }; VOLUME_LOG];
+static VOLUME_WHAT: [AtomicU32; VOLUME_LOG] = [const { AtomicU32::new(0) }; VOLUME_LOG];
+static VOLUME_N: AtomicUsize = AtomicUsize::new(0);
+
+/// The select screen's pointer volume arm took `percent` for `channel`
+/// (dev-tools): kept for the shots' answers. Allocates nothing.
+pub fn volume_reached(channel: game::Channel, percent: u32) {
+    let slider: u32 = match channel {
+        game::Channel::System => 17,
+        game::Channel::Key => 18,
+        game::Channel::Background => 19,
+    };
+    let i = VOLUME_N.load(Ordering::Relaxed);
+    if let (Some(at), Some(what)) = (VOLUME_AT.get(i), VOLUME_WHAT.get(i)) {
+        at.store(qpc(), Ordering::Relaxed);
+        what.store(slider << 8 | percent.min(0xff), Ordering::Relaxed);
+    }
+    VOLUME_N.store(i.saturating_add(1), Ordering::Release);
+}
+
+/// The witness so far.
+///
+/// # Errors
+///
+/// More settings than it keeps.
+fn volumes_reached() -> Result<Vec<VolumeSet>, String> {
+    let n = VOLUME_N.load(Ordering::Acquire);
+    if n > VOLUME_LOG {
+        return Err(format!(
+            "the volume arm was reached {n} times, more than the {VOLUME_LOG} its witness keeps"
+        ));
+    }
+    Ok(VOLUME_AT
+        .iter()
+        .zip(&VOLUME_WHAT)
+        .take(n)
+        .map(|(at, what)| {
+            let what = what.load(Ordering::Relaxed);
+            VolumeSet {
+                slider: u8::try_from(what >> 8).unwrap_or(0),
+                percent: what & 0xff,
+                at: at.load(Ordering::Relaxed),
+            }
+        })
+        .collect())
 }
 
 /// Where a request is.
@@ -195,6 +269,7 @@ impl render::PresentTap for Tap {
                     present,
                     acquired,
                     presented,
+                    volumes: Vec::new(),
                 })
             }
             (Ok(_), Some((_, before, after))) => Err(format!(
@@ -236,7 +311,9 @@ pub fn write_answer(
         Ok(s) => json!({
             "serial": serial, "width": s.width, "height": s.height,
             "previous": s.previous, "present": s.present,
-            "acquired": s.acquired, "presented": s.presented, "bytes": s.rgba.len(),
+            "acquired": s.acquired, "presented": s.presented,
+            "volumes": s.volumes.iter().map(|v| [i64::from(v.slider), i64::from(v.percent), v.at]).collect::<Vec<_>>(),
+            "bytes": s.rgba.len(),
         }),
         Err(e) => json!({ "serial": serial, "error": e }),
     };
@@ -291,6 +368,23 @@ pub fn read_answer(
         h[k].as_i64()
             .ok_or_else(|| format!("the answer has no `{k}`"))
     };
+    let volumes = h["volumes"]
+        .as_array()
+        .ok_or("the answer has no `volumes`")?
+        .iter()
+        .map(|v| {
+            let slider = v[0].as_u64().and_then(|n| u8::try_from(n).ok());
+            let percent = v[1].as_u64().and_then(|n| u32::try_from(n).ok());
+            match (slider, percent, v[2].as_i64(), v.as_array().map(Vec::len)) {
+                (Some(slider), Some(percent), Some(at), Some(3)) => Ok(VolumeSet {
+                    slider,
+                    percent,
+                    at,
+                }),
+                _ => Err(format!("the answer's volume {v} does not read")),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((
         serial,
         Ok(Shot {
@@ -301,6 +395,7 @@ pub fn read_answer(
             present: u32::try_from(num("present")?).map_err(|e| e.to_string())?,
             acquired: int("acquired")?,
             presented: int("presented")?,
+            volumes,
         }),
     ))
 }
@@ -327,7 +422,10 @@ pub fn serve(
         }
         let serial = parse_request(&line).ok_or_else(|| format!("a bad request {line:?}"))?;
         let mine = tap.request();
-        let answer = tap.wait(mine, wait);
+        let answer = tap.wait(mine, wait).and_then(|mut s| {
+            s.volumes = volumes_reached()?;
+            Ok(s)
+        });
         if let Err(e) = &answer {
             eprintln!("dev: shot {serial}: {e}");
         }
@@ -496,6 +594,29 @@ mod tests {
         assert!(!tap.wanted(true), "the request is dropped");
     }
 
+    /// The volume arm's witness keeps each setting it reached, in order,
+    /// with its slider's number, its percent and its counter, and refuses
+    /// once it has kept all it can.
+    #[test]
+    fn the_volume_witness_keeps_each_setting_in_order() {
+        let from = VOLUME_N.load(Ordering::Acquire);
+        volume_reached(game::Channel::Key, 50);
+        volume_reached(game::Channel::System, 25);
+        volume_reached(game::Channel::Background, 75);
+        let got = volumes_reached().unwrap();
+        let got: Vec<(u8, u32)> = got
+            .get(from..)
+            .unwrap()
+            .iter()
+            .map(|v| (v.slider, v.percent))
+            .collect();
+        assert_eq!(got, [(18, 50), (17, 25), (19, 75)]);
+        while VOLUME_N.load(Ordering::Acquire) <= VOLUME_LOG {
+            volume_reached(game::Channel::Key, 1);
+        }
+        assert!(volumes_reached().unwrap_err().contains("more than the 64"));
+    }
+
     /// An answer reads back as written, its pixels whole; an error answer
     /// reads as the error; a short answer is refused.
     #[test]
@@ -508,6 +629,18 @@ mod tests {
             present: 9,
             acquired: 100,
             presented: 120,
+            volumes: vec![
+                VolumeSet {
+                    slider: 17,
+                    percent: 25,
+                    at: 90,
+                },
+                VolumeSet {
+                    slider: 19,
+                    percent: 75,
+                    at: 95,
+                },
+            ],
         };
         let mut buf = Vec::new();
         write_answer(&mut buf, 5, &Ok(shot.clone())).unwrap();

@@ -1761,6 +1761,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
     // The window's own shots, asked for on a runner's pipe
     // (`--dev-shot-pipe`): every window renderer made copies for the tap.
+    // The select skin's clock frozen for a test device's shots
+    // (`--dev-freeze-skin-clock`).
+    #[cfg(feature = "dev-tools")]
+    if s.dev.freeze_skin_clock {
+        dev::skin_clock::freeze();
+    }
     #[cfg(feature = "dev-tools")]
     let shot_tap = s.dev.shot_pipe.clone().map(|name| {
         let tap = dev::present_shot::Tap::new();

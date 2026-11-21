@@ -392,6 +392,9 @@ mod tests {
             select(&["--dev-window", "8192x8192"]).dev.window,
             Some((8192, 8192))
         );
+        // The skin's frozen clock: off unless asked for.
+        assert!(!select(&["--dev-window", "1920x1080"]).dev.freeze_skin_clock);
+        assert!(select(&["--dev-freeze-skin-clock"]).dev.freeze_skin_clock);
         // The shot pipe: a pipe name, with a window to shoot.
         assert_eq!(
             select(&[

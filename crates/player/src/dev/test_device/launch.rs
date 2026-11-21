@@ -41,9 +41,13 @@ const PAD_INTERFACE: i64 = 1;
 /// The pad's X axis as a binding's control: usage page 1, usage 0x30.
 const X_AXIS: i64 = 0x1_0030;
 
-/// `device.toml` for a panel row: the run's monitor, the volumes at 1.0,
-/// the device's pad bound (buttons 1-7 on lanes 1-7, X on the scratch,
-/// buttons 9 and 10 on START and SELECT), the library.
+/// Each volume in the `device.toml` a panel row writes: the clicks' targets
+/// all lie below it.
+pub const START_VOLUME: f64 = 1.0;
+
+/// `device.toml` for a panel row: the run's monitor, the volumes at
+/// [`START_VOLUME`], the device's pad bound (buttons 1-7 on lanes 1-7, X on
+/// the scratch, buttons 9 and 10 on START and SELECT), the library.
 pub fn device_table(monitor: &str, library: &Path) -> toml::Table {
     let mut lanes = vec![toml::Value::Table(toml::Table::from_iter([
         ("control".to_owned(), toml::Value::Integer(X_AXIS)),
@@ -84,9 +88,12 @@ pub fn device_table(monitor: &str, library: &Path) -> toml::Table {
             "monitor".to_owned(),
             toml::Value::String(monitor.to_owned()),
         ),
-        ("system_volume".to_owned(), toml::Value::Float(1.0)),
-        ("key_volume".to_owned(), toml::Value::Float(1.0)),
-        ("background_volume".to_owned(), toml::Value::Float(1.0)),
+        ("system_volume".to_owned(), toml::Value::Float(START_VOLUME)),
+        ("key_volume".to_owned(), toml::Value::Float(START_VOLUME)),
+        (
+            "background_volume".to_owned(),
+            toml::Value::Float(START_VOLUME),
+        ),
         ("controller".to_owned(), toml::Value::Table(controller)),
         ("controller_device".to_owned(), toml::Value::Table(device)),
         ("library".to_owned(), toml::Value::Table(library)),
@@ -231,13 +238,15 @@ impl Player {
 }
 
 /// The player's arguments: a 1920×1080 window, its shots asked for on the
-/// runner's pipe `shot_pipe`.
+/// runner's pipe `shot_pipe`, the select skin's clock frozen so every run's
+/// shots are the same frame.
 fn args(shot_pipe: &str) -> Vec<String> {
     vec![
         "--dev-window".to_owned(),
         format!("{}x{}", CLIENT[0], CLIENT[1]),
         "--dev-shot-pipe".to_owned(),
         shot_pipe.to_owned(),
+        "--dev-freeze-skin-clock".to_owned(),
     ]
 }
 
@@ -629,7 +638,8 @@ mod tests {
     }
 
     /// The player is started in a window of the rows' size, its shots asked
-    /// for on the run's pipe, and the player's own parser takes them so.
+    /// for on the run's pipe, the skin's clock frozen, and the player's own
+    /// parser takes them so.
     #[test]
     fn the_player_takes_its_window_and_its_shot_pipe() {
         let pipe = super::super::shot::pipe_name("0123");
@@ -640,7 +650,8 @@ mod tests {
                 "--dev-window",
                 "1920x1080",
                 "--dev-shot-pipe",
-                pipe.as_str()
+                pipe.as_str(),
+                "--dev-freeze-skin-clock"
             ]
         );
         let parsed = crate::args::parse(a.iter().map(std::ffi::OsString::from)).unwrap();
@@ -649,6 +660,7 @@ mod tests {
         };
         assert_eq!(s.dev.window, Some((1920, 1080)));
         assert_eq!(s.dev.shot_pipe.as_deref(), Some(pipe.as_str()));
+        assert!(s.dev.freeze_skin_clock);
     }
 
     #[test]

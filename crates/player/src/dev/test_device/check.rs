@@ -400,7 +400,12 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[link],
                 &[ev(SINGLE, LINK, "check"), ev(SINGLE, LINK, "ping")],
             ),
-            judge("p1.volumes", &[f(DEVICE_AFTER)], &[ev(SINGLE, RUN, "exit")]),
+            judge(
+                "p1.volumes",
+                &[f(DEVICE_BEFORE), f(DEVICE_AFTER)],
+                &[ev(SINGLE, RUN, "exit")],
+            ),
+            judge("p1.volume-arm", &[run], &[ev(SINGLE, RUN, "shot")]),
             judge(
                 "p1.device-toml",
                 &[f(DEVICE_BEFORE), f(DEVICE_AFTER)],
@@ -483,7 +488,7 @@ fn p1() -> Expectation {
 fn p4() -> Expectation {
     panel(
         "p4",
-        &["p1.volumes", FRAME_A],
+        &["p1.volumes", "p1.volume-arm", FRAME_A],
         Some(Negative {
             mutation: "SELECT is never held: START alone opens panel 1",
             trigger: FRAME_A,
@@ -888,7 +893,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(failing(&p1()).is_empty());
-        assert_eq!(failing(&p4()), ["p1.volumes", FRAME_A]);
+        assert_eq!(failing(&p4()), ["p1.volumes", "p1.volume-arm", FRAME_A]);
         assert_eq!(failing(&p5()), ["p1.volumes", FRAME_A]);
         assert!(failing(&p1_kill()).is_empty());
         // A negative's checks are its positive row's, in the same order,
@@ -1123,6 +1128,10 @@ mod tests {
                 .filter(|v| v["t"] == "pad" && v["q"] == 1500)
             {
                 *v = super::super::judge::tests::panel_pad(1500, 1 << 8, 2, true);
+            }
+            // Its clicks reach no volume slider.
+            for v in run.iter_mut().filter(|v| v["t"] == "shot") {
+                v["volumes"] = json!([]);
             }
         }
         run[0] = json!({

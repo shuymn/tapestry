@@ -353,7 +353,11 @@ pub struct RunCall {
 
 /// A shot: its file, the player's process that made it and the process
 /// id of the shot pipe's client that sent it (the system's), the frame's
-/// size, the host counter when the runner sent the request, and the frame.
+/// size, the host counter when the runner sent the request, the frame, and
+/// the player's witness of its pointer volume arm: each volume the arm
+/// reached before the player answered, as the slider's number (17 system,
+/// 18 key, 19 background), the whole percent and the host counter when the
+/// arm took it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunShot {
@@ -364,6 +368,7 @@ pub struct RunShot {
     pub size: [i32; 2],
     pub requested: i64,
     pub frame: RunFrame,
+    pub volumes: Vec<[i64; 3]>,
 }
 
 /// A frame the player copied as it presented it: the swap chain's present

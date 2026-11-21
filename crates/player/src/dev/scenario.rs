@@ -3023,6 +3023,7 @@ fn select_args(
             stop_timeout: None,
             speculative_permits: None,
             shot_pipe: None,
+            freeze_skin_clock: false,
             size: None,
             window: None,
             scenario: Some(session),

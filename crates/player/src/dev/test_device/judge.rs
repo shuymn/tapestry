@@ -19,7 +19,7 @@ use test_device::protocol::{Answer, Command, Token};
 use test_device::provenance;
 
 use super::guard::SLICE_MS;
-use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE};
+use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE, START_VOLUME};
 use super::listen::{BUTTON_EDGES, a_runner_s};
 use super::run::{F24_SCAN, FOCUS_POINT, MODE_LINK, PANEL_MODE, SELECT, START, pad_buttons};
 
@@ -1007,14 +1007,26 @@ const VOLUME_KEYS: [(u8, &str); 3] = [
     (19, "background_volume"),
 ];
 
-/// The three volumes `device.toml` holds after the run: each target's
-/// percent.
-pub fn volumes(after: &[u8]) -> Result<(), String> {
-    let table: toml::Table = std::str::from_utf8(after)
-        .map_err(|e| e.to_string())
-        .and_then(|t| toml::from_str(t).map_err(|e| e.to_string()))
-        .map_err(|e| format!("device.toml after the run does not read: {e}"))?;
+/// The three volumes `device.toml` holds: before the run each at
+/// [`START_VOLUME`], as the runner writes it (a target the clicks must
+/// move, never one already set), and after it each target's percent.
+pub fn volumes(before: &[u8], after: &[u8]) -> Result<(), String> {
+    let read = |b: &[u8], when: &str| -> Result<toml::Table, String> {
+        std::str::from_utf8(b)
+            .map_err(|e| e.to_string())
+            .and_then(|t| toml::from_str(t).map_err(|e| e.to_string()))
+            .map_err(|e| format!("device.toml {when} the run does not read: {e}"))
+    };
+    let (before, table) = (read(before, "before")?, read(after, "after")?);
     let mut wrong = Vec::new();
+    for (_, key) in VOLUME_KEYS {
+        match before.get(key).and_then(toml::Value::as_float) {
+            Some(got) if got == START_VOLUME => {}
+            got => wrong.push(format!(
+                "{key} = {got:?} before the run, not {START_VOLUME}"
+            )),
+        }
+    }
     for t in test_device::panel::TARGETS {
         let Some((_, key)) = VOLUME_KEYS.iter().find(|(s, _)| *s == t.slider) else {
             continue;
@@ -1022,7 +1034,7 @@ pub fn volumes(after: &[u8]) -> Result<(), String> {
         let want = f64::from(t.percent) / 100.0;
         match table.get(*key).and_then(toml::Value::as_float) {
             Some(got) if got == want => {}
-            got => wrong.push(format!("{key} = {got:?}, not {want}")),
+            got => wrong.push(format!("{key} = {got:?} after the run, not {want}")),
         }
     }
     if wrong.is_empty() {
@@ -1048,8 +1060,8 @@ pub fn volumes_kept(after: &[u8]) -> Result<(), String> {
         .iter()
         .filter_map(
             |(_, key)| match table.get(*key).and_then(toml::Value::as_float) {
-                Some(1.0) => None,
-                got => Some(format!("{key} = {got:?}, not 1.0")),
+                Some(got) if got == START_VOLUME => None,
+                got => Some(format!("{key} = {got:?}, not {START_VOLUME}")),
             },
         )
         .collect();
@@ -1079,6 +1091,66 @@ fn mutation_build(run: &[Value]) -> Result<Result<String, String>, String> {
     Ok(match p["declared"].as_str() {
         Some(d) if d == sha && sha != runner && !sha.is_empty() => Ok(detail),
         _ => Err(detail),
+    })
+}
+
+/// The player's witness in shot A's record (its pointer volume arm's
+/// settings, docs/test-device.md "Run Guard", shots): before shot A's frame
+/// was taken, the arm reached each target's slider with its percent, and
+/// it reached no other slider or percent at any time; so every click's
+/// press was dispatched to the arm with its value, whatever the player did
+/// with it after. Outer error (incomplete): not exactly one shot A record,
+/// or one whose witness does not read.
+fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
+    let shots: Vec<&Value> = run
+        .iter()
+        .filter(|v| v["t"] == "shot" && v["what"] == "shot-a.png")
+        .collect();
+    let [shot] = shots.as_slice() else {
+        return Err(format!("{} shot A records, not one", shots.len()));
+    };
+    let acquired = shot["frame"]["acquired"]
+        .as_i64()
+        .ok_or("shot A's record has no frame counter")?;
+    let reached: Vec<(u64, u64, i64)> = shot["volumes"]
+        .as_array()
+        .ok_or("shot A's record has no volume witness")?
+        .iter()
+        .map(|v| Some((v[0].as_u64()?, v[1].as_u64()?, v[2].as_i64()?)))
+        .collect::<Option<_>>()
+        .ok_or("a volume in shot A's witness does not read")?;
+    let target = |slider: u64| {
+        test_device::panel::TARGETS
+            .iter()
+            .find(|t| u64::from(t.slider) == slider)
+    };
+    let mut wrong = Vec::new();
+    for &(slider, percent, at) in &reached {
+        match target(slider) {
+            Some(t) if u64::from(t.percent) == percent && at < acquired => {}
+            Some(t) if u64::from(t.percent) == percent => wrong.push(format!(
+                "slider {slider} reached at {at}, not before shot A's frame at {acquired}"
+            )),
+            _ => wrong.push(format!(
+                "the arm reached slider {slider} at {percent} %, which no target sets"
+            )),
+        }
+    }
+    for t in test_device::panel::TARGETS {
+        if !reached
+            .iter()
+            .any(|&(s, p, _)| s == u64::from(t.slider) && p == u64::from(t.percent))
+        {
+            wrong.push(format!(
+                "slider {} at {} % never reached the volume arm",
+                t.slider, t.percent
+            ));
+        }
+    }
+    Ok(if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
     })
 }
 
@@ -1274,8 +1346,13 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
         verdict("p1.grants", &[RUN_LINK], recs(&f.link).map(grants)),
         verdict(
             "p1.volumes",
-            &[file(DEVICE_AFTER)],
-            bytes(&x.device_after).map(|a| volumes(&a)),
+            &[file(DEVICE_BEFORE), file(DEVICE_AFTER)],
+            bytes(&x.device_before).and_then(|b| Ok(volumes(&b, &bytes(&x.device_after)?))),
+        ),
+        verdict(
+            "p1.volume-arm",
+            &[RUN_RUN],
+            recs(&f.run).and_then(volume_arm),
         ),
         verdict(
             "p1.device-toml",
@@ -2100,6 +2177,9 @@ pub mod tests {
     /// the recorder's clicks and buttons, and the settings.
     pub fn panel_good() -> (Files, PanelFiles) {
         let n1 = good();
+        // The volume arm's witness: each target's slider and percent,
+        // reached after its click and before shot A's frame (2410).
+        let arm = json!([[17, 25, 230], [18, 50, 240], [19, 75, 250]]);
         // Calls: the sink's focus (move, click), the player's focus (move,
         // click), four calibrations, three targets (move, click), tagged
         // 0xABCD0000 on, at 10-tick steps from 200.
@@ -2121,11 +2201,13 @@ pub mod tests {
             json!({"t": "held", "q": 1700}),
             json!({"t": "shot", "q": 2500, "what": "shot-a.png",
                    "process": {"pid": 8, "created": 80}, "client": 8, "size": [1920, 1080],
-                   "requested": 2400, "frame": {"previous": 29, "present": 30, "acquired": 2410, "presented": 2420}}),
+                   "requested": 2400, "frame": {"previous": 29, "present": 30, "acquired": 2410, "presented": 2420},
+                   "volumes": arm.clone()}),
             json!({"t": "released", "q": 3010, "report": 3000}),
             json!({"t": "shot", "q": 3500, "what": "shot-b.png",
                    "process": {"pid": 8, "created": 80}, "client": 8, "size": [1920, 1080],
-                   "requested": 3400, "frame": {"previous": 79, "present": 80, "acquired": 3410, "presented": 3420}}),
+                   "requested": 3400, "frame": {"previous": 79, "present": 80, "acquired": 3410, "presented": 3420},
+                   "volumes": arm.clone()}),
             json!({"t": "stop", "q": 5000, "what": "end"}),
             json!({"t": "quiet", "q": 5600, "line": hello(true, "released", "-")}),
             json!({"t": "close", "q": 5800, "window": SINK}),
@@ -2183,7 +2265,7 @@ pub mod tests {
     fn a_good_panel_run_passes_every_check() {
         let (f, x) = panel_good();
         let all = panel(Some("0123456789ab"), &f, &x, "p1");
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 12);
         for j in &all {
             assert_eq!(j.outcome, Outcome::Pass, "{j:?}");
         }
@@ -2407,7 +2489,8 @@ pub mod tests {
         let v = lines.iter().find(|v| v["check"] == "p1.volumes").unwrap();
         assert_eq!(v["outcome"], "pass", "{v}");
         let read_sha = contract::hex(&sha2::Sha256::digest(&after));
-        assert_eq!(v["inputs"][0]["sha256"], read_sha.as_str(), "{v}");
+        assert_eq!(v["inputs"][1]["path"], DEVICE_AFTER, "{v}");
+        assert_eq!(v["inputs"][1]["sha256"], read_sha.as_str(), "{v}");
     }
 
     /// The volumes are read from the copied `device.toml` after the run:
@@ -2419,7 +2502,10 @@ pub mod tests {
         x.device_after = Ok(DEVICE_TOML.as_bytes().to_vec());
         let (o, d) = panel_outcome(&f, &x, "p1", "p1.volumes");
         assert_eq!(o, Outcome::Fail);
-        assert!(d.contains("system_volume = Some(1.0), not 0.25"), "{d}");
+        assert!(
+            d.contains("system_volume = Some(1.0) after the run, not 0.25"),
+            "{d}"
+        );
         let (f, mut x) = panel_good();
         let a = String::from_utf8(x.device_after.unwrap()).unwrap();
         x.device_after = Ok(a
@@ -2430,6 +2516,104 @@ pub mod tests {
         x.device_after = Err("missing".into());
         assert_eq!(
             panel_outcome(&f, &x, "p1", "p1.volumes").0,
+            Outcome::Incomplete
+        );
+    }
+
+    /// The clicks must move each volume from the 1.0 the runner wrote: a
+    /// `device.toml` already holding the targets before the run (with
+    /// clicks that set nothing, the file after it the same) fails, and so
+    /// does any one volume off 1.0 before it; an unreadable copy from before
+    /// is incomplete.
+    #[test]
+    fn prefilled_volumes_before_the_run_fail() {
+        let (f, mut x) = panel_good();
+        x.device_before.clone_from(&x.device_after);
+        let (o, d) = panel_outcome(&f, &x, "p1", "p1.volumes");
+        assert_eq!(o, Outcome::Fail);
+        for want in [
+            "system_volume = Some(0.25) before the run, not 1",
+            "key_volume = Some(0.5) before the run, not 1",
+            "background_volume = Some(0.75) before the run, not 1",
+        ] {
+            assert!(d.contains(want), "{d}");
+        }
+        let (f, mut x) = panel_good();
+        let b = String::from_utf8(x.device_before.unwrap()).unwrap();
+        x.device_before = Ok(b
+            .replace("key_volume = 1.0", "key_volume = 0.99")
+            .into_bytes());
+        let (o, d) = panel_outcome(&f, &x, "p1", "p1.volumes");
+        assert_eq!(o, Outcome::Fail);
+        assert!(d.contains("key_volume = Some(0.99) before the run"), "{d}");
+        let (f, mut x) = panel_good();
+        x.device_before = Err("missing".into());
+        assert_eq!(
+            panel_outcome(&f, &x, "p1", "p1.volumes").0,
+            Outcome::Incomplete
+        );
+    }
+
+    /// Shot A's witness of the player's volume arm: each target reached it
+    /// with its slider and percent before shot A's frame. A press dropped
+    /// before dispatch (one target missing), a percent no target sets, or a
+    /// target reached only after the frame fails; P5's player, whose arm
+    /// drops the values it reached, passes; P4's, whose clicks reach no
+    /// slider, fails; a run with no shot A record or a witness that does not
+    /// read is incomplete.
+    #[test]
+    fn each_target_must_reach_the_volume_arm_before_shot_a() {
+        let arm = |vols: Value| {
+            let (mut f, x) = panel_good();
+            edit(&mut f.run, |r| {
+                for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+                    v["volumes"] = vols.clone();
+                }
+            });
+            panel_outcome(&f, &x, "p1", "p1.volume-arm")
+        };
+        assert_eq!(
+            arm(json!([[17, 25, 230], [18, 50, 240], [19, 75, 250]])).0,
+            Outcome::Pass
+        );
+        // Dragged on the same value: reached twice, still each target's.
+        assert_eq!(
+            arm(json!([
+                [17, 25, 230],
+                [17, 25, 231],
+                [18, 50, 240],
+                [19, 75, 250]
+            ]))
+            .0,
+            Outcome::Pass
+        );
+        let (o, d) = arm(json!([[17, 25, 230], [19, 75, 250]]));
+        assert_eq!(o, Outcome::Fail);
+        assert!(
+            d.contains("slider 18 at 50 % never reached the volume arm"),
+            "{d}"
+        );
+        let (o, d) = arm(json!([[17, 25, 230], [18, 51, 240], [19, 75, 250]]));
+        assert_eq!(o, Outcome::Fail);
+        assert!(d.contains("slider 18 at 51 %, which no target sets"), "{d}");
+        let (o, d) = arm(json!([[17, 25, 230], [18, 50, 240], [19, 75, 2410]]));
+        assert_eq!(o, Outcome::Fail);
+        assert!(
+            d.contains("slider 19 reached at 2410, not before shot A"),
+            "{d}"
+        );
+        assert_eq!(arm(json!([])).0, Outcome::Fail, "P4: no slider reached");
+        assert_eq!(arm(json!([[17, 25]])).0, Outcome::Incomplete);
+        assert_eq!(arm(Value::Null).0, Outcome::Incomplete);
+        let (f, x) = p5_good();
+        assert_eq!(
+            panel_outcome(&f, &x, "p5", "p1.volume-arm").0,
+            Outcome::Pass
+        );
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| r.retain(|v| v["what"] != "shot-a.png"));
+        assert_eq!(
+            panel_outcome(&f, &x, "p1", "p1.volume-arm").0,
             Outcome::Incomplete
         );
     }

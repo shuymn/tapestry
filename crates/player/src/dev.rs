@@ -37,6 +37,7 @@ mod decision_faults;
 pub mod loop_probe;
 pub mod present_shot;
 pub mod scenario;
+pub mod skin_clock;
 pub mod test_device;
 pub mod transitions;
 
@@ -834,6 +835,10 @@ pub struct SelectOptions {
     /// shots on (`--dev-shot-pipe <name>`, [`present_shot`]): each answered
     /// with a frame the render thread copied as it presented it.
     pub shot_pipe: Option<String>,
+    /// Whether the select skin's clock is frozen for the whole run
+    /// (`--dev-freeze-skin-clock`, [`skin_clock`]): a test device's shots
+    /// of the select screen are then the same frame in every run.
+    pub freeze_skin_clock: bool,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -877,6 +882,7 @@ impl SelectOptions {
                 }
                 self.shot_pipe = Some(name);
             }
+            "dev-freeze-skin-clock" => self.freeze_skin_clock = true,
             "dev-speculative-permits" => {
                 let n = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-speculative-permits takes a count".to_owned())

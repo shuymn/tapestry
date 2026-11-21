@@ -415,6 +415,7 @@ mod tests {
                 present: 7,
                 acquired: 10,
                 presented: 20,
+                volumes: Vec::new(),
             };
             present_shot::write_answer(&mut w, serial, &Ok(shot)).unwrap();
         });
@@ -444,6 +445,7 @@ mod tests {
                 present: 5,
                 acquired: 1_000,
                 presented: 1_200,
+                volumes: Vec::new(),
             }),
         };
         assert!(check_answer(good(), 3, 40, 900).is_ok());

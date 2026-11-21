@@ -812,6 +812,11 @@ impl Exec for Live {
                 "previous": frame.previous, "present": frame.present,
                 "acquired": frame.acquired, "presented": frame.presented,
             },
+            "volumes": frame
+                .volumes
+                .iter()
+                .map(|v| [i64::from(v.slider), i64::from(v.percent), v.at])
+                .collect::<Vec<_>>(),
         }));
         self.beat();
         self.shots
