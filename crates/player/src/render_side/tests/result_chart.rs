@@ -60,7 +60,7 @@ fn chart_skin(
 /// Two bundles of `bundle`'s skin over one new atlas: a view of the
 /// second staged while the first is installed is a layout on the
 /// installed array.
-fn pair(bundle: &Arc<render::SkinBundle>) -> [Arc<render::SkinBundle>; 2] {
+pub(super) fn pair(bundle: &Arc<render::SkinBundle>) -> [Arc<render::SkinBundle>; 2] {
     let skin = bundle.skin();
     let variant = bundle.atlas_pages().variant();
     let limits = AtlasLimits {

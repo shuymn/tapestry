@@ -61,6 +61,9 @@ impl Gate {
 /// timer's ms its state held as the build began.
 pub(super) type Build = (TimeUs, Option<TimeUs>, Option<i32>);
 
+/// A test's setup run on the menu screen's renderer ([`Faults::on_renderer`]).
+pub(crate) type OnRenderer = Box<dyn FnOnce(&mut render::Renderer) + Send>;
+
 /// Faults a test turns on.
 #[derive(Default)]
 pub(super) struct Faults {
@@ -179,6 +182,12 @@ pub(super) struct Faults {
     /// menu screen's renderer answers (`install_creates`, `install_room`);
     /// at once otherwise.
     pub(crate) step_creations: AtomicBool,
+    /// Run on the menu screen's renderer at the next upload boundary, in
+    /// order (a test's setup of charges and pools on the render thread).
+    pub(crate) on_renderer: Mutex<Vec<OnRenderer>>,
+    /// The next selection installation's chart-image pool arrays refused
+    /// this many times, as the device refuses one.
+    pub(crate) refuse_pools: AtomicU32,
 }
 
 impl Recorded {
@@ -201,6 +210,12 @@ impl Recorded {
         }
         if kind == ScreenKind::Result && self.faults.cancel_install.swap(false, Ordering::AcqRel) {
             return Some(Ok(Preparation::Cancelled));
+        }
+        if kind == ScreenKind::Selection {
+            let n = self.faults.refuse_pools.swap(0, Ordering::AcqRel);
+            if n > 0 {
+                self.menu.renderer_mut().refuse_next_pools(n);
+            }
         }
         if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
             self.menu.remove(ScreenKind::Result);
@@ -306,6 +321,10 @@ impl Screen for Recorded {
         })
     }
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        let setups = std::mem::take(&mut *self.faults.on_renderer.lock().unwrap());
+        for f in setups {
+            f(self.menu.renderer_mut());
+        }
         if self.faults.result_stepping.swap(false, Ordering::AcqRel)
             && self.faults.lose_in_staging.swap(false, Ordering::AcqRel)
         {
@@ -4602,6 +4621,214 @@ fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
         destroyed < created && heavy[created].start >= heavy[destroyed].end,
         "the creation before the destruction, or in its boundary: {heavy:?}"
     );
+    let seen = paths.0.lock().unwrap().clone();
+    let seen = seen.get(from..).unwrap_or(&[]);
+    assert!(
+        seen.iter().all(|p| *p == Some(ResultPath::Skin)),
+        "a frame not the shown view's while the switch staged: {seen:?}"
+    );
+    assert_eq!(presenting, Vec::new(), "a blocking wait presenting");
+    rig.link.exit();
+}
+
+/// A view switch whose union fits only once the selection's chart-image
+/// pool yields optional layers (a reduction), while the smaller pool a
+/// regrowth replaced still stands retired beside the live one: the
+/// reduction retires the live pool, one retired pool at a time, so the old
+/// one must be destroyed first. The switch's creation is not taken while
+/// it stands, and the shown view draws meanwhile; a boundary destroys it,
+/// then the creation retires the live pool on its own allowance. No
+/// destruction runs inside the creation's call, and no presenting pass
+/// waits for the GPU (V19 (k), the switch; V9b (c)).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_switch_reducing_the_pool_waits_for_the_retired_pools_destruction() {
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    switch_reducing_the_pool(&a, &b);
+}
+
+/// [`a_switch_reducing_the_pool_waits_for_the_retired_pools_destruction`]
+/// for a rebind, a layout on the installed array that creates none: it is
+/// taken at the first pass its staging needs no destruction, never refused
+/// for want of room, and draws once the boundary destroyed the retired
+/// pool.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_rebind_reducing_the_pool_waits_for_the_retired_pools_destruction() {
+    let (_ad, skin) = fixed_skin();
+    let [a, b] = super::result_chart::pair(&skin);
+    switch_reducing_the_pool(&a, &b);
+}
+
+/// The switch from `a` to `b` of the two tests above; a creation's heavy
+/// record checked when `b` creates an array.
+#[cfg(feature = "dev-tools")]
+fn switch_reducing_the_pool(a: &Arc<render::SkinBundle>, b: &Arc<render::SkinBundle>) {
+    use crate::measure::ResultPath;
+    use crate::render_side::HeavyKind;
+    type Setup = (Option<u32>, Option<u32>, render::Admission, usize);
+    type After = (u64, Vec<render::DestroyRecord>);
+    let creates = a.atlas_id() != b.atlas_id();
+    let (_x0d, x0) = fixed_skin();
+    let sel_dir = crate::selection_skin::chart_fixture();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let (sel, _script) =
+        crate::selection_skin::fixture_scripted(limits, sel_dir.path(), "chart.luaskin");
+    let paths = Paths::default();
+    let rig = Rig::with_sink(Box::new(paths.clone()));
+    rig.faults.step_creations.store(true, Ordering::Release);
+    let lifetime = installed(&rig, &x0);
+    // The selection's pool made at its firm layer alone: the device
+    // refuses its whole array once.
+    rig.faults.refuse_pools.store(1, Ordering::Release);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Selection, Some(Arc::clone(&sel)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.link.record_heavy(256);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((1, true))),
+        "the first view: {:?}",
+        rig.link.result_status()
+    );
+    // The installation before the lifetime, retired at the first view's
+    // commit, destroyed at a boundary before the pool's pair is set up.
+    assert!(wait_until(|| rig
+        .link
+        .heavy_record()
+        .iter()
+        .any(|r| r.kind == HeavyKind::Destruction)));
+    rig.link.hold_destruction(true);
+    // The pool regrown: the live pool beside the firm-layer one it
+    // replaced, retired and left standing; b charged so it fits once the
+    // live pool keeps one layer fewer.
+    let setup: Arc<Mutex<Option<Setup>>> = Arc::default();
+    let s2 = Arc::clone(&setup);
+    let b2 = Arc::clone(b);
+    rig.faults
+        .on_renderer
+        .lock()
+        .unwrap()
+        .push(Box::new(move |r| {
+            let before = r.pool().map(|p| p.layers);
+            let grown = r.regrow_pool().map(|p| p.layers);
+            let adm = r.admission();
+            let kept = u64::from(grown.unwrap_or(0).saturating_sub(2));
+            let others = adm.committed_total() - adm.charge(ScreenKind::Result);
+            r.state_candidate_charge(
+                &b2,
+                render::SHARED_TEXELS - others - adm.filled - kept * adm.firm,
+            );
+            *s2.lock().unwrap() = Some((before, grown, adm, r.destructions_recorded()));
+        }));
+    assert!(wait_until(|| setup.lock().unwrap().is_some()));
+    let (before, grown, adm, recorded) = setup.lock().unwrap().take().unwrap();
+    assert_eq!(before, Some(1), "the pool at its firm layer before");
+    let grown = grown.expect("a live pool");
+    assert!(grown >= 2, "the regrowth: {grown} layers");
+    assert!(
+        adm.retired_pool > 0,
+        "no retired pool beside the live one: {adm:?}"
+    );
+    assert_eq!(adm.filled, 0, "an entry still charged: {adm:?}");
+    rig.link.record_heavy(256);
+    render::probe::count_gpu_waits(Some(false));
+    let from = paths.0.lock().unwrap().len();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    // The retired pool stands: no creation, the first view drawn.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        rig.link.result_status().shown,
+        Some((1, true)),
+        "the switch committed while the retired pool stood"
+    );
+    assert!(
+        rig.link
+            .heavy_record()
+            .iter()
+            .all(|r| r.kind != HeavyKind::ResultCreation),
+        "the switch's creation taken with the retired pool standing: {:?}",
+        rig.link.heavy_record()
+    );
+    let waiting = paths.0.lock().unwrap().len();
+    assert!(waiting > from + 3, "frames stopped while the switch waited");
+    // A boundary destroys it, then the creation follows.
+    rig.link.hold_destruction(false);
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "the switch: {:?}",
+        rig.link.result_status()
+    );
+    let presenting: Vec<_> = render::probe::gpu_waits()
+        .into_iter()
+        .filter(|w| w.pass == render::probe::PASS_PRESENTING)
+        .collect();
+    render::probe::count_gpu_waits(None);
+    // What the creation did to the pool, and every destruction since the
+    // setup, read on the render thread.
+    let after: Arc<Mutex<Option<After>>> = Arc::default();
+    let a2 = Arc::clone(&after);
+    rig.faults
+        .on_renderer
+        .lock()
+        .unwrap()
+        .push(Box::new(move |r| {
+            let adm = r.admission();
+            let all: Vec<_> = r.destructions().copied().collect();
+            let n = (r.destructions_recorded() - recorded).min(all.len());
+            *a2.lock().unwrap() = Some((
+                adm.firm + adm.pool,
+                all.get(all.len() - n..).unwrap_or(&[]).to_vec(),
+            ));
+        }));
+    assert!(wait_until(|| after.lock().unwrap().is_some()));
+    let (pooled, destroyed) = after.lock().unwrap().take().unwrap();
+    assert!(
+        pooled < u64::from(grown) * adm.firm,
+        "the switch's creation did not reduce the pool: {pooled} texels of {grown} layers"
+    );
+    assert!(
+        destroyed
+            .iter()
+            .any(|d| d.class == render::Class::RetiredPool),
+        "the retired pool never destroyed: {destroyed:?}"
+    );
+    assert!(
+        destroyed.iter().all(|d| !d.in_call),
+        "a destruction inside a creation's call: {destroyed:?}"
+    );
+    let heavy = rig.link.heavy_record();
+    let destroyed_at = heavy
+        .iter()
+        .position(|r| r.kind == HeavyKind::Destruction)
+        .expect("the retired pool destroyed at a boundary");
+    if creates {
+        let created = heavy
+            .iter()
+            .position(|r| r.kind == HeavyKind::ResultCreation)
+            .expect("the switch's creation at a boundary");
+        assert!(
+            destroyed_at < created && heavy[created].start >= heavy[destroyed_at].end,
+            "the creation before the destruction, or in its boundary: {heavy:?}"
+        );
+    }
     let seen = paths.0.lock().unwrap().clone();
     let seen = seen.get(from..).unwrap_or(&[]);
     assert!(

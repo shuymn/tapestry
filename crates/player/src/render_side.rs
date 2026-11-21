@@ -10811,9 +10811,10 @@ impl Run {
                 // the room it needs (design.md "Memory Budget").
                 !s.taken
                     && s.held.payload.skin.as_ref().is_none_or(|b| {
-                        self.screen
-                            .as_ref()
-                            .is_some_and(|sc| sc.install_room(ScreenKind::Result, b))
+                        self.screen.as_ref().is_some_and(|sc| {
+                            sc.install_creates(ScreenKind::Result, b)
+                                && sc.install_room(ScreenKind::Result, b)
+                        })
                     })
             })
         {
@@ -13503,16 +13504,12 @@ impl Run {
                 } else if let (Some(_), false) = (&p.payload.skin, disabled) {
                     // Its staging steps; an installation that creates an
                     // array takes it first at a boundary the allowance
-                    // admits, any other at once.
-                    let taken = p
-                        .payload
-                        .skin
-                        .as_ref()
-                        .is_some_and(|b| !screen.install_creates(ScreenKind::Result, b));
+                    // admits, any other at the first pass it needs no
+                    // destruction (below).
                     side.staging = Some(StagingView {
                         held,
                         request,
-                        taken,
+                        taken: false,
                         token: None,
                         state: None,
                         #[cfg(feature = "dev-tools")]
@@ -13536,6 +13533,18 @@ impl Run {
         // the result skin): its installation, then its chart images and
         // text, none waiting for the GPU.
         let mut ended: Option<StagingEnd> = None;
+        // A rebind on the committed pages creates no array: taken at the
+        // first pass its admission and entries need no destruction in its
+        // call, the boundaries' retirement path freeing them meanwhile
+        // (design.md "Memory Budget").
+        if let Some(st) = side.staging.as_mut().filter(|s| !s.taken)
+            && st.held.payload.skin.as_ref().is_some_and(|b| {
+                !screen.install_creates(ScreenKind::Result, b)
+                    && screen.install_room(ScreenKind::Result, b)
+            })
+        {
+            st.taken = true;
+        }
         if let Some(st) = side.staging.as_mut().filter(|s| s.taken)
             && let Some(bundle) = st.held.payload.skin.clone()
         {

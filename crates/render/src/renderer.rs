@@ -2595,6 +2595,15 @@ impl Renderer {
     ///
     /// # Errors
     ///
+    /// A result view's staging destroys nothing in its call, whatever the
+    /// phase allows: its owner takes it once [`install_room`](Self::install_room)
+    /// answers that it needs no destruction, each destruction it waited for
+    /// made at a boundary (design.md "Memory Budget"); taken without that
+    /// room, it is refused as admission refuses it with destruction not
+    /// allowed.
+    ///
+    /// # Errors
+    ///
     /// As [`install`](Self::install).
     pub fn install_stepped(
         &mut self,
@@ -2602,7 +2611,13 @@ impl Renderer {
         bundle: &Arc<SkinBundle>,
         request: u64,
     ) -> Result<Option<PreparedToken>, RenderError> {
-        self.stage_with(kind, bundle, None, request, true)
+        if kind != ScreenKind::Result {
+            return self.stage_with(kind, bundle, None, request, true);
+        }
+        let allowed = std::mem::replace(&mut self.destroy_allowed, false);
+        let staged = self.stage_with(kind, bundle, None, request, true);
+        self.destroy_allowed = allowed;
+        staged
     }
 
     /// Whether staging `bundle` as `kind`'s would create an array of its
@@ -2616,14 +2631,17 @@ impl Renderer {
             && self.committed_atlas(kind) != Some(bundle.atlas_id())
     }
 
-    /// Whether staging `bundle` as `kind`'s now would destroy no filled
-    /// retirement entry in its call: neither its admission (the first step
-    /// of its order, or the pool's reduction after it) nor its entry's
-    /// reservation needs one destroyed where destruction is allowed. A
-    /// stepped staging that does waits until the boundaries' retirement
-    /// path has destroyed what it needs, each destruction at its own
-    /// boundary once its last use completes, never waiting for the GPU in
-    /// its call (design.md "Memory Budget", "Load Pipeline"). Reads only.
+    /// Whether staging `bundle` as `kind`'s now needs no destruction in its
+    /// call: its admission with no filled entry destroyed (the pool's
+    /// optional layers yielding, and a reduction's retired pool needing
+    /// none destroyed first), and its own entry and a reduction's entry
+    /// free to reserve. A staging that would need one waits until the
+    /// boundaries' retirement path has destroyed what it needs, each
+    /// destruction at its own boundary once its last use completes, never
+    /// waiting for the GPU in its call (design.md "Memory Budget", "Load
+    /// Pipeline"). Where destruction is not allowed, or nothing a boundary
+    /// destroys would make room, the staging's own refusal answers (true).
+    /// Reads only.
     #[must_use]
     pub fn install_room(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
         if !self.destroy_allowed
@@ -2633,15 +2651,24 @@ impl Renderer {
         {
             return true;
         }
-        let charged = self.retire.oldest(true).is_some();
-        let admits = match self.reclaim(kind, self.candidate_charge(kind, bundle), true) {
-            Reclaim::Fits | Reclaim::Refused(_) => true,
-            Reclaim::Destroy | Reclaim::Reduce(_) | Reclaim::ReleaseResult => !charged,
+        let charge = self.candidate_charge(kind, bundle);
+        if matches!(self.reclaim(kind, charge, true), Reclaim::Refused(_)) {
+            return true;
+        }
+        // Its own entry, and a reduction's when the live pool has more
+        // layers than it keeps.
+        let entries = match self.reclaim(kind, charge, false) {
+            Reclaim::Fits => 1,
+            Reclaim::Reduce(layers) if self.pool.as_ref().is_some_and(|p| p.layers() > layers) => {
+                if self.retire.retired_pool_entry().is_some() {
+                    return false;
+                }
+                2
+            }
+            Reclaim::Reduce(_) => 1,
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => return false,
         };
-        let reserves = !self.install_creates(kind, bundle)
-            || self.retire.has_free()
-            || self.retire.oldest(false).is_none();
-        admits && reserves
+        self.retire.free() >= entries || self.retire.oldest(false).is_none()
     }
 
     /// Writes the staging of `request` to its end, waiting for each step,
@@ -3561,7 +3588,7 @@ impl Renderer {
             // Another bundle on the pages installed: a fresh layout on
             // their array, nothing uploaded.
             None if self.committed_atlas(kind) == Some(bundle.atlas_id()) => {
-                let (staging, instances) = self.layout_for(bundle)?;
+                let (staging, instances) = self.layout_for(bundle, !stepped)?;
                 (
                     Installation::new(Arc::clone(bundle)),
                     PendingRes::Layout {
@@ -4125,8 +4152,15 @@ impl Renderer {
 
     /// A fresh layout for `bundle` on its kind's committed atlas array:
     /// its staging and an instance buffer, inside error scopes, with no
-    /// texture uploaded.
-    fn layout_for(&self, bundle: &Arc<SkinBundle>) -> Result<(Staging, wgpu::Buffer), RenderError> {
+    /// texture uploaded; waited for on the GPU when `wait` (a staging
+    /// answered at once). A staging in steps waits for nothing: the buffer
+    /// carries no GPU work before its commit, and the scopes report its
+    /// creation's refusal.
+    fn layout_for(
+        &self,
+        bundle: &Arc<SkinBundle>,
+        wait: bool,
+    ) -> Result<(Staging, wgpu::Buffer), RenderError> {
         let staging = self.staging_for(bundle)?;
         let device = self.gpu.device();
         let (buffer, refused) = skin_atlas::scoped(device, || {
@@ -4137,7 +4171,9 @@ impl Renderer {
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        wait_for_gpu(&self.gpu)?;
+        if wait {
+            wait_for_gpu(&self.gpu)?;
+        }
         Ok((staging, buffer))
     }
 
