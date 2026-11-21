@@ -342,6 +342,10 @@ pub struct MenuScreen {
     /// The font being read on a thread of its own, ahead of the page that
     /// needs it.
     font_ahead: Option<FontJob>,
+    /// That read failed, or its thread could not be started: the pending
+    /// presentation keeps its bitmap line and the result strip is left
+    /// out for this screen's life, with no read on the render thread.
+    font_failed: bool,
     /// The text prepared for this renderer, and the page it shows.
     text: Option<MenuText>,
     /// The cursor's line of the prepared page.
@@ -384,6 +388,10 @@ pub struct MenuScreen {
     /// the commit point to take (the S10-09i design's D1), each with its
     /// lines' count.
     result_strip: [(Option<MenuText>, usize); 3],
+    /// Each slot's strip lines asked for while the font was being read,
+    /// laid out once it is ([`Screen::settle_result_strips`]); they move
+    /// with their slot at the commit point.
+    owed_strip: [Option<Vec<String>>; 3],
     /// A frame's app work allocates once while set (tests: the allocation
     /// guards' positive control).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -391,6 +399,41 @@ pub struct MenuScreen {
     /// The views the selection skin has taken (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     selection_views: u64,
+    /// A swap chain's grants in place of the target's (tests: an
+    /// offscreen target paced as a window's).
+    #[cfg(all(test, feature = "dev-tools"))]
+    grants: Option<Arc<TestGrants>>,
+}
+
+/// A swap chain's grants for a test: each frame wait takes one of
+/// `permits`, `waits` counting the waits begun (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Debug, Default)]
+pub(crate) struct TestGrants {
+    pub(crate) permits: std::sync::atomic::AtomicU32,
+    pub(crate) waits: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl TestGrants {
+    /// Takes a permit, waiting at most `within` for one.
+    fn take(&self, within: std::time::Duration) -> bool {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        let end = std::time::Instant::now() + within;
+        loop {
+            if self
+                .permits
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+    }
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -517,6 +560,11 @@ pub(crate) static FONT_READS: [std::sync::atomic::AtomicU64; 2] = [
 pub(crate) static HOLD_FONT_READ: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// While set, a font read on its own thread fails (tests).
+#[cfg(test)]
+pub(crate) static FAIL_FONT_READ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Waits while [`HOLD_FONT_READ`] is set, at most 20 s (tests).
 #[cfg(test)]
 fn hold_font_read() {
@@ -551,7 +599,62 @@ fn read_font(ahead: &mut Option<FontJob>) -> Result<Fonts, render::text::TextErr
     Fonts::runtime()
 }
 
+/// Whether the page font is in hand, never waiting for its thread and
+/// never reading it here: a thread that ended is joined at once and its
+/// font taken; a read that failed, or a thread that could not be started,
+/// sets `failed`, and nothing reads it again for this screen.
+fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut bool) -> bool {
+    if fonts.is_some() {
+        return true;
+    }
+    if *failed {
+        return false;
+    }
+    match ahead.take() {
+        Some(job) if job.is_finished() => match job.join() {
+            Ok(Ok(read)) => {
+                *fonts = Some(read);
+                true
+            }
+            Ok(Err(e)) => {
+                eprintln!("render: the menu font could not be read: {e}");
+                *failed = true;
+                false
+            }
+            Err(_) => {
+                eprintln!("render: the menu font's read panicked");
+                *failed = true;
+                false
+            }
+        },
+        Some(job) => {
+            *ahead = Some(job);
+            false
+        }
+        None => {
+            eprintln!("render: the menu font's thread could not be started");
+            *failed = true;
+            false
+        }
+    }
+}
+
 impl MenuScreen {
+    /// Paced by `grants` as a swap chain's frames, whatever the target
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub(crate) fn with_test_grants(mut self, grants: Arc<TestGrants>) -> Self {
+        self.grants = Some(grants);
+        self
+    }
+
+    /// [`font_now`], its read begun on its own thread first when none is.
+    fn font_now(&mut self) -> bool {
+        <Self as Screen>::read_font_ahead(self);
+        font_now(&mut self.fonts, &mut self.font_ahead, &mut self.font_failed)
+    }
+
     /// `renderer`, drawing menus in `fonts`; a screen for plays only has
     /// none, draws a black launch screen, and reads the font when it first
     /// has a page to draw.
@@ -563,6 +666,7 @@ impl MenuScreen {
             result_table: None,
             fonts,
             font_ahead: None,
+            font_failed: false,
             text: None,
             cursor: None,
             underline: None,
@@ -588,10 +692,13 @@ impl MenuScreen {
             selection_key: None,
             page_caret: None,
             result_strip: [(None, 0), (None, 0), (None, 0)],
+            owed_strip: [None, None, None],
             #[cfg(all(test, feature = "dev-tools"))]
             alloc_probe: false,
             #[cfg(all(test, feature = "dev-tools"))]
             selection_views: 0,
+            #[cfg(all(test, feature = "dev-tools"))]
+            grants: None,
         }
     }
 
@@ -1328,6 +1435,10 @@ impl Screen for MenuScreen {
     }
 
     fn wait_grant(&mut self, pace: std::time::Duration) -> Option<bool> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(g) = &self.grants {
+            return Some(g.take(pace));
+        }
         match self.renderer.wait_grant_or_pace(pace) {
             render::GrantWait::Granted => Some(true),
             render::GrantWait::Paced => Some(false),
@@ -1434,6 +1545,10 @@ impl Screen for MenuScreen {
     /// stalled boundary's grant check).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn grant_ready(&self) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(g) = &self.grants {
+            return g.take(std::time::Duration::ZERO);
+        }
         self.paced() && !self.minimized() && self.renderer.wait_for_frame(0)
     }
 
@@ -1509,30 +1624,11 @@ impl Screen for MenuScreen {
     }
 
     fn page_font_ready(&mut self) -> bool {
-        if self.fonts.is_some() {
-            return true;
-        }
-        self.read_font_ahead();
-        match self.font_ahead.take() {
-            // Its thread ended: joined at once, the font taken; a read that
-            // failed is left to the page, which reports it.
-            Some(job) if job.is_finished() => {
-                if let Ok(Ok(fonts)) = job.join() {
-                    self.fonts = Some(fonts);
-                }
-                true
-            }
-            Some(job) => {
-                self.font_ahead = Some(job);
-                false
-            }
-            // No thread could be started: the page reads it.
-            None => true,
-        }
+        self.font_now()
     }
 
     fn read_font_ahead(&mut self) {
-        if self.fonts.is_some() || self.font_ahead.is_some() {
+        if self.fonts.is_some() || self.font_ahead.is_some() || self.font_failed {
             return;
         }
         self.font_ahead = std::thread::Builder::new()
@@ -1540,6 +1636,13 @@ impl Screen for MenuScreen {
             .spawn(|| {
                 #[cfg(test)]
                 hold_font_read();
+                #[cfg(test)]
+                if FAIL_FONT_READ.load(Ordering::SeqCst) {
+                    FONT_READS[1].fetch_add(1, Ordering::SeqCst);
+                    return Err(render::text::TextError::NoFamily {
+                        family: "a test's failed read".to_owned(),
+                    });
+                }
                 let fonts = Fonts::runtime();
                 #[cfg(test)]
                 FONT_READS[1].fetch_add(1, Ordering::SeqCst);
@@ -1629,9 +1732,24 @@ impl Screen for MenuScreen {
     }
 
     fn prepare_result_strip(&mut self, which: usize, lines: &[&str]) -> Result<(), RenderError> {
-        let fonts = match &mut self.fonts {
-            Some(fonts) => fonts,
-            none => none.insert(read_font(&mut self.font_ahead)?),
+        // The font not read yet: the slot draws no line until it is, and
+        // its lines are laid out then; never a read or a wait for the
+        // font's thread here (design.md "Rendering and Skins", the
+        // result's hold). A failed read leaves the strip out.
+        if !self.font_now() {
+            if let Some(o) = self.owed_strip.get_mut(which) {
+                *o = (!self.font_failed).then(|| lines.iter().map(|l| (*l).to_owned()).collect());
+            }
+            if let Some((_, n)) = self.result_strip.get_mut(which) {
+                *n = 0;
+            }
+            return Ok(());
+        }
+        if let Some(o) = self.owed_strip.get_mut(which) {
+            *o = None;
+        }
+        let Some(fonts) = &mut self.fonts else {
+            return Ok(());
         };
         let page = MenuPage {
             lines: lines
@@ -1661,6 +1779,27 @@ impl Screen for MenuScreen {
         {
             std::mem::swap(drawn, slot);
         }
+        if let [drawn, rest @ ..] = &mut self.owed_strip
+            && let Some(slot) = which.checked_sub(1).and_then(|i| rest.get_mut(i))
+        {
+            std::mem::swap(drawn, slot);
+        }
+    }
+
+    fn settle_result_strips(&mut self) -> Result<(), RenderError> {
+        if self.owed_strip.iter().all(Option::is_none) || !self.font_now() {
+            if self.font_failed {
+                self.owed_strip = [None, None, None];
+            }
+            return Ok(());
+        }
+        for which in 0..self.owed_strip.len() {
+            if let Some(lines) = self.owed_strip.get_mut(which).and_then(Option::take) {
+                let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+                self.prepare_result_strip(which, &refs)?;
+            }
+        }
+        Ok(())
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1791,11 +1930,19 @@ impl Screen for MenuScreen {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&self) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(g) = &self.grants {
+            return g.take(std::time::Duration::from_millis(100));
+        }
         self.renderer.wait_for_frame(100)
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn paced(&self) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.grants.is_some() {
+            return true;
+        }
         self.renderer.has_frame_waitable()
     }
 

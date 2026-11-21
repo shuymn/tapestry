@@ -633,9 +633,20 @@ pub trait Screen: Send {
         let _ = font;
     }
     /// Whether the page font is read, never waiting for its thread (begun
-    /// now when none is) and never reading it here; ready by default.
+    /// now when none is) and never reading it here; `false` for the
+    /// screen's life once its read failed. Ready by default.
     fn page_font_ready(&mut self) -> bool {
         true
+    }
+    /// Lays out the result strip's lines asked for while the page font was
+    /// being read, once it is, never waiting for it. Allocates. Nothing by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu`](Self::menu).
+    fn settle_result_strips(&mut self) -> Result<(), RenderError> {
+        Ok(())
     }
     /// Whether a loading text is in the uploader's hand; none by default.
     fn loading_text_held(&self) -> bool {
@@ -2153,10 +2164,10 @@ struct Shared {
     /// The held iterations, and their waits (tests).
     #[cfg(test)]
     held: [AtomicU64; 2],
-    /// The passes that waited for the pending presentation's font, each
-    /// presenting nothing (tests).
+    /// The pending presentation's frames drawn in the bitmap font while
+    /// the menu font was being read (tests).
     #[cfg(test)]
-    font_waits: AtomicU64,
+    bitmap_frames: AtomicU64,
     /// The uploader writes no step while a result view's staging is in
     /// hand, its staging answering not ready, while set (tests).
     #[cfg(test)]
@@ -2389,7 +2400,7 @@ impl Shared {
             #[cfg(test)]
             held: [AtomicU64::new(0), AtomicU64::new(0)],
             #[cfg(test)]
-            font_waits: AtomicU64::new(0),
+            bitmap_frames: AtomicU64::new(0),
             #[cfg(test)]
             result_staging_paused: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -4195,11 +4206,11 @@ impl RenderLink {
         self.shared.destruction_held.store(on, Ordering::SeqCst);
     }
 
-    /// The passes that waited for the pending presentation's font so far
-    /// (tests).
+    /// The pending presentation's frames drawn in the bitmap font so far,
+    /// the menu font unread (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn font_waits(&self) -> u64 {
-        self.shared.font_waits.load(Ordering::SeqCst)
+    pub fn bitmap_frames(&self) -> u64 {
+        self.shared.bitmap_frames.load(Ordering::SeqCst)
     }
 
     /// The held iterations so far, each counted as it begins (tests).
@@ -9298,17 +9309,18 @@ impl Run {
                             .end(&page(self.result.as_ref(), &self.end_page.1))
                             .map(|p| (timing_of(p), None)),
                         ResultDrawn::Pending => {
-                            // Its font not yet read: nothing presented.
-                            if !screen.page_font_ready() {
+                            if screen.page_font_ready() {
+                                let page = self
+                                    .wait_page
+                                    .get_or_insert_with(crate::loading_text::skin_wait_page);
+                                pending_frame = true;
+                                screen.menu(page, !self.wait_laid).map(|t| (t, None))
+                            } else {
+                                // Its font not yet read: the bitmap line.
                                 #[cfg(test)]
-                                self.shared.font_waits.fetch_add(1, Ordering::SeqCst);
-                                continue;
+                                self.shared.bitmap_frames.fetch_add(1, Ordering::SeqCst);
+                                pending_bitmap(screen.as_mut())
                             }
-                            let page = self
-                                .wait_page
-                                .get_or_insert_with(crate::loading_text::skin_wait_page);
-                            pending_frame = true;
-                            screen.menu(page, !self.wait_laid).map(|t| (t, None))
                         }
                         ResultDrawn::Refused(e) => {
                             // Refused on a healthy device: the built-in page
@@ -9429,23 +9441,23 @@ impl Run {
                     }
                 }
                 Mode::ResultPending => {
-                    // Its font not yet read (a screen made for plays only,
-                    // read on its own thread): nothing presented, never a
-                    // read in the frame; the passes go on paced as frames
-                    // (design.md "Rendering and Skins", the result's hold).
-                    if !screen.page_font_ready() {
-                        #[cfg(test)]
-                        self.shared.font_waits.fetch_add(1, Ordering::SeqCst);
-                        continue;
-                    }
                     // The wait page, laid out at its first frame; no result
-                    // picture (design.md "Rendering and Skins", the
-                    // result's hold).
-                    let page = self
-                        .wait_page
-                        .get_or_insert_with(crate::loading_text::skin_wait_page);
-                    pending_frame = true;
-                    let drawn = screen.menu(page, !self.wait_laid).map(|t| (t, None));
+                    // picture. Its font not yet read (a screen made for
+                    // plays only, read on its own thread), or its read
+                    // failed: the bitmap line instead, never a read or a
+                    // wait for the font in the frame (design.md "Rendering
+                    // and Skins", the result's hold).
+                    let drawn = if screen.page_font_ready() {
+                        let page = self
+                            .wait_page
+                            .get_or_insert_with(crate::loading_text::skin_wait_page);
+                        pending_frame = true;
+                        screen.menu(page, !self.wait_laid).map(|t| (t, None))
+                    } else {
+                        #[cfg(test)]
+                        self.shared.bitmap_frames.fetch_add(1, Ordering::SeqCst);
+                        pending_bitmap(screen.as_mut())
+                    };
                     #[cfg(feature = "dev-tools")]
                     {
                         result_stamp = Some(crate::measure::ResultStamp {
@@ -13538,6 +13550,10 @@ impl Run {
         };
         let mut refused: Option<String> = None;
         let mut failed: Option<RenderError> = None;
+        // The strip's lines asked for before the font was read.
+        if let Err(e) = screen.settle_result_strips() {
+            failed = Some(e);
+        }
         if std::mem::take(&mut side.reapply)
             && let Some(h) = &mut side.presented
         {
@@ -14609,6 +14625,15 @@ const fn shown_or_retry(presented: bool) -> FrameOutcome {
     } else {
         FrameOutcome::Retry
     }
+}
+
+/// The result's pending presentation in the bitmap font while the menu
+/// font is not in hand: one ASCII line, the same in every language, on the
+/// cleared canvas (design.md "Rendering and Skins", the result's hold).
+fn pending_bitmap(screen: &mut dyn Screen) -> Result<(FrameTiming, Option<TimeUs>), RenderError> {
+    screen
+        .text(&[crate::ui_text::Label::NowLoading.text()])
+        .map(|p| (timing_of(shown_or_retry(p)), None))
 }
 
 const fn timing_of(outcome: FrameOutcome) -> FrameTiming {

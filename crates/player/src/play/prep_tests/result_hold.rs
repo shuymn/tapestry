@@ -56,6 +56,8 @@ struct Frame {
     at: Instant,
     /// Its size read back; zero sides when it was not.
     size: (u32, u32),
+    /// The result strip's lines the screen draws.
+    strip: usize,
 }
 
 impl Frame {
@@ -176,6 +178,7 @@ impl FrameSink for Recorder {
             sampled: drawn.result.map(|r| r.sampled),
             at: Instant::now(),
             size,
+            strip: screen.result_strip(),
         });
         let [hold, held] = &*self.0.meet;
         if hold.load(Ordering::Acquire) {
@@ -202,6 +205,17 @@ fn on_warp_fonts(
     fonts: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Frames),
 ) {
+    on_warp_paced(chart, fonts, None, f);
+}
+
+/// [`on_warp_fonts`], its frames paced by `grants` as a swap chain's when
+/// given.
+fn on_warp_paced(
+    chart: &bms_model::Chart,
+    fonts: bool,
+    grants: Option<Arc<crate::menu_screen::TestGrants>>,
+    f: impl FnOnce(&mut PlayerRig<'_>, &Frames),
+) {
     let frames = Frames::default();
     let make: MakeScreen = Box::new(move || {
         let r = render::Renderer::new(
@@ -219,7 +233,12 @@ fn on_warp_fonts(
         } else {
             None
         };
-        Ok(Box::new(MenuScreen::new(r, fonts)) as Box<dyn Screen>)
+        let screen = MenuScreen::new(r, fonts);
+        let screen = match &grants {
+            Some(g) => screen.with_test_grants(Arc::clone(g)),
+            None => screen,
+        };
+        Ok(Box::new(screen) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
     let render: RenderLink = crate::render_side::spawn(
@@ -1527,76 +1546,366 @@ fn a_screen_for_plays_only_reads_the_pending_font_ahead() {
     });
 }
 
-/// Lets a held font read go when dropped, a test's panic included.
+/// Lets a held font read go, and a failing one succeed, when dropped, a
+/// test's panic included.
 struct FontGo;
 
 impl Drop for FontGo {
     fn drop(&mut self) {
         crate::menu_screen::HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        crate::menu_screen::FAIL_FONT_READ.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A result skin whose first view is prepared from its import, the play
+/// prepared: the skin's folder.
+fn pending_skin(rig: &mut PlayerRig<'_>, a: &game::Loaded) -> tempfile::TempDir {
+    let d = result::skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+    );
+    let p = result::pending(d.path(), result::LIMITS);
+    rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(p)));
+    prepared(rig, a);
+    d
+}
+
+/// The play screen drawing as the outgoing screen, as a play ends into
+/// its result: a play begun on views that do not move. Its link's ends,
+/// kept while it draws.
+fn playing(rig: &PlayerRig<'_>) -> (game::RenderSink, game::ViewWriter) {
+    let origin = bms_model::TimeSource::now(&QpcClock::start());
+    let mut initial = crate::render_common::view(0, 0);
+    initial.origin = Some(origin);
+    let (sink, writer, side) = game::render_link(16, &initial);
+    rig.render.send(RenderMsg::Play {
+        side,
+        gauge: 0,
+        measure: Box::new(crate::measure::PlayMeasure {
+            generation: 1,
+            origin,
+            ready_state_at: origin,
+            started: origin,
+            page_faults: None,
+            load_from: TimeUs(0),
+            retry: false,
+            audio: None,
+            queued_periods: None,
+        }),
+        state_origin: origin,
+    });
+    (sink, writer)
+}
+
+/// Asserts that the render thread takes a message within 2 s.
+fn takes_messages(rig: &PlayerRig<'_>) {
+    let taken = rig.render.messages_taken();
+    rig.render.send(RenderMsg::Resize);
+    let asked = Instant::now();
+    while rig.render.messages_taken() == taken {
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "the render thread stopped taking messages while the font was read"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
 /// A screen made for plays only whose font is still being read past the
-/// bound (its worker held): no pass joins the worker, so the render
-/// thread keeps taking its messages and presents nothing while the font
-/// is read, reads none in a frame, and the pending presentation draws
-/// once the worker ends (V19 (k), the screen made for plays only).
+/// bound (its worker held): no pass joins the worker or skips its
+/// present, so the pending presentation draws its line in the bitmap font
+/// on every frame, paced as frames, before the hand-over and after it
+/// with the view staging, the render thread taking its messages and no
+/// font read in a frame; once the worker ends, the line in the menu font
+/// from the next frame on (V19 (k), the screen made for plays only).
 #[test]
-fn a_font_read_held_past_the_bound_blocks_no_pass() {
+fn a_font_read_held_past_the_bound_draws_the_bitmap_line() {
     use crate::menu_screen::{FONT_READS, HOLD_FONT_READ};
     let _serial = imports::serial();
     let (dir, a) = chart(Some(RED));
     on_warp_fonts(a.chart(), false, |rig, frames| {
         let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
         let (report, screen) = result_of(dir.path());
-        let d = result::skin(
-            "",
-            "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
-        );
-        let p = result::pending(d.path(), result::LIMITS);
-        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(p)));
-        prepared(rig, &a);
+        let _skin = pending_skin(rig, &a);
+        let _play = playing(rig);
         frames.arm();
         let _go = FontGo;
         HOLD_FONT_READ.store(true, Ordering::SeqCst);
-        let in_frame = reads(0);
+        let (in_frame, ahead) = (reads(0), reads(1));
         rig.begin_result(&report, &screen);
         rig.result_compared(&report, &screen);
         laid_out(rig);
+        // Past the bound before the hand-over.
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        let from = frames.len();
+        let before = frames.until(rig, from, "bitmap frames before the hand-over", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        let first = before.iter().position(|f| f.pending()).unwrap();
+        assert!(
+            before[first..].iter().all(|f| f.pending()),
+            "the bitmap line on every frame past the bound: {before:?}"
+        );
+        let bitmap = rig.render.bitmap_frames();
+        assert!(bitmap >= 3, "{bitmap} frames in the bitmap font");
+        assert_eq!(reads(1), ahead, "the font read before its frames");
+        // The hand-over, the view's staging held.
         rig.render.pause_result_staging(true);
         rig.show_end(&report, &screen);
-        rig.render.set_hold_clock(Some(BOUND + 1));
-        std::thread::sleep(Duration::from_millis(300));
-        // The render thread past the bound with the font unread: its
-        // messages still taken, each pass bounded.
-        let taken = rig.render.messages_taken();
-        rig.render.send(RenderMsg::Resize);
-        let asked = Instant::now();
-        while rig.render.messages_taken() == taken {
-            assert!(
-                asked.elapsed() < Duration::from_secs(2),
-                "the render thread stopped taking messages while the font was read"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let waiting = frames.len();
-        std::thread::sleep(Duration::from_millis(200));
-        let presented = frames.since(waiting);
+        until_true(rig, "the view's creation", |rig| {
+            rig.render.creation_pass() > 0
+        });
+        let handed = frames.len();
+        let after = frames.until(rig, handed, "bitmap frames after the hand-over", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
         assert!(
-            presented.is_empty(),
-            "a frame presented before the font was read: {presented:?}"
+            after.iter().all(|f| f.pending()),
+            "the bitmap line on every frame after the hand-over: {after:?}"
         );
-        assert!(rig.render.font_waits() > 0, "no pass waited for the font");
+        assert!(
+            rig.render.bitmap_frames() >= bitmap + 3,
+            "the frames after the hand-over not in the bitmap font"
+        );
+        // Paced as frames: their intervals with none read back (a read
+        // back of the whole target is the test's own cost).
+        frames.blind(true);
+        let blind = frames.len();
+        let paced = frames.until(rig, blind, "frames unread", |f| f.len() >= 6);
+        frames.blind(false);
+        assert!(
+            paced.iter().all(|f| f.path == Some(ResultPath::Pending)),
+            "a frame past the bound not pending: {paced:?}"
+        );
+        for w in paced.windows(2) {
+            assert!(
+                w[1].at - w[0].at <= PACER_BOUND,
+                "a frame interval past the pacer's bound: {paced:?}"
+            );
+        }
+        takes_messages(rig);
+        assert_eq!(
+            reads(1),
+            ahead,
+            "the font read while its frames were checked"
+        );
+        // The worker ends: the menu font's line from then on.
         HOLD_FONT_READ.store(false, Ordering::SeqCst);
-        let pending = frames.until(rig, waiting, "pending frames", |f| {
+        until_true(rig, "the font read", |_| reads(1) > ahead);
+        let read = frames.len();
+        frames.until(rig, read, "frames after the read", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 2
+        });
+        let settled = rig.render.bitmap_frames();
+        let from = frames.len();
+        let menu = frames.until(rig, from, "frames in the menu font", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        assert!(
+            menu.iter().all(|f| f.pending()),
+            "the wait line on every frame: {menu:?}"
+        );
+        assert_eq!(
+            rig.render.bitmap_frames(),
+            settled,
+            "a frame in the bitmap font after the font was read"
+        );
+        assert_ne!(
+            menu.last().map(|f| f.lit),
+            after.last().map(|f| f.lit),
+            "the menu font's line lit as the bitmap one"
+        );
+        assert_eq!(reads(0), in_frame, "a font read in a frame");
+        rig.render.pause_result_staging(false);
+        rig.leave_result();
+    });
+}
+
+/// A screen made for plays only whose font read fails: the pending
+/// presentation keeps its bitmap line, nothing reads the font again (in a
+/// frame or on a thread), and the first view commits and draws with no
+/// strip (V19 (k), the screen made for plays only).
+#[test]
+fn a_failed_font_read_keeps_the_bitmap_line() {
+    use crate::menu_screen::{FAIL_FONT_READ, FONT_READS};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp_fonts(a.chart(), false, |rig, frames| {
+        let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        let (mut report, screen) = result_of(dir.path());
+        // A line of the strip, which no frame may draw with no font.
+        report.best = Some(game::BestView::NotCounted("a test's reason".to_owned()));
+        let _skin = pending_skin(rig, &a);
+        let _play = playing(rig);
+        frames.arm();
+        let _go = FontGo;
+        FAIL_FONT_READ.store(true, Ordering::SeqCst);
+        let (in_frame, ahead) = (reads(0), reads(1));
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        laid_out(rig);
+        until_true(rig, "the failed read", |_| reads(1) > ahead);
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        let from = frames.len();
+        frames.until(rig, from, "pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 2
+        });
+        let bitmap = rig.render.bitmap_frames();
+        let from = frames.len();
+        let pending = frames.until(rig, from, "more pending frames", |f| {
             f.iter().filter(|f| f.pending()).count() >= 3
         });
         assert!(
             pending.iter().all(|f| f.pending()),
-            "the wait line on every frame: {pending:?}"
+            "the bitmap line on every frame: {pending:?}"
         );
+        assert!(
+            rig.render.bitmap_frames() >= bitmap + 3,
+            "a frame past the failed read not in the bitmap font"
+        );
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
+        let v = first_view(&shown).unwrap();
+        assert_eq!(shown[v].strip, 0, "a strip drawn with no font");
+        let from = frames.len();
+        let later = frames.until(rig, from, "more skin frames", |f| {
+            f.iter()
+                .filter(|f| f.path == Some(ResultPath::Skin))
+                .count()
+                >= 3
+        });
+        assert!(
+            later.iter().all(|f| f.strip == 0),
+            "a strip drawn after the font's read failed: {later:?}"
+        );
+        assert_eq!(
+            (reads(0), reads(1)),
+            (in_frame, ahead + 1),
+            "the font read again after its read failed"
+        );
+        rig.leave_result();
+    });
+}
+
+/// A screen made for plays only whose font is still being read when the
+/// first view's staging ends: the view commits without waiting for the
+/// font, drawing no strip, and the strip's lines are laid out once the
+/// font is read, with no read in a frame (V19 (k), the screen made for
+/// plays only).
+#[test]
+fn a_view_staged_while_the_font_is_read_commits_without_it() {
+    use crate::menu_screen::{FONT_READS, HOLD_FONT_READ};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp_fonts(a.chart(), false, |rig, frames| {
+        let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        let (mut report, screen) = result_of(dir.path());
+        // A line of the strip: drawn once the font is read.
+        report.best = Some(game::BestView::NotCounted("a test's reason".to_owned()));
+        let _skin = pending_skin(rig, &a);
+        frames.arm();
+        let _go = FontGo;
+        HOLD_FONT_READ.store(true, Ordering::SeqCst);
+        let (in_frame, ahead) = (reads(0), reads(1));
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        laid_out(rig);
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
+        assert_eq!(
+            reads(1),
+            ahead,
+            "the view committed only once the font was read"
+        );
+        let v = first_view(&shown).unwrap();
+        assert_eq!(shown[v].strip, 0, "a strip drawn with no font");
+        takes_messages(rig);
+        HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        until_true(rig, "the font read", |_| reads(1) > ahead);
+        let read = frames.len();
+        frames.until(rig, read, "the strip drawn", |f| {
+            f.iter()
+                .any(|f| f.path == Some(ResultPath::Skin) && f.strip > 0)
+        });
         assert_eq!(reads(0), in_frame, "a font read in a frame");
-        rig.render.pause_result_staging(false);
+        rig.leave_result();
+    });
+}
+
+/// A screen made for plays only, paced by a swap chain's grants, past
+/// the bound with its font's read held: each grant presents one pending
+/// frame in the bitmap font, and with no grant no frame presents and no
+/// pass draws one, so no grant is kept by a pass that presents nothing
+/// (V19 (k), the screen made for plays only, on a swap-paced target).
+#[test]
+fn a_swap_paced_pending_frame_presents_on_each_grant() {
+    use crate::menu_screen::{FONT_READS, HOLD_FONT_READ, TestGrants};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    let grants = Arc::new(TestGrants::default());
+    // Ungated until the test holds it.
+    grants.permits.store(u32::MAX, Ordering::SeqCst);
+    let g = Arc::clone(&grants);
+    on_warp_paced(a.chart(), false, Some(grants), |rig, frames| {
+        let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        let (report, screen) = result_of(dir.path());
+        let _skin = pending_skin(rig, &a);
+        let _play = playing(rig);
+        frames.arm();
+        let _go = FontGo;
+        HOLD_FONT_READ.store(true, Ordering::SeqCst);
+        let ahead = reads(1);
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        laid_out(rig);
+        // No grant from here: the render thread waits in its pacing.
+        g.permits.store(0, Ordering::SeqCst);
+        let waits = g.waits.load(Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(20);
+        while g.waits.load(Ordering::SeqCst) < waits + 2 {
+            assert!(
+                Instant::now() < end,
+                "the render thread never waited for a grant"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        // Nothing presents without a grant.
+        let (from, bitmap) = (frames.len(), rig.render.bitmap_frames());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(frames.len(), from, "a frame presented with no grant");
+        assert_eq!(
+            rig.render.bitmap_frames(),
+            bitmap,
+            "a frame drawn with no grant"
+        );
+        // Each grant: one pending frame in the bitmap font.
+        for i in 1..=4 {
+            g.permits.store(1, Ordering::SeqCst);
+            frames.until(rig, from, "a frame for the grant", |f| f.len() >= i);
+            let end = Instant::now() + Duration::from_secs(20);
+            while g.permits.load(Ordering::SeqCst) > 0 {
+                assert!(Instant::now() < end, "the grant never taken");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(frames.since(from).len(), i, "frames for {i} grants");
+        }
+        let drawn = frames.since(from);
+        assert!(
+            drawn.iter().all(|f| f.pending()),
+            "the bitmap line on every granted frame: {drawn:?}"
+        );
+        assert_eq!(
+            rig.render.bitmap_frames(),
+            bitmap + 4,
+            "the granted frames not in the bitmap font"
+        );
+        assert_eq!(reads(1), ahead, "the font read during the grants");
+        g.permits.store(u32::MAX, Ordering::SeqCst);
+        HOLD_FONT_READ.store(false, Ordering::SeqCst);
         rig.leave_result();
     });
 }
@@ -1638,6 +1947,11 @@ fn a_plays_only_screen_built_again_keeps_the_font() {
             (reads(0), reads(1)),
             (in_frame, ahead),
             "the font read again for the screen built again"
+        );
+        assert_eq!(
+            rig.render.bitmap_frames(),
+            0,
+            "the rebuilt screen drew the bitmap line: its font not carried"
         );
         HOLD_FONT_READ.store(false, Ordering::SeqCst);
         rig.leave_result();
