@@ -532,8 +532,9 @@ pub const IN_PLAY: &[Site] = &[
     // A video's state, which the game thread's preparation deadline and
     // the render side's staged frames and ring faults change each frame.
     Site::File("crates/player/src/media_host/movie.rs"),
-    // The skin movie hook: each play and selection frame reads, admits,
-    // peeks and takes the screen's movies before the build.
+    // The skin movie hook: each play and selection frame reads, peeks and
+    // takes the screen's movies before the build (their admission is a
+    // preparation boundary's).
     Site::File("crates/player/src/movie_frame.rs"),
     Site::Fns(
         "crates/skin-model/src/bga.rs",
@@ -635,6 +636,7 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::pool_table",
             "MenuScreen::build_selection_frame",
             "MenuScreen::movie_frame",
+            "MenuScreen::play_movies",
             "MenuScreen::selection_movies",
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",

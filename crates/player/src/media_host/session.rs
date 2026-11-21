@@ -172,6 +172,40 @@ impl Movie {
         self.cell.staged_first();
     }
 
+    /// A live video of the screen of `generation`, of `width` × `height`
+    /// in BT.709 limited range, its ring mapped in this process with no
+    /// worker: the test writes its frames (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn live_here(generation: u64, width: u32, height: u32) -> Arc<Self> {
+        let geometry = Geometry::new(width, height).unwrap();
+        let ring = Ring::new(geometry).unwrap();
+        let window = Window {
+            first: 0,
+            last: i64::MAX,
+        };
+        let reader = Reader::new(ring.words(), geometry, window).unwrap();
+        let movie = Self::new(generation);
+        let live = Live {
+            ring,
+            reader: Mutex::new(Some(reader)),
+            width,
+            height,
+            duration: i64::MAX,
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
+        };
+        assert!(movie.live.set(live).is_ok());
+        assert!(movie.cell.go_live());
+        movie
+    }
+
+    /// The slots the render side's reader has freed over the ring's life
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn freed_total(&self) -> u64 {
+        self.freed.load(Ordering::Acquire)
+    }
+
     /// The render side's reader has freed `total` slots over the ring's
     /// life ([`Reader::freed`]): the count the session's progress rule
     /// reads. A rise signals the worker's event.

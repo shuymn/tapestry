@@ -848,6 +848,13 @@ pub trait Screen: Send {
     fn movie_frame(&mut self, screen_us: i64) {
         let _ = screen_us;
     }
+    /// The play state (its number) the attempt being prepared plays for,
+    /// before each poll of its preparation: the owner of the play skin's
+    /// movies, so a new play state opens them again and a practice
+    /// session's rounds keep them. Nothing by default.
+    fn play_state(&mut self, number: u64) {
+        let _ = number;
+    }
     /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
     /// the start gate): the skin's runtime state for the attempt starts
     /// over, its chart and text resources kept. Nothing by default.
@@ -5150,7 +5157,7 @@ fn take_loading(
 /// state yet it is the lifetime's first moment: from `now`, nothing
 /// loaded. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn loading_frame_of(
+pub(crate) fn loading_frame_of(
     lifetime: u64,
     now: TimeUs,
     update: Option<&LoadingUpdate>,
@@ -10306,6 +10313,7 @@ impl Run {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
+        screen.play_state(self.turntable.play_state());
         let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
         // Play's admission released the result's installation: recorded
         // with the staging's request and published before its answer

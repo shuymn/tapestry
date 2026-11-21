@@ -77,8 +77,10 @@ impl Loss {
     /// cap it passes; any other loss by its reason.
     pub fn line(self) -> String {
         match self {
-            Self::OverTotal => "a video is refused: over cap (the screen's movies pass                                 their 2048×2048 luma pixels)"
-                .to_owned(),
+            Self::OverTotal => {
+                "a video is refused: over cap (the screen's movies pass their 2048×2048 luma pixels)"
+                    .to_owned()
+            }
             why => format!("a video is lost ({why:?})"),
         }
     }

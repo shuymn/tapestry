@@ -41,7 +41,7 @@ use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 
 use crate::loading_state::LoadingUpdate;
 use crate::loading_text::ChosenChart;
-use crate::movie_screen::{MediaHub, MovieSet};
+use crate::movie_screen::{MediaHub, MovieSet, ScreenMovies};
 use crate::render_side::{Screen, refusal};
 use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionUpdate, StripText};
 
@@ -386,10 +386,14 @@ pub struct MenuScreen {
     /// The run's media session, which plays the skins' movies; without
     /// one no movie is opened.
     media: Option<Arc<MediaHub>>,
-    /// The movies of the screen shown or being prepared.
-    movies: Option<MovieSet>,
+    /// The movies of the screen shown or being prepared, with the
+    /// renderer's part of them.
+    movies: ScreenMovies,
     /// The play preparation whose movies' readiness is awaited, staged.
     movie_wait: Option<u64>,
+    /// The play state the next attempt's preparation plays for
+    /// ([`Screen::play_state`]): its movies' owner.
+    play_state: u64,
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -541,67 +545,73 @@ impl MenuScreen {
             #[cfg(all(test, feature = "dev-tools"))]
             selection_views: 0,
             media: None,
-            movies: None,
+            movies: ScreenMovies::new(),
             movie_wait: None,
+            play_state: 0,
         }
     }
 
     /// Plays the skins' movies through the run's media session `hub`,
     /// taking back the movies a screen dropped for its device's recovery
-    /// left there ([`MediaHub::unpark`]).
+    /// left there ([`MediaHub::unpark`]), their planes reserved on this
+    /// screen's device.
     #[must_use]
     pub fn with_media(mut self, hub: Arc<MediaHub>) -> Self {
-        self.movies = hub.unpark();
+        self.movies.restore(hub.unpark(), &mut self.renderer);
         self.media = Some(hub);
         self
+    }
+
+    /// The movies' owner leaves ([`ScreenMovies::retire`]).
+    fn retire_movies(&mut self) {
+        self.movies.retire(&mut self.renderer);
+        self.movie_wait = None;
     }
 
     /// Drops the movies of play preparation `request`, if they are still
     /// its own (not committed): its screen will not be shown.
     fn drop_preparing_movies(&mut self, request: Option<u64>) {
-        let preparing = self.movies.as_ref().and_then(|m| m.preparing);
+        let preparing = self.movies.get().and_then(|m| m.preparing);
         if preparing.is_some() && (request.is_none() || preparing == request) {
-            self.movies = None;
-            self.movie_wait = None;
-            self.renderer
-                .set_loading_movies(skin_model::movie::MovieShows::default());
+            self.retire_movies();
         }
     }
 
     /// Opens the movies of the play skin an attempt is prepared with for
     /// preparation `request`: `skin` staged, else the play skin in use. A
-    /// screen already showing that skin's movies keeps them (a retry, a
-    /// practice round). Either way they belong to `request` until its
-    /// commit.
+    /// screen already showing that skin's movies for the same play state
+    /// keeps them (a practice round); a new play state (a direct play's
+    /// retry) opens them again. Either way they belong to `request` until
+    /// its commit.
     fn open_play_movies(&mut self, skin: Option<&Arc<SkinBundle>>, request: u64) {
-        let Some(hub) = &self.media else {
+        let Some(hub) = self.media.clone() else {
             return;
         };
         let bundle = skin
             .cloned()
             .or_else(|| self.renderer.installed(ScreenKind::Play).cloned());
         let Some(bundle) = bundle else {
-            self.movies = None;
+            self.retire_movies();
             return;
         };
+        let owner = self.play_state;
         if !self
             .movies
-            .as_ref()
-            .is_some_and(|m| m.is_for(ScreenKind::Play, &bundle, 0))
+            .get()
+            .is_some_and(|m| m.is_for(ScreenKind::Play, &bundle, owner))
         {
-            let hub = Arc::clone(hub);
-            // The screen before is left first.
-            self.movies = None;
-            self.movies = MovieSet::open(
-                &hub,
-                ScreenKind::Play,
-                &bundle,
-                0,
-                std::time::Instant::now(),
-                0,
-            );
+            self.movies.replace(&mut self.renderer, || {
+                MovieSet::open(
+                    &hub,
+                    ScreenKind::Play,
+                    &bundle,
+                    owner,
+                    std::time::Instant::now(),
+                    0,
+                )
+            });
         }
-        if let Some(m) = &mut self.movies {
+        if let Some(m) = self.movies.get_mut() {
             m.preparing = Some(request);
         }
     }
@@ -616,21 +626,69 @@ impl MenuScreen {
     ) {
         if self
             .movies
-            .as_ref()
+            .get()
             .is_some_and(|m| m.is_for(ScreenKind::Selection, bundle, lifetime))
         {
             return;
         }
-        self.movies = None;
-        if let Some(hub) = &self.media {
-            self.movies = MovieSet::open(
-                hub,
+        let hub = self.media.clone();
+        self.movies.replace(&mut self.renderer, || {
+            MovieSet::open(
+                hub.as_ref()?,
                 ScreenKind::Selection,
                 bundle,
                 lifetime,
                 std::time::Instant::now(),
                 now.0,
-            );
+            )
+        });
+    }
+
+    /// The selection's movies' admission boundary, before its frame's
+    /// preparation and build ([`crate::movie_frame::Movies::admit`]): a
+    /// movie gone live is judged and its planes reserved here, never in
+    /// the frame's hook.
+    fn admit_selection_movies(&mut self) {
+        if let Some(m) = self
+            .movies
+            .get_mut()
+            .filter(|m| m.kind() == ScreenKind::Selection)
+        {
+            m.movies
+                .admit(&mut self.renderer, std::time::Instant::now());
+        }
+    }
+
+    /// The loading frame `frame`'s movie poll: a play's movies polled at
+    /// the loading state's screen time, the clock READY opens on, and
+    /// their shows published for the frame. A selection's movies are left
+    /// (the loading state follows the selection screen).
+    fn loading_movies(&mut self, frame: &LoadingFrame<'_>) {
+        let Some(m) = self.movies.get_mut() else {
+            return;
+        };
+        if m.kind() != ScreenKind::Play {
+            self.retire_movies();
+            return;
+        }
+        let origin = *m.loading_origin.get_or_insert(frame.load.since.0);
+        let due = frame.now.0.saturating_sub(origin);
+        let (_, shows) = m
+            .movies
+            .poll(&mut self.renderer, due, std::time::Instant::now());
+        self.renderer.set_loading_movies(shows);
+    }
+
+    /// The play frame's movie hook at the screen clock's `screen_us`
+    /// ([`crate::movie_frame`]): what the play skin's movies show.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn play_movies(&mut self, screen_us: i64) -> skin_model::movie::MovieShows {
+        match self.movies.get_mut() {
+            Some(m) if m.kind() == ScreenKind::Play => {
+                m.movies
+                    .frame(&mut self.renderer, screen_us, std::time::Instant::now())
+            }
+            _ => skin_model::movie::MovieShows::default(),
         }
     }
 
@@ -638,7 +696,7 @@ impl MenuScreen {
     /// what the selection skin's movies show.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn selection_movies(&mut self, now: bms_model::TimeUs) -> skin_model::movie::MovieShows {
-        match self.movies.as_mut() {
+        match self.movies.get_mut() {
             Some(m) if m.kind() == ScreenKind::Selection => {
                 let due = now.0.saturating_sub(m.origin);
                 m.movies
@@ -886,6 +944,7 @@ impl MenuScreen {
         if update.is_some() {
             self.renderer.enter_loading_on(on, frame.lifetime);
         }
+        self.loading_movies(frame);
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
         }
@@ -1106,7 +1165,7 @@ impl Screen for MenuScreen {
         // for each to settle, never past the preparation's deadline.
         if let Some(m) = self
             .movies
-            .as_mut()
+            .get_mut()
             .filter(|m| m.kind() == ScreenKind::Play)
         {
             let (settled, shows) = m
@@ -1137,7 +1196,7 @@ impl Screen for MenuScreen {
         };
         // Committed, the movies are the shown screen's.
         if done.is_ok()
-            && let Some(m) = &mut self.movies
+            && let Some(m) = self.movies.get_mut()
             && m.preparing == Some(token.request)
         {
             m.preparing = None;
@@ -1595,7 +1654,7 @@ impl Screen for MenuScreen {
 
     fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
         // The play screen is left.
-        self.movies = None;
+        self.retire_movies();
         let lines = self.result_strip();
         let timing = match self.result_strip.first().and_then(|(t, _)| t.as_ref()) {
             Some(t) if lines > 0 => self.renderer.submit_result(&[t]),
@@ -1656,7 +1715,7 @@ impl Screen for MenuScreen {
 
     fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
         // The select screen is left.
-        self.movies = None;
+        self.retire_movies();
         let timing = self.renderer.submit_decision(&[])?;
         self.shown(timing.presented());
         Ok(timing)
@@ -1727,18 +1786,16 @@ impl Screen for MenuScreen {
         self.renderer.build(f)
     }
 
+    fn play_state(&mut self, number: u64) {
+        self.play_state = number;
+    }
+
     /// The play frame's movie hook at the screen clock's `screen_us`
     /// ([`crate::movie_frame`]): the play skin's movies' shows for the
     /// build that follows.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn movie_frame(&mut self, screen_us: i64) {
-        let shows = match self.movies.as_mut() {
-            Some(m) if m.kind() == ScreenKind::Play => {
-                m.movies
-                    .frame(&mut self.renderer, screen_us, std::time::Instant::now())
-            }
-            _ => skin_model::movie::MovieShows::default(),
-        };
+        let shows = self.play_movies(screen_us);
         self.renderer.set_play_movies(shows);
     }
 
@@ -1766,7 +1823,7 @@ impl Screen for MenuScreen {
 
     fn end(&mut self, page: &crate::render_side::EndPage) -> Result<FrameOutcome, RenderError> {
         // The play screen is left.
-        self.movies = None;
+        self.retire_movies();
         let outcome = self
             .renderer
             .result_frame(&page.lines, page.graphs.as_deref())?
@@ -1870,7 +1927,7 @@ impl Screen for MenuScreen {
         let logic = logic.filter(|l| installed.is_some_and(|b| Arc::ptr_eq(&b, &l.bundle)));
         let Some(logic) = logic else {
             // The skin's screen, if it was shown, is left.
-            self.movies = None;
+            self.retire_movies();
             // A page laid out for the skin's screen sent no caret: it is
             // laid out again with its own.
             let changed = changed || self.selection_key.take().is_some();
@@ -1882,6 +1939,7 @@ impl Screen for MenuScreen {
             });
         };
         self.open_selection_movies(&logic.bundle, u.lifetime, now);
+        self.admit_selection_movies();
         let refused = match self.prepare_selection(u, logic, changed)? {
             // The frame's timers, then the runtime over that state, then
             // the build from it (docs/stage3.md S7-07).
@@ -2120,13 +2178,18 @@ impl MenuScreen {
     }
 }
 
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+mod movie_tests;
+
 impl Drop for MenuScreen {
     /// A screen dropped (its device's recovery builds another) parks its
-    /// movies in the hub for the screen built next; the run's end drops
-    /// them with the hub.
+    /// committed movies in the hub for the screen built next and drops
+    /// those of a preparation not committed ([`ScreenMovies::park`]); the
+    /// run's end drops them with the hub.
     fn drop(&mut self) {
-        if let (Some(hub), Some(set)) = (&self.media, self.movies.take()) {
-            hub.park(set);
+        if let Some(hub) = &self.media {
+            self.movies.park(hub);
         }
     }
 }
@@ -2169,12 +2232,12 @@ mod tests {
         drop(first);
         assert_eq!(hub.open_sets(), 1, "parked, not left");
         let mut second = super::MenuScreen::new(warp(), None).with_media(Arc::clone(&hub));
-        let m = second.movies.as_ref().expect("taken back");
+        let m = second.movies.get().expect("taken back");
         assert!(m.is_for(ScreenKind::Selection, &bundle, 7));
         assert_eq!(m.origin, 5_000, "its clock origin");
         second.open_selection_movies(&bundle, 7, bms_model::TimeUs(9_000));
         assert_eq!(
-            second.movies.as_ref().map(|m| m.origin),
+            second.movies.get().map(|m| m.origin),
             Some(5_000),
             "not opened again"
         );
