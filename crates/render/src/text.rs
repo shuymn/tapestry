@@ -134,7 +134,9 @@ pub struct Fonts {
 
 impl Fonts {
     /// The runtime font: the first of [`FONT_ORDER`] in the Windows fonts
-    /// folder.
+    /// folder, its file read whole here into memory, so laying out and
+    /// rasterizing with it never opens or maps the file again (design.md
+    /// "Rendering and Skins", the result's hold).
     ///
     /// # Errors
     ///
@@ -143,10 +145,8 @@ impl Fonts {
     pub fn runtime() -> Result<Self, TextError> {
         let dir = fonts_dir();
         let (font, path) = choose_font(&dir).ok_or(TextError::NoFont { dir })?;
-        let mut db = fontdb::Database::new();
-        db.load_font_file(&path)
-            .map_err(|source| TextError::Read { path, source })?;
-        Self::with_db(db, font.family)
+        let data = std::fs::read(&path).map_err(|source| TextError::Read { path, source })?;
+        Self::from_data(data, font.family)
     }
 
     /// `family` from font data in memory (a TTF, OTF or collection).
@@ -180,6 +180,16 @@ impl Fonts {
     #[must_use]
     pub fn family(&self) -> &str {
         &self.family
+    }
+
+    /// Whether every face is held in memory: none is read from a file, or
+    /// mapped from one, when text is laid out or rasterized.
+    #[must_use]
+    pub fn in_memory(&self) -> bool {
+        self.system
+            .db()
+            .faces()
+            .all(|f| matches!(f.source, fontdb::Source::Binary(_)))
     }
 }
 
@@ -408,6 +418,20 @@ mod tests {
         fs::create_dir(dir.path().join("YuGothM.ttc")).unwrap();
         assert_eq!(chosen(), Some(("Meiryo", dir.path().join("meiryo.ttc"))));
         assert_eq!(FONT_ORDER.len(), 3);
+    }
+
+    /// The runtime font holds every face in memory, so shaping it never
+    /// opens or maps its file; the same file registered by path does not
+    /// (the check's positive control).
+    #[test]
+    fn runtime_font_is_held_in_memory() {
+        let fonts = Fonts::runtime().unwrap();
+        assert!(fonts.in_memory(), "a runtime face read from its file");
+        let (font, path) = choose_font(&super::fonts_dir()).unwrap();
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&path).unwrap();
+        let by_path = Fonts::with_db(db, font.family).unwrap();
+        assert!(!by_path.in_memory(), "a face registered by path");
     }
 
     /// Lit pixels (any channel above 64) of an RGBA8 image `width` wide,
