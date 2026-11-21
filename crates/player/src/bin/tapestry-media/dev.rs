@@ -33,7 +33,9 @@
 //!   without) while the control loop still beats; `freeze=<player>:<play|decoding|waiting>` freezes that player
 //!   for good before it answers its play, or once it has published a frame
 //!   while it says it decodes, or while it says it waits for a free slot;
-//!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion.
+//!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion;
+//!   `stall-convert=<n>:<ms>` sleeps `ms` before the process's conversion
+//!   number `n`, counted from 0.
 //! - `--dev-balloon <step> <total> [<last> [free]]`: answers the hello and
 //!   serves the control pipe while a thread commits memory the worker never
 //!   frees, `step` MiB at a time about 10 ms apart up to `total` MiB and
@@ -100,6 +102,14 @@ fn serve_options(options: &[String]) -> Result<(), String> {
             "slow-convert" => {
                 let ms = value.parse().map_err(|e| format!("{option}: {e}"))?;
                 ffmpeg::slow_convert(ms);
+            }
+            "stall-convert" => {
+                let (at, ms) = value
+                    .split_once(':')
+                    .ok_or_else(|| format!("{option}: <conversion>:<ms>"))?;
+                let at = at.parse().map_err(|e| format!("{option}: {e}"))?;
+                let ms = ms.parse().map_err(|e| format!("{option}: {e}"))?;
+                ffmpeg::stall_convert(at, ms);
             }
             _ => return Err(format!("--dev-serve: unknown option {option}")),
         }

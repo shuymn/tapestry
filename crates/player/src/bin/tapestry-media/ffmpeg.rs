@@ -116,6 +116,25 @@ pub fn slow_convert(ms: u64) {
     SLOW_CONVERT_MS.store(ms, Ordering::Relaxed);
 }
 
+/// The conversions made so far in the process, counted from 0 (dev-tools).
+#[cfg(feature = "dev-tools")]
+static CONVERSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The conversion that stalls ([`stall_convert`]), and for how long.
+#[cfg(feature = "dev-tools")]
+static STALL_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "dev-tools")]
+static STALL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the process's conversion number `at` (counted from 0) sleep `ms`
+/// milliseconds first (dev-tools): one decode that blocks, the frames
+/// around it at full speed.
+#[cfg(feature = "dev-tools")]
+pub fn stall_convert(at: u64, ms: u64) {
+    STALL_MS.store(ms, Ordering::Relaxed);
+    STALL_AT.store(at, Ordering::Relaxed);
+}
+
 /// The codec whitelist, as the option an open sets.
 fn codec_list() -> &'static [(&'static CStr, &'static CStr)] {
     #[cfg(feature = "dev-tools")]
@@ -1691,6 +1710,12 @@ impl Input {
         match SLOW_CONVERT_MS.load(Ordering::Relaxed) {
             0 => {}
             ms => std::thread::sleep(std::time::Duration::from_millis(ms)),
+        }
+        #[cfg(feature = "dev-tools")]
+        if CONVERSIONS.fetch_add(1, Ordering::Relaxed) == STALL_AT.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(
+                STALL_MS.load(Ordering::Relaxed),
+            ));
         }
         // SAFETY: this input's frames and scaler.
         unsafe {

@@ -52,8 +52,12 @@
 //! fails its player.
 //!
 //! A frame is shown until its successor is due: the worker publishes each
-//! frame with the stamp of the frame after it (its `until`, once it has
-//! decoded that frame; [`UNTIL_END`] for a video's last), and the game
+//! frame as soon as it is decoded with its end (`until`) open
+//! ([`UNTIL_END`]) and resolves it to the next frame's stamp when it
+//! decodes that frame ([`Writer::resolve_until`]: a published slot's one
+//! word the worker writes again, read once at a peek and not re-checked
+//! after the copy, since it only decides whether a blind frame is late; a
+//! video's last frame stays open). The game
 //! writes the media time it shows at each peek in [`DUE_WORD`], then the
 //! run it shows in [`DUE_RUN_WORD`], so the worker reads a time only of
 //! the run it plays (a seek's run never drops frames by the time an
@@ -154,14 +158,19 @@ pub const DUE_RUN_WORD: usize = 10;
 /// [`DUE_WORD`]'s value before the game's first peek: no frame is due.
 pub const NOTHING_DUE: i64 = i64::MIN;
 
-/// The `until` of a video's last frame: no frame follows it.
+/// An open `until`: no frame after it is decoded yet (and none ever, for
+/// a video's last), so it is never late.
 pub const UNTIL_END: i64 = i64::MAX;
 
 /// The media time the game showed last in run `run`, from `ring`'s
 /// [`DUE_WORD`]; `None` when the game's last peek was of another run (or
 /// none yet) or the ring does not hold the header. The game writes the
 /// time before its run, so a run read here is never older than the time
-/// read after it.
+/// read after it. The pair is not one atomic read: between the game's two
+/// stores, the worker of the run being left can read that run with the
+/// next run's time. Only a superseded run's worker reads such a pair, and
+/// the game frees that run's frames unread whatever the worker decides, so
+/// no frame shown depends on it.
 #[must_use]
 pub fn shown<W: Words + ?Sized>(ring: &W, run: u64) -> Option<i64> {
     if word(ring, DUE_RUN_WORD)?.load(Ordering::Acquire) != run {
@@ -758,7 +767,7 @@ impl Reader {
         // Published blind and its successor due: behind the clock, freed
         // unread with the frames before it, and nothing is due. A late frame
         // the worker published knowing the time is taken: the newest there
-        // is.
+        // is; so is one whose end is still open.
         let behind = due
             .as_ref()
             .is_some_and(|d| !d.chosen.informed && behind(d.chosen.until, peek_due));
@@ -897,7 +906,6 @@ impl Reader {
             && load(S_SEQ) == Some(c.seq)
             && load(S_RUN) == Some(c.run)
             && load(S_STAMP) == Some(c.stamp.cast_unsigned())
-            && load(S_UNTIL) == Some(c.until.cast_unsigned())
             && load(S_INFORMED).map(|v| v != 0) == Some(c.informed)
             && load(S_INDEX) == Some(wide(c.slot))
             && load(S_BYTES) == Some(wide(self.geometry.frame_bytes()));
@@ -1040,6 +1048,21 @@ impl Writer {
                 Slot(slot)
             })
         })
+    }
+
+    /// Resolves the open end of the frame published in slot `slot` to
+    /// `until`, the next frame's stamp, once that is decoded: the slot's
+    /// `until` alone, which a peek reads once and the copy does not check
+    /// again. Nothing for a slot the ring does not hold; a slot the game
+    /// freed meanwhile takes the word to no effect (its next publication
+    /// writes every word).
+    pub fn resolve_until<W: Words + ?Sized>(self, ring: &W, slot: usize, until: i64) {
+        if slot >= SLOTS {
+            return;
+        }
+        if let Some(w) = word(ring, self.geometry.slot_start(slot) + S_UNTIL) {
+            w.store(until.cast_unsigned(), Ordering::Release);
+        }
     }
 
     /// Publishes `frame` in `slot` as sequence `seq` of run `run`, stamped

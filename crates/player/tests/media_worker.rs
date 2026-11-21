@@ -251,6 +251,20 @@ impl Ring {
         skin_model::media::watermark(Self::words(self.view, self.len)).unwrap()
     }
 
+    /// Takes the oldest frame the ring holds ready, polling at its stamp:
+    /// a game whose clock is never ahead of the worker's frames, so it takes
+    /// every frame and the worker drops none as late (design.md "Rendering
+    /// and Skins", video frames).
+    fn poll_next(&mut self) -> Option<Frame> {
+        let oldest = self
+            .slots()
+            .iter()
+            .filter(|s| s[0] == READY)
+            .map(|s| s[3].cast_signed())
+            .min()?;
+        self.poll(oldest)
+    }
+
     /// The ring's section's size in bytes.
     fn bytes(&self) -> usize {
         self.reader.geometry().bytes()
@@ -289,6 +303,9 @@ impl Drop for Ring {
         let _ = unsafe { UnmapViewOfFile(self.view) };
     }
 }
+
+/// A slot's state word for a published frame.
+const READY: u64 = 2;
 
 /// A frame taken from a ring.
 struct Taken {
@@ -949,6 +966,14 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
             player: 1
         }
     );
+    // The ring full of the clip's first frames, published before the game's
+    // first poll, each end resolved by the frame after it.
+    let slots = u64::try_from(skin_model::media::SLOTS).unwrap();
+    let deadline = Instant::now() + REPLY;
+    while ring.published() < slots {
+        assert!(Instant::now() < deadline, "the ring never filled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
     assert_eq!(shown.2, 120);
     let at = stamp_of(24, 24);
@@ -965,6 +990,62 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     let taken = take_seq(&worker, &mut ring, landed);
     assert_eq!((taken.1, taken.2), (at, 24));
     worker.close(1);
+}
+
+/// A frame due is published as soon as it is decoded, never held for the
+/// next decode (design.md "Rendering and Skins", video frames): with the
+/// conversion after it blocking for 600 ms, the game, polling on a
+/// real-time clock, takes the frame by the time it is due plus 60 ms,
+/// both for a clip's first frame (the second conversion blocks) and for a
+/// looping clip's last frame (the next pass's first conversion blocks).
+// Revert: the frame held until the next one is decoded (its end taken
+// from it before it is published) -> "taken while the next decode blocks".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_due_frame_is_published_while_the_next_decode_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "n.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    // (the conversion that blocks, looping, the frame due, its index)
+    for (stall, looping, index) in [(1, false, 0), (48, true, 47)] {
+        let option = format!("stall-convert={stall}:600");
+        let mut worker = Worker::start(&["--dev-serve", &option]);
+        let probe = worker.open(1, &path);
+        assert!(
+            matches!(probe, Reply::Probed { player: 1, .. }),
+            "{probe:?}"
+        );
+        let mut ring = Ring::new(320, 240);
+        assert_eq!(
+            worker.play_as(1, &ring, looping),
+            Reply::Playing {
+                id: worker.last,
+                player: 1
+            }
+        );
+        let due = stamp_of(index, 24);
+        let limit = due + 60_000;
+        let origin = Instant::now();
+        let mut taken = None;
+        loop {
+            let now = i64::try_from(origin.elapsed().as_micros()).unwrap();
+            if now > limit {
+                break;
+            }
+            if let Some(frame) = ring.poll(now)
+                && frame.stamp == due
+            {
+                taken = Some(now);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            taken.is_some(),
+            "frame {index} taken while the next decode blocks (by {limit} µs); the worker's log:\n{}",
+            worker.log()
+        );
+        worker.close(1);
+    }
 }
 
 /// A decoder slower than the game's clock (each frame's conversion takes
@@ -1390,7 +1471,7 @@ fn worker_caps_the_pixels_of_frames_after_the_probe() {
             ring.slots(),
             worker.log()
         );
-        if let Some(frame) = ring.poll(i64::MAX) {
+        if let Some(frame) = ring.poll_next() {
             taken.push(frame.stamp);
             continue;
         }
@@ -1399,7 +1480,7 @@ fn worker_caps_the_pixels_of_frames_after_the_probe() {
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    while let Some(frame) = ring.poll(i64::MAX) {
+    while let Some(frame) = ring.poll_next() {
         taken.push(frame.stamp);
     }
     // The decoder refuses the first frame past the cap, which fails the
@@ -1514,7 +1595,7 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[0] += usize::from(one.poll_next().is_some());
         frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
@@ -2286,7 +2367,7 @@ fn worker_caps_the_coded_size_of_h264_frames_after_the_probe() {
             taken.len(),
             worker.log()
         );
-        if let Some(frame) = ring.poll(i64::MAX) {
+        if let Some(frame) = ring.poll_next() {
             taken.push(frame.stamp);
             continue;
         }
@@ -2295,7 +2376,7 @@ fn worker_caps_the_coded_size_of_h264_frames_after_the_probe() {
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    while let Some(frame) = ring.poll(i64::MAX) {
+    while let Some(frame) = ring.poll_next() {
         taken.push(frame.stamp);
     }
     // The first frame past the cap fails the player, with the error the
@@ -2380,7 +2461,7 @@ fn h264_decoder_enomem_fails_one_player_and_the_worker_lives() {
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[0] += usize::from(one.poll_next().is_some());
         frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
@@ -2548,7 +2629,7 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[0] += usize::from(one.poll_next().is_some());
         frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
@@ -3176,7 +3257,7 @@ fn drain(worker: &Worker, rings: &mut BTreeMap<u8, Ring>) -> BTreeMap<u8, usize>
             worker.log()
         );
         for (player, ring) in rings.iter_mut() {
-            if ring.poll(i64::MAX).is_some() {
+            if ring.poll_next().is_some() {
                 *shown.get_mut(player).unwrap() += 1;
             }
         }
