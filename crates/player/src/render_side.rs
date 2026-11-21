@@ -849,10 +849,11 @@ pub trait Screen: Send {
     fn movie_frame(&mut self, at: i64) {
         let _ = at;
     }
-    /// The skin movies' admission boundary, in each pass before it waits
-    /// for the frame's grant ([`crate::movie_frame::Movies::admit`]): a
-    /// movie's planes are reserved or released here, never in a frame.
-    /// Nothing by default.
+    /// The skin movies' admission boundary, in each pass that finds no
+    /// frame due (no grant held or found, no clock deadline passed),
+    /// before it waits for the frame's grant
+    /// ([`crate::movie_frame::Movies::admit`]): a movie's planes are
+    /// reserved or released here, never in a frame. Nothing by default.
     fn movie_boundary(&mut self) {}
     /// The committed play begins (its play message), its READY at `anchor`
     /// µs on the frame clock less the play skin's loading minimum: its
@@ -7865,12 +7866,20 @@ impl Run {
                 }
                 self.first_frame = Some(first);
             }
+            // The skin movies' admission, behind the admission gate's frame
+            // check and before the grant is waited for: it reserves planes
+            // only while no frame is due, never with a grant held (taken by
+            // this pass's boundary, or kept from a pass whose lifetime was
+            // left during its wait) nor once one is found, which is kept
+            // for the frame; a reservation never delays a granted frame.
+            let frame = self.frame_due_by(&mode, None);
+            let frame_due = self.heavy_state(frame, None).frame_due;
             let Some(screen) = &mut self.screen else {
                 continue;
             };
-            // The skin movies' admission, before the grant is waited for:
-            // a reservation never delays a granted frame.
-            screen.movie_boundary();
+            if !frame_due {
+                screen.movie_boundary();
+            }
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
             // instead, and a frame granted before stays granted. READY's

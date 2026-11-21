@@ -117,6 +117,13 @@ struct Fake {
     /// The swap chain's grant is looked at through [`GRANT`]
     /// (`grant_probe`), as a paced window's is.
     probe: AtomicBool,
+    /// A grant the render thread took (a frame wait or a grant check
+    /// answered so) that no frame has drawn yet.
+    granted: AtomicBool,
+    /// Each movie boundary the render thread ran: the frames drawn before
+    /// it, and whether a frame was due then (a grant held, or the probe's
+    /// grant there to be found).
+    boundaries: Mutex<Vec<(usize, bool)>>,
 }
 
 /// The fake's swap chain grant while `Fake::probe` (one test uses it).
@@ -160,6 +167,7 @@ impl Fake {
     /// otherwise.
     fn frame(&self, kind: Kind) -> FrameTiming {
         let presented = !self.unpresented.load(Ordering::SeqCst);
+        self.granted.store(false, Ordering::SeqCst);
         let mut s = self.state();
         s.frames.push((kind, Instant::now(), presented));
         if presented {
@@ -187,13 +195,31 @@ impl Screen for Timed {
         Ok(())
     }
     fn wait(&self) -> bool {
-        self.0.gate.wait()
+        let granted = self.0.gate.wait();
+        if granted {
+            self.0.granted.store(true, Ordering::SeqCst);
+        }
+        granted
     }
     fn paced(&self) -> bool {
         self.0.gate.pacing()
     }
     fn grant_ready(&self) -> bool {
-        self.0.gate.take_ready()
+        let granted = self.0.gate.take_ready();
+        if granted {
+            self.0.granted.store(true, Ordering::SeqCst);
+        }
+        granted
+    }
+    fn movie_boundary(&mut self) {
+        let due = self.0.granted.load(Ordering::SeqCst)
+            || (self.0.probe.load(Ordering::SeqCst) && GRANT.load(Ordering::SeqCst));
+        let frames = self.0.state().frames.len();
+        self.0
+            .boundaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((frames, due));
     }
     fn grant_probe(&self) -> Option<render::GrantProbe> {
         self.0
@@ -1834,4 +1860,91 @@ fn a_loading_lifetime_destroys_nothing_at_a_boundary_before_its_first_frame() {
         first.shown > shown,
         "destroyed before the first presented loading frame"
     );
+}
+
+// ---- The skin movies' admission boundary on the real loop ----
+
+impl Rig {
+    fn boundaries(&self) -> Vec<(usize, bool)> {
+        self.fake
+            .boundaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Waits until the render thread ran a movie boundary after `frames`
+    /// frames were drawn.
+    #[track_caller]
+    fn until_boundary_after(&self, frames: usize) {
+        assert!(
+            wait_until(|| self.boundaries().iter().any(|(n, _)| *n >= frames)),
+            "no movie boundary after frame {frames}: {:?}",
+            self.boundaries()
+        );
+    }
+}
+
+/// The render pass's movie boundary reserves only while no frame is due
+/// (design.md "Scope of No Allocation", the admission boundary; "Memory
+/// Budget", the admission gate's frame check), on the real loop: a grant
+/// taken by a selection's wait and kept as that selection is left (the
+/// mode turning Idle) reaches the page's pass, which draws its frame
+/// with it and runs no boundary before; the pass after that frame, with
+/// no grant, runs the boundary. Every boundary of the run found no frame
+/// due, and one ran after the page's frame.
+// Revert: the boundary run whatever the frame (`if !frame_due` dropped)
+// -> "a boundary with a frame due"; the boundary's call deleted -> "no
+// movie boundary after frame".
+#[test]
+fn a_retained_grant_draws_its_frame_before_any_movie_boundary() {
+    let r = Rig::selection();
+    r.link.leave_selection();
+    r.link.send(RenderMsg::Menu(Box::default()));
+    let f = Arc::clone(&r.fake);
+    r.fake
+        .gate
+        .step_into(move || f.state().frames.iter().any(|(k, _, _)| *k == Kind::Page));
+    let page = r
+        .fake
+        .state()
+        .frames
+        .iter()
+        .position(|(k, _, _)| *k == Kind::Page)
+        .unwrap();
+    r.until_boundary_after(page + 1);
+    let b = r.boundaries();
+    assert!(
+        b.iter().all(|(_, due)| !due),
+        "a boundary with a frame due: {b:?}"
+    );
+}
+
+/// A grant the pass finds at the boundary's frame check is the frame's:
+/// with the swap chain's grant ready after a page frame, the next pass
+/// draws its frame first and runs no boundary before it; the pass after,
+/// with no grant to find, runs the boundary.
+// Revert: as above -> "a boundary with a frame due".
+#[test]
+fn a_grant_found_draws_its_frame_before_any_movie_boundary() {
+    let r = Rig::page();
+    r.fake.probe.store(true, Ordering::SeqCst);
+    GRANT.store(true, Ordering::SeqCst);
+    let n = r.fake.state().frames.len();
+    let f = Arc::clone(&r.fake);
+    r.fake.gate.step_into(move || f.state().frames.len() > n);
+    // The first boundary after the frame let through: with the grant
+    // found it follows the frame the grant drew.
+    r.until_boundary_after(n + 1);
+    let b = r.boundaries();
+    assert!(
+        b.iter().all(|(_, due)| !due),
+        "a boundary with a frame due: {b:?}"
+    );
+    assert!(!GRANT.load(Ordering::SeqCst), "the grant taken");
+    assert!(
+        b.iter().any(|(k, _)| *k >= n + 2),
+        "the grant's frame drawn before the boundary: {b:?}"
+    );
+    r.fake.probe.store(false, Ordering::SeqCst);
 }
