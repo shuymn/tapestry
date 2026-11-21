@@ -622,6 +622,21 @@ pub trait Screen: Send {
     /// Begins reading the font a page will need, off the frame, when the
     /// screen has none (a screen for plays only); nothing by default.
     fn read_font_ahead(&mut self) {}
+    /// The page font this screen read or is reading, taken as it is
+    /// dropped for the screen built in its place; none by default.
+    fn take_page_font(&mut self) -> Option<crate::menu_screen::PageFont> {
+        None
+    }
+    /// The page font a screen replaced read or was reading, for this one
+    /// when it has none; dropped by default.
+    fn give_page_font(&mut self, font: crate::menu_screen::PageFont) {
+        let _ = font;
+    }
+    /// Whether the page font is read, never waiting for its thread (begun
+    /// now when none is) and never reading it here; ready by default.
+    fn page_font_ready(&mut self) -> bool {
+        true
+    }
     /// Whether a loading text is in the uploader's hand; none by default.
     fn loading_text_held(&self) -> bool {
         false
@@ -2134,6 +2149,10 @@ struct Shared {
     /// The held iterations, and their waits (tests).
     #[cfg(test)]
     held: [AtomicU64; 2],
+    /// The passes that waited for the pending presentation's font, each
+    /// presenting nothing (tests).
+    #[cfg(test)]
+    font_waits: AtomicU64,
     /// The uploader writes no step while a result view's staging is in
     /// hand, its staging answering not ready, while set (tests).
     #[cfg(test)]
@@ -2361,6 +2380,8 @@ impl Shared {
             hold_bound: AtomicI64::new(FIRST_FRAME_HOLD.0),
             #[cfg(test)]
             held: [AtomicU64::new(0), AtomicU64::new(0)],
+            #[cfg(test)]
+            font_waits: AtomicU64::new(0),
             #[cfg(test)]
             result_staging_paused: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -4156,6 +4177,13 @@ impl RenderLink {
         self.shared.destruction_held.store(on, Ordering::SeqCst);
     }
 
+    /// The passes that waited for the pending presentation's font so far
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn font_waits(&self) -> u64 {
+        self.shared.font_waits.load(Ordering::SeqCst)
+    }
+
     /// The held iterations so far, each counted as it begins (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn held_passes(&self) -> u64 {
@@ -5277,6 +5305,7 @@ pub fn spawn(
                 image: Image::default(),
                 first_frame: None,
                 result_hold: None,
+                page_font: None,
                 wait_page: None,
                 wait_laid: false,
                 extent: None,
@@ -6987,6 +7016,8 @@ struct Run {
     /// The result's hold, while it lasts (design.md "Rendering and
     /// Skins", the result's hold): `None` from READY through the tail.
     result_hold: Option<ResultHold>,
+    /// The page font of a screen dropped, for the one built in its place.
+    page_font: Option<crate::menu_screen::PageFont>,
     /// The result's pending presentation, composed once.
     wait_page: Option<MenuPage>,
     /// The last frame drawn was the pending presentation: its page is
@@ -9249,6 +9280,12 @@ impl Run {
                             .end(&page(self.result.as_ref(), &self.end_page.1))
                             .map(|p| (timing_of(p), None)),
                         ResultDrawn::Pending => {
+                            // Its font not yet read: nothing presented.
+                            if !screen.page_font_ready() {
+                                #[cfg(test)]
+                                self.shared.font_waits.fetch_add(1, Ordering::SeqCst);
+                                continue;
+                            }
                             let page = self
                                 .wait_page
                                 .get_or_insert_with(crate::loading_text::skin_wait_page);
@@ -9374,6 +9411,15 @@ impl Run {
                     }
                 }
                 Mode::ResultPending => {
+                    // Its font not yet read (a screen made for plays only,
+                    // read on its own thread): nothing presented, never a
+                    // read in the frame; the passes go on paced as frames
+                    // (design.md "Rendering and Skins", the result's hold).
+                    if !screen.page_font_ready() {
+                        #[cfg(test)]
+                        self.shared.font_waits.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
                     // The wait page, laid out at its first frame; no result
                     // picture (design.md "Rendering and Skins", the
                     // result's hold).
@@ -9884,6 +9930,10 @@ impl Run {
     /// Pipeline", the device rebuild).
     fn screen_built(&mut self) {
         if let Some(s) = &mut self.screen {
+            // The page font the screen it replaces read, or was reading.
+            if let Some(font) = self.page_font.take() {
+                s.give_page_font(font);
+            }
             s.set_destroy_allowed(self.destroy_allowed);
             self.heavy_seen = s.heavy_ops().count;
             self.result_changes = s.result_changes();
@@ -12270,6 +12320,7 @@ impl Run {
         if ready.is_ok() {
             self.shared.failed.store(false, Ordering::Release);
         } else {
+            self.keep_page_font();
             self.screen = None;
             self.image.changed();
             self.granted = false;
@@ -12619,6 +12670,7 @@ impl Run {
                 Ok(())
             }
             crate::decision_side::Rebuilt::Failed(e) => {
+                self.keep_page_font();
                 self.screen = None;
                 self.image.changed();
                 self.granted = false;
@@ -13345,6 +13397,7 @@ impl Run {
     /// last time, then it is dropped.
     fn drop_screen(&mut self) {
         self.reconcile_result();
+        self.keep_page_font();
         self.screen = None;
         self.image.changed();
         self.screen_dropped();
@@ -13352,6 +13405,15 @@ impl Run {
         // recovered frame's (dev-tools: the whole frames).
         #[cfg(feature = "dev-tools")]
         let _ = self.result_frames.take_before_wait();
+    }
+
+    /// The page font of the screen about to be dropped, kept for the one
+    /// built in its place (design.md "Rendering and Skins", the result's
+    /// hold: a screen for plays only reads it off the frame).
+    fn keep_page_font(&mut self) {
+        if let Some(font) = self.screen.as_mut().and_then(|s| s.take_page_font()) {
+            self.page_font = Some(font);
+        }
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i

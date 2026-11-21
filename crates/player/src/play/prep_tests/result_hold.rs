@@ -1524,6 +1524,123 @@ fn a_screen_for_plays_only_reads_the_pending_font_ahead() {
     });
 }
 
+/// Lets a held font read go when dropped, a test's panic included.
+struct FontGo;
+
+impl Drop for FontGo {
+    fn drop(&mut self) {
+        crate::menu_screen::HOLD_FONT_READ.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A screen made for plays only whose font is still being read past the
+/// bound (its worker held): no pass joins the worker, so the render
+/// thread keeps taking its messages and presents nothing while the font
+/// is read, reads none in a frame, and the pending presentation draws
+/// once the worker ends (V19 (k), the screen made for plays only).
+#[test]
+fn a_font_read_held_past_the_bound_blocks_no_pass() {
+    use crate::menu_screen::{FONT_READS, HOLD_FONT_READ};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp_fonts(a.chart(), false, |rig, frames| {
+        let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        let (report, screen) = result_of(dir.path());
+        let d = result::skin(
+            "",
+            "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+        );
+        let p = result::pending(d.path(), result::LIMITS);
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(p)));
+        prepared(rig, &a);
+        frames.arm();
+        let _go = FontGo;
+        HOLD_FONT_READ.store(true, Ordering::SeqCst);
+        let in_frame = reads(0);
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        laid_out(rig);
+        rig.render.pause_result_staging(true);
+        rig.show_end(&report, &screen);
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        std::thread::sleep(Duration::from_millis(300));
+        // The render thread past the bound with the font unread: its
+        // messages still taken, each pass bounded.
+        let taken = rig.render.messages_taken();
+        rig.render.send(RenderMsg::Resize);
+        let asked = Instant::now();
+        while rig.render.messages_taken() == taken {
+            assert!(
+                asked.elapsed() < Duration::from_secs(2),
+                "the render thread stopped taking messages while the font was read"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let waiting = frames.len();
+        std::thread::sleep(Duration::from_millis(200));
+        let presented = frames.since(waiting);
+        assert!(
+            presented.is_empty(),
+            "a frame presented before the font was read: {presented:?}"
+        );
+        assert!(rig.render.font_waits() > 0, "no pass waited for the font");
+        HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        let pending = frames.until(rig, waiting, "pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        assert!(
+            pending.iter().all(|f| f.pending()),
+            "the wait line on every frame: {pending:?}"
+        );
+        assert_eq!(reads(0), in_frame, "a font read in a frame");
+        rig.render.pause_result_staging(false);
+        rig.leave_result();
+    });
+}
+
+/// A screen made for plays only lost past the bound, its font read, and
+/// built again by the plays-only factory, which reads none: the font
+/// goes to the new screen, so its pending presentation draws from its
+/// first frame with no font read again, ahead or in a frame, even with
+/// any new read held (V19 (g) and (k), a screen made for plays only).
+#[test]
+fn a_plays_only_screen_built_again_keeps_the_font() {
+    use crate::menu_screen::{FONT_READS, HOLD_FONT_READ};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp_fonts(a.chart(), false, |rig, frames| {
+        let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        let (report, screen) = result_of(dir.path());
+        let _go = FontGo;
+        let (from, _skin) = held(rig, frames, &a, &report, &screen);
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        frames.until(rig, from, "pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        let (in_frame, ahead) = (reads(0), reads(1));
+        HOLD_FONT_READ.store(true, Ordering::SeqCst);
+        crate::dev::lose_result_frame_at(1);
+        until_true(rig, "the loss", |rig| rig.screen_failed());
+        crate::dev::lose_result_frame_at(0);
+        let lost = frames.len();
+        rig.prepare_screen().unwrap();
+        let rebuilt = frames.until(rig, lost, "frames on the rebuilt screen", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        assert!(
+            rebuilt.iter().all(|f| f.pending()),
+            "the pending presentation from the rebuilt screen's first frame: {rebuilt:?}"
+        );
+        assert_eq!(
+            (reads(0), reads(1)),
+            (in_frame, ahead),
+            "the font read again for the screen built again"
+        );
+        HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        rig.leave_result();
+    });
+}
+
 /// No result skin: no hold, and the built-in end page at once from the
 /// hand-over, past the bound with no pending frame (V19 (k), its second
 /// case).

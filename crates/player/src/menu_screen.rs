@@ -511,8 +511,32 @@ pub(crate) static FONT_READS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// While set, a font read on its own thread waits before reading
+/// (tests: the worker held).
+#[cfg(test)]
+pub(crate) static HOLD_FONT_READ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Waits while [`HOLD_FONT_READ`] is set, at most 20 s (tests).
+#[cfg(test)]
+fn hold_font_read() {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while HOLD_FONT_READ.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// The font read on a thread of its own.
 type FontJob = std::thread::JoinHandle<Result<Fonts, render::text::TextError>>;
+
+/// A screen's page font, read or being read, carried to the screen that
+/// replaces it ([`Screen::take_page_font`]).
+pub(crate) enum PageFont {
+    /// Read.
+    Read(Box<Fonts>),
+    /// Being read on its own thread.
+    Reading(FontJob),
+}
 
 /// The runtime font for a page that needs it now: the one read ahead
 /// (`ahead`) once its thread ends, else read here, in the frame.
@@ -1459,6 +1483,54 @@ impl Screen for MenuScreen {
         self.renderer.install_room(kind, skin)
     }
 
+    fn take_page_font(&mut self) -> Option<PageFont> {
+        match (self.fonts.take(), self.font_ahead.take()) {
+            (Some(fonts), _) => Some(PageFont::Read(Box::new(fonts))),
+            (None, Some(job)) => Some(PageFont::Reading(job)),
+            (None, None) => None,
+        }
+    }
+
+    fn give_page_font(&mut self, font: PageFont) {
+        if self.fonts.is_some() {
+            return;
+        }
+        match font {
+            PageFont::Read(fonts) => {
+                self.fonts = Some(*fonts);
+                self.font_ahead = None;
+            }
+            PageFont::Reading(job) => {
+                if self.font_ahead.is_none() {
+                    self.font_ahead = Some(job);
+                }
+            }
+        }
+    }
+
+    fn page_font_ready(&mut self) -> bool {
+        if self.fonts.is_some() {
+            return true;
+        }
+        self.read_font_ahead();
+        match self.font_ahead.take() {
+            // Its thread ended: joined at once, the font taken; a read that
+            // failed is left to the page, which reports it.
+            Some(job) if job.is_finished() => {
+                if let Ok(Ok(fonts)) = job.join() {
+                    self.fonts = Some(fonts);
+                }
+                true
+            }
+            Some(job) => {
+                self.font_ahead = Some(job);
+                false
+            }
+            // No thread could be started: the page reads it.
+            None => true,
+        }
+    }
+
     fn read_font_ahead(&mut self) {
         if self.fonts.is_some() || self.font_ahead.is_some() {
             return;
@@ -1466,6 +1538,8 @@ impl Screen for MenuScreen {
         self.font_ahead = std::thread::Builder::new()
             .name("font".to_owned())
             .spawn(|| {
+                #[cfg(test)]
+                hold_font_read();
                 let fonts = Fonts::runtime();
                 #[cfg(test)]
                 FONT_READS[1].fetch_add(1, Ordering::SeqCst);
