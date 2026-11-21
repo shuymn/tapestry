@@ -926,6 +926,9 @@ fn a_movie_past_the_total_maps_no_ring() {
         until(LAUNCH, || movie.status() != Status::Pending).expect("the peer never judged");
         if refused {
             assert_eq!(movie.loss(), Some(Loss::OverTotal), "{peer}");
+            // Its player closed: the session is done with it.
+            rig.event(Deadlines::GAME.close + SLACK, |e| *e == Event::Closed)
+                .expect("the refused player never closed");
             assert!(movie.live().is_none(), "{peer}: a ring mapped");
         } else {
             assert_eq!(movie.status(), Status::Live, "{peer}");
