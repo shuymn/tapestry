@@ -245,6 +245,12 @@ impl Ring {
         taken
     }
 
+    /// The highest sequence the worker has published, its watermark.
+    #[cfg(feature = "dev-tools")]
+    fn published(&self) -> u64 {
+        skin_model::media::watermark(Self::words(self.view, self.len)).unwrap()
+    }
+
     /// The ring's section's size in bytes.
     fn bytes(&self) -> usize {
         self.reader.geometry().bytes()
@@ -877,8 +883,19 @@ fn worker_drops_frames_behind_the_game_s_clock() {
         }
     );
     let slots = u64::try_from(SLOTS).unwrap();
+    // The ring full of the clip's first frames, published before the game's
+    // first poll.
+    let deadline = Instant::now() + REPLY;
+    while ring.published() < slots {
+        assert!(Instant::now() < deadline, "the ring never filled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let first = take_seq(&worker, &mut ring, stamp_of(24, 24));
-    assert_eq!((first.1, first.2), (stamp_of(24, 24), 24));
+    assert_eq!(
+        (first.1, first.2),
+        (stamp_of(24, 24), 24),
+        "the frame due first"
+    );
     assert!(
         first.0 <= slots + 1,
         "frames behind the clock published: frame 24 is sequence {}; the worker's log:\n{}",
@@ -903,6 +920,47 @@ fn worker_drops_frames_behind_the_game_s_clock() {
         late.0,
         worker.log()
     );
+    worker.close(1);
+}
+
+/// A seek back starts a run whose frames the worker judges only by the
+/// game's time of that run (design.md "Rendering and Skins", video
+/// frames): after the game has shown 5 s of a 10 s clip, a seek to 1 s
+/// shows the frame there, not frames the worker published late after
+/// dropping the run's frames by the earlier run's 5 s.
+// Revert: the worker reading the game's time whatever its run -> "no frame
+// due at".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_seek_back_is_judged_by_its_own_run_s_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "k.mpg", "mpeg1video mpeg 320x240 24 240 12");
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
+    assert_eq!(shown.2, 120);
+    let at = stamp_of(24, 24);
+    let run = ring.start_run(at);
+    worker.send(&Order::Seek { player: 1, run, at });
+    let landed = match worker.reply() {
+        Reply::Sought { landed, .. } => landed,
+        other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+    };
+    assert_eq!(landed, at);
+    let taken = take_seq(&worker, &mut ring, landed);
+    assert_eq!((taken.1, taken.2), (at, 24));
     worker.close(1);
 }
 
