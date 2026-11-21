@@ -21,7 +21,7 @@ use test_device::provenance;
 use super::guard::SLICE_MS;
 use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE};
 use super::listen::{BUTTON_EDGES, a_runner_s};
-use super::run::{F24_SCAN, MODE_LINK, SELECT, START, pad_buttons};
+use super::run::{F24_SCAN, MODE_LINK, PANEL_MODE, SELECT, START, pad_buttons};
 
 /// The producer's name.
 pub const PRODUCER: &str = "judge";
@@ -343,6 +343,16 @@ fn pressed(
     Ok((press(pad), key.map(press)))
 }
 
+/// When `press` was first released: after it, the first record of its own
+/// handle that `is_release` takes, or the handle's removal; none while it
+/// stays held.
+fn first_release(rec: &[Value], press: Press, is_release: impl Fn(&Value) -> bool) -> Option<i64> {
+    rec.iter()
+        .filter(|v| q(v) > press.q && v["h"].as_u64() == Some(press.h))
+        .find(|v| (v["t"] == "dev" && v["change"] == "removal") || is_release(v))
+        .map(q)
+}
+
 /// Whether `press` was released: after it, the first record of its own
 /// handle is a release (`is_release`) or the handle's removal. A device
 /// change of that handle before then (it arrived again: another binding)
@@ -503,6 +513,30 @@ fn first_q(run: &Stream, kind: &str) -> Result<i64, String> {
         .find(|v| v["t"] == kind)
         .map(q)
         .ok_or_else(|| format!("the run recorded no `{kind}`"))
+}
+
+/// The provenance check of a panel row: [`provenance`], and every `hello`
+/// the driving connection read reports in [`PANEL_MODE`], the mode the
+/// run's verdicts read reports in.
+fn panel_provenance(
+    build: Option<&str>,
+    f: &Files,
+    mode: &Stream,
+) -> Result<Result<(), String>, String> {
+    if let Err(why) = provenance(build, &[(LINK, &f.link), (MODE_LINK, mode)])? {
+        return Ok(Err(why));
+    }
+    for v in recs(&f.link)?.iter().filter(|v| v["t"] == "ans") {
+        if let Some(Answer::Hello(h)) = v["line"].as_str().and_then(Answer::parse_canonical)
+            && h.mode != PANEL_MODE
+        {
+            return Ok(Err(format!(
+                "the driving connection's `hello` reads mode {:?}, not {PANEL_MODE:?}: {}",
+                h.mode, v["line"]
+            )));
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// The tags of the run's click calls.
@@ -760,6 +794,9 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
             },
         )
     };
+    // The presses held at the inner's fixture record and released only
+    // after the outer's kill, then neutral: a release before the kill
+    // would leave the kill nothing to release.
     let neutral_after = || -> Result<Result<(), String>, String> {
         let rec = recs(&outer.recorder)?;
         let Ok((pad, key)) = pressed(rec, None, k.buttons, k.key) else {
@@ -767,8 +804,50 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
                 "the outer's recorder saw no press: the kill's fixture was not reached".into(),
             );
         };
+        let reached = recs(&inner.run)?
+            .iter()
+            .find(|v| v["t"] == k.reached)
+            .map(q)
+            .ok_or_else(|| format!("the inner recorded no `{}`", k.reached))?;
+        let kill = recs(&outer.run)?
+            .iter()
+            .find(|v| v["t"] == "kill" && v["name"] == "inner")
+            .map(q)
+            .ok_or("the outer recorded no kill of the inner")?;
         let end = rec.iter().map(q).max().unwrap_or(i64::MAX);
         covered(rec, key.map_or(pad.q, |key| pad.q.min(key.q)), end)?;
+        let pad_up = first_release(rec, pad, |v| {
+            v["t"] == "pad"
+                && v["bytes"]
+                    .as_str()
+                    .and_then(pad_buttons)
+                    .is_some_and(|b| b & k.buttons != k.buttons)
+        });
+        let key_up = key.map(|key| {
+            (
+                key,
+                first_release(rec, key, |v| {
+                    v["t"] == "key" && v["code"] == F24_SCAN && v["down"] == false
+                }),
+            )
+        });
+        for (what, press, up) in std::iter::once(("the pad's buttons", pad, pad_up))
+            .chain(key_up.map(|(key, up)| ("F24", key, up)))
+        {
+            if press.q > reached {
+                return Ok(Err(format!(
+                    "{what} were not pressed at the inner's `{}`",
+                    k.reached
+                )));
+            }
+            if let Some(at) = up
+                && at <= kill
+            {
+                return Ok(Err(format!(
+                    "{what} were released at {at}, before the outer's kill at {kill}"
+                )));
+            }
+        }
         Ok(neutral_of(rec, pad, key))
     };
     // The inner's player ended with the inner's job: the outer observed its
@@ -808,7 +887,7 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
             provenance(build, &[("outer", &outer.link), ("inner", &inner.link)]),
         ),
         verdict(k.abnormal, &[INNER_RUN, INNER_LINK], abnormal()),
-        verdict(k.neutral, &[RUN_REC], neutral_after()),
+        verdict(k.neutral, &[RUN_RUN, RUN_REC, INNER_RUN], neutral_after()),
         verdict(k.quiet, &[RUN_RUN, RUN_LINK, INNER_LINK], quiet()),
         verdict(
             k.no_foreign,
@@ -827,7 +906,8 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
 /// could not be read.
 pub type Bytes = Result<Vec<u8>, String>;
 
-/// The panel run's files besides its three streams.
+/// The panel run's files besides its three streams, each read once: every
+/// check and every digest of its verdicts comes from these bytes.
 #[derive(Clone, Debug)]
 pub struct PanelFiles {
     pub mode: Stream,
@@ -835,20 +915,45 @@ pub struct PanelFiles {
     pub device_after: Bytes,
     pub player_before: Bytes,
     pub player_after: Bytes,
+    /// Each settings file's sha256, of the bytes above.
+    pub digests: Vec<(&'static str, String)>,
 }
 
 impl PanelFiles {
     fn read(dir: &Path) -> Self {
-        let bytes = |name: &str| {
-            std::fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()))
+        let mut digests = Vec::new();
+        let mut bytes = |name: &'static str| {
+            let b = std::fs::read(dir.join(name))
+                .map_err(|e| format!("{}: {e}", dir.join(name).display()))?;
+            digests.push((
+                name,
+                contract::hex(&<sha2::Sha256 as sha2::Digest>::digest(&b)),
+            ));
+            Ok(b)
         };
+        let device_before = bytes(DEVICE_BEFORE);
+        let device_after = bytes(DEVICE_AFTER);
+        let player_before = bytes(PLAYER_BEFORE);
+        let player_after = bytes(PLAYER_AFTER);
         Self {
             mode: Stream::read::<evidence::Link>(&dir.join(MODE_LINK)),
-            device_before: bytes(DEVICE_BEFORE),
-            device_after: bytes(DEVICE_AFTER),
-            player_before: bytes(PLAYER_BEFORE),
-            player_after: bytes(PLAYER_AFTER),
+            device_before,
+            device_after,
+            player_before,
+            player_after,
+            digests,
         }
+    }
+
+    /// The sha256 of file `name` as read, if it is one of these.
+    fn digest(&self, name: &str) -> Option<String> {
+        if name == MODE_LINK {
+            return Some(self.mode.sha.clone());
+        }
+        self.digests
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, d)| d.clone())
     }
 }
 
@@ -882,6 +987,56 @@ pub fn volumes(after: &[u8]) -> Result<(), String> {
     } else {
         Err(wrong.join("; "))
     }
+}
+
+/// A negative row's declared absence of any volume change: `device.toml`
+/// after the run reads through the player's own refusals and types, and
+/// each of the three volumes is exactly 1.0, as written before the run.
+pub fn volumes_kept(after: &[u8]) -> Result<(), String> {
+    use game::SettingsFile as _;
+    let text = std::str::from_utf8(after).map_err(|e| format!("device.toml after the run: {e}"))?;
+    let table: toml::Table = toml::from_str(text)
+        .map_err(|e| format!("device.toml after the run does not read: {e}"))?;
+    game::DeviceSettings::refuse(&table)
+        .map_err(|e| format!("the player refuses device.toml after the run: {e}"))?;
+    toml::from_str::<game::DeviceSettings>(text)
+        .map_err(|e| format!("the player refuses device.toml after the run: {e}"))?;
+    let moved: Vec<String> = VOLUME_KEYS
+        .iter()
+        .filter_map(
+            |(_, key)| match table.get(*key).and_then(toml::Value::as_float) {
+                Some(1.0) => None,
+                got => Some(format!("{key} = {got:?}, not 1.0")),
+            },
+        )
+        .collect();
+    if moved.is_empty() {
+        Ok(())
+    } else {
+        Err(moved.join("; "))
+    }
+}
+
+/// P5's player is the mutated build it declared: the `player` record's
+/// executable has the sha256 the row declared, which is not the runner's
+/// own (the build under test). The detail names both either way.
+fn mutation_build(run: &[Value]) -> Result<Result<String, String>, String> {
+    let p = run
+        .iter()
+        .find(|v| v["t"] == "player")
+        .ok_or("the run recorded no player")?;
+    let (sha, runner) = (
+        p["sha256"].as_str().unwrap_or_default(),
+        p["runner_sha256"].as_str().unwrap_or_default(),
+    );
+    let detail = format!(
+        "the player run has sha256 {sha}; declared {}; the runner's own {runner}",
+        p["declared"]
+    );
+    Ok(match p["declared"].as_str() {
+        Some(d) if d == sha && sha != runner && !sha.is_empty() => Ok(detail),
+        _ => Err(detail),
+    })
 }
 
 /// Every byte of `device.toml` but the three volumes' lines is unchanged:
@@ -920,40 +1075,60 @@ pub fn device_rest(before: &[u8], after: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The run's own clicks in the recorder's stream: each click call's tag
-/// gives exactly one left press and then its release, with no other button
-/// edge between them, and no left button is down at the end; the mapping
-/// calibration (one move-only call per point) came before the first click
-/// at a target.
-pub fn clicks(run: &[Value], rec: &[Value], points: usize) -> Result<(), String> {
-    let calls: Vec<(&str, u32)> = run
+/// The run's own clicks: its calls are exactly the row's (`want`: what
+/// each sends and the client point it aims at, in order; a point of
+/// `None`, the sink's focus click, is any point, the same for its move and
+/// its click), each with a tag of its own; and in the recorder's stream
+/// each click call's tag gives exactly one left press and then its
+/// release, with no other button edge between them, and no left button is
+/// down at the end.
+pub fn clicks(
+    run: &[Value],
+    rec: &[Value],
+    want: &[(&str, Option<(i32, i32)>)],
+) -> Result<(), String> {
+    // What each call sends, its tag and the client point it aims at.
+    type Call<'a> = (&'a str, u32, Option<(i64, i64)>);
+    let calls: Vec<Call<'_>> = run
         .iter()
         .filter(|v| v["t"] == "call")
-        .filter_map(|v| Some((v["what"].as_str()?, u32::try_from(v["tag"].as_u64()?).ok()?)))
-        .collect();
-    let calibrations = calls.iter().filter(|(w, _)| *w == "calibrate").count();
-    if calibrations != points {
-        return Err(format!(
-            "{calibrations} calibration calls, not one per point ({points})"
-        ));
+        .map(|v| {
+            let point = v["point"][0].as_i64().zip(v["point"][1].as_i64());
+            Some((
+                v["what"].as_str()?,
+                u32::try_from(v["tag"].as_u64()?).ok()?,
+                point,
+            ))
+        })
+        .collect::<Option<_>>()
+        .ok_or("a call record without its tag or kind")?;
+    let got: Vec<String> = calls.iter().map(|(w, _, p)| format!("{w} {p:?}")).collect();
+    let shape = || format!("the run's calls {got:?}, not the row's {want:?}");
+    if calls.len() != want.len() {
+        return Err(shape());
+    }
+    let mut any = None;
+    for ((what, _, point), (want_what, want_point)) in calls.iter().zip(want) {
+        let point = point.ok_or_else(shape)?;
+        let fits = match want_point {
+            Some((x, y)) => point == (i64::from(*x), i64::from(*y)),
+            None => *any.get_or_insert(point) == point,
+        };
+        if what != want_what || !fits {
+            return Err(shape());
+        }
+    }
+    let mut tags: Vec<u32> = calls.iter().map(|&(_, t, _)| t).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    if tags.len() != calls.len() {
+        return Err(format!("two calls share a tag: {got:?}"));
     }
     let clicks: Vec<u32> = calls
         .iter()
-        .filter(|(w, _)| *w == "click")
-        .map(|&(_, t)| t)
+        .filter(|(w, _, _)| *w == "click")
+        .map(|&(_, t, _)| t)
         .collect();
-    // The focus clicks (the sink's, the player's) come before the
-    // calibration, the targets' after it.
-    let last_calibration = calls.iter().rposition(|(w, _)| *w == "calibrate");
-    let first_target = calls
-        .iter()
-        .enumerate()
-        .filter(|(_, (w, _))| *w == "click")
-        .nth(2)
-        .map(|(i, _)| i);
-    if first_target.is_some_and(|t| last_calibration.is_none_or(|c| c > t)) {
-        return Err("a target was clicked before the mapping calibration".into());
-    }
     let edges: Vec<&Value> = rec
         .iter()
         .filter(|v| {
@@ -1032,20 +1207,28 @@ pub fn panel_keys(rec: &[Value], held: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The verdicts of a panel row's run (`p1`, `p4`, `p5`), which holds
-/// `held`.
-pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, held: &[u8]) -> Vec<Judged> {
+/// The verdicts of a panel row's run (`p1`, `p4`, `p5`): P1's checks, and
+/// a negative's affirmative ones, which show that it fails for its
+/// declared reason only (P4's and P5's volumes all kept at 1.0, P5's
+/// player the declared mutated build).
+pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<Judged> {
+    let Some(held) = held_by(row) else {
+        return Vec::new();
+    };
+    let want: Vec<(&str, Option<(i32, i32)>)> = super::run::row(row, false)
+        .map(|steps| super::run::calls_of(&steps))
+        .unwrap_or_default();
     let span = |kind: &str| first_q(&f.run, kind);
     let bytes = |b: &Bytes| b.clone();
     let buttons = held.iter().fold(0_u16, |a, b| a | 1 << (b - 1));
     let calls = recs(&f.run).map(click_tags).unwrap_or_default();
     let mode = (SINGLE, MODE_LINK);
     let file = |name: &'static str| (SINGLE, name);
-    vec![
+    let mut out = vec![
         verdict(
             provenance::CHECK,
             &[RUN_LINK, mode],
-            provenance(build, &[(LINK, &f.link), (MODE_LINK, &x.mode)]),
+            panel_provenance(build, f, &x.mode),
         ),
         verdict("p1.grants", &[RUN_LINK], recs(&f.link).map(grants)),
         verdict(
@@ -1085,7 +1268,7 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, held: &[u8]) -> Vec
             (|| {
                 let rec = recs(&f.recorder)?;
                 covered(rec, span("call")?, span("quiet")?)?;
-                Ok(clicks(recs(&f.run)?, rec, super::run::click_points().len()))
+                Ok(clicks(recs(&f.run)?, rec, &want))
             })(),
         ),
         verdict(
@@ -1121,7 +1304,33 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, held: &[u8]) -> Vec
             &[RUN_RUN, RUN_LINK],
             recs(&f.run).and_then(|r| Ok(quiet_before_close(r, recs(&f.link)?))),
         ),
-    ]
+    ];
+    let kept = |id| {
+        verdict(
+            id,
+            &[file(DEVICE_AFTER)],
+            bytes(&x.device_after).map(|a| volumes_kept(&a)),
+        )
+    };
+    match row {
+        "p4" => out.push(kept("p4.volumes-kept")),
+        "p5" => {
+            out.push(kept("p5.volumes-kept"));
+            let (outcome, detail) = match recs(&f.run).and_then(mutation_build) {
+                Ok(Ok(d)) => (Outcome::Pass, d),
+                Ok(Err(d)) => (Outcome::Fail, d),
+                Err(d) => (Outcome::Incomplete, d),
+            };
+            out.push(Judged {
+                check: "p5.mutation-build",
+                outcome,
+                detail,
+                inputs: vec![RUN_RUN],
+            });
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The buttons a panel row holds.
@@ -1133,6 +1342,100 @@ pub fn held_by(row: &str) -> Option<&'static [u8]> {
     }
 }
 
+/// What `judge` reads of a run's folder, once: every check and every
+/// digest of its verdicts comes from these bytes, so a verdict never
+/// carries the digest of a file other than the one it judged.
+pub struct Reading {
+    start: Value,
+    files: Files,
+    inner: Option<Files>,
+    panel: Option<PanelFiles>,
+}
+
+/// Reads the run in `dir` for row `row`.
+///
+/// # Errors
+///
+/// An unknown row, or the run's `start` unreadable.
+pub fn read(row: &str, dir: &Path) -> anyhow::Result<Reading> {
+    let files = Files::read(dir);
+    let start = recs(&files.run)
+        .ok()
+        .and_then(|r| r.first().cloned())
+        .filter(|v| v["t"] == "start")
+        .ok_or_else(|| anyhow::anyhow!("{}: no `start` record", dir.display()))?;
+    let e = super::check::expectation_of(row)
+        .ok_or_else(|| anyhow::anyhow!("`judge` has no row `{row}`"))?;
+    let standing = contract::standing(&e, dir, super::COMMIT);
+    let files = files.standing(SINGLE, &standing);
+    let (inner, panel) = match row {
+        "sink" | "sink-early-close" => (None, None),
+        "sink-kill" | "p1-kill" => (
+            Some(Files::read(&dir.join(INNER)).standing(INNER, &standing)),
+            None,
+        ),
+        _ if held_by(row).is_some() => (None, Some(PanelFiles::read(dir))),
+        _ => anyhow::bail!("`judge` has no row `{row}`"),
+    };
+    Ok(Reading {
+        start,
+        files,
+        inner,
+        panel,
+    })
+}
+
+/// The verdict lines of `r`, read as row `row`, each input's digest that
+/// of the bytes read.
+pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
+    let run = r.start["run"].as_str().unwrap_or_default();
+    let build = r.start["build"].as_str();
+    let f = &r.files;
+    let judged = match (row, &r.inner, &r.panel) {
+        ("sink-kill", Some(inner), _) => kill(&N2, build, f, inner),
+        ("p1-kill", Some(inner), _) => kill(&N2P, build, f, inner),
+        (_, _, Some(x)) => panel(build, f, x, row),
+        _ => n1(build, f),
+    };
+    let sha = |role: &str, path: &str| {
+        let files = if role == INNER {
+            r.inner.as_ref()
+        } else {
+            Some(f)
+        };
+        match (files, path) {
+            (None, _) => String::new(),
+            (Some(fs), RUN) => fs.run.sha.clone(),
+            (Some(fs), LINK) => fs.link.sha.clone(),
+            (Some(fs), RECORDER) => fs.recorder.sha.clone(),
+            (Some(_), other) => r
+                .panel
+                .as_ref()
+                .filter(|_| role != INNER)
+                .and_then(|x| x.digest(other))
+                .unwrap_or_default(),
+        }
+    };
+    judged
+        .into_iter()
+        .map(|j| {
+            json!({
+                "row": row, "run": run, "check": j.check,
+                "outcome": match j.outcome {
+                    Outcome::Pass => "pass",
+                    Outcome::Fail => "fail",
+                    Outcome::Incomplete => "incomplete",
+                },
+                "detail": j.detail,
+                "inputs": j.inputs.iter().map(|(role, path)| json!({
+                    "role": role, "path": path, "sha256": sha(role, path),
+                })).collect::<Vec<_>>(),
+                "producer": { "name": PRODUCER, "version": super::COMMIT },
+            })
+        })
+        .collect()
+}
+
 /// Judges the run in `dir` as row `row` and writes `verdicts-judge.jsonl`.
 ///
 /// # Errors
@@ -1140,63 +1443,10 @@ pub fn held_by(row: &str) -> Option<&'static [u8]> {
 /// An unknown row, the run's `start` unreadable, or the file cannot be
 /// written.
 pub fn judge(row: &str, dir: &Path) -> anyhow::Result<()> {
-    let f = Files::read(dir);
-    let start = recs(&f.run)
-        .ok()
-        .and_then(|r| r.first().cloned())
-        .filter(|v| v["t"] == "start")
-        .ok_or_else(|| anyhow::anyhow!("{}: no `start` record", dir.display()))?;
-    let run = start["run"].as_str().unwrap_or_default().to_owned();
-    let build = start["build"].as_str().map(str::to_owned);
-    let e = super::check::expectation_of(row)
-        .ok_or_else(|| anyhow::anyhow!("`judge` has no row `{row}`"))?;
-    let standing = contract::standing(&e, dir, super::COMMIT);
-    let f = f.standing(SINGLE, &standing);
-    let (judged, inner) = match row {
-        "sink" | "sink-early-close" => (n1(build.as_deref(), &f), None),
-        "sink-kill" | "p1-kill" => {
-            let k = if row == "sink-kill" { &N2 } else { &N2P };
-            let inner = Files::read(&dir.join(INNER)).standing(INNER, &standing);
-            (kill(k, build.as_deref(), &f, &inner), Some(inner))
-        }
-        _ => match held_by(row) {
-            Some(held) => (
-                panel(build.as_deref(), &f, &PanelFiles::read(dir), held),
-                None,
-            ),
-            None => anyhow::bail!("`judge` has no row `{row}`"),
-        },
-    };
-    // Each input's digest: a stream's as read, any other file's as it is.
-    let sha = |role: &str, path: &str| {
-        let (files, folder) = if role == INNER {
-            (inner.as_ref(), dir.join(INNER))
-        } else {
-            (Some(&f), dir.to_owned())
-        };
-        match (files, path) {
-            (None, _) => String::new(),
-            (Some(fs), RUN) => fs.run.sha.clone(),
-            (Some(fs), LINK) => fs.link.sha.clone(),
-            (Some(fs), RECORDER) => fs.recorder.sha.clone(),
-            (Some(_), other) => super::owner::digest(&folder.join(other)).unwrap_or_default(),
-        }
-    };
+    let r = read(row, dir)?;
     let out = super::owner::Stream::create(&dir.join(format!("verdicts-{PRODUCER}.jsonl")))?;
-    for j in judged {
-        out.write(&json!({
-            "row": row, "run": run, "check": j.check,
-            "outcome": match j.outcome {
-                Outcome::Pass => "pass",
-                Outcome::Fail => "fail",
-                Outcome::Incomplete => "incomplete",
-            },
-            "detail": j.detail,
-            "inputs": j.inputs.iter().map(|(role, path)| json!({
-                "role": role, "path": path, "sha256": sha(role, path),
-            })).collect::<Vec<_>>(),
-            "producer": { "name": PRODUCER, "version": super::COMMIT },
-        }));
+    for line in lines(row, &r) {
+        out.write(&line);
     }
     if let Some(e) = out.close() {
         anyhow::bail!("{e}");
@@ -1267,8 +1517,8 @@ pub mod tests {
         let run = vec![
             json!({"t": "start"}),
             json!({"t": "sink", "q": 100, "window": SINK}),
-            json!({"t": "call", "q": 200, "tag": tag - 1, "what": "move"}),
-            json!({"t": "call", "q": 210, "tag": tag, "what": "click"}),
+            json!({"t": "call", "q": 200, "tag": tag - 1, "what": "move", "point": [100, 50]}),
+            json!({"t": "call", "q": 210, "tag": tag, "what": "click", "point": [100, 50]}),
             json!({"t": "held", "q": 2000}),
             json!({"t": "stop", "q": 5000, "what": "end"}),
             json!({"t": "quiet", "q": 5600, "line": hello(true, "released", "-")}),
@@ -1625,8 +1875,8 @@ pub mod tests {
         let inner = Files {
             run: Stream::of(vec![
                 json!({"t": "start"}),
-                json!({"t": "call", "q": 200, "tag": 0xABCD_0000_u32, "what": "move"}),
-                json!({"t": "call", "q": 210, "tag": 0xABCD_0001_u32, "what": "click"}),
+                json!({"t": "call", "q": 200, "tag": 0xABCD_0000_u32, "what": "move", "point": [100, 50]}),
+                json!({"t": "call", "q": 210, "tag": 0xABCD_0001_u32, "what": "click", "point": [100, 50]}),
                 json!({"t": "held", "q": 2000}),
             ]),
             // Through the grant's answer.
@@ -1752,9 +2002,9 @@ pub mod tests {
     }
 
     /// The device's `device.toml` before a panel run: volumes at 1.0.
-    const DEVICE_TOML: &str = "version = 3\nmonitor = \"M\"\nsystem_volume = 1.0\nkey_volume = 1.0\nbackground_volume = 1.0\n\n[library]\nroots = [\"C:/lib\"]\n";
+    pub const DEVICE_TOML: &str = "version = 3\nmonitor = \"M\"\nsystem_volume = 1.0\nkey_volume = 1.0\nbackground_volume = 1.0\n\n[library]\nroots = [\"C:/lib\"]\n";
 
-    fn panel_pad(q: i64, buttons: u16, h: u64, ours: bool) -> Value {
+    pub fn panel_pad(q: i64, buttons: u16, h: u64, ours: bool) -> Value {
         let mut v = pad(q, buttons, ours);
         v["h"] = json!(h);
         v
@@ -1771,36 +2021,26 @@ pub mod tests {
     /// the recorder's clicks and buttons, and the settings.
     pub fn panel_good() -> (Files, PanelFiles) {
         let n1 = good();
-        let tags: Vec<u32> = (0..13).map(|k| 0xABCD_0000 + k).collect();
         // Calls: the sink's focus (move, click), the player's focus (move,
-        // click), four calibrations, three targets (move, click).
-        let whats = [
-            "move",
-            "click",
-            "move",
-            "click",
-            "calibrate",
-            "calibrate",
-            "calibrate",
-            "calibrate",
-            "move",
-            "click",
-            "move",
-            "click",
-            "move",
-        ];
+        // click), four calibrations, three targets (move, click), tagged
+        // 0xABCD0000 on, at 10-tick steps from 200.
+        let calls = super::super::run::calls_of(&super::super::run::row("p1", false).unwrap());
+        assert_eq!(calls.len(), 14);
         let mut run = vec![
             json!({"t": "start"}),
             json!({"t": "sink", "q": 100, "window": SINK}),
         ];
-        for (k, (tag, what)) in tags.iter().zip(whats).enumerate() {
-            run.push(json!({"t": "call", "q": 200 + 10 * i64::try_from(k).unwrap(), "tag": tag, "what": what}));
+        for (k, (what, point)) in calls.iter().enumerate() {
+            let (x, y) = point.unwrap_or((100, 50));
+            run.push(json!({
+                "t": "call", "q": 200 + 10 * i64::try_from(k).unwrap(),
+                "tag": 0xABCD_0000 + u32::try_from(k).unwrap(), "what": what, "point": [x, y],
+            }));
         }
-        run.push(json!({"t": "call", "q": 340, "tag": 0xABCD_000D_u32, "what": "click"}));
         run.extend([
             json!({"t": "held", "q": 1700}),
-            json!({"t": "shot", "q": 2500, "what": "shot-a.png"}),
-            json!({"t": "shot", "q": 3500, "what": "shot-b.png"}),
+            json!({"t": "shot", "q": 2500, "what": "shot-a.png", "owned": true, "doubts": []}),
+            json!({"t": "shot", "q": 3500, "what": "shot-b.png", "owned": true, "doubts": []}),
             json!({"t": "stop", "q": 5000, "what": "end"}),
             json!({"t": "quiet", "q": 5600, "line": hello(true, "released", "-")}),
             json!({"t": "close", "q": 5800, "window": SINK}),
@@ -1841,26 +2081,228 @@ pub mod tests {
             device_after: Ok(after.into_bytes()),
             player_before: Ok(b"[skins]\n".to_vec()),
             player_after: Ok(b"[skins]\n".to_vec()),
+            digests: Vec::new(),
         };
         (files, x)
     }
 
-    fn panel_outcome(f: &Files, x: &PanelFiles, held: &[u8], check: &str) -> (Outcome, String) {
-        let j = panel(Some("0123456789ab"), f, x, held)
+    fn panel_outcome(f: &Files, x: &PanelFiles, row: &str, check: &str) -> (Outcome, String) {
+        let j = panel(Some("0123456789ab"), f, x, row)
             .into_iter()
             .find(|j| j.check == check)
-            .unwrap();
+            .unwrap_or_else(|| panic!("no {check} for {row}"));
         (j.outcome, j.detail)
     }
 
     #[test]
     fn a_good_panel_run_passes_every_check() {
         let (f, x) = panel_good();
-        let all = panel(Some("0123456789ab"), &f, &x, &[START, SELECT]);
+        let all = panel(Some("0123456789ab"), &f, &x, "p1");
         assert_eq!(all.len(), 11);
         for j in &all {
             assert_eq!(j.outcome, Outcome::Pass, "{j:?}");
         }
+    }
+
+    /// The volumes as P4's and P5's players leave them: all three at 1.0.
+    fn kept() -> PanelFiles {
+        let (_, mut x) = panel_good();
+        x.device_after = x.device_before.clone();
+        x
+    }
+
+    /// A P5 run: P1's records with the declared mutated player, the
+    /// volumes kept.
+    fn p5_good() -> (Files, PanelFiles) {
+        let (mut f, _) = panel_good();
+        edit(&mut f.run, |r| {
+            r.insert(
+                2,
+                json!({"t": "player", "q": 150, "path": "p5/t.exe", "sha256": "5a", "declared": "5a",
+                       "runner_sha256": "4e", "commit": "nogit", "modified": 1}),
+            );
+        });
+        (f, kept())
+    }
+
+    /// P4 and P5 fail `p1.volumes` for their declared reason only: each
+    /// row's own check passes only when `device.toml` reads through the
+    /// player's refusals and types with all three volumes exactly 1.0. One
+    /// volume moved, a malformed or refused file, or a volume line gone
+    /// fails it; an unreadable copy is incomplete. P1's checks have none.
+    #[test]
+    fn p4_and_p5_keep_every_volume_at_1() {
+        let (f, _) = panel_good();
+        for (row, id) in [("p4", "p4.volumes-kept"), ("p5", "p5.volumes-kept")] {
+            let x = kept();
+            assert_eq!(panel_outcome(&f, &x, row, "p1.volumes").0, Outcome::Fail);
+            assert_eq!(panel_outcome(&f, &x, row, id).0, Outcome::Pass, "{row}");
+            let before = String::from_utf8(x.device_before.clone().unwrap()).unwrap();
+            for (why, after) in [
+                (
+                    "one moved",
+                    before.replace("system_volume = 1.0", "system_volume = 0.25"),
+                ),
+                (
+                    "another moved",
+                    before.replace("background_volume = 1.0", "background_volume = 0.75"),
+                ),
+                (
+                    "malformed",
+                    before.replace("background_volume = 1.0", "background_volume = \"x\""),
+                ),
+                (
+                    "an integer",
+                    before.replace("key_volume = 1.0", "key_volume = 1"),
+                ),
+                ("gone", before.replace("key_volume = 1.0\n", "")),
+                ("refused", before.replace("version = 3", "version = 2")),
+                ("not toml", "system_volume = = 1.0\n".to_owned()),
+            ] {
+                let mut x = kept();
+                x.device_after = Ok(after.into_bytes());
+                let (o, d) = panel_outcome(&f, &x, row, id);
+                assert_eq!(o, Outcome::Fail, "{row} {why}: {d}");
+            }
+            let mut x = kept();
+            x.device_after = Err("missing".into());
+            assert_eq!(panel_outcome(&f, &x, row, id).0, Outcome::Incomplete);
+        }
+        let (f, x) = panel_good();
+        let ids: Vec<&str> = panel(Some("0123456789ab"), &f, &x, "p1")
+            .iter()
+            .map(|j| j.check)
+            .collect();
+        assert!(!ids.iter().any(|c| c.ends_with("-kept")), "{ids:?}");
+    }
+
+    /// P5's player must be the mutated build it declared: the `player`
+    /// record's digest equal to the declared one and not the runner's own;
+    /// the verdict names the digests. A stale player (another digest), the
+    /// build under test itself, or no declaration fails; no record is
+    /// incomplete.
+    #[test]
+    fn p5_runs_the_declared_mutation_build() {
+        let (f, x) = p5_good();
+        let (o, d) = panel_outcome(&f, &x, "p5", "p5.mutation-build");
+        assert_eq!(o, Outcome::Pass, "{d}");
+        assert!(d.contains("sha256 5a") && d.contains("own 4e"), "{d}");
+        for (field, value) in [
+            ("sha256", json!("3c")),
+            ("sha256", json!("4e")),
+            ("declared", Value::Null),
+        ] {
+            let (mut f, x) = p5_good();
+            edit(&mut f.run, |r| {
+                r[2][field] = value.clone();
+                if field == "sha256" && value == "4e" {
+                    r[2]["declared"] = json!("4e");
+                }
+            });
+            assert_eq!(
+                panel_outcome(&f, &x, "p5", "p5.mutation-build").0,
+                Outcome::Fail,
+                "{field} {value}"
+            );
+        }
+        let (mut f, x) = p5_good();
+        edit(&mut f.run, |r| r.retain(|v| v["t"] != "player"));
+        assert_eq!(
+            panel_outcome(&f, &x, "p5", "p5.mutation-build").0,
+            Outcome::Incomplete
+        );
+    }
+
+    /// The click check takes the run's calls exactly as the row makes them:
+    /// a target's click left out (its move, its call and its press and
+    /// release with it), a click at another point, an extra call, or two
+    /// calls with one tag fail. The control: the good run.
+    #[test]
+    fn the_clicks_are_exactly_the_row_s() {
+        let (f, x) = panel_good();
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Pass);
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| {
+            r.retain(|v| !(v["t"] == "call" && v["tag"].as_u64().unwrap() >= 0xABCD_000C));
+        });
+        edit(&mut f.recorder, |r| {
+            r.retain(|v| v["extra"] != 0xABCD_000D_u32);
+        });
+        let (o, d) = panel_outcome(&f, &x, "p1", "p1.clicks");
+        assert_eq!(o, Outcome::Fail, "{d}");
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| {
+            let at = r.iter().position(|v| v["tag"] == 0xABCD_000B_u32).unwrap();
+            r[at]["point"] = json!([301, 657]);
+        });
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| {
+            let at = r.iter().position(|v| v["tag"] == 0xABCD_000D_u32).unwrap();
+            let mut extra = r[at].clone();
+            extra["tag"] = json!(0xABCD_000E_u32);
+            r.insert(at + 1, extra);
+        });
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| {
+            let at = r.iter().position(|v| v["tag"] == 0xABCD_000C_u32).unwrap();
+            r[at]["tag"] = json!(0xABCD_000A_u32);
+        });
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
+    }
+
+    /// A panel run's driving connection must report in the panel mode: a
+    /// `hello` of another mode on it fails provenance.
+    #[test]
+    fn a_panel_run_in_another_mode_fails_provenance() {
+        let (f, x) = panel_good();
+        assert_eq!(panel_outcome(&f, &x, "p1", "provenance").0, Outcome::Pass);
+        let (mut f, x) = panel_good();
+        edit(&mut f.link, |l| {
+            let line = l[2]["line"]
+                .as_str()
+                .unwrap()
+                .replace(" mode 8 ", " mode 1 ");
+            l[2]["line"] = json!(line);
+        });
+        let (o, d) = panel_outcome(&f, &x, "p1", "provenance");
+        assert_eq!(o, Outcome::Fail, "{d}");
+        assert!(d.contains("driving connection"), "{d}");
+    }
+
+    /// Each verdict carries the digest of the bytes it judged: a settings
+    /// copy replaced on disk after the judge read it leaves the verdicts'
+    /// digests those of the copy read.
+    #[test]
+    fn a_verdict_s_digest_is_of_the_bytes_it_judged() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let start = json!({
+            "t": "start", "run": "0123456789abcdef0123456789abcdef", "row": "p1", "role": SINGLE,
+            "build": "0123456789ab", "process": {"pid": 1, "created": 2}, "commit": super::super::COMMIT,
+            "tag": 0xABCD, "cut": 0x4000_0123, "args": [], "set": null, "inner": null,
+        });
+        let end = json!({"t": "end", "exit": 0, "errors": []});
+        std::fs::write(d.join(RUN), format!("{start}\n{end}\n")).unwrap();
+        let (_, x) = panel_good();
+        let after = x.device_after.unwrap();
+        for (name, bytes) in [
+            (DEVICE_BEFORE, x.device_before.unwrap()),
+            (DEVICE_AFTER, after.clone()),
+            (PLAYER_BEFORE, x.player_before.unwrap()),
+            (PLAYER_AFTER, x.player_after.unwrap()),
+        ] {
+            std::fs::write(d.join(name), bytes).unwrap();
+        }
+        let r = read("p1", d).unwrap();
+        std::fs::write(d.join(DEVICE_AFTER), b"system_volume = 0.0\n").unwrap();
+        let lines = lines("p1", &r);
+        let v = lines.iter().find(|v| v["check"] == "p1.volumes").unwrap();
+        assert_eq!(v["outcome"], "pass", "{v}");
+        let read_sha = contract::hex(&sha2::Sha256::digest(&after));
+        assert_eq!(v["inputs"][0]["sha256"], read_sha.as_str(), "{v}");
     }
 
     /// The volumes are read from the copied `device.toml` after the run:
@@ -1870,7 +2312,7 @@ pub mod tests {
     fn p_volumes_are_read_from_the_copied_settings() {
         let (f, mut x) = panel_good();
         x.device_after = Ok(DEVICE_TOML.as_bytes().to_vec());
-        let (o, d) = panel_outcome(&f, &x, &[START, SELECT], "p1.volumes");
+        let (o, d) = panel_outcome(&f, &x, "p1", "p1.volumes");
         assert_eq!(o, Outcome::Fail);
         assert!(d.contains("system_volume = Some(1.0), not 0.25"), "{d}");
         let (f, mut x) = panel_good();
@@ -1878,14 +2320,11 @@ pub mod tests {
         x.device_after = Ok(a
             .replace("key_volume = 0.5", "key_volume = 0.51")
             .into_bytes());
-        assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.volumes").0,
-            Outcome::Fail
-        );
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.volumes").0, Outcome::Fail);
         let (f, mut x) = panel_good();
         x.device_after = Err("missing".into());
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.volumes").0,
+            panel_outcome(&f, &x, "p1", "p1.volumes").0,
             Outcome::Incomplete
         );
     }
@@ -1896,7 +2335,7 @@ pub mod tests {
         let a = String::from_utf8(x.device_after.unwrap()).unwrap();
         x.device_after = Ok(a.replace("C:/lib", "C:/lic").into_bytes());
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.device-toml").0,
+            panel_outcome(&f, &x, "p1", "p1.device-toml").0,
             Outcome::Fail
         );
         // A line added.
@@ -1905,7 +2344,7 @@ pub mod tests {
         a.extend_from_slice(b"x = 1\n");
         x.device_after = Ok(a);
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.device-toml").0,
+            panel_outcome(&f, &x, "p1", "p1.device-toml").0,
             Outcome::Fail
         );
         // A volume's line swapped for another key's.
@@ -1915,7 +2354,7 @@ pub mod tests {
             .replace("key_volume = 0.5", "system_volume = 0.5")
             .into_bytes());
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.device-toml").0,
+            panel_outcome(&f, &x, "p1", "p1.device-toml").0,
             Outcome::Fail
         );
     }
@@ -1925,7 +2364,7 @@ pub mod tests {
         let (f, mut x) = panel_good();
         x.player_after = Ok(b"[skins]\n\n".to_vec());
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.player-toml").0,
+            panel_outcome(&f, &x, "p1", "p1.player-toml").0,
             Outcome::Fail
         );
     }
@@ -1939,7 +2378,7 @@ pub mod tests {
             r.insert(3, panel_pad(1400, 1 << 9, 9, false));
         });
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.panel-keys").0,
+            panel_outcome(&f, &x, "p1", "p1.panel-keys").0,
             Outcome::Fail
         );
         let (mut f, x) = panel_good();
@@ -1948,7 +2387,7 @@ pub mod tests {
             r[at]["h"] = json!(7);
         });
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.panel-keys").0,
+            panel_outcome(&f, &x, "p1", "p1.panel-keys").0,
             Outcome::Fail
         );
     }
@@ -1964,16 +2403,16 @@ pub mod tests {
             r[at] = panel_pad(1500, 1 << 8, 2, true);
         });
         assert_eq!(
-            panel_outcome(&f, &x, &[START], "p1.panel-keys").0,
+            panel_outcome(&f, &x, "p4", "p1.panel-keys").0,
             Outcome::Pass
         );
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.panel-keys").0,
+            panel_outcome(&f, &x, "p1", "p1.panel-keys").0,
             Outcome::Fail
         );
         let (f, x) = panel_good();
         assert_eq!(
-            panel_outcome(&f, &x, &[START], "p1.panel-keys").0,
+            panel_outcome(&f, &x, "p4", "p1.panel-keys").0,
             Outcome::Fail
         );
     }
@@ -1986,27 +2425,18 @@ pub mod tests {
             let at = r.iter().position(|v| q(v) == 236).unwrap();
             r.remove(at);
         });
-        assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.clicks").0,
-            Outcome::Fail
-        );
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
         // Another edge between a press and its release.
         let (mut f, x) = panel_good();
         edit(&mut f.recorder, |r| {
             let at = r.iter().position(|v| q(v) == 236).unwrap();
             r.insert(at, mouse(235, 4, 0xABCD_000B));
         });
-        assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.clicks").0,
-            Outcome::Fail
-        );
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
         // A target clicked before the calibration.
         let (mut f, x) = panel_good();
         edit(&mut f.run, |r| r.retain(|v| v["what"] != "calibrate"));
-        assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.clicks").0,
-            Outcome::Fail
-        );
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
         // A press of the run's tag never released.
         let (mut f, x) = panel_good();
         edit(&mut f.recorder, |r| {
@@ -2014,10 +2444,7 @@ pub mod tests {
                 !(v["t"] == "mouse" && v["buttons"] == 2 && v["extra"] == 0xABCD_000D_u32)
             });
         });
-        assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.clicks").0,
-            Outcome::Fail
-        );
+        assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
     }
 
     #[test]
@@ -2025,7 +2452,7 @@ pub mod tests {
         let (mut f, x) = panel_good();
         edit(&mut f.recorder, |r| r.retain(|v| q(v) != 3000));
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.buttons-released").0,
+            panel_outcome(&f, &x, "p1", "p1.buttons-released").0,
             Outcome::Fail
         );
         // The release from another pad does not count.
@@ -2035,7 +2462,7 @@ pub mod tests {
             r[at]["h"] = json!(7);
         });
         assert_eq!(
-            panel_outcome(&f, &x, &[START, SELECT], "p1.buttons-released").0,
+            panel_outcome(&f, &x, "p1", "p1.buttons-released").0,
             Outcome::Fail
         );
     }
@@ -2064,6 +2491,36 @@ pub mod tests {
             .find(|j| j.check == check)
             .unwrap()
             .outcome
+    }
+
+    #[test]
+    fn n2p_needs_the_buttons_held_until_the_kill() {
+        let (o, i) = n2p_good();
+        assert_eq!(n2p_outcome(&o, &i, "n2p.neutral"), Outcome::Pass);
+        // A neutral report after the barrier and before the kill (2050),
+        // one before the barrier, and one releasing SELECT only: each
+        // leaves the kill nothing to release.
+        for (at, buttons) in [(2040, 0), (1800, 0), (2040, 1 << 8)] {
+            let (mut o, i) = n2p_good();
+            edit(&mut o.recorder, |r| {
+                r.insert(1, panel_pad(at, buttons, 2, true));
+            });
+            assert_eq!(
+                n2p_outcome(&o, &i, "n2p.neutral"),
+                Outcome::Fail,
+                "{at} {buttons:#x}"
+            );
+        }
+        // Pressed only after the barrier.
+        let (mut o, i) = n2p_good();
+        edit(&mut o.recorder, |r| r[0]["q"] = json!(2020));
+        assert_eq!(n2p_outcome(&o, &i, "n2p.neutral"), Outcome::Fail);
+        // N2's F24 broken before the kill.
+        let (mut o, i) = n2_good();
+        edit(&mut o.recorder, |r| r.insert(2, key(2030, false, true)));
+        assert_eq!(n2_outcome(&o, &i, "n2.neutral"), Outcome::Fail);
+        let (o, i) = n2_good();
+        assert_eq!(n2_outcome(&o, &i, "n2.neutral"), Outcome::Pass);
     }
 
     #[test]

@@ -21,12 +21,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use serde_json::{Value, json};
+use test_device::clock::ticks_to_us;
 use test_device::evidence::{Process, Recorder as Rec, Reserved};
 use test_device::mode::{Mode, Rate, Reporting};
 use test_device::protocol::{Change, Command, Control, Token};
@@ -62,6 +62,9 @@ pub struct Args {
     pub monitor: String,
     /// The player a panel row starts.
     pub player: Option<launch::Player>,
+    /// The sha256 the player's executable must have: the build a row runs
+    /// against (P5's mutated player), refused when another is found.
+    pub player_sha256: Option<String>,
     /// An inner `p1` of `p1-kill`: wait at the kill barrier after shot A.
     pub kill_barrier: bool,
 }
@@ -184,6 +187,26 @@ pub fn click_points() -> Vec<(i32, i32)> {
         .collect()
 }
 
+/// The calls a row's `steps` make, in order: what each sends and the
+/// client point it aims at (`None` for the sink's focus click, at the
+/// sink's centre whatever its size).
+pub fn calls_of(steps: &[Step]) -> Vec<(&'static str, Option<(i32, i32)>)> {
+    let mut out = Vec::new();
+    for s in steps {
+        match *s {
+            Step::Focus => out.extend([("move", None), ("click", None)]),
+            Step::FocusAt { x, y } | Step::Click { x, y } => {
+                out.extend([("move", Some((x, y))), ("click", Some((x, y)))]);
+            }
+            Step::Calibrate => {
+                out.extend(click_points().into_iter().map(|p| ("calibrate", Some(p))));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The rows with steps of their own; `barrier` puts `p1`'s kill barrier in.
 /// N1's negative, `sink-early-close`, is not one: closing the sink before
 /// the release evidence would let a held input land in another window, so
@@ -245,18 +268,26 @@ pub fn bare_commit(s: &str) -> bool {
 
 /// Whether the run may hold input on the device whose `hello` is `line`:
 /// only when the run's build is a bare commit id and the device names it
-/// with `faults 0`.
+/// with `faults 0`, and, for a row whose verdicts need the report mode
+/// (the panel rows), reports in `mode` on this connection.
 ///
 /// # Errors
 ///
 /// Why not.
-pub fn may_hold(build: &str, line: &str) -> Result<(), String> {
+pub fn may_hold(build: &str, line: &str, mode: Option<Mode>) -> Result<(), String> {
     if !bare_commit(build) {
         return Err(format!(
             "`{build}` is not a bare commit id (12 hex digits): no hold is taken"
         ));
     }
-    hello_facts(line, Some(build)).map(drop)
+    let facts = hello_facts(line, Some(build))?;
+    match mode {
+        Some(m) if facts.mode != m => Err(format!(
+            "the device reports in mode {:?} on the driving connection, not {m:?}: no hold is taken",
+            facts.mode
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What the steps act through.
@@ -384,7 +415,7 @@ struct Live {
     writer: Writer,
     /// The guard, started by the row's lease on the run's window then.
     guard: Option<(guard::Handle, JoinHandle<()>)>,
-    beat: Arc<AtomicI64>,
+    beat: Arc<guard::Beat>,
     /// The run's window: the sink, then the player's main window once it
     /// shows.
     window: Win,
@@ -417,15 +448,17 @@ struct Launched {
 
 impl Live {
     fn beat(&self) {
-        self.beat.store(qpc(), Ordering::Release);
+        self.beat.beat(qpc());
     }
 
     /// A guarded click (`focus`: a focus click) of the run's window at
     /// client `point`.
     fn guarded(&mut self, point: (i32, i32), focus: bool) -> Result<(), String> {
         let log = self.log.clone();
-        let mut note = |tag: u32, what: &str| {
-            log.put(json!({ "t": "call", "q": qpc(), "tag": tag, "what": what }));
+        let mut note = |tag: u32, what: &str, point: (i32, i32)| {
+            log.put(json!({
+                "t": "call", "q": qpc(), "tag": tag, "what": what, "point": [point.0, point.1],
+            }));
         };
         let mut desk = Real {
             monitor: self.monitor.clone(),
@@ -491,6 +524,8 @@ impl Exec for Live {
             let client = desktop::client_rect(self.window).ok_or("the run's window is gone")?;
             let recorder = job::open(self.recorder_process)
                 .map_err(|e| format!("the recorder's process: {e:#}"))?;
+            // The heartbeat's gaps count from the guard's start.
+            self.beat.arm(qpc());
             self.guard = Some(guard::start(
                 self.freq,
                 Box::new(Looks {
@@ -633,8 +668,10 @@ impl Exec for Live {
 
     fn calibrate(&mut self) -> Result<(), String> {
         let log = self.log.clone();
-        let mut note = |tag: u32, what: &str| {
-            log.put(json!({ "t": "call", "q": qpc(), "tag": tag, "what": what }));
+        let mut note = |tag: u32, what: &str, point: (i32, i32)| {
+            log.put(json!({
+                "t": "call", "q": qpc(), "tag": tag, "what": what, "point": [point.0, point.1],
+            }));
         };
         let mut desk = Real {
             monitor: self.monitor.clone(),
@@ -660,8 +697,17 @@ impl Exec for Live {
         self.lost()?;
         self.beat();
         let client = desktop::client_rect(self.window).ok_or("the run's window is gone")?;
+        // The screen's pixels are the run's window's only when nothing could
+        // draw over its client area: read before and after the copy.
+        let before = desktop::doubts(self.window, client);
+        self.beat();
         let bgra = desktop::capture(client).map_err(|e| format!("the shot {name}: {e:#}"))?;
-        self.log.put(json!({ "t": "shot", "what": name }));
+        self.beat();
+        let mut doubts = before;
+        doubts.extend(desktop::doubts(self.window, client));
+        self.log.put(json!({
+            "t": "shot", "what": name, "owned": doubts.is_empty(), "doubts": doubts,
+        }));
         self.beat();
         let (w, h) = (
             u32::try_from(client[2]).unwrap_or(0),
@@ -687,7 +733,7 @@ struct Looks {
     monitor_then: [i32; 4],
     monitor_now: Option<[i32; 4]>,
     read: Instant,
-    beat: Arc<AtomicI64>,
+    beat: Arc<guard::Beat>,
     /// The recorder's process, by a handle of the guard's own.
     recorder: Child,
     /// The recorder's file, and its growth: the recorder writes a `beat`
@@ -739,12 +785,17 @@ impl Watch for Looks {
         let placed = self.monitor_now == Some(self.monitor_then)
             && client == Some(self.client)
             && click::contains(self.monitor_then, self.client);
+        let front = desktop::foreground() == self.window;
+        let recording = self.recorder.wait(Duration::ZERO) == Ok(None) && growing;
+        // Last, with the counter read after it: a beat after `at` cannot
+        // hide a gap, which the heartbeat latched.
+        let beat_age = self.beat.age(qpc);
         Look {
             at,
-            front: desktop::foreground() == self.window,
+            front,
             placed,
-            beat: self.beat.load(Ordering::Acquire),
-            recording: self.recorder.wait(Duration::ZERO) == Ok(None) && growing,
+            beat_age,
+            recording,
         }
     }
 }
@@ -1012,6 +1063,9 @@ impl end::Link for EndLink<'_> {
 }
 
 impl end::Window for Sink {
+    fn front(&mut self) -> Result<(), String> {
+        desktop::bring_to_front(self.window)
+    }
     fn close(&mut self) -> Result<(), String> {
         Sink::close(self).map_err(|e| format!("{e:#}"))
     }
@@ -1248,15 +1302,41 @@ fn mode_change(b: &Begun, a: &Args, journal: &Stream) -> anyhow::Result<String> 
     }
 }
 
+/// 1970-01-01 as a FILETIME (100 ns since 1601).
+const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+
+/// A file's last write as a FILETIME, refused before 1970: no build of the
+/// player is that old, so a clock or a file system that says so is wrong.
+///
+/// # Errors
+///
+/// A last write before 1970.
+pub fn last_write(filetime: u64) -> anyhow::Result<u64> {
+    if filetime < UNIX_EPOCH_FILETIME {
+        bail!("a last write before 1970 (FILETIME {filetime})");
+    }
+    Ok(filetime)
+}
+
 /// The `player` record: the executable a panel row starts, its sha256, the
-/// commit it reports (`<exe> test-device commit`, run in the run's job with
-/// its output in `player-commit.txt`) and its last write.
-fn player_record(b: &Begun, p: &launch::Player) -> anyhow::Result<()> {
+/// sha256 the row declared for it (`--player-sha256`; one that differs is
+/// refused before anything starts), the runner's own executable's sha256,
+/// the commit the player reports (`<exe> test-device commit`, run in the
+/// run's job with its output in `player-commit.txt`) and its last write.
+fn player_record(b: &Begun, p: &launch::Player, declared: Option<&str>) -> anyhow::Result<()> {
     let sha = owner::digest(&p.exe)?;
-    // FILETIME: 100 ns since 1601.
-    let filetime = std::os::windows::fs::MetadataExt::last_write_time(
+    if let Some(d) = declared
+        && d != sha
+    {
+        bail!(
+            "the player {} has sha256 {sha}, not the declared {d}",
+            p.exe.display()
+        );
+    }
+    let runner = owner::digest(&std::env::current_exe().context("the runner's own path")?)?;
+    let filetime = last_write(std::os::windows::fs::MetadataExt::last_write_time(
         &std::fs::metadata(&p.exe).with_context(|| p.exe.display().to_string())?,
-    );
+    ))?;
     let out = b.dir.join("player-commit.txt");
     let stdio = Stdio {
         input: Stdio::null()?,
@@ -1285,8 +1365,8 @@ fn player_record(b: &Begun, p: &launch::Player) -> anyhow::Result<()> {
         .trim()
         .to_owned();
     b.log.put(json!({
-        "t": "player", "path": p.exe.to_string_lossy(), "sha256": sha, "commit": commit,
-        "modified": filetime,
+        "t": "player", "path": p.exe.to_string_lossy(), "sha256": sha, "declared": declared,
+        "runner_sha256": runner, "commit": commit, "modified": filetime,
     }));
     Ok(())
 }
@@ -1342,6 +1422,9 @@ struct Windows<'a> {
 }
 
 impl end::Window for Windows<'_> {
+    fn front(&mut self) -> Result<(), String> {
+        end::Window::front(self.sink)
+    }
     fn close(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Some(l) = self.player.take() {
@@ -1401,6 +1484,9 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         bail!("no row `{}`", a.row);
     };
     let panel = steps.contains(&Step::Launch);
+    if (a.row == "p5") != a.player_sha256.is_some() {
+        bail!("--player-sha256 names P5's mutated player: row p5 takes it, and no other row does");
+    }
     match (panel, &a.player) {
         (true, None) => bail!(
             "row `{}` starts the player: it takes --player, --data, --library, --skin and --skin-entry",
@@ -1417,7 +1503,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     let mut rec = RecChild::spawn(&b, &a.port)?;
     let monitor = desktop::monitor(&a.monitor)?;
     if let Some(p) = &a.player {
-        player_record(&b, p)?;
+        player_record(&b, p, a.player_sha256.as_deref())?;
         p.prepare(&a.monitor, &b.dir)?;
         for name in [launch::DEVICE_BEFORE, launch::PLAYER_BEFORE] {
             seal_file(&b, name, &mut errors);
@@ -1429,10 +1515,17 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     let mut conn = owner::rediscover(&System, &a.port, &a.build)?;
     conn.identify(&b.run, b.process);
     let hello = conn.facts().context("no checked `hello`")?.line.clone();
-    may_hold(&a.build, &hello).map_err(anyhow::Error::msg)?;
+    // The panel rows' verdicts read reports in the panel mode: checked
+    // again on the connection that drives the run.
+    may_hold(&a.build, &hello, panel.then_some(PANEL_MODE)).map_err(anyhow::Error::msg)?;
     let token: Option<Token> = conn.token();
     let (writer, thread) = Writer::start(conn, link_log, b.stream.clone());
-    let beat = Arc::new(AtomicI64::new(qpc()));
+    let beat = Arc::new(guard::Beat::new(qpc()));
+    let freq = qpc_freq();
+    let fresh_beat = Arc::clone(&beat);
+    writer.fresh(Box::new(move |check| {
+        fresh(&fresh_beat, check, qpc(), freq)
+    }));
     let shot_log = b.log.clone();
     let seals = b.seals;
     let mut live = Live {
@@ -1449,7 +1542,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         recorder_process: rec.child.process,
         backlog: Vec::new(),
         held: Vec::new(),
-        freq: qpc_freq(),
+        freq,
         dir: b.dir.clone(),
         job: b.job,
         player: a.player.clone(),
@@ -1477,7 +1570,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         .answers
         .iter()
         .any(|(c, l)| matches!(c, Command::Lease { .. }) && l.starts_with("lease "));
-    let beat_fn = || beat.store(qpc(), Ordering::Release);
+    let beat_fn = || beat.beat(qpc());
     let mut link = EndLink {
         writer: &writer,
         thread: Some(thread),
@@ -1514,20 +1607,40 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         cause: "end",
     }));
     if let Some((guard, guard_thread)) = live.guard.take() {
-        guard.end();
-        let (age, looks) = guard.heartbeat();
-        eprintln!(
-            "guard: the step thread's heartbeat was at most {age} µs old over {looks} judged looks (bound {} µs)",
-            guard::BEAT_MAX_US
-        );
-        if let Err(e) = owner::join_within(guard_thread, "the guard's thread", GUARD_WAIT) {
-            errors.push(e);
+        match guard::stop(&guard, guard_thread, GUARD_WAIT) {
+            Ok((age, looks)) => eprintln!(
+                "guard: the step thread's heartbeat was at most {age} µs old over {looks} judged looks (bound {} µs)",
+                guard::BEAT_MAX_US
+            ),
+            Err(e) => errors.push(e),
         }
     }
     errors.extend(live.shots.finish());
     let link_closed = link.closed;
     seal_own(&b, link_closed, rec.ended.is_some(), &mut errors);
     Ok(finish(&b, errors))
+}
+
+/// Whether a hold-bearing command may be submitted at `now` (host counter
+/// ticks, `freq` a second): the step thread's heartbeat, gaps latched, no
+/// older than [`guard::BEAT_MAX_US`], and a grant's or renewal's check no
+/// older than that either.
+///
+/// # Errors
+///
+/// Why it is stale.
+fn fresh(beat: &guard::Beat, check: Option<i64>, now: i64, freq: i64) -> Result<(), String> {
+    let age = ticks_to_us(beat.age(|| now), freq);
+    if age > guard::BEAT_MAX_US {
+        return Err(format!("the step thread's heartbeat is {age} µs old"));
+    }
+    if let Some(c) = check {
+        let since = ticks_to_us(now.saturating_sub(c), freq);
+        if since > guard::BEAT_MAX_US {
+            return Err(format!("its check is {since} µs old"));
+        }
+    }
+    Ok(())
 }
 
 /// How long the outer waits for the inner's `held`.
@@ -1858,7 +1971,7 @@ mod tests {
                         at: self.at,
                         front: true,
                         placed: true,
-                        beat: self.at,
+                        beat_age: 0,
                         recording: true,
                     };
                     if let Act::Send { cmd, .. } = g.decide(&look, &view) {
@@ -1901,6 +2014,7 @@ mod tests {
 
     #[test]
     fn only_a_bare_commit_build_without_faults_takes_a_hold() {
+        let may_hold = |build, line: &str| super::may_hold(build, line, None);
         assert_eq!(may_hold(BUILD, &hello(BUILD, false)), Ok(()));
         // The H2 control: the run's bare id with `faults 1`.
         assert!(may_hold(BUILD, &hello(BUILD, true)).is_err());
@@ -1916,6 +2030,60 @@ mod tests {
         }
         // Another bare id than the run's, with `faults 0`.
         assert!(may_hold(BUILD, &hello("ba9876543210", false)).is_err());
+    }
+
+    /// A panel row holds only when the driving connection's own `hello`
+    /// reads the panel mode: a device of the same build in another mode
+    /// (1000 Hz, or continuous reports) is refused; a row that needs no
+    /// mode takes either.
+    #[test]
+    fn a_wrong_mode_on_the_driving_connection_refuses_holds() {
+        let line = hello(BUILD, false);
+        assert!(line.contains(&format!(" mode {} ", PANEL_MODE.byte())));
+        assert_eq!(super::may_hold(BUILD, &line, Some(PANEL_MODE)), Ok(()));
+        for other in [1_u8, 0x18] {
+            let wrong = line.replace(
+                &format!(" mode {} ", PANEL_MODE.byte()),
+                &format!(" mode {other} "),
+            );
+            let e = super::may_hold(BUILD, &wrong, Some(PANEL_MODE)).unwrap_err();
+            assert!(e.contains("driving connection"), "{e}");
+            assert_eq!(super::may_hold(BUILD, &wrong, None), Ok(()));
+        }
+    }
+
+    /// A grant, renewal or held change is submitted only while the step
+    /// thread's heartbeat (its gaps latched) and the command's check are
+    /// within the bound.
+    #[test]
+    fn a_command_is_fresh_only_within_the_heartbeat_bound() {
+        const F: i64 = 1_000_000;
+        let max = guard::BEAT_MAX_US;
+        let beat = guard::Beat::new(0);
+        assert_eq!(fresh(&beat, None, max, F), Ok(()));
+        assert!(fresh(&beat, None, max + 1, F).is_err());
+        // A fresh heartbeat with a check older than the bound.
+        let now = 1_000_000;
+        let beating = guard::Beat::new(now);
+        assert_eq!(fresh(&beating, Some(now - max), now, F), Ok(()));
+        let e = fresh(&beating, Some(now - max - 1), now, F).unwrap_err();
+        assert!(e.contains("check"), "{e}");
+        // A gap closed before the submission still counts.
+        beat.beat(max + 1);
+        assert!(fresh(&beat, None, max + 2, F).is_err());
+    }
+
+    /// A last write before 1970 is refused; 1970 itself and later stand.
+    #[test]
+    fn a_last_write_before_1970_is_refused() {
+        assert!(last_write(UNIX_EPOCH_FILETIME - 1).is_err());
+        assert!(last_write(0).is_err());
+        assert_eq!(
+            last_write(UNIX_EPOCH_FILETIME).unwrap(),
+            UNIX_EPOCH_FILETIME
+        );
+        let later = UNIX_EPOCH_FILETIME + 17_000_000_000_000_000;
+        assert_eq!(last_write(later).unwrap(), later);
     }
 
     /// No row step writes a `release`, or any command but a held change
@@ -1955,12 +2123,38 @@ mod tests {
             port: "L".into(),
             monitor: "M".into(),
             player: None,
+            player_sha256: None,
             kill_barrier: false,
         };
         let e = run(&args("sink-early-close")).unwrap_err();
         assert_eq!(format!("{e:#}"), "no row `sink-early-close`");
         // The row it negates is one.
         assert!(row("sink", false).is_some());
+        assert!(!out.exists());
+    }
+
+    /// P5 runs only against a player whose digest it declares, and no
+    /// other row takes one: both refused before anything is reserved.
+    #[test]
+    fn only_p5_declares_its_player_s_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("run");
+        let args = |row: &str, sha: Option<&str>| Args {
+            row: row.into(),
+            out: Some(out.clone()),
+            set: None,
+            role: None,
+            build: BUILD.into(),
+            port: "L".into(),
+            monitor: "M".into(),
+            player: None,
+            player_sha256: sha.map(str::to_owned),
+            kill_barrier: false,
+        };
+        for (row, sha) in [("p5", None), ("p1", Some("ab")), ("p4", Some("ab"))] {
+            let e = format!("{:#}", run(&args(row, sha)).unwrap_err());
+            assert!(e.contains("--player-sha256"), "{row}: {e}");
+        }
         assert!(!out.exists());
     }
 

@@ -285,8 +285,13 @@ fn sink_kill() -> Expectation {
             ),
             pass(
                 "n2.neutral",
-                &[rec],
-                &[ev(SINGLE, RECORDER, "pad"), ev(SINGLE, RECORDER, "key")],
+                &[run, rec, inner_run],
+                &[
+                    ev(SINGLE, RECORDER, "pad"),
+                    ev(SINGLE, RECORDER, "key"),
+                    ev(INNER, RUN, "held"),
+                    ev(SINGLE, RUN, "kill"),
+                ],
             ),
             pass(
                 "n2.quiet",
@@ -308,8 +313,19 @@ fn sink_kill() -> Expectation {
     }
 }
 
+/// The private panel judge's per-slider checks of P4 (no part of the
+/// slider drawn: knob, graph or number) and of P5 (the slider drawn at
+/// 100 %: the knob at the travel's end, the graph lit through it, the
+/// number reading 100), which show each negative fails for its declared
+/// reason at every slider.
+pub const P4_ABSENT: [&str; 3] = ["panel.absent-17", "panel.absent-18", "panel.absent-19"];
+pub const P5_FULL: [&str; 3] = ["panel.full-17", "panel.full-18", "panel.full-19"];
+
 /// A panel row (P1, and its negatives P4 and P5): `failing` the checks
-/// that must fail, and the negative's mutation and trigger.
+/// that must fail, and the negative's mutation and trigger. A negative
+/// also has checks of its own that must pass: the judge's (its volumes
+/// all kept at 1.0; P5's player the declared mutated build) and the
+/// private judge's per-slider ones ([`P4_ABSENT`], [`P5_FULL`]).
 fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Expectation {
     use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE};
     use super::run::{MODE_LINK, SHOT_A, SHOT_B};
@@ -425,7 +441,31 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
             private("panel.graphs", &[f(SHOT_A)]),
             private("panel.numbers", &[f(SHOT_A)]),
             private("panel.closed-b", &[f(SHOT_B)]),
-        ],
+        ]
+        .into_iter()
+        .chain(match row {
+            "p4" => [judge(
+                "p4.volumes-kept",
+                &[f(DEVICE_AFTER)],
+                &[ev(SINGLE, RUN, "exit")],
+            )]
+            .into_iter()
+            .chain(P4_ABSENT.map(|id| private(id, &[f(SHOT_A)])))
+            .collect(),
+            "p5" => [
+                judge(
+                    "p5.volumes-kept",
+                    &[f(DEVICE_AFTER)],
+                    &[ev(SINGLE, RUN, "exit")],
+                ),
+                judge("p5.mutation-build", &[run], &[ev(SINGLE, RUN, "player")]),
+            ]
+            .into_iter()
+            .chain(P5_FULL.map(|id| private(id, &[f(SHOT_A)])))
+            .collect(),
+            _ => Vec::new(),
+        })
+        .collect(),
         negative,
     }
 }
@@ -545,7 +585,15 @@ fn p1_kill() -> Expectation {
                 &[inner_run, inner_link],
                 &[ev(INNER, RUN, "barrier")],
             ),
-            check("n2p.neutral", &[rec], &[ev(SINGLE, RECORDER, "pad")]),
+            check(
+                "n2p.neutral",
+                &[run, rec, inner_run],
+                &[
+                    ev(SINGLE, RECORDER, "pad"),
+                    ev(INNER, RUN, "barrier"),
+                    ev(SINGLE, RUN, "kill"),
+                ],
+            ),
             check(
                 "n2p.quiet",
                 &[run, link, inner_link],
@@ -683,8 +731,21 @@ mod tests {
             ["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"]
         );
         assert!(failing(&p1_kill()).is_empty());
-        for (neg, pos) in [(p4(), p1()), (p5(), p1())] {
-            assert_eq!(ids(&neg), ids(&pos));
+        // A negative's checks are its positive row's, in the same order,
+        // then its own, which pass.
+        for (neg, own) in [
+            (p4(), ["p4.volumes-kept"].iter().chain(&P4_ABSENT)),
+            (
+                p5(),
+                ["p5.volumes-kept", "p5.mutation-build"]
+                    .iter()
+                    .chain(&P5_FULL),
+            ),
+        ] {
+            let all = ids(&neg);
+            let base = ids(&p1());
+            assert_eq!(all[..base.len()], base[..]);
+            assert_eq!(all[base.len()..], own.copied().collect::<Vec<_>>()[..]);
         }
         let neg = sink_early_close();
         let failing: Vec<&str> = neg
@@ -857,12 +918,25 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), "CONTRACT bare ok\n");
     }
 
+    /// How a test's panel run folder differs from a good P1 run's.
+    #[derive(Default)]
+    struct Folder<'a> {
+        /// The player kept the volumes at 1.0 (as P4's and P5's do).
+        left: bool,
+        /// `device.toml` after the run, as given.
+        after: Option<&'a str>,
+        /// The private judge's checks that failed.
+        failing: &'a [&'a str],
+        /// The player's executable is another than the declared one.
+        stale: bool,
+    }
+
     /// Writes a panel row's run folder as the runner writes it, from the
-    /// judge's good panel records in their full form, every file sealed;
-    /// with `volumes_left`, the player kept the volumes at 1.0 (as P5's
-    /// player does). Then the judge's verdicts, and the panel judge's
-    /// verdict lines with `failing` failed.
-    fn panel_folder(dir: &std::path::Path, row: &str, volumes_left: bool, failing: &[&str]) {
+    /// judge's good panel records in their full form, every file sealed, as
+    /// `how` says (a P5 folder declares its player's digest). Then the
+    /// judge's verdicts, and the panel judge's verdict lines for the row.
+    fn panel_folder(dir: &std::path::Path, row: &str, how: &Folder<'_>) {
+        let failing = how.failing;
         use serde_json::{Value, json};
 
         use super::super::launch::{
@@ -877,6 +951,15 @@ mod tests {
         let mut run = f.run.records.unwrap();
         let mut link = f.link.records.unwrap();
         let mut recorder = f.recorder.records.unwrap();
+        if row == "p4" {
+            // START alone.
+            for v in recorder
+                .iter_mut()
+                .filter(|v| v["t"] == "pad" && v["q"] == 1500)
+            {
+                *v = super::super::judge::tests::panel_pad(1500, 1 << 8, 2, true);
+            }
+        }
         run[0] = json!({
             "t": "start", "run": run_id, "row": row, "role": SINGLE, "build": "0123456789ab",
             "process": me, "commit": super::super::COMMIT, "tag": 0xABCD, "cut": 0x4000_0123,
@@ -884,12 +967,25 @@ mod tests {
         });
         let end = run.pop().unwrap();
         let hello = recs_line(&x.mode);
+        let (mutated, head) = ("5a".repeat(32), "4e".repeat(32));
+        let player_record = if row == "p5" {
+            let sha = if how.stale {
+                "3c".repeat(32)
+            } else {
+                mutated.clone()
+            };
+            json!({"t": "player", "q": 45, "path": "p5/t.exe", "sha256": sha, "declared": mutated,
+                   "runner_sha256": head, "commit": "nogit", "modified": 1})
+        } else {
+            json!({"t": "player", "q": 45, "path": "t.exe", "sha256": head, "declared": null,
+                   "runner_sha256": head, "commit": "nogit", "modified": 1})
+        };
         run.splice(
             1..1,
             [
                 json!({"t": "mode", "q": 20, "line": hello}),
                 json!({"t": "spawn", "q": 40, "name": "recorder", "process": rec}),
-                json!({"t": "player", "q": 45, "path": "t.exe", "sha256": "00", "commit": "c", "modified": 1}),
+                player_record,
             ],
         );
         let at = run.iter().position(|v| v["t"] == "call").unwrap();
@@ -923,8 +1019,11 @@ mod tests {
             json!({"t": "end", "q": 8, "problems": []}),
         ];
         let mut device_after = x.device_after.unwrap();
-        if volumes_left {
+        if how.left {
             device_after = x.device_before.clone().unwrap();
+        }
+        if let Some(a) = how.after {
+            device_after = a.as_bytes().to_vec();
         }
         let files: Vec<(&str, Vec<u8>)> = vec![
             (LINK, lines(&link).into_bytes()),
@@ -947,6 +1046,11 @@ mod tests {
         std::fs::write(dir.join(RUN), lines(&run)).unwrap();
         super::super::judge::judge(row, dir).unwrap();
         let sha = |p: &str| super::super::owner::digest(&dir.join(p)).unwrap();
+        let own: &[&str] = match row {
+            "p4" => &P4_ABSENT,
+            "p5" => &P5_FULL,
+            _ => &[],
+        };
         let panel: String = [
             ("panel.drawn-a", SHOT_A),
             ("panel.knobs", SHOT_A),
@@ -954,6 +1058,9 @@ mod tests {
             ("panel.numbers", SHOT_A),
             ("panel.closed-b", SHOT_B),
         ]
+        .into_iter()
+        .chain(own.iter().map(|id| (*id, SHOT_A)))
+        .collect::<Vec<_>>()
         .iter()
         .map(|(check, path)| {
             let outcome = if failing.contains(check) {
@@ -981,28 +1088,101 @@ mod tests {
             .to_owned()
     }
 
+    fn verdict(row: &str, how: &Folder<'_>) -> (bool, String) {
+        let dir = tempfile::tempdir().unwrap();
+        panel_folder(dir.path(), row, how);
+        let mut out = Vec::new();
+        let r = run(ROWS, row, dir.path(), &mut out);
+        (r.is_ok(), String::from_utf8(out).unwrap())
+    }
+
     /// A panel run folder matches its row's expectation through the
     /// checker: a good P1 run matches `p1`; P5's (the volumes left, the
-    /// knobs, graphs and numbers failed) matches `p5` and not `p1`; and P1's
-    /// matches no `p5`.
+    /// knobs, graphs and numbers failed, each slider at 100 %) matches `p5`
+    /// and not `p1`; and P1's matches no `p5`.
     #[test]
     fn a_panel_run_folder_matches_its_row() {
-        let verdict = |row: &str, left: bool, failing: &[&str]| {
-            let dir = tempfile::tempdir().unwrap();
-            panel_folder(dir.path(), row, left, failing);
-            let mut out = Vec::new();
-            let r = run(ROWS, row, dir.path(), &mut out);
-            (r.is_ok(), String::from_utf8(out).unwrap())
-        };
-        let (ok, out) = verdict("p1", false, &[]);
+        let (ok, out) = verdict("p1", &Folder::default());
         assert!(ok, "{out}");
         let p5 = ["panel.knobs", "panel.graphs", "panel.numbers"];
-        let (ok, out) = verdict("p5", true, &p5);
+        let left = Folder {
+            left: true,
+            failing: &p5,
+            ..Folder::default()
+        };
+        let (ok, out) = verdict("p5", &left);
         assert!(ok, "{out}");
-        let (ok, out) = verdict("p1", true, &p5);
+        let (ok, out) = verdict("p1", &left);
         assert!(!ok, "{out}");
         assert!(out.contains("p1.volumes"), "{out}");
-        let (ok, out) = verdict("p5", false, &[]);
+        let (ok, out) = verdict("p5", &Folder::default());
         assert!(!ok, "{out}");
+    }
+
+    /// A negative row matches only when it failed for its declared reason:
+    /// P4 and P5 with one volume moved, or P5's other two volumes kept but
+    /// its file refused; P5 against a stale player (not the declared
+    /// mutated build); P5 with one slider not at 100 % and P4 with one
+    /// slider drawn (the aggregate checks failing as declared either way)
+    /// each make the row a mismatch naming the check. The controls match.
+    #[test]
+    fn a_negative_row_fails_for_its_declared_reason_only() {
+        let p4 = [
+            "panel.drawn-a",
+            "panel.knobs",
+            "panel.graphs",
+            "panel.numbers",
+        ];
+        let p5 = ["panel.knobs", "panel.graphs", "panel.numbers"];
+        let moved = super::super::judge::tests::DEVICE_TOML
+            .replace("system_volume = 1.0", "system_volume = 0.25");
+        let refused = super::super::judge::tests::DEVICE_TOML.replace("version = 3", "version = 2");
+        for (row, failing) in [("p4", &p4[..]), ("p5", &p5[..])] {
+            let (ok, out) = verdict(
+                row,
+                &Folder {
+                    left: true,
+                    failing,
+                    ..Folder::default()
+                },
+            );
+            assert!(ok, "{row}: {out}");
+            for after in [&moved, &refused] {
+                let (ok, out) = verdict(
+                    row,
+                    &Folder {
+                        after: Some(after.as_str()),
+                        failing,
+                        ..Folder::default()
+                    },
+                );
+                assert!(!ok, "{row}: {out}");
+                assert!(out.contains(&format!("{row}.volumes-kept")), "{row}: {out}");
+            }
+        }
+        let (ok, out) = verdict(
+            "p5",
+            &Folder {
+                left: true,
+                failing: &p5,
+                stale: true,
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("p5.mutation-build"), "{out}");
+        for (row, base, slider) in [("p5", &p5[..], P5_FULL[1]), ("p4", &p4[..], P4_ABSENT[1])] {
+            let failing: Vec<&str> = base.iter().copied().chain([slider]).collect();
+            let (ok, out) = verdict(
+                row,
+                &Folder {
+                    left: true,
+                    failing: &failing,
+                    ..Folder::default()
+                },
+            );
+            assert!(!ok, "{row}: {out}");
+            assert!(out.contains(slider), "{row}: {out}");
+        }
     }
 }

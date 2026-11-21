@@ -5,7 +5,8 @@
 //! lease was granted), taken every 10 ms for up to 1 s; then the link's
 //! end within its bound, the recorder's end, and the close. Without that
 //! evidence, or on a `hello` of another token, the run fails and recovers
-//! with its sink open and in front: `release` and `hello` again on a
+//! with its sink open: it asks for the sink in front and checks it is
+//! (going on if Windows refuses), then `release` and `hello` again on a
 //! reopened connection of the bound location, then the 1200-baud touch,
 //! whose reboot the recorder must see as the bound handles' removal; the
 //! sink closes only on that removal, however long it takes. Every step's
@@ -79,6 +80,12 @@ pub trait Recorder {
 
 /// The run's windows: the sink, and the player a panel row started.
 pub trait Window {
+    /// Asks for the sink in front and checks that it is.
+    ///
+    /// # Errors
+    ///
+    /// Windows kept another window in front.
+    fn front(&mut self) -> Result<(), String>;
     /// Closes it.
     ///
     /// # Errors
@@ -187,7 +194,7 @@ fn evidence(line: &str, token: Option<Token>, granted: bool) -> Result<bool, Str
 pub fn end(r: Run<'_>) -> Vec<String> {
     let mut errors = Vec::new();
     r.link.stop_holds(r.cause);
-    let sink = r.sink;
+    let mut sink = r.sink;
     if let Err(e) = r.link.released(QUIET_WAIT) {
         errors.push(format!("the release: {e}"));
     }
@@ -216,7 +223,14 @@ pub fn end(r: Run<'_>) -> Vec<String> {
         errors.push(other.unwrap_or_else(|| {
             format!("no `hello` of the run's token read `quiet 1` within {QUIET_WAIT:?}")
         }));
-        recover(r.link, r.recorder, r.clock, r.record, &mut errors);
+        recover(
+            r.link,
+            r.recorder,
+            &mut sink,
+            r.clock,
+            r.record,
+            &mut errors,
+        );
     }
     if let Err(e) = r.recorder.stop() {
         errors.push(format!("the recorder's end: {e}"));
@@ -234,8 +248,11 @@ fn close(s: &mut dyn Window, record: &mut dyn FnMut(Value), errors: &mut Vec<Str
     }
 }
 
-/// Recovery, with the sink open: `release` and `hello` on a reopened
-/// connection, the 1200-baud touch, then the device's input interfaces
+/// Recovery, with the sink open and holds stopped: the sink asked in front
+/// and checked there (a refusal is recorded and kept, and recovery goes
+/// on, since the device's disarm does not need it), `release` and `hello`
+/// on a reopened connection, the 1200-baud touch, then the device's input
+/// interfaces
 /// gone from the bound location, waited for however long it takes. Only
 /// an enumeration that succeeded and found neither interface is the
 /// removal; a failed one is recorded (each new failure once) and looked
@@ -243,11 +260,22 @@ fn close(s: &mut dyn Window, record: &mut dyn FnMut(Value), errors: &mut Vec<Str
 fn recover(
     link: &mut dyn Link,
     rec: &mut dyn Recorder,
+    sink: &mut Option<&mut dyn Window>,
     clock: &dyn Clock,
     record: &mut dyn FnMut(Value),
     errors: &mut Vec<String>,
 ) {
     let mut step = |what: String| record(json!({ "t": "recovery", "what": what }));
+    if let Some(s) = sink.as_mut() {
+        match s.front() {
+            Ok(()) => step("the sink in front".into()),
+            Err(e) => {
+                let msg = format!("the sink could not be brought in front: {e}");
+                step(msg.clone());
+                errors.push(msg);
+            }
+        }
+    }
     match link.reopen_release() {
         Ok(line) => step(format!("reopened: `release`, then `hello` read `{line}`")),
         Err(e) => step(format!("reopening failed: {e}")),
@@ -392,9 +420,14 @@ mod tests {
         }
     }
 
-    struct W(Log);
+    /// A stand-in sink: `front` answers as given.
+    struct W(Log, Result<(), String>);
 
     impl Window for W {
+        fn front(&mut self) -> Result<(), String> {
+            self.0.borrow_mut().push("front".into());
+            self.1.clone()
+        }
         fn close(&mut self) -> Result<(), String> {
             self.0.borrow_mut().push("close".into());
             Ok(())
@@ -408,6 +441,8 @@ mod tests {
         looks: Vec<Result<bool, String>>,
         stop: Result<(), String>,
         granted: bool,
+        /// What asking for the sink in front gives.
+        front: Result<(), String>,
     }
 
     /// Looks that find the interfaces `n` times, then their removal.
@@ -425,6 +460,7 @@ mod tests {
                 looks: removed_after(0),
                 stop: Ok(()),
                 granted: true,
+                front: Ok(()),
             }
         }
     }
@@ -445,7 +481,7 @@ mod tests {
             looks: c.looks,
             stop: c.stop,
         };
-        let mut sink = W(Rc::clone(&log));
+        let mut sink = W(Rc::clone(&log), c.front);
         let clock = Fake::default();
         let records = RefCell::new(Vec::new());
         let mut record = |v: Value| {
@@ -633,11 +669,53 @@ mod tests {
             .filter(|v| v["t"] == "recovery")
             .map(|v| v["what"].as_str().unwrap())
             .collect();
-        assert_eq!(recovery.len(), 4, "{recovery:?}");
-        assert!(recovery[0].starts_with("reopened"));
-        assert_eq!(recovery[1], "the 1200-baud touch");
-        assert!(recovery[2].contains("stays open"));
-        assert!(recovery[3].contains("gone from the bound location"));
+        assert_eq!(recovery.len(), 5, "{recovery:?}");
+        assert_eq!(recovery[0], "the sink in front");
+        assert!(recovery[1].starts_with("reopened"));
+        assert_eq!(recovery[2], "the 1200-baud touch");
+        assert!(recovery[3].contains("stays open"));
+        assert!(recovery[4].contains("gone from the bound location"));
+    }
+
+    /// Recovery first asks for the sink in front, after holds stopped and
+    /// before the device is reopened; when Windows refuses, the refusal is
+    /// recorded and kept, and the disarm, the touch and the wait for the
+    /// removal still follow. A run with its evidence asks for nothing.
+    #[test]
+    fn recovery_brings_the_sink_in_front_first() {
+        for front in [Ok(()), Err("another window kept the foreground".to_owned())] {
+            let (errors, steps, records) = run(Case {
+                hellos: vec![hello(OTHER, true, "released")],
+                looks: removed_after(2),
+                front: front.clone(),
+                ..Case::default()
+            });
+            assert!(at(&steps, "stop end") < at(&steps, "front"), "{steps:?}");
+            assert!(at(&steps, "front") < at(&steps, "reopen"), "{steps:?}");
+            assert!(at(&steps, "reopen") < at(&steps, "touch"), "{steps:?}");
+            assert!(at(&steps, "touch") < at(&steps, "removed"), "{steps:?}");
+            assert!(at(&steps, "removed") < at(&steps, "close"), "{steps:?}");
+            let first = records.iter().find(|v| v["t"] == "recovery").unwrap();
+            let refused = errors.iter().any(|e| e.contains("brought in front"));
+            match front {
+                Ok(()) => {
+                    assert_eq!(first["what"], "the sink in front");
+                    assert!(!refused, "{errors:?}");
+                }
+                Err(_) => {
+                    assert!(
+                        first["what"]
+                            .as_str()
+                            .unwrap()
+                            .contains("another window kept the foreground"),
+                        "{first}"
+                    );
+                    assert!(refused, "{errors:?}");
+                }
+            }
+        }
+        let (_, steps, _) = run(Case::default());
+        assert!(!steps.contains(&"front".to_owned()), "{steps:?}");
     }
 
     /// A stand-in player: it ends by itself with `code` after `after`, or

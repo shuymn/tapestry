@@ -41,7 +41,8 @@ const USAGE: &str = "usage: tapestry test-device devices [--out <json>] \
 | trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe] \
 | listen --out <jsonl> --port <location> [--run <id>] [--for <ms>] \
 | run <row> (--out <dir> | --set <dir> --role <role>) --build <id> --port <location> --monitor <name> \
-[--player <exe> --data <dir> --library <dir> --skin <dir> --skin-entry <file>] [--kill-barrier] \
+[--player <exe> --data <dir> --library <dir> --skin <dir> --skin-entry <file> [--player-sha256 <hex>]] \
+[--kill-barrier] \
 | judge <row> <dir> | check <row> <dir> | commit";
 
 /// A `test-device` command.
@@ -111,6 +112,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     let mut library = None;
     let mut skin = None;
     let mut skin_entry = None;
+    let mut player_sha256 = None;
     let mut kill_barrier = false;
     while let Some(arg) = p.next()? {
         match (cmd.as_str(), arg) {
@@ -123,6 +125,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
             ("run", Arg::Long("library")) => library = Some(PathBuf::from(p.value()?)),
             ("run", Arg::Long("skin")) => skin = Some(PathBuf::from(p.value()?)),
             ("run", Arg::Long("skin-entry")) => skin_entry = Some(text(p)?),
+            ("run", Arg::Long("player-sha256")) => player_sha256 = Some(text(p)?),
             ("run", Arg::Long("kill-barrier")) => kill_barrier = true,
             ("devices" | "trace" | "listen" | "run", Arg::Long("out")) => {
                 out = Some(PathBuf::from(p.value()?));
@@ -210,6 +213,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
                 (None, None, None, None, None) => None,
                 _ => return Err(usage()),
             },
+            player_sha256,
             kill_barrier,
         })),
         "listen" => TestDevice::Listen(listen::Args {
@@ -398,6 +402,13 @@ mod tests {
             })
         );
         assert!(!a.kill_barrier);
+        assert_eq!(a.player_sha256, None);
+        let mut declared = player.to_vec();
+        declared.extend(["--player-sha256", "ab"]);
+        let Ok(TestDevice::Run(a)) = run(&declared) else {
+            panic!("a panel run with its player's digest")
+        };
+        assert_eq!(a.player_sha256.as_deref(), Some("ab"));
         // Every path of the player, or none.
         assert_eq!(run(&player[..8]).unwrap_err(), usage());
         let Ok(TestDevice::Run(a)) = run(&["--kill-barrier"]) else {

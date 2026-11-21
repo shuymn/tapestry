@@ -897,7 +897,7 @@ mod tests {
         let size = u32::try_from(size_of::<RAWINPUTDEVICE>()).unwrap();
         // SAFETY: registrations for this thread's window.
         unsafe { RegisterRawInputDevices(&registrations(hwnd), size) }.unwrap();
-        let mut note = |_: u32, _: &str| {};
+        let mut note = |_: u32, _: &str, _: (i32, i32)| {};
         let mut desk = Real {
             monitor: String::new(),
             note: &mut note,

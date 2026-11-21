@@ -250,8 +250,8 @@ pub enum Run {
     /// recorded it: the mode the run's reports come in.
     Mode(RunLine),
     /// A shot captured from the run's window: its file in the run's folder,
-    /// sealed once written.
-    Shot(RunNote),
+    /// sealed once written, and whether the captured area was the window's.
+    Shot(RunShot),
     /// The kill barrier: the run waits here, holding, for its outer to end
     /// it.
     Barrier(RunQ),
@@ -322,13 +322,28 @@ pub struct RunQ {
     pub q: i64,
 }
 
-/// A `SendInput` call: its 32-bit tag and what it sends (`move`, `click`).
+/// A `SendInput` call: its 32-bit tag, what it sends (`move`, `click`,
+/// `calibrate`) and the run's window's client point it aims at.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunCall {
     pub q: i64,
     pub tag: u32,
     pub what: String,
+    pub point: [i32; 2],
+}
+
+/// A shot: its file, and the evidence that the screen's pixels it copied
+/// were the run's window's: `owned` when the run's window was in front with
+/// its client area unchanged and no other window above it over that area,
+/// before and after the copy; else `doubts` says what was seen.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunShot {
+    pub q: i64,
+    pub what: String,
+    pub owned: bool,
+    pub doubts: Vec<String>,
 }
 
 /// A line the runner observed, with its host counter.
@@ -354,6 +369,10 @@ pub struct RunPlayer {
     pub q: i64,
     pub path: String,
     pub sha256: String,
+    /// The sha256 the row declared for it (P5's mutated player).
+    pub declared: Option<String>,
+    /// The runner's own executable's sha256.
+    pub runner_sha256: String,
     /// What `<exe> test-device commit` printed.
     pub commit: String,
     /// The file's last write, as the system's FILETIME.
@@ -417,7 +436,8 @@ impl Kinds for Run {
             Self::Call(r) => Some(r.q),
             Self::Quiet(r) | Self::Mode(r) => Some(r.q),
             Self::Held(r) | Self::Barrier(r) => Some(r.q),
-            Self::Stop(r) | Self::Recovery(r) | Self::Shot(r) => Some(r.q),
+            Self::Stop(r) | Self::Recovery(r) => Some(r.q),
+            Self::Shot(r) => Some(r.q),
             Self::Player(p) => Some(p.q),
             Self::Exit(e) => Some(e.q),
             Self::Start(_) | Self::Seal(_) | Self::End(_) => None,
