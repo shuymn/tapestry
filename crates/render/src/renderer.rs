@@ -589,6 +589,15 @@ pub enum LoadingOn {
     Staged(PreparedToken),
 }
 
+/// Development builds: whether a frame drawn `on` is the selection screen's,
+/// the only frames a present tap may copy ([`crate::PresentTap::wanted`]):
+/// its committed slot, `slot` saying the slot is there (a missing slot
+/// draws play's resources).
+#[cfg(feature = "dev-tools")]
+fn selection_frame(on: Draw, slot: bool) -> bool {
+    matches!(on, Draw::Slot(i) if slot && Renderer::screen(ScreenKind::Selection) == Some(i))
+}
+
 /// Which resources a frame is drawn from ([`Renderer::draw_on`]).
 #[derive(Clone, Copy, Debug)]
 enum Draw {
@@ -9385,11 +9394,21 @@ impl Renderer {
         }
         // A frame the present tap wants: its swap chain image copied after
         // every pass drew into it, in its own command buffer, before its
-        // present.
+        // present. Only a selection frame is copied (the copy allocates);
+        // the tap is told every frame's kind, so it refuses a request that
+        // another frame meets.
+        #[cfg(feature = "dev-tools")]
+        let selection = selection_frame(
+            on,
+            Self::screen(ScreenKind::Selection)
+                .and_then(|i| self.screens.get(i))
+                .is_some_and(Option::is_some),
+        );
         #[cfg(feature = "dev-tools")]
         let tapped = match (&frame, &self.present_tap) {
-            (Some(t), Some(tap)) if tap.wanted() => Some((
+            (Some(t), Some(tap)) if tap.wanted(selection) && selection => Some((
                 Arc::clone(tap),
+                self.chain().cloned(),
                 crate::present_tap::record(
                     self.gpu.device(),
                     &mut encoder,
@@ -9423,14 +9442,26 @@ impl Renderer {
         let mut out = timing(cpu, FrameOutcome::Shown);
         match frame {
             Some(t) => {
+                // A tapped frame's present is read on the chain it goes to,
+                // before and after: a count that does not advance is a
+                // present that did not happen.
+                #[cfg(feature = "dev-tools")]
+                let before = tapped.as_ref().and_then(|(_, chain, _)| {
+                    // SAFETY: a plain query of the live swap chain.
+                    chain
+                        .as_ref()
+                        .and_then(|c| unsafe { c.GetLastPresentCount() }.ok())
+                });
                 self.gpu.queue().present(t);
                 out.present_count = self.chain().and_then(|c| {
                     // SAFETY: a plain query of the live swap chain.
                     unsafe { c.GetLastPresentCount() }.ok()
                 });
                 #[cfg(feature = "dev-tools")]
-                if let Some((tap, copy)) = tapped {
-                    tap.presented(out.present_count);
+                if let Some((tap, chain, copy)) = tapped {
+                    // SAFETY: a plain query of the live swap chain.
+                    let after = chain.and_then(|c| unsafe { c.GetLastPresentCount() }.ok());
+                    tap.presented(before, after);
                     tap.deliver(
                         copy.and_then(|c| {
                             crate::present_tap::read(self.gpu.device(), &c, submitted)
@@ -10200,6 +10231,23 @@ mod tests {
         Acquisition, AtlasPages, ChartOutcome, ChartTarget, ClipTable, FrameOutcome, RenderError,
         Renderer, Target, acquisition, letterbox, offscreen_skip,
     };
+
+    /// A present tap may copy only the selection screen's frames: its own
+    /// slot while the slot is there, never play's, a pending play
+    /// staging's, another screen's slot, or a selection slot that is gone
+    /// (whose frame draws play's resources).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn only_a_selection_frame_is_a_tap_s() {
+        use super::{Draw, selection_frame};
+        let sel = Renderer::screen(skin_model::ScreenKind::Selection).unwrap();
+        let other = Renderer::screen(skin_model::ScreenKind::Result).unwrap();
+        assert!(selection_frame(Draw::Slot(sel), true));
+        assert!(!selection_frame(Draw::Slot(sel), false));
+        assert!(!selection_frame(Draw::Slot(other), true));
+        assert!(!selection_frame(Draw::Play, true));
+        assert!(!selection_frame(Draw::Pending, true));
+    }
     use crate::pace::Pacer;
     use crate::text::MenuText;
     use crate::{AdapterChoice, Blend, SkinError, Sprite, UploadError, solid_uv};

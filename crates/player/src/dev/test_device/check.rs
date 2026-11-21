@@ -313,23 +313,23 @@ fn sink_kill() -> Expectation {
     }
 }
 
-/// The private panel judge's per-slider checks of P4 (no part of the
-/// slider drawn: knob, graph or number) and of P5 (the slider drawn at
-/// 100 %: the knob at the travel's end, the graph lit through it, the
-/// number reading 100), which show each negative fails for its declared
-/// reason at every slider.
-pub const P4_ABSENT: [&str; 3] = ["panel.absent-17", "panel.absent-18", "panel.absent-19"];
-pub const P5_FULL: [&str; 3] = ["panel.full-17", "panel.full-18", "panel.full-19"];
-/// P4's positive check of its declared cause: shot A shows panel 1 (the
-/// panel START alone opens), so panel 3's absence is not the absence of
-/// any panel.
-pub const P4_PANEL_1: [&str; 1] = ["panel.panel1-a"];
+/// The private panel judge's checks, each a shot compared with a pinned
+/// reference frame by exact equality outside the reference's declared mask:
+/// shot A with P1's (panel 3 open, the sliders at their targets), shot B
+/// with the closed screen's.
+pub const FRAME_A: &str = "panel.frame-a";
+pub const FRAME_B: &str = "panel.frame-b";
+/// A negative's own declared frame, which must pass: shot A equal to the
+/// row's reference (P4: panel 1 open, nothing of panel 3; P5: panel 3 open
+/// with every slider at 100 %), so it fails [`FRAME_A`] for its declared
+/// reason and no other.
+pub const DECLARED_A: &str = "panel.declared-a";
 
 /// A panel row (P1, and its negatives P4 and P5): `failing` the checks
 /// that must fail, and the negative's mutation and trigger. A negative
 /// also has checks of its own that must pass: the judge's (its volumes
 /// all kept at 1.0; P5's player the declared mutated build) and the
-/// private judge's per-slider ones ([`P4_ABSENT`], [`P5_FULL`]).
+/// private judge's [`DECLARED_A`].
 fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Expectation {
     use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE};
     use super::run::{MODE_LINK, SHOT_A, SHOT_B};
@@ -441,11 +441,8 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[run, link],
                 &[ev(SINGLE, RUN, "close"), ev(SINGLE, LINK, "fence")],
             ),
-            private("panel.drawn-a", &[run, rec, f(SHOT_A)]),
-            private("panel.knobs", &[run, rec, f(SHOT_A)]),
-            private("panel.graphs", &[run, rec, f(SHOT_A)]),
-            private("panel.numbers", &[run, rec, f(SHOT_A)]),
-            private("panel.closed-b", &[run, rec, f(SHOT_B)]),
+            private(FRAME_A, &[run, rec, f(SHOT_A)]),
+            private(FRAME_B, &[run, rec, f(SHOT_B)]),
         ]
         .into_iter()
         .chain(match row {
@@ -455,8 +452,7 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[ev(SINGLE, RUN, "exit")],
             )]
             .into_iter()
-            .chain(P4_PANEL_1.map(|id| private(id, &[run, rec, f(SHOT_A)])))
-            .chain(P4_ABSENT.map(|id| private(id, &[run, rec, f(SHOT_A)])))
+            .chain([private(DECLARED_A, &[run, rec, f(SHOT_A)])])
             .collect(),
             "p5" => [
                 judge(
@@ -467,7 +463,7 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 judge("p5.mutation-build", &[run], &[ev(SINGLE, RUN, "player")]),
             ]
             .into_iter()
-            .chain(P5_FULL.map(|id| private(id, &[run, rec, f(SHOT_A)])))
+            .chain([private(DECLARED_A, &[run, rec, f(SHOT_A)])])
             .collect(),
             _ => Vec::new(),
         })
@@ -487,16 +483,10 @@ fn p1() -> Expectation {
 fn p4() -> Expectation {
     panel(
         "p4",
-        &[
-            "p1.volumes",
-            "panel.drawn-a",
-            "panel.knobs",
-            "panel.graphs",
-            "panel.numbers",
-        ],
+        &["p1.volumes", FRAME_A],
         Some(Negative {
             mutation: "SELECT is never held: START alone opens panel 1",
-            trigger: "panel.drawn-a",
+            trigger: FRAME_A,
         }),
     )
 }
@@ -506,7 +496,7 @@ fn p4() -> Expectation {
 fn p5() -> Expectation {
     panel(
         "p5",
-        &["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"],
+        &["p1.volumes", FRAME_A],
         Some(Negative {
             mutation: "the player's pointer volume arm drops the value (a local build)",
             trigger: "p1.volumes",
@@ -634,15 +624,20 @@ fn p1_kill() -> Expectation {
 /// run stream holds exactly one `shot` record of each shot, naming the
 /// player's process (its `spawn` record) as the shot's maker and its pid as
 /// the pipe's client, at the client size the rows run at, its frame
-/// acquired after the request and presented after its acquisition. Shot A
-/// is requested after the run's last call (the last target click), and its
-/// frame acquired after the recorder's first report of the row's buttons
+/// acquired after the request and presented after its acquisition, its
+/// present advancing the swap chain's present count. Shot A is requested
+/// after the recorder's button-up of the run's last click (the mouse report
+/// tagged with the last `click` call's tag: the click landed, not only its
+/// call logged), and its frame acquired after the recorder's first report
+/// of the row's buttons
 /// all held and presented before its next report that releases any of
 /// them; shot B is requested and its frame acquired after the recorder's
 /// first neutral report (no button) after that, and presented before the
 /// run's end begins (its `stop`). Each mismatch, named; a stream that does
 /// not read is the contract's to name.
 fn shots_bound(dir: &Path, row: &str) -> Vec<String> {
+    /// A recorder mouse report's left-button release edge.
+    const LEFT_UP: u64 = 2;
     use super::run::{SHOT_A, SHOT_B, pad_buttons};
     let files = super::judge::Files::read(dir);
     let (Ok(records), Ok(reports)) = (
@@ -686,11 +681,23 @@ fn shots_bound(dir: &Path, row: &str) -> Vec<String> {
     let held_q = held.and_then(|h| pads.get(h)).map(|&(q, _)| q);
     let release_q = after(&|b| b & mask != mask);
     let neutral_q = after(&|b| b == 0);
-    let last_call = records
+    // The recorder's button-ups of the run's last click.
+    let last_click = records
         .iter()
-        .filter(|v| v["t"] == "call")
-        .filter_map(|v| v["q"].as_i64())
+        .filter(|v| v["t"] == "call" && v["what"] == "click")
+        .filter_map(|v| Some((v["q"].as_i64()?, v["tag"].as_u64()?)))
         .max();
+    let last_ups: Vec<i64> = last_click.map_or_else(Vec::new, |(_, tag)| {
+        reports
+            .iter()
+            .filter(|v| {
+                v["t"] == "mouse"
+                    && v["extra"].as_u64() == Some(tag)
+                    && v["buttons"].as_u64().is_some_and(|b| b & LEFT_UP != 0)
+            })
+            .filter_map(|v| v["q"].as_i64())
+            .collect()
+    });
     let stop_q = records
         .iter()
         .find(|v| v["t"] == "stop")
@@ -728,6 +735,15 @@ fn shots_bound(dir: &Path, row: &str) -> Vec<String> {
             out.push(format!("{name}'s record has no request or frame counters"));
             continue;
         };
+        let counts = (
+            shot["frame"]["previous"].as_u64(),
+            shot["frame"]["present"].as_u64(),
+        );
+        if !matches!(counts, (Some(p), Some(c)) if c > p) {
+            out.push(format!(
+                "{name}'s present did not advance the swap chain's count: {counts:?}"
+            ));
+        }
         let mut order = |ok: bool, what: String| {
             if !ok {
                 out.push(format!("{name} ({phase}): {what}"));
@@ -743,8 +759,10 @@ fn shots_bound(dir: &Path, row: &str) -> Vec<String> {
         );
         if name == SHOT_A {
             order(
-                last_call.is_some_and(|c| requested > c),
-                format!("requested at {requested}, not after the last click at {last_call:?}"),
+                matches!(last_ups[..], [up] if requested > up),
+                format!(
+                    "requested at {requested}, not after the last click's one recorded button-up {last_ups:?}"
+                ),
             );
             order(
                 held_q.is_some_and(|h| acquired > h),
@@ -870,40 +888,16 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(failing(&p1()).is_empty());
-        assert_eq!(
-            failing(&p4()),
-            [
-                "p1.volumes",
-                "panel.drawn-a",
-                "panel.knobs",
-                "panel.graphs",
-                "panel.numbers"
-            ]
-        );
-        assert_eq!(
-            failing(&p5()),
-            ["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"]
-        );
+        assert_eq!(failing(&p4()), ["p1.volumes", FRAME_A]);
+        assert_eq!(failing(&p5()), ["p1.volumes", FRAME_A]);
         assert!(failing(&p1_kill()).is_empty());
         // A negative's checks are its positive row's, in the same order,
         // then its own, which pass.
         for (neg, own) in [
-            (
-                p4(),
-                ["p4.volumes-kept"]
-                    .iter()
-                    .chain(&P4_PANEL_1)
-                    .chain(&P4_ABSENT)
-                    .copied()
-                    .collect::<Vec<_>>(),
-            ),
+            (p4(), vec!["p4.volumes-kept", DECLARED_A]),
             (
                 p5(),
-                ["p5.volumes-kept", "p5.mutation-build"]
-                    .iter()
-                    .chain(&P5_FULL)
-                    .copied()
-                    .collect(),
+                vec!["p5.volumes-kept", "p5.mutation-build", DECLARED_A],
             ),
         ] {
             let all = ids(&neg);
@@ -1096,6 +1090,8 @@ mod tests {
         /// An edit of the run's records before they are written (the
         /// shot records).
         shots: Option<fn(&mut Vec<serde_json::Value>)>,
+        /// An edit of the recorder's records before they are written.
+        reports: Option<fn(&mut Vec<serde_json::Value>)>,
         /// The panel verdicts leave the run's stream out of their inputs.
         unbound: bool,
     }
@@ -1176,6 +1172,9 @@ mod tests {
             "t": "ready", "q": 50, "run": run_id, "process": rec, "window": 9,
             "location": "L", "keyboard": 1, "pad": 2,
         });
+        if let Some(edit) = how.reports {
+            edit(&mut recorder);
+        }
         let lines =
             |records: &[Value]| -> String { records.iter().map(|v| format!("{v}\n")).collect() };
         let mode = [
@@ -1251,27 +1250,11 @@ mod tests {
     /// written out as that judge names them.
     fn panel_judge_checks(row: &str) -> Vec<(&'static str, &'static str)> {
         let a = "shot-a.png";
-        let mut out = vec![
-            ("panel.drawn-a", a),
-            ("panel.knobs", a),
-            ("panel.graphs", a),
-            ("panel.numbers", a),
-            ("panel.closed-b", "shot-b.png"),
-        ];
-        match row {
-            "p4" => out.extend([
-                ("panel.panel1-a", a),
-                ("panel.absent-17", a),
-                ("panel.absent-18", a),
-                ("panel.absent-19", a),
-            ]),
-            "p5" => out.extend([
-                ("panel.full-17", a),
-                ("panel.full-18", a),
-                ("panel.full-19", a),
-            ]),
-            _ => {}
+        let mut out = vec![("panel.frame-a", a)];
+        if matches!(row, "p4" | "p5") {
+            out.push(("panel.declared-a", a));
         }
+        out.push(("panel.frame-b", "shot-b.png"));
         out
     }
 
@@ -1293,8 +1276,11 @@ mod tests {
     /// Each panel verdict reads the run's and the recorder's streams and
     /// its shot, and each shot is the player's frame of its phase: a folder
     /// whose shot record names another process or pipe client, another
-    /// size, or has no record of a shot or two of it, is a mismatch naming that shot; so is a shot A requested before the
-    /// last click, acquired before the buttons were held or presented after
+    /// size, or has no record of a shot or two of it, is a mismatch naming
+    /// that shot; so is a present that did not advance the swap chain's
+    /// count, a shot A requested before the last click's recorded
+    /// button-up (the call logged before the request, its click recorded
+    /// after it: a late pair), acquired before the buttons were held or presented after
     /// a release, a shot B requested or acquired before the neutral report
     /// or presented after the run's end began, and a frame acquired before
     /// its request or presented before its acquisition. A panel verdict
@@ -1309,10 +1295,11 @@ mod tests {
         fn at(r: &mut [serde_json::Value], shot: &str) -> usize {
             r.iter().position(|v| v["what"] == shot).unwrap()
         }
-        // The good folder: calls up to q 330, held 1500, shot A requested
+        // The good folder: calls up to q 330, the last click's button-up
+        // recorded at 246, held 1500, shot A requested
         // 2400 (frame 2410-2420), the neutral report 3000, shot B requested
         // 3400 (frame 3410-3420), the end's stop 5000.
-        let edits: [(&str, &str, Edit); 13] = [
+        let edits: [(&str, &str, Edit); 15] = [
             ("another process", SHOT_A, |r| {
                 let i = at(r, SHOT_A);
                 r[i]["process"]["created"] = serde_json::json!(81);
@@ -1331,11 +1318,12 @@ mod tests {
                 let again = r[i].clone();
                 r.insert(i, again);
             }),
-            // Requested before the last click (q 330), its frame taken after
-            // the buttons were held: only the last-click order fails.
-            ("A before the last click", SHOT_A, |r| {
+            // Requested before the last click's recorded button-up (q 246),
+            // its frame taken after the buttons were held: only the
+            // last-click order fails.
+            ("A before the last click's button-up", SHOT_A, |r| {
                 let i = at(r, SHOT_A);
-                r[i]["requested"] = serde_json::json!(320);
+                r[i]["requested"] = serde_json::json!(245);
             }),
             ("A before the buttons held", SHOT_A, |r| {
                 let i = at(r, SHOT_A);
@@ -1354,8 +1342,9 @@ mod tests {
             ("B taken while held (stale)", SHOT_B, |r| {
                 let i = at(r, SHOT_B);
                 r[i]["requested"] = serde_json::json!(2430);
-                r[i]["frame"] =
-                    serde_json::json!({"present": 31, "acquired": 2440, "presented": 2450});
+                r[i]["frame"] = serde_json::json!(
+                    {"previous": 30, "present": 31, "acquired": 2440, "presented": 2450}
+                );
             }),
             ("B presented after the end began", SHOT_B, |r| {
                 let i = at(r, SHOT_B);
@@ -1368,6 +1357,14 @@ mod tests {
             ("a frame presented before its acquisition", SHOT_A, |r| {
                 let i = at(r, SHOT_A);
                 r[i]["frame"]["presented"] = serde_json::json!(2409);
+            }),
+            ("a present that did not advance", SHOT_B, |r| {
+                let i = at(r, SHOT_B);
+                r[i]["frame"]["previous"] = serde_json::json!(80);
+            }),
+            ("a present count that went back", SHOT_A, |r| {
+                let i = at(r, SHOT_A);
+                r[i]["frame"]["previous"] = serde_json::json!(31);
             }),
         ];
         for (what, shot, edit) in edits {
@@ -1386,6 +1383,29 @@ mod tests {
                 "{what}: {out}"
             );
         }
+        // A late pair: the last click's press and release recorded after
+        // shot A's request (2400), its call logged long before it.
+        let (ok, out) = verdict(
+            "p1",
+            &Folder {
+                reports: Some(|r| {
+                    let tag = r
+                        .iter()
+                        .filter(|v| v["t"] == "mouse")
+                        .filter_map(|v| v["extra"].as_u64())
+                        .max()
+                        .unwrap();
+                    // The press at 2401, its release at 2402.
+                    for v in r.iter_mut().filter(|v| v["extra"].as_u64() == Some(tag)) {
+                        v["q"] = serde_json::json!(2400 + v["buttons"].as_i64().unwrap());
+                    }
+                    r.sort_by_key(|v| v["q"].as_i64());
+                }),
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("last click's one recorded button-up"), "{out}");
         // The runner's record of the neutral report it waited for.
         let (ok, out) = verdict(
             "p1",
@@ -1408,14 +1428,14 @@ mod tests {
     }
 
     /// A panel run folder matches its row's expectation through the
-    /// checker: a good P1 run matches `p1`; P5's (the volumes left, the
-    /// knobs, graphs and numbers failed, each slider at 100 %) matches `p5`
-    /// and not `p1`; and P1's matches no `p5`.
+    /// checker: a good P1 run matches `p1`; P5's (the volumes left, shot A
+    /// not P1's frame but its own declared one, every slider at 100 %)
+    /// matches `p5` and not `p1`; and P1's matches no `p5`.
     #[test]
     fn a_panel_run_folder_matches_its_row() {
         let (ok, out) = verdict("p1", &Folder::default());
         assert!(ok, "{out}");
-        let p5 = ["panel.knobs", "panel.graphs", "panel.numbers"];
+        let p5 = [FRAME_A];
         let left = Folder {
             left: true,
             failing: &p5,
@@ -1433,18 +1453,13 @@ mod tests {
     /// A negative row matches only when it failed for its declared reason:
     /// P4 and P5 with one volume moved, or P5's other two volumes kept but
     /// its file refused; P5 against a stale player (not the declared
-    /// mutated build); P5 with one slider not at 100 % and P4 with one
-    /// slider drawn (the aggregate checks failing as declared either way)
-    /// each make the row a mismatch naming the check. The controls match.
+    /// mutated build); P4 and P5 whose shot A is not their own declared
+    /// frame (P1's frame not matched either way) each make the row a
+    /// mismatch naming the check. The controls match.
     #[test]
     fn a_negative_row_fails_for_its_declared_reason_only() {
-        let p4 = [
-            "panel.drawn-a",
-            "panel.knobs",
-            "panel.graphs",
-            "panel.numbers",
-        ];
-        let p5 = ["panel.knobs", "panel.graphs", "panel.numbers"];
+        let p4 = [FRAME_A];
+        let p5 = [FRAME_A];
         let moved = super::super::judge::tests::DEVICE_TOML
             .replace("system_volume = 1.0", "system_volume = 0.25");
         let refused = super::super::judge::tests::DEVICE_TOML.replace("version = 3", "version = 2");
@@ -1482,32 +1497,20 @@ mod tests {
         );
         assert!(!ok, "{out}");
         assert!(out.contains("p5.mutation-build"), "{out}");
-        // P4 with no panel drawn at all in shot A (panel 1 not drawn
-        // either): the panel-3 checks fail as declared, but the row's own
-        // panel-1 check fails, so START alone did not open panel 1.
-        let failing: Vec<&str> = p4.iter().copied().chain(P4_PANEL_1).collect();
-        let (ok, out) = verdict(
-            "p4",
-            &Folder {
-                left: true,
-                failing: &failing,
-                ..Folder::default()
-            },
-        );
-        assert!(!ok, "{out}");
-        assert!(out.contains(P4_PANEL_1[0]), "{out}");
-        for (row, base, slider) in [("p5", &p5[..], P5_FULL[1]), ("p4", &p4[..], P4_ABSENT[1])] {
-            let failing: Vec<&str> = base.iter().copied().chain([slider]).collect();
+        // Shot A neither P1's frame nor the row's own (P4 with no panel
+        // drawn; P5 with a slider not at 100 %): the row's declared frame
+        // fails, so it did not fail for its declared reason.
+        for row in ["p4", "p5"] {
             let (ok, out) = verdict(
                 row,
                 &Folder {
                     left: true,
-                    failing: &failing,
+                    failing: &[FRAME_A, DECLARED_A],
                     ..Folder::default()
                 },
             );
             assert!(!ok, "{row}: {out}");
-            assert!(out.contains(slider), "{row}: {out}");
+            assert!(out.contains(DECLARED_A), "{row}: {out}");
         }
     }
 }

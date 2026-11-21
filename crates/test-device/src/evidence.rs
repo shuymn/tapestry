@@ -367,12 +367,14 @@ pub struct RunShot {
 }
 
 /// A frame the player copied as it presented it: the swap chain's present
-/// count after its present, and the host counter when the render thread
-/// took it for the copy and right after its present returned.
+/// count before and after its present (the player answers only a present
+/// that advanced it), and the host counter when the render thread took it
+/// for the copy and right after its present returned.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunFrame {
-    pub present: Option<u32>,
+    pub previous: u32,
+    pub present: u32,
     pub acquired: i64,
     pub presented: i64,
 }

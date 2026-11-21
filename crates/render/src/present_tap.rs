@@ -12,11 +12,17 @@ use std::time::Duration;
 /// What a window renderer asks of a tap ([`crate::Renderer::set_present_tap`]).
 pub trait PresentTap: Send + Sync {
     /// At each window frame acquired, after its passes are encoded: whether
-    /// to copy this frame.
-    fn wanted(&self) -> bool;
+    /// to copy this frame. `selection` says whether it is a frame of the
+    /// selection screen: only those are copied (a copy allocates its
+    /// readback buffer and pixels, which play's frames never do, design.md
+    /// "Scope of No Allocation"), so a tap refuses a request any
+    /// other frame meets, without allocating.
+    fn wanted(&self, selection: bool) -> bool;
     /// The copied frame was handed to the present: the swap chain's present
-    /// count read right after it (`None` when the call failed).
-    fn presented(&self, present_count: Option<u32>);
+    /// count read from the same chain right before and right after it
+    /// (`None` when a read failed). A present that did not advance the
+    /// count presented nothing.
+    fn presented(&self, before: Option<u32>, after: Option<u32>);
     /// The copied frame's pixels, or why they could not be read.
     fn deliver(&self, frame: Result<PresentFrame, String>);
 }

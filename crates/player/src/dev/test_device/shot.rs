@@ -136,8 +136,9 @@ impl Pipe {
 /// # Errors
 ///
 /// Why the answer is not that frame: another request's, another process's,
-/// the player's error, another size, short pixels, or a frame acquired
-/// before the request or presented before its acquisition.
+/// the player's error, another size, short pixels, a present that did not
+/// advance the swap chain's count, or a frame acquired before the request
+/// or presented before its acquisition.
 pub fn check_answer(
     answer: Answer,
     serial: u64,
@@ -166,6 +167,12 @@ pub fn check_answer(
     }
     if shot.rgba.len() != w as usize * h as usize * 4 {
         return Err(format!("{} bytes of pixels", shot.rgba.len()));
+    }
+    if shot.present <= shot.previous {
+        return Err(format!(
+            "a frame whose present did not advance the swap chain's count ({} to {})",
+            shot.previous, shot.present
+        ));
     }
     if shot.acquired <= requested {
         return Err(format!(
@@ -404,7 +411,8 @@ mod tests {
                 width: 1,
                 height: 1,
                 rgba: vec![1, 2, 3, 4],
-                present: Some(7),
+                previous: 6,
+                present: 7,
                 acquired: 10,
                 presented: 20,
             };
@@ -432,7 +440,8 @@ mod tests {
                 width: w,
                 height: h,
                 rgba: vec![0; w as usize * h as usize * 4],
-                present: Some(5),
+                previous: 4,
+                present: 5,
                 acquired: 1_000,
                 presented: 1_200,
             }),
@@ -443,7 +452,7 @@ mod tests {
             f(&mut a);
             a
         };
-        let cases: [(&str, Answer); 7] = [
+        let cases: [(&str, Answer); 8] = [
             ("request 4", edit(|a| a.serial = 4)),
             ("process 41", edit(|a| a.client = 41)),
             ("the player: late", edit(|a| a.shot = Err("late".into()))),
@@ -456,6 +465,10 @@ mod tests {
                 edit(|a| {
                     a.shot.as_mut().unwrap().rgba.pop();
                 }),
+            ),
+            (
+                "did not advance",
+                edit(|a| a.shot.as_mut().unwrap().previous = 5),
             ),
             (
                 "not after the request",

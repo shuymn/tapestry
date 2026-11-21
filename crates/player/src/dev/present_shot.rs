@@ -8,7 +8,12 @@
 //!
 //! A request is answered with a frame whose work began after the request
 //! was seen: the first frame acquired after it is passed over (its content
-//! may have been built before), and the next is copied.
+//! may have been built before), and the next is copied. Only the selection
+//! screen's frames are copied: a request any other frame meets (play's,
+//! whose processing allocates nothing, design.md "Scope of No
+//! Allocation") is refused there without a copy, and the refusal is
+//! answered and logged from the pipe's thread. A copy whose present did not
+//! advance the swap chain's present count is not a shot.
 
 use std::io::{BufReader, Read as _};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -31,8 +36,11 @@ pub struct Shot {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    /// The swap chain's present count right after its present.
-    pub present: Option<u32>,
+    /// The swap chain's present count right before its present.
+    pub previous: u32,
+    /// The swap chain's present count right after its present: above
+    /// `previous`.
+    pub present: u32,
     /// The host counter when the render thread took the frame for the copy
     /// (its passes encoded, before its submission).
     pub acquired: i64,
@@ -49,8 +57,11 @@ enum Phase {
     /// One frame passed over: the next is copied.
     Primed,
     /// A frame is being copied: acquired at this counter, presented at the
-    /// second once known.
-    Copying(i64, Option<(i64, Option<u32>)>),
+    /// second once known, with the chain's present counts before and after.
+    Copying(i64, Option<(i64, Option<u32>, Option<u32>)>),
+    /// A frame other than the selection screen's met the request: refused
+    /// on the render thread, without a copy or an allocation.
+    Refused,
     Done(Result<Shot, String>),
 }
 
@@ -58,6 +69,11 @@ struct State {
     serial: u64,
     phase: Phase,
 }
+
+/// Why a request met by a frame other than the selection screen's is not
+/// answered with a frame.
+pub const REFUSED: &str =
+    "refused: the frame drawn was not the selection screen's (no copy is made outside it)";
 
 /// The render thread's tap and the pipe's side of it.
 pub struct Tap {
@@ -108,6 +124,10 @@ impl Tap {
             if s.serial != serial {
                 return Err(format!("request {serial} was replaced by {}", s.serial));
             }
+            if let Phase::Refused = s.phase {
+                s.phase = Phase::Idle;
+                return Err(REFUSED.to_owned());
+            }
             if let Phase::Done(_) = &s.phase {
                 let Phase::Done(r) = std::mem::replace(&mut s.phase, Phase::Idle) else {
                     unreachable!("matched above");
@@ -129,9 +149,15 @@ impl Tap {
 }
 
 impl render::PresentTap for Tap {
-    fn wanted(&self) -> bool {
+    fn wanted(&self, selection: bool) -> bool {
         let mut s = self.lock();
         match s.phase {
+            Phase::Asked | Phase::Primed | Phase::Copying(..) if !selection => {
+                s.phase = Phase::Refused;
+                drop(s);
+                self.done.notify_all();
+                false
+            }
             Phase::Asked => {
                 s.phase = Phase::Primed;
                 false
@@ -142,15 +168,15 @@ impl render::PresentTap for Tap {
                 s.phase = Phase::Copying((self.clock)(), None);
                 true
             }
-            Phase::Idle | Phase::Done(_) => false,
+            Phase::Idle | Phase::Refused | Phase::Done(_) => false,
         }
     }
 
-    fn presented(&self, present_count: Option<u32>) {
+    fn presented(&self, before: Option<u32>, after: Option<u32>) {
         let now = (self.clock)();
         let mut s = self.lock();
         if let Phase::Copying(at, None) = s.phase {
-            s.phase = Phase::Copying(at, Some((now, present_count)));
+            s.phase = Phase::Copying(at, Some((now, before, after)));
         }
     }
 
@@ -160,14 +186,21 @@ impl render::PresentTap for Tap {
             return;
         };
         s.phase = Phase::Done(match (frame, presented) {
-            (Ok(f), Some((presented, present))) => Ok(Shot {
-                width: f.width,
-                height: f.height,
-                rgba: f.rgba,
-                present,
-                acquired,
-                presented,
-            }),
+            (Ok(f), Some((presented, Some(previous), Some(present)))) if present > previous => {
+                Ok(Shot {
+                    width: f.width,
+                    height: f.height,
+                    rgba: f.rgba,
+                    previous,
+                    present,
+                    acquired,
+                    presented,
+                })
+            }
+            (Ok(_), Some((_, before, after))) => Err(format!(
+                "the copied frame's present did not advance the swap chain's present count \
+                 (before {before:?}, after {after:?})"
+            )),
             (Ok(_), None) => Err("the copied frame was not presented".into()),
             (Err(e), _) => Err(e),
         });
@@ -201,7 +234,8 @@ pub fn write_answer(
 ) -> std::io::Result<()> {
     let header = match answer {
         Ok(s) => json!({
-            "serial": serial, "width": s.width, "height": s.height, "present": s.present,
+            "serial": serial, "width": s.width, "height": s.height,
+            "previous": s.previous, "present": s.present,
             "acquired": s.acquired, "presented": s.presented, "bytes": s.rgba.len(),
         }),
         Err(e) => json!({ "serial": serial, "error": e }),
@@ -263,7 +297,8 @@ pub fn read_answer(
             width: u32::try_from(num("width")?).map_err(|e| e.to_string())?,
             height: u32::try_from(num("height")?).map_err(|e| e.to_string())?,
             rgba,
-            present: h["present"].as_u64().and_then(|p| u32::try_from(p).ok()),
+            previous: u32::try_from(num("previous")?).map_err(|e| e.to_string())?,
+            present: u32::try_from(num("present")?).map_err(|e| e.to_string())?,
             acquired: int("acquired")?,
             presented: int("presented")?,
         }),
@@ -293,6 +328,9 @@ pub fn serve(
         let serial = parse_request(&line).ok_or_else(|| format!("a bad request {line:?}"))?;
         let mine = tap.request();
         let answer = tap.wait(mine, wait);
+        if let Err(e) = &answer {
+            eprintln!("dev: shot {serial}: {e}");
+        }
         write_answer(output, serial, &answer).map_err(|e| format!("answering: {e}"))?;
     }
 }
@@ -361,22 +399,61 @@ mod tests {
 
     /// A request is answered with the second frame acquired after it, not
     /// the first (whose content may predate it), with that frame's counter
-    /// readings and present count; a frame acquired with no request is not
+    /// readings and present counts; a frame acquired with no request is not
     /// copied.
     #[test]
     fn a_request_takes_the_second_frame_after_it() {
         let tap = Tap::with_clock(now);
-        assert!(!tap.wanted(), "no request");
+        assert!(!tap.wanted(true), "no request");
         let serial = tap.request();
-        assert!(!tap.wanted(), "the first frame after the request");
-        assert!(tap.wanted(), "the second");
-        tap.presented(Some(41));
+        assert!(!tap.wanted(true), "the first frame after the request");
+        assert!(tap.wanted(true), "the second");
+        tap.presented(Some(40), Some(41));
         tap.deliver(Ok(frame(7)));
         let shot = tap.wait(serial, Duration::from_secs(1)).unwrap();
         assert_eq!(shot.rgba, vec![7; 8]);
-        assert_eq!(shot.present, Some(41));
+        assert_eq!((shot.previous, shot.present), (40, 41));
         assert!(shot.presented > shot.acquired, "{shot:?}");
-        assert!(!tap.wanted(), "answered");
+        assert!(!tap.wanted(true), "answered");
+    }
+
+    /// A request that a frame other than the selection screen's meets (a
+    /// play frame), before its passed-over frame or at the copy, is refused
+    /// there: no copy is asked for, and the wait answers the refusal at
+    /// once, not at its deadline. With no request, such a frame is not
+    /// refused anything.
+    #[test]
+    fn a_request_during_play_is_refused_without_a_copy() {
+        let tap = Tap::with_clock(now);
+        assert!(!tap.wanted(false), "no request: nothing to refuse");
+        for passed in [false, true] {
+            let s = tap.request();
+            if passed {
+                assert!(!tap.wanted(true), "the selection frame passed over");
+            }
+            assert!(!tap.wanted(false), "a play frame is never copied");
+            let t = Instant::now();
+            assert_eq!(tap.wait(s, Duration::from_secs(5)), Err(REFUSED.to_owned()));
+            assert!(t.elapsed() < Duration::from_secs(1), "refused at once");
+            assert!(!tap.wanted(true), "the refused request is over");
+        }
+    }
+
+    /// A copy whose present did not advance the swap chain's present count
+    /// (the same count before and after, or a count that could not be read)
+    /// is not a shot.
+    #[test]
+    fn a_present_that_did_not_advance_is_not_a_shot() {
+        for (before, after) in [(Some(9), Some(9)), (Some(9), None), (None, Some(10))] {
+            let tap = Tap::with_clock(now);
+            let s = tap.request();
+            assert!(!tap.wanted(true));
+            assert!(tap.wanted(true));
+            tap.presented(before, after);
+            tap.deliver(Ok(frame(3)));
+            let e = tap.wait(s, Duration::from_secs(1)).unwrap_err();
+            assert!(e.contains("did not advance"), "{before:?} {after:?}: {e}");
+        }
     }
 
     /// A copy whose frame never came back is taken again from the next
@@ -386,25 +463,22 @@ mod tests {
     fn a_lost_or_failed_copy_is_not_a_shot() {
         let tap = Tap::with_clock(now);
         let s = tap.request();
-        assert!(!tap.wanted());
-        assert!(tap.wanted());
+        assert!(!tap.wanted(true));
+        assert!(tap.wanted(true));
         // That frame failed before its present: the next is copied.
-        assert!(tap.wanted());
-        tap.presented(Some(3));
+        assert!(tap.wanted(true));
+        tap.presented(Some(2), Some(3));
         tap.deliver(Ok(frame(9)));
-        assert_eq!(
-            tap.wait(s, Duration::from_secs(1)).unwrap().present,
-            Some(3)
-        );
+        assert_eq!(tap.wait(s, Duration::from_secs(1)).unwrap().present, 3);
         let s = tap.request();
-        assert!(!tap.wanted());
-        assert!(tap.wanted());
-        tap.presented(None);
+        assert!(!tap.wanted(true));
+        assert!(tap.wanted(true));
+        tap.presented(None, None);
         tap.deliver(Err("map".into()));
         assert_eq!(tap.wait(s, Duration::from_secs(1)), Err("map".into()));
         let s = tap.request();
-        assert!(!tap.wanted());
-        assert!(tap.wanted());
+        assert!(!tap.wanted(true));
+        assert!(tap.wanted(true));
         tap.deliver(Ok(frame(1)));
         assert!(tap.wait(s, Duration::from_secs(1)).is_err());
     }
@@ -419,7 +493,7 @@ mod tests {
         let r = tap.wait(s, Duration::from_millis(50));
         assert!(r.unwrap_err().contains("no frame"));
         assert!(t.elapsed() >= Duration::from_millis(50));
-        assert!(!tap.wanted(), "the request is dropped");
+        assert!(!tap.wanted(true), "the request is dropped");
     }
 
     /// An answer reads back as written, its pixels whole; an error answer
@@ -430,7 +504,8 @@ mod tests {
             width: 2,
             height: 1,
             rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            present: Some(9),
+            previous: 8,
+            present: 9,
             acquired: 100,
             presented: 120,
         };

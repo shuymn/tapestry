@@ -809,7 +809,8 @@ impl Exec for Live {
             "size": [frame.width, frame.height],
             "requested": requested,
             "frame": {
-                "present": frame.present, "acquired": frame.acquired, "presented": frame.presented,
+                "previous": frame.previous, "present": frame.present,
+                "acquired": frame.acquired, "presented": frame.presented,
             },
         }));
         self.beat();
