@@ -534,7 +534,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/media_host/movie.rs"),
     // The skin movie hook: each play and selection frame reads, peeks and
     // takes the screen's movies before the build (their admission is a
-    // preparation boundary's).
+    // boundary's of its own, before the frame's grant).
     Site::File("crates/player/src/movie_frame.rs"),
     Site::Fns(
         "crates/skin-model/src/bga.rs",

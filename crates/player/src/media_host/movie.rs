@@ -65,9 +65,10 @@ pub enum Loss {
     Preparation,
     /// The render side found its ring at fault.
     Fault,
-    /// The render side refused it at its probed size: with the screen's
-    /// earlier movies it passed the screen's pixel total
-    /// ([`skin_model::movie::MAX_MOVIE_PIXELS`]). It draws nothing.
+    /// The session refused it at its probe, before making its ring: with
+    /// the rings its screen's earlier movies hold it passed the screen's
+    /// pixel total ([`skin_model::movie::MAX_MOVIE_PIXELS`]). It draws
+    /// nothing.
     OverTotal,
 }
 

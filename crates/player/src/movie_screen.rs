@@ -13,33 +13,28 @@
 //! Dropping the screen's [`MovieSet`] leaves it: a new generation is
 //! entered, and the session closes the players of the one left.
 //!
-//! Each set has one owner: a selection's entry (its lifetime), or a play
-//! state (its number), so a direct play's retry, which starts a new play
-//! state, opens its movies again from their start while a practice
-//! session's rounds keep theirs. Everything of a screen's movies lives as
-//! long as that owner: the set and its session generation, the renderer's
-//! planes of each slot, and the shows of the loading frames. The screen
-//! holds them through [`ScreenMovies`], whose only ways to let a set go
-//! retire the renderer's part with it ([`ScreenMovies::retire`]); they are
-//! retired when their owner leaves: another screen's set opened, the play
-//! or selection screen left, a play preparation's request cancelled or
-//! discarded before its commit (a set belongs to its request until then).
-//!
-//! A committed set outlives the screen object across a device's recovery:
-//! the screen dropped parks it in the hub ([`MediaHub::park`]) and the one
-//! built again takes it back, so its movies keep their lifetime, clock
-//! origin and losses, and only their GPU planes are made again
-//! ([`Movies::rebuilt`]), at that screen's build. A set still preparing is
-//! dropped with the screen instead: its preparation's answer names the
-//! lost device, so nothing can commit it, and a cancel arriving while no
-//! screen exists has none to reach.
+//! A set belongs to exactly one screen instance ([`Holder`]): one
+//! selection entry, or one play preparation that becomes one play screen.
+//! Every entry and every preparation (each practice round, each retry)
+//! opens its own set, so its movies start from their start; nothing is
+//! handed back to a request, kept for a later screen or taken over by
+//! another. The screen holds its set through [`ScreenMovies`], whose
+//! [`retire`](ScreenMovies::retire) is the one place a set is let go while
+//! its renderer lives: the set (its generation left, so the session closes
+//! its players and their rings go), the renderer's planes of every slot and
+//! the loading frames' shows go together, when the instance ends by
+//! whichever path: another set opened, a frame of another screen drawn
+//! ([`Drawn`]), its preparation cancelled or discarded before its commit,
+//! its skin's installation removed. A screen dropped (its device lost, or
+//! the run's end) drops its set with its renderer; the screen built again
+//! opens new sets, whose movies start again, a movie lost before included.
 //!
 //! None of this waits on the session: entering stores a word and an open
 //! only queues a request.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
 use render::{Renderer, SkinBundle};
@@ -57,12 +52,13 @@ pub struct MediaHub {
     launching: Option<Launching>,
     session: OnceLock<Option<Session>>,
     generation: AtomicU64,
-    /// The committed set of a screen dropped for its device's recovery,
-    /// until the screen built again takes it.
-    parked: Mutex<Option<MovieSet>>,
     /// The sets open (tests).
     #[cfg(test)]
     open: AtomicU64,
+    /// The movies the next sets opened play, in place of their files'
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    supply: std::sync::Mutex<std::collections::VecDeque<[Option<Arc<Movie>>; MAX_MOVIES]>>,
 }
 
 impl MediaHub {
@@ -88,33 +84,17 @@ impl MediaHub {
             launching,
             session: OnceLock::new(),
             generation: AtomicU64::new(0),
-            parked: Mutex::new(None),
             #[cfg(test)]
             open: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            supply: std::sync::Mutex::default(),
         })
     }
 
-    /// Keeps `set` for the screen built next ([`unpark`](Self::unpark)),
-    /// dropping one kept before.
-    pub fn park(&self, set: MovieSet) {
-        let old = self
-            .parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(set);
-        drop(old);
-    }
-
-    /// The set parked for a screen built again, its GPU state to be made
-    /// again on that screen's device.
-    pub fn unpark(&self) -> Option<MovieSet> {
-        let mut set = self
-            .parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()?;
-        set.movies.rebuilt();
-        Some(set)
+    /// The next set opened plays `movies` in place of its files' (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn supply(&self, movies: [Option<Arc<Movie>>; MAX_MOVIES]) {
+        self.supply.lock().unwrap().push_back(movies);
     }
 
     /// How many sets are open (tests).
@@ -127,15 +107,6 @@ impl MediaHub {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
-    }
-
-    /// Whether a set is parked (tests).
-    #[cfg(all(test, feature = "dev-tools"))]
-    pub fn parked(&self) -> bool {
-        self.parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
     }
 
     /// The session, started on first use.
@@ -159,47 +130,39 @@ impl MediaHub {
 /// A screen's movies: what the session plays for it, and what the render
 /// side's hook keeps of each. Dropped, the screen is left.
 pub struct MovieSet {
-    /// Weak: a set parked in its hub must not keep the hub alive.
     hub: Weak<MediaHub>,
     kind: ScreenKind,
-    /// The skin it was opened for.
-    bundle: Arc<SkinBundle>,
-    /// Its owner: the selection's entry (its lifetime) it was opened in,
-    /// or the play state (its number) it plays for.
-    owner: u64,
     /// The generation it entered (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     generation: u64,
-    /// The screen's clock at its opening (µs), from which a selection
-    /// frame's movie time counts.
-    pub origin: i64,
-    /// A play's screen clock origin as the first loading frame drawn with
-    /// it gave it (that loading lifetime's beginning), from which the
-    /// loading frames' movie time counts; kept by the later rounds of its
-    /// play state, as the screen clock is.
-    pub loading_origin: Option<i64>,
-    /// The play preparation request it belongs to until that is
-    /// committed: its cancel or discard drops the set.
-    pub preparing: Option<u64>,
+    /// Its movie clock's origin on the render thread's frame clock (µs),
+    /// once known: a selection entry's first frame; a play's first loading
+    /// frame's lifetime origin, else its READY anchor
+    /// ([`ScreenMovies::begin_play`]). Its own: no other set's carries
+    /// over.
+    pub origin: Option<i64>,
     pub movies: Movies,
 }
 
 impl MovieSet {
-    /// Opens `bundle`'s movies for a `kind` screen of `owner`, its
-    /// preparation starting at `start` on the monotonic clock and at
-    /// `origin` µs on the screen's: `None` when the skin has none.
+    /// Opens `bundle`'s movies for a `kind` screen, its preparation
+    /// starting at `start` on the monotonic clock, its movie clock from
+    /// `origin` if known: `None` when the skin has none.
     pub fn open(
         hub: &Arc<MediaHub>,
         kind: ScreenKind,
         bundle: &Arc<SkinBundle>,
-        owner: u64,
         start: Instant,
-        origin: i64,
+        origin: Option<i64>,
     ) -> Option<Self> {
         let sheet = bundle.skin().sheet();
         let names = sheet.movies();
         if names.is_empty() {
             return None;
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(movies) = hub.supply.lock().unwrap().pop_front() {
+            return Some(Self::of(hub, kind, bundle, movies, start, origin));
         }
         let session = hub.session();
         let generation = hub.next_generation();
@@ -243,56 +206,50 @@ impl MovieSet {
         Some(Self {
             hub: Arc::downgrade(hub),
             kind,
-            bundle: Arc::clone(bundle),
-            owner,
             #[cfg(all(test, feature = "dev-tools"))]
             generation,
             origin,
-            loading_origin: None,
-            preparing: None,
-            // A play's READY opens at least the skin's loading minimum
-            // into its screen clock (design.md "Timers").
-            movies: match kind {
-                ScreenKind::Play => Movies::new(movies, start)
-                    .floored(game::loading_minimum(bundle.skin().loadend()).0),
-                _ => Movies::new(movies, start),
-            },
+            movies: Self::movies(kind, bundle, movies, start),
         })
     }
 
-    /// A set of `movies` for `bundle`'s `kind` screen of `owner`, opened
-    /// at `start` and screen time `origin`, as [`open`](Self::open) makes
-    /// it with no session (tests).
+    /// A set of `movies` for `bundle`'s `kind` screen, opened at `start`,
+    /// its movie clock from `origin`, as [`open`](Self::open) makes it with
+    /// no session (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn of(
         hub: &Arc<MediaHub>,
         kind: ScreenKind,
         bundle: &Arc<SkinBundle>,
-        owner: u64,
         movies: [Option<Arc<Movie>>; MAX_MOVIES],
         start: Instant,
+        origin: Option<i64>,
     ) -> Self {
         hub.open.fetch_add(1, Ordering::SeqCst);
         Self {
             hub: Arc::downgrade(hub),
             kind,
-            bundle: Arc::clone(bundle),
-            owner,
             generation: hub.next_generation(),
-            origin: 0,
-            loading_origin: None,
-            preparing: None,
-            movies: match kind {
-                ScreenKind::Play => Movies::new(movies, start)
-                    .floored(game::loading_minimum(bundle.skin().loadend()).0),
-                _ => Movies::new(movies, start),
-            },
+            origin,
+            movies: Self::movies(kind, bundle, movies, start),
         }
     }
 
-    /// Whether it is the movies of `bundle`'s `kind` screen of `owner`.
-    pub fn is_for(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>, owner: u64) -> bool {
-        self.kind == kind && self.owner == owner && Arc::ptr_eq(&self.bundle, bundle)
+    /// The hook's state of `movies` for `bundle`'s `kind` screen: a play's
+    /// READY opens at least the skin's loading minimum into its movie
+    /// clock (design.md "Timers"), which bounds its preparation's polls.
+    fn movies(
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+        movies: [Option<Arc<Movie>>; MAX_MOVIES],
+        start: Instant,
+    ) -> Movies {
+        match kind {
+            ScreenKind::Play => {
+                Movies::new(movies, start).floored(game::loading_minimum(bundle.skin().loadend()).0)
+            }
+            _ => Movies::new(movies, start),
+        }
     }
 
     /// The generation it entered (tests).
@@ -323,64 +280,130 @@ impl Drop for MovieSet {
     }
 }
 
-/// The movies of the screen shown or being prepared, held with the
-/// renderer's part of them: a set let go retires the renderer's planes and
-/// loading shows with it.
+/// The screen instance a set of movies belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// The selection entry of this lifetime.
+    Selection(u64),
+    /// The play preparation of this request, not committed yet.
+    Preparing(u64),
+    /// That preparation committed, its play not begun.
+    Committed(u64),
+    /// The play screen it became.
+    Playing,
+}
+
+/// The screen a frame drawn belongs to, as a set's holder judges it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    /// The selection skin's frame of this lifetime.
+    Selection(u64),
+    /// A play's frame.
+    Play,
+    /// Anything else: a page (the built-in selection, decision or practice
+    /// page), a loading frame, a result, the end page, a splash or a text.
+    Other,
+}
+
+impl Holder {
+    /// Whether its screen instance goes on while a `drawn` frame is drawn:
+    /// a selection entry's while its own skinned frames draw; a play's
+    /// preparation whatever draws meanwhile (its cancel ends it), and once
+    /// committed until a selection frame draws; a play screen while play
+    /// frames draw.
+    const fn keeps(self, drawn: Drawn) -> bool {
+        match (self, drawn) {
+            (Self::Selection(l), Drawn::Selection(d)) => l == d,
+            (Self::Preparing(_), _)
+            | (Self::Committed(_), Drawn::Play | Drawn::Other)
+            | (Self::Playing, Drawn::Play) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The movies of the screen instance shown or being prepared, with their
+/// holder; the renderer's part of them goes with them.
 pub struct ScreenMovies {
-    set: Option<MovieSet>,
+    held: Option<(Holder, MovieSet)>,
 }
 
 impl ScreenMovies {
     /// None held.
     pub const fn new() -> Self {
-        Self { set: None }
+        Self { held: None }
     }
 
-    /// The set held.
-    pub const fn get(&self) -> Option<&MovieSet> {
-        self.set.as_ref()
+    /// The set held and its holder.
+    pub fn get(&self) -> Option<(Holder, &MovieSet)> {
+        self.held.as_ref().map(|(h, s)| (*h, s))
     }
 
-    /// The set held.
-    pub const fn get_mut(&mut self) -> Option<&mut MovieSet> {
-        self.set.as_mut()
+    /// The set held and its holder.
+    pub fn get_mut(&mut self) -> Option<(Holder, &mut MovieSet)> {
+        self.held.as_mut().map(|(h, s)| (*h, s))
     }
 
-    /// Their owner leaves: the set is dropped (its generation left, its
-    /// players closed), and `renderer` releases every slot's planes and
-    /// shows no movie in its loading frames or play builds.
+    /// Its screen instance ends: the set is dropped (its generation left,
+    /// its players closed), and `renderer` releases every slot's planes
+    /// and shows no movie in its loading frames or play builds. The one
+    /// place a set is let go while its renderer lives.
     pub fn retire(&mut self, renderer: &mut Renderer) {
-        if self.set.take().is_some() {
+        if self.held.take().is_some() {
             renderer.retire_movies();
         }
     }
 
-    /// The set held retired, then `open`'s, opened once the one before
-    /// it is left.
-    pub fn replace(&mut self, renderer: &mut Renderer, open: impl FnOnce() -> Option<MovieSet>) {
+    /// The set held retired, then `open`'s held for `holder`, opened once
+    /// the one before it is left.
+    pub fn open(
+        &mut self,
+        holder: Holder,
+        renderer: &mut Renderer,
+        open: impl FnOnce() -> Option<MovieSet>,
+    ) {
         self.retire(renderer);
-        self.set = open();
+        self.held = open().map(|set| (holder, set));
     }
 
-    /// Holds `set`, taken back from the hub by a screen built again over
-    /// `renderer`, and reserves its admitted movies' planes there: the
-    /// screen's build is their admission boundary.
-    pub fn restore(&mut self, set: Option<MovieSet>, renderer: &mut Renderer) {
-        self.retire(renderer);
-        self.set = set;
-        if let Some(set) = &mut self.set {
-            set.movies.admit(renderer, Instant::now());
+    /// A `drawn` frame is drawn: the set held is retired unless its screen
+    /// instance goes on ([`Holder::keeps`]).
+    pub fn drawn(&mut self, drawn: Drawn, renderer: &mut Renderer) {
+        if self.held.as_ref().is_some_and(|(h, _)| !h.keeps(drawn)) {
+            self.retire(renderer);
         }
     }
 
-    /// The screen is dropped (its device's recovery builds another): a
-    /// committed set is parked in `hub` for the screen built next; one
-    /// still preparing is dropped, since its preparation can no longer
-    /// commit.
-    pub fn park(&mut self, hub: &MediaHub) {
-        match self.set.take() {
-            Some(set) if set.preparing.is_none() => hub.park(set),
-            set => drop(set),
+    /// Play preparation `request` (`None`: whichever) is cancelled or
+    /// discarded: the set it holds, not committed, is retired.
+    pub fn cancel(&mut self, request: Option<u64>, renderer: &mut Renderer) {
+        if let Some((Holder::Preparing(r), _)) = &self.held
+            && request.is_none_or(|q| q == *r)
+        {
+            self.retire(renderer);
+        }
+    }
+
+    /// Play preparation `request` is committed: the set it holds is its
+    /// play's.
+    pub fn commit(&mut self, request: u64) {
+        if let Some((holder, _)) = &mut self.held
+            && *holder == Holder::Preparing(request)
+        {
+            *holder = Holder::Committed(request);
+        }
+    }
+
+    /// The committed play begins: its screen draws its movies from here,
+    /// their clock from its first loading frame's origin or else from
+    /// `anchor`, its READY minus the play skin's loading minimum.
+    pub fn begin_play(&mut self, anchor: i64, renderer: &mut Renderer) {
+        self.drawn(Drawn::Play, renderer);
+        if let Some((holder, set)) = &mut self.held
+            && matches!(holder, Holder::Committed(_))
+        {
+            *holder = Holder::Playing;
+            set.origin.get_or_insert(anchor);
         }
     }
 }

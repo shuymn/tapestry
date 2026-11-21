@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use skin_model::media::{Geometry, Reader, SLOT_HEADER_WORDS, Window, Writer};
-use skin_model::movie::{MAX_MOVIE_PIXELS, MovieShow};
+use skin_model::movie::MovieShow;
 
 use super::*;
 
@@ -102,6 +102,10 @@ impl Source for Fake {
     fn settled(&self) -> bool {
         self.staged.load(Ordering::SeqCst) || matches!(self.status(), Status::Absent | Status::Lost)
     }
+
+    fn refused(&self) -> bool {
+        self.loss() == Some(Loss::OverTotal)
+    }
 }
 
 /// Planes that keep the luma rows each write took, by slot; a slot's
@@ -163,34 +167,6 @@ fn tick(m: &mut Movies<Fake>, planes: &mut dyn Planes, due: i64, now: Instant) -
 }
 
 #[test]
-fn second_movie_that_fits_is_admitted() {
-    let hd = 1920 * 1080;
-    assert_eq!(admit(&[Earlier::Counts(hd)], hd), Verdict::Admit);
-    assert!(2 * hd <= MAX_MOVIE_PIXELS);
-}
-
-#[test]
-fn second_movie_over_the_total_is_refused() {
-    assert_eq!(
-        admit(&[Earlier::Counts(2560 * 1440)], 1280 * 720),
-        Verdict::Refuse
-    );
-    // A refused or lost earlier slot counts nothing.
-    assert_eq!(admit(&[Earlier::Free], MAX_MOVIE_PIXELS), Verdict::Admit);
-}
-
-#[test]
-fn first_movie_alone_is_judged_at_the_boundary() {
-    assert_eq!(admit(&[], MAX_MOVIE_PIXELS), Verdict::Admit);
-    assert_eq!(admit(&[], MAX_MOVIE_PIXELS + 1), Verdict::Refuse);
-}
-
-#[test]
-fn an_unsettled_earlier_slot_defers_the_decision() {
-    assert_eq!(admit(&[Earlier::Unsettled], 1), Verdict::Defer);
-}
-
-#[test]
 fn each_state_shows_what_it_should() {
     let start = Instant::now();
     let (a, b) = (Fake::new(64, 32), Fake::new(16, 8));
@@ -201,16 +177,10 @@ fn each_state_shows_what_it_should() {
         tick(&mut m, &mut planes, 0, start),
         [MovieShow::Nothing, MovieShow::Nothing]
     );
-    // Slot 1 live while slot 0 is pending: deferred, its reader kept.
+    // Slot 1 live while slot 0 is pending (the session judged its total):
+    // admitted, its frame taken and shown.
     b.set(Status::Live);
     b.publish(1, 0, 9);
-    assert_eq!(
-        tick(&mut m, &mut planes, 0, start),
-        [MovieShow::Nothing, MovieShow::Nothing]
-    );
-    assert!(b.reader.lock().unwrap().is_some());
-    // Slot 0 absent: slot 1 admitted, its frame taken and shown.
-    a.set(Status::Absent);
     let shows = tick(&mut m, &mut planes, 0, start);
     assert_eq!(shows[0], MovieShow::Nothing);
     assert_eq!(
@@ -227,6 +197,10 @@ fn each_state_shows_what_it_should() {
     assert_eq!(b.freed.load(Ordering::SeqCst), 1);
     assert_eq!(planes.reserved, [[1, 16, 8]]);
     assert!(planes.luma[1].iter().all(|&v| v == 9));
+    assert!(b.reader.lock().unwrap().is_none(), "its reader taken");
+    // Slot 0 absent: nothing.
+    a.set(Status::Absent);
+    assert_eq!(tick(&mut m, &mut planes, 0, start)[0], MovieShow::Nothing);
     // Live with no new frame: the last one still shows.
     assert!(matches!(
         tick(&mut m, &mut planes, 10, start)[1],
@@ -278,19 +252,23 @@ fn movie_picks_newest_frame_at_or_before_screen_time() {
     assert!(planes.luma[0].iter().all(|&v| v == 3));
 }
 
+/// A movie the session refused at the pixel total draws nothing, never
+/// black, in a frame and in a preparation's poll, and no planes are made
+/// for it; its peer plays.
 #[test]
-fn a_movie_past_the_total_is_refused_and_draws_nothing() {
+fn a_refused_movie_draws_nothing_and_takes_no_planes() {
     let start = Instant::now();
     let (a, b) = (Fake::new(2560, 1440), Fake::new(1280, 720));
     a.set(Status::Live);
-    b.set(Status::Live);
+    a.publish(1, 0, 4);
+    b.lose(Loss::OverTotal);
     let mut m = movies(Some(&a), Some(&b), start);
     let mut planes = Kept::default();
     let shows = tick(&mut m, &mut planes, 0, start);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }));
     assert_eq!(shows[1], MovieShow::Nothing);
-    assert_eq!(b.loss(), Some(Loss::OverTotal));
-    // Refused stays nothing, never black.
-    assert_eq!(tick(&mut m, &mut planes, 10, start)[1], MovieShow::Nothing);
+    let (_, shows) = m.prepare(&mut planes, start);
+    assert_eq!(shows[1], MovieShow::Nothing, "a poll too");
     assert_eq!(planes.reserved, [[0, 2560, 1440]]);
 }
 
@@ -417,38 +395,6 @@ fn a_preparation_never_holds_a_frame_ahead_of_the_screen_clock() {
     );
 }
 
-/// After the device's recovery a live movie reserves its planes again on
-/// the new device and shows its next frame; a lost one stays lost.
-#[test]
-fn a_rebuilt_device_keeps_each_movie_s_state() {
-    let start = Instant::now();
-    let (a, b) = (Fake::new(16, 8), Fake::new(16, 8));
-    a.set(Status::Live);
-    b.set(Status::Live);
-    a.publish(1, 0, 3);
-    b.publish(1, 0, 4);
-    let mut m = movies(Some(&a), Some(&b), start);
-    let mut planes = Kept::default();
-    assert!(matches!(
-        tick(&mut m, &mut planes, 0, start),
-        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
-    ));
-    b.lose(Loss::Failed);
-    m.rebuilt();
-    let mut fresh = Kept::default();
-    // No new frame yet: nothing in the new planes, so nothing shows.
-    assert_eq!(
-        tick(&mut m, &mut fresh, 10, start),
-        [MovieShow::Nothing, MovieShow::Lost]
-    );
-    assert_eq!(fresh.reserved, [[0, 16, 8]], "only the live movie's");
-    a.publish(2, 20, 6);
-    let shows = tick(&mut m, &mut fresh, 20, start);
-    assert!(matches!(shows[0], MovieShow::Frame { .. }), "{shows:?}");
-    assert_eq!(shows[1], MovieShow::Lost);
-    assert!(fresh.luma[0].iter().all(|&v| v == 6));
-}
-
 /// A poll ends with a fresh clock sample: a first frame's take that runs
 /// past the preparation deadline loses its movie, and a peer still pending
 /// is lost and shows black in the same poll, the preparation settled,
@@ -473,45 +419,25 @@ fn a_take_crossing_the_deadline_expires_a_pending_peer_in_the_same_poll() {
     assert!(settled);
 }
 
-/// A movie lost after its admission gives its planes back before a later
-/// slot is judged: a 2048×2048 movie admitted then lost leaves room for a
-/// second 2048×2048 one, which is admitted and plays, and the planes the
-/// renderer holds stay within design.md "Memory Budget"'s 20 MiB and
-/// 512 bytes.
-#[cfg(feature = "dev-tools")]
+/// A movie lost after its admission gives its planes back at the next
+/// boundary, its peer's left as they are; the lost one shows black.
 #[test]
-fn lost_then_admit_keeps_resident_planes_within_the_budget() {
-    let _turn = crate::warp_turn::take();
-    let mut r = render::Renderer::new(
-        render::Target::Offscreen {
-            width: 64,
-            height: 64,
-        },
-        render::AdapterChoice::Warp,
-    )
-    .unwrap();
+fn a_lost_movie_s_planes_go_at_the_next_boundary() {
     let start = Instant::now();
-    let (a, b) = (Fake::new(2_048, 2_048), Fake::new(2_048, 2_048));
+    let (a, b) = (Fake::new(16, 8), Fake::new(32, 16));
     a.set(Status::Live);
-    a.publish(1, 0, 3);
-    let mut m = movies(Some(&a), Some(&b), start);
-    m.admit(&mut r, start);
-    assert!(matches!(
-        m.frame(&mut r, 0, start)[0],
-        MovieShow::Frame { .. }
-    ));
-    let one = r.video_bytes();
-    a.lose(Loss::Failed);
     b.set(Status::Live);
+    a.publish(1, 0, 3);
     b.publish(1, 0, 4);
-    m.admit(&mut r, start);
-    let shows = m.frame(&mut r, 0, start);
+    let mut m = movies(Some(&a), Some(&b), start);
+    let mut planes = Kept::default();
+    let _ = tick(&mut m, &mut planes, 0, start);
+    a.lose(Loss::Fault);
+    let shows = tick(&mut m, &mut planes, 10, start);
     assert_eq!(shows[0], MovieShow::Lost);
-    assert!(matches!(shows[1], MovieShow::Frame { .. }), "{shows:?}");
-    assert_eq!(b.loss(), None, "admitted");
-    let (texels, upload) = r.video_bytes();
-    assert_eq!((texels, upload), one, "one movie's planes resident");
-    assert!(texels + upload <= 20 * 1024 * 1024 + 512);
+    assert!(matches!(shows[1], MovieShow::Frame { .. }));
+    assert_eq!(planes.released, [0]);
+    assert!(planes.luma[1].iter().all(|&v| v == 4), "the peer's frame");
 }
 
 #[test]

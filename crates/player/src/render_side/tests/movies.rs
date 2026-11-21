@@ -1,7 +1,8 @@
-//! The skin movies' lifetime through the owner path (design.md
+//! The skin movies' holder through the render thread (design.md
 //! "Rendering and Skins", skin movies): the movies a play preparation
 //! opens are its own until its commit, so a practice Start cancelled
-//! drops them, and a committed one keeps them.
+//! drops them, and a committed one keeps them until its play's screen
+//! ends.
 
 use super::*;
 use crate::movie_screen::MediaHub;

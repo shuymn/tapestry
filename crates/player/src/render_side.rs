@@ -841,19 +841,24 @@ pub trait Screen: Send {
     /// again; the screen stays usable, and the next attempt's preparation
     /// builds again.
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), BuildError>;
-    /// The play frame's skin movie hook at the screen clock's `screen_us`,
+    /// The play frame's skin movie hook at `at` µs on the frame clock,
     /// before its [`build`](Self::build) ([`crate::movie_frame`]): it may
     /// upload a movie's frame through wgpu, so it runs outside the frame's
     /// app region and enters its own around the reads. Nothing by default.
-    fn movie_frame(&mut self, screen_us: i64) {
-        let _ = screen_us;
+    fn movie_frame(&mut self, at: i64) {
+        let _ = at;
     }
-    /// The play state (its number) the attempt being prepared plays for,
-    /// before each poll of its preparation: the owner of the play skin's
-    /// movies, so a new play state opens them again and a practice
-    /// session's rounds keep them. Nothing by default.
-    fn play_state(&mut self, number: u64) {
-        let _ = number;
+    /// The skin movies' admission boundary, in each pass before it waits
+    /// for the frame's grant ([`crate::movie_frame::Movies::admit`]): a
+    /// movie's planes are reserved or released here, never in a frame.
+    /// Nothing by default.
+    fn movie_boundary(&mut self) {}
+    /// The committed play begins (its play message), its READY at `anchor`
+    /// µs on the frame clock less the play skin's loading minimum: its
+    /// movies' clock starts there unless its loading frames started it.
+    /// Nothing by default.
+    fn begin_play(&mut self, anchor: i64) {
+        let _ = anchor;
     }
     /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
     /// the start gate): the skin's runtime state for the attempt starts
@@ -7509,6 +7514,11 @@ impl Run {
                 }) => {
                     let origin = measure.origin;
                     let screen_origin = self.resolve_screen_origin(&measure);
+                    // The play's movies: their clock, of this screen alone.
+                    let anchor = self.ready_anchor(&measure);
+                    if let Some(s) = self.screen.as_mut() {
+                        s.begin_play(anchor.0);
+                    }
                     self.turntable.play_starts();
                     // A decision screen is left by the loading state or
                     // the practice page before any play (dev-tools).
@@ -7857,6 +7867,9 @@ impl Run {
             let Some(screen) = &mut self.screen else {
                 continue;
             };
+            // The skin movies' admission, before the grant is waited for:
+            // a reservation never delays a granted frame.
+            screen.movie_boundary();
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
             // instead, and a frame granted before stays granted. READY's
@@ -8250,13 +8263,13 @@ impl Run {
                     {
                         screen_stamp = Some(screen_us);
                     }
-                    // The skin movies' frames, taken at the screen clock
+                    // The skin movies' frames, taken on their own clock
                     // before the build: their upload maps wgpu's buffer,
                     // so the app region pauses around the hook, which
                     // enters its own around its reads.
                     #[cfg(feature = "dev-tools")]
                     drop(region);
-                    screen.movie_frame(screen_us);
+                    screen.movie_frame(frame_at.0);
                     #[cfg(feature = "dev-tools")]
                     let region = crate::alloc_count::AppRegion::enter();
                     // The adjustments change anytime and move the notes
@@ -8477,6 +8490,10 @@ impl Run {
                     );
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
+                    // The app regions' allocations in the frame (its movie
+                    // hook's reads).
+                    #[cfg(feature = "dev-tools")]
+                    let app_before = crate::alloc_count::app_allocations();
                     // The settings the skin shows, the volume and the
                     // display offset as they are now: F3 to F6 show at the
                     // next frame, with no view of the game thread's.
@@ -8572,6 +8589,8 @@ impl Run {
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
                         self.menu_stats.frame(d.timing.cpu, after - before, changed);
+                        self.menu_stats
+                            .app(crate::alloc_count::app_allocations().saturating_sub(app_before));
                         skin_frame = shown.logic.is_some() && d.refused.is_none();
                         // What a refusal put on the screen, once drawn.
                         if changed
@@ -9314,20 +9333,28 @@ impl Run {
         if let Some(origin) = self.screen_resolved {
             return origin;
         }
-        let origin = self.screen_pending.take().unwrap_or_else(|| {
-            let loadend = self
-                .committed
-                .get(ScreenKind::Play)
-                .and_then(|i| i.bundle().skin().loadend());
-            TimeUs(
-                measure
-                    .ready_state_at
-                    .0
-                    .saturating_sub(game::loading_minimum(loadend).0),
-            )
-        });
+        let origin = self
+            .screen_pending
+            .take()
+            .unwrap_or_else(|| self.ready_anchor(measure));
         self.screen_resolved = Some(origin);
         origin
+    }
+
+    /// The play skin's loading minimum before the READY a play starting
+    /// with `measure` opens at (recording's opening,
+    /// [`PlayMeasure::ready_state_at`]).
+    fn ready_anchor(&self, measure: &PlayMeasure) -> TimeUs {
+        let loadend = self
+            .committed
+            .get(ScreenKind::Play)
+            .and_then(|i| i.bundle().skin().loadend());
+        TimeUs(
+            measure
+                .ready_state_at
+                .0
+                .saturating_sub(game::loading_minimum(loadend).0),
+        )
     }
 
     /// The answer to the end or pause of loading lifetime `lifetime`:
@@ -10313,7 +10340,6 @@ impl Run {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
-        screen.play_state(self.turntable.play_state());
         let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
         // Play's admission released the result's installation: recorded
         // with the staging's request and published before its answer
@@ -24340,7 +24366,7 @@ pub(crate) mod tests {
     // The play state's screen origin through loading lifetimes, play
     // states, rearms and practice Starts into each play's frames.
     mod screen_clock;
-    // The skin movies' lifetime through a play preparation's commit and
+    // The skin movies' holder through a play preparation's commit and
     // cancel.
     #[cfg(feature = "dev-tools")]
     pub(crate) mod movies;

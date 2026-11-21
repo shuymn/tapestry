@@ -1,12 +1,12 @@
-//! A screen's movies against their owner (design.md "Rendering and
-//! Skins", skin movies; "Memory Budget"; "Scope of No Allocation"): the
-//! set, its generation, the renderer's planes and the loading frames'
-//! shows live as long as their owner, and go through every exit; a
-//! selection's movie is admitted at its boundary, never in its frame; a
-//! visible loading state moves the play's movies on its own clock.
+//! A screen's movies against the screen instance they belong to
+//! (design.md "Rendering and Skins", skin movies; "Memory Budget"; "Scope
+//! of No Allocation"): each selection entry and each play preparation opens
+//! its own set, and the set, its generation, the renderer's planes and the
+//! loading frames' shows go together when that instance ends, by every path;
+//! a movie is admitted at the boundary before a frame, never in it; one play
+//! screen's loading frames and play frames share one movie clock.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use bms_model::TimeUs;
 use render::PreparedToken;
@@ -14,8 +14,8 @@ use skin_model::ScreenKind;
 use skin_model::media::{Geometry, Writer};
 use skin_model::movie::MovieShow;
 
-use crate::media_host::session::Movie;
-use crate::movie_screen::{MediaHub, MovieSet};
+use crate::media_host::session::{Loss, Movie};
+use crate::movie_screen::{Holder, MediaHub};
 use crate::render_side::Screen as _;
 
 /// A WARP screen playing movies through `hub`.
@@ -49,13 +49,18 @@ fn publish(movie: &Movie, seq: u64, stamp: i64, id: u8) {
     writer.publish(words, slot, &frame, seq, 1, stamp).unwrap();
 }
 
-/// Holds `set` as the screen's movies, the way an opening does.
-fn hold(s: &mut super::MenuScreen, set: MovieSet) {
-    s.movies.replace(&mut s.renderer, || Some(set));
+/// A live 64 × 32 movie with a frame at each of `stamps` (µs).
+fn clip(stamps: &[i64]) -> Arc<Movie> {
+    let m = Movie::live_here(1, 64, 32);
+    for (k, &stamp) in stamps.iter().enumerate() {
+        let k = u64::try_from(k).unwrap();
+        publish(&m, k + 1, stamp, u8::try_from(k + 1).unwrap());
+    }
+    m
 }
 
-/// A loading frame of `lifetime` at `now` on the loading clock, before
-/// the lifetime published a state.
+/// A loading frame of `lifetime` at `now` on the frame clock, before the
+/// lifetime published a state (its origin is `now`).
 fn loading_frame(lifetime: u64, now: i64) -> render::LoadingFrame<'static> {
     crate::render_side::loading_frame_of(
         lifetime,
@@ -67,12 +72,44 @@ fn loading_frame(lifetime: u64, now: i64) -> render::LoadingFrame<'static> {
     )
 }
 
-/// Play, then selection, then the next play's loading state: nothing of
-/// a screen's movies outlives it. The play's loading frames show its
-/// movie; selection's movies replace the play's, so the loading shows are
-/// cleared and the play's planes released before selection reserves its
-/// own; the next loading state leaves selection's movies, so their planes
-/// go and it shows no movie of theirs and no stale loss.
+/// Play preparation `request`'s token on `s`'s device.
+fn token(s: &super::MenuScreen, request: u64) -> PreparedToken {
+    PreparedToken {
+        request,
+        device: s.renderer.device_generation(),
+        kind: ScreenKind::Play,
+    }
+}
+
+/// A play screen of preparation `request` with `bundle`, its movies
+/// `movies`: opened, admitted, committed and begun with its READY anchor
+/// at `anchor` µs.
+fn play_screen(
+    s: &mut super::MenuScreen,
+    hub: &MediaHub,
+    bundle: &Arc<render::SkinBundle>,
+    request: u64,
+    movies: [Option<Arc<Movie>>; 2],
+    anchor: i64,
+) {
+    hub.supply(movies);
+    s.open_play_movies(Some(bundle), request);
+    s.movie_boundary();
+    s.commit(token(s, request)).unwrap();
+    s.begin_play(anchor);
+    assert!(matches!(s.movies.get(), Some((Holder::Playing, _))));
+}
+
+/// The stamp of the frame slot 0's planes hold.
+fn shown(s: &super::MenuScreen) -> Option<i64> {
+    s.movies.get().and_then(|(_, m)| m.movies.stamps()[0])
+}
+
+/// Play, then selection, then the next play's loading state: nothing of a
+/// screen's movies outlives it. The play's loading frames show its movie;
+/// selection's entry retires the play's set, its loading shows and its
+/// planes before it reserves its own; the next loading state leaves
+/// selection's, so their planes go and it shows no movie of theirs.
 #[test]
 fn a_screen_s_movies_never_outlive_it() {
     let _turn = crate::warp_turn::take();
@@ -80,50 +117,30 @@ fn a_screen_s_movies_never_outlive_it() {
     let (play, selection) = (bundle(&dir), bundle(&dir));
     let hub = MediaHub::with(None);
     let mut s = screen(&hub);
-    let start = Instant::now();
-    let a = Movie::live_here(1, 64, 32);
     let lost = Movie::new(1);
-    let _ = lost.lose(crate::media_host::session::Loss::Failed);
-    publish(&a, 1, 0, 9);
-    hold(
-        &mut s,
-        MovieSet::of(
-            &hub,
-            ScreenKind::Play,
-            &play,
-            1,
-            [Some(Arc::clone(&a)), Some(lost)],
-            start,
-        ),
-    );
+    let _ = lost.lose(Loss::Failed);
+    hub.supply([Some(clip(&[0])), Some(lost)]);
+    s.open_play_movies(Some(&play), 1);
+    s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     assert!(matches!(
         s.renderer.loading_movies(),
         [MovieShow::Frame { .. }, MovieShow::Lost]
     ));
-    let play_planes = s.renderer.video_bytes();
-    assert!(play_planes.0 > 0, "the play's planes");
-    // Selection's movies, opened as its entry opens them.
-    let b = Movie::live_here(2, 32, 16);
-    publish(&b, 1, 0, 200);
-    hold(
-        &mut s,
-        MovieSet::of(
-            &hub,
-            ScreenKind::Selection,
-            &selection,
-            7,
-            [Some(Arc::clone(&b)), None],
-            start,
-        ),
-    );
+    assert!(s.renderer.video_bytes().0 > 0, "the play's planes");
+    s.commit(token(&s, 1)).unwrap();
+    s.begin_play(0);
+    // Selection's entry.
+    hub.supply([Some(clip(&[0])), None]);
+    s.enter_selection_movies(&selection, 7, TimeUs(0));
     assert_eq!(
         s.renderer.loading_movies(),
         [MovieShow::Nothing; 2],
         "the play's shows left with it"
     );
     assert_eq!(s.renderer.video_bytes(), (0, 0), "the play's planes left");
-    s.admit_selection_movies();
+    assert_eq!(hub.open_sets(), 1);
+    s.movie_boundary();
     assert!(matches!(
         s.selection_movies(TimeUs(0))[0],
         MovieShow::Frame { .. }
@@ -138,100 +155,156 @@ fn a_screen_s_movies_never_outlive_it() {
     assert_eq!(hub.open_sets(), 0);
 }
 
-/// A device lost after a play's preparation answered and before its
-/// commit: the set, still its request's, is dropped with the screen (its
-/// generation left), not parked, so neither a later cancel nor the screen
-/// built again can keep it. The control, a committed set, is parked and
-/// taken back.
+/// Selection's entry ends with a page drawn in its place, the decision
+/// screen's built-in presentation among them: the entry's movies, their
+/// generation and planes go before that page draws.
 #[test]
-fn a_set_still_preparing_is_dropped_with_its_screen() {
+fn a_decision_by_the_built_in_page_retires_selection_s_movies() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let selection = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    hub.supply([Some(clip(&[0])), None]);
+    s.enter_selection_movies(&selection, 7, TimeUs(0));
+    s.movie_boundary();
+    assert!(s.renderer.video_bytes().0 > 0);
+    let generation = hub.generation();
+    let _ = s.menu(&super::MenuPage::default(), true);
+    assert!(s.movies.get().is_none());
+    assert_eq!(hub.open_sets(), 0, "the set left");
+    assert!(hub.generation() > generation, "its generation left");
+    assert_eq!(s.renderer.video_bytes(), (0, 0), "its planes left");
+}
+
+/// A selection skin refused at a frame is removed from the screen: its
+/// entry's movies go with it, before the installation.
+#[test]
+fn a_selection_refusal_retires_its_movies() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let selection = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    hub.supply([Some(clip(&[0])), None]);
+    s.enter_selection_movies(&selection, 7, TimeUs(0));
+    s.movie_boundary();
+    s.remove(ScreenKind::Selection);
+    assert!(s.movies.get().is_none());
+    assert_eq!(hub.open_sets(), 0);
+    assert_eq!(s.renderer.video_bytes(), (0, 0));
+}
+
+/// Each play screen opens its own movies: after a play whose movie shows
+/// its frame at 20 s, a practice round (its page drawn between), a retry
+/// from a practice result (its result drawn between) and a direct retry
+/// (straight from play) each open a new set, the old frame's planes
+/// released, so the new READY at 1 s on its own movie clock shows the new
+/// movie's frame at 1 s, never the one held at 20 s.
+#[test]
+fn each_play_screen_opens_its_own_movies() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    for between in ["practice page", "practice result", "direct retry"] {
+        let hub = MediaHub::with(None);
+        let mut s = screen(&hub);
+        play_screen(
+            &mut s,
+            &hub,
+            &play,
+            1,
+            [Some(clip(&[0, 20_000_000])), None],
+            0,
+        );
+        let _ = s.play_movies(20_000_000);
+        assert_eq!(shown(&s), Some(20_000_000), "{between}: the old frame");
+        let first = s.movies.get().unwrap().1.generation();
+        match between {
+            "practice page" => {
+                let _ = s.menu(&super::MenuPage::default(), true);
+            }
+            "practice result" => {
+                let _ = s.submit_result();
+            }
+            _ => {}
+        }
+        play_screen(
+            &mut s,
+            &hub,
+            &play,
+            2,
+            [Some(clip(&[0, 1_000_000])), None],
+            10_000_000,
+        );
+        let _ = s.play_movies(11_000_000);
+        assert_eq!(
+            shown(&s),
+            Some(1_000_000),
+            "{between}: READY at 1 s shows its own frame, not the old 20 s one"
+        );
+        assert_ne!(s.movies.get().unwrap().1.generation(), first, "{between}");
+        assert_eq!(hub.open_sets(), 1, "{between}: the old set left");
+    }
+}
+
+/// A practice Start cancelled after its loading state drew, then another
+/// Start: the second's loading frames and its play frames share the
+/// second's movie clock (its own loading lifetime's origin, 5 s), so the
+/// play at 6 s shows the frame at 1 s; neither the first Start's origin nor
+/// the READY anchor moves it.
+#[test]
+fn a_cancelled_start_leaves_one_clock_for_the_next_loading_and_ready() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    hub.supply([Some(clip(&[0])), None]);
+    s.open_play_movies(Some(&play), 1);
+    s.movie_boundary();
+    s.loading_movies(&loading_frame(1, 0));
+    s.discard_token(token(&s, 1));
+    assert_eq!(hub.open_sets(), 0, "the cancelled Start's movies");
+    hub.supply([Some(clip(&[0, 1_000_000, 3_000_000, 6_000_000])), None]);
+    s.open_play_movies(Some(&play), 2);
+    s.movie_boundary();
+    s.loading_movies(&loading_frame(2, 5_000_000));
+    s.commit(token(&s, 2)).unwrap();
+    s.begin_play(5_200_000);
+    let _ = s.play_movies(6_000_000);
+    assert_eq!(shown(&s), Some(1_000_000));
+}
+
+/// A device lost before a play's preparation commits and after: the
+/// screen dropped drops its set and leaves its generation; nothing is kept
+/// for the screen built again.
+#[test]
+fn a_device_loss_drops_the_set_before_and_after_commit() {
     let _turn = crate::warp_turn::take();
     let dir = tempfile::tempdir().unwrap();
     let play = bundle(&dir);
     for committed in [false, true] {
         let hub = MediaHub::with(None);
         let mut s = screen(&hub);
-        s.play_state(3);
         s.open_play_movies(Some(&play), 5);
         assert_eq!(hub.open_sets(), 1);
         if committed {
-            let token = PreparedToken {
-                request: 5,
-                device: s.renderer.device_generation(),
-                kind: ScreenKind::Play,
-            };
-            s.commit(token).unwrap();
+            s.commit(token(&s, 5)).unwrap();
         }
         let generation = hub.generation();
         drop(s);
+        assert_eq!(hub.open_sets(), 0, "committed {committed}");
+        assert!(hub.generation() > generation, "committed {committed}");
         let again = screen(&hub);
-        if committed {
-            assert!(again.movies.get().is_some(), "taken back");
-            assert_eq!(hub.open_sets(), 1);
-            assert_eq!(hub.generation(), generation);
-        } else {
-            assert!(!hub.parked());
-            assert!(again.movies.get().is_none(), "not taken back");
-            assert_eq!(hub.open_sets(), 0, "dropped");
-            assert!(hub.generation() > generation, "its generation left");
-        }
+        assert!(again.movies.get().is_none());
     }
 }
 
-/// A direct play's retry starts a new play state: its movies open again,
-/// so the frame the last play held at 20 s is gone and READY's first
-/// frame at 1 s on the new screen clock never shows it. A practice round,
-/// the same play state, keeps its movies and their frame.
-#[test]
-fn a_retry_opens_its_movies_afresh_and_a_practice_round_keeps_them() {
-    let _turn = crate::warp_turn::take();
-    let dir = tempfile::tempdir().unwrap();
-    let play = bundle(&dir);
-    let hub = MediaHub::with(None);
-    let mut s = screen(&hub);
-    s.play_state(1);
-    let a = Movie::live_here(1, 64, 32);
-    publish(&a, 1, 20_000_000, 7);
-    hold(
-        &mut s,
-        MovieSet::of(
-            &hub,
-            ScreenKind::Play,
-            &play,
-            1,
-            [Some(Arc::clone(&a)), None],
-            Instant::now(),
-        ),
-    );
-    let first = s.movies.get().unwrap().generation();
-    s.loading_movies(&loading_frame(1, 0));
-    assert!(matches!(
-        s.play_movies(20_000_000)[0],
-        MovieShow::Frame { .. }
-    ));
-    // A practice round: the same play state.
-    s.open_play_movies(Some(&play), 2);
-    assert_eq!(s.movies.get().unwrap().generation(), first, "kept");
-    assert!(matches!(
-        s.play_movies(21_000_000)[0],
-        MovieShow::Frame { .. }
-    ));
-    // A retry: a new play state, READY at 1 s on its screen clock.
-    s.play_state(2);
-    s.open_play_movies(Some(&play), 3);
-    assert_ne!(s.movies.get().unwrap().generation(), first, "opened again");
-    assert_eq!(hub.open_sets(), 1);
-    assert_eq!(s.renderer.video_bytes(), (0, 0), "the old frame's planes");
-    assert!(
-        !matches!(s.play_movies(1_000_000)[0], MovieShow::Frame { .. }),
-        "no frame of the last play"
-    );
-}
-
-/// A visible loading state draws the play's movies from its own screen
-/// clock and polls them while it draws: with the peer still pending (the
-/// preparation not settled), the ready clip moves on through 1 s, 1.5 s
-/// and 2 s rather than holding a frame.
+/// A visible loading state draws the play's movies on its own clock and
+/// polls them while it draws: with the peer still pending (the preparation
+/// not settled), the ready clip moves on through 1 s, 1.5 s and 2 s rather
+/// than holding a frame.
 #[test]
 fn loading_with_a_pending_peer_keeps_the_ready_clip_moving() {
     let _turn = crate::warp_turn::take();
@@ -239,27 +312,11 @@ fn loading_with_a_pending_peer_keeps_the_ready_clip_moving() {
     let play = bundle(&dir);
     let hub = MediaHub::with(None);
     let mut s = screen(&hub);
-    s.play_state(1);
-    let a = Movie::live_here(1, 64, 32);
+    let a = clip(&[0, 1_000_000, 1_500_000, 2_000_000]);
     let pending = Movie::new(1);
-    for (seq, stamp, id) in [
-        (1, 0, 1),
-        (2, 1_000_000, 2),
-        (3, 1_500_000, 3),
-        (4, 2_000_000, 4),
-    ] {
-        publish(&a, seq, stamp, id);
-    }
-    let mut set = MovieSet::of(
-        &hub,
-        ScreenKind::Play,
-        &play,
-        1,
-        [Some(Arc::clone(&a)), Some(Arc::clone(&pending))],
-        Instant::now(),
-    );
-    set.preparing = Some(1);
-    hold(&mut s, set);
+    hub.supply([Some(Arc::clone(&a)), Some(Arc::clone(&pending))]);
+    s.open_play_movies(Some(&play), 1);
+    s.movie_boundary();
     let page = super::MenuPage::default();
     let mut freed = Vec::new();
     for (k, at) in [0, 1_000_000, 1_500_000, 2_000_000].into_iter().enumerate() {
@@ -290,22 +347,8 @@ fn selection_movie_admission_alloc() {
     let selection = bundle(&dir);
     let hub = MediaHub::with(None);
     let mut s = screen(&hub);
-    let a = Movie::live_here(1, 64, 32);
-    for seq in 1..=4_u64 {
-        let stamp = i64::try_from(seq).unwrap() * 16_667;
-        publish(&a, seq, stamp, u8::try_from(seq).unwrap());
-    }
-    hold(
-        &mut s,
-        MovieSet::of(
-            &hub,
-            ScreenKind::Selection,
-            &selection,
-            7,
-            [Some(Arc::clone(&a)), None],
-            Instant::now(),
-        ),
-    );
+    hub.supply([Some(clip(&[16_667, 33_334, 50_001, 66_668])), None]);
+    s.enter_selection_movies(&selection, 7, TimeUs(0));
     // Live, not admitted yet: the frame neither admits nor reserves.
     let before = this_thread();
     let shows = s.selection_movies(TimeUs(16_667));
@@ -314,7 +357,7 @@ fn selection_movie_admission_alloc() {
     assert_eq!(shows[0], MovieShow::Nothing);
     assert_eq!(s.renderer.video_bytes(), (0, 0));
     // The boundary: admitted, its planes reserved by the renderer.
-    s.admit_selection_movies();
+    s.movie_boundary();
     let (texels, _) = s.renderer.video_bytes();
     assert_eq!(texels, 64 * 32 + 2 * 32 * 16, "the movie's planes");
     let before = app_allocations();

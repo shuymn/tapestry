@@ -128,6 +128,30 @@ impl Rig {
         started.elapsed()
     }
 
+    /// A clip of `spec` (`--dev-gen-clip`'s codec, container, size, rate,
+    /// frames and group) named `name` beside the rig's own.
+    fn clip_of(&self, name: &str, spec: &str) -> PathBuf {
+        let path = self.clip.with_file_name(name);
+        let out = Command::new(WORKER)
+            .arg("--dev-gen-clip")
+            .arg(&path)
+            .args(spec.split(' '))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        path
+    }
+
+    /// Asks for the file at `path` as `movie`, looping.
+    fn open_path(&self, movie: &Arc<Movie>, path: &std::path::Path) {
+        self.session
+            .open(movie, std::fs::File::open(path).unwrap(), true);
+    }
+
     /// Shows the screen of `generation`: how long the hand-off took.
     fn enter(&self, generation: u64) -> Duration {
         let started = Instant::now();
@@ -877,6 +901,38 @@ fn live_movie_without_a_frame_is_lost_at_the_preparation_deadline() {
     assert_eq!(movie.loss(), Some(Loss::Preparation));
     assert!(movie.live().is_some());
     drop(render);
+}
+
+/// The screen's pixel total is applied at a movie's probe, before its
+/// ring is made (design.md "Memory Budget"): with a 2048 × 1536 movie live,
+/// a 1280 × 1024 peer passes the 2048 × 2048 total and is refused, lost
+/// over its cap with no ring mapped; the control, a 1024 × 1024 peer,
+/// meets the total exactly and plays.
+// Covers: T02
+#[test]
+fn a_movie_past_the_total_maps_no_ring() {
+    for (peer, refused) in [("1280x1024", true), ("1024x1024", false)] {
+        let rig = Rig::serving(&[]);
+        rig.session.enter(1);
+        let big = Movie::new(1);
+        rig.open_path(
+            &big,
+            &rig.clip_of("big.mpg", "mpeg1video mpeg 2048x1536 30 10 5"),
+        );
+        until(LAUNCH, || big.status() == Status::Live).expect("the first never live");
+        let spec = format!("mpeg1video mpeg {peer} 30 10 5");
+        let movie = Movie::new(1);
+        rig.open_path(&movie, &rig.clip_of("peer.mpg", &spec));
+        until(LAUNCH, || movie.status() != Status::Pending).expect("the peer never judged");
+        if refused {
+            assert_eq!(movie.loss(), Some(Loss::OverTotal), "{peer}");
+            assert!(movie.live().is_none(), "{peer}: a ring mapped");
+        } else {
+            assert_eq!(movie.status(), Status::Live, "{peer}");
+            assert!(movie.live().is_some());
+        }
+        assert_eq!(big.status(), Status::Live, "{peer}: the first plays on");
+    }
 }
 
 // Covers: T02

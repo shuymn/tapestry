@@ -493,6 +493,49 @@ struct Player {
     progress: (u64, Instant),
     /// Its video's loss has been logged.
     noted: bool,
+    /// Its probe, answered and held back by the screen's pixel total until
+    /// every earlier video of its screen has its ring or is gone
+    /// ([`Supervisor::admit_probe`]).
+    held: Option<Probe>,
+}
+
+/// What a probe said of a video, as its ring is made from it.
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    width: u32,
+    height: u32,
+    duration: i64,
+    matrix: Matrix,
+    range: Range,
+}
+
+/// The pixel total's verdict on a probed video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// An earlier video of its screen has no ring yet and is not gone:
+    /// asked again at the next look.
+    Defer,
+    /// It fits with the rings its screen holds: its ring is made.
+    Admit,
+    /// It passes the total: refused before any ring, it draws nothing.
+    Refuse,
+}
+
+/// Judges a probed video of `pixels` luma pixels on a screen whose rings
+/// made so far hold `charged` luma pixels, `earlier_pending` when an earlier
+/// video of the screen, in its skin's declaration order, has no ring yet and
+/// is not gone: deferred then, admitted while the total stays within
+/// [`skin_model::movie::MAX_MOVIE_PIXELS`], refused past it. A ring once
+/// made stays charged for the rest of its screen, lost or not, so no change
+/// of a video's state frees pixels whose ring may still be mapped.
+pub fn total(earlier_pending: bool, charged: u64, pixels: u64) -> Verdict {
+    if earlier_pending {
+        Verdict::Defer
+    } else if charged.saturating_add(pixels) <= skin_model::movie::MAX_MOVIE_PIXELS {
+        Verdict::Admit
+    } else {
+        Verdict::Refuse
+    }
 }
 
 impl Player {
@@ -504,6 +547,10 @@ impl Player {
 
     /// The command its stage waits on, and how long its answer may take.
     fn awaited(&self, deadlines: &Deadlines) -> Option<(u32, Duration)> {
+        // A probe held back was answered: nothing is awaited of the worker.
+        if self.held.is_some() {
+            return None;
+        }
         match self.stage {
             Stage::Opening(id) | Stage::Playing(id) => Some((id, deadlines.answer)),
             Stage::Closing(id) => Some((id, deadlines.close)),
@@ -580,6 +627,9 @@ struct Supervisor {
     notes: Notes,
     /// The game's hand-off losses logged so far.
     queue_noted: u32,
+    /// The screen (its generation) whose rings were made last, and the luma
+    /// pixels of every ring made for it: the pixel total's charge.
+    charged: (u64, u64),
 }
 
 impl Supervisor {
@@ -599,6 +649,7 @@ impl Supervisor {
             strikes: Strikes::default(),
             notes: Notes::start(),
             queue_noted: 0,
+            charged: (0, 0),
         }
     }
 
@@ -664,6 +715,7 @@ impl Supervisor {
             written: None,
             progress: (0, now),
             noted: false,
+            held: None,
         });
     }
 
@@ -712,6 +764,10 @@ impl Supervisor {
             return;
         }
         self.start_queued();
+        self.retry_held(generation);
+        if self.worker.is_none() {
+            return;
+        }
         self.judge(generation, now, settled);
         if self.marked && !self.players.iter().any(Player::live) {
             self.fail_worker(Loss::Answer);
@@ -1026,7 +1082,16 @@ impl Supervisor {
                     matrix,
                     range,
                     ..
-                } => self.play(i, width, height, duration, matrix, range),
+                } => self.admit_probe(
+                    i,
+                    Probe {
+                        width,
+                        height,
+                        duration,
+                        matrix,
+                        range,
+                    },
+                ),
                 _ => Ok(()),
             },
         }
@@ -1096,17 +1161,87 @@ impl Supervisor {
         }
     }
 
-    /// Sets up player `i`'s ring for a probe of `width` × `height` and
-    /// sends its play.
-    fn play(
-        &mut self,
-        i: usize,
-        width: u32,
-        height: u32,
-        duration: i64,
-        matrix: Matrix,
-        range: Range,
-    ) -> Result<(), Loss> {
+    /// Applies the screen's pixel total to player `i`'s `probe` before any
+    /// ring is made for it ([`total`]): the earlier videos of its screen are
+    /// the players queued before it with its generation, in the order the
+    /// screen asked for them (its skin's declaration order). Held back while
+    /// one of them has no ring yet and is not gone; refused past the total,
+    /// lost for [`Loss::OverTotal`] and closed with no ring; else charged,
+    /// and its ring is made and its play sent.
+    fn admit_probe(&mut self, i: usize, probe: Probe) -> Result<(), Loss> {
+        let Some(p) = self.players.get(i) else {
+            return Ok(());
+        };
+        let generation = p.movie.generation();
+        let earlier_pending = self.players.iter().take(i).any(|q| {
+            q.movie.generation() == generation
+                && q.movie.status() == Status::Pending
+                && q.movie.live().is_none()
+        });
+        if self.charged.0 != generation {
+            self.charged = (generation, 0);
+        }
+        let pixels = u64::from(probe.width) * u64::from(probe.height);
+        match total(earlier_pending, self.charged.1, pixels) {
+            Verdict::Defer => {
+                if let Some(p) = self.players.get_mut(i) {
+                    p.held = Some(probe);
+                }
+                Ok(())
+            }
+            Verdict::Refuse => {
+                if let Some(p) = self.players.get(i)
+                    && p.movie.lose(Loss::OverTotal)
+                {
+                    event!(
+                        self.shared,
+                        Event::Lost {
+                            why: Loss::OverTotal
+                        }
+                    );
+                }
+                self.close(i)
+            }
+            Verdict::Admit => {
+                self.charged.1 = self.charged.1.saturating_add(pixels);
+                self.play(i, probe)
+            }
+        }
+    }
+
+    /// Asks the pixel total again of every probe held back, in the
+    /// screen's order: one of a screen no longer shown, or whose video is
+    /// no longer pending, is closed instead.
+    fn retry_held(&mut self, generation: u64) {
+        for i in 0..self.players.len() {
+            let Some(p) = self.players.get_mut(i) else {
+                break;
+            };
+            let Some(probe) = p.held.take() else {
+                continue;
+            };
+            let done = if p.movie.generation() == generation && p.movie.status() == Status::Pending
+            {
+                self.admit_probe(i, probe)
+            } else {
+                self.close(i)
+            };
+            if let Err(why) = done {
+                self.fail_worker(why);
+                return;
+            }
+        }
+    }
+
+    /// Sets up player `i`'s ring for its `probe` and sends its play.
+    fn play(&mut self, i: usize, probe: Probe) -> Result<(), Loss> {
+        let Probe {
+            width,
+            height,
+            duration,
+            matrix,
+            range,
+        } = probe;
         let Some(geometry) = Geometry::new(width, height) else {
             if let Some(p) = self.players.get_mut(i) {
                 p.movie.lose(Loss::Failed);
@@ -1331,6 +1466,112 @@ mod tests {
     use super::*;
 
     const LIMIT: Duration = Deadlines::GAME.progress;
+
+    /// The pixel total before any ring: a video alone at the total is
+    /// admitted and one pixel past it refused; a second that fits beside
+    /// the first's ring is admitted, one that does not is refused; while an
+    /// earlier video of the screen has no ring, the verdict waits.
+    #[test]
+    fn the_pixel_total_is_applied_in_slot_order_before_any_ring() {
+        use skin_model::movie::MAX_MOVIE_PIXELS;
+        let hd = 1920 * 1080;
+        assert_eq!(total(false, 0, MAX_MOVIE_PIXELS), Verdict::Admit);
+        assert_eq!(total(false, 0, MAX_MOVIE_PIXELS + 1), Verdict::Refuse);
+        assert_eq!(total(false, hd, hd), Verdict::Admit);
+        assert_eq!(total(false, 2560 * 1440, 1280 * 720), Verdict::Refuse);
+        assert_eq!(total(true, 0, 1), Verdict::Defer);
+    }
+
+    /// A session with no worker showing the screen of `generation`.
+    fn supervisor(generation: u64) -> Supervisor {
+        let shared = Arc::new(Shared {
+            generation: AtomicU64::new(generation),
+            pid: AtomicU32::new(0),
+            queue_lost: AtomicU32::new(0),
+            events: Mutex::new(Vec::new()),
+            origin: Instant::now(),
+            beats: Mutex::new(Vec::new()),
+        });
+        let launching = Launching {
+            installation: PathBuf::new(),
+            data: PathBuf::new(),
+            setup: Setup::recipe(),
+        };
+        Supervisor::new(launching, Deadlines::GAME, shared)
+    }
+
+    /// A player of `movie` whose open, by `id`, the worker has.
+    fn opening(movie: &Arc<Movie>, id: u8) -> Player {
+        let now = Instant::now();
+        Player {
+            id,
+            movie: Arc::clone(movie),
+            file: None,
+            looping: true,
+            stage: Stage::Opening(u32::from(id)),
+            queued: now,
+            written: None,
+            progress: (0, now),
+            noted: false,
+            held: None,
+        }
+    }
+
+    /// A probe of `width` × `height`.
+    const fn probe(width: u32, height: u32) -> Probe {
+        Probe {
+            width,
+            height,
+            duration: 1_000_000,
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
+        }
+    }
+
+    /// A probe answered while an earlier video of its screen has no ring
+    /// is held back, nothing charged; once that video is gone, the next
+    /// look judges it alone and charges it.
+    #[test]
+    fn a_probe_waits_for_the_earlier_videos_of_its_screen() {
+        let mut s = supervisor(1);
+        let (a, b) = (Movie::new(1), Movie::new(1));
+        s.players = vec![opening(&a, 1), opening(&b, 2)];
+        s.admit_probe(1, probe(1280, 1024)).unwrap();
+        assert!(s.players[1].held.is_some(), "held while slot 0 has no ring");
+        assert!(s.players[1].awaited(&Deadlines::GAME).is_none());
+        assert_eq!(s.charged.1, 0);
+        assert_eq!(b.status(), Status::Pending);
+        let _ = a.lose(Loss::Failed);
+        s.retry_held(1);
+        assert!(s.players[1].held.is_none());
+        assert_eq!(s.charged, (1, 1280 * 1024));
+        assert_eq!(b.loss(), None);
+    }
+
+    /// A video's ring stays charged for the rest of its screen, lost or not:
+    /// a 2048 × 1536 video admitted then lost (its ring still mapped by the
+    /// render side) leaves no room for a 1280 × 1024 peer, which is refused
+    /// at its probe and gets no ring. The next screen starts with nothing
+    /// charged.
+    #[test]
+    fn a_lost_video_s_ring_stays_charged_for_its_screen() {
+        let mut s = supervisor(1);
+        let (a, b) = (Movie::new(1), Movie::new(1));
+        s.players = vec![opening(&a, 1), opening(&b, 2)];
+        s.admit_probe(0, probe(2048, 1536)).unwrap();
+        assert_eq!(s.charged, (1, 2048 * 1536));
+        let _ = a.lose(Loss::Fault);
+        s.admit_probe(1, probe(1280, 1024)).unwrap();
+        assert_eq!(b.loss(), Some(Loss::OverTotal), "the peer refused");
+        assert!(b.live().is_none(), "no ring for it");
+        assert_eq!(s.charged, (1, 2048 * 1536));
+        // The next screen.
+        let c = Movie::new(2);
+        s.players = vec![opening(&c, 3)];
+        s.admit_probe(0, probe(2048, 2048)).unwrap();
+        assert_eq!(s.charged, (2, 2048 * 2048));
+        assert_eq!(c.loss(), None);
+    }
 
     /// The rule's verdict at each of `steps` (the time since the start, what
     /// is seen then), from a word of 0 seen at the start.

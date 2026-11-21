@@ -64,11 +64,6 @@ impl Turntable {
         }
     }
 
-    /// The number of the play state adopted last; 0 before any.
-    pub(crate) fn play_state(&self) -> u64 {
-        self.clock.number().unwrap_or(0)
-    }
-
     /// Play state `number`'s pause.
     pub(crate) const fn pause(&mut self, number: u64) {
         self.clock.pause(number);
