@@ -1331,10 +1331,11 @@ mod tests {
                 let again = r[i].clone();
                 r.insert(i, again);
             }),
+            // Requested before the last click (q 330), its frame taken after
+            // the buttons were held: only the last-click order fails.
             ("A before the last click", SHOT_A, |r| {
                 let i = at(r, SHOT_A);
-                r[i]["requested"] = serde_json::json!(300);
-                r[i]["frame"]["acquired"] = serde_json::json!(310);
+                r[i]["requested"] = serde_json::json!(320);
             }),
             ("A before the buttons held", SHOT_A, |r| {
                 let i = at(r, SHOT_A);
