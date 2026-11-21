@@ -630,6 +630,9 @@ struct Supervisor {
     /// The screen (its generation) whose rings were made last, and the luma
     /// pixels of every ring made for it: the pixel total's charge.
     charged: (u64, u64),
+    /// Every ring's creation fails (tests).
+    #[cfg(test)]
+    ring_fails: bool,
 }
 
 impl Supervisor {
@@ -650,6 +653,8 @@ impl Supervisor {
             notes: Notes::start(),
             queue_noted: 0,
             charged: (0, 0),
+            #[cfg(test)]
+            ring_fails: false,
         }
     }
 
@@ -764,7 +769,7 @@ impl Supervisor {
             return;
         }
         self.start_queued();
-        self.retry_held(generation);
+        self.retry_held();
         if self.worker.is_none() {
             return;
         }
@@ -1166,8 +1171,8 @@ impl Supervisor {
     /// the players queued before it with its generation, in the order the
     /// screen asked for them (its skin's declaration order). Held back while
     /// one of them has no ring yet and is not gone; refused past the total,
-    /// lost for [`Loss::OverTotal`] and closed with no ring; else charged,
-    /// and its ring is made and its play sent.
+    /// lost for [`Loss::OverTotal`] and closed with no ring; else its ring
+    /// is made, charged once it exists, and its play sent.
     fn admit_probe(&mut self, i: usize, probe: Probe) -> Result<(), Loss> {
         let Some(p) = self.players.get(i) else {
             return Ok(());
@@ -1202,18 +1207,18 @@ impl Supervisor {
                 }
                 self.close(i)
             }
-            Verdict::Admit => {
-                self.charged.1 = self.charged.1.saturating_add(pixels);
-                self.play(i, probe)
-            }
+            Verdict::Admit => self.play(i, probe),
         }
     }
 
     /// Asks the pixel total again of every probe held back, in the
     /// screen's order: one of a screen no longer shown, or whose video is
-    /// no longer pending, is closed instead.
-    fn retry_held(&mut self, generation: u64) {
+    /// no longer pending, is closed instead. The screen shown is read at
+    /// each admission, after the replies were taken, so a screen left
+    /// meanwhile gets no ring.
+    fn retry_held(&mut self) {
         for i in 0..self.players.len() {
+            let generation = self.shared.generation.load(Ordering::Acquire);
             let Some(p) = self.players.get_mut(i) else {
                 break;
             };
@@ -1233,7 +1238,9 @@ impl Supervisor {
         }
     }
 
-    /// Sets up player `i`'s ring for its `probe` and sends its play.
+    /// Sets up player `i`'s ring for its `probe`, charges its pixels to
+    /// the screen once the ring exists (a ring whose creation failed spends
+    /// nothing), and sends its play.
     fn play(&mut self, i: usize, probe: Probe) -> Result<(), Loss> {
         let Probe {
             width,
@@ -1268,6 +1275,12 @@ impl Supervisor {
                 range,
             })
         });
+        #[cfg(test)]
+        let made = made.filter(|_| !self.ring_fails);
+        if made.is_some() {
+            let pixels = u64::from(width) * u64::from(height);
+            self.charged.1 = self.charged.1.saturating_add(pixels);
+        }
         let (Some(p), Some(worker)) = (self.players.get_mut(i), self.worker.as_mut()) else {
             return Ok(());
         };
@@ -1542,10 +1555,49 @@ mod tests {
         assert_eq!(s.charged.1, 0);
         assert_eq!(b.status(), Status::Pending);
         let _ = a.lose(Loss::Failed);
-        s.retry_held(1);
+        s.retry_held();
         assert!(s.players[1].held.is_none());
         assert_eq!(s.charged, (1, 1280 * 1024));
         assert_eq!(b.loss(), None);
+    }
+
+    /// A probe held back whose screen is left before it is asked again
+    /// gets no ring: the screen shown is read at its admission, not where
+    /// the look began. Slot 1 of screen 1 is held behind slot 0; slot 0 is
+    /// lost and screen 2 entered; the retry closes slot 1 with nothing
+    /// charged and no ring.
+    #[test]
+    fn a_held_probe_of_a_screen_left_meanwhile_gets_no_ring() {
+        let mut s = supervisor(1);
+        let (a, b) = (Movie::new(1), Movie::new(1));
+        s.players = vec![opening(&a, 1), opening(&b, 2)];
+        s.admit_probe(1, probe(1280, 1024)).unwrap();
+        assert!(s.players[1].held.is_some());
+        let _ = a.lose(Loss::Failed);
+        s.shared.generation.store(2, Ordering::Release);
+        s.retry_held();
+        assert!(s.players[1].held.is_none());
+        assert_eq!(s.charged.1, 0, "no ring made for a screen left");
+    }
+
+    /// A ring whose creation fails spends nothing of the total: a
+    /// 2048 × 1536 video admitted whose ring cannot be made leaves nothing
+    /// charged, so a 1280 × 1024 peer of the same screen still fits (the
+    /// two together would not) and its ring is charged alone.
+    #[test]
+    fn a_failed_ring_creation_charges_nothing() {
+        let mut s = supervisor(1);
+        let (a, b) = (Movie::new(1), Movie::new(1));
+        s.players = vec![opening(&a, 1), opening(&b, 2)];
+        s.ring_fails = true;
+        s.admit_probe(0, probe(2048, 1536)).unwrap();
+        assert_eq!(s.charged, (1, 0), "a ring never made is not charged");
+        // Its loss, as a session with a worker records it.
+        let _ = a.lose(Loss::Failed);
+        s.ring_fails = false;
+        s.admit_probe(1, probe(1280, 1024)).unwrap();
+        assert_eq!(b.loss(), None, "the peer fits");
+        assert_eq!(s.charged, (1, 1280 * 1024));
     }
 
     /// A video's ring stays charged for the rest of its screen, lost or not:
