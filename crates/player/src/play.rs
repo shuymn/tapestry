@@ -336,6 +336,10 @@ pub struct PlayerRig<'a> {
     /// What the play skin declares, from the current attempt's commit
     /// receipt ([`commit_ready`]); none declared before it.
     pub declared: Declared,
+    /// The attempt committed and its play not begun (no play message
+    /// sent): a stop before recording opens abandons it on the render
+    /// thread.
+    pub committed_unplayed: bool,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -2528,6 +2532,7 @@ impl Rig for PlayerRig<'_> {
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared)?;
+        self.committed_unplayed = true;
         self.chart_images.committed();
         self.bga.committed();
         // The attempt's sources and result half move to the result,
@@ -2977,8 +2982,11 @@ impl Rig for PlayerRig<'_> {
 
     fn end_presentation(&mut self) {
         // A play committed and left before it began takes its movies
-        // with it; a preparation kept for a local retry keeps them.
-        self.render.abandon_attempt();
+        // with it; a stop before the commit (a preparation discarded, or
+        // kept for a local retry) sends nothing.
+        if std::mem::take(&mut self.committed_unplayed) {
+            self.render.abandon_attempt();
+        }
         #[cfg(feature = "dev-tools")]
         self.input.end_loading_script();
         if let Some(driver) = &mut self.adjust {
@@ -3231,6 +3239,7 @@ impl Rig for PlayerRig<'_> {
         // in for none.
         let state_origin = self.state_clock.origin().unwrap_or(self.load_start);
         self.interval = Some(self.render.scripts().open_interval());
+        self.committed_unplayed = false;
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.attempt_gauge,
