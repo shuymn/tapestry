@@ -4158,6 +4158,14 @@ impl RenderLink {
         self.shared.refuse_step.store(true, Ordering::SeqCst);
     }
 
+    /// The render loop's points a test can hold it at (tests): `0` after a
+    /// pass's boundary, before its frame reads the window's size; `1`
+    /// after that read; `2` after the frame's draw.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn frame_gate(&self, at: usize) -> &TestGate {
+        &self.shared.frame_gates[at]
+    }
+
     /// The pass the last result view's creation ran in, 0 none (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn creation_pass(&self) -> u64 {
@@ -8101,10 +8109,18 @@ impl Run {
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
+            // The window's size this turn's result frame is prepared and
+            // drawn for, read once: the notices published before it and
+            // the size. A notice published later leaves the frame's image
+            // invalid, and its size applies next turn.
+            let mut turn_extent = None;
             if matches!(mode, Mode::Result) {
                 // The window's newest size first: the strip's lines laid
                 // out here are placed for the target the frame draws on.
-                self.apply_extent();
+                let notices = notices_of(self.extent.as_ref());
+                let size = self.extent.as_ref().and_then(|e| e.latest());
+                turn_extent = Some((notices, size));
+                self.apply_size(size);
                 #[cfg(feature = "dev-tools")]
                 let (prepared, p_own) = (Instant::now(), render::probe::own_time());
                 self.prepare_result();
@@ -8163,9 +8179,21 @@ impl Run {
             // The frame's token, before it reads the window's size: a
             // notice or a target change from here on leaves what it
             // presents invalid.
-            let token = self.image.token(notices_of(self.extent.as_ref()));
-            // The window's newest size, between frames.
-            self.apply_extent();
+            // A result frame's: the turn's notices and size, applied again
+            // only to a screen built since.
+            let token = match turn_extent {
+                Some((notices, size)) => {
+                    let token = self.image.token(notices);
+                    self.apply_size(size);
+                    token
+                }
+                None => {
+                    let token = self.image.token(notices_of(self.extent.as_ref()));
+                    // The window's newest size, between frames.
+                    self.apply_extent();
+                    token
+                }
+            };
             #[cfg(test)]
             self.shared.frame_gates[1].pass();
             // The decision labels' work at this frame boundary, outside
@@ -9964,7 +9992,13 @@ impl Run {
     /// Applies the window's newest size to the screen, between frames, if
     /// it is not the one applied.
     fn apply_extent(&mut self) {
-        if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
+        self.apply_size(self.extent.as_ref().and_then(|e| e.latest()));
+    }
+
+    /// Applies `size`, the window's as read, to the screen, between
+    /// frames, if it is not the one applied.
+    fn apply_size(&mut self, size: Option<(u32, u32)>) {
+        if let Some(size) = size
             && self.applied != Some(size)
             && let Some(screen) = &mut self.screen
         {

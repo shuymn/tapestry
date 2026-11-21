@@ -2070,6 +2070,72 @@ fn a_plays_only_screen_built_again_keeps_the_font() {
     });
 }
 
+/// Lets the render loop's points go, the test's end or panic.
+struct GatesGo<'a>(&'a RenderLink);
+
+impl Drop for GatesGo<'_> {
+    fn drop(&mut self) {
+        for at in 0..3 {
+            self.0.frame_gate(at).hold(false);
+        }
+    }
+}
+
+/// Waits until the render loop waits at `gate`, at most 20 s.
+fn held_at(gate: &crate::render_side::TestGate, what: &str) {
+    let end = Instant::now() + Duration::from_secs(20);
+    while !gate.waiting() {
+        assert!(Instant::now() < end, "the render thread never held {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The result's view shown with its strip, the font in hand: a size
+/// notice published after a pass prepared its result, before its frame
+/// reads the window's size, applies from the next pass. Every frame
+/// draws its strip placed for the size it is drawn at, so no committed
+/// frame draws without it (V19 (k), the strip).
+#[test]
+fn a_size_notice_after_the_preparation_applies_next_turn() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        frames.glyphs.store(true, Ordering::Release);
+        let extent = Arc::new(crate::render_side::Extent::default());
+        extent.publish(1_920, 1_080);
+        rig.render.follow(&extent);
+        let (mut report, screen) = result_of(dir.path());
+        report.best = Some(game::BestView::NotCounted("a test's reason".to_owned()));
+        let _skin = pending_skin(rig, &a);
+        frames.arm();
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        laid_out(rig);
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        frames.until(rig, handed, "the view with its strip", |f| {
+            f.iter().filter(|f| strip_placed(f)).count() >= 2
+        });
+        let link = &rig.render;
+        let _go = GatesGo(link);
+        let after_boundary = link.frame_gate(0);
+        after_boundary.hold(true);
+        held_at(after_boundary, "after a result pass's boundary");
+        let at = frames.len();
+        extent.publish(1_000, 1_000);
+        after_boundary.hold(false);
+        drop(_go);
+        let after = frames.until(rig, at, "frames at the new size", |f| {
+            f.iter().filter(|f| f.size == (1_000, 1_000)).count() >= 2
+        });
+        assert!(
+            after.iter().all(strip_placed),
+            "a frame without its strip placed for its size: {after:?}"
+        );
+        rig.leave_result();
+    });
+}
+
 /// No result skin: no hold, and the built-in end page at once from the
 /// hand-over, past the bound with no pending frame (V19 (k), its second
 /// case).
