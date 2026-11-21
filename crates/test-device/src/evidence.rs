@@ -221,8 +221,9 @@ pub enum Run {
     /// A child the runner started: its name in the row and its process.
     Spawn(Child),
     /// The runner terminated a child it started, and every process in the
-    /// job it started that child in, with its cut code.
-    Kill(Child),
+    /// job it started that child in, with its cut code: written once the
+    /// termination call returned.
+    Kill(RunKill),
     /// The runner's sink window, once it shows.
     Sink(RunWindow),
     /// The runner's recorder shows every press the row holds, from the
@@ -249,8 +250,8 @@ pub enum Run {
     /// The device's `hello` after the run's mode step, as the mode link
     /// recorded it: the mode the run's reports come in.
     Mode(RunLine),
-    /// A shot captured from the run's window: its file in the run's folder,
-    /// sealed once written, and whether the captured area was the window's.
+    /// A shot of the player's window: its file in the run's folder, sealed
+    /// once written, and the window and process it was captured from.
     Shot(RunShot),
     /// The kill barrier: the run waits here, holding, for its outer to end
     /// it.
@@ -307,6 +308,20 @@ pub struct Child {
     pub process: Process,
 }
 
+/// A termination the runner made: the child's name and process, the host
+/// counter read just before the termination call (`requested`) and the
+/// record's own, written once the call returned. Whatever the recorder saw
+/// before `requested` came before the termination; between the two, its
+/// order with the termination is unknown.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunKill {
+    pub q: i64,
+    pub name: String,
+    pub process: Process,
+    pub requested: i64,
+}
+
 /// A window of the runner's, by its handle's value.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -333,17 +348,17 @@ pub struct RunCall {
     pub point: [i32; 2],
 }
 
-/// A shot: its file, and the evidence that the screen's pixels it copied
-/// were the run's window's: `owned` when the run's window was in front with
-/// its client area unchanged and no other window above it over that area,
-/// before and after the copy; else `doubts` says what was seen.
+/// A shot: its file, the player's window it captured by its handle (the
+/// window's own pixels, whatever covered it), that window's process, as
+/// checked before and after the capture, and the captured size.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunShot {
     pub q: i64,
     pub what: String,
-    pub owned: bool,
-    pub doubts: Vec<String>,
+    pub window: u64,
+    pub process: Process,
+    pub size: [i32; 2],
 }
 
 /// A line the runner observed, with its host counter.
@@ -362,12 +377,27 @@ pub struct RunNote {
     pub what: String,
 }
 
-/// The player's executable.
+/// A file of the player's private copy and its sha256.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopiedFile {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// The player's executable: the sha256 is the copy's, read through the
+/// handle that keeps it unchanged while the run lasts.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunPlayer {
     pub q: i64,
+    /// The private copy the run starts.
     pub path: String,
+    /// The executable it was copied from.
+    pub source: String,
+    /// Every file copied with it (the executable first, then its media
+    /// worker and DLLs), each with the sha256 of the copy.
+    pub files: Vec<CopiedFile>,
     pub sha256: String,
     /// The sha256 the row declared for it (P5's mutated player).
     pub declared: Option<String>,
@@ -431,7 +461,8 @@ impl Kinds for Run {
 
     fn q(&self) -> Option<i64> {
         match self {
-            Self::Spawn(c) | Self::Kill(c) => Some(c.q),
+            Self::Spawn(c) => Some(c.q),
+            Self::Kill(k) => Some(k.q),
             Self::Sink(r) | Self::Close(r) | Self::Window(r) => Some(r.q),
             Self::Call(r) => Some(r.q),
             Self::Quiet(r) | Self::Mode(r) => Some(r.q),

@@ -21,7 +21,7 @@ use test_device::provenance;
 use super::guard::SLICE_MS;
 use super::launch::{DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE};
 use super::listen::{BUTTON_EDGES, a_runner_s};
-use super::run::{F24_SCAN, MODE_LINK, PANEL_MODE, SELECT, START, pad_buttons};
+use super::run::{F24_SCAN, FOCUS_POINT, MODE_LINK, PANEL_MODE, SELECT, START, pad_buttons};
 
 /// The producer's name.
 pub const PRODUCER: &str = "judge";
@@ -83,7 +83,7 @@ pub struct Files {
 }
 
 impl Files {
-    fn read(dir: &Path) -> Self {
+    pub fn read(dir: &Path) -> Self {
         Self {
             run: Stream::read::<evidence::Run>(&dir.join(RUN)),
             link: Stream::read::<evidence::Link>(&dir.join(LINK)),
@@ -526,7 +526,13 @@ fn panel_provenance(
     if let Err(why) = provenance(build, &[(LINK, &f.link), (MODE_LINK, mode)])? {
         return Ok(Err(why));
     }
-    for v in recs(&f.link)?.iter().filter(|v| v["t"] == "ans") {
+    in_panel_mode(&f.link)
+}
+
+/// Every `hello` the driving connection `link` read reports in
+/// [`PANEL_MODE`].
+fn in_panel_mode(link: &Stream) -> Result<Result<(), String>, String> {
+    for v in recs(link)?.iter().filter(|v| v["t"] == "ans") {
         if let Some(Answer::Hello(h)) = v["line"].as_str().and_then(Answer::parse_canonical)
             && h.mode != PANEL_MODE
         {
@@ -612,6 +618,7 @@ pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
 
 const INNER_RUN: (&str, &str) = (INNER, RUN);
 const INNER_LINK: (&str, &str) = (INNER, LINK);
+const INNER_MODE: (&str, &str) = (INNER, MODE_LINK);
 
 /// An outer row's checks: their ids, the fixture record the inner reaches
 /// before the kill, what the inner holds, and whether it started a player.
@@ -655,9 +662,31 @@ pub const N2P: Kill = Kill {
     key: false,
 };
 
+/// The outer's kill of the inner: the counter read just before the
+/// termination call, and the record's own, written once it returned.
+fn kill_of(run: &[Value]) -> Result<(i64, i64), String> {
+    let k = run
+        .iter()
+        .find(|v| v["t"] == "kill" && v["name"] == "inner")
+        .ok_or("the outer recorded no kill of the inner")?;
+    let requested = k["requested"]
+        .as_i64()
+        .ok_or("the outer's kill of the inner has no request counter")?;
+    Ok((requested, q(k)))
+}
+
 /// The verdicts of a run of outer row `k` (`sink-kill`, `p1-kill`):
-/// `outer` the outer's files, `inner` the inner's.
-pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<Judged> {
+/// `outer` the outer's files, `inner` the inner's, and for N2p the inner's
+/// mode link (`inner_mode`): the inner drives the device as a panel run, so
+/// its provenance takes its mode connection and its driving connection
+/// must report in the panel mode.
+pub fn kill(
+    k: &Kill,
+    build: Option<&str>,
+    outer: &Files,
+    inner: &Files,
+    inner_mode: Option<&Stream>,
+) -> Vec<Judged> {
     let abnormal = || -> Result<Result<(), String>, String> {
         let run = recs(&inner.run)?;
         let link = recs(&inner.link)?;
@@ -702,12 +731,7 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
         let first = hello_of(recs(&outer.link)?, "the outer")?;
         let inner_link = recs(&inner.link)?;
         let theirs = hello_of(inner_link, "the inner")?;
-        let run = recs(&outer.run)?;
-        let kill = run
-            .iter()
-            .find(|v| v["t"] == "kill" && v["name"] == "inner")
-            .map(q)
-            .ok_or("the outer recorded no kill of the inner")?;
+        let (kill, _) = kill_of(recs(&outer.run)?)?;
         if first.lease.is_some() || !first.quiet {
             return Ok(Err(format!(
                 "the outer's first `hello` is not quiet with no lease: {first:?}"
@@ -809,11 +833,7 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
             .find(|v| v["t"] == k.reached)
             .map(q)
             .ok_or_else(|| format!("the inner recorded no `{}`", k.reached))?;
-        let kill = recs(&outer.run)?
-            .iter()
-            .find(|v| v["t"] == "kill" && v["name"] == "inner")
-            .map(q)
-            .ok_or("the outer recorded no kill of the inner")?;
+        let (requested, kill) = kill_of(recs(&outer.run)?)?;
         let end = rec.iter().map(q).max().unwrap_or(i64::MAX);
         covered(rec, key.map_or(pad.q, |key| pad.q.min(key.q)), end)?;
         let pad_up = first_release(rec, pad, |v| {
@@ -840,12 +860,20 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
                     k.reached
                 )));
             }
-            if let Some(at) = up
-                && at <= kill
-            {
-                return Ok(Err(format!(
-                    "{what} were released at {at}, before the outer's kill at {kill}"
-                )));
+            match up {
+                Some(at) if at <= requested => {
+                    return Ok(Err(format!(
+                        "{what} were released at {at}, before the outer requested the kill at                          {requested}"
+                    )));
+                }
+                // Between the request and its return, the release's order
+                // with the termination is unknown.
+                Some(at) if at <= kill => {
+                    return Err(format!(
+                        "{what} were released at {at}, while the outer's kill was being                          requested ({requested} to {kill})"
+                    ));
+                }
+                _ => {}
             }
         }
         Ok(neutral_of(rec, pad, key))
@@ -880,12 +908,27 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
             )),
         })
     };
+    let origin = || -> Result<Result<(), String>, String> {
+        let mut links = vec![("outer", &outer.link), ("inner", &inner.link)];
+        if k.player_gone.is_some() {
+            let mode = inner_mode.ok_or("the inner's mode link was not read")?;
+            links.push(("inner mode", mode));
+        }
+        if let Err(why) = provenance(build, &links)? {
+            return Ok(Err(why));
+        }
+        if k.player_gone.is_some() {
+            return in_panel_mode(&inner.link);
+        }
+        Ok(Ok(()))
+    };
+    let origin_inputs: &[(&str, &str)] = if k.player_gone.is_some() {
+        &[RUN_LINK, INNER_LINK, INNER_MODE]
+    } else {
+        &[RUN_LINK, INNER_LINK]
+    };
     let mut out = vec![
-        verdict(
-            provenance::CHECK,
-            &[RUN_LINK, INNER_LINK],
-            provenance(build, &[("outer", &outer.link), ("inner", &inner.link)]),
-        ),
+        verdict(provenance::CHECK, origin_inputs, origin()),
         verdict(k.abnormal, &[INNER_RUN, INNER_LINK], abnormal()),
         verdict(k.neutral, &[RUN_RUN, RUN_REC, INNER_RUN], neutral_after()),
         verdict(k.quiet, &[RUN_RUN, RUN_LINK, INNER_LINK], quiet()),
@@ -1215,9 +1258,7 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
     let Some(held) = held_by(row) else {
         return Vec::new();
     };
-    let want: Vec<(&str, Option<(i32, i32)>)> = super::run::row(row, false)
-        .map(|steps| super::run::calls_of(&steps))
-        .unwrap_or_default();
+    let want = panel_calls();
     let span = |kind: &str| first_q(&f.run, kind);
     let bytes = |b: &Bytes| b.clone();
     let buttons = held.iter().fold(0_u16, |a, b| a | 1 << (b - 1));
@@ -1333,6 +1374,34 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
     out
 }
 
+/// The calls every panel row must make, from the target table alone, not
+/// from the runner's steps (which a broken runner would change along with
+/// its calls): the sink's focus click (its move and its click, at a point
+/// of its own), the player's focus click at [`FOCUS_POINT`], a calibration
+/// call at the focus point and at each target, then each target's move and
+/// click, in the table's order.
+pub fn panel_calls() -> Vec<(&'static str, Option<(i32, i32)>)> {
+    let targets: Vec<(i32, i32)> = test_device::panel::TARGETS
+        .iter()
+        .map(|t| (t.x, t.y))
+        .collect();
+    let mut out = vec![
+        ("move", None),
+        ("click", None),
+        ("move", Some(FOCUS_POINT)),
+        ("click", Some(FOCUS_POINT)),
+    ];
+    out.extend(
+        std::iter::once(FOCUS_POINT)
+            .chain(targets.iter().copied())
+            .map(|p| ("calibrate", Some(p))),
+    );
+    for p in targets {
+        out.extend([("move", Some(p)), ("click", Some(p))]);
+    }
+    out
+}
+
 /// The buttons a panel row holds.
 pub fn held_by(row: &str) -> Option<&'static [u8]> {
     match row {
@@ -1349,6 +1418,8 @@ pub struct Reading {
     start: Value,
     files: Files,
     inner: Option<Files>,
+    /// N2p's inner's mode link.
+    inner_mode: Option<Stream>,
     panel: Option<PanelFiles>,
 }
 
@@ -1377,10 +1448,13 @@ pub fn read(row: &str, dir: &Path) -> anyhow::Result<Reading> {
         _ if held_by(row).is_some() => (None, Some(PanelFiles::read(dir))),
         _ => anyhow::bail!("`judge` has no row `{row}`"),
     };
+    let inner_mode = (row == "p1-kill")
+        .then(|| Stream::read::<evidence::Link>(&dir.join(INNER).join(MODE_LINK)));
     Ok(Reading {
         start,
         files,
         inner,
+        inner_mode,
         panel,
     })
 }
@@ -1392,8 +1466,8 @@ pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
     let build = r.start["build"].as_str();
     let f = &r.files;
     let judged = match (row, &r.inner, &r.panel) {
-        ("sink-kill", Some(inner), _) => kill(&N2, build, f, inner),
-        ("p1-kill", Some(inner), _) => kill(&N2P, build, f, inner),
+        ("sink-kill", Some(inner), _) => kill(&N2, build, f, inner, None),
+        ("p1-kill", Some(inner), _) => kill(&N2P, build, f, inner, r.inner_mode.as_ref()),
         (_, _, Some(x)) => panel(build, f, x, row),
         _ => n1(build, f),
     };
@@ -1405,6 +1479,11 @@ pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
         };
         match (files, path) {
             (None, _) => String::new(),
+            (Some(_), MODE_LINK) if role == INNER => r
+                .inner_mode
+                .as_ref()
+                .map(|m| m.sha.clone())
+                .unwrap_or_default(),
             (Some(fs), RUN) => fs.run.sha.clone(),
             (Some(fs), LINK) => fs.link.sha.clone(),
             (Some(fs), RECORDER) => fs.recorder.sha.clone(),
@@ -1886,7 +1965,7 @@ pub mod tests {
         let outer = Files {
             run: Stream::of(vec![
                 json!({"t": "start", "cut": CUT}),
-                json!({"t": "kill", "q": 2050, "name": "inner"}),
+                json!({"t": "kill", "q": 2050, "name": "inner", "requested": 2045}),
                 json!({"t": "exit", "q": 2100, "name": "inner", "code": CUT}),
                 json!({"t": "exit", "q": 2200, "name": "inner-recorder", "code": CUT}),
                 json!({"t": "end", "exit": 0, "errors": []}),
@@ -1906,7 +1985,7 @@ pub mod tests {
     }
 
     fn n2_outcome(o: &Files, i: &Files, check: &str) -> Outcome {
-        kill(&N2, Some("0123456789ab"), o, i)
+        kill(&N2, Some("0123456789ab"), o, i, None)
             .into_iter()
             .find(|j| j.check == check)
             .unwrap()
@@ -1916,7 +1995,7 @@ pub mod tests {
     #[test]
     fn n2_needs_the_children_gone() {
         let (o, i) = n2_good();
-        let all: Vec<Outcome> = kill(&N2, Some("0123456789ab"), &o, &i)
+        let all: Vec<Outcome> = kill(&N2, Some("0123456789ab"), &o, &i, None)
             .into_iter()
             .map(|j| j.outcome)
             .collect();
@@ -2024,8 +2103,9 @@ pub mod tests {
         // Calls: the sink's focus (move, click), the player's focus (move,
         // click), four calibrations, three targets (move, click), tagged
         // 0xABCD0000 on, at 10-tick steps from 200.
+        // The runner's own calls, from its steps: a runner whose steps
+        // drift from the target table fails the click check.
         let calls = super::super::run::calls_of(&super::super::run::row("p1", false).unwrap());
-        assert_eq!(calls.len(), 14);
         let mut run = vec![
             json!({"t": "start"}),
             json!({"t": "sink", "q": 100, "window": SINK}),
@@ -2039,8 +2119,10 @@ pub mod tests {
         }
         run.extend([
             json!({"t": "held", "q": 1700}),
-            json!({"t": "shot", "q": 2500, "what": "shot-a.png", "owned": true, "doubts": []}),
-            json!({"t": "shot", "q": 3500, "what": "shot-b.png", "owned": true, "doubts": []}),
+            json!({"t": "shot", "q": 2500, "what": "shot-a.png", "window": 99,
+                   "process": {"pid": 8, "created": 80}, "size": [1920, 1080]}),
+            json!({"t": "shot", "q": 3500, "what": "shot-b.png", "window": 99,
+                   "process": {"pid": 8, "created": 80}, "size": [1920, 1080]}),
             json!({"t": "stop", "q": 5000, "what": "end"}),
             json!({"t": "quiet", "q": 5600, "line": hello(true, "released", "-")}),
             json!({"t": "close", "q": 5800, "window": SINK}),
@@ -2118,7 +2200,7 @@ pub mod tests {
         edit(&mut f.run, |r| {
             r.insert(
                 2,
-                json!({"t": "player", "q": 150, "path": "p5/t.exe", "sha256": "5a", "declared": "5a",
+                json!({"t": "player", "q": 150, "path": "d/player-bin/t.exe", "files": [], "source": "p5/t.exe", "sha256": "5a", "declared": "5a",
                        "runner_sha256": "4e", "commit": "nogit", "modified": 1}),
             );
         });
@@ -2250,6 +2332,26 @@ pub mod tests {
             r[at]["tag"] = json!(0xABCD_000A_u32);
         });
         assert_eq!(panel_outcome(&f, &x, "p1", "p1.clicks").0, Outcome::Fail);
+    }
+
+    /// The expected calls come from the target table, independently of the
+    /// runner's steps: they are what P1's and P4's steps make (every target
+    /// clicked once, in order, after the calibration of each point), and a
+    /// runner whose steps leave out a target makes the click check fail.
+    #[test]
+    fn the_expected_calls_are_the_target_table_s() {
+        let want = panel_calls();
+        assert_eq!(want.len(), 4 + 4 + 2 * test_device::panel::TARGETS.len());
+        for row in ["p1", "p4", "p5"] {
+            let steps = super::super::run::row(row, false).unwrap();
+            assert_eq!(super::super::run::calls_of(&steps), want, "{row}");
+        }
+        let steps: Vec<_> = super::super::run::row("p1", false)
+            .unwrap()
+            .into_iter()
+            .filter(|s| !matches!(s, super::super::run::Step::Click { x: 344, .. }))
+            .collect();
+        assert_ne!(super::super::run::calls_of(&steps), want);
     }
 
     /// A panel run's driving connection must report in the panel mode: a
@@ -2467,6 +2569,49 @@ pub mod tests {
         );
     }
 
+    /// N2p's inner's mode link: its `hello` in the panel mode.
+    fn inner_mode() -> Stream {
+        Stream::of(vec![
+            json!({"t": "ans", "q": 1, "cmd": "hello", "line": hello(true, "none", "-")}),
+        ])
+    }
+
+    /// N2p's inner drives the device as a panel run: a `hello` of another
+    /// mode on its driving connection fails provenance, and its mode link
+    /// unread makes it incomplete. N2's inner (no player) takes no mode.
+    #[test]
+    fn n2p_s_inner_must_drive_in_the_panel_mode() {
+        let (o, i) = n2p_good();
+        assert_eq!(n2p_outcome(&o, &i, "provenance"), Outcome::Pass);
+        let (o, mut i) = n2p_good();
+        edit(&mut i.link, |l| {
+            for v in l.iter_mut().filter(|v| v["t"] == "ans") {
+                if let Some(line) = v["line"].as_str().filter(|x| x.starts_with("hello ")) {
+                    v["line"] = json!(line.replace(" mode 8 ", " mode 1 "));
+                }
+            }
+        });
+        let j = kill(&N2P, Some("0123456789ab"), &o, &i, Some(&inner_mode()));
+        let p = j.iter().find(|j| j.check == "provenance").unwrap();
+        assert_eq!(p.outcome, Outcome::Fail, "{}", p.detail);
+        assert!(p.detail.contains("driving connection"), "{}", p.detail);
+        let (o, i) = n2p_good();
+        let j = kill(&N2P, Some("0123456789ab"), &o, &i, None);
+        let p = j.iter().find(|j| j.check == "provenance").unwrap();
+        assert_eq!(p.outcome, Outcome::Incomplete, "{}", p.detail);
+        // The same inner link in another mode passes N2, which holds no
+        // panel.
+        let (o, mut i) = n2_good();
+        edit(&mut i.link, |l| {
+            for v in l.iter_mut().filter(|v| v["t"] == "ans") {
+                if let Some(line) = v["line"].as_str().filter(|x| x.starts_with("hello ")) {
+                    v["line"] = json!(line.replace(" mode 8 ", " mode 1 "));
+                }
+            }
+        });
+        assert_eq!(n2_outcome(&o, &i, "provenance"), Outcome::Pass);
+    }
+
     fn n2p_good() -> (Files, Files) {
         let (mut o, mut i) = n2_good();
         edit(&mut i.run, |r| {
@@ -2486,7 +2631,7 @@ pub mod tests {
     }
 
     fn n2p_outcome(o: &Files, i: &Files, check: &str) -> Outcome {
-        kill(&N2P, Some("0123456789ab"), o, i)
+        kill(&N2P, Some("0123456789ab"), o, i, Some(&inner_mode()))
             .into_iter()
             .find(|j| j.check == check)
             .unwrap()
@@ -2511,6 +2656,27 @@ pub mod tests {
                 "{at} {buttons:#x}"
             );
         }
+        // The kill is recorded once its call returned (2050), its request
+        // counter read before the call (2045): a neutral report at the
+        // request itself fails, one between the request and the record is
+        // of unknown order with the termination (incomplete), one a tick
+        // after the record passes.
+        for (at, want) in [
+            (2045, Outcome::Fail),
+            (2046, Outcome::Incomplete),
+            (2050, Outcome::Incomplete),
+            (2051, Outcome::Pass),
+        ] {
+            let (mut o, i) = n2p_good();
+            edit(&mut o.recorder, |r| r[1]["q"] = json!(at));
+            assert_eq!(n2p_outcome(&o, &i, "n2p.neutral"), want, "{at}");
+        }
+        // A kill record without its request counter shows no order.
+        let (mut o, i) = n2p_good();
+        edit(&mut o.run, |r| {
+            r[1].as_object_mut().unwrap().remove("requested");
+        });
+        assert_eq!(n2p_outcome(&o, &i, "n2p.neutral"), Outcome::Incomplete);
         // Pressed only after the barrier.
         let (mut o, i) = n2p_good();
         edit(&mut o.recorder, |r| r[0]["q"] = json!(2020));
@@ -2526,14 +2692,17 @@ pub mod tests {
     #[test]
     fn n2p_needs_the_player_gone() {
         let (o, i) = n2p_good();
-        let all = kill(&N2P, Some("0123456789ab"), &o, &i);
+        let all = kill(&N2P, Some("0123456789ab"), &o, &i, Some(&inner_mode()));
         assert_eq!(all.len(), 7);
         assert!(all.iter().all(|j| j.outcome == Outcome::Pass), "{all:?}");
         // The negative: the player outlived the inner's job, and the outer
         // ended it.
         let (mut o, i) = n2p_good();
         edit(&mut o.run, |r| {
-            r.insert(4, json!({"t": "kill", "q": 2240, "name": "inner-player"}));
+            r.insert(
+                4,
+                json!({"t": "kill", "q": 2240, "name": "inner-player", "requested": 2235}),
+            );
         });
         assert_eq!(n2p_outcome(&o, &i, "n2p.player-gone"), Outcome::Fail);
         // Never observed; ended by itself.
@@ -2564,7 +2733,7 @@ pub mod tests {
             let at = r.iter().position(|v| v["name"] == "inner-player").unwrap();
             r.insert(
                 at,
-                json!({"t": "kill", "q": 12_240, "name": "inner-player"}),
+                json!({"t": "kill", "q": 12_240, "name": "inner-player", "requested": 12_235}),
             );
             r[at + 1]["q"] = json!(12_250);
         });

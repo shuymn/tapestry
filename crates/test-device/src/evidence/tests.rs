@@ -240,7 +240,8 @@ fn verdict_lines_read_strictly() {
 #[test]
 fn the_runner_s_children_read() {
     let spawn = r#"{"t":"spawn","q":1,"name":"recorder","process":{"pid":8,"created":12}}"#;
-    let kill = r#"{"t":"kill","q":2,"name":"recorder","process":{"pid":8,"created":12}}"#;
+    let kill =
+        r#"{"t":"kill","q":2,"name":"recorder","process":{"pid":8,"created":12},"requested":1}"#;
     let exit = r#"{"t":"exit","q":3,"name":"recorder","process":{"pid":8,"created":12},"code":1073741831}"#;
     let s = read_run(&file(&[START, spawn, kill, exit, END])).unwrap();
     assert_eq!(s.records.len(), 5);

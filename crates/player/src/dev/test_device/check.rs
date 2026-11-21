@@ -320,6 +320,10 @@ fn sink_kill() -> Expectation {
 /// reason at every slider.
 pub const P4_ABSENT: [&str; 3] = ["panel.absent-17", "panel.absent-18", "panel.absent-19"];
 pub const P5_FULL: [&str; 3] = ["panel.full-17", "panel.full-18", "panel.full-19"];
+/// P4's positive check of its declared cause: shot A shows panel 1 (the
+/// panel START alone opens), so panel 3's absence is not the absence of
+/// any panel.
+pub const P4_PANEL_1: [&str; 1] = ["panel.panel1-a"];
 
 /// A panel row (P1, and its negatives P4 and P5): `failing` the checks
 /// that must fail, and the negative's mutation and trigger. A negative
@@ -436,11 +440,11 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[run, link],
                 &[ev(SINGLE, RUN, "close"), ev(SINGLE, LINK, "fence")],
             ),
-            private("panel.drawn-a", &[f(SHOT_A)]),
-            private("panel.knobs", &[f(SHOT_A)]),
-            private("panel.graphs", &[f(SHOT_A)]),
-            private("panel.numbers", &[f(SHOT_A)]),
-            private("panel.closed-b", &[f(SHOT_B)]),
+            private("panel.drawn-a", &[run, f(SHOT_A)]),
+            private("panel.knobs", &[run, f(SHOT_A)]),
+            private("panel.graphs", &[run, f(SHOT_A)]),
+            private("panel.numbers", &[run, f(SHOT_A)]),
+            private("panel.closed-b", &[run, f(SHOT_B)]),
         ]
         .into_iter()
         .chain(match row {
@@ -450,7 +454,8 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[ev(SINGLE, RUN, "exit")],
             )]
             .into_iter()
-            .chain(P4_ABSENT.map(|id| private(id, &[f(SHOT_A)])))
+            .chain(P4_PANEL_1.map(|id| private(id, &[run, f(SHOT_A)])))
+            .chain(P4_ABSENT.map(|id| private(id, &[run, f(SHOT_A)])))
             .collect(),
             "p5" => [
                 judge(
@@ -461,7 +466,7 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 judge("p5.mutation-build", &[run], &[ev(SINGLE, RUN, "player")]),
             ]
             .into_iter()
-            .chain(P5_FULL.map(|id| private(id, &[f(SHOT_A)])))
+            .chain(P5_FULL.map(|id| private(id, &[run, f(SHOT_A)])))
             .collect(),
             _ => Vec::new(),
         })
@@ -515,6 +520,7 @@ fn p5() -> Expectation {
 /// tests hold the survivors' records instead (docs/test-device.md
 /// "Verification", N2p).
 fn p1_kill() -> Expectation {
+    use super::run::MODE_LINK;
     use Count::{AtLeast, Exactly};
     let (run, link, rec) = (
         file(SINGLE, RUN),
@@ -564,11 +570,14 @@ fn p1_kill() -> Expectation {
             rule(SINGLE, RUN, "spawn", Exactly(2)),
             rule(SINGLE, RUN, "kill", Exactly(1)),
             rule(SINGLE, RUN, "exit", Exactly(4)),
-            rule(SINGLE, RUN, "seal", Exactly(4)),
+            // The inner's link, recorder and mode link, the outer's link and
+            // recorder.
+            rule(SINGLE, RUN, "seal", Exactly(5)),
             rule(SINGLE, RUN, "quiet", Exactly(1)),
             rule(SINGLE, LINK, "open", Exactly(1)),
             rule(INNER, RUN, "held", Exactly(1)),
             rule(INNER, RUN, "barrier", Exactly(1)),
+            rule(INNER, RUN, "mode", Exactly(1)),
             rule(INNER, RUN, "spawn", Exactly(2)),
             rule(INNER, RUN, "stop", Exactly(0)),
             rule(INNER, LINK, "open", Exactly(1)),
@@ -577,7 +586,7 @@ fn p1_kill() -> Expectation {
         checks: vec![
             check(
                 "provenance",
-                &[link, inner_link],
+                &[link, inner_link, file(INNER, MODE_LINK)],
                 &[ev(SINGLE, LINK, "ans"), ev(INNER, LINK, "ans")],
             ),
             check(
@@ -619,6 +628,59 @@ fn p1_kill() -> Expectation {
     }
 }
 
+/// A panel run's shots bound to the player: its run stream holds exactly
+/// one `shot` record of each shot, naming the player's window (the run's
+/// `window` record), the player's process (its `spawn` record) and the
+/// client size the rows run at. Each mismatch, named; a run stream that
+/// does not read is the contract's to name.
+fn shots_bound(dir: &Path) -> Vec<String> {
+    use super::run::{SHOT_A, SHOT_B};
+    let run = super::judge::Files::read(dir).run;
+    let Ok(records) = run.records.as_deref() else {
+        return Vec::new();
+    };
+    let one =
+        |kind: &str, pick: &dyn Fn(&serde_json::Value) -> bool| -> Option<serde_json::Value> {
+            let all: Vec<_> = records
+                .iter()
+                .filter(|v| v["t"] == kind && pick(v))
+                .collect();
+            match all[..] {
+                [v] => Some(v.clone()),
+                _ => None,
+            }
+        };
+    let window = one("window", &|_| true).map(|v| v["window"].clone());
+    let player = one("spawn", &|v| v["name"] == "player").map(|v| v["process"].clone());
+    let mut out = Vec::new();
+    for name in [SHOT_A, SHOT_B] {
+        let Some(shot) = one("shot", &|v| v["what"] == name) else {
+            out.push(format!("{name} has not exactly one `shot` record"));
+            continue;
+        };
+        if window.as_ref() != Some(&shot["window"]) {
+            out.push(format!(
+                "{name} was captured from window {}, not the player's window {window:?}",
+                shot["window"]
+            ));
+        }
+        if player.as_ref() != Some(&shot["process"]) {
+            out.push(format!(
+                "{name} was captured from process {}, not the player's {player:?}",
+                shot["process"]
+            ));
+        }
+        if shot["size"] != serde_json::json!(test_device::panel::CLIENT) {
+            out.push(format!(
+                "{name} is {}, not the rows' client size {:?}",
+                shot["size"],
+                test_device::panel::CLIENT
+            ));
+        }
+    }
+    out
+}
+
 /// The expectation of `row` among `rows`.
 fn expectation(rows: &[Row], row: &str) -> Option<Expectation> {
     rows.iter().find(|(name, _)| *name == row).map(|(_, e)| e())
@@ -644,7 +706,10 @@ fn run(rows: &[Row], row: &str, dir: &Path, out: &mut dyn Write) -> anyhow::Resu
     let Some(e) = expectation(rows, row) else {
         bail!("no row `{row}`: this build compiles no expectation for it");
     };
-    let report = contract::check(&e, dir, super::COMMIT);
+    let mut report = contract::check(&e, dir, super::COMMIT);
+    if super::judge::held_by(row).is_some() {
+        report.mismatches.extend(shots_bound(dir));
+    }
     for n in &report.notes {
         writeln!(out, "note: {n}")?;
     }
@@ -734,18 +799,28 @@ mod tests {
         // A negative's checks are its positive row's, in the same order,
         // then its own, which pass.
         for (neg, own) in [
-            (p4(), ["p4.volumes-kept"].iter().chain(&P4_ABSENT)),
+            (
+                p4(),
+                ["p4.volumes-kept"]
+                    .iter()
+                    .chain(&P4_PANEL_1)
+                    .chain(&P4_ABSENT)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
             (
                 p5(),
                 ["p5.volumes-kept", "p5.mutation-build"]
                     .iter()
-                    .chain(&P5_FULL),
+                    .chain(&P5_FULL)
+                    .copied()
+                    .collect(),
             ),
         ] {
             let all = ids(&neg);
             let base = ids(&p1());
             assert_eq!(all[..base.len()], base[..]);
-            assert_eq!(all[base.len()..], own.copied().collect::<Vec<_>>()[..]);
+            assert_eq!(all[base.len()..], own[..]);
         }
         let neg = sink_early_close();
         let failing: Vec<&str> = neg
@@ -929,6 +1004,11 @@ mod tests {
         failing: &'a [&'a str],
         /// The player's executable is another than the declared one.
         stale: bool,
+        /// An edit of the run's records before they are written (the
+        /// shot records).
+        shots: Option<fn(&mut Vec<serde_json::Value>)>,
+        /// The panel verdicts leave the run's stream out of their inputs.
+        unbound: bool,
     }
 
     /// Writes a panel row's run folder as the runner writes it, from the
@@ -974,10 +1054,10 @@ mod tests {
             } else {
                 mutated.clone()
             };
-            json!({"t": "player", "q": 45, "path": "p5/t.exe", "sha256": sha, "declared": mutated,
+            json!({"t": "player", "q": 45, "path": "d/player-bin/t.exe", "files": [], "source": "p5/t.exe", "sha256": sha, "declared": mutated,
                    "runner_sha256": head, "commit": "nogit", "modified": 1})
         } else {
-            json!({"t": "player", "q": 45, "path": "t.exe", "sha256": head, "declared": null,
+            json!({"t": "player", "q": 45, "path": "d/player-bin/t.exe", "files": [], "source": "t.exe", "sha256": head, "declared": null,
                    "runner_sha256": head, "commit": "nogit", "modified": 1})
         };
         run.splice(
@@ -1043,41 +1123,41 @@ mod tests {
             run.push(super::super::owner::seal(dir, &dir.join(name), run_id, SINGLE).unwrap());
         }
         run.push(end);
+        if let Some(edit) = how.shots {
+            edit(&mut run);
+        }
         std::fs::write(dir.join(RUN), lines(&run)).unwrap();
         super::super::judge::judge(row, dir).unwrap();
         let sha = |p: &str| super::super::owner::digest(&dir.join(p)).unwrap();
-        let own: &[&str] = match row {
-            "p4" => &P4_ABSENT,
-            "p5" => &P5_FULL,
-            _ => &[],
-        };
-        let panel: String = [
-            ("panel.drawn-a", SHOT_A),
-            ("panel.knobs", SHOT_A),
-            ("panel.graphs", SHOT_A),
-            ("panel.numbers", SHOT_A),
-            ("panel.closed-b", SHOT_B),
-        ]
-        .into_iter()
-        .chain(own.iter().map(|id| (*id, SHOT_A)))
-        .collect::<Vec<_>>()
-        .iter()
-        .map(|(check, path)| {
-            let outcome = if failing.contains(check) {
-                "fail"
-            } else {
-                "pass"
-            };
-            format!(
-                "{}\n",
-                json!({
-                    "row": row, "run": run_id, "check": check, "outcome": outcome, "detail": "",
-                    "inputs": [{"role": SINGLE, "path": path, "sha256": sha(path)}],
-                    "producer": {"name": PANEL, "version": "0"},
-                })
-            )
-        })
-        .collect();
+        // The panel judge's lines: one per private check the row's
+        // expectation declares, reading the files it declares (the run's
+        // stream left out when `unbound`).
+        let e = expectation_of(row).unwrap();
+        let panel: String = e
+            .checks
+            .iter()
+            .filter(|c| c.producer == PANEL)
+            .map(|c| {
+                let outcome = if failing.contains(&c.id) {
+                    "fail"
+                } else {
+                    "pass"
+                };
+                let inputs: Vec<serde_json::Value> = c
+                    .inputs
+                    .iter()
+                    .filter(|f| !(how.unbound && f.path == RUN))
+                    .map(|f| json!({"role": f.role, "path": f.path, "sha256": sha(f.path)}))
+                    .collect();
+                format!(
+                    "{}\n",
+                    json!({
+                        "row": row, "run": run_id, "check": c.id, "outcome": outcome, "detail": "",
+                        "inputs": inputs, "producer": {"name": PANEL, "version": "0"},
+                    })
+                )
+            })
+            .collect();
         std::fs::write(dir.join("verdicts-panel.jsonl"), panel).unwrap();
     }
 
@@ -1094,6 +1174,59 @@ mod tests {
         let mut out = Vec::new();
         let r = run(ROWS, row, dir.path(), &mut out);
         (r.is_ok(), String::from_utf8(out).unwrap())
+    }
+
+    /// Each panel verdict reads the run's stream and its shot, and the shot
+    /// is the player's: a folder whose shot record names another window,
+    /// another process or another size, has no record of a shot or two of
+    /// it, is a mismatch naming that shot; so is a panel verdict that leaves
+    /// the run's stream out of its inputs. The control matches.
+    #[test]
+    fn a_panel_verdict_binds_the_run_and_the_player_s_shot() {
+        use super::super::run::{SHOT_A, SHOT_B};
+        let (ok, out) = verdict("p1", &Folder::default());
+        assert!(ok, "{out}");
+        type Edit = fn(&mut Vec<serde_json::Value>);
+        let edits: [(&str, &str, Edit); 5] = [
+            ("another window", SHOT_B, |r| {
+                let at = r.iter().position(|v| v["what"] == SHOT_B).unwrap();
+                r[at]["window"] = serde_json::json!(100);
+            }),
+            ("another process", SHOT_A, |r| {
+                let at = r.iter().position(|v| v["what"] == SHOT_A).unwrap();
+                r[at]["process"]["created"] = serde_json::json!(81);
+            }),
+            ("another size", SHOT_A, |r| {
+                let at = r.iter().position(|v| v["what"] == SHOT_A).unwrap();
+                r[at]["size"] = serde_json::json!([2560, 1440]);
+            }),
+            ("no record", SHOT_B, |r| r.retain(|v| v["what"] != SHOT_B)),
+            ("two records", SHOT_A, |r| {
+                let at = r.iter().position(|v| v["what"] == SHOT_A).unwrap();
+                let again = r[at].clone();
+                r.insert(at, again);
+            }),
+        ];
+        for (what, shot, edit) in edits {
+            let (ok, out) = verdict(
+                "p1",
+                &Folder {
+                    shots: Some(edit),
+                    ..Folder::default()
+                },
+            );
+            assert!(!ok, "{what}: {out}");
+            assert!(out.contains(&format!("{shot} ")), "{what}: {out}");
+        }
+        let (ok, out) = verdict(
+            "p1",
+            &Folder {
+                unbound: true,
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("not exactly its declared files"), "{out}");
     }
 
     /// A panel run folder matches its row's expectation through the
@@ -1171,6 +1304,20 @@ mod tests {
         );
         assert!(!ok, "{out}");
         assert!(out.contains("p5.mutation-build"), "{out}");
+        // P4 with no panel drawn at all in shot A (panel 1 not drawn
+        // either): the panel-3 checks fail as declared, but the row's own
+        // panel-1 check fails, so START alone did not open panel 1.
+        let failing: Vec<&str> = p4.iter().copied().chain(P4_PANEL_1).collect();
+        let (ok, out) = verdict(
+            "p4",
+            &Folder {
+                left: true,
+                failing: &failing,
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains(P4_PANEL_1[0]), "{out}");
         for (row, base, slider) in [("p5", &p5[..], P5_FULL[1]), ("p4", &p4[..], P4_ABSENT[1])] {
             let failing: Vec<&str> = base.iter().copied().chain([slider]).collect();
             let (ok, out) = verdict(

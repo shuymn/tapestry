@@ -233,6 +233,102 @@ impl Player {
     }
 }
 
+/// The player a run starts: a private copy of its executable and the files
+/// it starts beside it, each hashed through a handle that denies writes
+/// and deletion from the copy until the run ends, so the file launched is
+/// the file hashed.
+#[derive(Debug)]
+pub struct Verified {
+    /// The copy of the executable.
+    pub exe: PathBuf,
+    /// Its sha256, read through its held handle.
+    pub sha256: String,
+    /// Every copied file's name and sha256, the executable's first.
+    pub files: Vec<(String, String)>,
+    /// The handles that keep the copies unchanged while they are held.
+    _locks: Vec<std::fs::File>,
+}
+
+impl Verified {
+    /// `p` with the copy as its executable: the player the run starts.
+    #[must_use]
+    pub fn player(&self, p: &Player) -> Player {
+        Player {
+            exe: self.exe.clone(),
+            ..p.clone()
+        }
+    }
+
+    /// How many copies are held.
+    #[cfg(test)]
+    pub const fn held(&self) -> usize {
+        self._locks.len()
+    }
+}
+
+/// The media worker, copied with the player's executable when it lies
+/// beside it, as its DLLs are.
+const WORKER: &str = "tapestry-media.exe";
+
+/// Copies the player's executable `exe`, and the media worker and DLLs
+/// beside it, into the new folder `into`, each a new file; then opens each
+/// copy for reading with only reads shared (no writer, no deletion or
+/// rename while it is held) and hashes it through that handle, which must
+/// read the bytes copied.
+///
+/// # Errors
+///
+/// `into` exists, a file cannot be read or written, or a copy reads other
+/// bytes than were written.
+pub fn private_copy(exe: &Path, into: &Path) -> anyhow::Result<Verified> {
+    use std::io::Read as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    std::fs::create_dir(into)
+        .with_context(|| format!("the player's private folder {}", into.display()))?;
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let main = name(exe).with_context(|| format!("{} names no file", exe.display()))?;
+    let beside = exe.parent().context("the player's folder")?;
+    let mut names = vec![main];
+    let mut others: Vec<String> = std::fs::read_dir(beside)
+        .with_context(|| beside.display().to_string())?
+        .filter_map(|e| name(&e.ok()?.path()))
+        .filter(|n| n == WORKER || n.to_ascii_lowercase().ends_with(".dll"))
+        .collect();
+    others.sort();
+    names.extend(others);
+    let mut files = Vec::new();
+    let mut locks = Vec::new();
+    for n in &names {
+        let bytes =
+            std::fs::read(beside.join(n)).with_context(|| beside.join(n).display().to_string())?;
+        let copy = into.join(n);
+        owner::write_new(&copy, &bytes)?;
+        let mut held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&copy)
+            .with_context(|| format!("holding {}", copy.display()))?;
+        let mut read = Vec::new();
+        held.read_to_end(&mut read)
+            .with_context(|| copy.display().to_string())?;
+        if read != bytes {
+            bail!("{} reads other bytes than were copied", copy.display());
+        }
+        files.push((
+            n.clone(),
+            test_device::contract::hex(&<sha2::Sha256 as sha2::Digest>::digest(&read)),
+        ));
+        locks.push(held);
+    }
+    Ok(Verified {
+        exe: into.join(&names[0]),
+        sha256: files[0].1.clone(),
+        files,
+        _locks: locks,
+    })
+}
+
 /// Copies `from` to the new file `to`.
 fn copy_new(from: &Path, to: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(from).with_context(|| from.display().to_string())?;
@@ -317,6 +413,52 @@ pub fn window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The player is launched from a private copy hashed through the
+    /// handle held on it: the executable, its media worker and its DLLs are
+    /// copied (nothing else beside them), each digest is of its copy, and
+    /// while the copies are held none can be written, replaced or deleted;
+    /// a source replaced after the copy leaves the copy as hashed. The
+    /// player the run starts is the copy. A folder that exists is refused.
+    #[test]
+    fn the_player_runs_from_a_held_private_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for (n, b) in [
+            ("tapestry.exe", &b"exe"[..]),
+            (WORKER, b"worker"),
+            ("avcodec-63.dll", b"dll"),
+            ("notes.txt", b"other"),
+        ] {
+            std::fs::write(bin.join(n), b).unwrap();
+        }
+        let into = tmp.path().join("copy");
+        let v = private_copy(&bin.join("tapestry.exe"), &into).unwrap();
+        let sha = |b: &[u8]| test_device::contract::hex(&<sha2::Sha256 as sha2::Digest>::digest(b));
+        assert_eq!(v.exe, into.join("tapestry.exe"));
+        assert_eq!(v.sha256, sha(b"exe"));
+        let names: Vec<&str> = v.files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["tapestry.exe", "avcodec-63.dll", WORKER]);
+        assert_eq!(v.held(), 3);
+        assert!(!into.join("notes.txt").exists());
+        // Held: no write, replacement or deletion of the copy.
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&v.exe)
+                .is_err()
+        );
+        assert!(std::fs::remove_file(&v.exe).is_err());
+        assert!(std::fs::rename(into.join(WORKER), &v.exe).is_err());
+        // The source replaced after the copy: the copy is as hashed.
+        std::fs::write(bin.join("tapestry.exe"), b"replaced").unwrap();
+        assert_eq!(std::fs::read(&v.exe).unwrap(), b"exe");
+        // The run starts the copy.
+        assert_eq!(v.player(&player(tmp.path())).exe, v.exe);
+        drop(v);
+        assert!(private_copy(&bin.join("tapestry.exe"), &into).is_err());
+    }
 
     fn player(dir: &Path) -> Player {
         Player {

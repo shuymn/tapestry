@@ -189,7 +189,9 @@ pub fn click_points() -> Vec<(i32, i32)> {
 
 /// The calls a row's `steps` make, in order: what each sends and the
 /// client point it aims at (`None` for the sink's focus click, at the
-/// sink's centre whatever its size).
+/// sink's centre whatever its size): the runner's side, which the judge's
+/// own table ([`super::judge::panel_calls`]) is tested against.
+#[cfg(test)]
 pub fn calls_of(steps: &[Step]) -> Vec<(&'static str, Option<(i32, i32)>)> {
     let mut out = Vec::new();
     for s in steps {
@@ -696,22 +698,46 @@ impl Exec for Live {
     fn shot(&mut self, name: &'static str) -> Result<(), String> {
         self.lost()?;
         self.beat();
-        let client = desktop::client_rect(self.window).ok_or("the run's window is gone")?;
-        // The screen's pixels are the run's window's only when nothing could
-        // draw over its client area: read before and after the copy.
-        let before = desktop::doubts(self.window, client);
+        // The player's own window, captured by its handle: no other
+        // window's pixels are in it, and a window that is not the player's
+        // is refused before and after the capture.
+        let (window, player) = self
+            .launched
+            .as_ref()
+            .and_then(|l| Some((l.window?, l.child.process)))
+            .ok_or_else(|| format!("the shot {name}: the run shows no player window"))?;
+        if window != self.window {
+            return Err(format!(
+                "the shot {name}: the run's window {:#x} is not the player's {window:#x}",
+                self.window
+            ));
+        }
+        let alive = || {
+            self.launched
+                .as_ref()
+                .is_some_and(|l| l.child.wait(Duration::ZERO) == Ok(None))
+        };
+        let owned = || -> Result<(), String> {
+            if !alive() {
+                return Err("the player has ended".into());
+            }
+            desktop::owned_by(window, player.pid)
+        };
+        owned().map_err(|e| format!("the shot {name}: {e}"))?;
         self.beat();
-        let bgra = desktop::capture(client).map_err(|e| format!("the shot {name}: {e:#}"))?;
+        let (size, bgra) =
+            desktop::capture_window(window).map_err(|e| format!("the shot {name}: {e:#}"))?;
         self.beat();
-        let mut doubts = before;
-        doubts.extend(desktop::doubts(self.window, client));
+        owned().map_err(|e| format!("the shot {name}, after its capture: {e}"))?;
         self.log.put(json!({
-            "t": "shot", "what": name, "owned": doubts.is_empty(), "doubts": doubts,
+            "t": "shot", "what": name, "window": window,
+            "process": { "pid": player.pid, "created": player.created },
+            "size": size,
         }));
         self.beat();
         let (w, h) = (
-            u32::try_from(client[2]).unwrap_or(0),
-            u32::try_from(client[3]).unwrap_or(0),
+            u32::try_from(size[0]).unwrap_or(0),
+            u32::try_from(size[1]).unwrap_or(0),
         );
         self.shots.write(self.dir.join(name), w, h, bgra)
     }
@@ -815,13 +841,27 @@ fn exit_record(log: &Log, name: &str, p: Process, code: i32) {
     }));
 }
 
-/// Writes the `kill` record of `name`, process `p`, before the runner
-/// terminates it with its cut code.
-fn kill_record(log: &Log, name: &str, p: Process) {
+/// Terminates `name`, process `p`, by `terminate` (with the runner's cut
+/// code) and, once the call returned, writes its `kill` record: the host
+/// counter read just before the call (`requested`) and the record's own
+/// after it. A call that failed writes none.
+///
+/// # Errors
+///
+/// The call's.
+fn kill_confirmed<E>(
+    log: &Log,
+    name: &str,
+    p: Process,
+    terminate: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let requested = qpc();
+    terminate()?;
     log.put(json!({
-        "t": "kill", "name": name,
+        "t": "kill", "name": name, "requested": requested,
         "process": { "pid": p.pid, "created": p.created },
     }));
+    Ok(())
 }
 
 /// Waits up to `wait` for `c` to end; else records its kill, terminates it
@@ -832,8 +872,7 @@ fn end_child(log: &Log, name: &str, c: &Child, wait: Duration, cut: i32) -> Resu
     let code = match c.wait(wait).map_err(|e| format!("{name}: {e}"))? {
         Some(code) => code,
         None => {
-            kill_record(log, name, c.process);
-            c.kill(cut.cast_unsigned())
+            kill_confirmed(log, name, c.process, || c.kill(cut.cast_unsigned()))
                 .map_err(|e| format!("terminating {name}: {e:#}"))?;
             c.wait(KILL_WAIT)
                 .map_err(|e| format!("{name}: {e}"))?
@@ -1302,6 +1341,10 @@ fn mode_change(b: &Begun, a: &Args, journal: &Stream) -> anyhow::Result<String> 
     }
 }
 
+/// The folder, in the player's scratch data folder, of the private copy
+/// of the player a panel row starts.
+pub const PLAYER_COPY: &str = "player-bin";
+
 /// 1970-01-01 as a FILETIME (100 ns since 1601).
 const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
 
@@ -1318,24 +1361,31 @@ pub fn last_write(filetime: u64) -> anyhow::Result<u64> {
     Ok(filetime)
 }
 
-/// The `player` record: the executable a panel row starts, its sha256, the
-/// sha256 the row declared for it (`--player-sha256`; one that differs is
-/// refused before anything starts), the runner's own executable's sha256,
-/// the commit the player reports (`<exe> test-device commit`, run in the
-/// run's job with its output in `player-commit.txt`) and its last write.
-fn player_record(b: &Begun, p: &launch::Player, declared: Option<&str>) -> anyhow::Result<()> {
-    let sha = owner::digest(&p.exe)?;
+/// The `player` record: the private copy a panel row starts (`path`) and
+/// the executable it was copied from (`source`), the copy's sha256 as read
+/// through its held handle, the sha256 the row declared for it
+/// (`--player-sha256`; one that differs is refused before anything
+/// starts), the runner's own executable's sha256, the commit the copy
+/// reports (`<copy> test-device commit`, run in the run's job with its
+/// output in `player-commit.txt`) and the source's last write.
+fn player_record(
+    b: &Begun,
+    source: &Path,
+    v: &launch::Verified,
+    declared: Option<&str>,
+) -> anyhow::Result<()> {
+    let sha = &v.sha256;
     if let Some(d) = declared
         && d != sha
     {
         bail!(
             "the player {} has sha256 {sha}, not the declared {d}",
-            p.exe.display()
+            source.display()
         );
     }
     let runner = owner::digest(&std::env::current_exe().context("the runner's own path")?)?;
     let filetime = last_write(std::os::windows::fs::MetadataExt::last_write_time(
-        &std::fs::metadata(&p.exe).with_context(|| p.exe.display().to_string())?,
+        &std::fs::metadata(source).with_context(|| source.display().to_string())?,
     ))?;
     let out = b.dir.join("player-commit.txt");
     let stdio = Stdio {
@@ -1344,19 +1394,19 @@ fn player_record(b: &Begun, p: &launch::Player, declared: Option<&str>) -> anyho
         error: Stdio::null()?,
     };
     let args = ["test-device".to_owned(), "commit".to_owned()];
-    let child = job::spawn(b.job, &p.exe, &args, &[], &stdio)?;
+    let child = job::spawn(b.job, &v.exe, &args, &[], &stdio)?;
     drop(stdio);
     match child
         .wait(Duration::from_secs(10))
         .map_err(anyhow::Error::msg)?
     {
         Some(0) => {}
-        Some(code) => bail!("`{} test-device commit` exited {code}", p.exe.display()),
+        Some(code) => bail!("`{} test-device commit` exited {code}", v.exe.display()),
         None => {
             let _ = child.kill(b.cut.cast_unsigned());
             bail!(
                 "`{} test-device commit` did not end within 10 s",
-                p.exe.display()
+                v.exe.display()
             );
         }
     }
@@ -1365,7 +1415,9 @@ fn player_record(b: &Begun, p: &launch::Player, declared: Option<&str>) -> anyho
         .trim()
         .to_owned();
     b.log.put(json!({
-        "t": "player", "path": p.exe.to_string_lossy(), "sha256": sha, "declared": declared,
+        "t": "player", "path": v.exe.to_string_lossy(), "source": source.to_string_lossy(),
+        "sha256": sha, "declared": declared,
+        "files": v.files.iter().map(|(name, sha256)| json!({ "name": name, "sha256": sha256 })).collect::<Vec<_>>(),
         "runner_sha256": runner, "commit": commit, "modified": filetime,
     }));
     Ok(())
@@ -1398,10 +1450,10 @@ impl end::Player for RealPlayer<'_> {
     }
 
     fn kill(&mut self) -> Result<(), String> {
-        kill_record(self.log, "player", self.child.process);
-        self.child
-            .kill(self.cut.cast_unsigned())
-            .map_err(|e| format!("{e:#}"))?;
+        kill_confirmed(self.log, "player", self.child.process, || {
+            self.child.kill(self.cut.cast_unsigned())
+        })
+        .map_err(|e| format!("{e:#}"))?;
         match self.wait(KILL_WAIT)? {
             Some(_) => Ok(()),
             None => Err(format!(
@@ -1502,8 +1554,19 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     }
     let mut rec = RecChild::spawn(&b, &a.port)?;
     let monitor = desktop::monitor(&a.monitor)?;
-    if let Some(p) = &a.player {
-        player_record(&b, p, a.player_sha256.as_deref())?;
+    // The player the run starts: a private copy, held unchanged until the
+    // run ends, of the one named.
+    let verified = match &a.player {
+        Some(p) => Some(launch::private_copy(&p.exe, &p.data.join(PLAYER_COPY))?),
+        None => None,
+    };
+    let player = a
+        .player
+        .as_ref()
+        .zip(verified.as_ref())
+        .map(|(p, v)| v.player(p));
+    if let (Some(p), Some(v)) = (&a.player, &verified) {
+        player_record(&b, &p.exe, v, a.player_sha256.as_deref())?;
         p.prepare(&a.monitor, &b.dir)?;
         for name in [launch::DEVICE_BEFORE, launch::PLAYER_BEFORE] {
             seal_file(&b, name, &mut errors);
@@ -1523,9 +1586,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     let beat = Arc::new(guard::Beat::new(qpc()));
     let freq = qpc_freq();
     let fresh_beat = Arc::clone(&beat);
-    writer.fresh(Box::new(move |check| {
-        fresh(&fresh_beat, check, qpc(), freq)
-    }));
+    writer.fresh(Box::new(move |check| fresh(&fresh_beat, check, qpc, freq)));
     let shot_log = b.log.clone();
     let seals = b.seals;
     let mut live = Live {
@@ -1545,7 +1606,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         freq,
         dir: b.dir.clone(),
         job: b.job,
-        player: a.player.clone(),
+        player: player.clone(),
         launched: None,
         shots: Shots::start(
             b.dir.clone(),
@@ -1592,7 +1653,7 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     let mut windows = Windows {
         sink: &mut sink,
         player: live.launched.take(),
-        spec: a.player.as_ref(),
+        spec: player.as_ref(),
         b: &b,
     };
     let clock = end::Wall(Instant::now());
@@ -1621,16 +1682,24 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
     Ok(finish(&b, errors))
 }
 
-/// Whether a hold-bearing command may be submitted at `now` (host counter
-/// ticks, `freq` a second): the step thread's heartbeat, gaps latched, no
-/// older than [`guard::BEAT_MAX_US`], and a grant's or renewal's check no
-/// older than that either.
+/// Whether a hold-bearing command may be submitted at the counter `now()`
+/// reads (host counter ticks, `freq` a second): the step thread's
+/// heartbeat, gaps latched, no older than [`guard::BEAT_MAX_US`], and a
+/// grant's or renewal's check no older than that either. The counter is
+/// read after the heartbeat's timestamp, so a submission delayed between
+/// the two reads is judged at its later counter.
 ///
 /// # Errors
 ///
 /// Why it is stale.
-fn fresh(beat: &guard::Beat, check: Option<i64>, now: i64, freq: i64) -> Result<(), String> {
-    let age = ticks_to_us(beat.age(|| now), freq);
+fn fresh(
+    beat: &guard::Beat,
+    check: Option<i64>,
+    now: impl FnOnce() -> i64,
+    freq: i64,
+) -> Result<(), String> {
+    let (age, now) = beat.age_at(now);
+    let age = ticks_to_us(age, freq);
     if age > guard::BEAT_MAX_US {
         return Err(format!("the step thread's heartbeat is {age} µs old"));
     }
@@ -1769,9 +1838,10 @@ fn outer(a: &Args, o: &Outer) -> anyhow::Result<i32> {
     // kill so that its end can be observed.
     let player = panel.then(|| spawned_in(&inner_run, "player").map(job::open));
     // The inner and its job, its recorder and player with it, end with the
-    // cut code.
-    kill_record(&b.log, "inner", child.process);
-    if let Err(e) = inner_job.terminate(b.cut.cast_unsigned()) {
+    // cut code; the kill is recorded once the call returned.
+    if let Err(e) = kill_confirmed(&b.log, "inner", child.process, || {
+        inner_job.terminate(b.cut.cast_unsigned())
+    }) {
         errors.push(format!("terminating the inner's job: {e:#}"));
     }
     // Each end counts only once observed: a timeout or a failed wait is
@@ -1822,11 +1892,16 @@ fn outer(a: &Args, o: &Outer) -> anyhow::Result<i32> {
     }
     drop(inner_job);
     // The inner's streams, each sealed only once its writer's end was
-    // observed: the link's by the inner's, the recorder's by its own.
-    for (name, ended) in [
+    // observed: the link's and (N2p) the mode link's by the inner's, the
+    // recorder's by its own.
+    let mut streams = vec![
         (test_device::contract::LINK, inner_ended),
         (test_device::contract::RECORDER, recorder_ended),
-    ] {
+    ];
+    if panel {
+        streams.push((MODE_LINK, inner_ended));
+    }
+    for (name, ended) in streams {
         if ended {
             seal(&b, &inner_dir, name, &inner.run, &inner.role, &mut errors);
         } else {
@@ -2060,17 +2135,81 @@ mod tests {
         const F: i64 = 1_000_000;
         let max = guard::BEAT_MAX_US;
         let beat = guard::Beat::new(0);
-        assert_eq!(fresh(&beat, None, max, F), Ok(()));
-        assert!(fresh(&beat, None, max + 1, F).is_err());
+        assert_eq!(fresh(&beat, None, || max, F), Ok(()));
+        assert!(fresh(&beat, None, || max + 1, F).is_err());
         // A fresh heartbeat with a check older than the bound.
         let now = 1_000_000;
         let beating = guard::Beat::new(now);
-        assert_eq!(fresh(&beating, Some(now - max), now, F), Ok(()));
-        let e = fresh(&beating, Some(now - max - 1), now, F).unwrap_err();
+        assert_eq!(fresh(&beating, Some(now - max), || now, F), Ok(()));
+        let e = fresh(&beating, Some(now - max - 1), || now, F).unwrap_err();
         assert!(e.contains("check"), "{e}");
         // A gap closed before the submission still counts.
         beat.beat(max + 1);
-        assert!(fresh(&beat, None, max + 2, F).is_err());
+        assert!(fresh(&beat, None, || max + 2, F).is_err());
+    }
+
+    /// A submission's counter is read after the heartbeat's timestamp: the
+    /// step thread beats at the meeting point inside the counter's read,
+    /// closing a gap within the bound, and the counter then reads past the
+    /// bound from the timestamp read before it, so the submission is
+    /// stale. Read before the timestamp, that counter would come with the
+    /// new beat and pass. The control: a counter within the bound.
+    #[test]
+    fn a_submission_reads_its_counter_after_the_heartbeat() {
+        const F: i64 = 1_000_000;
+        let max = guard::BEAT_MAX_US;
+        let beat = guard::Beat::new(0);
+        let stale = fresh(
+            &beat,
+            None,
+            || {
+                beat.beat(max);
+                max + 10
+            },
+            F,
+        );
+        assert!(stale.is_err(), "{stale:?}");
+        let beat = guard::Beat::new(0);
+        let control = fresh(
+            &beat,
+            None,
+            || {
+                beat.beat(max - 10);
+                max
+            },
+            F,
+        );
+        assert_eq!(control, Ok(()));
+    }
+
+    /// A kill is recorded only once its termination call returned, with the
+    /// counter read before the call: inside the call the stream holds no
+    /// `kill` yet, after it one whose `requested` precedes the call and
+    /// whose own counter follows it. A call that fails writes none.
+    #[test]
+    fn a_kill_is_recorded_once_its_call_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run.jsonl");
+        let log = Log(Stream::create(&path).unwrap());
+        let p = Process {
+            pid: 8,
+            created: 80,
+        };
+        let read = || std::fs::read_to_string(&path).unwrap();
+        let mut during = (String::new(), 0);
+        kill_confirmed(&log, "inner", p, || -> Result<(), ()> {
+            during = (read(), qpc());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!during.0.contains("kill"), "{}", during.0);
+        let v: Value = serde_json::from_str(read().lines().last().unwrap()).unwrap();
+        assert_eq!(v["t"], "kill");
+        assert!(v["requested"].as_i64().unwrap() <= during.1, "{v}");
+        assert!(v["q"].as_i64().unwrap() >= during.1, "{v}");
+        let before = read();
+        assert!(kill_confirmed(&log, "player", p, || Err(())).is_err());
+        assert_eq!(read(), before);
     }
 
     /// A last write before 1970 is refused; 1970 itself and later stand.

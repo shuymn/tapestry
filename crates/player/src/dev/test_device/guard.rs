@@ -53,11 +53,34 @@ impl Beat {
         }
     }
 
-    /// A beat at `now`: the gap it closes is latched.
+    /// A beat at `now`: the gap it closes is latched before the new
+    /// timestamp is published, so a reader that sees the new timestamp
+    /// sees that gap too ([`Self::age`] reads the timestamp first).
     pub fn beat(&self, now: i64) {
-        let before = self.last.swap(now, Ordering::AcqRel);
-        self.worst
-            .fetch_max(now.saturating_sub(before), Ordering::AcqRel);
+        self.beat_with(now, || {});
+    }
+
+    /// [`Self::beat`], running `between` after the gap is published and
+    /// before the timestamp is: the point a reader may meet.
+    fn beat_with(&self, now: i64, between: impl FnOnce()) {
+        let mut before = self.last.load(Ordering::Acquire);
+        let mut between = Some(between);
+        loop {
+            self.worst
+                .fetch_max(now.saturating_sub(before), Ordering::AcqRel);
+            if let Some(f) = between.take() {
+                f();
+            }
+            match self
+                .last
+                .compare_exchange(before, now, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                // Another beat came between: its gap is latched by it, and
+                // this one closes the gap from it.
+                Err(seen) => before = seen,
+            }
+        }
     }
 
     /// Beats at `now` and forgets the gaps before: the guard's start, so a
@@ -72,9 +95,16 @@ impl Beat {
     /// after the last beat is, or the longest one closed since the guard
     /// armed it, whichever is longer.
     pub fn age(&self, now: impl FnOnce() -> i64) -> i64 {
+        self.age_at(now).0
+    }
+
+    /// [`Self::age`] and the counter `now()` read for it, after the
+    /// timestamp: a submission's freshness is judged at that counter.
+    pub fn age_at(&self, now: impl FnOnce() -> i64) -> (i64, i64) {
         let last = self.last.load(Ordering::Acquire);
-        let open = now().saturating_sub(last);
-        open.max(self.worst.load(Ordering::Acquire))
+        let at = now();
+        let open = at.saturating_sub(last);
+        (open.max(self.worst.load(Ordering::Acquire)), at)
     }
 }
 
@@ -639,6 +669,46 @@ mod tests {
             }
         }
         // Arming forgets a gap before the guard's start.
+        let beat = Beat::new(0);
+        beat.beat(1_000_000);
+        beat.arm(1_000_000);
+        assert_eq!(beat.age(|| 1_000_010), 10);
+    }
+
+    /// A reader that meets a beat between its two publications reads the
+    /// gap that beat closes: the gap is published before the timestamp, so
+    /// the new timestamp never comes with the old gap. The beat closes a
+    /// gap past the bound and the reader reads at the meeting point; the
+    /// control, a gap within the bound, reads fresh.
+    #[test]
+    fn a_reader_between_a_beat_s_publications_sees_its_gap() {
+        use std::sync::Barrier;
+        let freq = 1_000_000;
+        for gap in [BEAT_MAX_US + 1, BEAT_MAX_US] {
+            let beat = Arc::new(Beat::new(0));
+            let meet = Arc::new(Barrier::new(2));
+            let (b2, m2) = (Arc::clone(&beat), Arc::clone(&meet));
+            let step = std::thread::spawn(move || {
+                b2.beat_with(gap, || {
+                    m2.wait();
+                    m2.wait();
+                });
+            });
+            meet.wait();
+            // The reader, between the beat's publications, at the beat's
+            // own time.
+            let age = beat.age(|| gap);
+            meet.wait();
+            step.join().unwrap();
+            let stale = ticks_to_us(age, freq) > BEAT_MAX_US;
+            assert_eq!(stale, gap > BEAT_MAX_US, "gap {gap}: age {age}");
+            // Once both are published the gap stays latched.
+            assert_eq!(beat.age(|| gap), gap);
+        }
+    }
+
+    #[test]
+    fn arming_forgets_a_gap_before_the_guard_s_start() {
         let beat = Beat::new(0);
         beat.beat(1_000_000);
         beat.arm(1_000_000);
