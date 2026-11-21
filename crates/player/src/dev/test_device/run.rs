@@ -208,9 +208,7 @@ struct Outer {
     wait: Duration,
 }
 
-/// The outer rows. `p1-kill-escape` runs as `p1-kill`; its expectation is
-/// N2p's negative, which only a runner that ends the inner's process alone,
-/// not its job, meets.
+/// The outer rows.
 fn outer_of(row: &str) -> Option<Outer> {
     match row {
         "sink-kill" => Some(Outer {
@@ -219,7 +217,7 @@ fn outer_of(row: &str) -> Option<Outer> {
             waits_for: "held",
             wait: INNER_HELD_WAIT,
         }),
-        "p1-kill" | "p1-kill-escape" => Some(Outer {
+        "p1-kill" => Some(Outer {
             inner: "p1",
             barrier: true,
             waits_for: "barrier",

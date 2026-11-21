@@ -26,7 +26,6 @@ const ROWS: &[Row] = &[
     ("p4", p4),
     ("p5", p5),
     ("p1-kill", p1_kill),
-    ("p1-kill-escape", p1_kill_escape),
 ];
 
 /// The private panel judge's name: it writes `verdicts-panel.jsonl`.
@@ -469,14 +468,13 @@ fn p5() -> Expectation {
     )
 }
 
-/// N2p (`p1-kill`), and with `escape` its negative: the outer reserves and
-/// kills an inner `p1` at its kill barrier. The negative's runner ends the
-/// inner's process alone, not its job: the inner's player outlives it (the
-/// outer then ends it), and the inner's recorder ends by itself at its
-/// input's end, so both of those checks fail. A player can leave the job
-/// the outer ends in no other way: it is in the inner's job from its
-/// creation, and the job refuses breakaway.
-fn n2p(row: &'static str, escape: bool) -> Expectation {
+/// N2p (`p1-kill`): the outer reserves and kills an inner `p1` at its kill
+/// barrier. It has no run negative: no player can outlive the inner, which
+/// starts it in the inner's own job (closed, and so killed, with the inner)
+/// inside the job the outer ends, neither allowing breakaway; the judge's
+/// tests hold the survivors' records instead (docs/test-device.md
+/// "Verification", N2p).
+fn p1_kill() -> Expectation {
     use Count::{AtLeast, Exactly};
     let (run, link, rec) = (
         file(SINGLE, RUN),
@@ -484,19 +482,16 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
         file(SINGLE, RECORDER),
     );
     let (inner_run, inner_link) = (file(INNER, RUN), file(INNER, LINK));
-    let check = |id, inputs: &[File], events: &[Event]| {
-        let outcome = if escape && ["n2p.player-gone", "n2p.children-gone"].contains(&id) {
-            Outcome::Fail
-        } else {
-            Outcome::Pass
-        };
-        check_rule(id, outcome, inputs, events)
-    };
+    let check =
+        |id, inputs: &[File], events: &[Event]| check_rule(id, Outcome::Pass, inputs, events);
     Expectation {
-        row,
+        row: "p1-kill",
         binding: Binding::Run,
         roles: vec![
-            Role { name: SINGLE, row },
+            Role {
+                name: SINGLE,
+                row: "p1-kill",
+            },
             Role {
                 name: INNER,
                 row: "p1",
@@ -516,7 +511,7 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
                 SINGLE,
                 "inner-recorder",
                 Some((INNER, "recorder")),
-                if escape { Exit::Code(0) } else { Exit::Killed },
+                Exit::Killed,
             ),
             exit_rule(
                 SINGLE,
@@ -527,7 +522,7 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
         ],
         records: vec![
             rule(SINGLE, RUN, "spawn", Exactly(2)),
-            rule(SINGLE, RUN, "kill", Exactly(if escape { 2 } else { 1 })),
+            rule(SINGLE, RUN, "kill", Exactly(1)),
             rule(SINGLE, RUN, "exit", Exactly(4)),
             rule(SINGLE, RUN, "seal", Exactly(4)),
             rule(SINGLE, RUN, "quiet", Exactly(1)),
@@ -572,19 +567,8 @@ fn n2p(row: &'static str, escape: bool) -> Expectation {
                 &[ev(SINGLE, RUN, "kill"), ev(SINGLE, RUN, "exit")],
             ),
         ],
-        negative: escape.then_some(Negative {
-            mutation: "the outer ends the inner's process alone, not its job (a local build)",
-            trigger: "n2p.player-gone",
-        }),
+        negative: None,
     }
-}
-
-fn p1_kill() -> Expectation {
-    n2p("p1-kill", false)
-}
-
-fn p1_kill_escape() -> Expectation {
-    n2p("p1-kill-escape", true)
 }
 
 /// The expectation of `row` among `rows`.
@@ -698,12 +682,8 @@ mod tests {
             failing(&p5()),
             ["p1.volumes", "panel.knobs", "panel.graphs", "panel.numbers"]
         );
-        assert_eq!(
-            failing(&p1_kill_escape()),
-            ["n2p.children-gone", "n2p.player-gone"]
-        );
         assert!(failing(&p1_kill()).is_empty());
-        for (neg, pos) in [(p4(), p1()), (p5(), p1()), (p1_kill_escape(), p1_kill())] {
+        for (neg, pos) in [(p4(), p1()), (p5(), p1())] {
             assert_eq!(ids(&neg), ids(&pos));
         }
         let neg = sink_early_close();

@@ -1,7 +1,7 @@
 //! `tapestry test-device judge <row> <dir>` (docs/test-device.md
 //! "Verdicts"): the repository's verdicts for a run of `sink`,
 //! `sink-early-close`, `sink-kill`, the panel rows `p1`, `p4` and `p5`,
-//! or `p1-kill` and its negative, from its kept files, written to
+//! or `p1-kill`, from its kept files, written to
 //! `verdicts-judge.jsonl`. Each check reads only records of what a runner,
 //! the recorder or the device observed, and their order within one
 //! stream; a check whose stretch of the recorder's stream an `error`
@@ -1167,7 +1167,7 @@ pub fn judge(row: &str, dir: &Path) -> anyhow::Result<()> {
     let f = f.standing(SINGLE, &standing);
     let (judged, inner) = match row {
         "sink" | "sink-early-close" => (n1(build.as_deref(), &f), None),
-        "sink-kill" | "p1-kill" | "p1-kill-escape" => {
+        "sink-kill" | "p1-kill" => {
             let k = if row == "sink-kill" { &N2 } else { &N2P };
             let inner = Files::read(&dir.join(INNER)).standing(INNER, &standing);
             (kill(k, build.as_deref(), &f, &inner), Some(inner))
@@ -2103,5 +2103,39 @@ pub mod tests {
         let (o, mut i) = n2p_good();
         edit(&mut i.run, |r| r.retain(|v| v["t"] != "barrier"));
         assert_eq!(n2p_outcome(&o, &i, "n2p.abnormal"), Outcome::Incomplete);
+    }
+
+    /// N2p's negative, on the records survivors would leave (no run can make
+    /// one: the inner starts its player in its own job, killed with it,
+    /// inside the job the outer ends, neither allowing breakaway). A player
+    /// still running after the wait, which the outer then ends itself, and a
+    /// recorder whose end the outer never sees fail `n2p.player-gone` and
+    /// `n2p.children-gone`; so do both ending with code 0, as the inner's
+    /// own job ends them when the outer kills the inner's process alone.
+    #[test]
+    fn n2p_fails_when_the_player_and_the_recorder_outlive_the_inner() {
+        let (mut o, i) = n2p_good();
+        edit(&mut o.run, |r| {
+            r.retain(|v| !(v["t"] == "exit" && v["name"] == "inner-recorder"));
+            let at = r.iter().position(|v| v["name"] == "inner-player").unwrap();
+            r.insert(
+                at,
+                json!({"t": "kill", "q": 12_240, "name": "inner-player"}),
+            );
+            r[at + 1]["q"] = json!(12_250);
+        });
+        assert_eq!(n2p_outcome(&o, &i, "n2p.player-gone"), Outcome::Fail);
+        assert_eq!(n2p_outcome(&o, &i, "n2p.children-gone"), Outcome::Fail);
+        let (mut o, i) = n2p_good();
+        edit(&mut o.run, |r| {
+            for v in r
+                .iter_mut()
+                .filter(|v| v["name"] == "inner-recorder" || v["name"] == "inner-player")
+            {
+                v["code"] = json!(0);
+            }
+        });
+        assert_eq!(n2p_outcome(&o, &i, "n2p.player-gone"), Outcome::Fail);
+        assert_eq!(n2p_outcome(&o, &i, "n2p.children-gone"), Outcome::Fail);
     }
 }
