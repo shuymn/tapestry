@@ -4585,6 +4585,10 @@ fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
     rig.link.record_heavy(256);
     render::probe::count_gpu_waits(Some(false));
     let from = paths.0.lock().unwrap().len();
+    // Frame by frame from here: the switch is taken, then four frames
+    // follow its admission with the retired entry standing.
+    rig.gate.hold();
+    let taken = rig.link.messages_taken();
     show(
         &rig.link,
         lifetime,
@@ -4592,23 +4596,37 @@ fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
         &payload(2, Some(&b), 2_000, &[]),
         &Overlay::default(),
     );
-    // The retired entry stands: no creation, the first view drawn.
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        rig.link.result_status().shown,
-        Some((1, true)),
-        "the switch committed while its admission needed a destruction no boundary made"
-    );
-    assert!(
-        rig.link
-            .heavy_record()
-            .iter()
-            .all(|r| r.kind != HeavyKind::ResultCreation),
-        "the switch's creation taken with no room: {:?}",
-        rig.link.heavy_record()
-    );
-    let waiting = paths.0.lock().unwrap().len();
-    assert!(waiting > from + 3, "frames stopped while the switch waited");
+    let end = Instant::now() + Duration::from_secs(20);
+    while rig.link.messages_taken() == taken {
+        assert!(Instant::now() < end, "the switch never taken");
+        rig.gate.step();
+    }
+    // The retired entry stands: no creation, the first view drawn on each
+    // frame.
+    for i in 1..=4 {
+        let before = paths.0.lock().unwrap().len();
+        rig.gate.step();
+        let seen = paths.0.lock().unwrap().clone();
+        assert!(
+            seen.len() > before && seen[before..].iter().all(|p| *p == Some(ResultPath::Skin)),
+            "frame {i} after the switch's admission not the shown view's: {:?}",
+            &seen[before..]
+        );
+        assert_eq!(
+            rig.link.result_status().shown,
+            Some((1, true)),
+            "the switch committed while its admission needed a destruction no boundary made"
+        );
+        assert!(
+            rig.link
+                .heavy_record()
+                .iter()
+                .all(|r| r.kind != HeavyKind::ResultCreation),
+            "the switch's creation taken with no room: {:?}",
+            rig.link.heavy_record()
+        );
+    }
+    rig.gate.release();
     // The boundaries destroy it, then the creation follows.
     rig.link.hold_destruction(false);
     assert!(
