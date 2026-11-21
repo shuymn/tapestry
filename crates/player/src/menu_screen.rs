@@ -1900,7 +1900,10 @@ impl Screen for MenuScreen {
         let installed = self.renderer.selection_bundle().cloned();
         let logic = logic.filter(|l| installed.is_some_and(|b| Arc::ptr_eq(&b, &l.bundle)));
         let Some(logic) = logic else {
-            self.movies.drawn(Drawn::Other, &mut self.renderer);
+            // Selection entered on its built-in page: a committed play left
+            // before READY and a skinned entry's set both end here.
+            self.movies
+                .drawn(Drawn::BuiltInSelection, &mut self.renderer);
             // A page laid out for the skin's screen sent no caret: it is
             // laid out again with its own.
             let changed = changed || self.selection_key.take().is_some();

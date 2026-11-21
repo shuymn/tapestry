@@ -304,10 +304,14 @@ pub enum Holder {
 pub enum Drawn {
     /// The selection skin's frame of this lifetime.
     Selection(u64),
+    /// Selection's built-in page, drawn when no selection skin draws (none
+    /// installed, or not the one its state is for): selection was entered
+    /// all the same.
+    BuiltInSelection,
     /// A play's frame.
     Play,
-    /// Anything else: a page (the built-in selection, decision or practice
-    /// page), a loading frame, a result, the end page, a splash or a text.
+    /// Anything else: a page (the decision or practice page), a loading
+    /// frame, a result, the end page, a splash or a text.
     Other,
 }
 
@@ -315,8 +319,8 @@ impl Holder {
     /// Whether its screen instance goes on while a `drawn` frame is drawn:
     /// a selection entry's while its own skinned frames draw; a play's
     /// preparation whatever draws meanwhile (its cancel ends it), and once
-    /// committed until a selection frame draws; a play screen while play
-    /// frames draw.
+    /// committed until a selection frame draws, skinned or built-in; a
+    /// play screen while play frames draw.
     const fn keeps(self, drawn: Drawn) -> bool {
         match (self, drawn) {
             (Self::Selection(l), Drawn::Selection(d)) => l == d,

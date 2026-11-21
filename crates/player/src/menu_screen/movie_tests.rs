@@ -205,6 +205,76 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     assert_eq!(hub.open_sets(), 1);
 }
 
+/// A WARP screen playing movies through `hub`, with the fixture
+/// selection skin installed when `installed` (kept alive by the folder
+/// returned).
+fn selection_screen(
+    hub: &Arc<MediaHub>,
+    installed: bool,
+) -> (Option<tempfile::TempDir>, super::MenuScreen) {
+    let mut r = render::Renderer::new(
+        render::Target::Offscreen {
+            width: 64,
+            height: 64,
+        },
+        render::AdapterChoice::Warp,
+    )
+    .unwrap();
+    let fixture = installed.then(|| {
+        let dir = crate::selection_skin::fixture();
+        let b = crate::selection_skin::fixture_bundle(&r, dir.path(), "s.json");
+        let t = r.install(ScreenKind::Selection, &b, 1).unwrap();
+        r.commit(t).unwrap();
+        assert!(r.selection_bundle().is_some());
+        dir
+    });
+    (
+        fixture,
+        super::MenuScreen::new(r, None).with_media(Arc::clone(hub)),
+    )
+}
+
+/// Selection entered on its built-in page, with no selection skin
+/// installed and with one installed that no state is for: it ends a
+/// committed play not begun (quit before READY) and a skinned entry's set
+/// alike. Each set's generation is left and its planes released before
+/// the page draws.
+#[test]
+fn the_built_in_selection_page_retires_a_committed_play_and_a_skinned_entry() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let (play, skinned) = (bundle(&dir), bundle(&dir));
+    for installed in [false, true] {
+        for held in ["committed play", "skinned entry"] {
+            let hub = MediaHub::with(None);
+            let (_fixture, mut s) = selection_screen(&hub, installed);
+            hub.supply([Some(clip(&[0])), None]);
+            if held == "committed play" {
+                s.open_play_movies(Some(&play), 1, Some(1));
+                s.movie_boundary();
+                s.commit(token(&s, 1)).unwrap();
+            } else {
+                s.enter_selection_movies(&skinned, 3, TimeUs(0));
+                s.movie_boundary();
+            }
+            assert!(s.renderer.video_bytes().0 > 0, "{held}: its planes");
+            let generation = hub.generation();
+            let _ = s.selection(
+                &crate::render_side::tests::selection_update(4, 1),
+                None,
+                true,
+                TimeUs(0),
+                skin_model::AppReadouts::LAUNCH,
+            );
+            let case = format!("installed {installed}, {held}");
+            assert!(s.movies.get().is_none(), "{case}: the set retired");
+            assert_eq!(hub.open_sets(), 0, "{case}: the set left");
+            assert!(hub.generation() > generation, "{case}: its generation left");
+            assert_eq!(s.renderer.video_bytes(), (0, 0), "{case}: its planes left");
+        }
+    }
+}
+
 /// Selection's entry ends with a page drawn in its place, the decision
 /// screen's built-in presentation among them: the entry's movies, their
 /// generation and planes go before that page draws.
