@@ -6348,7 +6348,7 @@ pub(crate) mod tests {
         let limits = crate::render_common::offscreen(1_920, 1_080);
         let skin = crate::selection_skin::fixture_bundle(&limits, dir.path(), "s.json");
         let frames = PanelFrames::default();
-        let make: crate::render_side::MakeScreen = Box::new(|| {
+        let make: crate::render_side::MakeScreen = Box::new(|_| {
             let r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,

@@ -234,7 +234,7 @@ fn rig_with(slots: u16) -> Rig {
         Arc::clone(&hold),
         Arc::clone(&selection),
     );
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         Ok(Box::new(ChartScreen {
             charts: Arc::clone(&c),
             installation: Arc::clone(&i),

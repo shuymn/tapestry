@@ -115,7 +115,7 @@ fn the_cutoff_reads_and_publishes_nothing_until_finish_alloc() {
         .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
         .build()
         .unwrap();
-    let make: MakeScreen = Box::new(|| {
+    let make: MakeScreen = Box::new(|_| {
         let r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,

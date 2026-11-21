@@ -621,6 +621,9 @@ pub enum ChartTarget {
 #[derive(Debug)]
 pub struct ChartUpload {
     target: ChartTarget,
+    /// A result view's publication instead ([`Renderer::begin_result_chart`]):
+    /// its array's target and the set it writes; `target` is unused then.
+    result: Option<(ResultChartTarget, u64)>,
     key: skin_model::chart_image::ChartKey,
     /// The chart layer in the array.
     at: u32,
@@ -711,11 +714,17 @@ impl ChartUpload {
         let k = u32::try_from(self.level).unwrap_or(0);
         let [x, y] = origin.map(|o| o >> k);
         let mut staged = 0;
+        // A result view's images are its staging's payload.
+        let payload = if self.result.is_some() {
+            crate::Payload::Staging
+        } else {
+            crate::Payload::Chart
+        };
         if let Some(texels) = bytes.get(from..to) {
             staged = crate::upload::write(
                 gpu,
                 gate,
-                crate::Payload::Chart,
+                payload,
                 &crate::upload::Band {
                     texture,
                     layer: self.at,
@@ -730,6 +739,16 @@ impl ChartUpload {
         self.settle(images);
         Ok(staged)
     }
+}
+
+/// How a result view's chart images were taken
+/// ([`Renderer::begin_result_chart`]).
+#[derive(Debug)]
+pub enum ResultChartBegin {
+    /// The array holds them already: their table.
+    Done(skin_model::chart_image::ChartTable),
+    /// In hand, to write in the boundaries' steps.
+    Begun(ChartUpload),
 }
 
 /// Where a result view's chart images are written
@@ -1030,6 +1049,40 @@ struct StagingText {
     slots: usize,
     /// Placed and stepping; `None` before its placement.
     upload: Option<text_upload::TextUpload>,
+}
+
+/// A result view's text in the uploader's hand (design.md "Memory Budget",
+/// the uploader): its requests, placed in the cache of the array the view
+/// draws from once its first step comes, written by the boundaries' steps
+/// and settled at its last step's completion, its answer kept until its
+/// owner asks ([`Renderer::result_text_answer`]).
+struct ResultTextUp {
+    /// The bundle whose skin attaches its table; `None` with no result
+    /// layout, which answers at once with nothing attached.
+    bundle: Option<Arc<SkinBundle>>,
+    /// The staging whose own array it goes into; `None` for the result
+    /// kind's installed (or pages-only) array.
+    own: Option<PreparedToken>,
+    requests: Vec<skin_model::TextRequest>,
+    slots: usize,
+    /// Placed and stepping; `None` before its first step.
+    upload: Option<text_upload::TextUpload>,
+    /// Its end: its table and its lines' holder (`None` with nothing to
+    /// attach), or why it failed.
+    done: Option<Result<Option<(TextTable, Holder)>, RenderError>>,
+}
+
+/// How a result view's text step went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultTextStep {
+    /// A step was written and is in flight.
+    Stepped,
+    /// Nothing written this time, and it goes on.
+    Again,
+    /// It ended: its answer waits for its owner.
+    Ended,
+    /// The gate refused its band: the boundary begins nothing more.
+    Deferred,
 }
 
 /// How a stepped staging's text step went.
@@ -1628,6 +1681,11 @@ pub struct Renderer {
     /// long after its submission ([`delay_steps`](Self::delay_steps)).
     #[cfg(feature = "dev-tools")]
     step_delay: Option<Duration>,
+    /// Development builds: the time a staging step's writes have taken on
+    /// the boundary's slice clock, read instead of the real clock
+    /// ([`set_write_slice_clock`](Self::set_write_slice_clock)).
+    #[cfg(feature = "dev-tools")]
+    write_slice_clock: Option<Duration>,
     /// Development builds: the chart-image bands written
     /// ([`chart_bands`](Self::chart_bands)).
     #[cfg(feature = "dev-tools")]
@@ -1736,6 +1794,9 @@ pub struct Renderer {
     /// whose text layer holds them
     /// ([`prepare_result_text`](Self::prepare_result_text)).
     staged_result_text: Option<(AtlasId, Holder)>,
+    /// A result view's text in the uploader's hand
+    /// ([`begin_result_text`](Self::begin_result_text)).
+    result_text_up: Option<ResultTextUp>,
     /// Tests and development builds: atlas arrays uploaded so far.
     #[cfg(any(test, feature = "dev-tools"))]
     atlas_uploads: u64,
@@ -2002,6 +2063,8 @@ impl Renderer {
             #[cfg(feature = "dev-tools")]
             step_delay: None,
             #[cfg(feature = "dev-tools")]
+            write_slice_clock: None,
+            #[cfg(feature = "dev-tools")]
             chart_bands: 0,
             #[cfg(feature = "dev-tools")]
             text_counts: Vec::new(),
@@ -2043,6 +2106,7 @@ impl Renderer {
             release_figures: [0; 3],
             result_disabled: false,
             staged_result_text: None,
+            result_text_up: None,
             #[cfg(any(test, feature = "dev-tools"))]
             atlas_uploads: 0,
             #[cfg(any(test, feature = "dev-tools"))]
@@ -2538,6 +2602,15 @@ impl Renderer {
     ///
     /// # Errors
     ///
+    /// A result view's staging destroys nothing in its call, whatever the
+    /// phase allows: its owner takes it once [`install_room`](Self::install_room)
+    /// answers that it needs no destruction, each destruction it waited for
+    /// made at a boundary (design.md "Memory Budget"); taken without that
+    /// room, it is refused as admission refuses it with destruction not
+    /// allowed.
+    ///
+    /// # Errors
+    ///
     /// As [`install`](Self::install).
     pub fn install_stepped(
         &mut self,
@@ -2545,7 +2618,64 @@ impl Renderer {
         bundle: &Arc<SkinBundle>,
         request: u64,
     ) -> Result<Option<PreparedToken>, RenderError> {
-        self.stage_with(kind, bundle, None, request, true)
+        if kind != ScreenKind::Result {
+            return self.stage_with(kind, bundle, None, request, true);
+        }
+        let allowed = std::mem::replace(&mut self.destroy_allowed, false);
+        let staged = self.stage_with(kind, bundle, None, request, true);
+        self.destroy_allowed = allowed;
+        staged
+    }
+
+    /// Whether staging `bundle` as `kind`'s would create an array of its
+    /// own (one heavy operation, design.md "Load Pipeline"): neither the
+    /// committed bundle nor a layout on the committed pages. Reads only.
+    #[must_use]
+    pub fn install_creates(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        !self
+            .committed_installation(kind)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+            && self.committed_atlas(kind) != Some(bundle.atlas_id())
+    }
+
+    /// Whether staging `bundle` as `kind`'s now needs no destruction in its
+    /// call: its admission with no filled entry destroyed (the pool's
+    /// optional layers yielding, and a reduction's retired pool needing
+    /// none destroyed first), and its own entry and a reduction's entry
+    /// free to reserve. A staging that would need one waits until the
+    /// boundaries' retirement path has destroyed what it needs, each
+    /// destruction at its own boundary once its last use completes, never
+    /// waiting for the GPU in its call (design.md "Memory Budget", "Load
+    /// Pipeline"). Where destruction is not allowed, or nothing a boundary
+    /// destroys would make room, the staging's own refusal answers (true).
+    /// Reads only.
+    #[must_use]
+    pub fn install_room(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        if !self.destroy_allowed
+            || self
+                .committed_installation(kind)
+                .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return true;
+        }
+        let charge = self.candidate_charge(kind, bundle);
+        if matches!(self.reclaim(kind, charge, true), Reclaim::Refused(_)) {
+            return true;
+        }
+        // Its own entry, and a reduction's when the live pool has more
+        // layers than it keeps.
+        let entries = match self.reclaim(kind, charge, false) {
+            Reclaim::Fits => 1,
+            Reclaim::Reduce(layers) if self.pool.as_ref().is_some_and(|p| p.layers() > layers) => {
+                if self.retire.retired_pool_entry().is_some() {
+                    return false;
+                }
+                2
+            }
+            Reclaim::Reduce(_) => 1,
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => return false,
+        };
+        self.retire.free() >= entries || self.retire.oldest(false).is_none()
     }
 
     /// Writes the staging of `request` to its end, waiting for each step,
@@ -3465,7 +3595,7 @@ impl Renderer {
             // Another bundle on the pages installed: a fresh layout on
             // their array, nothing uploaded.
             None if self.committed_atlas(kind) == Some(bundle.atlas_id()) => {
-                let (staging, instances) = self.layout_for(bundle)?;
+                let (staging, instances) = self.layout_for(bundle, !stepped)?;
                 (
                     Installation::new(Arc::clone(bundle)),
                     PendingRes::Layout {
@@ -4029,8 +4159,15 @@ impl Renderer {
 
     /// A fresh layout for `bundle` on its kind's committed atlas array:
     /// its staging and an instance buffer, inside error scopes, with no
-    /// texture uploaded.
-    fn layout_for(&self, bundle: &Arc<SkinBundle>) -> Result<(Staging, wgpu::Buffer), RenderError> {
+    /// texture uploaded; waited for on the GPU when `wait` (a staging
+    /// answered at once). A staging in steps waits for nothing: the buffer
+    /// carries no GPU work before its commit, and the scopes report its
+    /// creation's refusal.
+    fn layout_for(
+        &self,
+        bundle: &Arc<SkinBundle>,
+        wait: bool,
+    ) -> Result<(Staging, wgpu::Buffer), RenderError> {
         let staging = self.staging_for(bundle)?;
         let device = self.gpu.device();
         let (buffer, refused) = skin_atlas::scoped(device, || {
@@ -4041,7 +4178,9 @@ impl Renderer {
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        wait_for_gpu(&self.gpu)?;
+        if wait {
+            wait_for_gpu(&self.gpu)?;
+        }
         Ok((staging, buffer))
     }
 
@@ -5353,6 +5492,7 @@ impl Renderer {
         }
         let mut up = ChartUpload {
             target,
+            result: None,
             key,
             at,
             side,
@@ -5391,6 +5531,9 @@ impl Renderer {
     /// Whether `up`'s target is still the array it was taken for, on a
     /// device not lost.
     fn chart_current(&self, up: &ChartUpload) -> bool {
+        if let Some((target, _)) = up.result {
+            return self.result_chart_live(target) == Some(up.key);
+        }
         let live = match up.target {
             ChartTarget::Committed => self.chart_key(),
             ChartTarget::Staged(token) => self.staged_chart_key(token),
@@ -5423,9 +5566,13 @@ impl Renderer {
         #[cfg(test)]
         use skin_model::chart_image::ChartImage;
         use skin_model::chart_image::ChartTable;
-        let texture = match up.target {
-            ChartTarget::Committed => self.atlas.texture().clone(),
-            ChartTarget::Staged(_) => match self.pending.as_ref().map(|p| &p.res) {
+        let texture = match (up.result, up.target) {
+            (Some((target, _)), _) => match self.result_chart_array(target) {
+                Ok((_, a)) => a.texture().clone(),
+                Err(_) => return ChartBand::Ended(Err(RenderError::ChartChanged)),
+            },
+            (None, ChartTarget::Committed) => self.atlas.texture().clone(),
+            (None, ChartTarget::Staged(_)) => match self.pending.as_ref().map(|p| &p.res) {
                 Some(PendingRes::Own(r)) => r.atlas.texture().clone(),
                 _ => return ChartBand::Ended(Err(RenderError::ChartChanged)),
             },
@@ -5434,6 +5581,8 @@ impl Renderer {
         let fault = self.chart_fault.take();
         #[cfg(test)]
         let which = ChartImage::ALL.get(up.image).copied();
+        #[cfg(feature = "dev-tools")]
+        let image = up.image;
         let gpu = &self.gpu;
         let (written, refused) = skin_atlas::scoped(gpu.device(), || {
             let staged = up.write(gpu, &texture, images, gate)?;
@@ -5448,9 +5597,14 @@ impl Renderer {
             Err(crate::Refused::Past) => return ChartBand::Deferred,
             Err(crate::Refused::Stale) => return ChartBand::Ended(Err(self.chart_stale())),
         };
-        match up.target {
-            ChartTarget::Committed => self.atlas.mark(number),
-            ChartTarget::Staged(_) => {
+        match (up.result, up.target) {
+            (Some((target, _)), _) => {
+                if let Ok((_, a)) = self.result_chart_array(target) {
+                    a.mark(number);
+                }
+            }
+            (None, ChartTarget::Committed) => self.atlas.mark(number),
+            (None, ChartTarget::Staged(_)) => {
                 if let Some(PendingRes::Own(r)) = self.pending.as_ref().map(|p| &p.res) {
                     r.atlas.mark(number);
                 }
@@ -5460,18 +5614,39 @@ impl Renderer {
             &self.gpu,
             index,
             staged,
-            crate::Payload::Chart,
+            if up.result.is_some() {
+                crate::Payload::Staging
+            } else {
+                crate::Payload::Chart
+            },
         ));
         #[cfg(feature = "dev-tools")]
         {
             self.chart_bands += 1;
+            // A result view's band, as its staging's (`ci:result:*`).
+            if up.result.is_some() && crate::probe::on() {
+                let caller = crate::probe::set_caller(crate::probe::RESULT);
+                crate::probe::cmark!("ci", "image", i64::try_from(image).unwrap_or(-1));
+                crate::probe::cmark!("ci", "bytes", i64::try_from(staged).unwrap_or(-1));
+                crate::probe::set_caller(caller);
+            }
         }
         #[cfg(test)]
         if let Some(which) = which {
             self.chart_submissions.push((which, self.chart_waits));
         }
         if let Some(e) = refused {
-            self.set_chart_table(up.target, up.key, Some(ChartTable::ABSENT.keyed(up.key)));
+            match up.result {
+                // The array's images are unknown: written again whole.
+                Some((target, _)) => {
+                    if let Some(a) = self.result_chart_array_mut(target) {
+                        a.set_chart_set(None);
+                    }
+                }
+                None => {
+                    self.set_chart_table(up.target, up.key, Some(ChartTable::ABSENT.keyed(up.key)))
+                }
+            }
             return ChartBand::Ended(Err(RenderError::Atlas(UploadError::Device(e))));
         }
         ChartBand::Stepped
@@ -5486,6 +5661,14 @@ impl Renderer {
         use skin_model::chart_image::ChartTable;
         let [stage, back, banner] = up.uvs;
         let table = ChartTable::new(stage, back, banner).keyed(up.key);
+        // A result view's table is its caller's: the array records the set
+        // it now holds.
+        if let Some((target, set)) = up.result {
+            if let Some(a) = self.result_chart_array_mut(target) {
+                a.set_chart_set(Some(set));
+            }
+            return Ok(table);
+        }
         self.set_chart_table(up.target, up.key, Some(table));
         // A loss after the check discards the publication: it is the
         // device's failure, never a success.
@@ -5656,6 +5839,170 @@ impl Renderer {
         #[cfg(not(any(test, feature = "dev-tools")))]
         let _ = wrote;
         Ok(table)
+    }
+
+    /// A result view's chart images, set `set`, taken in hand as an
+    /// uploader payload into the array `target` names (design.md "Memory
+    /// Budget", the uploader), as [`begin_chart_upload`](Self::begin_chart_upload)
+    /// takes the attempt's: every image's place checked, nothing written;
+    /// the boundaries write it one band a step and its table is answered
+    /// at the last band's completion. Images the array already holds (its
+    /// set `set`) answer their table at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`write_result_chart`](Self::write_result_chart), before any
+    /// write.
+    pub fn begin_result_chart(
+        &mut self,
+        target: ResultChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+        set: u64,
+    ) -> Result<ResultChartBegin, RenderError> {
+        use skin_model::chart_image::{ChartImage, ChartKey, ChartTable, ChartUv};
+        if self.gpu.lost() {
+            return Err(RenderError::DeviceLost);
+        }
+        #[cfg(any(test, feature = "dev-tools"))]
+        let refuse = std::mem::take(&mut self.result_chart_refuse);
+        let renderer = self.id;
+        let (installation, atlas) = self.result_chart_array(target)?;
+        let bundle = installation.bundle();
+        let (Some(layer), Some(at)) = (bundle.chart_layer(), atlas.chart_layer()) else {
+            return Err(RenderError::NoChartLayer);
+        };
+        if u32::from(layer) != at {
+            return Err(RenderError::NoChartLayer);
+        }
+        let key = ChartKey {
+            renderer,
+            installation: installation.loading().id(),
+            atlas: bundle.atlas_id().0,
+            generation: atlas.serial(),
+        };
+        let (side, levels, held) = (atlas.side(), atlas.levels(), atlas.chart_set());
+        let mut uvs = [None; 3];
+        for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+            let Some(f) = image else {
+                continue;
+            };
+            let uv = ChartUv::of(f, which, side, layer)
+                .filter(|_| u32::try_from(f.levels().len()).ok() == Some(levels));
+            let Some(uv) = uv else {
+                if let Some(a) = self.result_chart_array_mut(target) {
+                    a.set_chart_set(None);
+                }
+                return Err(RenderError::ChartImage { which });
+            };
+            if let Some(slot) = uvs.get_mut(which.index()) {
+                *slot = Some(uv);
+            }
+        }
+        if held == Some(set) {
+            let [stage, back, banner] = uvs;
+            return Ok(ResultChartBegin::Done(
+                ChartTable::new(stage, back, banner).keyed(key),
+            ));
+        }
+        if let Some(a) = self.result_chart_array_mut(target) {
+            a.set_chart_set(None);
+        }
+        #[cfg(any(test, feature = "dev-tools"))]
+        if refuse {
+            return Err(RenderError::ChartImage {
+                which: ChartImage::Stage,
+            });
+        }
+        let mut up = ChartUpload {
+            target: ChartTarget::Committed,
+            result: Some((target, set)),
+            key,
+            at,
+            side,
+            uvs,
+            image: 0,
+            level: 0,
+            row: 0,
+        };
+        up.settle(images);
+        Ok(ResultChartBegin::Begun(up))
+    }
+
+    /// The installation and the array a result view's chart images go
+    /// into: the staging's own, or the result kind's installed array it
+    /// shares (or the pages-only one), or the committed installation's.
+    fn result_chart_array(
+        &self,
+        target: ResultChartTarget,
+    ) -> Result<(Installation, &AtlasTexture), RenderError> {
+        let slot = Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref);
+        match target {
+            ResultChartTarget::Committed => slot
+                .map(|s| (s.installation.clone(), &s.resources.atlas))
+                .ok_or(RenderError::NoChartLayer),
+            ResultChartTarget::Staged(token) => {
+                let p = self
+                    .pending
+                    .as_ref()
+                    .filter(|p| p.token == token)
+                    .ok_or(RenderError::ChartChanged)?;
+                let installation = p
+                    .skin
+                    .as_ref()
+                    .map(DeclSkin::installation)
+                    .ok_or(RenderError::NoChartLayer)?;
+                let atlas = match &p.res {
+                    PendingRes::Own(r) => &r.atlas,
+                    PendingRes::Installed | PendingRes::Layout { .. } => {
+                        match (slot, self.result_pages.as_ref()) {
+                            (Some(s), _) => &s.resources.atlas,
+                            (None, Some(p)) => &p.atlas,
+                            (None, None) => return Err(RenderError::NoChartLayer),
+                        }
+                    }
+                    PendingRes::Pages(_) => return Err(RenderError::NoChartLayer),
+                };
+                Ok((installation, atlas))
+            }
+        }
+    }
+
+    /// [`result_chart_array`](Self::result_chart_array)'s array, to change
+    /// its record of the set it holds.
+    fn result_chart_array_mut(&mut self, target: ResultChartTarget) -> Option<&mut AtlasTexture> {
+        let i = Self::screen(ScreenKind::Result)?;
+        let slot = self.screens.get_mut(i).and_then(Option::as_mut);
+        match target {
+            ResultChartTarget::Committed => slot.map(|s| &mut s.resources.atlas),
+            ResultChartTarget::Staged(token) => {
+                let p = self.pending.as_mut().filter(|p| p.token == token)?;
+                match &mut p.res {
+                    PendingRes::Own(r) => Some(&mut r.atlas),
+                    PendingRes::Installed | PendingRes::Layout { .. } => match slot {
+                        Some(s) => Some(&mut s.resources.atlas),
+                        None => self.result_pages.as_mut().map(|p| &mut p.atlas),
+                    },
+                    PendingRes::Pages(_) => None,
+                }
+            }
+        }
+    }
+
+    /// The live key of a result view's array `target` names, as
+    /// [`begin_result_chart`](Self::begin_result_chart) keys it.
+    fn result_chart_live(
+        &self,
+        target: ResultChartTarget,
+    ) -> Option<skin_model::chart_image::ChartKey> {
+        let (installation, atlas) = self.result_chart_array(target).ok()?;
+        (!self.gpu.lost()).then(|| skin_model::chart_image::ChartKey {
+            renderer: self.id,
+            installation: installation.loading().id(),
+            atlas: installation.bundle().atlas_id().0,
+            generation: atlas.serial(),
+        })
     }
 
     /// The seams of a chart write: `refuse`, and the test fault, taken.
@@ -6095,6 +6442,30 @@ impl Renderer {
                 steps += 1;
                 continue;
             }
+            // A result view's text, after the chart images.
+            if self.result_text_steps() {
+                let written = self
+                    .result_text_up
+                    .as_ref()
+                    .and_then(|u| u.upload.as_ref())
+                    .is_some_and(text_upload::TextUpload::written);
+                if !written {
+                    if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                        break;
+                    }
+                    if past.past() {
+                        break;
+                    }
+                }
+                match self.result_text_step(past) {
+                    ResultTextStep::Stepped => {
+                        steps += 1;
+                        continue;
+                    }
+                    ResultTextStep::Again | ResultTextStep::Ended => continue,
+                    ResultTextStep::Deferred => break,
+                }
+            }
             if self
                 .bga_upload
                 .as_ref()
@@ -6181,7 +6552,10 @@ impl Renderer {
     /// a BGA batch or the result pages; never the loading text alone.
     #[must_use]
     pub fn waited_upload(&self) -> bool {
-        self.staging_steps() || self.bga_upload.is_some() || self.pages_steps()
+        self.staging_steps()
+            || self.bga_upload.is_some()
+            || self.pages_steps()
+            || self.result_text_steps()
     }
 
     /// Whether a payload is in hand: the staging's pages, or a BGA batch.
@@ -6191,6 +6565,7 @@ impl Renderer {
             || self.bga_upload.is_some()
             || self.pages_steps()
             || self.pages_report.is_some()
+            || self.result_text_steps()
     }
 
     /// Whether the staging has pages to write or its last step's
@@ -6229,6 +6604,8 @@ impl Renderer {
         );
         #[cfg(feature = "dev-tools")]
         let refuse = std::mem::take(&mut self.step_refusal);
+        #[cfg(feature = "dev-tools")]
+        let slice_clock = self.write_slice_clock;
         let gpu = &self.gpu;
         let Some(p) = self.pending.as_mut() else {
             return AtlasStep::Nothing;
@@ -6245,6 +6622,10 @@ impl Renderer {
             #[cfg(test)]
             if let Some(each) = cost {
                 return each.saturating_mul(steps);
+            }
+            #[cfg(feature = "dev-tools")]
+            if let Some(at) = slice_clock {
+                return at;
             }
             started.elapsed()
         };
@@ -6373,6 +6754,15 @@ impl Renderer {
     #[cfg(feature = "dev-tools")]
     pub const fn delay_steps(&mut self, delay: Option<Duration>) {
         self.step_delay = delay;
+    }
+
+    /// Development builds: a staging step's writes read `elapsed` as the
+    /// time they took on the boundary's slice clock instead of the real
+    /// clock (`None`: the real one), so a test decides where the slice
+    /// closes a step whatever the machine's load.
+    #[cfg(feature = "dev-tools")]
+    pub const fn set_write_slice_clock(&mut self, elapsed: Option<Duration>) {
+        self.write_slice_clock = elapsed;
     }
 
     /// Development builds: the writes of the staging's first
@@ -6535,6 +6925,7 @@ impl Renderer {
     /// Its owner keeps the run's register and disables a renderer built
     /// again before restoring anything.
     pub fn disable_result(&mut self) {
+        self.cancel_result_text();
         self.result_disabled = true;
         self.remove(ScreenKind::Result);
     }
@@ -8739,6 +9130,244 @@ impl Renderer {
         Ok(())
     }
 
+    /// [`prepare_result_text`](Self::prepare_result_text) in the uploader's
+    /// steps (design.md "Memory Budget", the uploader): `res`'s requests,
+    /// as its last view and labels left them, are taken in hand for the
+    /// array the result bundle staged (or else the committed one) draws
+    /// from; the boundaries place and write them a band a step, waiting
+    /// for no GPU work, and [`result_text_answer`](Self::result_text_answer)
+    /// attaches them once their last step's completion was seen. A text in
+    /// hand before is cancelled. Allocates.
+    ///
+    /// # Errors
+    ///
+    /// A refusal injected by a test; nothing is taken then.
+    pub fn begin_result_text(&mut self, res: &ResultScreen) -> Result<(), RenderError> {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.result_faults.1) {
+            return Err(RenderError::Skin(SkinError {
+                reason: "the result text was refused (development fault)".to_owned(),
+            }));
+        }
+        self.cancel_result_text();
+        let target = self.target();
+        let pending = self
+            .pending
+            .as_ref()
+            .filter(|p| p.token.kind == ScreenKind::Result);
+        let staged = pending
+            .and_then(|p| p.skin.as_ref())
+            .map(|s| Arc::clone(s.bundle()));
+        let own = pending
+            .filter(|p| matches!(p.res, PendingRes::Own(_)))
+            .map(|p| p.token);
+        let slot = Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref);
+        let bundle = staged.or_else(|| slot.map(|s| Arc::clone(s.installation.bundle())));
+        // Where the lines go, as for a whole preparation: none, nothing.
+        let placed = own.is_some() || slot.is_some() || self.result_pages.is_some();
+        let mut up = ResultTextUp {
+            bundle: bundle.filter(|_| placed),
+            own,
+            requests: Vec::new(),
+            slots: 0,
+            upload: None,
+            done: None,
+        };
+        match up.bundle.as_ref() {
+            None => up.done = Some(Ok(None)),
+            Some(b) => {
+                let skin = b.skin();
+                up.slots = skin.text_slots();
+                if b.text_producer().is_some() {
+                    self.text_report = TextReport::default();
+                    up.requests = skin.result_text_requests(res, target, &Layout::AUTHOR);
+                } else {
+                    up.done = Some(Ok(Some((
+                        TextTable::new(vec![None; up.slots]),
+                        Holder::default(),
+                    ))));
+                }
+            }
+        }
+        self.result_text_up = Some(up);
+        Ok(())
+    }
+
+    /// The result view's text taken by [`begin_result_text`](Self::begin_result_text),
+    /// once it ended: attached to `res` with its bitmap-font lines and
+    /// staged, as [`prepare_result_text`](Self::prepare_result_text) stages
+    /// them. `None` while it steps, or with none in hand.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_result_text`](Self::prepare_result_text).
+    pub fn result_text_answer(
+        &mut self,
+        res: &mut ResultScreen,
+    ) -> Option<Result<(), RenderError>> {
+        self.result_text_up.as_ref()?.done.as_ref()?;
+        let up = self.result_text_up.take()?;
+        let (table, holder) = match up.done? {
+            Err(e) => return Some(Err(e)),
+            Ok(None) => return Some(Ok(())),
+            Ok(Some(done)) => done,
+        };
+        let bundle = up.bundle?;
+        let skin = bundle.skin();
+        if let Err(e) = skin.attach_result_text(res, table) {
+            return Some(Err(RenderError::Skin(SkinError {
+                reason: e.to_string(),
+            })));
+        }
+        skin.attach_result_bitmap_text(res);
+        self.staged_result_text = Some((bundle.atlas_id(), holder));
+        Some(Ok(()))
+    }
+
+    /// Drops the result view's text in hand, unpublished: its new lines
+    /// are released in the cache they were placed in, if it is still
+    /// there.
+    pub fn cancel_result_text(&mut self) {
+        let Some(up) = self.result_text_up.take() else {
+            return;
+        };
+        let Some(u) = up.upload else {
+            return;
+        };
+        match up.own {
+            Some(token) => {
+                if let Some(PendingRes::Own(r)) = self
+                    .pending
+                    .as_mut()
+                    .filter(|p| p.token == token)
+                    .map(|p| &mut p.res)
+                {
+                    u.abort(&mut r.text_cache);
+                }
+            }
+            None => {
+                let slot = Self::screen(ScreenKind::Result)
+                    .and_then(|i| self.screens.get_mut(i))
+                    .and_then(Option::as_mut);
+                match (slot, self.result_pages.as_mut()) {
+                    (Some(s), _) => u.abort(&mut s.resources.text_cache),
+                    (None, Some(p)) => u.abort(&mut p.text_cache),
+                    (None, None) => {}
+                }
+            }
+        }
+    }
+
+    /// Whether a result view's text is in hand and not ended.
+    fn result_text_steps(&self) -> bool {
+        self.result_text_up
+            .as_ref()
+            .is_some_and(|u| u.done.is_none())
+    }
+
+    /// One step of the result view's text in hand, its last step's
+    /// completion seen by the caller: placed at its first, then a band at
+    /// a time, then settled once written.
+    fn result_text_step(&mut self, gate: &mut dyn crate::UploadGate) -> ResultTextStep {
+        let Some(up) = self.result_text_up.as_mut().filter(|u| u.done.is_none()) else {
+            return ResultTextStep::Ended;
+        };
+        let Some(bundle) = up.bundle.clone() else {
+            up.done = Some(Ok(None));
+            return ResultTextStep::Ended;
+        };
+        let Some(producer) = bundle.text_producer() else {
+            up.done = Some(Ok(None));
+            return ResultTextStep::Ended;
+        };
+        // Its array and cache, and the lines that must stay: gone (its
+        // staging or the installation replaced), it ends as changed.
+        let slot = Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get_mut(i))
+            .and_then(Option::as_mut);
+        let dest = match up.own {
+            Some(token) => match self
+                .pending
+                .as_mut()
+                .filter(|p| p.token == token)
+                .map(|p| &mut p.res)
+            {
+                Some(PendingRes::Own(r)) => Some((&r.atlas, &mut r.text_cache, None)),
+                _ => None,
+            },
+            None => match (slot, self.result_pages.as_mut()) {
+                (Some(s), _) => {
+                    let Slot {
+                        resources, text, ..
+                    } = s;
+                    Some((&resources.atlas, &mut resources.text_cache, Some(&*text)))
+                }
+                (None, Some(p)) => Some((&p.atlas, &mut p.text_cache, None)),
+                (None, None) => None,
+            },
+        };
+        let Some((atlas, cache, held)) = dest else {
+            up.upload = None;
+            up.done = Some(Err(RenderError::ChartChanged));
+            return ResultTextStep::Ended;
+        };
+        let held: Vec<&Holder> = held.into_iter().collect();
+        if up.upload.is_none() {
+            up.upload = Some(text_upload::TextUpload::begin(
+                cache,
+                &mut self.text_scratch,
+                producer.as_ref(),
+                bundle.text_scope(),
+                &held,
+                &up.requests,
+                up.slots,
+            ));
+        }
+        let Some(u) = up.upload.as_mut() else {
+            return ResultTextStep::Ended;
+        };
+        if !u.written() {
+            let before = u.report().upload_bytes;
+            let step = u.write_step(
+                &self.gpu,
+                atlas,
+                &mut self.text_scratch,
+                producer.as_ref(),
+                gate,
+                crate::Payload::Staging,
+            );
+            self.text_report.clone_from(u.report());
+            return match step {
+                Ok(Some(index)) => {
+                    let staged = u.report().upload_bytes - before;
+                    self.step = Some(crate::upload::InFlight::register(
+                        &self.gpu,
+                        index,
+                        staged,
+                        crate::Payload::Staging,
+                    ));
+                    ResultTextStep::Stepped
+                }
+                Ok(None) => ResultTextStep::Again,
+                Err(_) => ResultTextStep::Deferred,
+            };
+        }
+        // Written, its last step's completion seen: settled.
+        let Some(u) = up.upload.take() else {
+            return ResultTextStep::Ended;
+        };
+        up.done = Some(match u.finish(cache, &held) {
+            Ok((table, holder, report)) => {
+                self.text_report = report;
+                Ok(Some((table, holder)))
+            }
+            Err(e) => Err(e),
+        });
+        ResultTextStep::Ended
+    }
+
     /// Installs the result's lines [`prepare_result_text`]
     /// (Self::prepare_result_text) staged, in place of the ones its frames
     /// draw, which are let go: the commit point of a presentation, between
@@ -9226,13 +9855,18 @@ impl Renderer {
                     {
                         p_polled = true;
                     }
-                    !matches!(
+                    #[cfg(feature = "dev-tools")]
+                    let p_paced = Instant::now();
+                    let done = !matches!(
                         device.poll(wgpu::PollType::Wait {
                             submission_index: Some(previous.clone()),
                             timeout: wait,
                         }),
                         Err(wgpu::PollError::Timeout)
-                    )
+                    );
+                    #[cfg(feature = "dev-tools")]
+                    crate::probe::gpu_wait(p_paced.elapsed(), wait, true);
+                    done
                 });
                 #[cfg(feature = "dev-tools")]
                 if crate::probe::POST.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -9815,10 +10449,16 @@ fn write_chart_set(
 /// records them all as seen complete.
 pub(crate) fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
     let made = gpu.latest();
-    gpu.device()
+    #[cfg(feature = "dev-tools")]
+    let start = Instant::now();
+    let waited = gpu
+        .device()
         .poll(wgpu::PollType::wait_indefinitely())
         .map(|_| gpu.saw(made))
-        .map_err(RenderError::Poll)
+        .map_err(RenderError::Poll);
+    #[cfg(feature = "dev-tools")]
+    crate::probe::gpu_wait(start.elapsed(), None, false);
+    waited
 }
 
 /// The viewport `[x, y, width, height]` that fits the 1920×1080 layout

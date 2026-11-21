@@ -514,6 +514,14 @@ impl Retirements {
         Some(i)
     }
 
+    /// How many entries are free to reserve.
+    pub(super) fn free(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Free))
+            .count()
+    }
+
     /// The entry reserved for `hold`, if one is.
     pub(super) fn reserved(&self, hold: Hold) -> Option<usize> {
         self.entries

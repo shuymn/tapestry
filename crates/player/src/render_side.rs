@@ -606,6 +606,48 @@ pub trait Screen: Send {
     ) -> Option<Result<Preparation, RenderError>> {
         Some(self.install(kind, skin, request))
     }
+    /// Whether staging `skin` as `kind`'s would create an array of its own
+    /// ([`render::Renderer::install_creates`]); never by default.
+    fn install_creates(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        let _ = (kind, skin);
+        false
+    }
+    /// Whether staging `skin` as `kind`'s now would destroy no filled
+    /// retirement entry in its call ([`render::Renderer::install_room`]);
+    /// always by default.
+    fn install_room(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        let _ = (kind, skin);
+        true
+    }
+    /// Begins reading the font a page will need, off the frame, when the
+    /// screen has none (a screen for plays only); nothing by default.
+    fn read_font_ahead(&mut self) {}
+    /// The page font this screen read or is reading, taken as it is
+    /// dropped for the screen built in its place; none by default.
+    fn take_page_font(&mut self) -> Option<crate::menu_screen::PageFont> {
+        None
+    }
+    /// The page font a screen replaced read or was reading, for this one
+    /// when it has none; dropped by default.
+    fn give_page_font(&mut self, font: crate::menu_screen::PageFont) {
+        let _ = font;
+    }
+    /// Whether the page font is read, never waiting for its thread (begun
+    /// now when none is) and never reading it here; `false` for the
+    /// screen's life once its read failed. Ready by default.
+    fn page_font_ready(&mut self) -> bool {
+        true
+    }
+    /// Lays out the result strip's lines asked for while the page font was
+    /// being read, once it is, never waiting for it. Allocates. Nothing by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu`](Self::menu).
+    fn settle_result_strips(&mut self) -> Result<(), RenderError> {
+        Ok(())
+    }
     /// Whether a loading text is in the uploader's hand; none by default.
     fn loading_text_held(&self) -> bool {
         false
@@ -645,6 +687,75 @@ pub trait Screen: Send {
     ) -> Result<Result<(), String>, RenderError> {
         let _ = (skin, state, view, labels);
         Ok(Err("this screen draws no declarative skin".to_owned()))
+    }
+    /// Begins a result view's staging on `state`, a state of `skin`'s
+    /// whose installation for request `target` is staged (or committed):
+    /// the view and labels taken ([`skin_model::Skin::update_result`]),
+    /// then its chart images `chart` and its lines in the uploader's steps
+    /// (design.md "Memory Budget", the uploader), the lines staged for the
+    /// result bundle, not drawn until
+    /// [`install_result_text`](Self::install_result_text). `Some` with the
+    /// view's chart table when it is ready at once; `None` while it steps,
+    /// [`result_view_ready`](Self::result_view_ready) answering it. A
+    /// staging begun before is cancelled. Allocates. The default prepares
+    /// it whole at once: the chart images, then the text.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is the device's; the inner one the skin's refusal
+    /// on a healthy device.
+    fn begin_result_view(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        state: &mut skin_model::ResultScreen,
+        view: &skin_model::ResultView,
+        labels: &skin_model::ResultLabels,
+        target: render::ResultChartTarget,
+        chart: Option<&Arc<crate::chart_images::ChartImages>>,
+    ) -> Result<Result<Option<skin_model::chart_image::ChartTable>, String>, RenderError> {
+        let table = match chart {
+            None => skin_model::chart_image::ChartTable::ABSENT,
+            Some(set) => chart_absent(self.write_result_chart(target, set.fitted(), set.id()))?,
+        };
+        Ok(self
+            .prepare_result(skin, state, view, labels)?
+            .map(|()| Some(table)))
+    }
+    /// The result view's staging begun by
+    /// [`begin_result_view`](Self::begin_result_view), once its steps
+    /// ended: its chart table, its lines staged. `None` while it steps.
+    /// None by default, which stages at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_result_view`](Self::begin_result_view).
+    fn result_view_ready(
+        &mut self,
+        state: &mut skin_model::ResultScreen,
+    ) -> Option<Result<Result<skin_model::chart_image::ChartTable, String>, RenderError>> {
+        let _ = state;
+        None
+    }
+    /// Drops the result view's staging in hand, if any. Nothing by
+    /// default.
+    fn cancel_result_view(&mut self) {}
+    /// Holds each uploader step's completion unseen `delay` after its
+    /// submission (tests). Nothing by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn delay_steps(&mut self, _delay: Option<Duration>) {}
+    /// While `on`, a staging step's writes read no time passed on the
+    /// uploader's slice clock (dev-tools tests). Nothing by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn freeze_write_slice(&mut self, _on: bool) {}
+    /// Has the device refuse the next staging step (tests). Nothing by
+    /// default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn refuse_next_step(&mut self) {}
+    /// The writes of the first staging atlas steps, each step's count in
+    /// order, and how many steps were written (tests). None by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn steps_logged(&self) -> (Vec<u64>, usize) {
+        (Vec::new(), 0)
     }
     /// Installs the result's staged lines, at the commit point: whether
     /// they were. Allocates nothing. Never by default.
@@ -868,6 +979,17 @@ pub trait Screen: Send {
     ///
     /// As [`draw`](Self::draw).
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError>;
+    /// [`text`](Self::text), with what became of the frame: a minimized
+    /// window's frame ends invisible, which refills the frame interval's
+    /// allowance as a shown one does (design.md "Load Pipeline"). A screen
+    /// that tells only whether it presented ends any other frame `Retry`.
+    ///
+    /// # Errors
+    ///
+    /// As [`draw`](Self::draw).
+    fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
+        self.text(lines).map(|p| timing_of(shown_or_retry(p)))
+    }
     /// Draws the end screen's `page`, its lines and its graphs, as
     /// [`draw`](Self::draw), and says what became of the frame. A screen
     /// that draws no graphs draws the lines as [`text`](Self::text), a
@@ -1198,7 +1320,14 @@ impl Extent {
 }
 
 /// Builds the screen on the render thread, at startup and after a failure.
-pub type MakeScreen = Box<dyn FnMut() -> Result<Box<dyn Screen>, RenderError> + Send>;
+/// The page font the screen it replaces read, or was reading, comes in
+/// its argument: a factory that draws menus takes it from there instead
+/// of reading the font again, and leaves it when the build fails before
+/// the screen is made.
+pub type MakeScreen = Box<
+    dyn FnMut(&mut Option<crate::menu_screen::PageFont>) -> Result<Box<dyn Screen>, RenderError>
+        + Send,
+>;
 
 /// Why the screen cannot draw a play.
 #[derive(Debug, thiserror::Error)]
@@ -1450,6 +1579,10 @@ pub enum RenderMsg {
     /// Draw the result screen from the newest presentation in the slot
     /// ([`RenderLink::show_result`]), if its lifetime is current.
     ResultChanged,
+    /// The result's hold `number` begins, the result's preparation having
+    /// begun at `from` ([`RenderLink::hold_result`]; design.md "Rendering
+    /// and Skins", the result's hold).
+    HoldResult { number: u64, from: TimeUs },
     /// Draw the play screen's loading state of this loading lifetime with
     /// the lines in the slot ([`LoadingSink`]), kept through a chart's load
     /// and a preparation until something else is drawn; nothing when the
@@ -1641,6 +1774,14 @@ pub trait FrameSink: Send {
     #[cfg(feature = "dev-tools")]
     fn result_taken(&mut self, at: TimeUs) {
         let _ = at;
+    }
+
+    /// The result's hold's outgoing phase ended: from the preparation's
+    /// start (`from`) to its end (`to`), why, the hold's number as its
+    /// lifetime (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn result_hold(&mut self, hold: crate::measure::HoldStamp) {
+        let _ = hold;
     }
 
     /// A loading lifetime's hold ended by its device's loss: the screen is
@@ -2041,6 +2182,54 @@ struct Shared {
     /// The held iterations, and their waits (tests).
     #[cfg(test)]
     held: [AtomicU64; 2],
+    /// The pending presentation's frames drawn in the bitmap font while
+    /// the menu font was being read (tests).
+    #[cfg(test)]
+    bitmap_frames: AtomicU64,
+    /// The uploader writes no step while a result view's staging is in
+    /// hand, its staging answering not ready, while set (tests).
+    #[cfg(test)]
+    result_staging_paused: AtomicBool,
+    /// Each uploader step's completion held unseen this long after its
+    /// submission, in µs; 0 none (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    step_delay_us: AtomicU64,
+    /// While set, a staging step's writes read no time passed on the
+    /// uploader's slice clock (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    write_slice_frozen: AtomicBool,
+    /// The next result view's creation lasts this much longer, in µs, and
+    /// at its end moves the hold's clock to the second value (tests).
+    #[cfg(test)]
+    creation_hook: [AtomicI64; 2],
+    /// The pass a result view's creation ran in, 0 none (tests).
+    #[cfg(test)]
+    creation_pass: AtomicU64,
+    /// The uploader's next staging step is refused by the device, once
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    refuse_step: AtomicBool,
+    /// Each staging atlas step the uploader wrote, as its boundary ends
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    step_records: Mutex<Vec<StepRecord>>,
+    /// The messages the render thread took, each counted before its
+    /// handler runs (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    messages: AtomicU64,
+    /// Each result view's staging withdrawn with its side (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    withdrawals: Mutex<Vec<Withdrawal>>,
+    /// The result view stagings ended, ready or not (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    stagings_ended: AtomicU64,
+    /// No boundary destroys a filled entry while set (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    destruction_held: AtomicBool,
+    /// After the next frame's pacing, the hold's clock set to this and
+    /// the call made (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    after_pacing: PacingHook,
     /// The render thread's own allocations so far, read as each held
     /// iteration begins (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2228,6 +2417,32 @@ impl Shared {
             hold_bound: AtomicI64::new(FIRST_FRAME_HOLD.0),
             #[cfg(test)]
             held: [AtomicU64::new(0), AtomicU64::new(0)],
+            #[cfg(test)]
+            bitmap_frames: AtomicU64::new(0),
+            #[cfg(test)]
+            result_staging_paused: AtomicBool::new(false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            step_delay_us: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            write_slice_frozen: AtomicBool::new(false),
+            #[cfg(test)]
+            creation_hook: [AtomicI64::new(0), AtomicI64::new(i64::MIN)],
+            #[cfg(test)]
+            creation_pass: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            refuse_step: AtomicBool::new(false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            step_records: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "dev-tools"))]
+            messages: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            withdrawals: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "dev-tools"))]
+            stagings_ended: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            destruction_held: AtomicBool::new(false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            after_pacing: PacingHook::default(),
             #[cfg(all(test, feature = "dev-tools"))]
             held_allocations: AtomicU64::new(0),
             #[cfg(test)]
@@ -2959,6 +3174,8 @@ pub struct RenderLink {
     scripts: Scripts,
     /// The result lifetimes begun.
     result_lifetimes: AtomicU64,
+    /// The result's holds begun.
+    result_holds: AtomicU64,
 }
 
 impl RenderLink {
@@ -3085,8 +3302,27 @@ impl RenderLink {
         lifetime
     }
 
+    /// The result's hold begins (design.md "Rendering and Skins", the
+    /// result's hold), the result's preparation having begun at `from`: it
+    /// is numbered and marked in the result slot, under the slot's lock,
+    /// before the render thread is told. Its number.
+    pub fn hold_result(&self, from: TimeUs) -> u64 {
+        let number = self.result_holds.fetch_add(1, Ordering::Relaxed) + 1;
+        self.shared.result_slot().hold(number);
+        self.send(RenderMsg::HoldResult { number, from });
+        number
+    }
+
+    /// The result's hold is released with no lifetime begun (the
+    /// preparation withdrawn): no pending presentation draws after the
+    /// game's next screen message.
+    pub fn release_result_hold(&self) {
+        self.shared.result_slot().release_hold();
+    }
+
     /// The result is left: its lifetime ends and the slot empties, so no
-    /// presentation of it is drawn, one the render thread took included.
+    /// presentation of it is drawn, one the render thread took included;
+    /// its hold is released in the same lock.
     pub fn end_result(&self) {
         self.shared.result_slot().enter(0);
         self.scripts.leave_result();
@@ -3870,6 +4106,148 @@ impl RenderLink {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn set_first_frame_hold(&self, bound: TimeUs) {
         self.shared.hold_bound.store(bound.0, Ordering::SeqCst);
+    }
+
+    /// The hold's clock: `Some(elapsed)` µs since the hold's start (the
+    /// loading state's showing, the result preparation's start) in place
+    /// of the clock's reading, `None` the clock's (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_hold_clock(&self, elapsed: Option<i64>) {
+        self.shared
+            .hold_elapsed
+            .store(elapsed.unwrap_or(i64::MIN), Ordering::SeqCst);
+    }
+
+    /// Holds every step of a result view's staging unwritten from now on
+    /// (`true`), its staging answering not ready while the loop goes on,
+    /// or lets it step (`false`) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn pause_result_staging(&self, on: bool) {
+        self.shared
+            .result_staging_paused
+            .store(on, Ordering::SeqCst);
+    }
+
+    /// Holds each uploader step's completion unseen `us` µs after its
+    /// submission from the next boundary on; 0 none (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn delay_steps(&self, us: u64) {
+        self.shared.step_delay_us.store(us, Ordering::SeqCst);
+    }
+
+    /// While `on`, a staging step's writes read no time passed on the
+    /// uploader's slice clock from the next boundary on, so only the
+    /// step's size and the hold's bound close it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn freeze_write_slice(&self, on: bool) {
+        self.shared.write_slice_frozen.store(on, Ordering::SeqCst);
+    }
+
+    /// Makes the next result view's creation last `us` µs longer and, at
+    /// its end, sets the hold's clock to `then` (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn delay_result_creation(&self, us: i64, then: i64) {
+        let [delay, clock] = &self.shared.creation_hook;
+        clock.store(then, Ordering::SeqCst);
+        delay.store(us, Ordering::SeqCst);
+    }
+
+    /// Moves the hold's clock `us` µs as each write of a held pass's step
+    /// after its first begins; 0 moves nothing (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_write_clock_step(&self, us: i64) {
+        self.shared.write_clock_step.store(us, Ordering::SeqCst);
+    }
+
+    /// Has the device refuse the uploader's next staging step (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn refuse_next_step(&self) {
+        self.shared.refuse_step.store(true, Ordering::SeqCst);
+    }
+
+    /// The render loop's points a test can hold it at (tests): `0` after a
+    /// pass's boundary, before its frame reads the window's size; `1`
+    /// after that read; `2` after the frame's draw.
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a test names one of the three points"
+    )]
+    pub fn frame_gate(&self, at: usize) -> &TestGate {
+        &self.shared.frame_gates[at]
+    }
+
+    /// The pass the last result view's creation ran in, 0 none (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn creation_pass(&self) -> u64 {
+        self.shared.creation_pass.load(Ordering::SeqCst)
+    }
+
+    /// The staging atlas steps the uploader wrote so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn step_records(&self) -> Vec<StepRecord> {
+        self.shared
+            .step_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The messages the render thread took so far, each counted before
+    /// its handler runs (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn messages_taken(&self) -> u64 {
+        self.shared.messages.load(Ordering::SeqCst)
+    }
+
+    /// The result view stagings withdrawn with their side so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn withdrawals(&self) -> Vec<Withdrawal> {
+        self.shared
+            .withdrawals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The result view stagings ended so far, ready or not (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn stagings_ended(&self) -> u64 {
+        self.shared.stagings_ended.load(Ordering::SeqCst)
+    }
+
+    /// After the next frame's pacing, before what it draws is chosen,
+    /// sets the hold's clock to `elapsed` and calls `then` on the render
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn after_next_pacing(&self, elapsed: i64, then: Box<dyn FnOnce() + Send>) {
+        *self
+            .shared
+            .after_pacing
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((elapsed, then));
+    }
+
+    /// Holds every boundary's destruction of a filled entry while `on`
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn hold_destruction(&self, on: bool) {
+        self.shared.destruction_held.store(on, Ordering::SeqCst);
+    }
+
+    /// The pending presentation's frames drawn in the bitmap font so far,
+    /// the menu font unread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn bitmap_frames(&self) -> u64 {
+        self.shared.bitmap_frames.load(Ordering::SeqCst)
+    }
+
+    /// The held iterations so far, each counted as it begins (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn held_passes(&self) -> u64 {
+        let [passes, _] = &self.shared.held;
+        passes.load(Ordering::SeqCst)
     }
 
     /// The first frame's held iterations' waits so far, read from any
@@ -4934,6 +5312,7 @@ pub fn spawn(
             crate::dev::read_script_switches();
             let screen = match build(
                 &mut make,
+                &mut None,
                 &mut Committed::default(),
                 chart.as_deref(),
                 section.as_ref(),
@@ -4985,6 +5364,10 @@ pub fn spawn(
                 staged_seen: false,
                 image: Image::default(),
                 first_frame: None,
+                result_hold: None,
+                page_font: None,
+                wait_page: None,
+                wait_laid: false,
                 extent: None,
                 applied: None,
                 selected: None,
@@ -5086,6 +5469,7 @@ pub fn spawn(
             clock,
             scripts,
             result_lifetimes: AtomicU64::new(0),
+            result_holds: AtomicU64::new(0),
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -5251,7 +5635,7 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
         Mode::Play { .. } => K::Play,
         Mode::End => K::End,
         Mode::Selection => K::Selection,
-        Mode::Result => K::Result,
+        Mode::Result | Mode::ResultPending => K::Result,
         Mode::Menu {
             loading: Some(_), ..
         } => K::Loading,
@@ -5304,6 +5688,7 @@ fn stage_of(mode: &Mode, f: &StageFacts) -> crate::measure::Stage {
         let drew = match path {
             Some(ResultPath::Skin) => Drew::Skin,
             Some(ResultPath::Refused) => Drew::Refused,
+            Some(ResultPath::Pending) => Drew::Pending,
             Some(ResultPath::BuiltIn) | None => Drew::BuiltIn,
         };
         stage(State::Result, lifetime, drew)
@@ -5333,6 +5718,7 @@ fn stage_of(mode: &Mode, f: &StageFacts) -> crate::measure::Stage {
         }
         Mode::End => result(None),
         Mode::Result => result(f.result.map(|r| r.path)),
+        Mode::ResultPending => result(Some(crate::measure::ResultPath::Pending)),
         Mode::Selection => {
             let (lifetime, skinned) = f.selection.unwrap_or((0, false));
             let drew = if skinned { Drew::Skin } else { Drew::BuiltIn };
@@ -5810,8 +6196,13 @@ impl Committed {
 /// refused, and any failure, fails the build. A result restore refused
 /// says why in `result_refused`, so its owner disables the kind for the
 /// run (the S10-09i design's D2, "Keying and recovery").
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the factory and the page font it is handed, beside the restore's inputs and its two refusals"
+)]
 fn build(
     make: &mut MakeScreen,
+    font: &mut Option<crate::menu_screen::PageFont>,
     committed: &mut Committed,
     chart: Option<&Chart>,
     section: Option<&Section>,
@@ -5819,7 +6210,37 @@ fn build(
     result_refused: &mut Option<String>,
     decision_refused: &mut Option<String>,
 ) -> Result<Box<dyn Screen>, RenderError> {
-    let mut s = make()?;
+    let mut s = make(font)?;
+    match fill(
+        s.as_mut(),
+        committed,
+        chart,
+        section,
+        disabled,
+        result_refused,
+        decision_refused,
+    ) {
+        Ok(()) => Ok(s),
+        Err(e) => {
+            // The page font the factory took stays for the next build.
+            if let Some(f) = s.take_page_font() {
+                *font = Some(f);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// [`build`]'s restores and load on the screen `s` just made.
+fn fill(
+    s: &mut dyn Screen,
+    committed: &mut Committed,
+    chart: Option<&Chart>,
+    section: Option<&Section>,
+    disabled: bool,
+    result_refused: &mut Option<String>,
+    decision_refused: &mut Option<String>,
+) -> Result<(), RenderError> {
     if disabled {
         s.disable_result();
     }
@@ -5895,7 +6316,7 @@ fn build(
     if let Some(chart) = chart {
         s.load(chart, section)?;
     }
-    Ok(s)
+    Ok(())
 }
 
 enum Mode {
@@ -5945,6 +6366,10 @@ enum Mode {
     Selection,
     /// The result screen from its presentations: [`Run::result`].
     Result,
+    /// The result's pending presentation, with no result side
+    /// ([`Run::result_hold`], design.md "Rendering and Skins", the
+    /// result's hold): the wait page.
+    ResultPending,
 }
 
 /// The select screen as the render thread holds it: the newest update
@@ -6152,6 +6577,17 @@ impl Image {
 /// The size notices `extent` published, none without one.
 fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
     extent.map_or(0, |e| e.notices())
+}
+
+/// The result's hold on the render thread (design.md "Rendering and
+/// Skins", the result's hold): its number, the result preparation's start
+/// on the clock, and whether the outgoing screen's phase lasts, which,
+/// once ended, never resumes.
+#[derive(Clone, Copy, Debug)]
+struct ResultHold {
+    number: u64,
+    from: TimeUs,
+    held: bool,
 }
 
 /// A loading lifetime's first frame: when it was shown, and whether its
@@ -6368,6 +6804,8 @@ enum Creation {
     Pages,
     /// A result skin's selection: its staging's first take.
     Select,
+    /// A result view's staging: its installation's first take.
+    ResultView,
 }
 
 /// A result skin's selection in hand ([`Run::begin_select`]).
@@ -6597,6 +7035,8 @@ pub(crate) enum HeavyKind {
     PagesCreation,
     /// A result skin's selection taken, its array created.
     SelectCreation,
+    /// A result view's staging taken, its union's array created.
+    ResultCreation,
 }
 
 /// The regime a boundary read (design.md "Load Pipeline", the
@@ -6668,6 +7108,16 @@ struct Run {
     image: Image,
     /// The current loading lifetime's first frame, once visited.
     first_frame: Option<FirstFrame>,
+    /// The result's hold, while it lasts (design.md "Rendering and
+    /// Skins", the result's hold): `None` from READY through the tail.
+    result_hold: Option<ResultHold>,
+    /// The page font of a screen dropped, for the one built in its place.
+    page_font: Option<crate::menu_screen::PageFont>,
+    /// The result's pending presentation, composed once.
+    wait_page: Option<MenuPage>,
+    /// The last frame drawn was the pending presentation: its page is
+    /// laid out.
+    wait_laid: bool,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
     /// The size last applied to the screen; `None` until one is, and for
@@ -6965,9 +7415,16 @@ impl Run {
                     Mode::Decision => 5,
                     Mode::Selection => 6,
                     Mode::Result => 7,
+                    Mode::ResultPending => 8,
                 },
             );
             self.sync_chart();
+            // The result's hold, while one lasts: dropped once its mark no
+            // longer names it (design.md "Rendering and Skins", the
+            // result's hold). In play it is `None`: one test.
+            if self.result_hold.is_some() {
+                self.check_result_hold(&mut mode);
+            }
             // Every pass's end comes back here, whichever way it ended:
             // READY's cutoff asked with no entry filled is given here, and
             // a heavy operation a handler ran spends the allowance.
@@ -7039,12 +7496,34 @@ impl Run {
                     i64::from(idle),
                 );
             }
+            // A result left (its lifetime ended, or another begun) is
+            // withdrawn before anything else of this turn: its staging
+            // retires into its own entry before the next screen's message
+            // is handled or a boundary writes it (design.md "Rendering and
+            // Skins", the result's hold). Outside Result it is `None`: one
+            // test.
+            if self
+                .result
+                .as_ref()
+                .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+            {
+                self.drop_result();
+            }
+            #[cfg(all(test, feature = "dev-tools"))]
+            if msg.is_ok() {
+                self.shared.messages.fetch_add(1, Ordering::SeqCst);
+            }
             // The game's next screen or attempt ends READY's cutoff before
             // its handler runs, and the result's wait for its first
             // picture (design.md "Memory Budget", READY's condition).
             if self.ends_cutoff(&msg) {
                 self.end_cutoff();
                 self.result_unacked = false;
+            }
+            // Another screen's message ends a result hold still held, a
+            // screen built again excepted.
+            if self.result_hold.is_some() && Self::ends_result_hold(&msg) {
+                self.result_hold = None;
             }
             self.allow_destruction(&mode);
             // The select screen is left: its frames are reported; and the
@@ -7203,6 +7682,19 @@ impl Run {
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
+                Ok(RenderMsg::HoldResult { number, from }) => {
+                    self.result_hold = Some(ResultHold {
+                        number,
+                        from,
+                        held: true,
+                    });
+                    // The pending presentation's font, read off the frame
+                    // before its first frame needs it.
+                    if let Some(s) = &mut self.screen {
+                        s.read_font_ahead();
+                    }
+                    continue;
+                }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
                     if self.current_result().is_some() {
@@ -7339,6 +7831,16 @@ impl Run {
                     // A result lifetime draws on from what it presented.
                     if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
+                    } else if let Some(h) = self.result_hold {
+                        // The outgoing picture went with the old target:
+                        // the pending presentation draws from the rebuilt
+                        // screen's first frame.
+                        #[cfg(feature = "dev-tools")]
+                        if h.held {
+                            self.result_held_ended(h, crate::measure::HoldEnd::Image);
+                        }
+                        self.result_hold = Some(ResultHold { held: false, ..h });
+                        mode = Mode::ResultPending;
                     }
                     continue;
                 }
@@ -7533,6 +8035,17 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     self.frames.result_taken(self.clock.now());
                     let shows = self.current_result().is_some_and(ResultSide::shows);
+                    // A leaving command pinned the current lifetime's hold
+                    // before its first view: the hold stays, the outgoing
+                    // picture or the pending presentation drawn until the
+                    // next screen's message, never the built-in page.
+                    let pinned = self.result_hold.is_some()
+                        && self.result.as_ref().is_some_and(|side| {
+                            side.presented.is_none() && {
+                                let b = self.shared.barrier();
+                                b.lifetime == side.lifetime && b.fadeout.is_some()
+                            }
+                        });
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {
@@ -7541,7 +8054,15 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if shows { Mode::Result } else { Mode::End };
+                    mode = if shows || pinned {
+                        Mode::Result
+                    } else {
+                        Mode::End
+                    };
+                    // The built-in page with no lifetime ends the hold.
+                    if !shows && !pinned {
+                        self.result_hold = None;
+                    }
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -7635,7 +8156,18 @@ impl Run {
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
+            // The window's size this turn's result frame is prepared and
+            // drawn for, read once: the notices published before it and
+            // the size. A notice published later leaves the frame's image
+            // invalid, and its size applies next turn.
+            let mut turn_extent = None;
             if matches!(mode, Mode::Result) {
+                // The window's newest size first: the strip's lines laid
+                // out here are placed for the target the frame draws on.
+                let notices = notices_of(self.extent.as_ref());
+                let size = self.extent.as_ref().and_then(|e| e.latest());
+                turn_extent = Some((notices, size));
+                self.apply_size(size);
                 #[cfg(feature = "dev-tools")]
                 let (prepared, p_own) = (Instant::now(), render::probe::own_time());
                 self.prepare_result();
@@ -7663,6 +8195,13 @@ impl Run {
             let regrow = std::mem::take(&mut self.regrow_due);
             #[cfg(test)]
             self.shared.passes.fetch_add(1, Ordering::SeqCst);
+            // The pass's kind for the blocking-wait counter (tests).
+            #[cfg(all(test, feature = "dev-tools"))]
+            render::probe::set_pass(match (&held, &mode) {
+                (Some(_), _) => render::probe::PASS_HELD,
+                (None, Mode::Idle) => render::probe::PASS_OTHER,
+                (None, _) => render::probe::PASS_PRESENTING,
+            });
             if self.boundary(&mode, held, regrow) {
                 mode = Mode::Idle;
                 continue;
@@ -7679,23 +8218,29 @@ impl Run {
                 self.poll_attempt();
                 self.poll_select();
             }
-            let Some(screen) = &mut self.screen else {
+            if self.screen.is_none() {
                 continue;
-            };
+            }
             #[cfg(test)]
             self.shared.frame_gates[0].pass();
             // The frame's token, before it reads the window's size: a
             // notice or a target change from here on leaves what it
             // presents invalid.
-            let token = self.image.token(notices_of(self.extent.as_ref()));
-            // The window's newest size, between frames.
-            if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
-                && self.applied != Some(size)
-            {
-                screen.resize(size.0, size.1);
-                self.applied = Some(size);
-                self.image.changed();
-            }
+            // A result frame's: the turn's notices and size, applied again
+            // only to a screen built since.
+            let token = match turn_extent {
+                Some((notices, size)) => {
+                    let token = self.image.token(notices);
+                    self.apply_size(size);
+                    token
+                }
+                None => {
+                    let token = self.image.token(notices_of(self.extent.as_ref()));
+                    // The window's newest size, between frames.
+                    self.apply_extent();
+                    token
+                }
+            };
             #[cfg(test)]
             self.shared.frame_gates[1].pass();
             // The decision labels' work at this frame boundary, outside
@@ -7714,6 +8259,12 @@ impl Run {
             // size: brought to the lifetime's chart and the target applied
             // (design.md "Rendering and Skins").
             self.loading_text_pass(&mode);
+            // The result's hold before the hand-over: the outgoing screen
+            // (the play's) draws until the bound, the pending presentation
+            // after it.
+            if !matches!(mode, Mode::Result | Mode::ResultPending) && self.result_hold_passed() {
+                mode = Mode::ResultPending;
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -7840,6 +8391,67 @@ impl Run {
                 }
                 self.first_frame = Some(first);
             }
+            // The result's held pass after the hand-over: nothing built or
+            // presented while the first view stages within the bound; its
+            // outgoing phase ends at the bound, a size notice, a target
+            // change or a lost device, never to resume.
+            if matches!(mode, Mode::Result)
+                && self.result_hold.is_some_and(|h| h.held)
+                && self
+                    .result
+                    .as_ref()
+                    .is_some_and(|s| self.first_view_waits(s))
+            {
+                let lost = self.screen.as_ref().is_some_and(|s| s.device_lost());
+                match self.result_held().filter(|_| !lost) {
+                    Some(from) => {
+                        let now = self.clock.now();
+                        #[cfg(test)]
+                        let now = hold_now(&self.shared, now, from);
+                        let wait = held_wait(now, from, first_frame_bound(&self.shared))
+                            .map_or(Duration::ZERO, |w| {
+                                Duration::from_micros(w.0.unsigned_abs())
+                            });
+                        #[cfg(test)]
+                        self.shared.held[0].fetch_add(1, Ordering::SeqCst);
+                        let paused = self.result_staging_paused();
+                        match self.screen.as_ref().map(|s| s.upload_state()) {
+                            // A step ready to write: the next pass at once.
+                            Some(render::UploadState::Ready) if !paused => {}
+                            Some(render::UploadState::InFlight) => self.wait_step(wait),
+                            _ => {
+                                #[cfg(test)]
+                                count_wait(&self.shared, WaitKind::HeldPace);
+                                std::thread::sleep(wait);
+                            }
+                        }
+                        #[cfg(test)]
+                        self.shared.held[1].fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    None => {
+                        #[cfg(feature = "dev-tools")]
+                        if let Some(h) = self.result_hold {
+                            let now = self.clock.now();
+                            #[cfg(test)]
+                            let now = hold_now(&self.shared, now, h.from);
+                            let why = if lost {
+                                crate::measure::HoldEnd::DeviceLost
+                            } else if held_wait(now, h.from, first_frame_bound(&self.shared))
+                                .is_none()
+                            {
+                                crate::measure::HoldEnd::Bound
+                            } else {
+                                crate::measure::HoldEnd::Image
+                            };
+                            self.result_held_ended(h, why);
+                        }
+                        if let Some(h) = &mut self.result_hold {
+                            h.held = false;
+                        }
+                    }
+                }
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -7891,11 +8503,17 @@ impl Run {
                 let now = Instant::now();
                 let deadline = *self.pace_deadline.get_or_insert(now + CLOCK_PACE);
                 if now < deadline {
+                    // The frame's pacing until its deadline (tests: the
+                    // blocking-wait counter's kind).
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    render::probe::set_pass(render::probe::PASS_BETWEEN);
                     let _ = screen.wait_step(
                         deadline
                             .saturating_duration_since(now)
                             .min(pace_of(HELD_PACE)),
                     );
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    render::probe::set_pass(render::probe::PASS_PRESENTING);
                 }
                 if Instant::now() < deadline {
                     #[cfg(test)]
@@ -8027,6 +8645,15 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
+            // The result's hold's bound passed during the frame's pacing:
+            // this frame draws the pending presentation, never one more
+            // outgoing frame (design.md "Rendering and Skins", the
+            // result's hold). In play it is `None`: one test.
+            #[cfg(all(test, feature = "dev-tools"))]
+            self.after_pacing();
+            if !matches!(mode, Mode::Result | Mode::ResultPending) && self.result_hold_passed() {
+                mode = Mode::ResultPending;
+            }
             // A test holds a result frame here, after its lifetime's
             // check: a new lifetime may begin before its commit point.
             #[cfg(test)]
@@ -8070,6 +8697,8 @@ impl Run {
             // its instant: the presents of the last second, the local time
             // and the uptime, the clock reading 0 at launch.
             let mut frame_at = self.clock.now();
+            // Whether this frame draws the result's pending presentation.
+            let mut pending_frame = false;
             // Whether a result frame was built with its skin (dev-tools:
             // G3's and G5's ends).
             #[cfg(feature = "dev-tools")]
@@ -8627,6 +9256,40 @@ impl Run {
                         .as_ref()
                         .is_some_and(|s| s.presented.is_some())
                         .then_some(entry);
+                    // No view presented after the commit point while the
+                    // hold's outgoing phase lasts (a leaving command
+                    // pinned during the frame's pacing discarded the view
+                    // prepared there): the hold decides this frame at the
+                    // barrier, so nothing is presented and the outgoing
+                    // picture stays; past the bound the pending
+                    // presentation draws (design.md "Rendering and
+                    // Skins", the result's hold).
+                    if result_picture.is_none()
+                        && fadeout.is_some()
+                        && Self::hold_within(
+                            self.result_hold,
+                            self.clock,
+                            &self.shared,
+                            &self.image,
+                            self.extent.as_ref(),
+                        )
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    // The lifetime's first committed view ends the hold.
+                    if result_picture.is_some() {
+                        #[cfg(feature = "dev-tools")]
+                        if let Some(h) = self.result_hold.filter(|h| h.held) {
+                            self.frames.result_hold(crate::measure::HoldStamp {
+                                lifetime: h.number,
+                                from: h.from,
+                                to: self.clock.now(),
+                                ended_by: Some(crate::measure::HoldEnd::Skin),
+                            });
+                        }
+                        self.result_hold = None;
+                    }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
@@ -8641,6 +9304,7 @@ impl Run {
                         self.result.as_mut(),
                         now,
                         fadeout,
+                        self.result_hold.is_some(),
                         &app,
                     );
                     // A frame under the barrier refused (dev-tools: the
@@ -8691,6 +9355,7 @@ impl Run {
                             path: match built {
                                 ResultDrawn::Built => crate::measure::ResultPath::Skin,
                                 ResultDrawn::BuiltIn => crate::measure::ResultPath::BuiltIn,
+                                ResultDrawn::Pending => crate::measure::ResultPath::Pending,
                                 ResultDrawn::Refused(_) => crate::measure::ResultPath::Refused,
                             },
                             page: self.end_page.0,
@@ -8726,6 +9391,20 @@ impl Run {
                         ResultDrawn::BuiltIn => screen
                             .end(&page(self.result.as_ref(), &self.end_page.1))
                             .map(|p| (timing_of(p), None)),
+                        ResultDrawn::Pending => {
+                            if screen.page_font_ready() {
+                                let page = self
+                                    .wait_page
+                                    .get_or_insert_with(crate::loading_text::skin_wait_page);
+                                pending_frame = true;
+                                screen.menu(page, !self.wait_laid).map(|t| (t, None))
+                            } else {
+                                // Its font not yet read: the bitmap line.
+                                #[cfg(test)]
+                                self.shared.bitmap_frames.fetch_add(1, Ordering::SeqCst);
+                                pending_bitmap(screen.as_mut())
+                            }
+                        }
                         ResultDrawn::Refused(e) => {
                             // Refused on a healthy device: the built-in page
                             // draws in this frame, and the result kind is
@@ -8844,6 +9523,37 @@ impl Run {
                         }
                     }
                 }
+                Mode::ResultPending => {
+                    // The wait page, laid out at its first frame; no result
+                    // picture. Its font not yet read (a screen made for
+                    // plays only, read on its own thread), or its read
+                    // failed: the bitmap line instead, never a read or a
+                    // wait for the font in the frame (design.md "Rendering
+                    // and Skins", the result's hold).
+                    let drawn = if screen.page_font_ready() {
+                        let page = self
+                            .wait_page
+                            .get_or_insert_with(crate::loading_text::skin_wait_page);
+                        pending_frame = true;
+                        screen.menu(page, !self.wait_laid).map(|t| (t, None))
+                    } else {
+                        #[cfg(test)]
+                        self.shared.bitmap_frames.fetch_add(1, Ordering::SeqCst);
+                        pending_bitmap(screen.as_mut())
+                    };
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        result_stamp = Some(crate::measure::ResultStamp {
+                            id: None,
+                            path: crate::measure::ResultPath::Pending,
+                            page: self.end_page.0,
+                            view: None,
+                            sampled: frame_at,
+                            timer_origin: None,
+                        });
+                    }
+                    drawn
+                }
                 Mode::End => {
                     // An entry whose result lifetime began shows first at
                     // its first committed view, not on this page.
@@ -8901,14 +9611,16 @@ impl Run {
             if decision_refused.is_some() {
                 self.shared.decision_cleanup_gate.pass();
             }
+            self.wait_laid = pending_frame && drawn.is_ok();
             #[cfg(feature = "dev-tools")]
             crate::dev::loop_probe::mark("draw1", 0);
-            // A result or end frame lost as a device loss (dev-tools: a
-            // recovery while a result shows).
+            // A result or end frame, or the result's pending presentation,
+            // lost as a device loss (dev-tools: a recovery while a result
+            // shows or is prepared).
             #[cfg(feature = "dev-tools")]
             let drawn = match drawn {
                 Ok(_)
-                    if matches!(mode, Mode::Result | Mode::End)
+                    if matches!(mode, Mode::Result | Mode::End | Mode::ResultPending)
                         && crate::dev::lose_result_frame() =>
                 {
                     Err(RenderError::SurfaceLost)
@@ -9225,10 +9937,11 @@ impl Run {
                     if timing.presented()
                         && (matches!(mode, Mode::End)
                             || matches!(mode, Mode::Result)
-                                && self
-                                    .result
-                                    .as_ref()
-                                    .is_none_or(|r| r.incoming.is_none() && r.prepared.is_none()))
+                                && self.result.as_ref().is_none_or(|r| {
+                                    r.incoming.is_none()
+                                        && r.staging.is_none()
+                                        && r.prepared.is_none()
+                                }))
                     {
                         self.shared
                             .end_drawn
@@ -9323,6 +10036,25 @@ impl Run {
         self.shared.built(screen);
     }
 
+    /// Applies the window's newest size to the screen, between frames, if
+    /// it is not the one applied.
+    fn apply_extent(&mut self) {
+        self.apply_size(self.extent.as_ref().and_then(|e| e.latest()));
+    }
+
+    /// Applies `size`, the window's as read, to the screen, between
+    /// frames, if it is not the one applied.
+    fn apply_size(&mut self, size: Option<(u32, u32)>) {
+        if let Some(size) = size
+            && self.applied != Some(size)
+            && let Some(screen) = &mut self.screen
+        {
+            screen.resize(size.0, size.1);
+            self.applied = Some(size);
+            self.image.changed();
+        }
+    }
+
     /// A screen built again (a recovery, a chart load's retry): it takes
     /// the pass's permission to destroy in a staging's call, its heavy
     /// operations are counted from its own, and the rebuild, inline, spends
@@ -9330,6 +10062,10 @@ impl Run {
     /// Pipeline", the device rebuild).
     fn screen_built(&mut self) {
         if let Some(s) = &mut self.screen {
+            // The page font the screen it replaces read, or was reading.
+            if let Some(font) = self.page_font.take() {
+                s.give_page_font(font);
+            }
             s.set_destroy_allowed(self.destroy_allowed);
             self.heavy_seen = s.heavy_ops().count;
             self.result_changes = s.result_changes();
@@ -9375,6 +10111,153 @@ impl Run {
     /// which ends READY's cutoff (design.md "Memory Budget", its end):
     /// a loading lifetime's lines only for another lifetime than the one
     /// ended or paused last, whose sinks may still report late.
+    /// Whether `msg` is another screen's, which ends a result hold still
+    /// held (a screen built again keeps it).
+    const fn ends_result_hold(msg: &Result<RenderMsg, TryRecvError>) -> bool {
+        matches!(
+            msg,
+            Ok(RenderMsg::Load { .. }
+                | RenderMsg::PrepareAttempt { .. }
+                | RenderMsg::Menu(_)
+                | RenderMsg::Decision { .. }
+                | RenderMsg::PracticePage(_)
+                | RenderMsg::SelectionChanged
+                | RenderMsg::Select { .. }
+                | RenderMsg::Loading(_))
+        )
+    }
+
+    /// The result's held pass (design.md "Rendering and Skins", the
+    /// result's hold): from the hand-over, while the hold's outgoing phase
+    /// lasts, the side has no view presented or prepared, the bound has
+    /// not passed and the image on screen is valid, the pass presents
+    /// nothing; the preparation's start, then.
+    fn result_held(&self) -> Option<TimeUs> {
+        let side = self.result.as_ref()?;
+        if !self.first_view_waits(side) || self.screen.is_none() {
+            return None;
+        }
+        Self::hold_within(
+            self.result_hold,
+            self.clock,
+            &self.shared,
+            &self.image,
+            self.extent.as_ref(),
+        )
+    }
+
+    /// Whether the result's hold `hold` is in its outgoing phase now: held,
+    /// its bound not passed and the image on screen valid; the
+    /// preparation's start, then. Reads only the fields it is given, so a
+    /// frame that holds the screen can ask it.
+    fn hold_within(
+        hold: Option<ResultHold>,
+        clock: QpcClock,
+        shared: &Shared,
+        image: &Image,
+        extent: Option<&Arc<Extent>>,
+    ) -> Option<TimeUs> {
+        let h = hold.filter(|h| h.held)?;
+        let now = clock.now();
+        #[cfg(test)]
+        let now = hold_now(shared, now, h.from);
+        (held_wait(now, h.from, first_frame_bound(shared)).is_some()
+            && image.valid(notices_of(extent)))
+        .then_some(h.from)
+    }
+
+    /// Whether `side`'s first view is still to come: none presented, and
+    /// none prepared that its commit point would commit (a leaving command
+    /// pinned before the first commit discards the view prepared, which is
+    /// then never presented). The outgoing picture or the pending
+    /// presentation stays meanwhile, never the built-in end page.
+    fn first_view_waits(&self, side: &ResultSide) -> bool {
+        side.presented.is_none()
+            && (side.prepared.is_none() || {
+                let b = self.shared.barrier();
+                b.lifetime == side.lifetime && b.fadeout.is_some()
+            })
+    }
+
+    /// The hook after a frame's pacing, if one is set (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn after_pacing(&self) {
+        let hook = self
+            .shared
+            .after_pacing
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((elapsed, then)) = hook {
+            self.shared.hold_elapsed.store(elapsed, Ordering::SeqCst);
+            then();
+        }
+    }
+
+    /// Whether a test holds the result view's staging unwritten (tests):
+    /// its flag set and a staging in hand.
+    fn result_staging_paused(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.shared.result_staging_paused.load(Ordering::SeqCst)
+                && self.result.as_ref().is_some_and(|s| s.staging.is_some())
+        }
+        #[cfg(not(test))]
+        false
+    }
+
+    /// The result's hold's own lifetime check, at the top of a loop turn
+    /// while one lasts: a mark that no longer names it (released, or a
+    /// newer hold begun) drops it, and its pending presentation turns
+    /// Idle.
+    fn check_result_hold(&mut self, mode: &mut Mode) {
+        let Some(h) = self.result_hold else {
+            return;
+        };
+        if self.shared.result_slot().holds(h.number) {
+            return;
+        }
+        self.result_hold = None;
+        if matches!(mode, Mode::ResultPending) {
+            *mode = Mode::Idle;
+        }
+    }
+
+    /// Whether the result's hold's outgoing phase ends now, its bound
+    /// passed on the hold's clock: it never resumes.
+    fn result_hold_passed(&mut self) -> bool {
+        let Some(h) = self.result_hold.as_mut().filter(|h| h.held) else {
+            return false;
+        };
+        let now = self.clock.now();
+        #[cfg(test)]
+        let now = hold_now(&self.shared, now, h.from);
+        if held_wait(now, h.from, first_frame_bound(&self.shared)).is_some() {
+            return false;
+        }
+        h.held = false;
+        #[cfg(feature = "dev-tools")]
+        {
+            let h = *h;
+            self.result_held_ended(h, crate::measure::HoldEnd::Bound);
+        }
+        true
+    }
+
+    /// Records the end of the result's hold's outgoing phase, for `why`
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn result_held_ended(&mut self, h: ResultHold, why: crate::measure::HoldEnd) {
+        let to = self.clock.now();
+        self.frames.result_hold(crate::measure::HoldStamp {
+            lifetime: h.number,
+            from: h.from,
+            to,
+            ended_by: Some(why),
+        });
+    }
+
     fn ends_cutoff(&self, msg: &Result<RenderMsg, TryRecvError>) -> bool {
         match msg {
             Ok(
@@ -9550,6 +10433,10 @@ impl Run {
     /// staging may, and not before a loading lifetime's first presented
     /// frame.
     fn destroy_ok(&self, mode: &Mode) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.shared.destruction_held.load(Ordering::SeqCst) {
+            return false;
+        }
         !self.cut_off
             && !matches!(mode, Mode::Play { .. })
             && !self.result_unacked
@@ -9657,6 +10544,9 @@ impl Run {
     /// the image held is valid and the bound has not passed. Changes
     /// nothing.
     fn held(&self, mode: &Mode) -> Option<TimeUs> {
+        if matches!(mode, Mode::Result) {
+            return self.result_held();
+        }
         let (
             Mode::Menu {
                 loading: Some(lifetime),
@@ -9994,6 +10884,32 @@ impl Run {
                     }
                     self.poll_select();
                 }
+                Creation::ResultView => {
+                    #[cfg(feature = "dev-tools")]
+                    let uploads = self.screen.as_ref().map_or(0, |s| s.atlas_uploads());
+                    if let Some(st) = self.result.as_mut().and_then(|r| r.staging.as_mut()) {
+                        st.taken = true;
+                        #[cfg(feature = "dev-tools")]
+                        {
+                            st.uploads = uploads;
+                        }
+                    }
+                    self.prepare_result();
+                    #[cfg(test)]
+                    {
+                        let [delay, clock] = &self.shared.creation_hook;
+                        let us = delay.swap(0, Ordering::SeqCst);
+                        if us > 0 {
+                            std::thread::sleep(Duration::from_micros(us.unsigned_abs()));
+                            self.shared
+                                .hold_elapsed
+                                .store(clock.load(Ordering::SeqCst), Ordering::SeqCst);
+                        }
+                        self.shared
+                            .creation_pass
+                            .store(self.shared.passes.load(Ordering::SeqCst), Ordering::SeqCst);
+                    }
+                }
             }
             #[cfg(test)]
             self.note_heavy_record(HeavyRec {
@@ -10001,6 +10917,7 @@ impl Run {
                     Creation::Play => HeavyKind::PlayCreation,
                     Creation::Pages => HeavyKind::PagesCreation,
                     Creation::Select => HeavyKind::SelectCreation,
+                    Creation::ResultView => HeavyKind::ResultCreation,
                 },
                 start,
                 end: Instant::now(),
@@ -10096,7 +11013,10 @@ impl Run {
     /// that draws one (design.md "Memory Budget", the uploader's admission
     /// gate): the swap chain's grant where frames are paced by it, or the
     /// frame's clock deadline while an upload steps offscreen or
-    /// minimized. Nothing in an Idle or a held pass, or with a grant kept.
+    /// minimized. Nothing in an Idle or a held pass. A grant kept makes
+    /// the frame due only while the target is visible and paced by it: a
+    /// grant kept across a minimize waits for the restore, and the clock
+    /// paces the frames meanwhile.
     fn frame_due_by(&self, mode: &Mode, held: Option<TimeUs>) -> FrameDue {
         let Some(s) = &self.screen else {
             return FrameDue::Never;
@@ -10104,10 +11024,10 @@ impl Run {
         if held.is_some() || matches!(mode, Mode::Idle) {
             return FrameDue::Never;
         }
-        if self.granted {
-            return FrameDue::Now;
-        }
         if s.paced() && !s.minimized() {
+            if self.granted {
+                return FrameDue::Now;
+            }
             return s.grant_probe().map_or(FrameDue::Never, FrameDue::Grant);
         }
         self.pace_deadline.map_or(FrameDue::Never, FrameDue::At)
@@ -10122,6 +11042,24 @@ impl Run {
             Some(Creation::Pages)
         } else if self.select_hand.as_ref().is_some_and(|h| !h.taken) {
             Some(Creation::Select)
+        } else if self
+            .result
+            .as_ref()
+            .and_then(|r| r.staging.as_ref())
+            .is_some_and(|s| {
+                // Owed once it can be admitted with no destruction in its
+                // call: until then the boundaries' retirement path frees
+                // the room it needs (design.md "Memory Budget").
+                !s.taken
+                    && s.held.payload.skin.as_ref().is_none_or(|b| {
+                        self.screen.as_ref().is_some_and(|sc| {
+                            sc.install_creates(ScreenKind::Result, b)
+                                && sc.install_room(ScreenKind::Result, b)
+                        })
+                    })
+            })
+        {
+            Some(Creation::ResultView)
         } else {
             None
         }
@@ -10167,6 +11105,7 @@ impl Run {
             let (mut refused, mut decision_refused) = (None, None);
             let built = build(
                 &mut self.make,
+                &mut self.page_font,
                 &mut self.committed,
                 None,
                 None,
@@ -10821,6 +11760,26 @@ impl Run {
             .as_ref()
             .filter(|h| h.taken)
             .map(|_| crate::dev::loop_probe::Caller::set(render::probe::SELECT_SKIN));
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(s) = self.screen.as_mut() {
+            let us = self.shared.step_delay_us.load(Ordering::SeqCst);
+            s.delay_steps((us > 0).then(|| Duration::from_micros(us)));
+            s.freeze_write_slice(self.shared.write_slice_frozen.load(Ordering::SeqCst));
+        }
+        if self.result_staging_paused() {
+            return;
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.shared.refuse_step.swap(false, Ordering::SeqCst)
+            && let Some(s) = self.screen.as_mut()
+        {
+            s.refuse_next_step();
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        let logged = (
+            self.screen.as_ref().map_or(0, |s| s.steps_logged().1),
+            render::probe::steps(),
+        );
         let mut pages_end = None;
         let frame = self.frame_due_by(mode, held);
         let chart = self
@@ -10891,6 +11850,8 @@ impl Run {
             }
             None => stale,
         };
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.record_steps(logged, held.is_some());
         if let Some(end) = pages_end {
             self.pages_end(end);
         }
@@ -10904,6 +11865,42 @@ impl Run {
         };
         if let Some((_, reply)) = self.bga_reply.take() {
             let _ = reply.send(answer);
+        }
+    }
+
+    /// Records the uploader's steps this boundary submitted past the
+    /// `logged` before it (staging atlas steps, every step), with whether
+    /// its pass was held (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn record_steps(&self, (logged, stepped): (usize, u64), held: bool) {
+        let Some(s) = self.screen.as_ref() else {
+            return;
+        };
+        let (log, now) = s.steps_logged();
+        let others = (render::probe::steps() - stepped).saturating_sub((now - logged) as u64);
+        let mut records = self
+            .shared
+            .step_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let pass = self.shared.passes.load(Ordering::SeqCst);
+        for n in logged..now {
+            records.push(StepRecord {
+                atlas: true,
+                writes: log.get(n).copied(),
+                held,
+                pass,
+                at: Instant::now(),
+            });
+        }
+        for _ in 0..others {
+            records.push(StepRecord {
+                atlas: false,
+                writes: None,
+                held,
+                pass,
+                at: Instant::now(),
+            });
         }
     }
 
@@ -11431,6 +12428,7 @@ impl Run {
             (None, _) => {
                 let built = build(
                     &mut self.make,
+                    &mut self.page_font,
                     &mut self.committed,
                     chart,
                     section,
@@ -11460,6 +12458,7 @@ impl Run {
         if ready.is_ok() {
             self.shared.failed.store(false, Ordering::Release);
         } else {
+            self.keep_page_font();
             self.screen = None;
             self.image.changed();
             self.granted = false;
@@ -11809,6 +12808,7 @@ impl Run {
                 Ok(())
             }
             crate::decision_side::Rebuilt::Failed(e) => {
+                self.keep_page_font();
                 self.screen = None;
                 self.image.changed();
                 self.granted = false;
@@ -11834,6 +12834,9 @@ enum ResultDrawn {
     Built,
     /// The built-in page of the view presented.
     BuiltIn,
+    /// The result's pending presentation: no view presented, the first
+    /// one staging (design.md "Rendering and Skins", the result's hold).
+    Pending,
     /// The skin refused its frame on a healthy device: nothing of it was
     /// staged.
     Refused(BuildError),
@@ -11872,6 +12875,31 @@ fn stage_result_chart(
     }
 }
 
+/// A result view's chart table from a write's outcome: a target with no
+/// chart layer and a refused write (a misfit, a level mismatch, a write
+/// the device refused) leave an all-absent table, never a failed screen.
+///
+/// # Errors
+///
+/// The device's failure during the write.
+pub(crate) fn chart_absent(
+    written: Result<skin_model::chart_image::ChartTable, RenderError>,
+) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+    use skin_model::chart_image::ChartTable;
+    match written {
+        Ok(table) => Ok(table),
+        Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
+        Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
+            eprintln!(
+                "render: the result's chart images are not shown: {}",
+                Chain(&e)
+            );
+            Ok(ChartTable::ABSENT)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The strip's text slots, after the one drawn: the one prepared with a
 /// view payload waiting, and the one prepared for the view presented.
 pub(super) const STRIP_PREPARED: usize = 1;
@@ -11894,6 +12922,89 @@ struct HeldView {
     script: ScriptSlot,
 }
 
+/// A view payload whose staging steps (design.md "beatoraja Lua Skins",
+/// the result skin): its request; whether its installation's first take
+/// ran, a creation owed to the boundary's allowance until then; and, once
+/// that installation answered ready, its token and the skin state whose
+/// chart images and text step.
+struct StagingView {
+    held: HeldView,
+    request: u64,
+    taken: bool,
+    token: Option<PreparedToken>,
+    state: Option<skin_model::ResultScreen>,
+    /// The atlas uploads counted before its first take (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    uploads: u64,
+}
+
+/// A step the uploader submitted (tests): whether it was a staging's
+/// atlas step and its writes, when the log kept them; whether its pass
+/// was held; its pass; when its boundary ended.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug)]
+pub struct StepRecord {
+    pub atlas: bool,
+    pub writes: Option<u64>,
+    pub held: bool,
+    pub pass: u64,
+    pub at: Instant,
+}
+
+/// A hook run after a frame's pacing (tests): the hold's clock to set,
+/// and the call.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Default)]
+struct PacingHook(Mutex<Option<(i64, PacingCall)>>);
+
+/// The call a [`PacingHook`] makes (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+type PacingCall = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl std::fmt::Debug for PacingHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PacingHook")
+    }
+}
+
+/// A result view's staging withdrawn with its side (tests): the messages
+/// the render thread had taken before, and the filled retirement entries
+/// before and after.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Withdrawal {
+    pub messages: u64,
+    pub filled: [u32; 2],
+}
+
+/// How a result view's staging ended.
+enum StagingEnd {
+    /// Its steps completed: its text staged, or the skin's refusal of it.
+    Text(Result<(), String>),
+    /// Its installation was refused, with why.
+    Refused(String),
+    /// The device failed.
+    Failed(RenderError),
+}
+
+impl StagingView {
+    /// Withdraws what the screen holds of it: its chart images and text
+    /// in hand, and what was staged for its request, in flight or
+    /// answered, whose array retires into its own entry.
+    fn withdraw(&self, screen: &mut dyn Screen) {
+        if !self.taken {
+            return;
+        }
+        screen.cancel_result_view();
+        screen.discard_token(self.token.unwrap_or(PreparedToken {
+            request: self.request,
+            device: screen.device(),
+            kind: ScreenKind::Result,
+        }));
+    }
+}
+
 /// A view payload prepared and not yet presented: its staging's token.
 struct PreparedView {
     held: HeldView,
@@ -11908,6 +13019,10 @@ struct PreparedView {
 struct ResultSide {
     lifetime: u64,
     incoming: Option<Box<ResultPresentation>>,
+    /// The view payload whose staging steps (design.md "beatoraja Lua
+    /// Skins", the result skin), asked again each pass with the same
+    /// request until its last step completes, when it is prepared.
+    staging: Option<StagingView>,
     prepared: Option<PreparedView>,
     presented: Option<HeldView>,
     /// The lifetime's origin, its `screen` timer's start (design.md
@@ -11953,6 +13068,7 @@ impl ResultSide {
         Self {
             lifetime,
             incoming: None,
+            staging: None,
             prepared: None,
             presented: None,
             origin: None,
@@ -12002,6 +13118,7 @@ impl ResultSide {
             .presented
             .iter_mut()
             .chain(self.prepared.iter_mut().map(|v| &mut v.held))
+            .chain(self.staging.iter_mut().map(|v| &mut v.held))
             .chain(self.dropped.iter_mut().flatten())
             .chain(self.overflow.iter_mut())
         {
@@ -12011,7 +13128,10 @@ impl ResultSide {
 
     /// Whether it has something to draw.
     const fn shows(&self) -> bool {
-        self.incoming.is_some() || self.prepared.is_some() || self.presented.is_some()
+        self.incoming.is_some()
+            || self.staging.is_some()
+            || self.prepared.is_some()
+            || self.presented.is_some()
     }
 
     /// Prints the lifetime's book (dev-tools: a scenario run's runtime
@@ -12139,10 +13259,25 @@ impl Run {
             }
         }
         if let Some(side) = self.result.take()
-            && let Some(token) = side.prepared.and_then(|p| p.token)
             && let Some(screen) = &mut self.screen
         {
-            screen.discard_token(token);
+            if let Some(st) = side.staging {
+                #[cfg(all(test, feature = "dev-tools"))]
+                let filled = screen.filled();
+                st.withdraw(screen.as_mut());
+                #[cfg(all(test, feature = "dev-tools"))]
+                self.shared
+                    .withdrawals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Withdrawal {
+                        messages: self.shared.messages.load(Ordering::SeqCst),
+                        filled: [filled, screen.filled()],
+                    });
+            }
+            if let Some(token) = side.prepared.and_then(|p| p.token) {
+                screen.discard_token(token);
+            }
         }
     }
 
@@ -12161,6 +13296,17 @@ impl Run {
         self.reconcile_result();
         if let Some(side) = &mut self.result {
             side.reapply = true;
+            // A staging on the old screen went with it: staged again.
+            if let Some(st) = side.staging.take() {
+                side.restaged = true;
+                side.incoming = Some(Box::new(ResultPresentation {
+                    lifetime: side.lifetime,
+                    revision: st.held.revision,
+                    request: st.request,
+                    payload: st.held.payload,
+                    overlay: st.held.overlay,
+                }));
+            }
             if let Some(p) = side.prepared.take() {
                 side.restaged = true;
                 side.incoming = Some(Box::new(ResultPresentation {
@@ -12389,6 +13535,7 @@ impl Run {
     /// last time, then it is dropped.
     fn drop_screen(&mut self) {
         self.reconcile_result();
+        self.keep_page_font();
         self.screen = None;
         self.image.changed();
         self.screen_dropped();
@@ -12396,6 +13543,15 @@ impl Run {
         // recovered frame's (dev-tools: the whole frames).
         #[cfg(feature = "dev-tools")]
         let _ = self.result_frames.take_before_wait();
+    }
+
+    /// The page font of the screen about to be dropped, kept for the one
+    /// built in its place (design.md "Rendering and Skins", the result's
+    /// hold: a screen for plays only reads it off the frame).
+    fn keep_page_font(&mut self) {
+        if let Some(font) = self.screen.as_mut().and_then(|s| s.take_page_font()) {
+            self.page_font = Some(font);
+        }
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i
@@ -12415,6 +13571,22 @@ impl Run {
         // own rows: the one presented, else the one prepared, whose
         // staging the screen dropped (it commits as the built-in page, the
         // first presentation's rows and reason drawn in this frame).
+        if let Some(side) = &mut self.result
+            && let Some(mut st) = side.staging.take()
+        {
+            // The view staging becomes the view prepared, with no staging:
+            // its built-in page, the first view's when none is presented.
+            if let Some(screen) = &mut self.screen {
+                st.withdraw(screen.as_mut());
+            }
+            st.held.state = None;
+            if side.presented.is_none() && side.prepared.is_none() {
+                side.prepared = Some(PreparedView {
+                    held: st.held,
+                    token: None,
+                });
+            }
+        }
         if let Some(side) = &mut self.result {
             let latest = &self.end_page.1;
             let why = self.result_disabled.as_deref();
@@ -12485,6 +13657,10 @@ impl Run {
         };
         let mut refused: Option<String> = None;
         let mut failed: Option<RenderError> = None;
+        // The strip's lines asked for before the font was read.
+        if let Err(e) = screen.settle_result_strips() {
+            failed = Some(e);
+        }
         if std::mem::take(&mut side.reapply)
             && let Some(h) = &mut side.presented
         {
@@ -12544,18 +13720,29 @@ impl Run {
         if let Some(p) = side.incoming.take() {
             let same = |h: &HeldView| Arc::ptr_eq(&h.payload, &p.payload);
             let presented = side.presented.as_ref().is_some_and(same);
-            let known = presented || side.prepared.as_ref().is_some_and(|v| same(&v.held));
-            if presented && side.prepared.as_ref().is_some_and(|v| !same(&v.held)) {
+            let known = presented
+                || side.prepared.as_ref().is_some_and(|v| same(&v.held))
+                || side.staging.as_ref().is_some_and(|v| same(&v.held));
+            if presented {
                 // The newest is the view presented again: the other one
-                // prepared goes, so it is not committed after it.
-                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                // prepared or staging goes, so it is not committed after it.
+                if side.prepared.as_ref().is_some_and(|v| !same(&v.held))
+                    && let Some(token) = side.prepared.take().and_then(|v| v.token)
+                {
                     screen.discard_token(token);
+                }
+                if let Some(st) = side.staging.take() {
+                    st.withdraw(screen.as_mut());
                 }
             }
             if !known {
-                // A new view payload: the one prepared before goes.
+                // A new view payload: the one prepared or staging before
+                // goes.
                 if let Some(token) = side.prepared.take().and_then(|v| v.token) {
                     screen.discard_token(token);
+                }
+                if let Some(st) = side.staging.take() {
+                    st.withdraw(screen.as_mut());
                 }
                 let request = p.request;
                 let restaged = std::mem::take(&mut side.restaged);
@@ -12571,18 +13758,61 @@ impl Run {
                     page: None,
                     script: self.scripts.result_slot(p.payload.script),
                 };
-                let mut token = None;
-                let mut ok = true;
                 if !fresh && !restaged {
                     // A later attempt or selection superseded it: nothing
                     // of it is prepared, and it is no view's refusal.
-                    ok = false;
-                } else if let (Some(bundle), false) = (&p.payload.skin, disabled) {
-                    #[cfg(feature = "dev-tools")]
-                    let uploads = screen.atlas_uploads();
-                    #[cfg(feature = "dev-tools")]
-                    let p_t = render::probe::Span::start();
-                    let installed = screen.install(ScreenKind::Result, bundle, request);
+                } else if let (Some(_), false) = (&p.payload.skin, disabled) {
+                    // Its staging steps; an installation that creates an
+                    // array takes it first at a boundary the allowance
+                    // admits, any other at the first pass it needs no
+                    // destruction (below).
+                    side.staging = Some(StagingView {
+                        held,
+                        request,
+                        taken: false,
+                        token: None,
+                        state: None,
+                        #[cfg(feature = "dev-tools")]
+                        uploads: screen.atlas_uploads(),
+                    });
+                } else {
+                    held.page = Some(crate::result_present::compose_page(
+                        &held.payload.page,
+                        &self.end_page.1,
+                        self.result_disabled
+                            .as_deref()
+                            .or_else(|| held.payload.why.as_ref().map(|(_, w)| w.as_str())),
+                    ));
+                    side.prepared = Some(PreparedView { held, token: None });
+                }
+            }
+            side.overlay = Some((p.revision, p.overlay));
+        }
+        // The staging in hand, asked again with the same request each pass
+        // until its last step completes (design.md "beatoraja Lua Skins",
+        // the result skin): its installation, then its chart images and
+        // text, none waiting for the GPU.
+        let mut ended: Option<StagingEnd> = None;
+        // A rebind on the committed pages creates no array: taken at the
+        // first pass its admission and entries need no destruction in its
+        // call, the boundaries' retirement path freeing them meanwhile
+        // (design.md "Memory Budget").
+        if let Some(st) = side.staging.as_mut().filter(|s| !s.taken)
+            && st.held.payload.skin.as_ref().is_some_and(|b| {
+                !screen.install_creates(ScreenKind::Result, b)
+                    && screen.install_room(ScreenKind::Result, b)
+            })
+        {
+            st.taken = true;
+        }
+        if let Some(st) = side.staging.as_mut().filter(|s| s.taken)
+            && let Some(bundle) = st.held.payload.skin.clone()
+        {
+            if st.token.is_none() {
+                #[cfg(feature = "dev-tools")]
+                let p_t = render::probe::Span::start();
+                let installed = screen.install_stepped(ScreenKind::Result, &bundle, st.request);
+                if let Some(installed) = installed {
                     #[cfg(feature = "dev-tools")]
                     {
                         crate::dev::loop_probe::mark(
@@ -12602,16 +13832,15 @@ impl Run {
                             "res:bundle_level_bytes",
                             crate::dev::loop_probe::pages_level_bytes(pages),
                         );
+                        crate::dev::result_staged(screen.atlas_uploads() - st.uploads);
                     }
-                    #[cfg(feature = "dev-tools")]
-                    crate::dev::result_staged(screen.atlas_uploads() - uploads);
                     // A refusal injected by a test of the real flow
                     // (dev-tools).
                     #[cfg(feature = "dev-tools")]
                     let installed = match installed {
                         Ok(Preparation::Ready) if crate::dev::refuse_result_staging() => {
                             screen.discard_token(PreparedToken {
-                                request,
+                                request: st.request,
                                 device: screen.device(),
                                 kind: ScreenKind::Result,
                             });
@@ -12619,115 +13848,155 @@ impl Run {
                         }
                         other => other,
                     };
-                    match installed {
+                    ended = match installed {
                         Ok(Preparation::Ready) => {
-                            let staged = PreparedToken {
-                                request,
+                            let token = PreparedToken {
+                                request: st.request,
                                 device: screen.device(),
                                 kind: ScreenKind::Result,
                             };
-                            token = Some(staged);
+                            st.token = Some(token);
                             let mut state = bundle.skin().prepare_result();
-                            #[cfg(feature = "dev-tools")]
-                            let p_t = render::probe::Span::start();
-                            // The view's images, into the array its
-                            // staging uses, keyed to its installation.
-                            let p_chart = stage_result_chart(
-                                screen.as_mut(),
-                                render::ResultChartTarget::Staged(staged),
-                                p.payload.chart.as_deref(),
-                            );
-                            #[cfg(feature = "dev-tools")]
-                            crate::dev::loop_probe::mark(
-                                "res:chart_us",
-                                crate::dev::loop_probe::us(p_t.elapsed()),
-                            );
-                            match p_chart {
-                                Ok(table) => state.set_chart_images(table),
-                                Err(e) => failed = Some(e),
-                            }
-                            #[cfg(feature = "dev-tools")]
-                            let p_t = render::probe::Span::start();
-                            let prepared = screen.prepare_result(
-                                bundle,
+                            let begun = screen.begin_result_view(
+                                &bundle,
                                 &mut state,
-                                &p.payload.view,
-                                &p.payload.labels,
+                                &st.held.payload.view,
+                                &st.held.payload.labels,
+                                render::ResultChartTarget::Staged(token),
+                                st.held.payload.chart.as_ref(),
                             );
-                            #[cfg(feature = "dev-tools")]
-                            crate::dev::loop_probe::mark(
-                                "res:text_us",
-                                crate::dev::loop_probe::us(p_t.elapsed()),
-                            );
-                            // A refusal injected by a test of the real flow
-                            // (dev-tools).
-                            #[cfg(feature = "dev-tools")]
-                            let prepared = match prepared {
-                                Ok(Ok(())) if crate::dev::refuse_result_text() => {
-                                    Ok(Err("dev: the view's text was refused".to_owned()))
+                            let end = match begun {
+                                Ok(Ok(Some(table))) => {
+                                    state.set_chart_images(table);
+                                    Some(StagingEnd::Text(Ok(())))
                                 }
-                                other => other,
+                                Ok(Ok(None)) => None,
+                                Ok(Err(why)) => Some(StagingEnd::Text(Err(why))),
+                                Err(e) => Some(StagingEnd::Failed(e)),
                             };
-                            match prepared {
-                                Ok(Ok(())) => held.state = Some(state),
-                                Ok(Err(why)) => {
-                                    // Disabled below; the first presentation
-                                    // still commits, as the built-in page with
-                                    // its own rows and the reason.
-                                    refused = Some(why);
-                                    ok = side.presented.is_none();
-                                }
-                                Err(e) => {
-                                    failed = Some(e);
-                                    ok = false;
-                                }
-                            }
+                            st.state = Some(state);
+                            end
                         }
-                        Ok(why) => {
-                            // The view's staging was refused: the presenter
-                            // shows the built-in result for it (scope view).
-                            let why = match why {
-                                Preparation::Refused(r) => r.to_string(),
-                                _ => "the staging was cancelled".to_owned(),
-                            };
-                            eprintln!("render: the result view's staging was refused: {why}");
-                            // The view draws the built-in page with its own
-                            // rows at once (scope view, the S10-09i design's
-                            // D7); the presenter's built-in payload for it
-                            // follows.
-                            held.page = Some(crate::result_present::compose_page(
-                                &held.payload.page,
-                                &self.end_page.1,
-                                Some(&why),
-                            ));
-                            side.refused = Some((p.payload.key, why));
-                        }
-                        Err(e) => {
-                            failed = Some(e);
-                            ok = false;
-                        }
-                    }
+                        Ok(why) => Some(StagingEnd::Refused(match why {
+                            Preparation::Refused(r) => r.to_string(),
+                            _ => "the staging was cancelled".to_owned(),
+                        })),
+                        Err(e) => Some(StagingEnd::Failed(e)),
+                    };
                 }
-                if ok {
-                    if held.page.is_none() && (held.state.is_none() || disabled) {
+            } else if let Some(state) = st.state.as_mut() {
+                ended = match screen.result_view_ready(state) {
+                    None => None,
+                    Some(Ok(Ok(table))) => {
+                        state.set_chart_images(table);
+                        Some(StagingEnd::Text(Ok(())))
+                    }
+                    Some(Ok(Err(why))) => Some(StagingEnd::Text(Err(why))),
+                    Some(Err(e)) => Some(StagingEnd::Failed(e)),
+                };
+            }
+        }
+        // A refusal of the text injected by a test of the real flow
+        // (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let ended = match ended {
+            Some(StagingEnd::Text(Ok(()))) if crate::dev::refuse_result_text() => Some(
+                StagingEnd::Text(Err("dev: the view's text was refused".to_owned())),
+            ),
+            other => other,
+        };
+        // Its chart images and text ended (dev-tools: the transition
+        // probe's view staged).
+        #[cfg(feature = "dev-tools")]
+        if matches!(ended, Some(StagingEnd::Text(_))) {
+            crate::dev::loop_probe::mark("res:chart_us", 0);
+        }
+        if let Some(end) = ended
+            && let Some(st) = side.staging.take()
+        {
+            #[cfg(all(test, feature = "dev-tools"))]
+            self.shared.stagings_ended.fetch_add(1, Ordering::SeqCst);
+            let StagingView {
+                mut held,
+                request,
+                token,
+                state,
+                ..
+            } = st;
+            match end {
+                StagingEnd::Text(Ok(())) => {
+                    held.state = state;
+                    side.prepared = Some(PreparedView { held, token });
+                }
+                StagingEnd::Text(Err(why)) => {
+                    // Disabled below; the first presentation still commits,
+                    // as the built-in page with its own rows and the reason.
+                    refused = Some(why);
+                    if side.presented.is_none() {
                         held.page = Some(crate::result_present::compose_page(
                             &held.payload.page,
                             &self.end_page.1,
-                            self.result_disabled
-                                .as_deref()
-                                .or_else(|| held.payload.why.as_ref().map(|(_, w)| w.as_str())),
+                            held.payload.why.as_ref().map(|(_, w)| w.as_str()),
                         ));
+                        side.prepared = Some(PreparedView { held, token });
+                    } else if let Some(token) = token {
+                        screen.cancel_result_view();
+                        screen.discard_token(token);
                     }
-                    side.prepared = Some(PreparedView { held, token });
-                } else if let Some(token) = token {
-                    screen.discard_token(token);
+                }
+                StagingEnd::Refused(why) => {
+                    // The view's staging was refused: the presenter shows
+                    // the built-in result for it (scope view).
+                    eprintln!("render: the result view's staging was refused: {why}");
+                    // The view draws the built-in page with its own rows at
+                    // once (scope view, the S10-09i design's D7); the
+                    // presenter's built-in payload for it follows.
+                    held.page = Some(crate::result_present::compose_page(
+                        &held.payload.page,
+                        &self.end_page.1,
+                        Some(&why),
+                    ));
+                    side.refused = Some((held.payload.key, why));
+                    side.prepared = Some(PreparedView { held, token: None });
+                }
+                StagingEnd::Failed(e) => {
+                    // The screen fails below: the view is staged again on
+                    // the screen built again (`result_rebuilt`).
+                    failed = Some(e);
+                    if let Some(token) = token {
+                        screen.cancel_result_view();
+                        screen.discard_token(token);
+                    }
+                    side.staging = Some(StagingView {
+                        held,
+                        request,
+                        taken: false,
+                        token: None,
+                        state: None,
+                        #[cfg(feature = "dev-tools")]
+                        uploads: 0,
+                    });
                 }
             }
-            side.overlay = Some((p.revision, p.overlay));
         }
         // The strip's text for what each outcome of the commit point
         // presents: the view prepared, or the view presented, with the
         // newest overlay.
+        // A view prepared once its staging ended, after the overlay merged
+        // into the view presented, takes that one.
+        if let Some(v) = &side.prepared
+            && side.overlay.is_none()
+        {
+            let overlay = side
+                .presented
+                .as_ref()
+                .filter(|h| h.revision > v.held.revision)
+                .map_or(&v.held.overlay, |h| &h.overlay);
+            let lines = strip_lines(&v.held.payload, overlay, side.stop);
+            if let Err(e) = screen.prepare_result_strip(STRIP_PREPARED, &lines) {
+                failed = Some(e);
+            }
+        }
         if let Some((_, overlay)) = &side.overlay {
             if let Some(v) = &side.prepared {
                 let lines = strip_lines(&v.held.payload, overlay, side.stop);
@@ -12817,8 +14086,8 @@ impl Run {
                     side.discard = v.token.or(side.discard);
                     side.drop_later(v.held);
                 }
-                if let (Some((revision, overlay)), Some(h)) =
-                    (side.overlay.take(), side.presented.as_mut())
+                if let Some(h) = side.presented.as_mut()
+                    && let Some((revision, overlay)) = side.overlay.take()
                 {
                     h.revision = h.revision.max(revision);
                     h.overlay = overlay;
@@ -12864,6 +14133,14 @@ impl Run {
                     if let Some((revision, overlay)) = side.overlay.take() {
                         h.revision = h.revision.max(revision);
                         h.overlay = overlay;
+                    } else if let Some(old) = side.presented.as_mut()
+                        && old.revision > h.revision
+                    {
+                        // A newer overlay merged into the view it replaces
+                        // while it staged: it goes on, taken from the view
+                        // dropped after the frame.
+                        h.revision = old.revision;
+                        h.overlay = std::mem::take(&mut old.overlay);
                     }
                     screen.use_result_strip(STRIP_PREPARED);
                     if let Some(old) = side.presented.as_mut() {
@@ -12882,8 +14159,8 @@ impl Run {
                     if let Some(old) = side.presented.replace(h) {
                         side.drop_later(old);
                     }
-                } else if let (Some((revision, overlay)), Some(h)) =
-                    (side.overlay.take(), side.presented.as_mut())
+                } else if let Some(h) = side.presented.as_mut()
+                    && let Some((revision, overlay)) = side.overlay.take()
                 {
                     h.revision = h.revision.max(revision);
                     h.overlay = overlay;
@@ -12954,14 +14231,23 @@ impl Run {
         side: Option<&mut ResultSide>,
         now: TimeUs,
         fadeout: Option<TimeUs>,
+        held: bool,
         app: &skin_model::AppReadouts,
     ) -> ResultDrawn {
         let Some(side) = side else {
             return ResultDrawn::BuiltIn;
         };
         let origin = side.origin;
+        // No view presented: while the first one stages, or once a leaving
+        // command pinned the result's hold before its first view was
+        // committed, the pending presentation, never the built-in end page
+        // (design.md "Rendering and Skins", the result's hold).
         let Some(h) = side.presented.as_mut() else {
-            return ResultDrawn::BuiltIn;
+            return if side.staging.is_some() || (held && fadeout.is_some()) {
+                ResultDrawn::Pending
+            } else {
+                ResultDrawn::BuiltIn
+            };
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
             let frame = skin_model::ResultFrame {
@@ -13448,6 +14734,15 @@ const fn shown_or_retry(presented: bool) -> FrameOutcome {
     }
 }
 
+/// The result's pending presentation in the bitmap font while the menu
+/// font is not in hand: one ASCII line, the same in every language, on the
+/// cleared canvas (design.md "Rendering and Skins", the result's hold).
+fn pending_bitmap(screen: &mut dyn Screen) -> Result<(FrameTiming, Option<TimeUs>), RenderError> {
+    screen
+        .text_frame(&[crate::ui_text::Label::NowLoading.text()])
+        .map(|t| (t, None))
+}
+
 const fn timing_of(outcome: FrameOutcome) -> FrameTiming {
     FrameTiming {
         cpu: Duration::ZERO,
@@ -13628,7 +14923,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let builds = Arc::new(AtomicU32::new(0));
         let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let id = made.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(Box::new(Menus {
                 id,
@@ -13724,7 +15019,7 @@ pub(crate) mod tests {
             let held = Arc::new(AtomicBool::new(in_hand));
             let drops = Arc::new(AtomicU32::new(0));
             let (h, d) = (Arc::clone(&held), Arc::clone(&drops));
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 Ok(Box::new(Texting {
                     held: Arc::clone(&h),
                     drops: Arc::clone(&d),
@@ -13770,7 +15065,7 @@ pub(crate) mod tests {
     fn the_loading_state_is_drawn_through_the_load_and_the_preparation() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Menus {
                 // Not the first build: no frame fails.
                 id: 2,
@@ -13951,7 +15246,7 @@ pub(crate) mod tests {
         let answer = Arc::new(std::sync::Mutex::new(Answer::default()));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
         let answered = Arc::clone(&answer);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
@@ -14094,7 +15389,7 @@ pub(crate) mod tests {
         let hold = Arc::new(AtomicBool::new(false));
         let waiting = Arc::new(AtomicBool::new(false));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&hold), Arc::clone(&waiting));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(PacedLoading {
                 hold: Arc::clone(&held),
                 waiting: Arc::clone(&at),
@@ -14258,7 +15553,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let link = spawn(
             make,
@@ -14360,7 +15655,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         let clock = QpcClock::start();
         let link = spawn(
@@ -14454,7 +15749,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let shared_chart = Arc::new(chart.clone());
         let link = spawn(
@@ -14556,7 +15851,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let shared_chart = Arc::new(chart.clone());
         let link = spawn(
@@ -14637,7 +15932,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(ClockedLoading(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(ClockedLoading(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let link = spawn(
             make,
@@ -14767,7 +16062,7 @@ pub(crate) mod tests {
         let stall = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
@@ -14812,7 +16107,7 @@ pub(crate) mod tests {
         let stall = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
@@ -14959,7 +16254,7 @@ pub(crate) mod tests {
     fn the_splash_shows_out_its_time_then_the_first_page() {
         let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Splashes {
                 splashes: Arc::clone(&s),
                 menus: Arc::clone(&m),
@@ -14995,7 +16290,7 @@ pub(crate) mod tests {
     fn a_page_after_the_splash_time_shows_at_once() {
         let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Splashes {
                 splashes: Arc::clone(&s),
                 menus: Arc::clone(&m),
@@ -15033,7 +16328,7 @@ pub(crate) mod tests {
         for prepare_first in [true, false] {
             let splashes = Arc::new(AtomicU32::new(0));
             let s = Arc::clone(&splashes);
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 Ok(Box::new(Splashes {
                     splashes: Arc::clone(&s),
                     menus: Arc::new(AtomicU32::new(0)),
@@ -15111,7 +16406,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Sections(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Sections(Arc::clone(&noted))) as Box<dyn Screen>));
         let section = |s: i64| eval::Section {
             start: TimeUs(s),
             end: TimeUs(s + 1_000_000),
@@ -15241,7 +16536,7 @@ pub(crate) mod tests {
         let lost = Arc::new(AtomicBool::new(false));
         let builds = Arc::new(AtomicU32::new(0));
         let (made, noted, gone) = (Arc::clone(&builds), Arc::clone(&seen), Arc::clone(&lost));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let id = made.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(Box::new(Refusing {
                 id,
@@ -15315,7 +16610,7 @@ pub(crate) mod tests {
         drop(r);
         assert_eq!(result.atlas_texels(), TINY);
         let stated = Arc::clone(&result);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut renderer = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
@@ -15383,7 +16678,7 @@ pub(crate) mod tests {
         drop(r);
         assert_eq!(result.atlas_texels(), TINY);
         let stated = Arc::clone(&result);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut renderer = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
@@ -15509,7 +16804,7 @@ pub(crate) mod tests {
     fn the_default_skins_refusal_keeps_the_screen() {
         let builds = Arc::new(AtomicU32::new(0));
         let made = Arc::clone(&builds);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             made.fetch_add(1, Ordering::SeqCst);
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {
@@ -15599,7 +16894,7 @@ pub(crate) mod tests {
         let hold = Arc::new(AtomicBool::new(false));
         let held = Arc::clone(&hold);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
         let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
@@ -15633,7 +16928,7 @@ pub(crate) mod tests {
     fn the_end_of_loading_reports_a_screen_lost_after_the_preparation() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Menus {
                 // The first build: its third frame fails.
                 id: 1,
@@ -15715,7 +17010,7 @@ pub(crate) mod tests {
     fn held_loading() -> (super::RenderLink, Typed) {
         let seen: Typed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(TypedLoading {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -15959,7 +17254,7 @@ pub(crate) mod tests {
     fn a_loading_lifetimes_state_reaches_the_screen_whole_and_in_order() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(TypedLoading {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -16040,7 +17335,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let builds = Arc::new(AtomicU32::new(0));
         let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let id = made.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(Box::new(NoCharts {
                 id,
@@ -16114,7 +17409,7 @@ pub(crate) mod tests {
     fn a_blocked_thread_bounds_the_figures_wait() {
         let (release, blocked) = std::sync::mpsc::channel();
         let mut blocked = Some(blocked);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = blocked.take().expect("built once");
             Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
         });
@@ -16146,7 +17441,7 @@ pub(crate) mod tests {
     fn a_blocked_load_bounds_the_preparation_and_the_close() {
         let (release, blocked) = std::sync::mpsc::channel();
         let mut blocked = Some(blocked);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = blocked.take().expect("built once");
             Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
         });
@@ -16202,7 +17497,7 @@ pub(crate) mod tests {
         let builds = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&builds);
         let presented_at = Arc::clone(presented_at);
-        let make = Box::new(move || {
+        let make = Box::new(move |_: &mut Option<crate::menu_screen::PageFont>| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
             if n <= ok {
                 Ok(Box::new(Flaky {
@@ -16451,7 +17746,7 @@ pub(crate) mod tests {
         .unwrap();
         let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&frames);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(RearmedFrames {
                 frames: Arc::clone(&noted),
                 rearms: 0,
@@ -16627,7 +17922,7 @@ pub(crate) mod tests {
         captures.bind(1);
         let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&frames);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(RearmedFrames {
                 frames: Arc::clone(&noted),
                 rearms: 0,
@@ -16706,7 +18001,7 @@ pub(crate) mod tests {
         let refuse = Arc::new(AtomicBool::new(false));
         let made = Arc::new(AtomicU32::new(0));
         let (seen, refusing, count) = (Arc::clone(&calls), Arc::clone(&refuse), Arc::clone(&made));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             count.fetch_add(1, Ordering::AcqRel);
             Ok(Box::new(RefusingFrames {
                 calls: Arc::clone(&seen),
@@ -16902,7 +18197,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen_seen = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let view = View { effects: 16 };
         let link = spawn(
@@ -17060,7 +18355,7 @@ pub(crate) mod tests {
                 .any(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
         );
         let clock = QpcClock::start();
-        let make: MakeScreen = Box::new(|| Ok(Box::new(Lost) as Box<dyn Screen>));
+        let make: MakeScreen = Box::new(|_| Ok(Box::new(Lost) as Box<dyn Screen>));
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
@@ -17204,7 +18499,7 @@ pub(crate) mod tests {
             Arc::clone(&waits),
             Arc::clone(&at_end),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Stepping {
                 steps: Arc::clone(&s),
                 draws: Arc::clone(&d),
@@ -17332,7 +18627,7 @@ pub(crate) mod tests {
         let waits = Arc::new(AtomicU32::new(0));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen = (Arc::clone(&waits), Arc::clone(&seen));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Stalling {
                 waits: Arc::clone(&screen.0),
                 seen: Arc::clone(&screen.1),
@@ -17462,7 +18757,7 @@ pub(crate) mod tests {
         .unwrap();
         let counters = [(); 3].map(|()| Arc::new(AtomicU32::new(0)));
         let [draws, read_backs, sunk] = counters.clone();
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Allocating {
                 in_build,
                 draws: Arc::clone(&draws),
@@ -17562,7 +18857,7 @@ pub(crate) mod tests {
         ]);
         let draws = Arc::new(AtomicU32::new(0));
         let drawn = Arc::clone(&draws);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Allocating {
                 in_build: false,
                 draws: Arc::clone(&drawn),
@@ -17676,7 +18971,7 @@ pub(crate) mod tests {
         let (release, released) = std::sync::mpsc::channel();
         let mut released = Some(released);
         let (noted, held) = (Arc::clone(&drew), Arc::clone(&hold));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = released.take().expect("built once");
             Ok(Box::new(Ends {
                 drew: Arc::clone(&noted),
@@ -18072,7 +19367,7 @@ pub(crate) mod tests {
         let (release, released) = std::sync::mpsc::channel();
         let mut released = Some(released);
         let (noted, held) = (Arc::clone(&drew), Arc::clone(&hold));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = released.take().expect("built once");
             Ok(Box::new(Paced {
                 drew: Arc::clone(&noted),
@@ -18217,7 +19512,7 @@ pub(crate) mod tests {
     fn resizing_thread() -> (super::RenderLink, Applied) {
         let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
         let r = Arc::clone(&resized);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Resizing {
                 id: 1,
                 size: (1_920, 1_080),
@@ -18416,7 +19711,7 @@ pub(crate) mod tests {
             Arc::clone(&fail),
             Arc::clone(&builds),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Resizing {
                 id: b.fetch_add(1, Ordering::SeqCst) + 1,
                 size: (1_920, 1_080),
@@ -18488,7 +19783,7 @@ pub(crate) mod tests {
             Arc::clone(&frames),
             Arc::clone(&waited_minimized),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Resizing {
                 id: 1,
                 size: (1_920, 1_080),
@@ -19386,7 +20681,7 @@ pub(crate) mod tests {
         /// [`spawn_bare`](Self::spawn_bare) with the frame sink `frames`.
         pub(crate) fn spawn_with(&self, frames: Box<dyn super::FrameSink>) -> super::RenderLink {
             let shared = self.clone();
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 shared.build_calls.fetch_add(1, Ordering::AcqRel);
                 while shared.hold_builds.load(Ordering::Acquire) {
                     shared.build_held.store(true, Ordering::Release);
@@ -20660,7 +21955,7 @@ pub(crate) mod tests {
     fn a_direct_launch_draws_the_skin_wait_on_its_screen() {
         let builds = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let built = Arc::clone(&builds);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             built.fetch_add(1, Ordering::SeqCst);
             let target = render::Target::Offscreen {
                 width: 1_280,
@@ -22237,7 +23532,7 @@ pub(crate) mod tests {
         assert!(queued.len() > 2 * buffer);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Adapted {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -22350,7 +23645,7 @@ pub(crate) mod tests {
         logic.enter_closing(at);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(ClosingFrames {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -22686,7 +23981,7 @@ pub(crate) mod tests {
         let probed = Arc::new(std::sync::Mutex::new(Probed::default()));
         let builds = Arc::new(AtomicU32::new(0));
         let (f, p, b) = (Arc::clone(&fail), Arc::clone(&probed), Arc::clone(&builds));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             b.fetch_add(1, Ordering::SeqCst);
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {
@@ -23149,7 +24444,7 @@ pub(crate) mod tests {
                 Arc::clone(&fail),
                 Arc::clone(&made),
             );
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 m.fetch_add(1, Ordering::SeqCst);
                 let renderer = render::Renderer::new(
                     render::Target::Offscreen {
@@ -24152,7 +25447,7 @@ pub(crate) mod tests {
             Arc::clone(&probed),
             Arc::clone(&builds),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             b.fetch_add(1, Ordering::SeqCst);
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {

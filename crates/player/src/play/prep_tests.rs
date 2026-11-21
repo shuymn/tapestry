@@ -28,6 +28,8 @@ mod adapter;
 mod bga;
 mod images;
 mod result_flow;
+#[cfg(feature = "dev-tools")]
+mod result_hold;
 mod result_images;
 mod settle;
 

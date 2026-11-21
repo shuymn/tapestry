@@ -51,7 +51,7 @@ pub const LINE_STEP: f32 = 42.0;
 /// Where the first line's top lies.
 const TOP: f32 = 30.0;
 /// The left edge of the text.
-const LEFT: f32 = 60.0;
+pub(crate) const LEFT: f32 = 60.0;
 /// The lines a page holds: they fill the layout's height.
 pub const PAGE_LINES: usize = 24;
 
@@ -201,7 +201,7 @@ pub fn caret_area(page: &MenuPage, mut width: impl FnMut(&str) -> f32) -> Option
 }
 
 /// The top of line `i` of the select screen, in layout pixels.
-fn line_top(i: usize) -> f32 {
+pub(crate) fn line_top(i: usize) -> f32 {
     lines_from(TOP, i)
 }
 
@@ -329,10 +329,23 @@ pub struct MenuScreen {
     /// The attempt's chart-image publication in hand and its images,
     /// stepped by the uploader's boundaries.
     chart: Option<(render::ChartUpload, Arc<crate::chart_images::ChartImages>)>,
+    /// A result view's chart-image publication in hand and its images
+    /// ([`Screen::begin_result_view`]), stepped after the attempt's.
+    result_chart: Option<(render::ChartUpload, Arc<crate::chart_images::ChartImages>)>,
+    /// That publication's end, or its table ready at once, until the
+    /// view's staging is answered.
+    result_table: Option<Result<skin_model::chart_image::ChartTable, RenderError>>,
     /// The font, read once per screen: when it is built on a screen that
     /// draws menus, and on a screen for plays only when its first page
-    /// comes.
+    /// comes, or ahead of a page known to come ([`Screen::read_font_ahead`]).
     fonts: Option<Fonts>,
+    /// The font being read on a thread of its own, ahead of the page that
+    /// needs it.
+    font_ahead: Option<FontJob>,
+    /// That read failed, or its thread could not be started: the pending
+    /// presentation keeps its bitmap line and the result strip is left
+    /// out for this screen's life, with no read on the render thread.
+    font_failed: bool,
     /// The text prepared for this renderer, and the page it shows.
     text: Option<MenuText>,
     /// The cursor's line of the prepared page.
@@ -375,6 +388,14 @@ pub struct MenuScreen {
     /// the commit point to take (the S10-09i design's D1), each with its
     /// lines' count.
     result_strip: [(Option<MenuText>, usize); 3],
+    /// Each slot's strip lines asked for while the font was being read,
+    /// laid out once it is ([`Screen::settle_result_strips`]); they move
+    /// with their slot at the commit point.
+    owed_strip: [Option<Vec<String>>; 3],
+    /// Each slot's strip lines as laid out, for the target they were
+    /// placed on: a target change owes them again ([`Screen::resize`]);
+    /// they move with their slot at the commit point.
+    laid_strip: [Vec<String>; 3],
     /// A frame's app work allocates once while set (tests: the allocation
     /// guards' positive control).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -382,6 +403,41 @@ pub struct MenuScreen {
     /// The views the selection skin has taken (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     selection_views: u64,
+    /// A swap chain's grants in place of the target's (tests: an
+    /// offscreen target paced as a window's).
+    #[cfg(all(test, feature = "dev-tools"))]
+    grants: Option<Arc<TestGrants>>,
+}
+
+/// A swap chain's grants for a test: each frame wait takes one of
+/// `permits`, `waits` counting the waits begun (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Debug, Default)]
+pub(crate) struct TestGrants {
+    pub(crate) permits: std::sync::atomic::AtomicU32,
+    pub(crate) waits: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl TestGrants {
+    /// Takes a permit, waiting at most `within` for one.
+    fn take(&self, within: std::time::Duration) -> bool {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        let end = std::time::Instant::now() + within;
+        loop {
+            if self
+                .permits
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+    }
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -494,7 +550,146 @@ fn fields_changed(old: &ChosenChart, new: &ChosenChart) -> TextSlots {
     })
 }
 
+/// The runtime fonts read when a page needed one (`[0]`), and those read
+/// ahead on their own thread (`[1]`), each counted once its read is sent
+/// to the screen (tests).
+#[cfg(test)]
+pub(crate) static FONT_READS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// While set, a font read on its own thread waits before reading
+/// (tests: the worker held).
+#[cfg(test)]
+pub(crate) static HOLD_FONT_READ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// While set, a font read on its own thread fails (tests).
+#[cfg(test)]
+pub(crate) static FAIL_FONT_READ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// While set, the font's thread cannot be started (tests).
+#[cfg(test)]
+pub(crate) static FAIL_FONT_SPAWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Waits while [`HOLD_FONT_READ`] is set, at most 20 s (tests).
+#[cfg(test)]
+fn hold_font_read() {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while HOLD_FONT_READ.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The font read on a thread of its own: its read, sent once it ends;
+/// the thread gone with nothing sent is a read that panicked.
+type FontJob = std::sync::mpsc::Receiver<Result<Fonts, render::text::TextError>>;
+
+/// A screen's page font, read or being read, carried to the screen that
+/// replaces it ([`Screen::take_page_font`]).
+pub(crate) enum PageFont {
+    /// Read.
+    Read(Box<Fonts>),
+    /// Being read on its own thread.
+    Reading(FontJob),
+}
+
+/// The runtime font for a page that needs it now: the one read ahead
+/// (`ahead`) once its thread ends, else read here, in the frame.
+fn read_font(ahead: &mut Option<FontJob>) -> Result<Fonts, render::text::TextError> {
+    if let Some(job) = ahead.take()
+        && let Ok(fonts) = job.recv()
+    {
+        return fonts;
+    }
+    #[cfg(test)]
+    FONT_READS[0].fetch_add(1, Ordering::SeqCst);
+    Fonts::runtime()
+}
+
+/// Whether the page font is in hand, never waiting for its thread and
+/// never reading it here: a read the thread sent is taken at once; a read
+/// that failed or panicked, or a thread that could not be started,
+/// sets `failed`, and nothing reads it again for this screen.
+fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut bool) -> bool {
+    if fonts.is_some() {
+        return true;
+    }
+    if *failed {
+        return false;
+    }
+    match ahead.take() {
+        Some(job) => match job.try_recv() {
+            Ok(Ok(read)) => {
+                *fonts = Some(read);
+                true
+            }
+            Ok(Err(e)) => {
+                eprintln!("render: the menu font could not be read: {e}");
+                *failed = true;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eprintln!("render: the menu font's read panicked");
+                *failed = true;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                *ahead = Some(job);
+                false
+            }
+        },
+        None => {
+            eprintln!("render: the menu font's thread could not be started");
+            *failed = true;
+            false
+        }
+    }
+}
+
 impl MenuScreen {
+    /// Paced by `grants` as a swap chain's frames, whatever the target
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub(crate) fn with_test_grants(mut self, grants: Arc<TestGrants>) -> Self {
+        self.grants = Some(grants);
+        self
+    }
+
+    /// [`font_now`], its read begun on its own thread first when none is.
+    fn font_now(&mut self) -> bool {
+        <Self as Screen>::read_font_ahead(self);
+        font_now(&mut self.fonts, &mut self.font_ahead, &mut self.font_failed)
+    }
+
+    /// `renderer`, drawing menus in the page font a screen built again
+    /// takes from `saved`, where the screen it replaces left it, with no
+    /// font read; else in the one `read` reads now (design.md "Rendering
+    /// and Skins", the result's hold).
+    ///
+    /// # Errors
+    ///
+    /// `read`'s, when `saved` holds no font.
+    pub(crate) fn with_page_font(
+        renderer: Renderer,
+        saved: &mut Option<PageFont>,
+        read: impl FnOnce() -> Result<Fonts, render::text::TextError>,
+    ) -> Result<Self, render::text::TextError> {
+        match saved.take() {
+            Some(PageFont::Read(fonts)) => Ok(Self::new(renderer, Some(*fonts))),
+            Some(PageFont::Reading(job)) => {
+                let mut screen = Self::new(renderer, None);
+                screen.font_ahead = Some(job);
+                Ok(screen)
+            }
+            None => Ok(Self::new(renderer, Some(read()?))),
+        }
+    }
+
     /// `renderer`, drawing menus in `fonts`; a screen for plays only has
     /// none, draws a black launch screen, and reads the font when it first
     /// has a page to draw.
@@ -502,7 +697,11 @@ impl MenuScreen {
         Self {
             renderer,
             chart: None,
+            result_chart: None,
+            result_table: None,
             fonts,
+            font_ahead: None,
+            font_failed: false,
             text: None,
             cursor: None,
             underline: None,
@@ -528,10 +727,14 @@ impl MenuScreen {
             selection_key: None,
             page_caret: None,
             result_strip: [(None, 0), (None, 0), (None, 0)],
+            owed_strip: [None, None, None],
+            laid_strip: [Vec::new(), Vec::new(), Vec::new()],
             #[cfg(all(test, feature = "dev-tools"))]
             alloc_probe: false,
             #[cfg(all(test, feature = "dev-tools"))]
             selection_views: 0,
+            #[cfg(all(test, feature = "dev-tools"))]
+            grants: None,
         }
     }
 
@@ -818,7 +1021,7 @@ impl MenuScreen {
     ) -> Result<Option<[f32; 4]>, RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
-            none => none.insert(Fonts::runtime()?),
+            none => none.insert(read_font(&mut self.font_ahead)?),
         };
         let (blocks, area) = lay_out(fonts, page, left, top);
         let refs: Vec<&TextBlock> = blocks.iter().collect();
@@ -863,7 +1066,7 @@ impl MenuScreen {
     ) -> Result<(), RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
-            none => none.insert(Fonts::runtime()?),
+            none => none.insert(read_font(&mut self.font_ahead)?),
         };
         let mut page = strip.page();
         if let Some(text) = script
@@ -935,6 +1138,22 @@ impl MenuScreen {
             flag.store(true, Ordering::Release);
         }
         presented
+    }
+}
+
+impl MenuScreen {
+    /// The result view's text taken in the uploader's hand
+    /// ([`render::Renderer::begin_result_text`]): stepping, or its
+    /// refusal.
+    fn begin_result_text(
+        &mut self,
+        state: &skin_model::ResultScreen,
+    ) -> Result<Result<Option<skin_model::chart_image::ChartTable>, String>, RenderError> {
+        match self.renderer.begin_result_text(state) {
+            Ok(()) => Ok(Ok(None)),
+            Err(e) if e.is_refusal() => Ok(Err(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1028,12 +1247,23 @@ impl Screen for MenuScreen {
     }
 
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-        let chart = self.chart.as_mut().map(|(up, set)| (up, set.fitted()));
-        let up = self
+        // The attempt's images first; a result view's while it has none.
+        let attempt = self.chart.is_some();
+        let chart = match (&mut self.chart, &mut self.result_chart) {
+            (Some((up, set)), _) | (None, Some((up, set))) => Some((up, set.fitted())),
+            (None, None) => None,
+        };
+        let mut up = self
             .renderer
             .upload_boundary_within(render::UPLOAD_TIME_SLICE, past, chart);
-        if up.chart.is_some() {
-            self.chart = None;
+        if attempt {
+            if up.chart.is_some() {
+                self.chart = None;
+            }
+        } else if let Some(end) = up.chart.take() {
+            // The result view's: its own, never the attempt's answer.
+            self.result_chart = None;
+            self.result_table = Some(end);
         }
         if let Some(done) = &up.text {
             self.text_done(done);
@@ -1042,17 +1272,18 @@ impl Screen for MenuScreen {
     }
 
     fn upload_state(&self) -> render::UploadState {
-        match (self.renderer.upload_state(), &self.chart) {
-            (render::UploadState::Idle, Some(_)) if self.renderer.step_in_flight() => {
+        let charts = self.chart.is_some() || self.result_chart.is_some();
+        match (self.renderer.upload_state(), charts) {
+            (render::UploadState::Idle, true) if self.renderer.step_in_flight() => {
                 render::UploadState::InFlight
             }
-            (render::UploadState::Idle, Some(_)) => render::UploadState::Ready,
+            (render::UploadState::Idle, true) => render::UploadState::Ready,
             (state, _) => state,
         }
     }
 
     fn upload_waited(&self) -> bool {
-        self.chart.is_some() || self.renderer.waited_upload()
+        self.chart.is_some() || self.result_chart.is_some() || self.renderer.waited_upload()
     }
 
     fn loading_text(
@@ -1240,6 +1471,10 @@ impl Screen for MenuScreen {
     }
 
     fn wait_grant(&mut self, pace: std::time::Duration) -> Option<bool> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(g) = &self.grants {
+            return Some(g.take(pace));
+        }
         match self.renderer.wait_grant_or_pace(pace) {
             render::GrantWait::Granted => Some(true),
             render::GrantWait::Paced => Some(false),
@@ -1346,6 +1581,10 @@ impl Screen for MenuScreen {
     /// stalled boundary's grant check).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn grant_ready(&self) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(g) = &self.grants {
+            return g.take(std::time::Duration::ZERO);
+        }
         self.paced() && !self.minimized() && self.renderer.wait_for_frame(0)
     }
 
@@ -1387,15 +1626,191 @@ impl Screen for MenuScreen {
         }
     }
 
+    fn install_creates(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        self.renderer.install_creates(kind, skin)
+    }
+
+    fn install_room(&self, kind: ScreenKind, skin: &Arc<SkinBundle>) -> bool {
+        self.renderer.install_room(kind, skin)
+    }
+
+    fn take_page_font(&mut self) -> Option<PageFont> {
+        match (self.fonts.take(), self.font_ahead.take()) {
+            (Some(fonts), _) => Some(PageFont::Read(Box::new(fonts))),
+            (None, Some(job)) => Some(PageFont::Reading(job)),
+            (None, None) => None,
+        }
+    }
+
+    fn give_page_font(&mut self, font: PageFont) {
+        if self.fonts.is_some() {
+            return;
+        }
+        match font {
+            PageFont::Read(fonts) => {
+                self.fonts = Some(*fonts);
+                self.font_ahead = None;
+            }
+            PageFont::Reading(job) => {
+                if self.font_ahead.is_none() {
+                    self.font_ahead = Some(job);
+                }
+            }
+        }
+    }
+
+    fn page_font_ready(&mut self) -> bool {
+        self.font_now()
+    }
+
+    fn read_font_ahead(&mut self) {
+        if self.fonts.is_some() || self.font_ahead.is_some() || self.font_failed {
+            return;
+        }
+        #[cfg(test)]
+        let refused = FAIL_FONT_SPAWN.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let refused = false;
+        let (tx, job) = std::sync::mpsc::sync_channel(1);
+        let spawned = if refused {
+            Err(std::io::Error::other("a test's refused spawn"))
+        } else {
+            // The thread ends on its own once its read is sent.
+            std::thread::Builder::new()
+                .name("font".to_owned())
+                .spawn(move || {
+                    #[cfg(test)]
+                    hold_font_read();
+                    #[cfg(test)]
+                    let fonts = if FAIL_FONT_READ.load(Ordering::SeqCst) {
+                        Err(render::text::TextError::NoFamily {
+                            family: "a test's failed read".to_owned(),
+                        })
+                    } else {
+                        Fonts::runtime()
+                    };
+                    #[cfg(not(test))]
+                    let fonts = Fonts::runtime();
+                    let _ = tx.send(fonts);
+                    // Counted once the read is in hand for the screen.
+                    #[cfg(test)]
+                    FONT_READS[1].fetch_add(1, Ordering::SeqCst);
+                })
+        };
+        // A thread that could not be started is a failed read: latched
+        // here, at the hold's start, so nothing tries it again for this
+        // screen.
+        match spawned {
+            Ok(_) => self.font_ahead = Some(job),
+            Err(e) => {
+                eprintln!("render: the menu font's thread could not be started: {e}");
+                self.font_failed = true;
+            }
+        }
+    }
+
+    fn begin_result_view(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        state: &mut skin_model::ResultScreen,
+        view: &skin_model::ResultView,
+        labels: &skin_model::ResultLabels,
+        target: render::ResultChartTarget,
+        chart: Option<&Arc<crate::chart_images::ChartImages>>,
+    ) -> Result<Result<Option<skin_model::chart_image::ChartTable>, String>, RenderError> {
+        self.cancel_result_view();
+        if let Err(e) = skin.skin().update_result(state, view, labels) {
+            return Ok(Err(e.to_string()));
+        }
+        self.result_table = Some(match chart {
+            None => Ok(skin_model::chart_image::ChartTable::ABSENT),
+            Some(set) => match self
+                .renderer
+                .begin_result_chart(target, set.fitted(), set.id())
+            {
+                Ok(render::ResultChartBegin::Done(table)) => Ok(table),
+                Ok(render::ResultChartBegin::Begun(up)) => {
+                    self.result_chart = Some((up, Arc::clone(set)));
+                    return self.begin_result_text(state);
+                }
+                Err(e) => Err(e),
+            },
+        });
+        self.begin_result_text(state)
+    }
+
+    fn result_view_ready(
+        &mut self,
+        state: &mut skin_model::ResultScreen,
+    ) -> Option<Result<Result<skin_model::chart_image::ChartTable, String>, RenderError>> {
+        // Its images first, then its lines.
+        if self.result_chart.is_some() || self.result_table.is_none() {
+            return None;
+        }
+        let text = self.renderer.result_text_answer(state)?;
+        let table = self.result_table.take()?;
+        Some(match text {
+            Err(e) if e.is_refusal() => Ok(Err(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+            Ok(()) => crate::render_side::chart_absent(table).map(Ok),
+        })
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn delay_steps(&mut self, delay: Option<std::time::Duration>) {
+        self.renderer.delay_steps(delay);
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn freeze_write_slice(&mut self, on: bool) {
+        self.renderer
+            .set_write_slice_clock(on.then_some(std::time::Duration::ZERO));
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn refuse_next_step(&mut self) {
+        self.renderer.refuse_next_step();
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn steps_logged(&self) -> (Vec<u64>, usize) {
+        let (log, logged) = self.renderer.step_log();
+        (log.to_vec(), logged)
+    }
+
+    fn cancel_result_view(&mut self) {
+        self.result_chart = None;
+        self.result_table = None;
+        self.renderer.cancel_result_text();
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn install_result_text(&mut self) -> bool {
         self.renderer.install_staged_result_text()
     }
 
     fn prepare_result_strip(&mut self, which: usize, lines: &[&str]) -> Result<(), RenderError> {
-        let fonts = match &mut self.fonts {
-            Some(fonts) => fonts,
-            none => none.insert(Fonts::runtime()?),
+        // The font not read yet: the slot draws no line until it is, and
+        // its lines are laid out then; never a read or a wait for the
+        // font's thread here (design.md "Rendering and Skins", the
+        // result's hold). A failed read leaves the strip out.
+        if let Some(l) = self.laid_strip.get_mut(which) {
+            l.clear();
+        }
+        if !self.font_now() {
+            if let Some(o) = self.owed_strip.get_mut(which) {
+                *o = (!self.font_failed).then(|| lines.iter().map(|l| (*l).to_owned()).collect());
+            }
+            if let Some((_, n)) = self.result_strip.get_mut(which) {
+                *n = 0;
+            }
+            return Ok(());
+        }
+        if let Some(o) = self.owed_strip.get_mut(which) {
+            *o = None;
+        }
+        let Some(fonts) = &mut self.fonts else {
+            return Ok(());
         };
         let page = MenuPage {
             lines: lines
@@ -1415,6 +1830,9 @@ impl Screen for MenuScreen {
         let text = text.get_or_insert_with(|| MenuText::new(&self.renderer));
         text.prepare(&self.renderer, fonts, &refs)?;
         *n = lines.len().min(PAGE_LINES);
+        if let Some(l) = self.laid_strip.get_mut(which) {
+            *l = lines.iter().map(|l| (*l).to_owned()).collect();
+        }
         Ok(())
     }
 
@@ -1425,6 +1843,32 @@ impl Screen for MenuScreen {
         {
             std::mem::swap(drawn, slot);
         }
+        if let [drawn, rest @ ..] = &mut self.owed_strip
+            && let Some(slot) = which.checked_sub(1).and_then(|i| rest.get_mut(i))
+        {
+            std::mem::swap(drawn, slot);
+        }
+        if let [drawn, rest @ ..] = &mut self.laid_strip
+            && let Some(slot) = which.checked_sub(1).and_then(|i| rest.get_mut(i))
+        {
+            std::mem::swap(drawn, slot);
+        }
+    }
+
+    fn settle_result_strips(&mut self) -> Result<(), RenderError> {
+        if self.owed_strip.iter().all(Option::is_none) || !self.font_now() {
+            if self.font_failed {
+                self.owed_strip = [None, None, None];
+            }
+            return Ok(());
+        }
+        for which in 0..self.owed_strip.len() {
+            if let Some(lines) = self.owed_strip.get_mut(which).and_then(Option::take) {
+                let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+                self.prepare_result_strip(which, &refs)?;
+            }
+        }
+        Ok(())
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1555,11 +1999,19 @@ impl Screen for MenuScreen {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&self) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(g) = &self.grants {
+            return g.take(std::time::Duration::from_millis(100));
+        }
         self.renderer.wait_for_frame(100)
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn paced(&self) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.grants.is_some() {
+            return true;
+        }
         self.renderer.has_frame_waitable()
     }
 
@@ -1591,8 +2043,13 @@ impl Screen for MenuScreen {
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
-        let presented = self.renderer.text_frame(lines)?.presented();
-        Ok(self.shown(presented))
+        self.text_frame(lines).map(|t| t.presented())
+    }
+
+    fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
+        let timing = self.renderer.text_frame(lines)?;
+        self.shown(timing.presented());
+        Ok(timing)
     }
 
     fn end(&mut self, page: &crate::render_side::EndPage) -> Result<FrameOutcome, RenderError> {
@@ -1796,6 +2253,19 @@ impl Screen for MenuScreen {
             self.stale = true;
             if let Some(splash) = &mut self.splash {
                 splash.alpha = None;
+            }
+            // The strip's glyphs were placed for the old target: each
+            // slot's lines are owed again, drawing none until laid out for
+            // this one ([`Screen::settle_result_strips`]).
+            for ((text, n), (owed, laid)) in self
+                .result_strip
+                .iter_mut()
+                .zip(self.owed_strip.iter_mut().zip(self.laid_strip.iter_mut()))
+            {
+                if text.is_some() && *n > 0 && owed.is_none() {
+                    *owed = Some(std::mem::take(laid));
+                    *n = 0;
+                }
             }
         }
     }
@@ -2287,6 +2757,54 @@ mod tests {
         let page = SelectScreen::new(Vec::new()).page("");
         screen.menu(&page, true).unwrap();
         assert_eq!(sent.0.lock().unwrap().last(), Some(&None));
+    }
+
+    /// The font a screen made for plays only reads on its own thread holds
+    /// every face in memory: the render thread's first shaping with it (a
+    /// pending frame's line after the swap it arrives on, a strip's
+    /// preparation or deferred settlement) opens and maps no file
+    /// (design.md "Rendering and Skins", the result's hold).
+    #[test]
+    fn the_font_read_ahead_is_held_in_memory() {
+        use crate::render_side::Screen;
+        let mut screen = MenuScreen::new(warp(), None);
+        screen.read_font_ahead();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !screen.page_font_ready() {
+            assert!(!screen.font_failed, "the font's read failed");
+            assert!(std::time::Instant::now() < end, "the font never read");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let fonts = screen.fonts.as_ref().expect("the font in hand");
+        assert!(fonts.in_memory(), "a face of the font read from its file");
+    }
+
+    /// The font's thread not started at the hold's start is a failed read
+    /// at once: the screen keeps the bitmap line and starts no thread
+    /// later, even once one could be started.
+    #[test]
+    fn a_font_thread_not_started_is_a_failed_read() {
+        use super::{FAIL_FONT_SPAWN, FONT_READS};
+        use crate::render_side::Screen;
+        let mut screen = MenuScreen::new(warp(), None);
+        FAIL_FONT_SPAWN.store(true, Ordering::SeqCst);
+        screen.read_font_ahead();
+        FAIL_FONT_SPAWN.store(false, Ordering::SeqCst);
+        assert!(screen.font_failed, "the spawn's failure not latched");
+        let reads = FONT_READS[1].load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(!screen.page_font_ready(), "a font after the failure");
+        }
+        assert!(
+            screen.font_ahead.is_none(),
+            "a thread started after the failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            FONT_READS[1].load(Ordering::SeqCst),
+            reads,
+            "the font read after the failure"
+        );
     }
 
     #[cfg(feature = "dev-tools")]

@@ -353,7 +353,7 @@ pub(super) fn lossy_spawn(
     let skip = Arc::new(AtomicBool::new(false));
     let skipping = Arc::clone(&skip);
     let built = Arc::new(AtomicBool::new(false));
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,
@@ -718,7 +718,7 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
         let frames = SettingsFrames::default();
         let gate = Arc::new(Gate::default());
         let paced = Arc::clone(&gate);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,

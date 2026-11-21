@@ -74,7 +74,7 @@ fn a_play_frame_s_time_is_after_what_its_view_finalized() {
     initial.origin = Some(origin);
     let (_sink, mut writer, side) = game::render_link(16, &initial);
     let stamped: Stamped = Arc::new(Mutex::new(Vec::new()));
-    let make: MakeScreen = Box::new(|| Ok(Box::new(Frames) as Box<dyn Screen>));
+    let make: MakeScreen = Box::new(|_| Ok(Box::new(Frames) as Box<dyn Screen>));
     let chart = Arc::new(
         ChartBuilder::new(120_000)
             .tap(Lane::new(1).unwrap(), TimeUs(60_000 * MS))
