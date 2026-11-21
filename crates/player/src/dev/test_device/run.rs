@@ -324,41 +324,42 @@ impl Log {
     }
 }
 
-/// The recorder's records so far, read whole lines at a time.
+/// The records of a stream another process appends to, read whole lines at
+/// a time through one handle, opened once the file exists: opening the
+/// file again at every poll costs a step thread's poll up to tens of
+/// milliseconds when the file system's filters look at the open, which
+/// starved the guard's heartbeat on the development PC.
 struct Tail {
     path: PathBuf,
-    at: u64,
-    partial: String,
+    file: Option<std::fs::File>,
+    partial: Vec<u8>,
 }
 
 impl Tail {
     fn new(path: &Path) -> Self {
         Self {
             path: path.to_owned(),
-            at: 0,
-            partial: String::new(),
+            file: None,
+            partial: Vec::new(),
         }
     }
 
     /// The records written since the last read.
     fn read(&mut self) -> Vec<Value> {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-        let Ok(mut f) = std::fs::File::open(&self.path) else {
+        use std::io::Read as _;
+        if self.file.is_none() {
+            self.file = std::fs::File::open(&self.path).ok();
+        }
+        let Some(f) = self.file.as_mut() else {
             return Vec::new();
         };
-        if f.seek(SeekFrom::Start(self.at)).is_err() {
+        if f.read_to_end(&mut self.partial).is_err() {
             return Vec::new();
         }
-        let mut text = String::new();
-        let Ok(n) = f.read_to_string(&mut text) else {
-            return Vec::new();
-        };
-        self.at += n as u64;
-        self.partial.push_str(&text);
         let mut out = Vec::new();
-        while let Some(i) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=i).collect();
-            if let Ok(v) = serde_json::from_str(line.trim_end()) {
+        while let Some(i) = self.partial.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=i).collect();
+            if let Ok(v) = serde_json::from_slice(line.trim_ascii_end()) {
                 out.push(v);
             }
         }
@@ -2036,5 +2037,29 @@ mod tests {
         assert_eq!(holds("p4"), [format!("hold b{START}+")]);
         assert_eq!(holds("p5"), holds("p1"));
         assert!(row("sink", true).is_none() && row("p4", true).is_none());
+    }
+
+    /// A tail opens its stream once it exists and then reads, through that
+    /// one handle, whole lines as another writer appends them, a line cut
+    /// mid-way (in a multi-byte character too) waiting for its end.
+    #[test]
+    fn a_tail_reads_whole_lines_as_they_are_appended() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("recorder.jsonl");
+        let mut tail = Tail::new(&path);
+        assert!(tail.read().is_empty());
+        let mut w = std::fs::File::create(&path).unwrap();
+        let first = "{\"t\":\"a\",\"s\":\"é\"}\n".as_bytes();
+        let cut = first.iter().position(|&b| b == 0xC3).unwrap() + 1;
+        w.write_all(&first[..cut]).unwrap();
+        assert!(tail.read().is_empty());
+        w.write_all(&first[cut..]).unwrap();
+        w.write_all(b"{\"t\":\"b\"}\n{\"t\":").unwrap();
+        let got = tail.read();
+        assert_eq!(got, [json!({"t": "a", "s": "é"}), json!({"t": "b"})]);
+        w.write_all(b"\"c\"}\n").unwrap();
+        assert_eq!(tail.read(), [json!({"t": "c"})]);
+        assert!(tail.read().is_empty());
     }
 }
