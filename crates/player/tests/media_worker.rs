@@ -278,6 +278,19 @@ impl Ring {
         })
     }
 
+    /// Whether every frame the ring holds ready has its end resolved: the
+    /// worker has decoded the frame after each (the slot's seventh word,
+    /// `until`, is no longer open).
+    fn ends_resolved(&self) -> bool {
+        let words = Self::words(self.view, self.len);
+        let geometry = self.reader.geometry();
+        (0..skin_model::media::SLOTS).all(|s| {
+            let base = geometry.frame_start(s) - skin_model::media::SLOT_HEADER_WORDS;
+            let load = |i: usize| words[base + i].load(std::sync::atomic::Ordering::Acquire);
+            load(0) != READY || load(6) != skin_model::media::UNTIL_END.cast_unsigned()
+        })
+    }
+
     /// Each slot's state, sequence, run and stamp, for a failure's message.
     fn slots(&self) -> Vec<[u64; 4]> {
         let words = Self::words(self.view, self.len);
@@ -901,10 +914,19 @@ fn worker_drops_frames_behind_the_game_s_clock() {
     );
     let slots = u64::try_from(SLOTS).unwrap();
     // The ring full of the clip's first frames, published before the game's
-    // first poll.
+    // first poll, each end resolved (the last one's once the worker decodes
+    // the frame it waits to publish), so the first poll judges all of them.
     let deadline = Instant::now() + REPLY;
-    while ring.published() < slots {
-        assert!(Instant::now() < deadline, "the ring never filled");
+    while ring.published() < slots || !ring.ends_resolved() {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            if ring.published() < slots {
+                "the ring never filled"
+            } else {
+                "a published frame's end never resolved"
+            }
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     let first = take_seq(&worker, &mut ring, stamp_of(24, 24));
@@ -967,11 +989,20 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
         }
     );
     // The ring full of the clip's first frames, published before the game's
-    // first poll, each end resolved by the frame after it.
+    // first poll, each end resolved by the frame after it (the last one's
+    // once the worker decodes the frame it waits to publish).
     let slots = u64::try_from(skin_model::media::SLOTS).unwrap();
     let deadline = Instant::now() + REPLY;
-    while ring.published() < slots {
-        assert!(Instant::now() < deadline, "the ring never filled");
+    while ring.published() < slots || !ring.ends_resolved() {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            if ring.published() < slots {
+                "the ring never filled"
+            } else {
+                "a published frame's end never resolved"
+            }
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     let shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
