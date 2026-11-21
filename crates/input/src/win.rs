@@ -2121,12 +2121,8 @@ mod deliver_tests {
 
     /// A keyboard Raw Input block, as `GetRawInputBuffer` hands it.
     fn block(device: u64, make: u16, down: bool) -> Vec<u8> {
-        let (flags, message, vkey): (u16, u32, u16) = match (make, down) {
-            (E, true) => (0, 0x100, 0x45),
-            (E, false) => (BREAK, 0x101, 0x45),
-            (_, true) => (0, 0x100, 0x57),
-            (_, false) => (BREAK, 0x101, 0x57),
-        };
+        let vkey: u16 = if make == E { 0x45 } else { 0x57 };
+        let (flags, message): (u16, u32) = if down { (0, 0x100) } else { (BREAK, 0x101) };
         let mut b = Vec::with_capacity(40);
         b.extend_from_slice(&1u32.to_le_bytes()); // RIM_TYPEKEYBOARD
         b.extend_from_slice(&40u32.to_le_bytes());

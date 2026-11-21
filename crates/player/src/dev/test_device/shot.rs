@@ -4,7 +4,7 @@
 //! writes it as a new file of the run's folder, closes it and only then
 //! seals it, so no step waits on a file write.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -43,14 +43,6 @@ pub fn png(width: u32, height: u32, bgra: &[u8]) -> Vec<u8> {
     crate::dev::png(width, height, &rgba)
 }
 
-/// Writes `bytes` as the new file `path`, closed and flushed to disk.
-fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let mut f = owner::create(path)?;
-    std::io::Write::write_all(&mut f, bytes).with_context(|| path.display().to_string())?;
-    f.sync_all().with_context(|| path.display().to_string())
-}
-
 impl Shots {
     /// Starts the writer for the run whose folder is `dir`: each written
     /// shot's seal (`run`, `role`) goes to `record`.
@@ -64,7 +56,7 @@ impl Shots {
         let thread = std::thread::spawn(move || {
             let mut errors = Vec::new();
             for j in rx {
-                let written = write_new(&j.path, &png(j.width, j.height, &j.bgra))
+                let written = owner::write_new(&j.path, &png(j.width, j.height, &j.bgra))
                     .and_then(|()| owner::seal(&dir, &j.path, &run, &role));
                 match written {
                     Ok(seal) => record(seal),

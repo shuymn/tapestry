@@ -496,32 +496,36 @@ const RUN_RUN: (&str, &str) = (SINGLE, RUN);
 const RUN_LINK: (&str, &str) = (SINGLE, LINK);
 const RUN_REC: (&str, &str) = (SINGLE, RECORDER);
 
+/// The host counter of `run`'s first record of `kind`.
+fn first_q(run: &Stream, kind: &str) -> Result<i64, String> {
+    recs(run)?
+        .iter()
+        .find(|v| v["t"] == kind)
+        .map(q)
+        .ok_or_else(|| format!("the run recorded no `{kind}`"))
+}
+
+/// The tags of the run's click calls.
+fn click_tags(run: &[Value]) -> Vec<u32> {
+    run.iter()
+        .filter(|v| v["t"] == "call" && v["what"] == "click")
+        .filter_map(|v| v["tag"].as_u64().and_then(|t| u32::try_from(t).ok()))
+        .collect()
+}
+
 /// The verdicts of a run of `sink` or `sink-early-close`.
 pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
     let front = recs(&f.run)
         .ok()
         .and_then(|r| r.iter().find(|v| v["t"] == "sink"))
         .and_then(|v| v["window"].as_u64());
-    let span = |kind: &str| -> Result<i64, String> {
-        recs(&f.run)?
-            .iter()
-            .find(|v| v["t"] == kind)
-            .map(q)
-            .ok_or_else(|| format!("the run recorded no `{kind}`"))
-    };
+    let span = |kind: &str| first_q(&f.run, kind);
     let pressed = || -> Result<Result<(Press, Press), String>, String> {
         let rec = recs(&f.recorder)?;
         covered(rec, span("call")?, span("held")?)?;
         Ok(presses(rec, front))
     };
-    let calls: Vec<u32> = recs(&f.run)
-        .map(|r| {
-            r.iter()
-                .filter(|v| v["t"] == "call" && v["what"] == "click")
-                .filter_map(|v| v["tag"].as_u64().and_then(|t| u32::try_from(t).ok()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let calls = recs(&f.run).map(click_tags).unwrap_or_default();
     vec![
         verdict(
             provenance::CHECK,
@@ -730,11 +734,7 @@ pub fn kill(k: &Kill, build: Option<&str>, outer: &Files, inner: &Files) -> Vec<
             .find(|v| v["t"] == "exit" && v["name"] == "inner")
             .map(q)
             .ok_or("the outer observed no end of the inner")?;
-        let calls: Vec<u32> = inner_run
-            .iter()
-            .filter(|v| v["t"] == "call" && v["what"] == "click")
-            .filter_map(|v| v["tag"].as_u64().and_then(|t| u32::try_from(t).ok()))
-            .collect();
+        let calls = click_tags(inner_run);
         covered(rec, from, to)?;
         Ok(no_foreign(rec, &calls, from, to))
     };
@@ -1035,23 +1035,10 @@ pub fn panel_keys(rec: &[Value], held: &[u8]) -> Result<(), String> {
 /// The verdicts of a panel row's run (`p1`, `p4`, `p5`), which holds
 /// `held`.
 pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, held: &[u8]) -> Vec<Judged> {
-    let span = |kind: &str| -> Result<i64, String> {
-        recs(&f.run)?
-            .iter()
-            .find(|v| v["t"] == kind)
-            .map(q)
-            .ok_or_else(|| format!("the run recorded no `{kind}`"))
-    };
+    let span = |kind: &str| first_q(&f.run, kind);
     let bytes = |b: &Bytes| b.clone();
     let buttons = held.iter().fold(0_u16, |a, b| a | 1 << (b - 1));
-    let calls: Vec<u32> = recs(&f.run)
-        .map(|r| {
-            r.iter()
-                .filter(|v| v["t"] == "call" && v["what"] == "click")
-                .filter_map(|v| v["tag"].as_u64().and_then(|t| u32::try_from(t).ok()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let calls = recs(&f.run).map(click_tags).unwrap_or_default();
     let mode = (SINGLE, MODE_LINK);
     let file = |name: &'static str| (SINGLE, name);
     vec![

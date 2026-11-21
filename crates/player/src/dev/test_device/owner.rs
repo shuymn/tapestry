@@ -114,6 +114,18 @@ impl Stream {
     }
 }
 
+/// Writes `bytes` as the new file `path` ([`create`]), closed and flushed
+/// to disk.
+///
+/// # Errors
+///
+/// The file exists or cannot be written.
+pub fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut f = create(path)?;
+    std::io::Write::write_all(&mut f, bytes).with_context(|| path.display().to_string())?;
+    f.sync_all().with_context(|| path.display().to_string())
+}
+
 /// The sha256 of a file's bytes as they are now.
 ///
 /// # Errors

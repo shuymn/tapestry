@@ -396,7 +396,6 @@ struct Live {
     recorder: Tail,
     /// The recorder's process and file, for the guard's looks.
     recorder_process: Process,
-    recorder_file: PathBuf,
     /// The recorder's records read and not yet looked at.
     backlog: Vec<Value>,
     held: Vec<Change>,
@@ -503,7 +502,7 @@ impl Exec for Live {
                     read: Instant::now(),
                     beat: Arc::clone(&self.beat),
                     recorder,
-                    recorder_file: self.recorder_file.clone(),
+                    recorder_file: self.recorder.path.clone(),
                     recorder_growth: Growth::new(Instant::now()),
                 }),
                 Arc::new(self.writer.clone()),
@@ -1254,15 +1253,10 @@ fn mode_change(b: &Begun, a: &Args, journal: &Stream) -> anyhow::Result<String> 
 /// its output in `player-commit.txt`) and its last write.
 fn player_record(b: &Begun, p: &launch::Player) -> anyhow::Result<()> {
     let sha = owner::digest(&p.exe)?;
-    let modified = std::fs::metadata(&p.exe)
-        .and_then(|m| m.modified())
-        .with_context(|| p.exe.display().to_string())?;
     // FILETIME: 100 ns since 1601.
-    let since = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("a last write before 1970")?;
-    let filetime = u64::try_from(since.as_nanos() / 100).context("the last write's time")?
-        + 116_444_736_000_000_000;
+    let filetime = std::os::windows::fs::MetadataExt::last_write_time(
+        &std::fs::metadata(&p.exe).with_context(|| p.exe.display().to_string())?,
+    );
     let out = b.dir.join("player-commit.txt");
     let stdio = Stdio {
         input: Stdio::null()?,
@@ -1453,7 +1447,6 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         log: b.log.clone(),
         recorder: Tail::new(&rec.path),
         recorder_process: rec.child.process,
-        recorder_file: rec.path.clone(),
         backlog: Vec::new(),
         held: Vec::new(),
         freq: qpc_freq(),

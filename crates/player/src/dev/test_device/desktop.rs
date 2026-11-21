@@ -162,11 +162,8 @@ pub fn windows_of(pid: u32) -> Vec<Win> {
     unsafe extern "system" fn each(h: HWND, data: LPARAM) -> BOOL {
         // SAFETY: `data` is the Find passed below, alive for the call.
         let f = unsafe { &mut *(data.0 as *mut Find) };
-        let mut pid = 0;
-        // SAFETY: one u32 written.
-        unsafe { GetWindowThreadProcessId(h, Some(&raw mut pid)) };
         // SAFETY: a window handle the system gave.
-        if pid == f.pid && unsafe { IsWindowVisible(h) }.as_bool() {
+        if process_of(win(h)) == f.pid && unsafe { IsWindowVisible(h) }.as_bool() {
             f.out.push(win(h));
         }
         BOOL(1)

@@ -56,8 +56,14 @@ pub fn device_table(monitor: &str, library: &Path) -> toml::Table {
         ]))
     }));
     let controller = toml::Table::from_iter([
-        ("start".to_owned(), toml::Value::Integer(9)),
-        ("select".to_owned(), toml::Value::Integer(10)),
+        (
+            "start".to_owned(),
+            toml::Value::Integer(super::run::START.into()),
+        ),
+        (
+            "select".to_owned(),
+            toml::Value::Integer(super::run::SELECT.into()),
+        ),
         ("lanes".to_owned(), toml::Value::Array(lanes)),
     ]);
     let device = toml::Table::from_iter([
@@ -230,9 +236,7 @@ impl Player {
 /// Copies `from` to the new file `to`.
 fn copy_new(from: &Path, to: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(from).with_context(|| from.display().to_string())?;
-    let mut f = owner::create(to)?;
-    std::io::Write::write_all(&mut f, &bytes).with_context(|| to.display().to_string())?;
-    f.sync_all().with_context(|| to.display().to_string())
+    owner::write_new(to, &bytes)
 }
 
 /// How long the runner keeps letting the player take the foreground:
