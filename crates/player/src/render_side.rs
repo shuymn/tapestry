@@ -4169,6 +4169,10 @@ impl RenderLink {
     /// pass's boundary, before its frame reads the window's size; `1`
     /// after that read; `2` after the frame's draw.
     #[cfg(all(test, feature = "dev-tools"))]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a test names one of the three points"
+    )]
     pub fn frame_gate(&self, at: usize) -> &TestGate {
         &self.shared.frame_gates[at]
     }
@@ -6192,6 +6196,10 @@ impl Committed {
 /// refused, and any failure, fails the build. A result restore refused
 /// says why in `result_refused`, so its owner disables the kind for the
 /// run (the S10-09i design's D2, "Keying and recovery").
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the factory and the page font it is handed, beside the restore's inputs and its two refusals"
+)]
 fn build(
     make: &mut MakeScreen,
     font: &mut Option<crate::menu_screen::PageFont>,
