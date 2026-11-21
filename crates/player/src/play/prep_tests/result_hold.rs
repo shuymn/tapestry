@@ -538,9 +538,12 @@ struct Waits {
     between: Vec<render::probe::GpuWait>,
 }
 
-/// How late past its bound a counted wait may return: the scheduler's
-/// lateness on a loaded machine, far below a frame that freezes.
-const LATENESS_US: u64 = 30_000;
+/// How late past its bound a counted wait may return. The bound asked is
+/// checked exactly; what it took is not clipped to it, and on WARP beside
+/// the other WARP tests of a run a 4 ms poll was seen to return up to 46 ms
+/// late (the CPU renderer and the scheduler under load). A wait that does
+/// not honour its bound (one asked for 1 s) exceeds this.
+const LATENESS_US: u64 = 100_000;
 
 fn gpu_waits() -> Waits {
     let all = render::probe::gpu_waits();

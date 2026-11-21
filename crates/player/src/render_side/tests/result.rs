@@ -2296,6 +2296,7 @@ fn result_frame_alloc() {
             Some(&mut side),
             now,
             fadeout,
+            false,
             &skin_model::AppReadouts::LAUNCH,
         );
         counts.push(commit + crate::alloc_count::this_thread() - before);
@@ -2326,6 +2327,7 @@ fn result_frame_alloc() {
         Some(&mut side),
         TimeUs(2_000_000),
         fadeout,
+        false,
         &skin_model::AppReadouts::LAUNCH,
     );
     counts.push(crate::alloc_count::this_thread() - before);
@@ -3407,6 +3409,7 @@ fn the_build_mark_precedes_the_result_build() {
             Some(&mut side),
             now,
             fadeout,
+            false,
             &skin_model::AppReadouts::LAUNCH,
         );
         assert_eq!(drawn, ResultDrawn::Built);

@@ -983,6 +983,7 @@ fn result_chart_frame_alloc() {
             Some(&mut side),
             now,
             fadeout,
+            false,
             &skin_model::AppReadouts::LAUNCH,
         );
         counts.push(crate::alloc_count::this_thread() - before);

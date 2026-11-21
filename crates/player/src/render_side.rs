@@ -9125,6 +9125,7 @@ impl Run {
                         self.result.as_mut(),
                         now,
                         fadeout,
+                        self.result_hold.is_some(),
                         &app,
                     );
                     // A frame under the barrier refused (dev-tools: the
@@ -13961,18 +13962,23 @@ impl Run {
         side: Option<&mut ResultSide>,
         now: TimeUs,
         fadeout: Option<TimeUs>,
+        held: bool,
         app: &skin_model::AppReadouts,
     ) -> ResultDrawn {
         let Some(side) = side else {
             return ResultDrawn::BuiltIn;
         };
         let origin = side.origin;
-        // No view presented: the first one stages, or a leaving command
-        // pinned before it was committed. The pending presentation, never
-        // the built-in end page (design.md "Rendering and Skins", the
-        // result's hold).
+        // No view presented: while the first one stages, or once a leaving
+        // command pinned the result's hold before its first view was
+        // committed, the pending presentation, never the built-in end page
+        // (design.md "Rendering and Skins", the result's hold).
         let Some(h) = side.presented.as_mut() else {
-            return ResultDrawn::Pending;
+            return if side.staging.is_some() || (held && fadeout.is_some()) {
+                ResultDrawn::Pending
+            } else {
+                ResultDrawn::BuiltIn
+            };
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
             let frame = skin_model::ResultFrame {
