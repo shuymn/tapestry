@@ -707,6 +707,10 @@ pub trait Screen: Send {
     /// submission (tests). Nothing by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn delay_steps(&mut self, _delay: Option<Duration>) {}
+    /// Has the device refuse the next staging step (tests). Nothing by
+    /// default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn refuse_next_step(&mut self) {}
     /// The writes of the first staging atlas steps, each step's count in
     /// order, and how many steps were written (tests). None by default.
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2127,6 +2131,10 @@ struct Shared {
     /// The pass a result view's creation ran in, 0 none (tests).
     #[cfg(test)]
     creation_pass: AtomicU64,
+    /// The uploader's next staging step is refused by the device, once
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    refuse_step: AtomicBool,
     /// Each staging atlas step the uploader wrote, as its boundary ends
     /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2326,6 +2334,8 @@ impl Shared {
             creation_hook: [AtomicI64::new(0), AtomicI64::new(i64::MIN)],
             #[cfg(test)]
             creation_pass: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            refuse_step: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
             step_records: Mutex::new(Vec::new()),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -4034,6 +4044,12 @@ impl RenderLink {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn set_write_clock_step(&self, us: i64) {
         self.shared.write_clock_step.store(us, Ordering::SeqCst);
+    }
+
+    /// Has the device refuse the uploader's next staging step (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn refuse_next_step(&self) {
+        self.shared.refuse_step.store(true, Ordering::SeqCst);
     }
 
     /// The pass the last result view's creation ran in, 0 none (tests).
@@ -11298,7 +11314,16 @@ impl Run {
             return;
         }
         #[cfg(all(test, feature = "dev-tools"))]
-        let logged = self.screen.as_ref().map_or(0, |s| s.steps_logged().1);
+        if self.shared.refuse_step.swap(false, Ordering::SeqCst)
+            && let Some(s) = self.screen.as_mut()
+        {
+            s.refuse_next_step();
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        let logged = (
+            self.screen.as_ref().map_or(0, |s| s.steps_logged().1),
+            render::probe::steps(),
+        );
         let mut pages_end = None;
         let frame = self.frame_due_by(mode, held);
         let chart = self
@@ -11387,24 +11412,37 @@ impl Run {
         }
     }
 
-    /// Records the staging atlas steps this boundary wrote past the
-    /// `logged` before it, with whether its pass was held (tests).
+    /// Records the uploader's steps this boundary submitted past the
+    /// `logged` before it (staging atlas steps, every step), with whether
+    /// its pass was held (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    fn record_steps(&self, logged: usize, held: bool) {
+    fn record_steps(&self, (logged, stepped): (usize, u64), held: bool) {
         let Some(s) = self.screen.as_ref() else {
             return;
         };
         let (log, now) = s.steps_logged();
+        let others = (render::probe::steps() - stepped).saturating_sub((now - logged) as u64);
         let mut records = self
             .shared
             .step_records
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let pass = self.shared.passes.load(Ordering::SeqCst);
         for n in logged..now {
             records.push(StepRecord {
+                atlas: true,
                 writes: log.get(n).copied(),
                 held,
-                pass: self.shared.passes.load(Ordering::SeqCst),
+                pass,
+                at: Instant::now(),
+            });
+        }
+        for _ in 0..others {
+            records.push(StepRecord {
+                atlas: false,
+                writes: None,
+                held,
+                pass,
                 at: Instant::now(),
             });
         }
@@ -12441,12 +12479,13 @@ struct StagingView {
     uploads: u64,
 }
 
-/// A staging atlas step the uploader wrote (tests): its writes, when the
-/// log kept them; whether its pass was held; its pass; when its boundary
-/// ended.
+/// A step the uploader submitted (tests): whether it was a staging's
+/// atlas step and its writes, when the log kept them; whether its pass
+/// was held; its pass; when its boundary ended.
 #[cfg(all(test, feature = "dev-tools"))]
 #[derive(Clone, Copy, Debug)]
 pub struct StepRecord {
+    pub atlas: bool,
     pub writes: Option<u64>,
     pub held: bool,
     pub pass: u64,

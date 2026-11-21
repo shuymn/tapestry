@@ -366,6 +366,14 @@ pub(crate) fn array_key(b: &wgpu::Texture) -> u64 {
     })
 }
 
+/// The uploader's steps submitted so far, every payload's (tests).
+pub(crate) static STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// The uploader's steps submitted so far, every payload's (tests).
+pub fn steps() -> u64 {
+    STEPS.load(Ordering::Relaxed)
+}
+
 /// The kinds of a render-thread pass a blocking GPU wait is counted in
 /// ([`count_gpu_waits`]): none of the others, a held pass (one that
 /// presents nothing while a first picture is held), a pass that presents a

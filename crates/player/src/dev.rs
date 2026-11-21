@@ -3233,6 +3233,14 @@ pub fn read_result_faults() {
 static LOST_RESULT_FAULT: AtomicU64 = AtomicU64::new(0);
 static LOST_RESULT_SEEN: AtomicU64 = AtomicU64::new(0);
 
+/// Loses the `n`th result or end frame drawn from now on as a device
+/// loss; 0 none (tests).
+#[cfg(test)]
+pub fn lose_result_frame_at(n: u64) {
+    LOST_RESULT_SEEN.store(0, Ordering::SeqCst);
+    LOST_RESULT_FAULT.store(n, Ordering::SeqCst);
+}
+
 /// Whether this result or end frame, drawn, is lost as a device loss.
 pub fn lose_result_frame() -> bool {
     let n = LOST_RESULT_FAULT.load(Ordering::SeqCst);

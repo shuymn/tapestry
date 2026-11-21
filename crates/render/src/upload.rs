@@ -317,6 +317,8 @@ impl InFlight {
         staged: u64,
         payload: Payload,
     ) -> Self {
+        #[cfg(feature = "dev-tools")]
+        crate::probe::STEPS.fetch_add(1, Ordering::Relaxed);
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
         gpu.queue()

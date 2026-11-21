@@ -1480,6 +1480,11 @@ impl Screen for MenuScreen {
     }
 
     #[cfg(all(test, feature = "dev-tools"))]
+    fn refuse_next_step(&mut self) {
+        self.renderer.refuse_next_step();
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
     fn steps_logged(&self) -> (Vec<u64>, usize) {
         let (log, logged) = self.renderer.step_log();
         (log.to_vec(), logged)

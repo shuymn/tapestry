@@ -31,6 +31,10 @@ const BOUND: i64 = 200_000;
 const LIT: usize = 100;
 /// The held pass's longest wait for a step in flight, in µs.
 const HELD_PACE_US: u64 = 4_000;
+/// The longest frame interval the offscreen pacer allows: its wait for
+/// the frame before (100 ms, after which that frame is skipped) and the
+/// frame's own work on WARP.
+const PACER_BOUND: Duration = Duration::from_millis(150);
 /// The scheduler's lateness a measured wait is allowed past its bound.
 const SLACK_US: u64 = 3_000;
 
@@ -39,12 +43,15 @@ const SLACK_US: u64 = 3_000;
 struct Frame {
     /// What its result stamp names; `None` for a frame of another screen.
     path: Option<ResultPath>,
-    /// Its texels with a channel above 200.
+    /// Its texels with a channel above 200; `usize::MAX` when it was not
+    /// read back.
     lit: usize,
     /// The instant a result frame evaluated its skin at.
     sampled: Option<TimeUs>,
     /// When the sink saw it.
     at: Instant,
+    /// Its size read back; zero sides when it was not.
+    size: (u32, u32),
 }
 
 impl Frame {
@@ -59,12 +66,20 @@ impl Frame {
 #[derive(Clone, Default)]
 struct Frames {
     armed: Arc<AtomicBool>,
+    /// No frame is read back while set: its texels count as lit.
+    blind: Arc<AtomicBool>,
     log: Arc<Mutex<Vec<Frame>>>,
 }
 
 impl Frames {
     fn arm(&self) {
         self.armed.store(true, Ordering::Release);
+    }
+
+    /// Reads no frame back from now on (`true`): frames come at the
+    /// render thread's own pace.
+    fn blind(&self, on: bool) {
+        self.blind.store(on, Ordering::Release);
     }
 
     fn len(&self) -> usize {
@@ -104,17 +119,25 @@ impl FrameSink for Recorder {
         if !self.0.armed.load(Ordering::Acquire) {
             return;
         }
-        let lit = screen.read_back().map_or(0, |(_, _, pixels)| {
-            pixels
-                .chunks(4)
-                .filter(|p| p.iter().take(3).any(|&c| c > 200))
-                .count()
-        });
+        let blind = self.0.blind.load(Ordering::Acquire);
+        let mut size = (0, 0);
+        let lit = if blind {
+            usize::MAX
+        } else {
+            screen.read_back().map_or(0, |(w, h, pixels)| {
+                size = (w, h);
+                pixels
+                    .chunks(4)
+                    .filter(|p| p.iter().take(3).any(|&c| c > 200))
+                    .count()
+            })
+        };
         self.0.log.lock().unwrap().push(Frame {
             path: drawn.result.map(|r| r.path),
             lit,
             sampled: drawn.result.map(|r| r.sampled),
             at: Instant::now(),
+            size,
         });
     }
 }
@@ -669,8 +692,12 @@ fn a_step_crossing_the_bound_closes_at_it() {
         until_true(rig, "held passes", |rig| {
             rig.render.held_passes() > passes + 3
         });
+        let paused_at = rig.render.creation_pass();
         assert!(
-            rig.render.step_records().is_empty(),
+            rig.render
+                .step_records()
+                .iter()
+                .all(|r| !r.atlas || r.pass <= paused_at),
             "a step written while paused"
         );
         // 1 ms before the bound as the first write ends: the boundary looks
@@ -681,7 +708,12 @@ fn a_step_crossing_the_bound_closes_at_it() {
         rig.render.pause_result_staging(false);
         let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
         rig.render.set_write_clock_step(0);
-        let records = rig.render.step_records();
+        let records: Vec<_> = rig
+            .render
+            .step_records()
+            .into_iter()
+            .filter(|r| r.atlas && r.pass > paused_at)
+            .collect();
         let first = records.first().copied().expect("a step written");
         assert!(first.held, "the first step in a held pass: {records:?}");
         assert_eq!(
@@ -705,6 +737,306 @@ fn a_step_crossing_the_bound_closes_at_it() {
         assert!(
             records[1..].iter().any(|r| r.at > first_pending),
             "no write after the first pending frame: {records:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// The staging after the bound, each step's completion delayed: pending
+/// frames between its steps and every frame interval within the
+/// offscreen pacer's bound (V19 (e), its frames; on WARP a step's writes
+/// take longer than a frame, so two steps between two frames are not
+/// shown here).
+#[test]
+fn a_staging_after_the_bound_steps_between_pending_frames() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held_miss_of(rig, frames, &a, &report, &screen, 2_048, false);
+        laid_out(rig);
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.render.pause_result_staging(true);
+        rig.show_end(&report, &screen);
+        until_true(rig, "the view's creation", |rig| {
+            rig.render.creation_pass() > 0
+        });
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        frames.blind(true);
+        let past = frames.len();
+        frames.until(rig, past, "pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        rig.render.delay_steps(2_000);
+        let stepping = frames.len();
+        let unpaused = Instant::now();
+        rig.render.pause_result_staging(false);
+        let shown = frames.until(rig, stepping, "the skin's view", |f| {
+            first_view(f).is_some()
+        });
+        rig.render.delay_steps(0);
+        frames.blind(false);
+        let records: Vec<_> = rig
+            .render
+            .step_records()
+            .into_iter()
+            .filter(|r| r.at >= unpaused)
+            .collect();
+        let at = first_view(&shown).unwrap();
+        assert!(
+            shown[..at].iter().all(|f| f.pending()),
+            "pending until the first view: {shown:?}"
+        );
+        assert!(records.len() >= 2, "steps: {records:?}");
+        let intervals: Vec<_> = shown.windows(2).map(|w| w[1].at - w[0].at).collect();
+        assert!(
+            intervals.iter().all(|d| *d <= PACER_BOUND),
+            "a frame interval past the pacer's bound: {intervals:?}"
+        );
+        // Pending frames between the staging's steps: one after its first
+        // and before its last.
+        let (first, last) = (records[0].at, records[records.len() - 1].at);
+        assert!(
+            shown[..at].iter().any(|f| f.at > first && f.at < last),
+            "no pending frame between the steps: {records:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// Waits until the frames from `from` on satisfy `want`, at most 20 s,
+/// landing the result's layouts and building a failed screen again as
+/// the flow does: those frames.
+fn until_rebuilt(
+    rig: &mut PlayerRig<'_>,
+    frames: &Frames,
+    from: usize,
+    what: &str,
+    want: impl Fn(&[Frame]) -> bool,
+) -> Vec<Frame> {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let f = frames.since(from);
+        if want(&f) {
+            return f;
+        }
+        assert!(Instant::now() < end, "never {what}: {f:?}");
+        if rig.screen_failed() {
+            rig.prepare_screen().unwrap();
+        }
+        rig.land_result();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A miss handed over with its staging held by the flag and the bound
+/// passed: the pending presentation drawing. The frames' count then.
+fn pending_after_hand_over(
+    rig: &mut PlayerRig<'_>,
+    frames: &Frames,
+    a: &game::Loaded,
+    report: &game::PlayReport,
+    screen: &game::ResultScreen,
+) -> (usize, tempfile::TempDir) {
+    let (from, skin) = held_miss(rig, frames, a, report, screen);
+    laid_out(rig);
+    frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+    rig.render.pause_result_staging(true);
+    rig.show_end(report, screen);
+    until_true(rig, "the view's creation", |rig| {
+        rig.render.creation_pass() > 0
+    });
+    rig.render.set_hold_clock(Some(BOUND + 1));
+    let past = frames.len();
+    frames.until(rig, past, "pending frames", |f| {
+        f.iter().filter(|f| f.pending()).count() >= 3
+    });
+    (frames.len(), skin)
+}
+
+/// Result left after the hand-over while its first view still stages
+/// (the flag set): no pending frame after the next screen's message
+/// (V19 (f) after the hand-over).
+#[test]
+fn a_result_left_while_its_first_view_stages_draws_no_pending_frame_after() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (_, _skin) = pending_after_hand_over(rig, frames, &a, &report, &screen);
+        rig.leave_result();
+        rig.render.pause_result_staging(false);
+        let after = frames.len();
+        rig.render.send(RenderMsg::Menu(Box::new(
+            crate::render_side::tests::one_line("select"),
+        )));
+        let next = frames.until(rig, after, "the next screen's frames", |f| {
+            f.iter().filter(|f| f.lit > LIT && f.path.is_none()).count() >= 3
+        });
+        let first = next
+            .iter()
+            .position(|f| f.lit > LIT && f.path.is_none())
+            .unwrap();
+        assert!(
+            next[first..].iter().all(|f| f.path.is_none()),
+            "a result frame after the next screen's message: {next:?}"
+        );
+        assert_eq!(rig.render.presented_origin(), None, "an origin");
+    });
+}
+
+/// A device loss after the hand-over while the first view stages (the
+/// flag set): the view is staged again on the rebuilt screen, and pending
+/// frames draw until it commits (V19 (g), its second half, past the
+/// bound).
+#[test]
+fn a_device_lost_while_the_first_view_stages_stages_it_again() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (at, _skin) = pending_after_hand_over(rig, frames, &a, &report, &screen);
+        let creations = rig.render.creation_pass();
+        crate::dev::lose_result_frame_at(1);
+        let lost = until_rebuilt(rig, frames, at, "frames on the rebuilt screen", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        crate::dev::lose_result_frame_at(0);
+        assert!(
+            lost.iter().all(|f| f.pending()),
+            "the pending presentation on the rebuilt screen: {lost:?}"
+        );
+        let rebuilt = frames.len();
+        rig.render.pause_result_staging(false);
+        let shown = until_rebuilt(rig, frames, rebuilt, "the skin's view", |f| {
+            first_view(f).is_some()
+        });
+        assert!(
+            rig.render.creation_pass() > creations,
+            "the view not staged again on the rebuilt screen"
+        );
+        let first = first_view(&shown).unwrap();
+        assert!(
+            shown[..first].iter().all(|f| f.pending()),
+            "pending until the first view: {shown:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// A size notice in the held phase after the hand-over: no further held
+/// pass, and the pending presentation at the new size (V19 (h)).
+#[test]
+fn a_size_notice_while_held_ends_the_held_phase() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let extent = Arc::new(crate::render_side::Extent::default());
+        extent.publish(1_920, 1_080);
+        rig.render.follow(&extent);
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held_miss(rig, frames, &a, &report, &screen);
+        laid_out(rig);
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        rig.render.pause_result_staging(true);
+        rig.show_end(&report, &screen);
+        let passes = rig.render.held_passes();
+        until_true(rig, "held passes", |rig| {
+            rig.render.held_passes() > passes + 3
+        });
+        let held_at = frames.len();
+        extent.publish(1_280, 720);
+        let after = frames.until(rig, held_at, "pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        let passes = rig.render.held_passes();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            rig.render.held_passes(),
+            passes,
+            "a held pass after the notice"
+        );
+        assert!(
+            after.iter().all(|f| f.pending() && f.size == (1_280, 720)),
+            "the pending presentation at the new size: {after:?}"
+        );
+        rig.render.pause_result_staging(false);
+        rig.leave_result();
+    });
+}
+
+/// A union's step refused after the bound: the pending presentation,
+/// then the built-in view as the lifetime's first committed view, the
+/// origin at its frame (V19 (j)).
+#[test]
+fn a_step_refused_after_the_bound_commits_the_built_in_view() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (at, _skin) = pending_after_hand_over(rig, frames, &a, &report, &screen);
+        rig.render.refuse_next_step();
+        rig.render.pause_result_staging(false);
+        let shown = frames.until(rig, at, "a committed view", |f| {
+            f.iter().any(|f| f.path.is_some() && !f.pending())
+        });
+        let first = shown
+            .iter()
+            .position(|f| f.path.is_some() && !f.pending())
+            .unwrap();
+        assert!(
+            shown[..first].iter().all(|f| f.pending()),
+            "pending until the first view: {shown:?}"
+        );
+        assert_eq!(
+            shown[first].path,
+            Some(ResultPath::BuiltIn),
+            "the built-in view first: {shown:?}"
+        );
+        assert_eq!(
+            rig.render.presented_origin(),
+            shown[first].sampled,
+            "the origin at the built-in view's frame"
+        );
+        rig.leave_result();
+    });
+}
+
+/// No result skin: no hold, and the built-in end page at once from the
+/// hand-over, past the bound with no pending frame (V19 (k), its second
+/// case).
+#[test]
+fn a_result_without_a_skin_draws_the_end_page_at_once() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        rig.result_skin = ResultSkin::new(None);
+        prepared(rig, &a);
+        rig.render.send(RenderMsg::Menu(Box::default()));
+        frames.arm();
+        let from = frames.len();
+        rig.begin_result(&report, &screen);
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        frames.until(rig, from, "outgoing frames", |f| f.len() >= 3);
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        let shown = frames.until(rig, handed, "the end page", |f| {
+            f.iter()
+                .filter(|f| f.path == Some(ResultPath::BuiltIn))
+                .count()
+                >= 3
+        });
+        assert!(
+            shown.iter().all(|f| f.path != Some(ResultPath::Pending)),
+            "a pending frame with no skin: {shown:?}"
+        );
+        let first = shown.iter().position(|f| f.path.is_some()).unwrap();
+        assert!(
+            shown[first..]
+                .iter()
+                .all(|f| f.path == Some(ResultPath::BuiltIn)),
+            "the end page from its first frame: {shown:?}"
         );
         rig.leave_result();
     });
