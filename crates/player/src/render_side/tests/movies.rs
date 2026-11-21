@@ -136,7 +136,7 @@ fn an_abandoned_committed_start_drops_its_movies() {
     link.send(RenderMsg::Abandon(committed + 1));
     assert!(link.fence(Duration::from_secs(20)));
     assert_eq!(hub.open_sets(), 1, "another request's abandonment");
-    link.abandon_attempt();
+    link.abandon_attempt(committed);
     link.send(RenderMsg::PracticePage(Box::default()));
     assert!(
         wait_until(|| hub.open_sets() == 0),

@@ -1014,7 +1014,7 @@ fn rig<'a>(
         ready_state_at: None,
         origin: None,
         declared: crate::render_side::Declared::default(),
-        committed_unplayed: false,
+        committed: None,
         steps,
         steps_dropped: 0,
         figures: None,

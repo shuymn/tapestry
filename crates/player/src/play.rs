@@ -336,10 +336,13 @@ pub struct PlayerRig<'a> {
     /// What the play skin declares, from the current attempt's commit
     /// receipt ([`commit_ready`]); none declared before it.
     pub declared: Declared,
-    /// The attempt committed and its play not begun (no play message
-    /// sent): a stop before recording opens abandons it on the render
-    /// thread.
-    pub committed_unplayed: bool,
+    /// The committed attempt's guard: its request, from the commit until
+    /// its start (the play message) disarms it. Any stop before the start,
+    /// before recording opens (`end_presentation`) or after
+    /// ([`close`](game::live::Rig::close) with no start), retires the
+    /// attempt's movies on the render thread by that request
+    /// ([`PlayerRig::retire_unstarted`]).
+    pub committed: Option<u64>,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -2223,6 +2226,16 @@ pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
 }
 
 impl PlayerRig<'_> {
+    /// The committed attempt's guard fired: a play committed and not
+    /// started has its movies retired on the render thread, by the request
+    /// it was committed as; nothing once its start disarmed it, or before
+    /// a commit.
+    fn retire_unstarted(&mut self) {
+        if let Some(request) = self.committed.take() {
+            self.render.abandon_attempt(request);
+        }
+    }
+
     /// Parks for `park` at most (the input thread unparks it earlier),
     /// then serves what a step's wait serves ([`game::Rig::wait`]).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -2532,7 +2545,7 @@ impl Rig for PlayerRig<'_> {
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared)?;
-        self.committed_unplayed = true;
+        self.committed = Some(self.render.last_request());
         self.chart_images.committed();
         self.bga.committed();
         // The attempt's sources and result half move to the result,
@@ -2984,9 +2997,7 @@ impl Rig for PlayerRig<'_> {
         // A play committed and left before it began takes its movies
         // with it; a stop before the commit (a preparation discarded, or
         // kept for a local retry) sends nothing.
-        if std::mem::take(&mut self.committed_unplayed) {
-            self.render.abandon_attempt();
-        }
+        self.retire_unstarted();
         #[cfg(feature = "dev-tools")]
         self.input.end_loading_script();
         if let Some(driver) = &mut self.adjust {
@@ -3239,7 +3250,7 @@ impl Rig for PlayerRig<'_> {
         // in for none.
         let state_origin = self.state_clock.origin().unwrap_or(self.load_start);
         self.interval = Some(self.render.scripts().open_interval());
-        self.committed_unplayed = false;
+        self.committed = None;
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.attempt_gauge,
@@ -3381,6 +3392,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn close(&mut self) -> Result<Closing, InputWaitError> {
+        // Recording closed before the play started (a refusal after the
+        // opening, as the recording's cap): the committed attempt's movies
+        // go with it.
+        self.retire_unstarted();
         self.input.close()
     }
 

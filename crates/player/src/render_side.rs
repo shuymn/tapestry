@@ -3711,11 +3711,16 @@ impl RenderLink {
         self.send(RenderMsg::Discard(self.requests.load(Ordering::Relaxed)));
     }
 
-    /// The last attempt's play is left before it began: once committed,
-    /// its movies are retired ([`RenderMsg::Abandon`]); its installation
-    /// stays.
-    pub fn abandon_attempt(&self) {
-        self.send(RenderMsg::Abandon(self.requests.load(Ordering::Relaxed)));
+    /// The play of the attempt prepared as `request` is left before it
+    /// began: once committed, its movies are retired
+    /// ([`RenderMsg::Abandon`]); its installation stays.
+    pub fn abandon_attempt(&self, request: u64) {
+        self.send(RenderMsg::Abandon(request));
+    }
+
+    /// The request of the last attempt prepared, which a commit commits.
+    pub fn last_request(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// Starts installing the declarative `skin` for screen `kind`, as a

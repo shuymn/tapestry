@@ -678,6 +678,47 @@ fn a_quit_at_the_last_look_reopens_tuning_on_the_page() {
     });
 }
 
+/// A Start refused after recording opened (design.md "Rendering and
+/// Skins", skin movies: a committed play left before it began): a chart
+/// of 57 minutes, under the load's duration cap, is over one keyboard's
+/// recording cap, which the opening's sources decide, so the attempt is
+/// committed, recording opens and closes again with the refusal, and the
+/// play never starts. The committed
+/// attempt's guard retires its movies: the render thread is told the
+/// committed request's abandonment after its commit, and the practice page
+/// drawn after holds none of them.
+// Revert: the guard not fired by a close before the start
+// (`retire_unstarted` dropped from `close`) -> "the committed request
+// abandoned".
+#[test]
+fn a_start_refused_after_recording_opens_abandons_its_commit() {
+    let (_dir, mut loaded) = chart("#PLAYLEVEL 13\n#BPM 30\n#43011:01\n", covers());
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let ended = open_with(loaded, rig, side, || {});
+        assert!(
+            matches!(
+                ended,
+                Err(LiveError::Logic(game::LogicError::RecordingTooLarge { .. }))
+            ),
+            "{ended:?}"
+        );
+        assert!(rig.render.epochs().1 > 0, "committed");
+        let log = side.screens.log();
+        let commit = log
+            .iter()
+            .rposition(|l| l.contains(" commit "))
+            .expect("the attempt committed");
+        let request = log[commit].rsplit(' ').next().unwrap().to_owned();
+        until("the committed request abandoned", || {
+            side.screens.log()[commit..]
+                .iter()
+                .any(|l| l.ends_with(&format!(" abandon {request}")))
+        });
+        let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+        rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));
+    });
+}
+
 /// The times the flow decided to end the loading state at: the clock it
 /// last read before each end of loading it asked.
 fn ends(side: &Side<'_>) -> Vec<TimeUs> {
