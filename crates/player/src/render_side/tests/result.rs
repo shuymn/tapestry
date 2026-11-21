@@ -781,7 +781,7 @@ impl Rig {
         let faults = Arc::new(Faults::default());
         let drawn = Arc::new(Mutex::new(Vec::new()));
         let (g, f, d) = (Arc::clone(&gate), Arc::clone(&faults), Arc::clone(&drawn));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,

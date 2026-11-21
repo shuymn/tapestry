@@ -1320,7 +1320,14 @@ impl Extent {
 }
 
 /// Builds the screen on the render thread, at startup and after a failure.
-pub type MakeScreen = Box<dyn FnMut() -> Result<Box<dyn Screen>, RenderError> + Send>;
+/// The page font the screen it replaces read, or was reading, comes in
+/// its argument: a factory that draws menus takes it from there instead
+/// of reading the font again, and leaves it when the build fails before
+/// the screen is made.
+pub type MakeScreen = Box<
+    dyn FnMut(&mut Option<crate::menu_screen::PageFont>) -> Result<Box<dyn Screen>, RenderError>
+        + Send,
+>;
 
 /// Why the screen cannot draw a play.
 #[derive(Debug, thiserror::Error)]
@@ -5301,6 +5308,7 @@ pub fn spawn(
             crate::dev::read_script_switches();
             let screen = match build(
                 &mut make,
+                &mut None,
                 &mut Committed::default(),
                 chart.as_deref(),
                 section.as_ref(),
@@ -6186,6 +6194,7 @@ impl Committed {
 /// run (the S10-09i design's D2, "Keying and recovery").
 fn build(
     make: &mut MakeScreen,
+    font: &mut Option<crate::menu_screen::PageFont>,
     committed: &mut Committed,
     chart: Option<&Chart>,
     section: Option<&Section>,
@@ -6193,7 +6202,37 @@ fn build(
     result_refused: &mut Option<String>,
     decision_refused: &mut Option<String>,
 ) -> Result<Box<dyn Screen>, RenderError> {
-    let mut s = make()?;
+    let mut s = make(font)?;
+    match fill(
+        s.as_mut(),
+        committed,
+        chart,
+        section,
+        disabled,
+        result_refused,
+        decision_refused,
+    ) {
+        Ok(()) => Ok(s),
+        Err(e) => {
+            // The page font the factory took stays for the next build.
+            if let Some(f) = s.take_page_font() {
+                *font = Some(f);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// [`build`]'s restores and load on the screen `s` just made.
+fn fill(
+    s: &mut dyn Screen,
+    committed: &mut Committed,
+    chart: Option<&Chart>,
+    section: Option<&Section>,
+    disabled: bool,
+    result_refused: &mut Option<String>,
+    decision_refused: &mut Option<String>,
+) -> Result<(), RenderError> {
     if disabled {
         s.disable_result();
     }
@@ -6269,7 +6308,7 @@ fn build(
     if let Some(chart) = chart {
         s.load(chart, section)?;
     }
-    Ok(s)
+    Ok(())
 }
 
 enum Mode {
@@ -11058,6 +11097,7 @@ impl Run {
             let (mut refused, mut decision_refused) = (None, None);
             let built = build(
                 &mut self.make,
+                &mut self.page_font,
                 &mut self.committed,
                 None,
                 None,
@@ -12380,6 +12420,7 @@ impl Run {
             (None, _) => {
                 let built = build(
                     &mut self.make,
+                    &mut self.page_font,
                     &mut self.committed,
                     chart,
                     section,
@@ -14874,7 +14915,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let builds = Arc::new(AtomicU32::new(0));
         let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let id = made.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(Box::new(Menus {
                 id,
@@ -14970,7 +15011,7 @@ pub(crate) mod tests {
             let held = Arc::new(AtomicBool::new(in_hand));
             let drops = Arc::new(AtomicU32::new(0));
             let (h, d) = (Arc::clone(&held), Arc::clone(&drops));
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 Ok(Box::new(Texting {
                     held: Arc::clone(&h),
                     drops: Arc::clone(&d),
@@ -15016,7 +15057,7 @@ pub(crate) mod tests {
     fn the_loading_state_is_drawn_through_the_load_and_the_preparation() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Menus {
                 // Not the first build: no frame fails.
                 id: 2,
@@ -15197,7 +15238,7 @@ pub(crate) mod tests {
         let answer = Arc::new(std::sync::Mutex::new(Answer::default()));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
         let answered = Arc::clone(&answer);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
@@ -15340,7 +15381,7 @@ pub(crate) mod tests {
         let hold = Arc::new(AtomicBool::new(false));
         let waiting = Arc::new(AtomicBool::new(false));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&hold), Arc::clone(&waiting));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(PacedLoading {
                 hold: Arc::clone(&held),
                 waiting: Arc::clone(&at),
@@ -15504,7 +15545,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let link = spawn(
             make,
@@ -15606,7 +15647,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         let clock = QpcClock::start();
         let link = spawn(
@@ -15700,7 +15741,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let shared_chart = Arc::new(chart.clone());
         let link = spawn(
@@ -15802,7 +15843,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let shared_chart = Arc::new(chart.clone());
         let link = spawn(
@@ -15883,7 +15924,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(ClockedLoading(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(ClockedLoading(Arc::clone(&noted))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let link = spawn(
             make,
@@ -16013,7 +16054,7 @@ pub(crate) mod tests {
         let stall = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
@@ -16058,7 +16099,7 @@ pub(crate) mod tests {
         let stall = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
@@ -16205,7 +16246,7 @@ pub(crate) mod tests {
     fn the_splash_shows_out_its_time_then_the_first_page() {
         let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Splashes {
                 splashes: Arc::clone(&s),
                 menus: Arc::clone(&m),
@@ -16241,7 +16282,7 @@ pub(crate) mod tests {
     fn a_page_after_the_splash_time_shows_at_once() {
         let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Splashes {
                 splashes: Arc::clone(&s),
                 menus: Arc::clone(&m),
@@ -16279,7 +16320,7 @@ pub(crate) mod tests {
         for prepare_first in [true, false] {
             let splashes = Arc::new(AtomicU32::new(0));
             let s = Arc::clone(&splashes);
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 Ok(Box::new(Splashes {
                     splashes: Arc::clone(&s),
                     menus: Arc::new(AtomicU32::new(0)),
@@ -16357,7 +16398,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Sections(Arc::clone(&noted))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Sections(Arc::clone(&noted))) as Box<dyn Screen>));
         let section = |s: i64| eval::Section {
             start: TimeUs(s),
             end: TimeUs(s + 1_000_000),
@@ -16487,7 +16528,7 @@ pub(crate) mod tests {
         let lost = Arc::new(AtomicBool::new(false));
         let builds = Arc::new(AtomicU32::new(0));
         let (made, noted, gone) = (Arc::clone(&builds), Arc::clone(&seen), Arc::clone(&lost));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let id = made.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(Box::new(Refusing {
                 id,
@@ -16561,7 +16602,7 @@ pub(crate) mod tests {
         drop(r);
         assert_eq!(result.atlas_texels(), TINY);
         let stated = Arc::clone(&result);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut renderer = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
@@ -16629,7 +16670,7 @@ pub(crate) mod tests {
         drop(r);
         assert_eq!(result.atlas_texels(), TINY);
         let stated = Arc::clone(&result);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut renderer = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
@@ -16755,7 +16796,7 @@ pub(crate) mod tests {
     fn the_default_skins_refusal_keeps_the_screen() {
         let builds = Arc::new(AtomicU32::new(0));
         let made = Arc::clone(&builds);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             made.fetch_add(1, Ordering::SeqCst);
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {
@@ -16845,7 +16886,7 @@ pub(crate) mod tests {
         let hold = Arc::new(AtomicBool::new(false));
         let held = Arc::clone(&hold);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
         let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
@@ -16879,7 +16920,7 @@ pub(crate) mod tests {
     fn the_end_of_loading_reports_a_screen_lost_after_the_preparation() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Menus {
                 // The first build: its third frame fails.
                 id: 1,
@@ -16961,7 +17002,7 @@ pub(crate) mod tests {
     fn held_loading() -> (super::RenderLink, Typed) {
         let seen: Typed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(TypedLoading {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -17205,7 +17246,7 @@ pub(crate) mod tests {
     fn a_loading_lifetimes_state_reaches_the_screen_whole_and_in_order() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(TypedLoading {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -17286,7 +17327,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let builds = Arc::new(AtomicU32::new(0));
         let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let id = made.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(Box::new(NoCharts {
                 id,
@@ -17360,7 +17401,7 @@ pub(crate) mod tests {
     fn a_blocked_thread_bounds_the_figures_wait() {
         let (release, blocked) = std::sync::mpsc::channel();
         let mut blocked = Some(blocked);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = blocked.take().expect("built once");
             Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
         });
@@ -17392,7 +17433,7 @@ pub(crate) mod tests {
     fn a_blocked_load_bounds_the_preparation_and_the_close() {
         let (release, blocked) = std::sync::mpsc::channel();
         let mut blocked = Some(blocked);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = blocked.take().expect("built once");
             Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
         });
@@ -17448,7 +17489,7 @@ pub(crate) mod tests {
         let builds = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&builds);
         let presented_at = Arc::clone(presented_at);
-        let make = Box::new(move || {
+        let make = Box::new(move |_: &mut Option<crate::menu_screen::PageFont>| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
             if n <= ok {
                 Ok(Box::new(Flaky {
@@ -17697,7 +17738,7 @@ pub(crate) mod tests {
         .unwrap();
         let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&frames);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(RearmedFrames {
                 frames: Arc::clone(&noted),
                 rearms: 0,
@@ -17873,7 +17914,7 @@ pub(crate) mod tests {
         captures.bind(1);
         let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&frames);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(RearmedFrames {
                 frames: Arc::clone(&noted),
                 rearms: 0,
@@ -17952,7 +17993,7 @@ pub(crate) mod tests {
         let refuse = Arc::new(AtomicBool::new(false));
         let made = Arc::new(AtomicU32::new(0));
         let (seen, refusing, count) = (Arc::clone(&calls), Arc::clone(&refuse), Arc::clone(&made));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             count.fetch_add(1, Ordering::AcqRel);
             Ok(Box::new(RefusingFrames {
                 calls: Arc::clone(&seen),
@@ -18148,7 +18189,7 @@ pub(crate) mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen_seen = Arc::clone(&seen);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
         let clock = QpcClock::start();
         let view = View { effects: 16 };
         let link = spawn(
@@ -18306,7 +18347,7 @@ pub(crate) mod tests {
                 .any(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
         );
         let clock = QpcClock::start();
-        let make: MakeScreen = Box::new(|| Ok(Box::new(Lost) as Box<dyn Screen>));
+        let make: MakeScreen = Box::new(|_| Ok(Box::new(Lost) as Box<dyn Screen>));
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
@@ -18450,7 +18491,7 @@ pub(crate) mod tests {
             Arc::clone(&waits),
             Arc::clone(&at_end),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Stepping {
                 steps: Arc::clone(&s),
                 draws: Arc::clone(&d),
@@ -18578,7 +18619,7 @@ pub(crate) mod tests {
         let waits = Arc::new(AtomicU32::new(0));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen = (Arc::clone(&waits), Arc::clone(&seen));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Stalling {
                 waits: Arc::clone(&screen.0),
                 seen: Arc::clone(&screen.1),
@@ -18708,7 +18749,7 @@ pub(crate) mod tests {
         .unwrap();
         let counters = [(); 3].map(|()| Arc::new(AtomicU32::new(0)));
         let [draws, read_backs, sunk] = counters.clone();
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Allocating {
                 in_build,
                 draws: Arc::clone(&draws),
@@ -18808,7 +18849,7 @@ pub(crate) mod tests {
         ]);
         let draws = Arc::new(AtomicU32::new(0));
         let drawn = Arc::clone(&draws);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Allocating {
                 in_build: false,
                 draws: Arc::clone(&drawn),
@@ -18922,7 +18963,7 @@ pub(crate) mod tests {
         let (release, released) = std::sync::mpsc::channel();
         let mut released = Some(released);
         let (noted, held) = (Arc::clone(&drew), Arc::clone(&hold));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = released.take().expect("built once");
             Ok(Box::new(Ends {
                 drew: Arc::clone(&noted),
@@ -19318,7 +19359,7 @@ pub(crate) mod tests {
         let (release, released) = std::sync::mpsc::channel();
         let mut released = Some(released);
         let (noted, held) = (Arc::clone(&drew), Arc::clone(&hold));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let release = released.take().expect("built once");
             Ok(Box::new(Paced {
                 drew: Arc::clone(&noted),
@@ -19463,7 +19504,7 @@ pub(crate) mod tests {
     fn resizing_thread() -> (super::RenderLink, Applied) {
         let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
         let r = Arc::clone(&resized);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Resizing {
                 id: 1,
                 size: (1_920, 1_080),
@@ -19662,7 +19703,7 @@ pub(crate) mod tests {
             Arc::clone(&fail),
             Arc::clone(&builds),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Resizing {
                 id: b.fetch_add(1, Ordering::SeqCst) + 1,
                 size: (1_920, 1_080),
@@ -19734,7 +19775,7 @@ pub(crate) mod tests {
             Arc::clone(&frames),
             Arc::clone(&waited_minimized),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Resizing {
                 id: 1,
                 size: (1_920, 1_080),
@@ -20632,7 +20673,7 @@ pub(crate) mod tests {
         /// [`spawn_bare`](Self::spawn_bare) with the frame sink `frames`.
         pub(crate) fn spawn_with(&self, frames: Box<dyn super::FrameSink>) -> super::RenderLink {
             let shared = self.clone();
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 shared.build_calls.fetch_add(1, Ordering::AcqRel);
                 while shared.hold_builds.load(Ordering::Acquire) {
                     shared.build_held.store(true, Ordering::Release);
@@ -21906,7 +21947,7 @@ pub(crate) mod tests {
     fn a_direct_launch_draws_the_skin_wait_on_its_screen() {
         let builds = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let built = Arc::clone(&builds);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             built.fetch_add(1, Ordering::SeqCst);
             let target = render::Target::Offscreen {
                 width: 1_280,
@@ -23483,7 +23524,7 @@ pub(crate) mod tests {
         assert!(queued.len() > 2 * buffer);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(Adapted {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -23596,7 +23637,7 @@ pub(crate) mod tests {
         logic.enter_closing(at);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             Ok(Box::new(ClosingFrames {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
@@ -23932,7 +23973,7 @@ pub(crate) mod tests {
         let probed = Arc::new(std::sync::Mutex::new(Probed::default()));
         let builds = Arc::new(AtomicU32::new(0));
         let (f, p, b) = (Arc::clone(&fail), Arc::clone(&probed), Arc::clone(&builds));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             b.fetch_add(1, Ordering::SeqCst);
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {
@@ -24395,7 +24436,7 @@ pub(crate) mod tests {
                 Arc::clone(&fail),
                 Arc::clone(&made),
             );
-            let make: MakeScreen = Box::new(move || {
+            let make: MakeScreen = Box::new(move |_| {
                 m.fetch_add(1, Ordering::SeqCst);
                 let renderer = render::Renderer::new(
                     render::Target::Offscreen {
@@ -25398,7 +25439,7 @@ pub(crate) mod tests {
             Arc::clone(&probed),
             Arc::clone(&builds),
         );
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             b.fetch_add(1, Ordering::SeqCst);
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {

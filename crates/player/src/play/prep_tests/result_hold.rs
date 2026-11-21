@@ -42,6 +42,10 @@ const PACER_BOUND: Duration = Duration::from_millis(250);
 /// built again (each test runs in a process of its own).
 static REFUSE_SCREEN: AtomicBool = AtomicBool::new(false);
 
+/// While set, the factory's own font read fails, as a font file that
+/// cannot be read again (each test runs in a process of its own).
+static FAIL_FACTORY_FONT: AtomicBool = AtomicBool::new(false);
+
 /// One frame drawn while armed.
 #[derive(Clone, Copy, Debug)]
 struct Frame {
@@ -261,7 +265,7 @@ fn on_warp_paced(
     f: impl FnOnce(&mut PlayerRig<'_>, &Frames),
 ) {
     let frames = Frames::default();
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |font| {
         let r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,
@@ -272,12 +276,21 @@ fn on_warp_paced(
         if REFUSE_SCREEN.load(Ordering::SeqCst) {
             return Err(render::RenderError::SurfaceLost);
         }
-        let fonts = if fonts {
-            Some(render::text::Fonts::runtime()?)
+        // A screen that draws menus is built as the player's factory
+        // builds it: the font the screen it replaces left, else its own
+        // read.
+        let screen = if fonts {
+            MenuScreen::with_page_font(r, font, || {
+                if FAIL_FACTORY_FONT.load(Ordering::SeqCst) {
+                    return Err(render::text::TextError::NoFamily {
+                        family: "a test's failed read".to_owned(),
+                    });
+                }
+                render::text::Fonts::runtime()
+            })?
         } else {
-            None
+            MenuScreen::new(r, None)
         };
-        let screen = MenuScreen::new(r, fonts);
         let screen = match &grants {
             Some(g) => screen.with_test_grants(Arc::clone(g)),
             None => screen,
@@ -2066,6 +2079,56 @@ fn a_plays_only_screen_built_again_keeps_the_font() {
             "the rebuilt screen drew the bitmap line: its font not carried"
         );
         HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        rig.leave_result();
+    });
+}
+
+/// Lets the factory read its own font again, the test's end or panic.
+struct FactoryFontGo;
+
+impl Drop for FactoryFontGo {
+    fn drop(&mut self) {
+        FAIL_FACTORY_FONT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A screen that draws menus lost past the bound and built again by the
+/// player's factory while its own font read fails: the factory takes the
+/// font the lost screen read and reads none, so the rebuild succeeds and
+/// the pending presentation draws in that font from the rebuilt screen's
+/// first frame (V19 (g) and (k)).
+#[test]
+fn a_screen_built_again_takes_the_font_of_the_one_it_replaces() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held(rig, frames, &a, &report, &screen);
+        rig.render.set_hold_clock(Some(BOUND + 1));
+        frames.until(rig, from, "pending frames", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        let _go = FactoryFontGo;
+        FAIL_FACTORY_FONT.store(true, Ordering::SeqCst);
+        crate::dev::lose_result_frame_at(1);
+        until_true(rig, "the loss", |rig| rig.screen_failed());
+        crate::dev::lose_result_frame_at(0);
+        let lost = frames.len();
+        if let Err(e) = rig.prepare_screen() {
+            panic!("the screen not built again with the factory's font read failing: {e}");
+        }
+        let rebuilt = frames.until(rig, lost, "frames on the rebuilt screen", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        assert!(
+            rebuilt.iter().all(|f| f.pending()),
+            "the pending presentation from the rebuilt screen's first frame: {rebuilt:?}"
+        );
+        assert_eq!(
+            rig.render.bitmap_frames(),
+            0,
+            "the rebuilt screen drew the bitmap line: its font not carried"
+        );
         rig.leave_result();
     });
 }

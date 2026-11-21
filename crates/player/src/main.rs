@@ -1342,7 +1342,7 @@ fn play(
         }
     };
     let link = window_thread.link();
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let target = Target::Window {
             window: surface.into(),
             width: surface.width,
@@ -1760,21 +1760,21 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
     let make: MakeScreen = match (surface, link) {
-        (Some(surface), Some(link)) => Box::new(move || {
+        (Some(surface), Some(link)) => Box::new(move |font| {
             let target = Target::Window {
                 window: surface.into(),
                 width: surface.width,
                 height: surface.height,
             };
             let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
-            let fonts = render::text::Fonts::runtime()?;
-            let screen = MenuScreen::new(r, Some(fonts)).with_sink(Box::new(link.clone()));
+            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
+                .with_sink(Box::new(link.clone()));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // Headless (dev-tools): offscreen on WARP, or on the hardware
         // adapter a scenario asks for, admitted at every build.
         #[cfg(feature = "dev-tools")]
-        _ => Box::new(move || {
+        _ => Box::new(move |font| {
             let target = Target::Offscreen {
                 width: size.0,
                 height: size.1,
@@ -1788,12 +1788,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             println!("{line}");
             log::info!("{line}");
             dev::scenario::admit(adapter, &got)?;
-            let fonts = render::text::Fonts::runtime()?;
-            Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
+            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?;
+            Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // A production run always has its window.
         #[cfg(not(feature = "dev-tools"))]
-        _ => Box::new(|| Err(render::RenderError::SurfaceUnsupported)),
+        _ => Box::new(|_| Err(render::RenderError::SurfaceUnsupported)),
     };
     let measure = measure(
         clock,
@@ -2090,7 +2090,7 @@ fn headless(
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),
         None => Box::new(NoFrames),
     };
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let target = Target::Offscreen {
             width: size.0,
             height: size.1,
@@ -2905,7 +2905,7 @@ mod tests {
             let render = {
                 let (scripts, gone, seen) =
                     (Arc::clone(&scripts), Arc::clone(&gone), Arc::clone(&seen));
-                crate::render_side::tests::spawn_empty(Box::new(move || {
+                crate::render_side::tests::spawn_empty(Box::new(move |_| {
                     Ok(Box::new(RestFrames {
                         scripts: Arc::clone(&scripts),
                         gone: Arc::clone(&gone),
@@ -3033,7 +3033,7 @@ mod tests {
     #[cfg(feature = "dev-tools")]
     fn gauge_render(seen: &Gauges, loaded: &game::Loaded) -> crate::render_side::RenderLink {
         let noted = Arc::clone(seen);
-        let render = crate::render_side::tests::spawn_empty(Box::new(move || {
+        let render = crate::render_side::tests::spawn_empty(Box::new(move |_| {
             Ok(Box::new(GaugeFrames {
                 seen: Arc::clone(&noted),
             }) as Box<dyn crate::render_side::Screen>)

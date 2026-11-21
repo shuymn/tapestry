@@ -120,7 +120,7 @@ fn on_warp_charged<R>(
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
 ) -> R {
     let seen = Seen::default();
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let mut r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,

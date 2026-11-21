@@ -664,6 +664,30 @@ impl MenuScreen {
         font_now(&mut self.fonts, &mut self.font_ahead, &mut self.font_failed)
     }
 
+    /// `renderer`, drawing menus in the page font a screen built again
+    /// takes from `saved`, where the screen it replaces left it, with no
+    /// font read; else in the one `read` reads now (design.md "Rendering
+    /// and Skins", the result's hold).
+    ///
+    /// # Errors
+    ///
+    /// `read`'s, when `saved` holds no font.
+    pub(crate) fn with_page_font(
+        renderer: Renderer,
+        saved: &mut Option<PageFont>,
+        read: impl FnOnce() -> Result<Fonts, render::text::TextError>,
+    ) -> Result<Self, render::text::TextError> {
+        match saved.take() {
+            Some(PageFont::Read(fonts)) => Ok(Self::new(renderer, Some(*fonts))),
+            Some(PageFont::Reading(job)) => {
+                let mut screen = Self::new(renderer, None);
+                screen.font_ahead = Some(job);
+                Ok(screen)
+            }
+            None => Ok(Self::new(renderer, Some(read()?))),
+        }
+    }
+
     /// `renderer`, drawing menus in `fonts`; a screen for plays only has
     /// none, draws a black launch screen, and reads the font when it first
     /// has a page to draw.

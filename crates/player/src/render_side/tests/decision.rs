@@ -756,7 +756,7 @@ impl Rig {
     ) -> Self {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: size[0],
