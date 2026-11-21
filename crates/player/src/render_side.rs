@@ -113,7 +113,7 @@ pub trait Screen: Send {
     fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError>;
     /// Prepares the attempt `a` (its chart, its context and its labels,
     /// borrowed for this call only) for preparation request `request`,
-    /// staging `skin`'s installation when one is chosen, else readying the
+    /// published in loading lifetime `lifetime` (`None`: in none), staging `skin`'s installation when one is chosen, else readying the
     /// skin in use; nothing it stages draws before its
     /// [`commit`](Self::commit). `None` while the answer is not ready: it
     /// is asked again between frames with the same attempt, until it
@@ -132,8 +132,9 @@ pub trait Screen: Send {
         a: &AttemptInput<'_>,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
-        let _ = request;
+        let _ = (request, lifetime);
         if skin.is_some() {
             return Some(Ok(refusal("this screen draws no declarative skin")));
         }
@@ -10343,7 +10344,7 @@ impl Run {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
-        let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
+        let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request, p.lifetime);
         // Play's admission released the result's installation: recorded
         // with the staging's request and published before its answer
         // (design.md "Memory Budget", R5).
@@ -18765,6 +18766,7 @@ pub(crate) mod tests {
             a: &render::AttemptInput<'_>,
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
+            _lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
@@ -22551,8 +22553,9 @@ pub(crate) mod tests {
             a: &render::AttemptInput<'_>,
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
+            lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
-            let answer = self.menu.prepare_attempt(a, skin, request);
+            let answer = self.menu.prepare_attempt(a, skin, request, lifetime);
             if matches!(answer, Some(Ok(Preparation::Ready))) {
                 let staged = self.menu.renderer_mut().memory().staged_atlas;
                 self.probed().staged_atlas.push(staged);
@@ -23001,8 +23004,9 @@ pub(crate) mod tests {
             a: &render::AttemptInput<'_>,
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
+            lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
-            self.menu.prepare_attempt(a, skin, request)
+            self.menu.prepare_attempt(a, skin, request, lifetime)
         }
         fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
             if self.hold_up.load(Ordering::Acquire) {

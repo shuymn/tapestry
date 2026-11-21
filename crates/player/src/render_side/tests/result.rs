@@ -284,6 +284,7 @@ impl Screen for Recorded {
         a: &render::AttemptInput<'_>,
         skin: Option<&Arc<render::SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, render::RenderError>> {
         // A specialization stages on the menu screen; an attempt with the
         // skin in use loads through this screen's faults, as before.
@@ -292,7 +293,7 @@ impl Screen for Recorded {
             self.menu
                 .renderer_mut()
                 .delay_steps((delay > 0).then(|| Duration::from_micros(delay)));
-            return self.menu.prepare_attempt(a, skin, request);
+            return self.menu.prepare_attempt(a, skin, request, lifetime);
         }
         Some(match self.load(a.chart, a.section()) {
             Ok(()) => Ok(Preparation::Ready),

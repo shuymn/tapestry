@@ -342,8 +342,9 @@ impl Screen for Recorder {
         a: &render::AttemptInput<'_>,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
-        self.menu.prepare_attempt(a, skin, request)
+        self.menu.prepare_attempt(a, skin, request, lifetime)
     }
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
         self.menu.upload_boundary(past)

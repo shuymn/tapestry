@@ -211,13 +211,14 @@ impl Screen for Noted {
         a: &render::AttemptInput<'_>,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
         self.seen
             .play_difficulties
             .lock()
             .unwrap()
             .push(a.context.meta.difficulty);
-        self.menu.prepare_attempt(a, skin, request)
+        self.menu.prepare_attempt(a, skin, request, lifetime)
     }
     fn device(&self) -> u64 {
         self.menu.device()

@@ -141,6 +141,10 @@ pub struct MovieSet {
     /// ([`ScreenMovies::begin_play`]). Its own: no other set's carries
     /// over.
     pub origin: Option<i64>,
+    /// A play's: the loading lifetime its preparation's request was
+    /// published in. Only that lifetime's loading frames show its movies;
+    /// a frame of another (a later Start's) shows none of them.
+    pub loading: Option<u64>,
     pub movies: Movies,
 }
 
@@ -209,6 +213,7 @@ impl MovieSet {
             #[cfg(all(test, feature = "dev-tools"))]
             generation,
             origin,
+            loading: None,
             movies: Self::movies(kind, bundle, movies, start),
         })
     }
@@ -231,6 +236,7 @@ impl MovieSet {
             kind,
             generation: hub.next_generation(),
             origin,
+            loading: None,
             movies: Self::movies(kind, bundle, movies, start),
         }
     }

@@ -555,10 +555,15 @@ impl MenuScreen {
     }
 
     /// Opens the movies of the play skin an attempt is prepared with for
-    /// preparation `request`, its own whatever was held before (a practice
-    /// round and a retry included): `skin` staged, else the play skin in
-    /// use.
-    fn open_play_movies(&mut self, skin: Option<&Arc<SkinBundle>>, request: u64) {
+    /// preparation `request`, published in loading lifetime `lifetime`,
+    /// its own whatever was held before (a practice round and a retry
+    /// included): `skin` staged, else the play skin in use.
+    fn open_play_movies(
+        &mut self,
+        skin: Option<&Arc<SkinBundle>>,
+        request: u64,
+        lifetime: Option<u64>,
+    ) {
         let hub = self.media.clone();
         let bundle = skin
             .cloned()
@@ -572,6 +577,10 @@ impl MenuScreen {
                     std::time::Instant::now(),
                     None,
                 )
+                .map(|mut set| {
+                    set.loading = lifetime;
+                    set
+                })
             });
     }
 
@@ -603,15 +612,23 @@ impl MenuScreen {
     }
 
     /// The loading frame `frame`'s movie poll: the movies of the play
-    /// being prepared or committed, polled on their own clock, from the
-    /// first loading frame's lifetime origin, the clock READY opens on, and
-    /// their shows published for the frame; a set of another screen is
-    /// retired first.
+    /// being prepared or committed in `frame`'s loading lifetime, polled on
+    /// their own clock, from that lifetime's origin, the clock READY opens
+    /// on, and their shows published for the frame; a set of another
+    /// screen is retired first. A set whose preparation was published in
+    /// another lifetime (a Start quit after its commit, before READY)
+    /// shows nothing in this one: no frame, no loss, no clock taken from
+    /// it.
     fn loading_movies(&mut self, frame: &LoadingFrame<'_>) {
         self.movies.drawn(Drawn::Other, &mut self.renderer);
         let Some((Holder::Preparing(_) | Holder::Committed(_), m)) = self.movies.get_mut() else {
             return;
         };
+        if m.loading != Some(frame.lifetime) {
+            self.renderer
+                .set_loading_movies(skin_model::movie::MovieShows::default());
+            return;
+        }
         let origin = *m.origin.get_or_insert(frame.load.since.0);
         let due = frame.now.0.saturating_sub(origin);
         let (_, shows) = m
@@ -1068,6 +1085,7 @@ impl Screen for MenuScreen {
         a: &AttemptInput<'_>,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
         if self.movie_wait != Some(request) {
             self.movie_wait = None;
@@ -1099,7 +1117,7 @@ impl Screen for MenuScreen {
                 }
                 Err(e) => return Some(Err(e)),
             }
-            self.open_play_movies(skin, request);
+            self.open_play_movies(skin, request, lifetime);
             self.movie_wait = Some(request);
         }
         // The movies' readiness (design.md "Threat Model" T02, L5): their

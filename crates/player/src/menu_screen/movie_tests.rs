@@ -93,7 +93,7 @@ fn play_screen(
     anchor: i64,
 ) {
     hub.supply(movies);
-    s.open_play_movies(Some(bundle), request);
+    s.open_play_movies(Some(bundle), request, Some(request));
     s.movie_boundary();
     s.commit(token(s, request)).unwrap();
     s.begin_play(anchor);
@@ -120,7 +120,7 @@ fn a_screen_s_movies_never_outlive_it() {
     let lost = Movie::new(1);
     let _ = lost.lose(Loss::Failed);
     hub.supply([Some(clip(&[0])), Some(lost)]);
-    s.open_play_movies(Some(&play), 1);
+    s.open_play_movies(Some(&play), 1, Some(1));
     s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     assert!(matches!(
@@ -153,6 +153,56 @@ fn a_screen_s_movies_never_outlive_it() {
     assert_eq!(s.renderer.loading_movies(), [MovieShow::Nothing; 2]);
     assert_eq!(s.renderer.video_bytes(), (0, 0), "selection's planes left");
     assert_eq!(hub.open_sets(), 0);
+}
+
+/// A practice Start quit after its commit and before READY, then another
+/// Start: the second's loading lifetime publishes before its preparation
+/// opens its movies, and its loading frames show none of the first
+/// Start's (neither its frame nor its loss) and take no clock from them;
+/// its own preparation's movies then show in them.
+#[test]
+fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    let lost = Movie::new(1);
+    let _ = lost.lose(Loss::Failed);
+    hub.supply([Some(clip(&[0])), Some(lost)]);
+    s.open_play_movies(Some(&play), 1, Some(1));
+    s.movie_boundary();
+    s.loading_movies(&loading_frame(1, 0));
+    assert!(matches!(
+        s.renderer.loading_movies(),
+        [MovieShow::Frame { .. }, MovieShow::Lost]
+    ));
+    s.commit(token(&s, 1)).unwrap();
+    // Quit before READY: the practice page, then the next Start's loading
+    // state, its preparation not begun.
+    let _ = s.menu(&super::MenuPage::default(), true);
+    assert!(matches!(s.movies.get(), Some((Holder::Committed(1), _))));
+    s.loading_movies(&loading_frame(2, 3_000_000));
+    assert_eq!(
+        s.renderer.loading_movies(),
+        [MovieShow::Nothing; 2],
+        "the first Start's frame and loss in the second's loading frames"
+    );
+    assert_eq!(
+        s.movies.get().and_then(|(_, m)| m.origin),
+        Some(0),
+        "no clock taken from the second lifetime"
+    );
+    // The second Start's preparation: its own movies show.
+    hub.supply([Some(clip(&[0])), None]);
+    s.open_play_movies(Some(&play), 2, Some(2));
+    s.movie_boundary();
+    s.loading_movies(&loading_frame(2, 3_000_000));
+    assert!(matches!(
+        s.renderer.loading_movies(),
+        [MovieShow::Frame { .. }, MovieShow::Nothing]
+    ));
+    assert_eq!(hub.open_sets(), 1);
 }
 
 /// Selection's entry ends with a page drawn in its place, the decision
@@ -261,13 +311,13 @@ fn a_cancelled_start_leaves_one_clock_for_the_next_loading_and_ready() {
     let hub = MediaHub::with(None);
     let mut s = screen(&hub);
     hub.supply([Some(clip(&[0])), None]);
-    s.open_play_movies(Some(&play), 1);
+    s.open_play_movies(Some(&play), 1, Some(1));
     s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     s.discard_token(token(&s, 1));
     assert_eq!(hub.open_sets(), 0, "the cancelled Start's movies");
     hub.supply([Some(clip(&[0, 1_000_000, 3_000_000, 6_000_000])), None]);
-    s.open_play_movies(Some(&play), 2);
+    s.open_play_movies(Some(&play), 2, Some(2));
     s.movie_boundary();
     s.loading_movies(&loading_frame(2, 5_000_000));
     s.commit(token(&s, 2)).unwrap();
@@ -287,7 +337,7 @@ fn a_device_loss_drops_the_set_before_and_after_commit() {
     for committed in [false, true] {
         let hub = MediaHub::with(None);
         let mut s = screen(&hub);
-        s.open_play_movies(Some(&play), 5);
+        s.open_play_movies(Some(&play), 5, Some(5));
         assert_eq!(hub.open_sets(), 1);
         if committed {
             s.commit(token(&s, 5)).unwrap();
@@ -315,7 +365,7 @@ fn loading_with_a_pending_peer_keeps_the_ready_clip_moving() {
     let a = clip(&[0, 1_000_000, 1_500_000, 2_000_000]);
     let pending = Movie::new(1);
     hub.supply([Some(Arc::clone(&a)), Some(Arc::clone(&pending))]);
-    s.open_play_movies(Some(&play), 1);
+    s.open_play_movies(Some(&play), 1, Some(1));
     s.movie_boundary();
     let page = super::MenuPage::default();
     let mut freed = Vec::new();
