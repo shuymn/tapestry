@@ -58,7 +58,8 @@ fn bga_images_seeds_read_or_fail_as_built() {
 
 /// The frame ring seeds stage a due frame, then the next a second later,
 /// wait for one not due, stage the newest of a full ring, free an earlier
-/// run's frame unread and a frame behind the clock, and fail the player for each broken slot they were
+/// run's frame unread and a blind frame behind the clock, stage a late one
+/// published knowing the time, and fail the player for each broken slot they were
 /// built with.
 #[test]
 fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
@@ -83,6 +84,7 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
             "stamp_order",
             "stamp_outside",
             "behind",
+            "late_informed",
             "until",
         ],
     );
@@ -130,6 +132,11 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
         outcome("behind"),
         RingOutcome::Nothing,
         "a frame whose successor is due freed unread"
+    );
+    assert_eq!(
+        outcome("late_informed"),
+        staged(1, 1_000),
+        "a late frame published knowing the time staged"
     );
     assert_eq!(
         outcome("until"),

@@ -45,6 +45,7 @@ const RING_STAMP: usize = 3;
 const RING_INDEX: usize = 4;
 const RING_BYTES: usize = 5;
 const RING_UNTIL: usize = 6;
+const RING_INFORMED: usize = 7;
 
 /// A frame ring of `size` ([`crate::RING_SIZES`], with
 /// [`crate::RING_SECOND_RUN`] in its run started) as the game sets it up,
@@ -141,6 +142,15 @@ pub fn rings() -> Vec<Seed> {
         (
             "behind",
             ring_seed(1, 1_500, &[(1, 1, 1_000)], &[(0, RING_UNTIL, 1_200)]),
+        ),
+        (
+            "late_informed",
+            ring_seed(
+                1,
+                1_500,
+                &[(1, 1, 1_000)],
+                &[(0, RING_UNTIL, 1_200), (0, RING_INFORMED, 1)],
+            ),
         ),
         (
             "until",

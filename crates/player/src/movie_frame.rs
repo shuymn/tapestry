@@ -29,9 +29,11 @@
 //! at the screen's time and, when a frame is due, takes it straight into
 //! the renderer's upload buffer ([`Planes::write`]); a fault loses it in
 //! the same frame. It shows its newest frame once one was taken on the
-//! screen, and nothing before, nor while the ring's newest frame at its
-//! time is behind it (its successor due: freed unread,
-//! [`skin_model::media::Peek::behind`]) until a due frame is taken. A
+//! screen, and nothing before: a frame the ring's reader frees unread as
+//! late and published before the worker knew the game's time
+//! ([`skin_model::media::Peek::behind`]) is never taken, and a late frame
+//! the worker published knowing the time is, a stutter rather than a blank
+//! panel. A
 //! first frame whose take ends past the preparation deadline loses its
 //! movie (L5): it is judged when the frame is accepted, not when the poll
 //! began. Anything else shows nothing.
@@ -429,12 +431,6 @@ impl<S: Source> Movies<S> {
         };
         if peek.freed {
             movie.freed(reader.freed());
-        }
-        // The newest frame at or before the time was behind it: none of
-        // this movie is shown until its due frame is taken, never an older
-        // frame the planes still hold.
-        if peek.behind {
-            slot.shown = false;
         }
         if let Some(d) = peek.due {
             let mut took = None;

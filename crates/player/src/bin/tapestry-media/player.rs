@@ -11,10 +11,12 @@
 //! last it published, and waits on the event while every slot is full. It
 //! decodes one frame ahead, so it publishes each frame with its
 //! successor's stamp, until which it is shown (a video's last frame with
-//! none), and drops a frame whose successor the game's due time has
-//! already reached in the run it plays rather than publish it: at the
-//! start, after a wait for a slot and whenever its decoding falls behind,
-//! the ring receives no frame behind the game's clock. A decode ahead that
+//! none), and whether it knew the game's time of the run it plays. Behind
+//! that time (a frame whose successor is already due) it drops frames to
+//! catch up, but only for [`CATCH_UP_US`] since it last published or
+//! waited for a slot: then it publishes the frame it
+//! holds, late or not, so a decoder slower than the game's clock shows
+//! frames that advance rather than none. A decode ahead that
 //! fails (a decoder error, a frame over the caps, a refused restart) ends
 //! the frames: the frame held is published as the last, and the failure is
 //! answered after it, as before a frame was decoded ahead. It
@@ -29,9 +31,10 @@
 //! unmaps its view of the ring before it answers.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
-use skin_model::media::{PROGRESS_WORD, State, UNTIL_END, Writer, behind, shown};
+use skin_model::media::{CATCH_UP_US, PROGRESS_WORD, State, UNTIL_END, Writer, behind, shown};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
@@ -202,6 +205,7 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         pending: None,
         until: None,
         failing: None,
+        since: Instant::now(),
         ended: false,
     };
     let stopped = playing.play(rx, out);
@@ -246,6 +250,10 @@ struct Playing {
     /// The failure of the decode ahead, answered once the frame held is
     /// published (with [`UNTIL_END`]) or a seek drops it.
     failing: Option<(Failure, i32)>,
+    /// When it last published or waited for a slot (before it knows the
+    /// game's time it does one or the other): it drops late frames for
+    /// [`CATCH_UP_US`] from then.
+    since: Instant,
     /// The run's video has ended.
     ended: bool,
 }
@@ -386,13 +394,16 @@ impl Playing {
             return Ok(());
         };
         let words = self.view.words();
+        let due = shown(words, self.run);
         // Its successor already due: behind the game's clock, dropped
-        // unpublished, the successor next.
-        if shown(words, self.run).is_some_and(|due| behind(until, due)) {
+        // unpublished for the successor while it catches up.
+        let catching_up = self.since.elapsed() < Duration::from_micros(CATCH_UP_US);
+        if catching_up && due.is_some_and(|due| behind(until, due)) {
             self.advance(until);
             return Ok(());
         }
         let Some(slot) = self.writer.claim(words) else {
+            self.since = Instant::now();
             self.writer.state(words, State::Waiting);
             if self.seq > 0 {
                 freeze_at(self.player, Freeze::Waiting);
@@ -403,8 +414,18 @@ impl Playing {
         self.writer.state(words, State::Decoding);
         let seq = self.seq.saturating_add(1);
         self.writer
-            .publish_until(words, slot, &self.frame, seq, self.run, stamp, until)
+            .publish_until(
+                words,
+                slot,
+                &self.frame,
+                seq,
+                self.run,
+                stamp,
+                until,
+                due.is_some(),
+            )
             .map_err(|_| (Failure::Ring, 0))?;
+        self.since = Instant::now();
         self.seq = seq;
         self.last = Some(stamp);
         if until == UNTIL_END {

@@ -838,8 +838,7 @@ fn take_seq(worker: &Worker, ring: &mut Ring, due: i64) -> (u64, i64, u32) {
         }
         assert!(
             Instant::now() < deadline,
-            "no frame due at {due}, slots {:?}; the worker's log:
-{}",
+            "no frame due at {due}, slots {:?}; the worker's log:\n{}",
             ring.slots(),
             worker.log()
         );
@@ -849,11 +848,12 @@ fn take_seq(worker: &Worker, ring: &mut Ring, due: i64) -> (u64, i64, u32) {
 
 /// A play whose clock is already a second in when the game first polls,
 /// and that jumps on after a stall (design.md "Rendering and Skins", skin
-/// movies: the due frame only): the first frame the game takes is the one
+/// movies, "Video frames"): the first frame the game takes is the one
 /// due, and the worker dropped the frames behind the clock rather than
 /// publish each for the game to free, so at most a ring's slots of them
-/// (published before it saw the clock) came before it; after the stall
-/// likewise.
+/// (published before it saw the clock) came before it. After the stall the
+/// game takes the newest frame the ring holds, late, and then the frame
+/// due, the worker publishing none between them.
 // Revert: the worker publishing every frame -> "frames behind the clock
 // published".
 #[cfg(feature = "dev-tools")]
@@ -881,21 +881,72 @@ fn worker_drops_frames_behind_the_game_s_clock() {
     assert_eq!((first.1, first.2), (stamp_of(24, 24), 24));
     assert!(
         first.0 <= slots + 1,
-        "frames behind the clock published: frame 24 is sequence {}; the worker's log:
-{}",
+        "frames behind the clock published: frame 24 is sequence {}; the worker's log:\n{}",
         first.0,
         worker.log()
     );
-    // A stall: the ring refills from frame 25 while the clock runs to 40.
+    // A stall: the ring refills with frames 25 to 28 while the clock runs
+    // to 40.
     std::thread::sleep(Duration::from_millis(300));
+    let late = take_seq(&worker, &mut ring, stamp_of(40, 24));
+    assert_eq!(
+        (late.1, late.2),
+        (stamp_of(28, 24), 28),
+        "the newest late frame"
+    );
     let later = take_seq(&worker, &mut ring, stamp_of(40, 24));
     assert_eq!((later.1, later.2), (stamp_of(40, 24), 40));
     assert!(
-        later.0 <= first.0 + slots + 1,
-        "frames behind the clock published: frame 40 is sequence {} after {}; the worker's log:
-{}",
+        later.0 == late.0 + 1,
+        "frames behind the clock published: frame 40 is sequence {} after {}; the worker's log:\n{}",
         later.0,
-        first.0,
+        late.0,
+        worker.log()
+    );
+    worker.close(1);
+}
+
+/// A decoder slower than the game's clock (each frame's conversion takes
+/// 100 ms, a 24 fps clip's frame lasting 42 ms) shows frames that advance
+/// (design.md "Rendering and Skins", video frames: a late frame is dropped
+/// only for a newer one): the worker publishes a frame at least once a
+/// catch-up bound, late, and the game takes each, so over two seconds of
+/// polls on a real-time clock the panel shows several frames, each newer
+/// than the last.
+// Revert: the worker dropping every late frame, or the game freeing a late
+// frame the worker published knowing the time -> "a slow decoder shows
+// advancing frames".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_slow_decoder_shows_advancing_late_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "w.mpg", "mpeg1video mpeg 320x240 24 240 12");
+    let mut worker = Worker::start(&["--dev-serve", "slow-convert=100"]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let origin = Instant::now();
+    let mut shown = Vec::new();
+    while origin.elapsed() < Duration::from_secs(2) {
+        let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
+        if let Some(frame) = ring.poll(due) {
+            shown.push(frame.stamp);
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    assert!(
+        shown.len() >= 4 && shown.windows(2).all(|w| w[0] < w[1]),
+        "a slow decoder shows advancing frames: {shown:?}; the worker's log:\n{}",
         worker.log()
     );
     worker.close(1);
