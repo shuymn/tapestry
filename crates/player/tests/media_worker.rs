@@ -959,6 +959,9 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
         other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
     };
     assert_eq!(landed, at);
+    // The worker decodes the new run before the game polls it, with only
+    // the earlier run's time to read.
+    std::thread::sleep(Duration::from_millis(200));
     let taken = take_seq(&worker, &mut ring, landed);
     assert_eq!((taken.1, taken.2), (at, 24));
     worker.close(1);
