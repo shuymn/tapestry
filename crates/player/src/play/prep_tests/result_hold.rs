@@ -58,6 +58,9 @@ struct Frame {
     size: (u32, u32),
     /// The result strip's lines the screen draws.
     strip: usize,
+    /// Its texels in the strip's line colour, and their bounds (left, top,
+    /// right, bottom); zero when it was not read back.
+    notice: (usize, [u32; 4]),
 }
 
 impl Frame {
@@ -148,6 +151,31 @@ impl Frames {
     }
 }
 
+/// A texel of the strip's line colour (255, 120, 110) drawn over its band.
+fn is_notice(p: &[u8]) -> bool {
+    matches!(p, [r, g, b, ..] if *r > 200 && (80..=170).contains(g) && (60..=160).contains(b))
+}
+
+/// Whether `f` draws its strip's glyphs where its bands are at its size:
+/// inside the letterboxed bands, starting at the text's left edge.
+fn strip_placed(f: &Frame) -> bool {
+    use crate::menu_screen::{LEFT, LINE_STEP, line_top};
+    let (count, [left, top, _, bottom]) = f.notice;
+    if f.strip == 0 || count < 20 {
+        return false;
+    }
+    let [x, y, w, _] = render::letterbox(f.size.0, f.size.1);
+    let scale = w / 1_920.0;
+    let band_top = (line_top(0) - 3.0).mul_add(scale, y);
+    let band_bottom = (line_top(f.strip - 1) - 3.0 + LINE_STEP).mul_add(scale, y);
+    let text_left = LEFT.mul_add(scale, x);
+    (top as f32) >= band_top - 1.0
+        && (top as f32) <= band_top + LINE_STEP * scale
+        && (bottom as f32) <= band_bottom + 1.0
+        && (left as f32) >= text_left - 2.0
+        && (left as f32) <= text_left + LINE_STEP * scale
+}
+
 struct Recorder(Frames);
 
 impl FrameSink for Recorder {
@@ -161,11 +189,20 @@ impl FrameSink for Recorder {
         }
         let blind = self.0.blind.load(Ordering::Acquire);
         let mut size = (0, 0);
+        let mut notice = (0, [u32::MAX, u32::MAX, 0, 0]);
         let lit = if blind {
             usize::MAX
         } else {
             screen.read_back().map_or(0, |(w, h, pixels)| {
                 size = (w, h);
+                for (i, p) in pixels.chunks(4).enumerate() {
+                    if is_notice(p) {
+                        let (x, y) = (i as u32 % w, i as u32 / w);
+                        let b = &mut notice.1;
+                        *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+                        notice.0 += 1;
+                    }
+                }
                 pixels
                     .chunks(4)
                     .filter(|p| p.iter().take(3).any(|&c| c > 200))
@@ -179,6 +216,7 @@ impl FrameSink for Recorder {
             at: Instant::now(),
             size,
             strip: screen.result_strip(),
+            notice,
         });
         let [hold, held] = &*self.0.meet;
         if hold.load(Ordering::Acquire) {
@@ -1830,6 +1868,73 @@ fn a_view_staged_while_the_font_is_read_commits_without_it() {
                 .any(|f| f.path == Some(ResultPath::Skin) && f.strip > 0)
         });
         assert_eq!(reads(0), in_frame, "a font read in a frame");
+        rig.leave_result();
+    });
+}
+
+/// A screen made for plays only whose first view committed while its
+/// font was read, the strip's line owed: the read ends on the turn a size
+/// of another aspect applies, and the first frame after draws the strip's
+/// glyphs inside its bands at that size; a later change of aspect places
+/// them again for the new one from its first frame (V19 (k), the screen
+/// made for plays only).
+#[test]
+fn a_font_read_ending_across_a_resize_places_the_strip_for_the_new_size() {
+    use crate::menu_screen::{FONT_READS, HOLD_FONT_READ};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp_fonts(a.chart(), false, |rig, frames| {
+        let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+        let extent = Arc::new(crate::render_side::Extent::default());
+        extent.publish(1_920, 1_080);
+        rig.render.follow(&extent);
+        let (mut report, screen) = result_of(dir.path());
+        // A line of the strip: drawn once the font is read.
+        report.best = Some(game::BestView::NotCounted("a test's reason".to_owned()));
+        let _skin = pending_skin(rig, &a);
+        frames.arm();
+        let _go = FontGo;
+        HOLD_FONT_READ.store(true, Ordering::SeqCst);
+        let ahead = reads(1);
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        laid_out(rig);
+        let handed = frames.len();
+        rig.show_end(&report, &screen);
+        let shown = frames.until(rig, handed, "the skin's view", |f| first_view(f).is_some());
+        let v = first_view(&shown).unwrap();
+        assert_eq!(shown[v].strip, 0, "a strip drawn with no font");
+        // Between two turns: the read ends and the new size is published,
+        // both found by the next turn.
+        frames.meet();
+        HOLD_FONT_READ.store(false, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(20);
+        while reads(1) == ahead {
+            assert!(Instant::now() < end, "the font never read");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The read's thread ended after its count.
+        std::thread::sleep(Duration::from_millis(50));
+        extent.publish(1_000, 1_000);
+        let at = frames.len();
+        frames.part();
+        let after = frames.until(rig, at, "frames at the new size", |f| f.len() >= 3);
+        assert_eq!(after[0].size, (1_000, 1_000), "{after:?}");
+        assert!(
+            after.iter().all(strip_placed),
+            "the strip not placed for the new size from its first frame: {after:?}"
+        );
+        // A later change of aspect, the font in hand.
+        frames.meet();
+        extent.publish(1_280, 1_024);
+        let at = frames.len();
+        frames.part();
+        let after = frames.until(rig, at, "frames at the later size", |f| f.len() >= 3);
+        assert_eq!(after[0].size, (1_280, 1_024), "{after:?}");
+        assert!(
+            after.iter().all(strip_placed),
+            "the strip not placed again for the later size: {after:?}"
+        );
         rig.leave_result();
     });
 }

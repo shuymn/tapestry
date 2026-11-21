@@ -51,7 +51,7 @@ pub const LINE_STEP: f32 = 42.0;
 /// Where the first line's top lies.
 const TOP: f32 = 30.0;
 /// The left edge of the text.
-const LEFT: f32 = 60.0;
+pub(crate) const LEFT: f32 = 60.0;
 /// The lines a page holds: they fill the layout's height.
 pub const PAGE_LINES: usize = 24;
 
@@ -201,7 +201,7 @@ pub fn caret_area(page: &MenuPage, mut width: impl FnMut(&str) -> f32) -> Option
 }
 
 /// The top of line `i` of the select screen, in layout pixels.
-fn line_top(i: usize) -> f32 {
+pub(crate) fn line_top(i: usize) -> f32 {
     lines_from(TOP, i)
 }
 
@@ -392,6 +392,10 @@ pub struct MenuScreen {
     /// laid out once it is ([`Screen::settle_result_strips`]); they move
     /// with their slot at the commit point.
     owed_strip: [Option<Vec<String>>; 3],
+    /// Each slot's strip lines as laid out, for the target they were
+    /// placed on: a target change owes them again ([`Screen::resize`]);
+    /// they move with their slot at the commit point.
+    laid_strip: [Vec<String>; 3],
     /// A frame's app work allocates once while set (tests: the allocation
     /// guards' positive control).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -698,6 +702,7 @@ impl MenuScreen {
             page_caret: None,
             result_strip: [(None, 0), (None, 0), (None, 0)],
             owed_strip: [None, None, None],
+            laid_strip: [Vec::new(), Vec::new(), Vec::new()],
             #[cfg(all(test, feature = "dev-tools"))]
             alloc_probe: false,
             #[cfg(all(test, feature = "dev-tools"))]
@@ -1758,6 +1763,9 @@ impl Screen for MenuScreen {
         // its lines are laid out then; never a read or a wait for the
         // font's thread here (design.md "Rendering and Skins", the
         // result's hold). A failed read leaves the strip out.
+        if let Some(l) = self.laid_strip.get_mut(which) {
+            l.clear();
+        }
         if !self.font_now() {
             if let Some(o) = self.owed_strip.get_mut(which) {
                 *o = (!self.font_failed).then(|| lines.iter().map(|l| (*l).to_owned()).collect());
@@ -1791,6 +1799,9 @@ impl Screen for MenuScreen {
         let text = text.get_or_insert_with(|| MenuText::new(&self.renderer));
         text.prepare(&self.renderer, fonts, &refs)?;
         *n = lines.len().min(PAGE_LINES);
+        if let Some(l) = self.laid_strip.get_mut(which) {
+            *l = lines.iter().map(|l| (*l).to_owned()).collect();
+        }
         Ok(())
     }
 
@@ -1802,6 +1813,11 @@ impl Screen for MenuScreen {
             std::mem::swap(drawn, slot);
         }
         if let [drawn, rest @ ..] = &mut self.owed_strip
+            && let Some(slot) = which.checked_sub(1).and_then(|i| rest.get_mut(i))
+        {
+            std::mem::swap(drawn, slot);
+        }
+        if let [drawn, rest @ ..] = &mut self.laid_strip
             && let Some(slot) = which.checked_sub(1).and_then(|i| rest.get_mut(i))
         {
             std::mem::swap(drawn, slot);
@@ -2206,6 +2222,19 @@ impl Screen for MenuScreen {
             self.stale = true;
             if let Some(splash) = &mut self.splash {
                 splash.alpha = None;
+            }
+            // The strip's glyphs were placed for the old target: each
+            // slot's lines are owed again, drawing none until laid out for
+            // this one ([`Screen::settle_result_strips`]).
+            for ((text, n), (owed, laid)) in self
+                .result_strip
+                .iter_mut()
+                .zip(self.owed_strip.iter_mut().zip(self.laid_strip.iter_mut()))
+            {
+                if text.is_some() && *n > 0 && owed.is_none() {
+                    *owed = Some(std::mem::take(laid));
+                    *n = 0;
+                }
             }
         }
     }

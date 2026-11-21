@@ -8102,6 +8102,9 @@ impl Run {
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
             if matches!(mode, Mode::Result) {
+                // The window's newest size first: the strip's lines laid
+                // out here are placed for the target the frame draws on.
+                self.apply_extent();
                 #[cfg(feature = "dev-tools")]
                 let (prepared, p_own) = (Instant::now(), render::probe::own_time());
                 self.prepare_result();
@@ -8152,9 +8155,9 @@ impl Run {
                 self.poll_attempt();
                 self.poll_select();
             }
-            let Some(screen) = &mut self.screen else {
+            if self.screen.is_none() {
                 continue;
-            };
+            }
             #[cfg(test)]
             self.shared.frame_gates[0].pass();
             // The frame's token, before it reads the window's size: a
@@ -8162,13 +8165,7 @@ impl Run {
             // presents invalid.
             let token = self.image.token(notices_of(self.extent.as_ref()));
             // The window's newest size, between frames.
-            if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
-                && self.applied != Some(size)
-            {
-                screen.resize(size.0, size.1);
-                self.applied = Some(size);
-                self.image.changed();
-            }
+            self.apply_extent();
             #[cfg(test)]
             self.shared.frame_gates[1].pass();
             // The decision labels' work at this frame boundary, outside
@@ -9962,6 +9959,19 @@ impl Run {
     /// Publishes what skins are packed for on the screen just built.
     fn built(&self, screen: &dyn Screen) {
         self.shared.built(screen);
+    }
+
+    /// Applies the window's newest size to the screen, between frames, if
+    /// it is not the one applied.
+    fn apply_extent(&mut self) {
+        if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
+            && self.applied != Some(size)
+            && let Some(screen) = &mut self.screen
+        {
+            screen.resize(size.0, size.1);
+            self.applied = Some(size);
+            self.image.changed();
+        }
     }
 
     /// A screen built again (a recovery, a chart load's retry): it takes
