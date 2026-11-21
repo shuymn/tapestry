@@ -1026,6 +1026,57 @@ fn assert_movies(p: &[u8], what: &str) {
     );
 }
 
+/// A screen's movies retired leave nothing of theirs to the next loading
+/// state: a play's loading frames draw its ready movie and its lost one
+/// black; the play is left (its movies retired) and selection reserves
+/// slot 0 for a white clip of its own; the next play's loading frames,
+/// before its preparation publishes anything, draw neither selection's
+/// clip nor the old loss, only what lies under the destinations.
+#[test]
+fn a_retired_screen_s_movies_never_draw_in_the_next_loading_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let look = Look {
+        movies: true,
+        ..loader()
+    };
+    let (a, _) = bundle(&r, dir.path(), &look);
+    install(&mut r, &a, 1);
+    let under = loading(&mut r, &text, &frame_at(1, 0));
+    let under = [
+        at(&under, decl_support::MOVIE_A),
+        at(&under, decl_support::MOVIE_B),
+    ];
+    assert_eq!(under, [RED, RED], "the image under the destinations");
+    movies_shown(&mut r);
+    assert_movies(&loading(&mut r, &text, &frame_at(1, 10)), "the play's");
+    r.retire_movies();
+    r.video_reserve(0, 64, 64);
+    assert!(r.video_write_with(0, 64, 64, |sink, [luma, chroma]| {
+        let mut at = 0;
+        for (rows, width, value, pitch) in [
+            (64, 64, 235_u8, luma),
+            (32, 32, 128, chroma),
+            (32, 32, 128, chroma),
+        ] {
+            for _ in 0..rows {
+                if !sink(at, &vec![value; width]) {
+                    return false;
+                }
+                at += pitch;
+            }
+        }
+        true
+    }));
+    let p = loading(&mut r, &text, &frame_at(2, 0));
+    assert_eq!(
+        [at(&p, decl_support::MOVIE_A), at(&p, decl_support::MOVIE_B)],
+        under,
+        "the next play's loading frame"
+    );
+}
+
 /// Both loading build paths draw the movies' preparation: the skin in
 /// use's and a staged skin's loading frames draw a ready movie's frame
 /// and a lost movie's opaque black.

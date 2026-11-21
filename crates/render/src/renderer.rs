@@ -6508,6 +6508,41 @@ impl Renderer {
         self.video.reserve(&self.gpu, slot, width, height);
     }
 
+    /// Releases movie slot `slot`'s planes and upload buffer: its movie
+    /// was lost or refused. The other slot keeps its own.
+    pub fn video_release(&mut self, slot: u32) {
+        self.video.release(&self.gpu, slot);
+    }
+
+    /// The screen whose movies these were is left: every slot's planes
+    /// and upload buffer are released, and neither the loading frames nor
+    /// the play skin's builds show any movie until the next screen's
+    /// movies set them.
+    pub fn retire_movies(&mut self) {
+        for slot in 0..crate::video::MAX_MOVIES {
+            self.video.release(&self.gpu, slot);
+        }
+        self.loading_movies = skin_model::movie::MovieShows::default();
+        self.skin
+            .set_movies(skin_model::movie::MovieShows::default());
+    }
+
+    /// What the play skin's movie destinations show in the loading frames
+    /// that follow ([`set_loading_movies`](Self::set_loading_movies)).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn loading_movies(&self) -> skin_model::movie::MovieShows {
+        self.loading_movies
+    }
+
+    /// The GPU bytes the movie slots hold (their planes' texels, their
+    /// upload buffers), the stand-in left out.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn video_bytes(&self) -> (u64, u64) {
+        self.video.bytes()
+    }
+
     /// The movie hook's upload: `fill` writes a frame of `width` ×
     /// `height` into movie slot `slot`'s mapped upload buffer through the
     /// sink it is given (a byte offset and the bytes), each plane's rows

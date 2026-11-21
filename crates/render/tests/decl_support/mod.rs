@@ -147,7 +147,7 @@ pub struct Look {
     pub loadend: Option<TimeUs>,
     /// Two skin movies filling [`MOVIE_A`] (slot 0) and [`MOVIE_B`]
     /// (slot 1) on the untimed `screen` timer, so loading frames draw
-    /// them too.
+    /// them too, over the image drawn across [`MOVIES_UNDER`].
     pub movies: bool,
 }
 
@@ -266,6 +266,9 @@ pub const WHEN_MARK: [i32; 4] = [1_700, 900, 100, 100];
 pub const MOVIE_A: [i32; 4] = [400, 900, 100, 100];
 /// Where skin movie 1 draws.
 pub const MOVIE_B: [i32; 4] = [600, 900, 100, 100];
+/// The image under both movies' destinations, so a destination that draws
+/// nothing is told from a black one.
+pub const MOVIES_UNDER: [i32; 4] = [380, 880, 340, 140];
 /// The `when` timer's slot: the first after the built-in timers.
 pub const WHEN_SLOT: u16 = skin_model::timer::BUILTIN;
 
@@ -421,6 +424,10 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
     let [x, y, ..] = look.rect;
     let mut elements = vec![image(look.rect, clipped)];
     let sheet = if look.movies {
+        elements.push(ElementDef {
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..image(MOVIES_UNDER, false)
+        });
         for (slot, rect) in [(0, MOVIE_A), (1, MOVIE_B)] {
             elements.push(ElementDef {
                 source: Source::Movie {

@@ -17,8 +17,13 @@
 //! leaves the planes as they were and records no copy.
 //!
 //! A movie's planes and buffer are made when it is reserved (its admission,
-//! never a frame's upload) and touch no other movie's: a peer admitted
-//! later leaves its planes, its frame and its queued copy as they are.
+//! at a preparation boundary, never a frame's upload) and touch no other
+//! movie's: a peer admitted later leaves its planes, its frame and its
+//! queued copy as they are. They are released when the movie or its screen
+//! leaves ([`Video::release`]): a slot with none binds a shared 1×1
+//! stand-in, so the GPU holds only the planes of movies still kept. Making
+//! the bind group allocates nothing of the app's: its views and entries are
+//! fixed-size arrays.
 
 use crate::gpu::Gpu;
 
@@ -133,18 +138,22 @@ impl Movie {
 /// The movies' planes, by slot, their bind group and upload buffers.
 pub(crate) struct Video {
     layout: wgpu::BindGroupLayout,
-    movies: [Movie; MAX_MOVIES as usize],
+    /// The 1×1 planes a slot with no movie binds.
+    blank: Movie,
+    movies: [Option<Movie>; MAX_MOVIES as usize],
     pub(crate) bind: wgpu::BindGroup,
 }
 
 impl Video {
-    /// 1×1 planes in every slot over the video group's `layout`, the
-    /// stand-in bound while no movie is reserved.
+    /// No movie in any slot over the video group's `layout`: each binds
+    /// the 1×1 stand-in.
     pub(crate) fn new(gpu: &Gpu, layout: &wgpu::BindGroupLayout) -> Self {
-        let movies = [Movie::sized(gpu, 1, 1), Movie::sized(gpu, 1, 1)];
-        let bind = bind(gpu, layout, &movies);
+        let blank = Movie::sized(gpu, 1, 1);
+        let movies = [None, None];
+        let bind = bind(gpu, layout, &blank, &movies);
         Self {
             layout: layout.clone(),
+            blank,
             movies,
             bind,
         }
@@ -153,12 +162,26 @@ impl Video {
     /// Replaces slot `slot`'s planes and buffer with ones of a movie of
     /// `width` × `height`: a movie's admission, not a frame's upload. The
     /// other slot keeps its planes, its frame and its queued copy.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn reserve(&mut self, gpu: &Gpu, slot: u32, width: u32, height: u32) {
         let Some(m) = self.movies.get_mut(slot as usize) else {
             return;
         };
-        *m = Movie::sized(gpu, width, height);
-        self.bind = bind(gpu, &self.layout, &self.movies);
+        *m = Some(Movie::sized(gpu, width, height));
+        self.bind = bind(gpu, &self.layout, &self.blank, &self.movies);
+    }
+
+    /// Releases slot `slot`'s planes and buffer, its movie or its screen
+    /// gone: the slot binds the stand-in again. The other slot keeps its
+    /// own.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn release(&mut self, gpu: &Gpu, slot: u32) {
+        let Some(m) = self.movies.get_mut(slot as usize) else {
+            return;
+        };
+        if m.take().is_some() {
+            self.bind = bind(gpu, &self.layout, &self.blank, &self.movies);
+        }
     }
 
     /// `fill` writes a frame of `width` × `height` into slot `slot`'s
@@ -177,7 +200,7 @@ impl Video {
         height: u32,
         fill: impl FnOnce(&mut dyn FnMut(usize, &[u8]) -> bool, [usize; 2]) -> bool,
     ) -> bool {
-        let Some(m) = self.movies.get_mut(slot as usize) else {
+        let Some(Some(m)) = self.movies.get_mut(slot as usize) else {
             return false;
         };
         if m.width != width || m.height != height {
@@ -200,7 +223,7 @@ impl Video {
     /// samples the planes, and clears them.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn record(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for m in self.movies.iter_mut().filter(|m| m.copy) {
+        for m in self.movies.iter_mut().flatten().filter(|m| m.copy) {
             m.copy = false;
             let luma = u64::from(m.pitch[0]) * u64::from(m.height);
             let chroma = u64::from(m.pitch[1]) * u64::from(half(m.height));
@@ -235,12 +258,13 @@ impl Video {
         }
     }
 
-    /// The GPU bytes the slots hold, as their resources were made: their
-    /// planes' texels and their upload buffers.
-    #[cfg(test)]
+    /// The GPU bytes the slots' movies hold, as their resources were
+    /// made: their planes' texels and their upload buffers (the stand-in
+    /// left out).
+    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn bytes(&self) -> (u64, u64) {
         let texels = |t: &wgpu::Texture| u64::from(t.width()) * u64::from(t.height());
-        self.movies.iter().fold((0, 0), |(t, u), m| {
+        self.movies.iter().flatten().fold((0, 0), |(t, u), m| {
             (
                 t + texels(&m.y) + texels(&m.u) + texels(&m.v),
                 u + m.upload.size(),
@@ -249,22 +273,36 @@ impl Video {
     }
 }
 
-fn bind(gpu: &Gpu, layout: &wgpu::BindGroupLayout, movies: &[Movie]) -> wgpu::BindGroup {
-    let views: Vec<wgpu::TextureView> = movies
-        .iter()
-        .flat_map(|m| [&m.y, &m.u, &m.v])
-        .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
-        .collect();
-    let entries: Vec<wgpu::BindGroupEntry<'_>> = (0_u32..)
-        .zip(&views)
-        .map(|(binding, view)| wgpu::BindGroupEntry {
-            binding,
-            resource: wgpu::BindingResource::TextureView(view),
-        })
-        .collect();
+/// The video group over `layout`: each slot's movie's planes, or
+/// `blank`'s for a slot with none. Fixed-size arrays: the app allocates
+/// nothing here, wgpu's own objects aside.
+fn bind(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    blank: &Movie,
+    movies: &[Option<Movie>; MAX_MOVIES as usize],
+) -> wgpu::BindGroup {
+    let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+    let planes = |m: &Option<Movie>| {
+        let m = m.as_ref().unwrap_or(blank);
+        [view(&m.y), view(&m.u), view(&m.v)]
+    };
+    let [m0, m1] = movies;
+    let [[y0, u0, v0], [y1, u1, v1]] = [planes(m0), planes(m1)];
+    let entry = |binding, view| wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(view),
+    };
     gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("video"),
         layout,
-        entries: &entries,
+        entries: &[
+            entry(0, &y0),
+            entry(1, &u0),
+            entry(2, &v0),
+            entry(3, &y1),
+            entry(4, &u1),
+            entry(5, &v1),
+        ],
     })
 }
