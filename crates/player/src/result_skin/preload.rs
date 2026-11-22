@@ -15,15 +15,21 @@
 //!   before it drops its pages, and a new job packs from the start after
 //!   the release. A stop is collected before another pack begins, so two
 //!   packs never hold pages at once.
+//! - **The claim.** A choice to play or a Start claims the pack
+//!   ([`PreloadClaim`]): the pause does not stop it, and once the chosen
+//!   chart's bank no longer decodes it is promoted to the foreground. The
+//!   attempt's image stage adopts a claimed pack of its mode and waits for
+//!   it in place of its own import and build; the claim's end demotes it
+//!   and hands it back to the preload.
 //! - **One warm-up.** Once a pack is collected, or an attempt runs its
 //!   own image stage, the preload ends for the installation.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use game::coord::{Class, Coordinator, Outcome, Runner};
+use game::coord::{Class, Coordinator, Outcome, Promoter, Runner};
 use skin_beatoraja::{Cancel, FactDeps, Imported, LuaImported};
 
 use super::{
@@ -46,6 +52,26 @@ pub(super) enum Preload {
     /// No preload for this installation: none was imported, or it ended.
     #[default]
     Retired,
+}
+
+/// How long an adopted pack's wait looks for its outcome before it asks
+/// the attempt's signals again.
+const ADOPTED_SLICE: Duration = Duration::from_millis(5);
+
+/// A running pack the attempt's image stage adopted, with the claim that
+/// let it: dropped with the stage (the quit key, a discard), the claim
+/// ends and the pack is handed back to the preload.
+pub(super) struct Adopted {
+    id: u64,
+    _claim: PreloadClaim,
+}
+
+impl Adopted {
+    /// Its pack's job (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub(super) const fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// What a stopped pack's preload becomes once its outcome is collected.
@@ -118,9 +144,15 @@ enum PackRan {
 pub struct PreloadControl {
     /// The shelf's pause holds.
     paused: AtomicBool,
-    /// A choice to play or a Start claims the pack: the pause does not
-    /// stop it.
-    claimed: AtomicBool,
+    /// The claims live ([`PreloadClaim`]): while any does, the pause does
+    /// not stop the pack.
+    claims: AtomicUsize,
+    /// The claimed pack is wanted in the foreground: its chart's bank no
+    /// longer decodes. Cleared with the last claim.
+    foreground: AtomicBool,
+    /// The current pack's promoter, which a claim promotes and its end
+    /// demotes.
+    promoter: Mutex<Option<Promoter>>,
     /// The run ends: the pack stops.
     closing: AtomicBool,
     /// A pack's thread could not enter background mode.
@@ -153,7 +185,39 @@ impl PreloadControl {
 
     /// Whether the pause holds with no claim exempting the pack.
     fn held(&self) -> bool {
-        self.paused.load(Ordering::SeqCst) && !self.claimed.load(Ordering::SeqCst)
+        self.paused.load(Ordering::SeqCst) && !self.claimed()
+    }
+
+    /// Whether a claim lives.
+    pub fn claimed(&self) -> bool {
+        self.claims.load(Ordering::SeqCst) > 0
+    }
+
+    /// A choice to play or a Start claims the pack (design.md "Load
+    /// Pipeline", Pauses): from now until the claim drops, the pause does
+    /// not stop it. The claim's holder asks for it before it requests the
+    /// pause, so a pack never sees the choice's pause unclaimed.
+    pub fn claim(self: &Arc<Self>) -> PreloadClaim {
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        PreloadClaim(Arc::clone(self))
+    }
+
+    fn promoter(&self) -> MutexGuard<'_, Option<Promoter>> {
+        self.promoter.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Job `promoter`'s begin: it is the one a claim promotes from now,
+    /// promoted at once when a claim lives and either wants it in the
+    /// foreground already or `alone` (no speculative pack can run:
+    /// speculation off, or background mode refused). Whether it was.
+    fn set_promoter(&self, promoter: Promoter, alone: bool) -> bool {
+        let mut current = self.promoter();
+        let promote = self.claimed() && (alone || self.foreground.load(Ordering::SeqCst));
+        if promote {
+            promoter.promote();
+        }
+        *current = Some(promoter);
+        promote
     }
 
     /// Whether a running pack stops: the run ends, or the pause holds
@@ -166,7 +230,7 @@ impl PreloadControl {
     /// is no pack's thread runs its build unclaimed, waiting at most
     /// `slice` for it.
     pub fn wait_acknowledged(&self, slice: Duration) -> bool {
-        let quiet = |l: &Live| self.claimed.load(Ordering::SeqCst) || l.job.is_none() || l.left;
+        let quiet = |l: &Live| self.claimed() || l.job.is_none() || l.left;
         let live = self.live();
         let (live, _) = self
             .changed
@@ -236,6 +300,46 @@ impl Drop for Ended<'_> {
     }
 }
 
+/// A choice's claim on the result skin's preload pack (design.md "State
+/// Model", the decision screen and the practice page): held from a choice
+/// to play or a Start by its load, and moved into the attempt's
+/// preparation, so every end of the choice drops it. While it lives the
+/// pause does not stop the pack; dropped, the pack is demoted and handed
+/// back to the preload (with speculation off its next checkpoint then
+/// cancels it).
+pub struct PreloadClaim(Arc<PreloadControl>);
+
+impl std::fmt::Debug for PreloadClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreloadClaim").finish_non_exhaustive()
+    }
+}
+
+impl PreloadClaim {
+    /// The chosen chart's bank no longer decodes (or the attempt adopts
+    /// the pack): the claimed pack, and any pack begun under the claim
+    /// from now, is promoted to the foreground at its next checkpoint.
+    pub fn promote(&self) {
+        let current = self.0.promoter();
+        self.0.foreground.store(true, Ordering::SeqCst);
+        if let Some(p) = current.as_ref() {
+            p.promote();
+        }
+    }
+}
+
+impl Drop for PreloadClaim {
+    fn drop(&mut self) {
+        let current = self.0.promoter();
+        if self.0.claims.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.foreground.store(false, Ordering::SeqCst);
+            if let Some(p) = current.as_ref() {
+                p.demote();
+            }
+        }
+    }
+}
+
 /// What a pack's thread is given.
 struct PackJob {
     id: u64,
@@ -248,13 +352,16 @@ struct PackJob {
     stop: Cancel,
     control: Arc<PreloadControl>,
     mode: Arc<dyn ThreadMode>,
+    /// Begun promoted by a claim: it begins in the foreground, and its
+    /// thread enters no background mode first.
+    promoted: bool,
     done: mpsc::Sender<PackOut>,
 }
 
 impl PackJob {
     /// The pack on its own thread: background mode entered through the
-    /// priority seam first, then the layout's atlas step on `runner`, its
-    /// checkpoint the build's stop.
+    /// priority seam first (unless a claim began it promoted), then the
+    /// layout's atlas step on `runner`, its checkpoint the build's stop.
     fn run(self, runner: Runner<()>) {
         let Self {
             id,
@@ -267,13 +374,16 @@ impl PackJob {
             stop,
             control,
             mode,
+            promoted,
             done,
         } = self;
         let _ended = Ended(&control, id);
         #[cfg(feature = "dev-tools")]
         super::IMPORT_PERMIT.set(kept);
         let mode = JobMode::new(mode, "skin: result: preload");
-        mode.on_class(Class::Speculative);
+        if !promoted {
+            mode.on_class(Class::Speculative);
+        }
         if mode.refused() {
             control.refused.store(true, Ordering::SeqCst);
             drop(runner);
@@ -284,12 +394,17 @@ impl PackJob {
             });
             return;
         }
-        let stops = || stop.is_cancelled() || control.stops();
+        // A pack with no background mode runs only while claimed.
+        let stops = || {
+            stop.is_cancelled()
+                || control.stops()
+                || (control.refused.load(Ordering::SeqCst) && !control.claimed())
+        };
         let mut laid: Option<Laid> = None;
         let outcome = runner.run(&stops, &|class| mode.on_class(class), |ctx| {
             let check = || {
                 #[cfg(all(test, feature = "dev-tools"))]
-                tests::pack_gate(&|| stop.is_cancelled() || control.stops());
+                tests::pack_gate(&stops);
                 let stopped = ctx.checkpoint();
                 if stopped {
                     control.left(id);
@@ -363,21 +478,21 @@ impl ResultSkin {
     /// [`crate::page_jobs::PageJobs::preload_may_run`]). Whether a pack is
     /// to begin now ([`begin_preload`](Self::begin_preload), after a fresh
     /// report): the preload waits, `may_run`, no pause holds unclaimed,
-    /// `coord` has a speculative permit, and background mode was never
-    /// refused.
+    /// and either a claim lives or `coord` has a speculative permit and
+    /// background mode was never refused.
     pub fn poll_preload(&mut self, coord: &Coordinator, may_run: bool) -> bool {
-        self.collect_preload(false);
+        self.collect_preload(Duration::ZERO);
         if !may_run {
             self.stop_preload(Then::Idle);
         }
         let Some(control) = &self.control else {
             return false;
         };
+        let speculative = coord.caps().speculative > 0 && !control.refused.load(Ordering::SeqCst);
         matches!(self.preload, Preload::Idle(_))
             && may_run
             && !control.held()
-            && coord.caps().speculative > 0
-            && !control.refused.load(Ordering::SeqCst)
+            && (speculative || control.claimed())
     }
 
     /// Begins the pack on `coord`, after [`poll_preload`](Self::poll_preload)
@@ -423,7 +538,13 @@ impl ResultSkin {
         let slot = self.slot_for_job();
         let stop = Cancel::new();
         let (done, received) = mpsc::channel();
+        // Of the speculative class whatever begins it, so a claim's end
+        // demotes it there (with no speculative permit, its next
+        // checkpoint then cancels it); a claim that no speculative pack
+        // can serve begins it promoted.
         let runner = coord.task::<()>(Class::Speculative);
+        let alone = coord.caps().speculative == 0 || control.refused.load(Ordering::SeqCst);
+        let promoted = control.set_promoter(runner.promoter(), alone);
         let job = PackJob {
             id,
             kept: input.kept,
@@ -438,6 +559,7 @@ impl ResultSkin {
                 .preload_mode
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::priority::Checked::SYSTEM)),
+            promoted,
             done,
         };
         control.began(id);
@@ -487,23 +609,27 @@ impl ResultSkin {
         }
     }
 
-    /// The pack's outcome collected, waited for when `wait` (its stop
-    /// already set), else only when it is in. A pack is taken while its
-    /// mode is the one preferred: its image entry restored and its probe's
-    /// facts and cells kept, so the attempt reuses it, and the preload
-    /// ends. A deferred or stopped pack hands its holdings back and the
-    /// preload waits again (or ends, as its stop said); a refused one, or
-    /// a thread that ended without an outcome, ends it.
-    pub(super) fn collect_preload(&mut self, wait: bool) {
+    /// The pack's outcome collected, waited for at most `wait` (`MAX` to
+    /// its end, once its stop is set). A pack is taken while its mode is
+    /// the one preferred: its image entry restored and its probe's facts
+    /// and cells kept, so the attempt reuses it, and the preload ends. A
+    /// deferred or stopped pack hands its holdings back and the preload
+    /// waits again (or ends, as its stop said); a refused one, or a thread
+    /// that ended without an outcome, ends it.
+    pub(super) fn collect_preload(&mut self, wait: Duration) {
         let got = match &self.preload {
             Preload::Running(r) | Preload::Stopping { run: r, .. } => {
-                if wait {
-                    Some(r.done.recv().ok())
-                } else {
+                if wait.is_zero() {
                     match r.done.try_recv() {
                         Ok(out) => Some(Some(out)),
                         Err(TryRecvError::Empty) => None,
                         Err(TryRecvError::Disconnected) => Some(None),
+                    }
+                } else {
+                    match r.done.recv_timeout(wait) {
+                        Ok(out) => Some(Some(out)),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => Some(None),
                     }
                 }
             }
@@ -564,8 +690,73 @@ impl ResultSkin {
     pub(super) fn settle_preload(&mut self, then: Then) {
         if matches!(self.preload, Preload::Running(_) | Preload::Stopping { .. }) {
             self.stop_preload(then);
-            self.collect_preload(true);
+            self.collect_preload(Duration::MAX);
         }
+    }
+
+    /// The attempt's image stage adopts the running pack when `claim` is
+    /// the live claim and the pack's probe was imported in the mode now
+    /// preferred (design.md "beatoraja Lua Skins", the result skin's
+    /// preload): the claim is promoted and moves into the stage, which
+    /// waits for the pack in place of its own import and build. `None`
+    /// otherwise (the claim, if any, dropped).
+    pub(super) fn adopt_preload(&mut self, claim: Option<PreloadClaim>) -> Option<Adopted> {
+        let Preload::Running(run) = &self.preload else {
+            return None;
+        };
+        let claim = claim?;
+        if self.kept != Some(run.input.kept) {
+            return None;
+        }
+        claim.promote();
+        log::info!("skin: result: the attempt adopts preload {}", run.id);
+        Some(Adopted {
+            id: run.id,
+            _claim: claim,
+        })
+    }
+
+    /// The adopted pack `adopted` waited for until `until` at most:
+    /// `Some(true)` once its outcome is collected (the attempt's stage is
+    /// then decided from what it left), `Some(false)` when `quit` (the
+    /// attempt's quit key: the stage drops its claim, the pack goes on
+    /// and the preload keeps it, nothing waited for) or `end_run` (the
+    /// run ends: the pack is cancelled and its thread waited for within
+    /// [`crate::imports::STOP_WAIT`]) came first, `None` at `until`.
+    pub(super) fn wait_adopted(
+        &mut self,
+        adopted: &Adopted,
+        until: Option<Instant>,
+        mut quit: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        loop {
+            if end_run() {
+                self.end_preload(crate::imports::STOP_WAIT);
+                return Some(false);
+            }
+            if quit() {
+                return Some(false);
+            }
+            let now = Instant::now();
+            let slice = until.map_or(ADOPTED_SLICE, |u| {
+                ADOPTED_SLICE.min(u.saturating_duration_since(now))
+            });
+            self.collect_preload(slice.max(Duration::from_micros(1)));
+            if !matches!(&self.preload, Preload::Running(r) if r.id == adopted.id) {
+                return Some(true);
+            }
+            if until.is_some_and(|u| Instant::now() >= u) {
+                return None;
+            }
+        }
+    }
+
+    /// The run disabled the result skin: a running pack is stopped and
+    /// its outcome collected (its next checkpoint), and the preload ends.
+    pub fn retire_preload(&mut self) {
+        self.settle_preload(Then::Retired);
+        self.preload = Preload::Retired;
     }
 
     /// The installation ends: a running pack is stopped and its thread

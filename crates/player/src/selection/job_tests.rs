@@ -1593,5 +1593,55 @@ fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
     assert_eq!(witnessed(&b), (2, Vec::new()));
 }
 
+/// A load under a held pause (a bank look's, say) while the result skin's
+/// preload pack runs: the load claims the pack, so the pause does not stop
+/// it; the pack stays on its speculative permit through the decode, which
+/// is granted every foreground permit its pool runs a worker for, as with
+/// no preload; once the decode has ended the pack is promoted, and moves
+/// to the foreground at its next checkpoint.
+#[test]
+fn a_claimed_preload_leaves_the_decode_its_width() {
+    use crate::result_skin::preload_tests::{Opened, REACHED, Seam, gate, preloaded_with};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let builds = crate::result_skin::builds();
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.result_skin =
+                preloaded_with(skin.path(), &seam, Some(rig.render.scripts().clone()));
+            let control = rig.result_skin.preload_control().unwrap();
+            sel(rig).shelf.set_preload(Arc::clone(&control));
+            gate(2);
+            rig.poll_preload();
+            until("the pack's checkpoint", || REACHED.load(Ordering::SeqCst));
+            assert_eq!(b.coord.held(Class::Speculative), 1);
+            sel(rig).shelf.pause();
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert!(control.claimed(), "the load claimed it");
+            // The decode began beside no foreground permit of the pack's, and
+            // ran every worker it would without it.
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+            assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
+            assert!(seam.left.lock().unwrap().is_empty(), "speculative so far");
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+            assert_eq!(*seam.left.lock().unwrap(), ["result-preload"], "promoted");
+            rig.poll_preload();
+            assert!(rig.result_skin.image().is_some(), "packed, not stopped");
+            assert_eq!(crate::result_skin::builds(), builds + 1);
+        },
+    );
+}
+
 mod page;
 mod served;

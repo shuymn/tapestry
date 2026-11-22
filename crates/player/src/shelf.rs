@@ -591,6 +591,16 @@ impl Shelf {
         }
     }
 
+    /// A choice to play or a Start claims the result skin's preload pack
+    /// (design.md "Load Pipeline", Pauses): asked before the choice's
+    /// pause, so the pause does not stop it while the claim lives. None
+    /// without a preload.
+    pub fn claim_preload(&self) -> Option<crate::result_skin::PreloadClaim> {
+        self.preload
+            .as_ref()
+            .map(crate::result_skin::PreloadControl::claim)
+    }
+
     /// The result skin's preload takes part in the pause from now on,
     /// paused at once when a pause holds.
     pub fn set_preload(&mut self, preload: Arc<crate::result_skin::PreloadControl>) {

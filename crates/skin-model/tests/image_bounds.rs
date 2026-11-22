@@ -898,7 +898,7 @@ fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
     let asks = std::cell::Cell::new(0);
     let grow = || grow_once(&path, &asks);
     // Eight layers and none reserved: a page holds at most 32 767 cells,
-    // so the cells take three pages of 4 096.
+    // and the build makes `GROW_PAGES` pages.
     let limits = AtlasLimits {
         max_side: 8_192,
         max_layers: 8,

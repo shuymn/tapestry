@@ -2930,6 +2930,12 @@ impl PlayerRig<'_> {
             if let Some(script) = &mut sel.script {
                 script.chose();
             }
+            // A choice to play claims the result skin's preload before
+            // its pause (design.md "State Model", the decision screen).
+            self.preload_claim = match pick {
+                Pick::Play(_) => sel.shelf.claim_preload(),
+                Pick::Practice(_) => None,
+            };
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
             self.ready_figure_due = true;
@@ -3587,6 +3593,12 @@ impl PlayerRig<'_> {
                 sel.shelf.stop_awaiting();
             }
         }
+        // A Start claims the result skin's preload as a choice to play
+        // does, whatever pause holds (design.md "State Model", the
+        // practice page); a choice to play claimed it already.
+        if self.preload_claim.is_none() {
+            self.preload_claim = sel.shelf.claim_preload();
+        }
         // Requested again after the practice page released it, as a
         // choice does.
         sel.shelf.choose(loaded.path());
@@ -3751,6 +3763,12 @@ impl PlayerRig<'_> {
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
+        // The bank no longer decodes: the claimed preload pack is promoted
+        // to the foreground pool it no longer draws (design.md "Load
+        // Pipeline", Pauses).
+        if let Some(claim) = &self.preload_claim {
+            claim.promote();
+        }
         #[cfg(test)]
         if let Some(gate) = self.selection.as_ref().and_then(|s| s.after_bank.as_ref()) {
             gate();
@@ -4293,6 +4311,8 @@ impl AppRig for PlayerRig<'_> {
     /// nowhere (design.md "Load Pipeline"), but a panic one published
     /// meanwhile that a Start was responsible for, which ends the run.
     fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // The choice's claim on the result skin's preload ends with it.
+        self.preload_claim = None;
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
@@ -4313,6 +4333,8 @@ impl AppRig for PlayerRig<'_> {
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
         self.leave_result();
+        // The chosen chart's claim on the result skin's preload ends.
+        self.preload_claim = None;
         // A result left for selection, by back or its scene time
         // (dev-tools).
         #[cfg(feature = "dev-tools")]
@@ -4488,6 +4510,9 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.leave_result();
+        // A Start's claim on the result skin's preload ends with its
+        // return to the page, where the page's jobs decide again.
+        self.preload_claim = None;
         // A result left for the practice page (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);

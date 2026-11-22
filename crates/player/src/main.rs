@@ -1070,6 +1070,7 @@ fn rig<'a>(
         views_shown: 0,
         result_outro: None,
         decision_claim: None,
+        preload_claim: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
         #[cfg(test)]

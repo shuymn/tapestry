@@ -472,6 +472,11 @@ pub struct PlayerRig<'a> {
     /// (its choice set at the entry), and the lifetime the label book is
     /// told has ended.
     pub decision_claim: Option<crate::decision_side::ShownDecision>,
+    /// The chosen chart's claim on the result skin's preload pack
+    /// (design.md "State Model", the decision screen): taken by a choice
+    /// to play or a Start, moved into the attempt's image stage, and
+    /// dropped with every other end of the choice.
+    pub preload_claim: Option<crate::result_skin::PreloadClaim>,
     /// Development builds: G2's start (the S10-09i design's §8.1), when
     /// the attempt's `commit_ready` returned, and what its result step
     /// did, until the opening prints it.
@@ -731,8 +736,11 @@ impl PlayerRig<'_> {
         self.result_chart = Some(chart);
         self.result_labels = prep.labels.take();
         // Once the run disabled the result skin, no skin work is done: the
-        // built-in result shows the chart and labels taken above.
+        // built-in result shows the chart and labels taken above, and the
+        // preload's pack is cancelled first.
         if self.result_run_disabled() {
+            self.preload_claim = None;
+            self.result_skin.retire_preload();
             return self.send_screen(prep, skin);
         }
         // The kept probe only while the selection's and decision's
@@ -743,16 +751,21 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
         self.fresh_result_report();
-        match self.result_skin.begin_image_stage(chart, prep.class) {
+        // The choice's claim on the preload moves into the stage, which
+        // adopts a claimed pack still running.
+        let claim = self.preload_claim.take();
+        match self.result_skin.begin_image_stage(chart, prep.class, claim) {
             crate::result_skin::ImageStage::Ready(staged) => self.after_image(prep, skin, staged),
-            crate::result_skin::ImageStage::Running(job) => PrepStage::Image(skin, job),
+            crate::result_skin::ImageStage::Running(job)
+            | crate::result_skin::ImageStage::Adopted(job) => PrepStage::Image(skin, job),
         }
     }
 
     /// The result skin's image stage `job`, waited for until `until`: the
-    /// quit key cancels its job and waits for its thread; the window's
-    /// close and a failure of the input or audio thread end it within the
-    /// stop bound. `None` at `until` with the job still running.
+    /// quit key cancels its job and waits for its thread (an adopted
+    /// preload pack is handed back without a wait); the window's close and
+    /// a failure of the input or audio thread end it within the stop
+    /// bound. `None` at `until` with the job still running.
     fn poll_image(
         &mut self,
         job: &mut crate::result_skin::ImageJob,

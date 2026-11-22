@@ -1782,7 +1782,7 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
     let p = pending(d.path(), LIMITS);
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
     let super::ImageStage::Running(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
     else {
         panic!("a job runs");
     };
@@ -1846,7 +1846,7 @@ fn the_probe_packs_the_cells_a_runtime_draws() {
     REACHED.store(false, SeqCst);
     GATE.store(true, SeqCst);
     let super::ImageStage::Running(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
     else {
         GATE.store(false, SeqCst);
         panic!("a job runs");

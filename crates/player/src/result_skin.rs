@@ -31,8 +31,10 @@ use crate::screens::{ScriptGen, ScriptPermit, ScriptSlot, Scripts};
 
 mod preload;
 
-pub use preload::PreloadControl;
-use preload::{Preload, Then};
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) use preload::tests as preload_tests;
+use preload::{Adopted, Preload, Then};
+pub use preload::{PreloadClaim, PreloadControl};
 
 /// A result skin whose base import read a fact the base snapshot has
 /// pending: what each image stage and layout starts from, and the skin
@@ -681,12 +683,25 @@ pub enum ImageStage {
     Ready(Staged),
     /// Its job runs.
     Running(Box<ImageJob>),
+    /// It waits for the preload's claimed pack, which it adopted in place
+    /// of its own import and build; polled as [`Running`](Self::Running).
+    Adopted(Box<ImageJob>),
 }
 
-/// An image stage's job in flight.
-pub struct ImageJob {
-    job: imports::Job<ImageOut>,
-    slot: Slot,
+/// An image stage in flight: its own job, or the preload's pack it
+/// adopted.
+pub struct ImageJob(InFlight);
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "an image stage in flight is always held boxed"
+)]
+enum InFlight {
+    Own {
+        job: imports::Job<ImageOut>,
+        slot: Slot,
+    },
+    Adopted(Adopted),
 }
 
 /// `slot`'s holdings, a poisoned lock included.
@@ -1470,9 +1485,9 @@ impl ResultSkin {
         mut quit: impl FnMut() -> bool,
         mut end_run: impl FnMut() -> bool,
     ) -> Staged {
-        match self.begin_image_stage(chart, class) {
+        match self.begin_image_stage(chart, class, None) {
             ImageStage::Ready(staged) => staged,
-            ImageStage::Running(mut job) => loop {
+            ImageStage::Running(mut job) | ImageStage::Adopted(mut job) => loop {
                 if let Some(staged) = self.poll_image_stage(&mut job, None, &mut quit, &mut end_run)
                 {
                     break staged;
@@ -1485,19 +1500,42 @@ impl ResultSkin {
     /// job is needed, else its job started and returned at once
     /// ([`ImageStage::Running`]), to be waited for
     /// ([`poll_image_stage`](Self::poll_image_stage)), which finishes it.
+    /// With `claim`, the choice's claim on the preload, a running pack of
+    /// the mode now preferred is adopted instead ([`ImageStage::Adopted`]):
+    /// no import or build of the stage's own (design.md "beatoraja Lua
+    /// Skins", the result skin's preload).
     pub fn begin_image_stage(
         &mut self,
         chart: ResultChart,
         class: Option<JudgeClass>,
+        claim: Option<PreloadClaim>,
     ) -> ImageStage {
-        // The preload's pack, if one runs, hands the image state back
-        // (packed, it is reused below); the attempt's stage ends the
-        // preload either way (design.md "beatoraja Lua Skins", the result
-        // skin's preload).
-        self.settle_preload(Then::Idle);
-        self.preload = Preload::Retired;
         self.chart = Some(chart);
         self.class = Some(class);
+        // A pack that ended is collected first: packed, it is reused below.
+        self.collect_preload(std::time::Duration::ZERO);
+        if let Some(adopted) = self.adopt_preload(claim) {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark("img:adopted", i64::try_from(adopted.id()).unwrap_or(-1));
+            return ImageStage::Adopted(Box::new(ImageJob(InFlight::Adopted(adopted))));
+        }
+        self.attempt_stage()
+    }
+
+    /// The attempt's image stage for the chart and judgment class set,
+    /// with no pack to adopt. A pack still running hands the image state
+    /// back first: an unclaimed one (the pause's acknowledgement before
+    /// Preparing leaves none in its build; should one be, it takes this
+    /// path) or one whose mode is no longer preferred is stopped and its
+    /// outcome discarded, waited for to its next checkpoint; a packed one
+    /// is reused below. The stage ends the preload either way (design.md
+    /// "beatoraja Lua Skins", the result skin's preload).
+    fn attempt_stage(&mut self) -> ImageStage {
+        self.settle_preload(Then::Idle);
+        self.preload = Preload::Retired;
+        let (Some(chart), Some(class)) = (self.chart, self.class) else {
+            return ImageStage::Ready(Staged::Ready);
+        };
         #[cfg(feature = "dev-tools")]
         {
             crate::dev::loop_probe::mark(
@@ -1674,7 +1712,7 @@ impl ResultSkin {
             }
         });
         match spawned {
-            Ok(job) => ImageStage::Running(Box::new(ImageJob { job, slot })),
+            Ok(job) => ImageStage::Running(Box::new(ImageJob(InFlight::Own { job, slot }))),
             Err(why) => ImageStage::Ready(self.finish_image_stage(&slot, Ran::Refused(why))),
         }
     }
@@ -1691,13 +1729,31 @@ impl ResultSkin {
         quit: impl FnMut() -> bool,
         end_run: impl FnMut() -> bool,
     ) -> Option<Staged> {
-        let ran = job.job.wait_until(until, quit, end_run)?;
-        let staged = self.finish_image_stage(&job.slot, ran);
-        Some(if job.job.signaled() {
-            Staged::Cancelled
-        } else {
-            staged
-        })
+        let (mut quit, mut end_run) = (quit, end_run);
+        loop {
+            match &mut job.0 {
+                InFlight::Own { job, slot } => {
+                    let ran = job.wait_until(until, &mut quit, &mut end_run)?;
+                    let staged = self.finish_image_stage(slot, ran);
+                    return Some(if job.signaled() {
+                        Staged::Cancelled
+                    } else {
+                        staged
+                    });
+                }
+                InFlight::Adopted(a) => {
+                    if !self.wait_adopted(a, until, &mut quit, &mut end_run)? {
+                        return Some(Staged::Cancelled);
+                    }
+                    // Collected: the stage is decided from what the pack
+                    // left, its own job begun only when it left nothing.
+                    match self.attempt_stage() {
+                        ImageStage::Ready(staged) => return Some(staged),
+                        ImageStage::Running(next) | ImageStage::Adopted(next) => *job = *next,
+                    }
+                }
+            }
+        }
     }
 
     /// An image stage's `job` no attempt waits for any more (its
@@ -1706,14 +1762,26 @@ impl ResultSkin {
     /// bound, while `end_run` (a close, a thread's failure) is still asked;
     /// once it turns true, the job is given up within
     /// [`imports::STOP_WAIT`] of it. A job that ended is finished, so its
-    /// images are handed back; an abandoned one keeps them.
+    /// images are handed back; an abandoned one keeps them. An adopted
+    /// pack is handed back to the preload as its claim drops, its thread
+    /// not waited for, unless the run ends: then it is cancelled and
+    /// waited for within the same bound.
     pub fn settle_image_stage(
         &mut self,
         job: &mut ImageJob,
-        end_run: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
     ) -> imports::Settled {
+        let (job, slot) = match &mut job.0 {
+            InFlight::Own { job, slot } => (job, slot),
+            InFlight::Adopted(_) => {
+                if end_run() {
+                    self.end_preload(imports::STOP_WAIT);
+                }
+                return imports::Settled::Ended;
+            }
+        };
         // Without a deadline the wait returns only with the job's end.
-        let Some(ran) = job.job.wait_until(None, || true, end_run) else {
+        let Some(ran) = job.wait_until(None, || true, end_run) else {
             return imports::Settled::Ended;
         };
         let settled = if matches!(ran, Ran::Abandoned) {
@@ -1721,7 +1789,7 @@ impl ResultSkin {
         } else {
             imports::Settled::Ended
         };
-        let _ = self.finish_image_stage(&job.slot, ran);
+        let _ = self.finish_image_stage(slot, ran);
         settled
     }
 
