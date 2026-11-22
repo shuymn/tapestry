@@ -531,17 +531,17 @@ fn loading_with_a_pending_peer_keeps_the_ready_clip_moving() {
     hub.supply([Some(Arc::clone(&a)), Some(Arc::clone(&pending))]);
     s.open_play_movies(Some(&play), 1, Some(1));
     s.movie_boundary();
+    // The first loading frame draws it: the fixture skin has no quad of
+    // it, so a frame presented with its quad stands in for that one.
+    s.loading_movies(&loading_frame(1, 0));
+    present(&mut s);
     let page = super::MenuPage::default();
-    let mut freed = Vec::new();
-    for (k, at) in [0, 1_000_000, 1_500_000, 2_000_000].into_iter().enumerate() {
+    let mut freed = vec![a.freed_total()];
+    for (k, at) in [1_000_000, 1_500_000, 2_000_000].into_iter().enumerate() {
         let drawn = s
             .loading(&page, None, k == 0, &loading_frame(1, at))
             .unwrap();
         assert!(drawn.is_ok());
-        // The loading frame drew no quad of it (the fixture skin has
-        // none), so the frame presented with its quad stands in.
-        s.loading_movies(&loading_frame(1, at));
-        present(&mut s);
         freed.push(a.freed_total());
     }
     assert!(!pending.settled(), "the peer still pending");
