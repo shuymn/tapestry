@@ -432,6 +432,9 @@ pub struct RunPlayer {
     /// worker and DLLs), each with the sha256 of the copy.
     pub files: Vec<CopiedFile>,
     pub sha256: String,
+    /// The sha256 the row expected of it, recorded before the holds: the
+    /// runner's own executable's, or the declared one (P5's).
+    pub expected: String,
     /// The sha256 the row declared for it (P5's mutated player).
     pub declared: Option<String>,
     /// The runner's own executable's sha256.

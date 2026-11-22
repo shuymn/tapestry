@@ -1098,37 +1098,72 @@ fn mutation_build(run: &[Value]) -> Result<Result<String, String>, String> {
 /// counter and the pointer input that brought it.
 type ArmEntry = (u64, u64, i64, String);
 
-/// Shot A's record and its frame's counter, and the volume arm's witness
-/// in it (docs/test-device.md "Run Guard", shots): each entry's slider,
+/// What the run's answers witnessed of the volume arm (docs/test-device.md
+/// "Run Guard", shots): shot A's frame counter and witness, and the witness
+/// of every later answer, by its shot's name. The witness is cumulative, so
+/// a later answer holds A's entries and any the arm took after A.
+struct Witnesses {
+    acquired: i64,
+    a: Vec<ArmEntry>,
+    later: Vec<(String, Vec<ArmEntry>)>,
+}
+
+/// Each answer's witness in the run's `shot` records: each entry's slider,
 /// percent, counter and the pointer input that brought it. Error: not
-/// exactly one shot A record, or one whose witness does not read.
-fn arm_witness(run: &[Value]) -> Result<(i64, Vec<ArmEntry>), String> {
-    let shots: Vec<&Value> = run
+/// exactly one shot A record, or a record whose witness does not read.
+fn arm_witness(run: &[Value]) -> Result<Witnesses, String> {
+    let shots: Vec<&Value> = run.iter().filter(|v| v["t"] == "shot").collect();
+    let at_a: Vec<usize> = shots
         .iter()
-        .filter(|v| v["t"] == "shot" && v["what"] == "shot-a.png")
+        .enumerate()
+        .filter(|(_, v)| v["what"] == "shot-a.png")
+        .map(|(i, _)| i)
         .collect();
-    let [shot] = shots.as_slice() else {
-        return Err(format!("{} shot A records, not one", shots.len()));
+    let [at_a] = at_a.as_slice() else {
+        return Err(format!("{} shot A records, not one", at_a.len()));
     };
+    let read = |shot: &Value| -> Result<Vec<ArmEntry>, String> {
+        let what = shot["what"].as_str().unwrap_or("a shot");
+        shot["volumes"]
+            .as_array()
+            .ok_or_else(|| format!("{what}'s record has no volume witness"))?
+            .iter()
+            .map(|v| {
+                (v.as_array().map(Vec::len) == Some(4)).then_some(())?;
+                Some((
+                    v[0].as_u64()?,
+                    v[1].as_u64()?,
+                    v[2].as_i64()?,
+                    v[3].as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("a volume in {what}'s witness does not read"))
+    };
+    let shot = shots.get(*at_a).ok_or("shot A's record is gone")?;
     let acquired = shot["frame"]["acquired"]
         .as_i64()
         .ok_or("shot A's record has no frame counter")?;
-    let reached = shot["volumes"]
-        .as_array()
-        .ok_or("shot A's record has no volume witness")?
+    let a = read(shot)?;
+    let later = shots
         .iter()
-        .map(|v| {
-            (v.as_array().map(Vec::len) == Some(4)).then_some(())?;
-            Some((
-                v[0].as_u64()?,
-                v[1].as_u64()?,
-                v[2].as_i64()?,
-                v[3].as_str()?.to_owned(),
-            ))
+        .skip(at_a + 1)
+        .map(|v| Ok((v["what"].as_str().unwrap_or("a shot").to_owned(), read(v)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Witnesses { acquired, a, later })
+}
+
+/// The entries each later answer's witness holds beyond shot A's (all of
+/// them when it does not start with A's): what the arm took after shot A.
+fn after_a(w: &Witnesses) -> Vec<String> {
+    w.later
+        .iter()
+        .filter(|(_, later)| *later != w.a)
+        .map(|(what, later)| {
+            let extra = later.strip_prefix(w.a.as_slice()).unwrap_or(later);
+            format!("{what}'s witness holds entries beyond shot A's: {extra:?}")
         })
-        .collect::<Option<Vec<_>>>()
-        .ok_or("a volume in shot A's witness does not read")?;
-    Ok((acquired, reached))
+        .collect()
 }
 
 /// The witness's press entries bound to the target clicks (`p1.volume-arm`):
@@ -1138,9 +1173,12 @@ fn arm_witness(run: &[Value]) -> Result<(i64, Vec<ArmEntry>), String> {
 /// click call and before shot A's frame; so each target's own press reached
 /// the arm with its value, whatever the player did with it after. Outer
 /// error (incomplete): the witness does not read, or the run's click calls
-/// at the targets are not one per target in order.
+/// at the targets are not one per target in order. Every later answer's
+/// witness must equal shot A's: an entry the arm took after shot A (a
+/// press dispatched late, or anything else) fails.
 fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
-    let (acquired, reached) = arm_witness(run)?;
+    let w = arm_witness(run)?;
+    let (acquired, reached) = (w.acquired, &w.a);
     let targets = test_device::panel::TARGETS;
     let calls: Vec<i64> = run
         .iter()
@@ -1195,6 +1233,7 @@ fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
             ));
         }
     }
+    wrong.extend(after_a(&w));
     Ok(if wrong.is_empty() {
         Ok(())
     } else {
@@ -1203,16 +1242,54 @@ fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
 }
 
 /// P4's affirmative absence (`p4.no-volume-arm`): no press, drag or other
-/// input brought any volume to the arm by shot A, so its clicks set nothing,
-/// not even a wrong slider. Outer error (incomplete): the witness does not
-/// read.
+/// input brought any volume to the arm in any answer's witness, shot A's or
+/// a later one's, so its clicks set nothing, not even a wrong slider and not
+/// late. Outer error (incomplete): a witness does not read.
 fn no_volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
-    let (_, reached) = arm_witness(run)?;
+    let w = arm_witness(run)?;
+    let reached: Vec<String> = std::iter::once(("shot-a.png", &w.a))
+        .chain(w.later.iter().map(|(what, l)| (what.as_str(), l)))
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(what, l)| format!("{what}: {l:?}"))
+        .collect();
     Ok(if reached.is_empty() {
         Ok(())
     } else {
-        Err(format!("the volume arm was reached: {reached:?}"))
+        Err(format!(
+            "the volume arm was reached: {}",
+            reached.join("; ")
+        ))
     })
+}
+
+/// Every panel row's player is the one the row expected
+/// (`p1.player-bound`): the `player` record's digest of the held copy
+/// equals the digest the runner recorded as expected before the holds, the
+/// runner's own executable's for every row but P5, whose mutated build is
+/// named by `--player-sha256`, and the launched executable's (the first
+/// copied file's). A run whose record names another digest, or none, fails.
+fn player_bound(run: &[Value], row: &str) -> Result<Result<(), String>, String> {
+    let p = run
+        .iter()
+        .find(|v| v["t"] == "player")
+        .ok_or("the run recorded no player")?;
+    let (sha, expected, runner, launched) = (
+        p["sha256"].as_str().unwrap_or_default(),
+        p["expected"].as_str().unwrap_or_default(),
+        p["runner_sha256"].as_str().unwrap_or_default(),
+        p["files"][0]["sha256"].as_str().unwrap_or_default(),
+    );
+    let own = row != "p5";
+    Ok(
+        if !sha.is_empty() && sha == expected && sha == launched && (!own || expected == runner) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the player run has sha256 {sha}; expected {}; the runner's own {runner}",
+                p["expected"]
+            ))
+        },
+    )
 }
 
 /// Every panel row's starting volumes (`p1.volumes-start`): the
@@ -1431,6 +1508,11 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
             panel_provenance(build, f, &x.mode),
         ),
         verdict("p1.grants", &[RUN_LINK], recs(&f.link).map(grants)),
+        verdict(
+            "p1.player-bound",
+            &[RUN_RUN],
+            recs(&f.run).and_then(|r| player_bound(r, row)),
+        ),
         verdict(
             "p1.volumes",
             &[file(DEVICE_BEFORE), file(DEVICE_AFTER)],
@@ -2292,6 +2374,9 @@ pub mod tests {
         let mut run = vec![
             json!({"t": "start"}),
             json!({"t": "sink", "q": 100, "window": SINK}),
+            // The runner's own build, expected and held.
+            json!({"t": "player", "q": 150, "path": "d/player-bin/t.exe", "files": [{"name": "tapestry.exe", "sha256": "4e"}], "source": "t.exe", "sha256": "4e", "expected": "4e", "declared": null,
+                   "runner_sha256": "4e", "commit": "nogit", "modified": 1}),
         ];
         for (k, (what, point)) in calls.iter().enumerate() {
             let (x, y) = point.unwrap_or((100, 50));
@@ -2368,7 +2453,7 @@ pub mod tests {
     fn a_good_panel_run_passes_every_check() {
         let (f, x) = panel_good();
         let all = panel(Some("0123456789ab"), &f, &x, "p1");
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), 14);
         for j in &all {
             assert_eq!(j.outcome, Outcome::Pass, "{j:?}");
         }
@@ -2391,11 +2476,8 @@ pub mod tests {
     fn p5_good() -> (Files, PanelFiles) {
         let (mut f, _) = panel_good();
         edit(&mut f.run, |r| {
-            r.insert(
-                2,
-                json!({"t": "player", "q": 150, "path": "d/player-bin/t.exe", "files": [], "source": "p5/t.exe", "sha256": "5a", "declared": "5a",
-                       "runner_sha256": "4e", "commit": "nogit", "modified": 1}),
-            );
+            r[2] = json!({"t": "player", "q": 150, "path": "d/player-bin/t.exe", "files": [{"name": "tapestry.exe", "sha256": "5a"}], "source": "p5/t.exe", "sha256": "5a", "expected": "5a", "declared": "5a",
+                          "runner_sha256": "4e", "commit": "nogit", "modified": 1});
         });
         (f, kept())
     }
@@ -2677,7 +2759,7 @@ pub mod tests {
         let arm = |vols: Value| {
             let (mut f, x) = panel_good();
             edit(&mut f.run, |r| {
-                for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+                for v in r.iter_mut().filter(|v| v["t"] == "shot") {
                     v["volumes"] = vols.clone();
                 }
             });
@@ -2792,6 +2874,101 @@ pub mod tests {
         );
     }
 
+    /// Every panel row's player is the one it expected (`p1.player-bound`):
+    /// the runner's own build in P1 and P4, P5's declared mutated build in
+    /// P5. A P4 run whose held copy is P5's mutated build, though the record
+    /// expected the runner's (an otherwise valid run on the wrong player),
+    /// fails; so do a P1 run whose expected digest is not the runner's, a
+    /// record with no expected digest, and a P5 run whose copy is not the
+    /// one it declared; a run with no `player` record is incomplete.
+    #[test]
+    fn every_panel_row_runs_the_player_it_expected() {
+        let (f, x) = panel_good();
+        for row in ["p1", "p4"] {
+            assert_eq!(
+                panel_outcome(&f, &x, row, "p1.player-bound").0,
+                Outcome::Pass,
+                "{row}"
+            );
+        }
+        let (f5, x5) = p5_good();
+        assert_eq!(
+            panel_outcome(&f5, &x5, "p5", "p1.player-bound").0,
+            Outcome::Pass
+        );
+        let bound = |row: &str, set: &[(&str, Value)]| {
+            let (mut f, x) = if row == "p5" { p5_good() } else { panel_good() };
+            edit(&mut f.run, |r| {
+                for (k, v) in set {
+                    r[2][*k] = v.clone();
+                }
+            });
+            panel_outcome(&f, &x, row, "p1.player-bound")
+        };
+        let (o, d) = bound("p4", &[("sha256", json!("5a"))]);
+        assert_eq!(o, Outcome::Fail);
+        assert!(d.contains("sha256 5a; expected \"4e\""), "{d}");
+        assert_eq!(
+            bound("p1", &[("sha256", json!("5a")), ("expected", json!("5a"))]).0,
+            Outcome::Fail,
+            "a normal row expects the runner's own build"
+        );
+        assert_eq!(bound("p1", &[("expected", Value::Null)]).0, Outcome::Fail);
+        assert_eq!(bound("p5", &[("sha256", json!("3c"))]).0, Outcome::Fail);
+        let (mut f, x) = panel_good();
+        edit(&mut f.run, |r| r.retain(|v| v["t"] != "player"));
+        assert_eq!(
+            panel_outcome(&f, &x, "p1", "p1.player-bound").0,
+            Outcome::Incomplete
+        );
+    }
+
+    /// Every answer's witness counts, not shot A's alone: an entry the arm
+    /// took after shot A, seen only in shot B's witness (a target's press
+    /// dispatched late, both frames and settings as they were), fails
+    /// P4's `p4.no-volume-arm` and P1's `p1.volume-arm`; shot B's witness
+    /// equal to shot A's passes, and one that does not read is incomplete.
+    #[test]
+    fn a_later_answer_s_witness_counts() {
+        let only_b = |row: &str, check: &str, vols: Value| {
+            let (mut f, x) = panel_good();
+            edit(&mut f.run, |r| {
+                for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+                    if row == "p4" {
+                        v["volumes"] = json!([]);
+                    }
+                }
+                for v in r.iter_mut().filter(|v| v["what"] == "shot-b.png") {
+                    v["volumes"] = vols.clone();
+                }
+            });
+            let x = if row == "p4" { kept_of(x) } else { x };
+            panel_outcome(&f, &x, row, check)
+        };
+        assert_eq!(only_b("p4", "p4.no-volume-arm", json!([])).0, Outcome::Pass);
+        let (o, d) = only_b("p4", "p4.no-volume-arm", json!([[17, 100, 2600, "press"]]));
+        assert_eq!(o, Outcome::Fail);
+        assert!(d.contains("shot-b.png: [(17, 100, 2600"), "{d}");
+        let a = json!([
+            [17, 25, 295, "press"],
+            [18, 50, 315, "press"],
+            [19, 75, 335, "press"]
+        ]);
+        assert_eq!(only_b("p1", "p1.volume-arm", a.clone()).0, Outcome::Pass);
+        let mut more = a.as_array().unwrap().clone();
+        more.push(json!([18, 100, 2600, "press"]));
+        let (o, d) = only_b("p1", "p1.volume-arm", Value::Array(more));
+        assert_eq!(o, Outcome::Fail);
+        assert!(
+            d.contains("shot-b.png's witness holds entries beyond shot A's: [(18, 100, 2600"),
+            "{d}"
+        );
+        assert_eq!(
+            only_b("p4", "p4.no-volume-arm", Value::Null).0,
+            Outcome::Incomplete
+        );
+    }
+
     /// P4's clicks bring nothing to the volume arm (`p4.no-volume-arm`): an
     /// empty witness passes; one press, even to a slider at 100 % that
     /// leaves the settings and the frame as P4's, fails; so does a drag; a
@@ -2801,7 +2978,7 @@ pub mod tests {
         let p4 = |vols: Value| {
             let (mut f, x) = panel_good();
             edit(&mut f.run, |r| {
-                for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+                for v in r.iter_mut().filter(|v| v["t"] == "shot") {
                     v["volumes"] = vols.clone();
                 }
             });

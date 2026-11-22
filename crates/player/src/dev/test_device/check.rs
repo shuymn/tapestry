@@ -404,6 +404,7 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
                 &[link],
                 &[ev(SINGLE, LINK, "check"), ev(SINGLE, LINK, "ping")],
             ),
+            judge("p1.player-bound", &[run], &[ev(SINGLE, RUN, "player")]),
             judge(
                 "p1.volumes",
                 &[f(DEVICE_BEFORE), f(DEVICE_AFTER)],
@@ -1107,6 +1108,9 @@ mod tests {
         before: Option<&'a str>,
         /// The private judge's name, in place of [`PANEL`].
         producer: Option<&'a str>,
+        /// A normal row's held copy is P5's mutated build, not the runner's
+        /// own it expected.
+        other_player: bool,
         /// The private judge's checks that failed.
         failing: &'a [&'a str],
         /// The player's executable is another than the declared one.
@@ -1138,6 +1142,8 @@ mod tests {
         let player = json!({"pid": 8, "created": 80});
         let (f, x) = super::super::judge::tests::panel_good();
         let mut run = f.run.records.unwrap();
+        // The folder's own `player` record replaces the judge fixture's.
+        run.retain(|v| v["t"] != "player");
         let mut link = f.link.records.unwrap();
         let mut recorder = f.recorder.records.unwrap();
         if row == "p4" {
@@ -1167,10 +1173,15 @@ mod tests {
             } else {
                 mutated.clone()
             };
-            json!({"t": "player", "q": 45, "path": "d/player-bin/t.exe", "files": [], "source": "p5/t.exe", "sha256": sha, "declared": mutated,
+            json!({"t": "player", "q": 45, "path": "d/player-bin/t.exe", "files": [{"name": "tapestry.exe", "sha256": sha}], "source": "p5/t.exe", "sha256": sha, "expected": mutated, "declared": mutated,
                    "runner_sha256": head, "commit": "nogit", "modified": 1})
         } else {
-            json!({"t": "player", "q": 45, "path": "d/player-bin/t.exe", "files": [], "source": "t.exe", "sha256": head, "declared": null,
+            let sha = if how.other_player {
+                mutated.clone()
+            } else {
+                head.clone()
+            };
+            json!({"t": "player", "q": 45, "path": "d/player-bin/t.exe", "files": [{"name": "tapestry.exe", "sha256": sha}], "source": "t.exe", "sha256": sha, "expected": head, "declared": null,
                    "runner_sha256": head, "commit": "nogit", "modified": 1})
         };
         run.splice(
@@ -1342,7 +1353,7 @@ mod tests {
     fn a_panel_row_binds_its_presses_and_its_starting_volumes() {
         type Edit = fn(&mut Vec<serde_json::Value>);
         fn witness(r: &mut [serde_json::Value], vols: &serde_json::Value) {
-            for v in r.iter_mut().filter(|v| v["what"] == "shot-a.png") {
+            for v in r.iter_mut().filter(|v| v["t"] == "shot") {
                 v["volumes"] = vols.clone();
             }
         }
@@ -1421,6 +1432,56 @@ mod tests {
                 "{row}: {out}"
             );
         }
+    }
+
+    /// A normal row binds its player and every answer's witness: P4 run on
+    /// P5's mutated build (frames, settings and witnesses otherwise P4's) is
+    /// a mismatch on `p1.player-bound`; P4 with a dispatch only in shot B's
+    /// witness is one on `p4.no-volume-arm`; P1 with an extra entry only in
+    /// shot B's is one on `p1.volume-arm`.
+    #[test]
+    fn a_panel_row_binds_its_player_and_every_witness() {
+        let (ok, out) = verdict(
+            "p4",
+            &Folder {
+                left: true,
+                failing: &[FRAME_A],
+                other_player: true,
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("check `p1.player-bound` is Fail"), "{out}");
+        let (ok, out) = verdict(
+            "p4",
+            &Folder {
+                left: true,
+                failing: &[FRAME_A],
+                shots: Some(|r| {
+                    for v in r.iter_mut().filter(|v| v["what"] == "shot-b.png") {
+                        v["volumes"] = serde_json::json!([[17, 100, 2600, "press"]]);
+                    }
+                }),
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("check `p4.no-volume-arm` is Fail"), "{out}");
+        let (ok, out) = verdict(
+            "p1",
+            &Folder {
+                shots: Some(|r| {
+                    for v in r.iter_mut().filter(|v| v["what"] == "shot-b.png") {
+                        if let Some(w) = v["volumes"].as_array_mut() {
+                            w.push(serde_json::json!([18, 100, 2600, "press"]));
+                        }
+                    }
+                }),
+                ..Folder::default()
+            },
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("check `p1.volume-arm` is Fail"), "{out}");
     }
 
     fn recs_line(s: &super::super::judge::Stream) -> String {

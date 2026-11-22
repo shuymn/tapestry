@@ -1438,13 +1438,38 @@ pub fn last_write(filetime: u64) -> anyhow::Result<u64> {
     Ok(filetime)
 }
 
+/// The digest a panel row expects of its player's held copy: the one the
+/// row declared (`--player-sha256`, P5's mutated build), or else the
+/// runner's own executable's, since every other row runs the build that
+/// runs it.
+#[must_use]
+pub fn expected_player<'a>(declared: Option<&'a str>, runner: &'a str) -> &'a str {
+    declared.unwrap_or(runner)
+}
+
+/// The held copy's digest against the one its row expects.
+///
+/// # Errors
+///
+/// The digests differ: the run must not start that player.
+pub fn bind_player(source: &Path, sha: &str, expected: &str) -> anyhow::Result<()> {
+    if sha != expected {
+        bail!(
+            "the player {} has sha256 {sha}, not the expected {expected}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
 /// The `player` record: the private copy a panel row starts (`path`) and
 /// the executable it was copied from (`source`), the copy's sha256 as read
-/// through its held handle, the sha256 the row declared for it
-/// (`--player-sha256`; one that differs is refused before anything
-/// starts), the runner's own executable's sha256, the commit the copy
-/// reports (`<copy> test-device commit`, run in the run's job with its
-/// output in `player-commit.txt`) and the source's last write.
+/// through its held handle, the sha256 the row expected for it (`expected`,
+/// [`expected_player`]; one that differs is refused before anything
+/// starts), the sha256 the row declared (`--player-sha256`, P5's alone),
+/// the runner's own executable's sha256, the commit the copy reports
+/// (`<copy> test-device commit`, run in the run's job with its output in
+/// `player-commit.txt`) and the source's last write.
 fn player_record(
     b: &Begun,
     source: &Path,
@@ -1452,15 +1477,9 @@ fn player_record(
     declared: Option<&str>,
 ) -> anyhow::Result<()> {
     let sha = &v.sha256;
-    if let Some(d) = declared
-        && d != sha
-    {
-        bail!(
-            "the player {} has sha256 {sha}, not the declared {d}",
-            source.display()
-        );
-    }
     let runner = owner::digest(&std::env::current_exe().context("the runner's own path")?)?;
+    let expected = expected_player(declared, &runner);
+    bind_player(source, sha, expected)?;
     let filetime = last_write(std::os::windows::fs::MetadataExt::last_write_time(
         &std::fs::metadata(source).with_context(|| source.display().to_string())?,
     ))?;
@@ -1493,7 +1512,7 @@ fn player_record(
         .to_owned();
     b.log.put(json!({
         "t": "player", "path": v.exe.to_string_lossy(), "source": source.to_string_lossy(),
-        "sha256": sha, "declared": declared,
+        "sha256": sha, "expected": expected, "declared": declared,
         "files": v.files.iter().map(|(name, sha256)| json!({ "name": name, "sha256": sha256 })).collect::<Vec<_>>(),
         "runner_sha256": runner, "commit": commit, "modified": filetime,
     }));
@@ -2298,6 +2317,23 @@ mod tests {
     }
 
     /// A last write before 1970 is refused; 1970 itself and later stand.
+    /// A panel row expects the runner's own build of its player unless it
+    /// declares another (P5's mutated build), and a held copy of any other
+    /// digest is refused: P4 pointed at P5's executable does not run.
+    #[test]
+    fn a_row_runs_only_the_player_it_expects() {
+        let (runner, mutated) = ("4e".repeat(32), "5a".repeat(32));
+        assert_eq!(expected_player(None, &runner), runner);
+        assert_eq!(expected_player(Some(&mutated), &runner), mutated);
+        let exe = Path::new("p5/tapestry.exe");
+        let e = bind_player(exe, &mutated, expected_player(None, &runner))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&format!("not the expected {runner}")), "{e}");
+        bind_player(exe, &runner, expected_player(None, &runner)).unwrap();
+        bind_player(exe, &mutated, expected_player(Some(&mutated), &runner)).unwrap();
+    }
+
     #[test]
     fn a_last_write_before_1970_is_refused() {
         assert!(last_write(UNIX_EPOCH_FILETIME - 1).is_err());
