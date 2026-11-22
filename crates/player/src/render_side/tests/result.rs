@@ -5218,11 +5218,18 @@ fn a_first_view_whose_commit_is_refused_falls_back_to_its_page() {
         &payload(1, Some(&a), 1_000, &[]),
         &Overlay::default(),
     );
+    // The status is published before the frame reaches the sink: the
+    // page's frame is waited for there.
     assert!(
-        wait_until(|| rig.link.result_status().shown == Some((1, false))),
+        wait_until(|| views
+            .0
+            .lock()
+            .unwrap()
+            .contains(&(ResultPath::BuiltIn, Some(1)))),
         "the first view not committed as its page: {:?}",
         rig.link.result_status()
     );
+    assert_eq!(rig.link.result_status().shown, Some((1, false)));
     assert!(
         !rig.faults.refuse_commit.load(Ordering::Acquire),
         "never refused"

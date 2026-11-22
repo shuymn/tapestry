@@ -2228,6 +2228,9 @@ struct Shared {
     /// The result view stagings ended, ready or not (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     stagings_ended: AtomicU64,
+    /// Result views committed (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    result_commits: AtomicU64,
     /// No boundary destroys a filled entry while set (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     destruction_held: AtomicBool,
@@ -2446,6 +2449,8 @@ impl Shared {
             withdrawals: Mutex::new(Vec::new()),
             #[cfg(all(test, feature = "dev-tools"))]
             stagings_ended: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            result_commits: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
             destruction_held: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -4235,6 +4240,12 @@ impl RenderLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The result views committed so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn result_commits(&self) -> u64 {
+        self.shared.result_commits.load(Ordering::SeqCst)
     }
 
     /// The result view stagings ended so far, ready or not (tests).
@@ -14219,6 +14230,8 @@ impl Run {
                     });
                     match commit {
                         ViewCommit::Committed => {
+                            #[cfg(all(test, feature = "dev-tools"))]
+                            shared.result_commits.fetch_add(1, Ordering::SeqCst);
                             if v.token.is_some() {
                                 side.reconcile = true;
                             }

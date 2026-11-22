@@ -2442,21 +2442,25 @@ fn a_render_thread_held_across_both_publications_shows_the_hand_over_view_first(
 }
 
 /// V19 (l3): the first view's text refused, which disables the kind before
-/// the first commit: the first committed view is the hand-over payload's
-/// built-in page, committed with no runtime (no fallback at the commit
-/// point), and the presenter's built-in payload shows after the
-/// acknowledgement.
+/// the first commit and retires every runtime: the first committed view is
+/// the hand-over payload's built-in page, committed with no runtime (no
+/// fallback at the commit point), and the presenter's built-in payload
+/// commits after the acknowledgement.
 #[test]
 fn a_text_refused_first_view_commits_its_built_in_page_first() {
     let _serial = imports::serial();
     let (dir, a) = chart(Some(RED));
     on_warp(a.chart(), |rig, frames| {
         let (report, screen) = result_of(dir.path());
-        let (from, _skin) = held_miss_with_text(rig, frames, &a, &report, &screen);
-        laid_out(rig);
+        let (from, _skin) = held_scripted_miss(rig, frames, &a, &report, &screen);
         crate::dev::refuse_next_result_text();
+        let commits = rig.render.result_commits();
         rig.show_end(&report, &screen);
         let handed = published(rig);
+        assert!(
+            handed.script.is_some(),
+            "the hand-over's view keeps no runtime"
+        );
         let seen = frames.until(rig, from, "the first committed view", |f| {
             f.iter().any(|f| f.path.is_some() && !f.pending())
         });
@@ -2475,7 +2479,9 @@ fn a_text_refused_first_view_commits_its_built_in_page_first() {
         let revision = rig.presenter.revision();
         until_true(rig, "the built-in payload committed", |rig| {
             let s = rig.render.result_status();
-            s.revision >= revision && s.shown == Some((handed.key, false))
+            s.revision >= revision
+                && s.shown == Some((handed.key, false))
+                && rig.render.result_commits() >= commits + 2
         });
         let status = rig.render.result_status();
         assert!(status.disabled.is_some(), "the kind not disabled");
