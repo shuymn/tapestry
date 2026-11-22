@@ -1759,6 +1759,20 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let ime = window_thread.as_ref().map(window::WindowThread::ime);
     let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
+    // The window's own shots, asked for on a runner's pipe
+    // (`--dev-shot-pipe`): every window renderer made copies for the tap.
+    // The select skin's clock frozen for a test device's shots
+    // (`--dev-freeze-skin-clock`).
+    #[cfg(feature = "dev-tools")]
+    if s.dev.freeze_skin_clock {
+        dev::skin_clock::freeze();
+    }
+    #[cfg(feature = "dev-tools")]
+    let shot_tap = s.dev.shot_pipe.clone().map(|name| {
+        let tap = dev::present_shot::Tap::new();
+        dev::present_shot::start(name, Arc::clone(&tap));
+        tap
+    });
     let make: MakeScreen = match (surface, link) {
         (Some(surface), Some(link)) => Box::new(move |font| {
             let target = Target::Window {
@@ -1766,7 +1780,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 width: surface.width,
                 height: surface.height,
             };
-            let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+            let mut r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            #[cfg(feature = "dev-tools")]
+            if let Some(tap) = &shot_tap
+                && let Err(e) = r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>)
+            {
+                eprintln!("dev: the window's shots: {e}");
+            }
             let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
                 .with_sink(Box::new(link.clone()));
             Ok(Box::new(screen) as Box<dyn Screen>)
@@ -1865,6 +1886,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         preset_steps: std::collections::VecDeque::new(),
         covers_turned: [false; 3],
         volumes_set: [None; 3],
+        #[cfg(feature = "dev-tools")]
+        act_origin: crate::dev::present_shot::VolumeOrigin::Other,
         cues: crate::select::SelectCues::default(),
         feed: selection_skin::SkinFeed::default(),
         ime,

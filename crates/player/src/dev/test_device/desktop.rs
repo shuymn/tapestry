@@ -3,7 +3,7 @@
 //! tagged `SendInput` calls: the real [`Desk`] of the guarded click.
 
 use anyhow::{Context as _, bail};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
@@ -18,10 +18,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GUI_INMENUMODE, GUI_POPUPMENUMODE, GUI_SYSTEMMENUMODE, GUITHREADINFO, GetAncestor,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics,
-    GetWindowThreadProcessId, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WindowFromPoint,
+    EnumWindows, GA_ROOT, GUI_INMENUMODE, GUI_POPUPMENUMODE, GUI_SYSTEMMENUMODE, GUITHREADINFO,
+    GetAncestor, GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetSystemMetrics, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetForegroundWindow,
+    WM_CLOSE, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -150,6 +151,85 @@ pub fn process_of(w: Win) -> u32 {
     pid
 }
 
+/// The visible top-level windows of process `pid`.
+pub fn windows_of(pid: u32) -> Vec<Win> {
+    struct Find {
+        pid: u32,
+        out: Vec<Win>,
+    }
+    unsafe extern "system" fn each(h: HWND, data: LPARAM) -> BOOL {
+        // SAFETY: `data` is the Find passed below, alive for the call.
+        let f = unsafe { &mut *(data.0 as *mut Find) };
+        // SAFETY: a window handle the system gave.
+        if process_of(win(h)) == f.pid && unsafe { IsWindowVisible(h) }.as_bool() {
+            f.out.push(win(h));
+        }
+        BOOL(1)
+    }
+    let mut f = Find {
+        pid,
+        out: Vec::new(),
+    };
+    // SAFETY: the callback reads `f` only during the call.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM((&raw mut f) as isize)) };
+    f.out
+}
+
+/// The visible top-level window of `pid` with the largest client area, if
+/// it has one: a process can show other windows, of no size, before (or
+/// beside) its own.
+pub fn main_window_of(pid: u32) -> Option<Win> {
+    windows_of(pid)
+        .into_iter()
+        .filter_map(|w| {
+            let [_, _, cw, ch] = client_rect(w)?;
+            (cw > 0 && ch > 0).then_some((i64::from(cw) * i64::from(ch), w))
+        })
+        .max_by_key(|&(area, _)| area)
+        .map(|(_, w)| w)
+}
+
+/// How long [`bring_to_front`] waits for the window to come in front.
+const FRONT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Asks for window `w` in front (`SetForegroundWindow`) and waits up to
+/// [`FRONT_WAIT`], looking every 10 ms, for the foreground to be `w`:
+/// Windows may refuse a process that is not in front.
+///
+/// # Errors
+///
+/// Another window stayed in front.
+pub fn bring_to_front(w: Win) -> Result<(), String> {
+    // SAFETY: no pointers. Its result is not the evidence; the
+    // foreground read below is.
+    let _ = unsafe { SetForegroundWindow(hwnd(w)) };
+    let end = std::time::Instant::now() + FRONT_WAIT;
+    loop {
+        let fg = foreground();
+        if fg == w {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= end {
+            return Err(format!(
+                "window {fg:#x} of process {} stayed in front for {FRONT_WAIT:?}",
+                process_of(fg)
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Asks window `w` to close (`WM_CLOSE`), as its close button would.
+///
+/// # Errors
+///
+/// The message cannot be posted.
+pub fn close(w: Win) -> anyhow::Result<()> {
+    // SAFETY: no pointers.
+    unsafe { PostMessageW(Some(hwnd(w)), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+        .context("PostMessage(WM_CLOSE)")
+}
+
 /// The mouse input of one [`Input`], tagged.
 fn mouse(input: Input, tag: u32) -> INPUT {
     let (dx, dy, flags) = match input {
@@ -175,11 +255,15 @@ fn mouse(input: Input, tag: u32) -> INPUT {
     }
 }
 
+/// Records a call (its tag, what it sends and the client point it aims
+/// at) before it is made.
+pub type Note<'a> = dyn FnMut(u32, &str, (i32, i32)) + 'a;
+
 /// The real desktop, for the run's monitor `monitor` (by name).
 pub struct Real<'a> {
     pub monitor: String,
     /// Records a call before it is made (the run's `call` record).
-    pub note: &'a mut dyn FnMut(u32, &str),
+    pub note: &'a mut Note<'a>,
 }
 
 impl Desk for Real<'_> {
@@ -258,8 +342,8 @@ impl Desk for Real<'_> {
         unsafe { SendInput(&batch, i32::try_from(size_of::<INPUT>()).unwrap_or(0)) }
     }
 
-    fn note(&mut self, tag: u32, what: &str) {
-        (self.note)(tag, what);
+    fn note(&mut self, tag: u32, what: &str, point: (i32, i32)) {
+        (self.note)(tag, what, point);
     }
 
     fn sleep(&mut self, ms: u64) {
