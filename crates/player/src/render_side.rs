@@ -4139,13 +4139,13 @@ impl RenderLink {
 
     /// Holds each result frame after its commit point and runtime step
     /// from now on (`true`), or lets them go (`false`) (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn hold_result_commit(&self, on: bool) {
         self.shared.result_commit_hold[0].store(on, Ordering::SeqCst);
     }
 
     /// Whether a result frame holds after its commit point (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn result_commit_held(&self) -> bool {
         self.shared.result_commit_hold[1].load(Ordering::SeqCst)
     }

@@ -5071,11 +5071,15 @@ fn switch_reducing_the_pool(a: &Arc<render::SkinBundle>, b: &Arc<render::SkinBun
     rig.link.exit();
 }
 
+/// A result frame's path and the view it presented.
+#[cfg(feature = "dev-tools")]
+type Seen = (crate::measure::ResultPath, Option<u64>);
+
 /// The result frames' paths and the view each presented, a sink saw, in
 /// order.
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Default)]
-struct Views(Arc<Mutex<Vec<(crate::measure::ResultPath, Option<u64>)>>>);
+struct Views(Arc<Mutex<Vec<Seen>>>);
 
 #[cfg(feature = "dev-tools")]
 impl FrameSink for Views {
