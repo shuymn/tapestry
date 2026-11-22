@@ -26,6 +26,9 @@ const ROWS: &[Row] = &[
     ("p4", p4),
     ("p5", p5),
     ("p1-kill", p1_kill),
+    ("p1-ref", p1_ref),
+    ("p1-ref-75", p1_ref_75),
+    ("p1-compare", p1_compare),
 ];
 
 /// The private panel judge's name: it writes `verdicts-panel-exact.jsonl`.
@@ -59,7 +62,7 @@ const fn rule(
 
 fn check_rule(id: &'static str, outcome: Outcome, inputs: &[File], events: &[Event]) -> CheckRule {
     CheckRule {
-        id,
+        id: id.into(),
         producer: PRODUCER,
         outcome,
         inputs: inputs.to_vec(),
@@ -348,8 +351,8 @@ fn panel(row: &'static str, failing: &[&str], negative: Option<Negative>) -> Exp
         }
     };
     let judge = |id, inputs: &[File], events: &[Event]| check_rule(id, outcome(id), inputs, events);
-    let private = |id, inputs: &[File]| CheckRule {
-        id,
+    let private = |id: &'static str, inputs: &[File]| CheckRule {
+        id: id.into(),
         producer: PANEL,
         outcome: outcome(id),
         inputs: inputs.to_vec(),
@@ -637,6 +640,237 @@ fn p1_kill() -> Expectation {
     }
 }
 
+/// A reference row (`p1-ref`, `p1-ref-75`): the runner attaches to the
+/// reference player's window, clicks the row's targets and captures shot A
+/// twice; it starts no player and holds nothing on the device, so its link
+/// makes no check and the release evidence's `hello` keeps its reason.
+fn reference(row: &'static str) -> Expectation {
+    use Count::{AtLeast, Exactly};
+    let (run, link, rec) = (
+        file(SINGLE, RUN),
+        file(SINGLE, LINK),
+        file(SINGLE, RECORDER),
+    );
+    let check =
+        |id, inputs: &[File], events: &[Event]| check_rule(id, Outcome::Pass, inputs, events);
+    let role = SINGLE;
+    Expectation {
+        row,
+        binding: Binding::Run,
+        roles: vec![Role { name: SINGLE, row }],
+        exits: vec![
+            exit_rule(SINGLE, RUNNER, None, Exit::Code(0)),
+            exit_rule(
+                SINGLE,
+                "recorder",
+                Some((SINGLE, "recorder")),
+                Exit::Code(0),
+            ),
+        ],
+        records: vec![
+            rule(role, RUN, "spawn", Exactly(1)),
+            rule(role, RUN, "mode", Exactly(0)),
+            rule(role, RUN, "player", Exactly(0)),
+            rule(role, RUN, "sink", Exactly(1)),
+            rule(role, RUN, "window", Exactly(0)),
+            rule(role, RUN, "attach", Exactly(1)),
+            rule(role, RUN, "call", AtLeast(9)),
+            rule(role, RUN, "held", Exactly(0)),
+            rule(role, RUN, "shot", Exactly(0)),
+            rule(role, RUN, "capture", Exactly(1)),
+            rule(role, RUN, "stop", Exactly(1)),
+            rule(role, RUN, "quiet", Exactly(1)),
+            rule(role, RUN, "close", Exactly(1)),
+            rule(role, RUN, "exit", Exactly(1)),
+            // The link, the recorder, the two captures.
+            rule(role, RUN, "seal", Exactly(4)),
+            rule(role, LINK, "open", Exactly(1)),
+            rule(role, LINK, "fence", Exactly(1)),
+            rule(role, LINK, "check", Exactly(0)),
+        ],
+        checks: vec![
+            check("provenance", &[link], &[ev(SINGLE, LINK, "ans")]),
+            check("ref.attached", &[run], &[ev(SINGLE, RUN, "attach")]),
+            check(
+                "p1.clicks",
+                &[run, rec],
+                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RECORDER, "mouse")],
+            ),
+            check(
+                "p1.no-foreign",
+                &[run, rec],
+                &[ev(SINGLE, RUN, "call"), ev(SINGLE, RUN, "quiet")],
+            ),
+            check(
+                "ref.device-idle",
+                &[link, rec],
+                &[ev(SINGLE, LINK, "open"), ev(SINGLE, RUN, "quiet")],
+            ),
+            check(
+                "ref.capture-bound",
+                &[run, rec],
+                &[ev(SINGLE, RUN, "capture"), ev(SINGLE, RECORDER, "mouse")],
+            ),
+            check(
+                "p1.release-requested",
+                &[run, link],
+                &[ev(SINGLE, RUN, "stop"), ev(SINGLE, LINK, "ans")],
+            ),
+            check(
+                "ref.quiet-before-close",
+                &[run, link],
+                &[ev(SINGLE, RUN, "close"), ev(SINGLE, LINK, "fence")],
+            ),
+        ],
+        negative: None,
+    }
+}
+
+/// `p1-ref`: the reference player's panel 3 with each volume target
+/// clicked, as P1 clicks them.
+fn p1_ref() -> Expectation {
+    reference("p1-ref")
+}
+
+/// `p1-ref-75`: the comparison's control, slider 17 clicked at 75 %.
+fn p1_ref_75() -> Expectation {
+    reference("p1-ref-75")
+}
+
+/// The private comparison's name: it writes
+/// `verdicts-panel-compare.jsonl` in a `p1-compare` set's folder.
+pub const COMPARE: &str = "panel-compare";
+
+/// The regions the comparison judges, per slider: its bar, its graph and
+/// its number.
+const COMPARED: [&str; 9] = [
+    "band-17",
+    "graph-17",
+    "number-17",
+    "band-18",
+    "graph-18",
+    "number-18",
+    "band-19",
+    "graph-19",
+    "number-19",
+];
+/// Each slider's knob position, judged on its own.
+const KNOBS: [&str; 3] = ["knob-17", "knob-18", "knob-19"];
+
+/// `p1-compare`: tapestry's panel 3 against the reference player's, each
+/// set by clicks on the test device. Its roles are two runs of P1 (`A1`,
+/// `A2`), two of `p1-ref` (`R1`, `R2`) and one of `p1-ref-75` (`R75`),
+/// reserved together; each role's run is held to its own row's
+/// expectation (its checks named by the role), with one provenance over
+/// every role's links. The private comparison judges each A run against
+/// the R run of its pair (`A1` with `R1`, `A2` with `R2`) per region and
+/// knob, the two R runs against each other, and two controls that must
+/// fail: `A1` against `R75` (slider 17 differs, the others pass), and `A1`
+/// against `R1` shifted 3 pixels (every slider).
+fn p1_compare() -> Expectation {
+    use super::run::{MODE_LINK, SHOT_A, SHOT_A_2};
+    const ROLES: [(&str, &str); 5] = [
+        ("A1", "p1"),
+        ("A2", "p1"),
+        ("R1", "p1-ref"),
+        ("R2", "p1-ref"),
+        ("R75", "p1-ref-75"),
+    ];
+    let second = SHOT_A_2;
+    let mut exits = Vec::new();
+    let mut records = Vec::new();
+    let mut checks = vec![check_rule(
+        "provenance",
+        Outcome::Pass,
+        &ROLES
+            .iter()
+            .flat_map(|&(role, row)| {
+                std::iter::once(file(role, LINK))
+                    .chain((row == "p1").then(|| file(role, MODE_LINK)))
+            })
+            .collect::<Vec<_>>(),
+        &ROLES
+            .iter()
+            .map(|&(role, _)| ev(role, LINK, "ans"))
+            .collect::<Vec<_>>(),
+    )];
+    for (role, row) in ROLES {
+        let e = expectation_of(row).and_then(|e| e.as_role(role));
+        let Some(r) = e else {
+            continue;
+        };
+        exits.extend(r.exits);
+        records.extend(r.records);
+        checks.extend(r.checks);
+    }
+    let inputs = |a: &'static str, r: &'static str| -> Vec<File> {
+        let mut v = vec![file(a, RUN), file(a, SHOT_A), file(r, RUN), file(r, SHOT_A)];
+        if r.starts_with('R') {
+            v.push(file(r, second));
+        }
+        if a.starts_with('R') {
+            v.insert(2, file(a, second));
+        }
+        v
+    };
+    let events = |a: &'static str, r: &'static str| -> Vec<Event> {
+        [a, r]
+            .into_iter()
+            .map(|x| {
+                if x.starts_with('A') {
+                    ev(x, RUN, "shot")
+                } else {
+                    ev(x, RUN, "capture")
+                }
+            })
+            .collect()
+    };
+    let compare = |id: String, outcome, a, r| CheckRule {
+        id: id.into(),
+        producer: COMPARE,
+        outcome,
+        inputs: inputs(a, r),
+        events: events(a, r),
+    };
+    for (pair, a, r) in [
+        ("a1-r1", "A1", "R1"),
+        ("a2-r2", "A2", "R2"),
+        ("r1-r2", "R1", "R2"),
+    ] {
+        for m in COMPARED.iter().chain(&KNOBS) {
+            checks.push(compare(format!("compare.{pair}.{m}"), Outcome::Pass, a, r));
+        }
+    }
+    for m in COMPARED.iter().chain(&KNOBS) {
+        let outcome = if m.ends_with("-17") {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        };
+        checks.push(compare(format!("compare.a1-r75.{m}"), outcome, "A1", "R75"));
+    }
+    for slider in [17, 18, 19] {
+        checks.push(compare(
+            format!("compare.a1-r1-shift3.slider-{slider}"),
+            Outcome::Fail,
+            "A1",
+            "R1",
+        ));
+    }
+    Expectation {
+        row: "p1-compare",
+        binding: Binding::Set,
+        roles: ROLES
+            .iter()
+            .map(|&(name, row)| Role { name, row })
+            .collect(),
+        exits,
+        records,
+        checks,
+        negative: None,
+    }
+}
+
 /// A panel run's shots bound to the player and to their phases, from the
 /// run's and the recorder's records alone, not from the runner's steps: the
 /// run stream holds exactly one `shot` record of each shot, naming the
@@ -835,6 +1069,23 @@ fn run(rows: &[Row], row: &str, dir: &Path, out: &mut dyn Write) -> anyhow::Resu
     if super::judge::held_by(row).is_some() {
         report.mismatches.extend(shots_bound(dir, row));
     }
+    // A set's panel roles: each role's shots, bound in its own folder.
+    if e.binding == Binding::Set
+        && let Ok(Some(set)) = super::owner::reservation(dir)
+    {
+        for role in &e.roles {
+            let Some(r) = set.roles.iter().find(|r| r.role == role.name) else {
+                continue;
+            };
+            if super::judge::held_by(role.row).is_some() && contract::one_segment(&r.dir) {
+                report.mismatches.extend(
+                    shots_bound(&dir.join(&r.dir), role.row)
+                        .into_iter()
+                        .map(|m| format!("role `{}`: {m}", role.name)),
+                );
+            }
+        }
+    }
     for n in &report.notes {
         writeln!(out, "note: {n}")?;
     }
@@ -869,7 +1120,7 @@ mod tests {
             }],
             records: vec![],
             checks: vec![CheckRule {
-                id: "provenance",
+                id: "provenance".into(),
                 producer: "judge",
                 outcome: Outcome::Incomplete,
                 inputs: vec![],
@@ -897,12 +1148,12 @@ mod tests {
         }
         // Each negative fails exactly its declared set, and its checks are
         // its positive row's, in the same order.
-        let ids = |e: &Expectation| e.checks.iter().map(|c| c.id).collect::<Vec<_>>();
+        let ids = |e: &Expectation| e.checks.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
         let failing = |e: &Expectation| {
             e.checks
                 .iter()
                 .filter(|c| c.outcome == Outcome::Fail)
-                .map(|c| c.id)
+                .map(|c| c.id.clone())
                 .collect::<Vec<_>>()
         };
         assert!(failing(&p1()).is_empty());
@@ -931,12 +1182,11 @@ mod tests {
             .checks
             .iter()
             .filter(|c| c.outcome == Outcome::Fail)
-            .map(|c| c.id)
+            .map(|c| &*c.id)
             .collect();
         assert_eq!(failing, ["n1.quiet-before-close"]);
         // The negative's checks are the row's, in the same order.
-        let ids = |e: Expectation| e.checks.iter().map(|c| c.id).collect::<Vec<_>>();
-        assert_eq!(ids(neg), ids(sink()));
+        assert_eq!(ids(&neg), ids(&sink()));
     }
 
     /// Writes an N1 run folder as the runner writes it, from the judge's
@@ -1122,6 +1372,21 @@ mod tests {
         reports: Option<fn(&mut Vec<serde_json::Value>)>,
         /// The panel verdicts leave the run's stream out of their inputs.
         unbound: bool,
+        /// The folder is a set's role: its reservation, and no verdicts of
+        /// its own (the set's are in the set's folder).
+        role: Option<SetRole<'a>>,
+        /// The shots' bytes from this folder's files of their names, in
+        /// place of a stand-in.
+        shot_files: Option<&'a std::path::Path>,
+    }
+
+    /// A role of a set as its run's `start` names it.
+    #[derive(Clone, Copy)]
+    struct SetRole<'a> {
+        role: &'a str,
+        run: &'a str,
+        set: &'a str,
+        cut: u32,
     }
 
     /// Writes a panel row's run folder as the runner writes it, from the
@@ -1136,7 +1401,15 @@ mod tests {
             DEVICE_AFTER, DEVICE_BEFORE, PLAYER_AFTER, PLAYER_BEFORE, STDERR, STDOUT,
         };
         use super::super::run::{MODE_LINK, SHOT_A, SHOT_B};
-        let run_id = "0123456789abcdef0123456789abcdef";
+        let (run_id, role, set, cut) = how.role.map_or(
+            (
+                "0123456789abcdef0123456789abcdef",
+                SINGLE,
+                None,
+                0x4000_0123,
+            ),
+            |r| (r.run, r.role, Some(r.set), r.cut),
+        );
         let me = json!({"pid": 1, "created": 2});
         let rec = json!({"pid": 7, "created": 70});
         let player = json!({"pid": 8, "created": 80});
@@ -1160,9 +1433,9 @@ mod tests {
             }
         }
         run[0] = json!({
-            "t": "start", "run": run_id, "row": row, "role": SINGLE, "build": "0123456789ab",
-            "process": me, "commit": super::super::COMMIT, "tag": 0xABCD, "cut": 0x4000_0123,
-            "args": [], "set": null, "inner": null,
+            "t": "start", "run": run_id, "row": row, "role": role, "build": "0123456789ab",
+            "process": me, "commit": super::super::COMMIT, "tag": 0xABCD, "cut": cut,
+            "args": [], "set": set, "inner": null,
         });
         let end = run.pop().unwrap();
         let hello = recs_line(&x.mode);
@@ -1250,14 +1523,21 @@ mod tests {
             (SHOT_B, b"b".to_vec()),
         ];
         for (name, bytes) in &files {
+            let bytes = match (name, how.shot_files) {
+                (&(SHOT_A | SHOT_B), Some(from)) => std::fs::read(from.join(name)).unwrap(),
+                _ => bytes.clone(),
+            };
             std::fs::write(dir.join(name), bytes).unwrap();
-            run.push(super::super::owner::seal(dir, &dir.join(name), run_id, SINGLE).unwrap());
+            run.push(super::super::owner::seal(dir, &dir.join(name), run_id, role).unwrap());
         }
         run.push(end);
         if let Some(edit) = how.shots {
             edit(&mut run);
         }
         std::fs::write(dir.join(RUN), lines(&run)).unwrap();
+        if how.role.is_some() {
+            return;
+        }
         super::super::judge::judge(row, dir).unwrap();
         let sha = |p: &str| super::super::owner::digest(&dir.join(p)).unwrap();
         // The panel judge's lines, as that judge writes them for the row
@@ -1288,6 +1568,275 @@ mod tests {
             })
             .collect();
         std::fs::write(dir.join(format!("verdicts-{producer}.jsonl")), panel).unwrap();
+    }
+
+    /// Writes a reference row's run folder for role `r` of a set, from the
+    /// judge's good reference records in their full form, every file
+    /// sealed; its captures' bytes from `shots` when given.
+    fn ref_folder(
+        dir: &std::path::Path,
+        row: &str,
+        r: SetRole<'_>,
+        shots: Option<&std::path::Path>,
+    ) {
+        use serde_json::{Value, json};
+
+        use super::super::run::{SHOT_A, SHOT_A_2};
+        let me = json!({"pid": 3, "created": 4});
+        let rec = json!({"pid": 9, "created": 90});
+        let f = super::super::judge::tests::ref_good(row);
+        let mut run = f.run.records.unwrap();
+        let mut link = f.link.records.unwrap();
+        let mut recorder = f.recorder.records.unwrap();
+        run[0] = json!({
+            "t": "start", "run": r.run, "row": row, "role": r.role, "build": "0123456789ab",
+            "process": me, "commit": super::super::COMMIT, "tag": 0xABCD, "cut": r.cut,
+            "args": [], "set": r.set, "inner": null,
+        });
+        run.insert(
+            1,
+            json!({"t": "spawn", "q": 40, "name": "recorder", "process": rec}),
+        );
+        let end = run.pop().unwrap();
+        let last = run
+            .iter()
+            .map(|v| v["q"].as_i64().unwrap_or(0))
+            .max()
+            .unwrap();
+        run.push(
+            json!({"t": "exit", "q": last + 300, "name": "recorder", "process": rec, "code": 0}),
+        );
+        link[0] = json!({
+            "t": "open", "q": 10, "run": r.run, "process": me, "freq": 10_000_000,
+            "location": "L", "com": "COM9", "path": "p",
+        });
+        link.push(json!({"t": "end", "q": last + 100, "problems": []}));
+        recorder[0] = json!({
+            "t": "ready", "q": 50, "run": r.run, "process": rec, "window": 9,
+            "location": "L", "keyboard": 1, "pad": 2,
+        });
+        let lines =
+            |records: &[Value]| -> String { records.iter().map(|v| format!("{v}\n")).collect() };
+        let shot = |name: &str, stand_in: &[u8]| {
+            shots.map_or_else(
+                || stand_in.to_vec(),
+                |from| std::fs::read(from.join(name)).unwrap(),
+            )
+        };
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            (LINK, lines(&link).into_bytes()),
+            (RECORDER, lines(&recorder).into_bytes()),
+            (SHOT_A, shot(SHOT_A, b"r")),
+            (SHOT_A_2, shot(SHOT_A_2, b"r")),
+        ];
+        for (name, bytes) in &files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+            run.push(super::super::owner::seal(dir, &dir.join(name), r.run, r.role).unwrap());
+        }
+        run.push(end);
+        std::fs::write(dir.join(RUN), lines(&run)).unwrap();
+    }
+
+    /// Writes a `p1-compare` set in the new folder `dir` as its runs write
+    /// it: the reservation, each role's run folder (A1 and A2 P1's, R1 and
+    /// R2 `p1-ref`'s, R75 `p1-ref-75`'s; the shots from
+    /// `shots/<role>/` when given), and the judge's set verdicts. The
+    /// private verdicts are the caller's.
+    fn set_folder(
+        dir: &std::path::Path,
+        shots: Option<&std::path::Path>,
+    ) -> test_device::evidence::Set {
+        super::super::reserve::reserve("p1-compare", dir, "0123456789ab").unwrap();
+        let set = super::super::owner::reservation(dir).unwrap().unwrap();
+        for (k, r) in set.roles.iter().enumerate() {
+            let folder = dir.join(&r.dir);
+            std::fs::create_dir(&folder).unwrap();
+            let role = SetRole {
+                role: &r.role,
+                run: &r.run,
+                set: &set.set,
+                cut: 0x4000_0200 + u32::try_from(k).unwrap(),
+            };
+            let from = shots.map(|s| s.join(&r.role));
+            if r.row == "p1" {
+                panel_folder(
+                    &folder,
+                    "p1",
+                    &Folder {
+                        role: Some(role),
+                        shot_files: from.as_deref(),
+                        ..Folder::default()
+                    },
+                );
+            } else {
+                ref_folder(&folder, &r.row, role, from.as_deref());
+            }
+        }
+        super::super::judge::judge("p1-compare", dir).unwrap();
+        set
+    }
+
+    /// The private verdicts of a set as the private judges write them:
+    /// the whole-frame judge's for A1's and A2's shots, and the
+    /// comparison's per pair, region and knob, with `outcome` for each id.
+    fn private_verdicts(
+        dir: &std::path::Path,
+        set: &test_device::evidence::Set,
+        outcome: &dyn Fn(&str) -> &'static str,
+    ) {
+        use serde_json::json;
+        let folder = |role: &str| {
+            let r = set.roles.iter().find(|r| r.role == role).unwrap();
+            dir.join(&r.dir)
+        };
+        let input = |role: &str, path: &str| {
+            json!({"role": role, "path": path,
+                   "sha256": super::super::owner::digest(&folder(role).join(path)).unwrap()})
+        };
+        let line = |id: &str, inputs: Vec<serde_json::Value>, producer: &str| {
+            format!(
+                "{}\n",
+                json!({"row": "p1-compare", "run": set.set, "check": id, "outcome": outcome(id),
+                       "detail": "", "inputs": inputs, "producer": {"name": producer, "version": "0"}})
+            )
+        };
+        let mut exact = String::new();
+        for role in ["A1", "A2"] {
+            for (id, shot) in [
+                ("panel.frame-a", "shot-a.png"),
+                ("panel.frame-b", "shot-b.png"),
+            ] {
+                exact += &line(
+                    &format!("{role}/{id}"),
+                    vec![
+                        input(role, "run.jsonl"),
+                        input(role, "recorder.jsonl"),
+                        input(role, shot),
+                    ],
+                    PANEL,
+                );
+            }
+        }
+        std::fs::write(dir.join(format!("verdicts-{PANEL}.jsonl")), exact).unwrap();
+        let side = |role: &str| {
+            let mut v = vec![input(role, "run.jsonl"), input(role, "shot-a.png")];
+            if role.starts_with('R') {
+                v.push(input(role, "shot-a-2.png"));
+            }
+            v
+        };
+        let mut compare = String::new();
+        let regions: Vec<String> = [17, 18, 19]
+            .iter()
+            .flat_map(|n| ["band", "graph", "number"].map(|k| format!("{k}-{n}")))
+            .chain([17, 18, 19].map(|n| format!("knob-{n}")))
+            .collect();
+        for (pair, a, r) in [
+            ("a1-r1", "A1", "R1"),
+            ("a2-r2", "A2", "R2"),
+            ("r1-r2", "R1", "R2"),
+            ("a1-r75", "A1", "R75"),
+        ] {
+            for m in &regions {
+                compare += &line(
+                    &format!("compare.{pair}.{m}"),
+                    [side(a), side(r)].concat(),
+                    COMPARE,
+                );
+            }
+        }
+        for n in [17, 18, 19] {
+            compare += &line(
+                &format!("compare.a1-r1-shift3.slider-{n}"),
+                [side("A1"), side("R1")].concat(),
+                COMPARE,
+            );
+        }
+        std::fs::write(dir.join(format!("verdicts-{COMPARE}.jsonl")), compare).unwrap();
+    }
+
+    /// The comparison's outcomes as the set must have them: slider 17
+    /// differs against the 75 % control, and every shifted slider differs.
+    fn set_outcome(id: &str) -> &'static str {
+        let control = id.starts_with("compare.a1-r75.") && id.ends_with("-17");
+        if control || id.starts_with("compare.a1-r1-shift3.") {
+            "fail"
+        } else {
+            "pass"
+        }
+    }
+
+    fn check_set(dir: &std::path::Path) -> (bool, String) {
+        let mut out = Vec::new();
+        let r = run(ROWS, "p1-compare", dir, &mut out);
+        (r.is_ok(), String::from_utf8(out).unwrap())
+    }
+
+    /// A `p1-compare` set written as its runs and judges write it matches
+    /// the row: each role's run bound by the reservation and held to its
+    /// own row's checks under the role's name, one provenance over every
+    /// role's links, the shots of each panel role bound in its folder, and
+    /// the comparison's controls failing as declared. A set whose
+    /// comparison passes a control, whose role folders are swapped, or
+    /// whose role runs the wrong row does not match.
+    #[test]
+    fn a_p1_compare_set_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("set");
+        let set = set_folder(&dir, None);
+        private_verdicts(&dir, &set, &set_outcome);
+        let (ok, out) = check_set(&dir);
+        assert!(ok, "{out}");
+        assert!(out.ends_with("CONTRACT p1-compare ok\n"), "{out}");
+        let judged = std::fs::read_to_string(dir.join("verdicts-judge.jsonl")).unwrap();
+        for id in [
+            "\"provenance\"",
+            "\"A1/p1.volumes\"",
+            "\"R75/ref.capture-bound\"",
+            "\"R1/p1.clicks\"",
+        ] {
+            assert!(judged.contains(id), "{id}: {judged}");
+        }
+        // The control passing (a comparison that cannot tell 25 % from
+        // 75 %) is a mismatch.
+        private_verdicts(&dir, &set, &|_| "pass");
+        let (ok, out) = check_set(&dir);
+        assert!(!ok && out.contains("compare.a1-r75.band-17"), "{out}");
+
+        // A1's folder in R1's place: the runs no longer bind to their roles.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("set");
+        let set = set_folder(&dir, None);
+        private_verdicts(&dir, &set, &set_outcome);
+        let (a1, r1) = (dir.join("A1"), dir.join("R1"));
+        std::fs::rename(&r1, dir.join("R1.kept")).unwrap();
+        copy_dir(&a1, &r1);
+        let (ok, out) = check_set(&dir);
+        assert!(!ok && out.contains("role `R1`"), "{out}");
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+
+    /// Writes a `p1-compare` set for the private judges' offline checks:
+    /// the set in `$B4_SET_FIXTURE` (a new folder) with each role's shots
+    /// from `$B4_SET_SHOTS/<role>/`, and the judge's set verdicts; the
+    /// private judges then write theirs and `check` reads the set.
+    #[test]
+    #[ignore = "writes a fixture for the private judges: run with $B4_SET_FIXTURE and $B4_SET_SHOTS"]
+    fn write_p1_compare_fixture() {
+        let out = std::env::var_os("B4_SET_FIXTURE").expect("$B4_SET_FIXTURE");
+        let shots = std::env::var_os("B4_SET_SHOTS").expect("$B4_SET_SHOTS");
+        let set = set_folder(
+            std::path::Path::new(&out),
+            Some(std::path::Path::new(&shots)),
+        );
+        println!("set {} roles {}", set.set, set.roles.len());
     }
 
     /// The private panel judge's checks of `row` and the shot each reads,

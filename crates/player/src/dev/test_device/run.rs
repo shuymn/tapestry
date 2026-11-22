@@ -17,7 +17,11 @@
 //! the player closed and its settings copied), `p5` (P1's steps, run
 //! against a player whose volume path is broken), `p4` (button 9 only),
 //! and `p1-kill` (N2p: `sink-kill`'s outer over an inner `p1` that waits
-//! at its kill barrier after shot A, both buttons held).
+//! at its kill barrier after shot A, both buttons held). The reference rows
+//! attach to the reference player's window (`--attach <pid>`), hold nothing
+//! on the device and take screen captures of it: `p1-ref` (a guarded click
+//! at each volume target, then two captures of shot A) and `p1-ref-75`
+//! (slider 17 at 75 %, the comparison's control).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,9 +33,12 @@ use serde_json::{Value, json};
 use test_device::clock::ticks_to_us;
 use test_device::evidence::{Process, Recorder as Rec, Reserved};
 use test_device::mode::{Mode, Rate, Reporting};
+use test_device::panel::Target;
 use test_device::protocol::{Change, Command, Control, Token};
 use test_device::report::{PAD_REPORT, PadReport};
 
+use super::attach;
+use super::capture;
 use super::click::{self, Win};
 use super::desktop::{self, Real};
 use super::devices::{self, System};
@@ -65,6 +72,8 @@ pub struct Args {
     /// The sha256 the player's executable must have: the build a row runs
     /// against (P5's mutated player), refused when another is found.
     pub player_sha256: Option<String>,
+    /// The process a reference row attaches to: the reference player.
+    pub attach: Option<u32>,
     /// An inner `p1` of `p1-kill`: wait at the kill barrier after shot A.
     pub kill_barrier: bool,
 }
@@ -113,6 +122,13 @@ pub enum Step {
     /// Writes `barrier` and waits there, holding, for the outer to end
     /// the run: [`BARRIER_WAIT`] later it fails.
     Barrier,
+    /// Makes the attached process's main window the run's window (a
+    /// reference row).
+    Attach,
+    /// Two guarded screen captures of the attached window's client area, of
+    /// one shot: its file and its second file, at least [`CAPTURE_GAP`]
+    /// apart.
+    Capture([&'static str; 2]),
 }
 
 /// F24's keyboard usage: a key that types nothing.
@@ -187,12 +203,52 @@ pub fn panel_steps(buttons: &[u8], barrier: bool) -> Vec<Step> {
     steps
 }
 
-/// The client points a panel row clicks: the focus point, then each
-/// volume target.
-pub fn click_points() -> Vec<(i32, i32)> {
+/// The client points a panel or reference row clicks: the focus point,
+/// then each of its volume targets.
+pub fn click_points(targets: &[Target]) -> Vec<(i32, i32)> {
     std::iter::once(FOCUS_POINT)
-        .chain(test_device::panel::TARGETS.iter().map(|t| (t.x, t.y)))
+        .chain(targets.iter().map(|t| (t.x, t.y)))
         .collect()
+}
+
+/// The volume targets row `row` clicks: the reference control's for
+/// `p1-ref-75`, the panel targets for every other row.
+#[must_use]
+pub fn targets_of(row: &str) -> &'static [Target; 3] {
+    if row == "p1-ref-75" {
+        &test_device::panel::REF_75
+    } else {
+        &test_device::panel::TARGETS
+    }
+}
+
+/// How far apart a reference row's two captures are at least: three frame
+/// intervals at 60 Hz, so a frame the compositor had not settled when the
+/// first was copied differs in the second.
+pub const CAPTURE_GAP: Duration = Duration::from_millis(50);
+
+/// Shot A's second capture in a reference row.
+pub const SHOT_A_2: &str = "shot-a-2.png";
+
+/// The steps of a reference row clicking `targets`: the sink's focus
+/// click, the attachment, a focus click on the reference's window, the
+/// mapping calibration, one guarded click at each target, and the two
+/// captures of shot A. Nothing is held on the device: the reference's
+/// panel 3 is opened by its own start.
+pub fn ref_steps(targets: &[Target]) -> Vec<Step> {
+    let mut steps = vec![
+        Step::Focus,
+        Step::Attach,
+        Step::FocusAt {
+            x: FOCUS_POINT.0,
+            y: FOCUS_POINT.1,
+        },
+        Step::Calibrate,
+        Step::Wait { ms: 500 },
+    ];
+    steps.extend(targets.iter().map(|t| Step::Click { x: t.x, y: t.y }));
+    steps.extend([Step::Wait { ms: 500 }, Step::Capture([SHOT_A, SHOT_A_2])]);
+    steps
 }
 
 /// The calls a row's `steps` make, in order: what each sends and the
@@ -209,7 +265,16 @@ pub fn calls_of(steps: &[Step]) -> Vec<(&'static str, Option<(i32, i32)>)> {
                 out.extend([("move", Some((x, y))), ("click", Some((x, y)))]);
             }
             Step::Calibrate => {
-                out.extend(click_points().into_iter().map(|p| ("calibrate", Some(p))));
+                // The focus point and every target the row clicks.
+                let targets = steps.iter().filter_map(|s| match *s {
+                    Step::Click { x, y } => Some((x, y)),
+                    _ => None,
+                });
+                out.extend(
+                    std::iter::once(FOCUS_POINT)
+                        .chain(targets)
+                        .map(|p| ("calibrate", Some(p))),
+                );
             }
             _ => {}
         }
@@ -227,6 +292,7 @@ pub fn row(name: &str, barrier: bool) -> Option<Vec<Step>> {
         ("sink", false) => Some(sink_steps()),
         ("p1" | "p5", _) => Some(panel_steps(&[START, SELECT], barrier)),
         ("p4", false) => Some(panel_steps(&[START], false)),
+        ("p1-ref" | "p1-ref-75", false) => Some(ref_steps(targets_of(name))),
         _ => None,
     }
 }
@@ -314,6 +380,8 @@ pub trait Exec {
     fn click(&mut self, point: (i32, i32)) -> Result<(), String>;
     fn shot(&mut self, name: &'static str) -> Result<(), String>;
     fn barrier(&mut self) -> Result<(), String>;
+    fn attach(&mut self) -> Result<(), String>;
+    fn capture(&mut self, files: [&'static str; 2]) -> Result<(), String>;
 }
 
 /// Runs `steps`: the first error ends them.
@@ -336,6 +404,8 @@ pub fn perform(steps: &[Step], x: &mut dyn Exec) -> Result<(), String> {
             Step::Click { x: px, y } => x.click((px, y)),
             Step::Shot(name) => x.shot(name),
             Step::Barrier => x.barrier(),
+            Step::Attach => x.attach(),
+            Step::Capture(files) => x.capture(files),
         }?;
     }
     Ok(())
@@ -464,6 +534,12 @@ struct Live {
     /// the player.
     shot_pipe: Option<shot::Pipe>,
     shots: Shots,
+    /// The row's volume targets.
+    targets: &'static [Target; 3],
+    /// The process a reference row attaches to, and once attached, that
+    /// process and its window's client area then.
+    attach: Option<u32>,
+    attached: Option<(Child, [i32; 4])>,
 }
 
 /// The player a run started.
@@ -735,7 +811,7 @@ impl Exec for Live {
         let r = click::calibrate(
             &mut desk,
             self.window,
-            &click_points(),
+            &click_points(self.targets),
             self.prefix,
             &mut self.call,
         );
@@ -825,6 +901,84 @@ impl Exec for Live {
         Err(format!(
             "the run was not ended within {BARRIER_WAIT:?} of its kill barrier"
         ))
+    }
+
+    fn attach(&mut self) -> Result<(), String> {
+        let pid = self
+            .attach
+            .ok_or("the row attaches to a process, and none is given")?;
+        let child = job::observe(pid).map_err(|e| format!("the attached process {pid}: {e:#}"))?;
+        let window = desktop::main_window_of(pid);
+        let owner = window.map_or(0, desktop::process_of);
+        let client = window.and_then(desktop::client_rect);
+        let w = attach::check(
+            pid,
+            window,
+            owner,
+            client,
+            test_device::panel::CLIENT,
+            self.monitor_then,
+        )?;
+        let client = client.ok_or("the attached window has no client area")?;
+        let p = child.process;
+        self.log.put(json!({
+            "t": "attach", "process": { "pid": p.pid, "created": p.created },
+            "window": w, "client": client,
+        }));
+        self.window = w;
+        self.attached = Some((child, client));
+        Ok(())
+    }
+
+    fn capture(&mut self, files: [&'static str; 2]) -> Result<(), String> {
+        let name = files[0];
+        self.lost()?;
+        self.beat();
+        let window = self.window;
+        let (process, client) = match &self.attached {
+            Some((child, client)) => {
+                if child.wait(Duration::ZERO) != Ok(None) {
+                    return Err(format!(
+                        "the capture {name}: the attached process has ended"
+                    ));
+                }
+                (child.process, *client)
+            }
+            None => {
+                return Err(format!(
+                    "the capture {name}: the run attached to no process"
+                ));
+            }
+        };
+        let mut grabs = Vec::new();
+        for (i, file) in files.into_iter().enumerate() {
+            if i > 0 {
+                self.idle(CAPTURE_GAP)?;
+            }
+            let mut quiet = |_: u32, _: &str, _: (i32, i32)| {};
+            let mut screen = Real {
+                monitor: self.monitor.clone(),
+                note: &mut quiet,
+            };
+            let before = qpc();
+            let bgra = capture::guarded(&mut screen, window, self.monitor_then, client)
+                .map_err(|e| format!("the capture {file}: {e}"))?;
+            let after = qpc();
+            self.beat();
+            let (w, h) = (
+                u32::try_from(client[2]).unwrap_or(0),
+                u32::try_from(client[3]).unwrap_or(0),
+            );
+            self.shots
+                .write(self.dir.join(file), w, h, capture::rgba(&bgra))?;
+            grabs.push(json!({ "file": file, "before": before, "after": after }));
+        }
+        self.log.put(json!({
+            "t": "capture", "what": name,
+            "process": { "pid": process.pid, "created": process.created },
+            "window": window, "client": client, "grabs": grabs,
+        }));
+        Ok(())
     }
 }
 
@@ -1223,7 +1377,7 @@ fn begin(a: &Args, inner: Option<&Reserved>) -> anyhow::Result<Begun> {
             )
         }
         (None, Some(set), Some(role)) => {
-            let (outer, run, dir) = owner::reserved(set, role, &a.row)?;
+            let (outer, run, dir) = owner::reserved(set, role, &a.row, &a.build)?;
             (dir, run, role.clone(), Some(outer))
         }
         _ => bail!("a run takes `--out <dir>`, or `--set <dir> --role <role>`"),
@@ -1632,6 +1786,11 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
         bail!("no row `{}`", a.row);
     };
     let panel = steps.contains(&Step::Launch);
+    if steps.contains(&Step::Attach) != a.attach.is_some() {
+        bail!(
+            "--attach names the reference player: the reference rows take it, and no other row does"
+        );
+    }
     if (a.row == "p5") != a.player_sha256.is_some() {
         bail!("--player-sha256 names P5's mutated player: row p5 takes it, and no other row does");
     }
@@ -1718,6 +1877,9 @@ pub fn run(a: &Args) -> anyhow::Result<i32> {
                 }
             }),
         ),
+        targets: targets_of(&a.row),
+        attach: a.attach,
+        attached: None,
     };
     let stepped =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| perform(&steps, &mut live)));
@@ -2124,6 +2286,14 @@ mod tests {
             self.did.push("barrier".into());
             Ok(())
         }
+        fn attach(&mut self) -> Result<(), String> {
+            self.did.push("attach".into());
+            Ok(())
+        }
+        fn capture(&mut self, files: [&'static str; 2]) -> Result<(), String> {
+            self.did.push(format!("capture {files:?}"));
+            Ok(())
+        }
         fn wait(&mut self, ms: u64) -> Result<(), String> {
             self.did.push(format!("wait {ms}"));
             // The guard over the wait, looks 5 ms apart.
@@ -2384,6 +2554,7 @@ mod tests {
             monitor: "M".into(),
             player: None,
             player_sha256: None,
+            attach: None,
             kill_barrier: false,
         };
         let e = run(&args("sink-early-close")).unwrap_err();
@@ -2409,6 +2580,7 @@ mod tests {
             monitor: "M".into(),
             player: None,
             player_sha256: sha.map(str::to_owned),
+            attach: None,
             kill_barrier: false,
         };
         for (row, sha) in [("p5", None), ("p1", Some("ab")), ("p4", Some("ab"))] {

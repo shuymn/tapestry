@@ -3,9 +3,11 @@
 //! `player` for its Win32 access. `devices` finds it and checks its shape,
 //! `flash` loads its firmware and `bootsel` puts it into its boot ROM's
 //! drive, both on the USB location they are given, `trace` holds its
-//! link passively, and `check` applies the verdict contract to a run's
-//! files.
+//! link passively, `run` runs a row, `reserve` reserves a set of runs a row
+//! compares, and `check` applies the verdict contract to a run's files.
 
+mod attach;
+mod capture;
 mod check;
 mod click;
 mod desktop;
@@ -20,6 +22,7 @@ mod link;
 mod listen;
 mod owner;
 mod release;
+mod reserve;
 mod run;
 pub(crate) mod shot;
 mod sink;
@@ -63,6 +66,12 @@ pub enum TestDevice {
     Trace(trace::Args),
     Listen(listen::Args),
     Run(Box<run::Args>),
+    /// Reserves the set of runs row `row` compares, in the new folder `out`.
+    Reserve {
+        row: String,
+        out: PathBuf,
+        build: String,
+    },
     /// The repository's verdicts for the run in `dir`.
     Judge {
         row: String,
@@ -114,9 +123,13 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     let mut skin_entry = None;
     let mut player_sha256 = None;
     let mut kill_barrier = false;
+    let mut attach = None;
+    let mut skin_options = Vec::new();
     while let Some(arg) = p.next()? {
         match (cmd.as_str(), arg) {
-            ("flash" | "check" | "judge" | "run", Arg::Value(v)) => values.push(PathBuf::from(v)),
+            ("flash" | "check" | "judge" | "run" | "reserve", Arg::Value(v)) => {
+                values.push(PathBuf::from(v));
+            }
             ("run", Arg::Long("set")) => set = Some(PathBuf::from(p.value()?)),
             ("run", Arg::Long("role")) => role = Some(text(p)?),
             ("run", Arg::Long("monitor")) => monitor = Some(text(p)?),
@@ -127,10 +140,28 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
             ("run", Arg::Long("skin-entry")) => skin_entry = Some(text(p)?),
             ("run", Arg::Long("player-sha256")) => player_sha256 = Some(text(p)?),
             ("run", Arg::Long("kill-barrier")) => kill_barrier = true,
-            ("devices" | "trace" | "listen" | "run", Arg::Long("out")) => {
+            ("run", Arg::Long("attach")) => {
+                attach =
+                    Some(text(p)?.parse().map_err(|_| {
+                        UsageError::Usage("--attach takes a process id".to_owned())
+                    })?);
+            }
+            ("run", Arg::Long("skin-option")) => {
+                let v = text(p)?;
+                let (name, value) = v
+                    .split_once('=')
+                    .filter(|(n, _)| !n.is_empty())
+                    .ok_or_else(|| {
+                        UsageError::Usage("--skin-option takes <name>=<value>".to_owned())
+                    })?;
+                skin_options.push((name.to_owned(), value.to_owned()));
+            }
+            ("devices" | "trace" | "listen" | "run" | "reserve", Arg::Long("out")) => {
                 out = Some(PathBuf::from(p.value()?));
             }
-            ("flash" | "trace" | "run", Arg::Long("build")) => build = Some(text(p)?),
+            ("flash" | "trace" | "run" | "reserve", Arg::Long("build")) => {
+                build = Some(text(p)?);
+            }
             ("flash" | "bootsel" | "trace" | "listen" | "run", Arg::Long("port")) => {
                 port = Some(text(p)?);
             }
@@ -208,14 +239,26 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
                         library,
                         skin,
                         skin_entry,
+                        skin_options,
                     })
                 }
-                (None, None, None, None, None) => None,
+                // Skin options are the player's: none without it.
+                (None, None, None, None, None) if skin_options.is_empty() => None,
                 _ => return Err(usage()),
             },
             player_sha256,
+            attach,
             kill_barrier,
         })),
+        "reserve" => TestDevice::Reserve {
+            row: values
+                .next()
+                .ok_or_else(usage)?
+                .to_string_lossy()
+                .into_owned(),
+            out: out.ok_or_else(usage)?,
+            build: build.ok_or_else(usage)?,
+        },
         "listen" => TestDevice::Listen(listen::Args {
             out: out.ok_or_else(usage)?,
             port: port.ok_or_else(usage)?,
@@ -249,6 +292,7 @@ pub fn run(t: TestDevice) -> anyhow::Result<()> {
                 anyhow::bail!("the run failed (exit {code}); its errors are in its `end` record")
             }
         },
+        TestDevice::Reserve { row, out, build } => reserve::reserve(&row, &out, &build),
         TestDevice::Judge { row, dir } => judge::judge(&row, &dir),
         TestDevice::Check { row, dir } => check::check(&row, &dir),
         TestDevice::Commit => {
@@ -399,6 +443,7 @@ mod tests {
                 library: "l".into(),
                 skin: "s".into(),
                 skin_entry: "e".into(),
+                skin_options: Vec::new(),
             })
         );
         assert!(!a.kill_barrier);
@@ -415,6 +460,38 @@ mod tests {
             panic!("a run")
         };
         assert!(a.kill_barrier && a.player.is_none());
+        // The skin's options go with the player, each as name and value.
+        let mut options = player.to_vec();
+        options.extend(["--skin-option", "Movies=OFF", "--skin-option", "A=b=c"]);
+        let Ok(TestDevice::Run(a)) = run(&options) else {
+            panic!("a panel run with skin options")
+        };
+        assert_eq!(
+            a.player.unwrap().skin_options,
+            [
+                ("Movies".to_owned(), "OFF".to_owned()),
+                ("A".to_owned(), "b=c".to_owned())
+            ]
+        );
+        assert_eq!(run(&["--skin-option", "Movies=OFF"]).unwrap_err(), usage());
+        assert!(run(&["--skin-option", "=OFF"]).is_err());
+        let Ok(TestDevice::Run(a)) = run(&["--attach", "42"]) else {
+            panic!("an attached run")
+        };
+        assert_eq!(a.attach, Some(42));
+        assert!(run(&["--attach", "x"]).is_err());
+        assert_eq!(
+            parsed(&["reserve", "p1-compare", "--out", "s", "--build", "b"]).unwrap(),
+            TestDevice::Reserve {
+                row: "p1-compare".to_owned(),
+                out: PathBuf::from("s"),
+                build: "b".to_owned(),
+            }
+        );
+        assert_eq!(
+            parsed(&["reserve", "p1-compare", "--out", "s"]).unwrap_err(),
+            usage()
+        );
         assert_eq!(parsed(&["commit"]).unwrap(), TestDevice::Commit);
         assert_eq!(parsed(&["jump"]).unwrap_err(), usage());
         assert_eq!(parsed(&[]).unwrap_err(), usage());

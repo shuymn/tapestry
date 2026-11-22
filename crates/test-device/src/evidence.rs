@@ -256,6 +256,12 @@ pub enum Run {
     /// A shot of the player's window: its file in the run's folder, sealed
     /// once written; the player's own copy of a frame it presented.
     Shot(RunShot),
+    /// The process a reference row attached to and its main window, the
+    /// run's window from then on: a process the runner did not start.
+    Attach(RunAttach),
+    /// A reference row's screen captures of the attached window's client
+    /// area, each guarded before and after.
+    Capture(RunCapture),
     /// The kill barrier: the run waits here, holding, for its outer to end
     /// it.
     Barrier(RunQ),
@@ -370,6 +376,41 @@ pub struct RunShot {
     pub requested: i64,
     pub frame: RunFrame,
     pub volumes: Vec<(u8, u32, i64, String)>,
+}
+
+/// The attached process (by pid and creation time), its main window and
+/// that window's client area on the screen, [x, y, w, h].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunAttach {
+    pub q: i64,
+    pub process: Process,
+    pub window: u64,
+    pub client: [i32; 4],
+}
+
+/// The captures of one shot (`what`, its first file's name) of the attached
+/// window: the process and window they show, the client area on the
+/// screen they copied, [x, y, w, h], and each capture, in order.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCapture {
+    pub q: i64,
+    pub what: String,
+    pub process: Process,
+    pub window: u64,
+    pub client: [i32; 4],
+    pub grabs: Vec<RunGrab>,
+}
+
+/// One capture: its file in the run's folder and the host counter before
+/// its guard's first check and after its last.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGrab {
+    pub file: String,
+    pub before: i64,
+    pub after: i64,
 }
 
 /// A frame the player copied as it presented it: the swap chain's present
@@ -489,6 +530,8 @@ impl Kinds for Run {
             Self::Player(_) => "player",
             Self::Mode(_) => "mode",
             Self::Shot(_) => "shot",
+            Self::Attach(_) => "attach",
+            Self::Capture(_) => "capture",
             Self::Barrier(_) => "barrier",
             Self::Kill(_) => "kill",
             Self::Exit(_) => "exit",
@@ -506,6 +549,8 @@ impl Kinds for Run {
             Self::Held(r) | Self::Barrier(r) => Some(r.q),
             Self::Stop(r) | Self::Recovery(r) => Some(r.q),
             Self::Shot(r) => Some(r.q),
+            Self::Attach(r) => Some(r.q),
+            Self::Capture(r) => Some(r.q),
             Self::Released(r) => Some(r.q),
             Self::Player(p) => Some(p.q),
             Self::Exit(e) => Some(e.q),

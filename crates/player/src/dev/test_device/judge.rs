@@ -1,8 +1,10 @@
 //! `tapestry test-device judge <row> <dir>` (docs/test-device.md
 //! "Verdicts"): the repository's verdicts for a run of `sink`,
 //! `sink-early-close`, `sink-kill`, the panel rows `p1`, `p4` and `p5`,
-//! or `p1-kill`, from its kept files, written to
-//! `verdicts-judge.jsonl`. Each check reads only records of what a runner,
+//! `p1-kill`, the reference rows `p1-ref` and `p1-ref-75`, or the set of
+//! `p1-compare`, from its kept files, written to `verdicts-judge.jsonl`
+//! (a set's in its own folder: each role's row checks on that role's run,
+//! named by the role, and one provenance over every role's links). Each check reads only records of what a runner,
 //! the recorder or the device observed, and their order within one
 //! stream; a check whose stretch of the recorder's stream an `error`
 //! record covers, or whose file is missing or unreadable, is
@@ -413,8 +415,12 @@ fn no_foreign(rec: &[Value], calls: &[u32], from: i64, to: i64) -> Result<(), St
 
 /// The release evidence before the close: the run's `quiet` record, of a
 /// `hello` the link read after its fence that names the connection's
-/// token, `quiet 1` and reason `released`, and then the `close`.
-fn quiet_before_close(run: &[Value], link: &[Value]) -> Result<(), String> {
+/// token and `quiet 1`, and then the `close`. With `require_released` (a
+/// row that leases) the `hello` must also read reason `released`; a row
+/// that grants no lease cannot give that reason, and the device keeps the
+/// one it had (`none` after a boot, `closed` after a connection ended
+/// holding).
+fn quiet_before_close(run: &[Value], link: &[Value], require_released: bool) -> Result<(), String> {
     let close = run
         .iter()
         .position(|v| v["t"] == "close")
@@ -429,10 +435,18 @@ fn quiet_before_close(run: &[Value], link: &[Value]) -> Result<(), String> {
     let tok = token(link);
     match Answer::parse_canonical(line) {
         Some(Answer::Hello(h))
-            if h.quiet && h.reason == Reason::Released && h.session == tok && tok.is_some() => {}
+            if h.quiet
+                && (!require_released || h.reason == Reason::Released)
+                && h.session == tok
+                && tok.is_some() => {}
         _ => {
             return Err(format!(
-                "the evidence `{line}` is not a quiet `hello` of the run's token after a release"
+                "the evidence `{line}` is not a quiet `hello` of the run's token{}",
+                if require_released {
+                    " after a release"
+                } else {
+                    ""
+                }
             ));
         }
     }
@@ -599,7 +613,7 @@ pub fn n1(build: Option<&str>, f: &Files) -> Vec<Judged> {
         verdict(
             "n1.quiet-before-close",
             &[RUN_RUN, RUN_LINK],
-            recs(&f.run).and_then(|r| Ok(quiet_before_close(r, recs(&f.link)?))),
+            recs(&f.run).and_then(|r| Ok(quiet_before_close(r, recs(&f.link)?, true))),
         ),
         verdict(
             "n1.no-foreign",
@@ -1481,7 +1495,7 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
     let Some(held) = held_by(row) else {
         return Vec::new();
     };
-    let want = panel_calls();
+    let want = panel_calls(super::run::targets_of(row));
     let span = |kind: &str| first_q(&f.run, kind);
     let bytes = |b: &Bytes| b.clone();
     let buttons = held.iter().fold(0_u16, |a, b| a | 1 << (b - 1));
@@ -1581,7 +1595,7 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
         verdict(
             "p1.quiet-before-close",
             &[RUN_RUN, RUN_LINK],
-            recs(&f.run).and_then(|r| Ok(quiet_before_close(r, recs(&f.link)?))),
+            recs(&f.run).and_then(|r| Ok(quiet_before_close(r, recs(&f.link)?, true))),
         ),
     ];
     let kept = |id| {
@@ -1619,17 +1633,223 @@ pub fn panel(build: Option<&str>, f: &Files, x: &PanelFiles, row: &str) -> Vec<J
     out
 }
 
-/// The calls every panel row must make, from the target table alone, not
-/// from the runner's steps (which a broken runner would change along with
-/// its calls): the sink's focus click (its move and its click, at a point
-/// of its own), the player's focus click at [`FOCUS_POINT`], a calibration
-/// call at the focus point and at each target, then each target's move and
-/// click, in the table's order.
-pub fn panel_calls() -> Vec<(&'static str, Option<(i32, i32)>)> {
-    let targets: Vec<(i32, i32)> = test_device::panel::TARGETS
+/// A reference row's attachment (`ref.attached`): one `attach` record,
+/// made after the sink's focus click and before the focus click on the
+/// attached window, of a 1920×1080 client area.
+fn attached(run: &[Value]) -> Result<(), String> {
+    let at: Vec<usize> = run
         .iter()
-        .map(|t| (t.x, t.y))
+        .enumerate()
+        .filter(|(_, v)| v["t"] == "attach")
+        .map(|(i, _)| i)
         .collect();
+    let [at] = at[..] else {
+        return Err(format!("{} `attach` records, not one", at.len()));
+    };
+    let a = &run[at];
+    let size = [a["client"][2].as_i64(), a["client"][3].as_i64()];
+    let want = test_device::panel::CLIENT.map(|c| Some(i64::from(c)));
+    if size != want {
+        return Err(format!(
+            "the attached window's client area is {:?}, not {:?}",
+            a["client"],
+            test_device::panel::CLIENT
+        ));
+    }
+    let calls: Vec<usize> = run
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v["t"] == "call")
+        .map(|(i, _)| i)
+        .collect();
+    // The sink's move and click come before it, every other call after.
+    if calls.len() < 3 || !(calls[1] < at && at < calls[2]) {
+        return Err(
+            "the attachment is not between the sink's focus click and the next call".into(),
+        );
+    }
+    Ok(())
+}
+
+/// A reference row holds nothing on the device (`ref.device-idle`): its
+/// link writes no `lease` and no held change, and the recorder holds no
+/// report of the device's pad with a button down and no key edge of its
+/// keyboard.
+fn device_idle(link: &[Value], rec: &[Value]) -> Result<(), String> {
+    if let Some(v) = link.iter().find(|v| {
+        v["t"] == "cmd"
+            && v["line"]
+                .as_str()
+                .and_then(Command::parse_canonical)
+                .is_some_and(|c| c.holds_input())
+    }) {
+        return Err(format!(
+            "the link wrote a hold-bearing command: {}",
+            v["line"]
+        ));
+    }
+    if let Some(v) = rec.iter().find(|v| {
+        v["ours"] == true
+            && (v["t"] == "key"
+                || (v["t"] == "pad" && v["bytes"].as_str().and_then(pad_buttons) != Some(0)))
+    }) {
+        return Err(format!("the device gave input during the run: {v}"));
+    }
+    Ok(())
+}
+
+/// A reference row's captures bound to the attachment and the clicks
+/// (`ref.capture-bound`): one `capture` record, of shot A, of the attached
+/// process and window and its client area as attached; two captures,
+/// [`super::run::SHOT_A`] and [`super::run::SHOT_A_2`], each begun after the
+/// recorder's button-up of the run's last click call, the second begun at
+/// least [`super::run::CAPTURE_GAP`] after the first ended (the link's
+/// counter frequency).
+fn capture_bound(run: &[Value], rec: &[Value], freq: i64) -> Result<Result<(), String>, String> {
+    use super::run::{CAPTURE_GAP, SHOT_A, SHOT_A_2};
+    let attach = run
+        .iter()
+        .find(|v| v["t"] == "attach")
+        .ok_or("the run recorded no attachment")?;
+    let caps: Vec<&Value> = run.iter().filter(|v| v["t"] == "capture").collect();
+    let [cap] = caps[..] else {
+        return Ok(Err(format!("{} `capture` records, not one", caps.len())));
+    };
+    let mut wrong = Vec::new();
+    if cap["what"] != SHOT_A {
+        wrong.push(format!("the capture is of {}, not {SHOT_A}", cap["what"]));
+    }
+    for key in ["process", "window", "client"] {
+        if cap[key] != attach[key] {
+            wrong.push(format!(
+                "the capture's {key} {} is not the attachment's {}",
+                cap[key], attach[key]
+            ));
+        }
+    }
+    let last = run
+        .iter()
+        .rev()
+        .find(|v| v["t"] == "call" && v["what"] == "click")
+        .and_then(|v| v["tag"].as_u64())
+        .ok_or("the run made no click")?;
+    let up = rec
+        .iter()
+        .find(|v| v["t"] == "mouse" && v["extra"].as_u64() == Some(last) && v["buttons"] == 2)
+        .map(q)
+        .ok_or("the recorder saw no button-up of the last click")?;
+    let grabs = cap["grabs"]
+        .as_array()
+        .ok_or("the capture lists no grabs")?;
+    let files: Vec<&str> = grabs.iter().filter_map(|g| g["file"].as_str()).collect();
+    if files != [SHOT_A, SHOT_A_2] {
+        wrong.push(format!(
+            "the captures are {files:?}, not {SHOT_A} and {SHOT_A_2}"
+        ));
+    }
+    for g in grabs {
+        if g["before"].as_i64().is_none_or(|b| b <= up) {
+            wrong.push(format!(
+                "{} was begun at {}, not after the last click's button-up at {up}",
+                g["file"], g["before"]
+            ));
+        }
+    }
+    if let [a, b] = &grabs[..] {
+        let gap =
+            b["before"].as_i64().unwrap_or(i64::MIN) - a["after"].as_i64().unwrap_or(i64::MAX);
+        let want = i64::try_from(CAPTURE_GAP.as_micros()).unwrap_or(i64::MAX) * freq / 1_000_000;
+        if gap < want {
+            wrong.push(format!(
+                "the second capture was begun {gap} ticks after the first ended, not at least {want}"
+            ));
+        }
+    }
+    Ok(if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
+    })
+}
+
+/// The verdicts of a reference row's run (`p1-ref`, `p1-ref-75`): the
+/// device's provenance, the attachment, the row's clicks and no foreign
+/// input, the device idle, the captures bound, and the end's release
+/// request and quiet evidence before the close (no lease, so any reason).
+pub fn reference(build: Option<&str>, f: &Files, row: &str) -> Vec<Judged> {
+    let want = panel_calls(super::run::targets_of(row));
+    let span = |kind: &str| first_q(&f.run, kind);
+    let calls = recs(&f.run).map(click_tags).unwrap_or_default();
+    let freq = || {
+        recs(&f.link)?
+            .iter()
+            .find(|v| v["t"] == "open")
+            .and_then(|v| v["freq"].as_i64())
+            .ok_or_else(|| "the link has no `open` record".to_owned())
+    };
+    vec![
+        verdict(
+            provenance::CHECK,
+            &[RUN_LINK],
+            provenance(build, &[(LINK, &f.link)]),
+        ),
+        verdict("ref.attached", &[RUN_RUN], recs(&f.run).map(attached)),
+        verdict(
+            "p1.clicks",
+            &[RUN_RUN, RUN_REC],
+            (|| {
+                let rec = recs(&f.recorder)?;
+                covered(rec, span("call")?, span("quiet")?)?;
+                Ok(clicks(recs(&f.run)?, rec, &want))
+            })(),
+        ),
+        verdict(
+            "p1.no-foreign",
+            &[RUN_RUN, RUN_REC],
+            (|| {
+                let rec = recs(&f.recorder)?;
+                let (from, to) = (span("call")?, span("quiet")?);
+                covered(rec, from, to)?;
+                Ok(no_foreign(rec, &calls, from, to))
+            })(),
+        ),
+        verdict(
+            "ref.device-idle",
+            &[RUN_LINK, RUN_REC],
+            (|| {
+                let rec = recs(&f.recorder)?;
+                covered(rec, span("call")?, span("quiet")?)?;
+                Ok(device_idle(recs(&f.link)?, rec))
+            })(),
+        ),
+        verdict(
+            "ref.capture-bound",
+            &[RUN_RUN, RUN_REC],
+            (|| capture_bound(recs(&f.run)?, recs(&f.recorder)?, freq()?))(),
+        ),
+        verdict(
+            "p1.release-requested",
+            &[RUN_RUN, RUN_LINK],
+            recs(&f.run).and_then(|r| Ok(release_requested(r, recs(&f.link)?))),
+        ),
+        verdict(
+            "ref.quiet-before-close",
+            &[RUN_RUN, RUN_LINK],
+            recs(&f.run).and_then(|r| Ok(quiet_before_close(r, recs(&f.link)?, false))),
+        ),
+    ]
+}
+
+/// The calls every panel or reference row must make, from its target
+/// table alone (`targets`), not from the runner's steps (which a broken
+/// runner would change along with its calls): the sink's focus click (its
+/// move and its click, at a point of its own), the player's focus click at
+/// [`FOCUS_POINT`], a calibration call at the focus point and at each
+/// target, then each target's move and click, in the table's order.
+pub fn panel_calls(
+    targets: &[test_device::panel::Target],
+) -> Vec<(&'static str, Option<(i32, i32)>)> {
+    let targets: Vec<(i32, i32)> = targets.iter().map(|t| (t.x, t.y)).collect();
     let mut out = vec![
         ("move", None),
         ("click", None),
@@ -1674,20 +1894,31 @@ pub struct Reading {
 ///
 /// An unknown row, or the run's `start` unreadable.
 pub fn read(row: &str, dir: &Path) -> anyhow::Result<Reading> {
+    let e = super::check::expectation_of(row)
+        .ok_or_else(|| anyhow::anyhow!("`judge` has no row `{row}`"))?;
+    let standing = contract::standing(&e, dir, super::COMMIT);
+    read_role(row, dir, SINGLE, &standing)
+}
+
+/// Reads the run in `dir` as role `role` of row `row`, its streams kept
+/// only as `standing` takes them for that role.
+fn read_role(
+    row: &str,
+    dir: &Path,
+    role: &str,
+    standing: &contract::Standing,
+) -> anyhow::Result<Reading> {
     let files = Files::read(dir);
     let start = recs(&files.run)
         .ok()
         .and_then(|r| r.first().cloned())
         .filter(|v| v["t"] == "start")
         .ok_or_else(|| anyhow::anyhow!("{}: no `start` record", dir.display()))?;
-    let e = super::check::expectation_of(row)
-        .ok_or_else(|| anyhow::anyhow!("`judge` has no row `{row}`"))?;
-    let standing = contract::standing(&e, dir, super::COMMIT);
-    let files = files.standing(SINGLE, &standing);
+    let files = files.standing(role, standing);
     let (inner, panel) = match row {
-        "sink" | "sink-early-close" => (None, None),
+        "sink" | "sink-early-close" | "p1-ref" | "p1-ref-75" => (None, None),
         "sink-kill" | "p1-kill" => (
-            Some(Files::read(&dir.join(INNER)).standing(INNER, &standing)),
+            Some(Files::read(&dir.join(INNER)).standing(INNER, standing)),
             None,
         ),
         _ if held_by(row).is_some() => (None, Some(PanelFiles::read(dir))),
@@ -1713,6 +1944,7 @@ pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
     let judged = match (row, &r.inner, &r.panel) {
         ("sink-kill", Some(inner), _) => kill(&N2, build, f, inner, None),
         ("p1-kill", Some(inner), _) => kill(&N2P, build, f, inner, r.inner_mode.as_ref()),
+        ("p1-ref" | "p1-ref-75", _, _) => reference(build, f, row),
         (_, _, Some(x)) => panel(build, f, x, row),
         _ => n1(build, f),
     };
@@ -1760,6 +1992,83 @@ pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
         .collect()
 }
 
+/// The verdict lines of the set in `dir` for its row `e`: the set's
+/// provenance over every role's link (and each panel role's mode link), the
+/// reservation's build named in every `hello`, each panel role's driving
+/// connection in the panel mode; then each role's row checks on its run,
+/// its own provenance left out, each id and input named by the role. The
+/// standing of every role's streams is read once, for the whole set; every
+/// line names the set's row and id.
+///
+/// # Errors
+///
+/// The reservation does not read, or a role's `start` does not.
+pub fn set_lines(e: &contract::Expectation, dir: &Path) -> anyhow::Result<Vec<Value>> {
+    let set = super::owner::reservation(dir)?
+        .ok_or_else(|| anyhow::anyhow!("{} holds no reservation", dir.display()))?;
+    let standing = contract::standing(e, dir, super::COMMIT);
+    let mut out = Vec::new();
+    let mut links: Vec<(&'static str, &'static str, Stream)> = Vec::new();
+    let mut modes_ok: Result<Result<(), String>, String> = Ok(Ok(()));
+    for role in &e.roles {
+        let reserved = set
+            .roles
+            .iter()
+            .find(|r| r.role == role.name)
+            .ok_or_else(|| anyhow::anyhow!("the set reserves no role `{}`", role.name))?;
+        let r = read_role(role.row, &dir.join(&reserved.dir), role.name, &standing)?;
+        links.push((role.name, LINK, r.files.link.clone()));
+        if let Some(x) = &r.panel {
+            links.push((role.name, MODE_LINK, x.mode.clone()));
+            if let Ok(Ok(())) = modes_ok {
+                modes_ok = in_panel_mode(&r.files.link);
+            }
+        }
+        for mut line in lines(role.row, &r) {
+            if line["check"] == provenance::CHECK {
+                continue;
+            }
+            line["check"] = json!(format!(
+                "{}/{}",
+                role.name,
+                line["check"].as_str().unwrap_or("")
+            ));
+            for input in line["inputs"].as_array_mut().into_iter().flatten() {
+                if input["role"] == SINGLE {
+                    input["role"] = json!(role.name);
+                }
+            }
+            line["row"] = json!(e.row);
+            line["run"] = json!(set.set);
+            out.push(line);
+        }
+    }
+    let sources: Vec<(String, &Stream)> = links
+        .iter()
+        .map(|(role, path, s)| (format!("{role}/{path}"), s))
+        .collect();
+    let named: Vec<(&str, &Stream)> = sources.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let judged = match provenance(Some(&set.build), &named) {
+        Ok(Ok(())) => modes_ok,
+        other => other,
+    };
+    let (outcome, detail) = match judged {
+        Ok(Ok(())) => ("pass", String::new()),
+        Ok(Err(why)) => ("fail", why),
+        Err(why) => ("incomplete", why),
+    };
+    let first = json!({
+        "row": e.row, "run": set.set, "check": provenance::CHECK, "outcome": outcome,
+        "detail": detail,
+        "inputs": links.iter().map(|(role, path, s)| json!({
+            "role": role, "path": path, "sha256": s.sha,
+        })).collect::<Vec<_>>(),
+        "producer": { "name": PRODUCER, "version": super::COMMIT },
+    });
+    out.insert(0, first);
+    Ok(out)
+}
+
 /// Judges the run in `dir` as row `row` and writes `verdicts-judge.jsonl`.
 ///
 /// # Errors
@@ -1767,9 +2076,12 @@ pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
 /// An unknown row, the run's `start` unreadable, or the file cannot be
 /// written.
 pub fn judge(row: &str, dir: &Path) -> anyhow::Result<()> {
-    let r = read(row, dir)?;
+    let lines = match super::check::expectation_of(row) {
+        Some(e) if e.binding == contract::Binding::Set => set_lines(&e, dir)?,
+        _ => lines(row, &read(row, dir)?),
+    };
     let out = super::owner::Stream::create(&dir.join(format!("verdicts-{PRODUCER}.jsonl")))?;
-    for line in lines(row, &r) {
+    for line in lines {
         out.write(&line);
     }
     if let Some(e) = out.close() {
@@ -2428,6 +2740,262 @@ pub mod tests {
         (files, x)
     }
 
+    /// The reference player's process and window in a reference run.
+    pub const REF_PROCESS: (u32, u64) = (30, 300);
+    pub const REF_WINDOW: u64 = 0x6060;
+
+    /// A good reference run of `row` (`p1-ref`, `p1-ref-75`): the sink's
+    /// focus click, the attachment, the row's calls from its steps, the
+    /// recorder's clicks, the two captures 50 ms apart after the last
+    /// click's button-up, and a link that grants no lease, its evidence
+    /// `hello` quiet with reason `none`.
+    pub fn ref_good(row: &str) -> Files {
+        let calls = super::super::run::calls_of(&super::super::run::row(row, false).unwrap());
+        let (pid, created) = REF_PROCESS;
+        let process = json!({"pid": pid, "created": created});
+        let client = json!([8, 31, 1920, 1080]);
+        let mut run = vec![
+            json!({"t": "start"}),
+            json!({"t": "sink", "q": 100, "window": SINK}),
+        ];
+        let mut recorder = vec![json!({"t": "ready", "q": 50})];
+        for (k, (what, point)) in calls.iter().enumerate() {
+            let (x, y) = point.unwrap_or((100, 50));
+            let q = 200 + 10 * i64::try_from(k).unwrap();
+            let tag = 0xABCD_0000 + u32::try_from(k).unwrap();
+            run.push(json!({"t": "call", "q": q, "tag": tag, "what": what, "point": [x, y]}));
+            if *what == "click" {
+                recorder.extend([mouse(q + 5, 1, tag), mouse(q + 6, 2, tag)]);
+            }
+            if k == 1 {
+                run.push(json!({"t": "attach", "q": 215, "process": process, "window": REF_WINDOW, "client": client}));
+            }
+        }
+        // 50 ms at the link's frequency.
+        let gap = FREQ / 20;
+        run.extend([
+            json!({"t": "capture", "q": 2500 + gap, "what": "shot-a.png", "process": process,
+            "window": REF_WINDOW, "client": client, "grabs": [
+                {"file": "shot-a.png", "before": 2400, "after": 2410},
+                {"file": "shot-a-2.png", "before": 2410 + gap, "after": 2420 + gap},
+            ]}),
+            json!({"t": "stop", "q": 5000 + gap, "what": "end"}),
+            json!({"t": "quiet", "q": 5600 + gap, "line": hello(true, "none", "-")}),
+            json!({"t": "close", "q": 5800 + gap, "window": SINK}),
+            json!({"t": "end", "exit": 0, "errors": []}),
+        ]);
+        recorder.push(json!({"t": "end", "q": 6000 + gap}));
+        let mut link = vec![
+            json!({"t": "open", "q": 10, "freq": FREQ}),
+            json!({"t": "cmd", "q": 20, "line": "hello"}),
+            json!({"t": "ans", "q": 30, "sent": 20, "cmd": "hello", "line": hello(true, "none", "-")}),
+        ];
+        for k in 0..4 {
+            let (sent, recv) = (40 + k * 100, 60 + k * 100);
+            link.push(json!({"t": "ping", "n": k, "sent": sent, "device": device(50 + k * 100), "recv": recv}));
+        }
+        link.extend([
+            json!({"t": "fence", "q": 5100 + gap}),
+            json!({"t": "cmd", "q": 5110 + gap, "line": "release"}),
+            json!({"t": "ans", "q": 5120 + gap, "sent": 5110 + gap, "cmd": "release", "line": "ok"}),
+            json!({"t": "cmd", "q": 5500 + gap, "line": "hello"}),
+            json!({"t": "ans", "q": 5510 + gap, "sent": 5500 + gap, "cmd": "hello", "line": hello(true, "none", "-")}),
+        ]);
+        Files {
+            run: Stream::of(run),
+            link: Stream::of(link),
+            recorder: Stream::of(recorder),
+        }
+    }
+
+    fn ref_outcome(f: &Files, row: &str, check: &str) -> (Outcome, String) {
+        let j = reference(Some("0123456789ab"), f, row)
+            .into_iter()
+            .find(|j| j.check == check)
+            .unwrap_or_else(|| panic!("no {check} for {row}"));
+        (j.outcome, j.detail)
+    }
+
+    #[test]
+    fn a_good_reference_run_passes_every_check() {
+        for row in ["p1-ref", "p1-ref-75"] {
+            let all = reference(Some("0123456789ab"), &ref_good(row), row);
+            assert_eq!(all.len(), 8);
+            for j in &all {
+                assert_eq!(j.outcome, Outcome::Pass, "{row}: {j:?}");
+            }
+        }
+        // Each row is held to its own targets: `p1-ref-75`'s calls are not
+        // `p1-ref`'s.
+        assert_eq!(
+            ref_outcome(&ref_good("p1-ref-75"), "p1-ref", "p1.clicks").0,
+            Outcome::Fail
+        );
+    }
+
+    /// The device holds nothing in a reference run: a pad report with a
+    /// button down, a key edge, or a hold-bearing command on the link
+    /// fails `ref.device-idle`; a neutral pad report does not.
+    #[test]
+    fn ref_device_idle_fails_on_a_press() {
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.recorder, |r| r.insert(1, panel_pad(300, 0, 2, true)));
+        assert_eq!(
+            ref_outcome(&f, "p1-ref", "ref.device-idle").0,
+            Outcome::Pass
+        );
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.recorder, |r| {
+            r.insert(1, panel_pad(300, PANEL3, 2, true))
+        });
+        let (o, why) = ref_outcome(&f, "p1-ref", "ref.device-idle");
+        assert_eq!(o, Outcome::Fail, "{why}");
+        assert!(why.contains("gave input"), "{why}");
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.recorder, |r| r.insert(1, key(300, true, true)));
+        assert_eq!(
+            ref_outcome(&f, "p1-ref", "ref.device-idle").0,
+            Outcome::Fail
+        );
+        // Another device's key is not the test device's.
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.recorder, |r| r.insert(1, key(300, true, false)));
+        assert_eq!(
+            ref_outcome(&f, "p1-ref", "ref.device-idle").0,
+            Outcome::Pass
+        );
+        let mut f = ref_good("p1-ref");
+        let lease = format!("lease {TOKEN} 250 {}", deadline(1000));
+        edit(&mut f.link, |l| {
+            l.push(json!({"t": "cmd", "q": 1010, "line": lease}))
+        });
+        let (o, why) = ref_outcome(&f, "p1-ref", "ref.device-idle");
+        assert_eq!(o, Outcome::Fail, "{why}");
+        assert!(why.contains("hold-bearing"), "{why}");
+    }
+
+    /// The captures follow the last click's button-up, 50 ms apart, of the
+    /// attached window: a capture begun before the button-up, a second
+    /// capture too soon, one of another process, or a missing button-up
+    /// each fails or holds `ref.capture-bound`.
+    #[test]
+    fn ref_capture_bound_needs_the_last_click_up() {
+        fn grab(r: &mut [Value], k: usize, field: &str, v: i64) {
+            let at = r.iter().position(|v| v["t"] == "capture").unwrap();
+            r[at]["grabs"][k][field] = json!(v);
+        }
+        let ok = |f: &Files| ref_outcome(f, "p1-ref", "ref.capture-bound");
+        assert_eq!(ok(&ref_good("p1-ref")).0, Outcome::Pass);
+        let last_up = {
+            let f = ref_good("p1-ref");
+            let r = f.recorder.records.unwrap();
+            r.iter()
+                .filter(|v| v["t"] == "mouse" && v["buttons"] == 2)
+                .map(q)
+                .max()
+                .unwrap()
+        };
+        // Begun at the button-up itself: not after it.
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.run, |r| grab(r, 0, "before", last_up));
+        let (o, why) = ok(&f);
+        assert_eq!(o, Outcome::Fail, "{why}");
+        assert!(
+            why.contains("not after the last click's button-up"),
+            "{why}"
+        );
+        // The second capture 1 tick short of 50 ms after the first.
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.run, |r| grab(r, 1, "before", 2410 + FREQ / 20 - 1));
+        let (o, why) = ok(&f);
+        assert_eq!(o, Outcome::Fail, "{why}");
+        assert!(why.contains("not at least"), "{why}");
+        // Another process than the one attached.
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.run, |r| {
+            let at = r.iter().position(|v| v["t"] == "capture").unwrap();
+            r[at]["process"]["created"] = json!(301);
+        });
+        assert!(ok(&f).1.contains("process"), "{:?}", ok(&f));
+        // The last click's button-up not recorded: not judged.
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.recorder, |r| {
+            let at = r
+                .iter()
+                .rposition(|v| v["t"] == "mouse" && v["buttons"] == 2)
+                .unwrap();
+            r.remove(at);
+        });
+        assert_eq!(ok(&f).0, Outcome::Incomplete);
+    }
+
+    /// A run without a lease takes any reason in its evidence `hello`, and
+    /// still needs it quiet, of its token, read after the fence and before
+    /// the close; a leasing row still needs `released`.
+    #[test]
+    fn quiet_before_close_without_a_lease() {
+        let f = ref_good("p1-ref");
+        let (run, link) = (f.run.records.unwrap(), f.link.records.unwrap());
+        assert_eq!(quiet_before_close(&run, &link, false), Ok(()));
+        assert!(quiet_before_close(&run, &link, true).is_err());
+        for reason in ["closed", "expired"] {
+            let mut r = run.clone();
+            let at = r.iter().position(|v| v["t"] == "quiet").unwrap();
+            r[at]["line"] = json!(hello(true, reason, "-"));
+            let mut l = link.clone();
+            let at = l.iter().rposition(|v| v["t"] == "ans").unwrap();
+            l[at]["line"] = json!(hello(true, reason, "-"));
+            assert_eq!(quiet_before_close(&r, &l, false), Ok(()), "{reason}");
+        }
+        // Not quiet.
+        let mut r = run.clone();
+        let mut l = link.clone();
+        let at = r.iter().position(|v| v["t"] == "quiet").unwrap();
+        r[at]["line"] = json!(hello(false, "none", "-"));
+        let at2 = l.iter().rposition(|v| v["t"] == "ans").unwrap();
+        l[at2]["line"] = json!(hello(false, "none", "-"));
+        assert!(quiet_before_close(&r, &l, false).is_err());
+        // The close before the evidence.
+        let mut r = run;
+        let close = r.iter().position(|v| v["t"] == "close").unwrap();
+        let c = r.remove(close);
+        let stop = r.iter().position(|v| v["t"] == "stop").unwrap();
+        r.insert(stop, c);
+        assert!(quiet_before_close(&r, &link, false).is_err());
+        assert_eq!(
+            ref_outcome(&ref_good("p1-ref"), "p1-ref", "ref.quiet-before-close").0,
+            Outcome::Pass
+        );
+    }
+
+    /// The attachment is one record of a 1920×1080 client area, between
+    /// the sink's focus click and the next call.
+    #[test]
+    fn ref_attached_is_one_record_in_its_place() {
+        let at = |f: &Files| ref_outcome(f, "p1-ref", "ref.attached").0;
+        assert_eq!(at(&ref_good("p1-ref")), Outcome::Pass);
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.run, |r| {
+            let a = r.iter().position(|v| v["t"] == "attach").unwrap();
+            r[a]["client"] = json!([8, 31, 1280, 720]);
+        });
+        assert_eq!(at(&f), Outcome::Fail);
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.run, |r| {
+            let a = r.iter().position(|v| v["t"] == "attach").unwrap();
+            let v = r.remove(a);
+            r.insert(2, v);
+        });
+        assert_eq!(at(&f), Outcome::Fail);
+        let mut f = ref_good("p1-ref");
+        edit(&mut f.run, |r| {
+            let a = r.iter().position(|v| v["t"] == "attach").unwrap();
+            let v = r[a].clone();
+            r.insert(a, v);
+        });
+        assert_eq!(at(&f), Outcome::Fail);
+    }
+
     fn panel_outcome(f: &Files, x: &PanelFiles, row: &str, check: &str) -> (Outcome, String) {
         let j = panel(Some("0123456789ab"), f, x, row)
             .into_iter()
@@ -2602,12 +3170,29 @@ pub mod tests {
     /// runner whose steps leave out a target makes the click check fail.
     #[test]
     fn the_expected_calls_are_the_target_table_s() {
-        let want = panel_calls();
+        let want = panel_calls(&test_device::panel::TARGETS);
         assert_eq!(want.len(), 4 + 4 + 2 * test_device::panel::TARGETS.len());
         for row in ["p1", "p4", "p5"] {
             let steps = super::super::run::row(row, false).unwrap();
             assert_eq!(super::super::run::calls_of(&steps), want, "{row}");
         }
+        // The reference rows make their own table's calls: `p1-ref` P1's,
+        // `p1-ref-75` the control's, which differ at slider 17 alone.
+        let steps = super::super::run::row("p1-ref", false).unwrap();
+        assert_eq!(super::super::run::calls_of(&steps), want);
+        let control = panel_calls(&test_device::panel::REF_75);
+        let steps = super::super::run::row("p1-ref-75", false).unwrap();
+        assert_eq!(super::super::run::calls_of(&steps), control);
+        let differ: Vec<_> = want
+            .iter()
+            .zip(&control)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.1)
+            .collect();
+        assert!(
+            !differ.is_empty() && differ.iter().all(|p| *p == Some((256, 606))),
+            "{differ:?}"
+        );
         let steps: Vec<_> = super::super::run::row("p1", false)
             .unwrap()
             .into_iter()
