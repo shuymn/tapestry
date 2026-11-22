@@ -1056,19 +1056,25 @@ pub fn volumes_kept(after: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("the player refuses device.toml after the run: {e}"))?;
     toml::from_str::<game::DeviceSettings>(text)
         .map_err(|e| format!("the player refuses device.toml after the run: {e}"))?;
-    let moved: Vec<String> = VOLUME_KEYS
+    at_start_volume(&table, "")
+}
+
+/// Each of the three volumes in `table` at exactly [`START_VOLUME`]; else
+/// each volume that is not, named with `when`.
+fn at_start_volume(table: &toml::Table, when: &str) -> Result<(), String> {
+    let off: Vec<String> = VOLUME_KEYS
         .iter()
         .filter_map(
             |(_, key)| match table.get(*key).and_then(toml::Value::as_float) {
                 Some(got) if got == START_VOLUME => None,
-                got => Some(format!("{key} = {got:?}, not {START_VOLUME}")),
+                got => Some(format!("{key} = {got:?}{when}, not {START_VOLUME}")),
             },
         )
         .collect();
-    if moved.is_empty() {
+    if off.is_empty() {
         Ok(())
     } else {
-        Err(moved.join("; "))
+        Err(off.join("; "))
     }
 }
 
@@ -1180,30 +1186,26 @@ fn volume_arm(run: &[Value]) -> Result<Result<(), String>, String> {
     let w = arm_witness(run)?;
     let (acquired, reached) = (w.acquired, &w.a);
     let targets = test_device::panel::TARGETS;
-    let calls: Vec<i64> = run
+    let point = |t: &test_device::panel::Target| (i64::from(t.x), i64::from(t.y));
+    // The run's click calls at a target's point, in order: each point and
+    // its counter.
+    let at_targets: Vec<((i64, i64), Option<i64>)> = run
         .iter()
         .filter(|v| v["t"] == "call" && v["what"] == "click")
         .filter_map(|v| {
-            let point = (v["point"][0].as_i64()?, v["point"][1].as_i64()?);
-            let q = v["q"].as_i64()?;
-            targets
-                .iter()
-                .any(|t| (i64::from(t.x), i64::from(t.y)) == point)
-                .then_some((point, q))
+            Some((
+                (v["point"][0].as_i64()?, v["point"][1].as_i64()?),
+                v["q"].as_i64(),
+            ))
         })
-        .map(|(_, q)| q)
+        .filter(|(p, _)| targets.iter().any(|t| point(t) == *p))
         .collect();
-    let in_order = run
+    let calls: Vec<i64> = at_targets.iter().filter_map(|(_, q)| *q).collect();
+    if !at_targets
         .iter()
-        .filter(|v| v["t"] == "call" && v["what"] == "click")
-        .filter_map(|v| Some((v["point"][0].as_i64()?, v["point"][1].as_i64()?)))
-        .filter(|p| {
-            targets
-                .iter()
-                .any(|t| (i64::from(t.x), i64::from(t.y)) == *p)
-        })
-        .eq(targets.iter().map(|t| (i64::from(t.x), i64::from(t.y))));
-    if !in_order {
+        .map(|(p, _)| *p)
+        .eq(targets.iter().map(point))
+    {
         return Err("the run's click calls at the targets are not one per target, in order".into());
     }
     let presses: Vec<&ArmEntry> = reached.iter().filter(|(_, _, _, o)| o == "press").collect();
@@ -1300,22 +1302,7 @@ pub fn volumes_start(before: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
         .and_then(|t| toml::from_str(t).map_err(|e| e.to_string()))
         .map_err(|e| format!("device.toml before the run does not read: {e}"))?;
-    let off: Vec<String> = VOLUME_KEYS
-        .iter()
-        .filter_map(
-            |(_, key)| match table.get(*key).and_then(toml::Value::as_float) {
-                Some(got) if got == START_VOLUME => None,
-                got => Some(format!(
-                    "{key} = {got:?} before the run, not {START_VOLUME}"
-                )),
-            },
-        )
-        .collect();
-    if off.is_empty() {
-        Ok(())
-    } else {
-        Err(off.join("; "))
-    }
+    at_start_volume(&table, " before the run")
 }
 
 /// Every byte of `device.toml` but the three volumes' lines is unchanged:
