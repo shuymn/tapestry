@@ -2732,7 +2732,9 @@ impl PlayerRig<'_> {
         let tuning = self.controls.tuning();
         let gauge = self.gauge;
         let on_failure = self.files.on_failure();
+        let target = self.files.target();
         if let Some(sel) = &mut self.selection {
+            sel.feed.target = target;
             sel.feed.settings = crate::selection_skin::settings_of(
                 options,
                 sel.screen.bests_preset(),
@@ -8142,7 +8144,7 @@ pub(crate) mod tests {
         sel.feed.enter(TimeUs(100));
         let u = at(&mut sel, 100);
         assert_eq!((u.lifetime, u.revision), (1, 1));
-        assert_eq!(u.labels, crate::select::labels());
+        assert_eq!(u.labels, crate::select::labels(game::ScoreTarget::Max));
         // Top: the all-charts row, s1, s2, c, d; three on each side of
         // the cursor around the ring.
         assert_eq!((u.view.rows.len(), u.view.cursor), (7, Some(3)));

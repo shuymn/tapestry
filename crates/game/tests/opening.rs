@@ -2216,6 +2216,7 @@ fn a_ready_preparation_survives_a_same_key_local_retry() {
         best: 1,
         best_known: true,
         target: 3,
+        setting: Some(game::ScoreTarget::Next),
     };
     assert_eq!(reads(&lookups), 1);
     assert_eq!(rig.scores, [basis]);
@@ -2608,6 +2609,7 @@ fn a_mixed_tuning_and_structural_stale_retries_through_the_wait() {
         best: 1,
         best_known: true,
         target: 3,
+        setting: Some(game::ScoreTarget::Next),
     };
     assert_eq!(reads(&lookups), 1);
     assert_eq!(rig.scores, [basis, basis]);
@@ -2640,6 +2642,7 @@ fn the_preparation_at_load_ready_carries_the_plays_best_and_target() {
             best,
             best_known,
             target: t,
+            setting: Some(target),
         };
         assert_eq!(rig.begun.len(), 1, "{target:?}");
         assert_eq!(rig.scores, [basis], "{target:?}");

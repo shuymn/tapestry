@@ -1367,8 +1367,9 @@ fn known_string(an: &Analysis, res: &Residual, v: Val) -> R<Option<String>> {
 /// known string, a read of a chart field, or a select on that read against
 /// `""` with the read and a known string as its arms. Every read must be
 /// of a chart field, as a text has nowhere to put a guard; `None` otherwise.
-/// On a selection skin the root may also be a whole read of a screen's
-/// own string (30, the query; 1000, the place), as its JSON `ref` is.
+/// The root may also be a whole read of a screen's own string where the
+/// screen bridges it (on selection 30, the query, and 1000, the place; a
+/// target's name on selection and the result), as its JSON `ref` is.
 fn text_fold(an: &Analysis, res: &Residual, kind: ScreenKind) -> R<Option<TextFold>> {
     let field = |r: u32| match res.node(r) {
         Node::Read { api, arg: Some(n) } if residual::is_text(api) && (10..=16).contains(&n) => {
@@ -1377,12 +1378,13 @@ fn text_fold(an: &Analysis, res: &Residual, kind: ScreenKind) -> R<Option<TextFo
         _ => None,
     };
     let screen = |r: u32| match res.node(r) {
-        Node::Read { api, arg: Some(n) }
-            if kind == ScreenKind::Selection && residual::is_text(api) =>
-        {
-            i32::try_from(n)
-                .ok()
-                .filter(|&n| matches!(property::str_in(kind, n), property::StrProp::Screen(_)))
+        Node::Read { api, arg: Some(n) } if residual::is_text(api) => {
+            i32::try_from(n).ok().filter(|&n| {
+                matches!(
+                    property::str_in(kind, n),
+                    property::StrProp::Screen(_) | property::StrProp::Target(_)
+                )
+            })
         }
         _ => None,
     };

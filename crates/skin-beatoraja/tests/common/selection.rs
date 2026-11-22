@@ -166,6 +166,13 @@ pub fn labels() -> SelectionLabels {
     SelectionLabels {
         all_charts: "ALL".to_owned(),
         search_results: "FOUND".to_owned(),
+        // The chosen `C`, `P1` to `P10` before it and `N1` to `N10` after
+        // it, nearest first.
+        targets: skin_model::TargetNames {
+            chosen: "C".to_owned(),
+            before: std::array::from_fn(|i| format!("P{}", i + 1)),
+            after: std::array::from_fn(|i| format!("N{}", i + 1)),
+        },
     }
 }
 

@@ -482,6 +482,37 @@ tests = [
 
 [[entry]]
 id = "SF-023"
+summary = "Targets are named in the source's wording, and a selection skin's texts 200 to 219 name the ten targets before and after the chosen one, wrapping"
+class = "compatibility"
+reason = """
+A player sees the chosen target named in the skin's target box, and on a \
+selection skin that lists them its neighbours: skins size those boxes and \
+their fonts for the source's names ("RANK A-" to "RANK MAX-", "MAX", "NEXT \
+RANK") and bind 200 to 209 as the tenth to the first before the chosen \
+target, 210 to 219 as the first to the tenth after it, by id and by name \
+(`targetnamep<v>`, `targetnamen<v>`), wrapping around the list. The list \
+itself is tapestry's twelve targets (design.md "Personal Bests", Target, \
+and its differences from the source)."""
+source = [
+    "src/bms/player/beatoraja/play/TargetProperty.java:116-146 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/TargetProperty.java:308-310 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/StringPropertyFactory.java:86-88 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/StringPropertyFactory.java:368-380 @beatoraja-0.8.9",
+]
+sites = [
+    "crates/game/src/bests.rs",
+    "crates/player/src/ui_text.rs",
+    "crates/skin-beatoraja/src/import/property.rs",
+    "crates/skin-beatoraja/src/import/selection/profile.rs",
+]
+tests = [
+    "crates/game/src/bests.rs::offset_wraps_around_the_list",
+    "crates/player/src/ui_text.rs::targets_are_named_in_the_sources_wording",
+    "crates/skin-beatoraja/src/import/property.rs::target_names_bind_by_id_and_by_name",
+]
+
+[[entry]]
+id = "SF-024"
 summary = "A BGA video draws opaque on the layer too: its black is not keyed"
 class = "rule"
 reason = """

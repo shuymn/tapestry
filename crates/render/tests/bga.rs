@@ -405,7 +405,7 @@ fn near(got: [u8; 3], want: [u8; 3], what: &str) {
 /// A layer that shows a video frame is opaque (design.md "Rendering and
 /// Skins", BGA): the frame's black covers the base, where a layer
 /// picture's black in the same place lets the base through.
-// Source: SF-023
+// Source: SF-024
 #[test]
 fn a_layer_video_is_opaque_over_the_base() {
     let dir = tempfile::tempdir().unwrap();

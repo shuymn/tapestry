@@ -158,7 +158,7 @@ pub(crate) struct Parts<'a> {
 }
 
 impl Parts<'_> {
-    // Source: SF-023
+    // Source: SF-024
     /// Pushes video `id`'s frame from its chart movie slot, placed by the
     /// stretch against the video's size, at its linear samples and opaque;
     /// `false` when its slot shows none.

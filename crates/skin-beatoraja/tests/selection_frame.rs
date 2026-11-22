@@ -208,6 +208,7 @@ fn texts_show_the_view_and_the_labels() {
             SelectionLabels {
                 all_charts: "every".to_owned(),
                 search_results: "hits".to_owned(),
+                targets: Default::default(),
             },
             "every",
             "hits",
@@ -232,6 +233,71 @@ fn texts_show_the_view_and_the_labels() {
     s.view(&v);
     let (texts, _) = s.requests();
     assert!(texts.iter().all(|(_, t)| t != " > "));
+}
+
+/// S10-44: texts 3 and 200 to 219 show the target names the labels give
+/// (`labels`: the chosen `C`, `P1` to `P10` before it, `N1` to `N10` after),
+/// by `ref` and by name (`targetnamep<v>` the `v`th before, `targetnamen<v>`
+/// the `v`th after: `StringPropertyFactory.java:86-88` at `0.8.9`), on a
+/// chart row, a folder row and an empty list alike.
+#[test]
+fn target_texts_show_the_labels_names_on_every_row() {
+    let props = [
+        r#""ref": 3"#,
+        r#""ref": 200"#,
+        r#""ref": 209"#,
+        r#""ref": 210"#,
+        r#""ref": 219"#,
+        r#""value": "targetnamep1""#,
+        r#""value": "targetnamen10""#,
+        r#""value": "target""#,
+    ];
+    let texts: Vec<String> = props
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!(r#"{{"id": "t{i}", "font": "f", {p}}}"#))
+        .collect();
+    let dsts: Vec<String> = (0..props.len())
+        .map(|i| {
+            format!(
+                r#"{{"id": "t{i}", "dst": [{}]}}"#,
+                at(0, 20 * i as i32, 300, 10)
+            )
+        })
+        .collect();
+    let list = song_list(
+        &[&at(0, 900, 300, 40), &at(0, 800, 300, 40)],
+        &[&at(0, 900, 300, 40), &at(0, 800, 300, 40)],
+        0,
+        TITLE,
+    );
+    let body = format!(
+        r#""imageset": [{SET}], "text": [{TEXT_T}, {}], {list},
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        texts.join(","),
+        dsts.join(",")
+    );
+    let d = folder(&body);
+    let mut s = Sel::of(d.path());
+    let want = ["C", "P10", "P1", "N1", "N10", "P1", "N10", "C"];
+    for v in [
+        view(vec![chart("a"), folder_row("F", 2)], Some(0), None, None),
+        view(vec![chart("a"), folder_row("F", 2)], Some(1), None, None),
+        view(Vec::new(), None, None, None),
+    ] {
+        s.skin.update_selection(&mut s.sel, &v, &labels()).unwrap();
+        let (texts, _) = s.requests();
+        let strings: Vec<&str> = texts.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(strings, want, "{:?}", v.cursor);
+    }
+    // Empty names draw nothing.
+    let unnamed = SelectionLabels {
+        targets: skin_model::TargetNames::default(),
+        ..labels()
+    };
+    let v = view(vec![chart("a")], Some(0), None, None);
+    s.skin.update_selection(&mut s.sel, &v, &unnamed).unwrap();
+    assert!(s.requests().0.is_empty());
 }
 
 /// The numbers of the C24 fixture, by the id each shows: one element a

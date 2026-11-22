@@ -1207,6 +1207,7 @@ fn texts_show_the_view_and_the_players_labels() {
     let other = skin_model::SelectionLabels {
         all_charts: "every".to_owned(),
         search_results: "hits".to_owned(),
+        targets: Default::default(),
     };
     fx.skin.update_selection(&mut fx.sel, &v3, &other).unwrap();
     assert_eq!(
