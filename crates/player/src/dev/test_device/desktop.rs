@@ -376,12 +376,15 @@ impl Desk for Real<'_> {
             // Unreadable: refuse as if a menu were up.
             return Gui {
                 foreign_capture: false,
+                capture_process: 0,
                 menu: true,
             };
         }
         let capture = win(info.hwndCapture);
+        let capture_process = if capture == 0 { 0 } else { process_of(capture) };
         Gui {
-            foreign_capture: capture != 0 && process_of(capture) != std::process::id(),
+            foreign_capture: capture != 0 && capture_process != std::process::id(),
+            capture_process,
             menu: info.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0 | GUI_SYSTEMMENUMODE.0)
                 != 0,
         }

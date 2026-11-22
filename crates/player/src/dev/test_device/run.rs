@@ -185,11 +185,7 @@ pub fn panel_steps(buttons: &[u8], barrier: bool) -> Vec<Step> {
     ];
     steps.extend(buttons.iter().map(|&b| set(b, 1)));
     steps.extend([Step::AwaitHeld, Step::Wait { ms: 500 }]);
-    steps.extend(
-        test_device::panel::TARGETS
-            .iter()
-            .map(|t| Step::Click { x: t.x, y: t.y }),
-    );
+    steps.extend(target_clicks(&test_device::panel::TARGETS));
     steps.extend([Step::Wait { ms: 500 }, Step::Shot(SHOT_A)]);
     if barrier {
         steps.push(Step::Barrier);
@@ -200,6 +196,24 @@ pub fn panel_steps(buttons: &[u8], barrier: bool) -> Vec<Step> {
         Step::Wait { ms: 800 },
         Step::Shot(SHOT_B),
     ]);
+    steps
+}
+
+/// How long a row waits between its target clicks: six frames at 60 Hz,
+/// so each press has a frame of its own. The reference player reads one
+/// mouse press a frame (the last press's position), so presses a few
+/// milliseconds apart land in one frame and only the last takes effect.
+pub const CLICK_GAP_MS: u64 = 100;
+
+/// One guarded click at each of `targets`, [`CLICK_GAP_MS`] apart.
+fn target_clicks(targets: &[Target]) -> Vec<Step> {
+    let mut steps = Vec::new();
+    for (i, t) in targets.iter().enumerate() {
+        if i > 0 {
+            steps.push(Step::Wait { ms: CLICK_GAP_MS });
+        }
+        steps.push(Step::Click { x: t.x, y: t.y });
+    }
     steps
 }
 
@@ -232,7 +246,8 @@ pub const SHOT_A_2: &str = "shot-a-2.png";
 
 /// The steps of a reference row clicking `targets`: the sink's focus
 /// click, the attachment, a focus click on the reference's window, the
-/// mapping calibration, one guarded click at each target, and the two
+/// mapping calibration, one guarded click at each target ([`CLICK_GAP_MS`]
+/// apart), and the two
 /// captures of shot A. Nothing is held on the device: the reference's
 /// panel 3 is opened by its own start.
 pub fn ref_steps(targets: &[Target]) -> Vec<Step> {
@@ -246,7 +261,7 @@ pub fn ref_steps(targets: &[Target]) -> Vec<Step> {
         Step::Calibrate,
         Step::Wait { ms: 500 },
     ];
-    steps.extend(targets.iter().map(|t| Step::Click { x: t.x, y: t.y }));
+    steps.extend(target_clicks(targets));
     steps.extend([Step::Wait { ms: 500 }, Step::Capture([SHOT_A, SHOT_A_2])]);
     steps
 }
@@ -2211,6 +2226,32 @@ fn outer(a: &Args, o: &Outer) -> anyhow::Result<i32> {
 #[cfg(test)]
 mod tests {
     use test_device::protocol::LeaseId;
+
+    /// Every panel and reference row clicks its targets a frame apart and
+    /// more: a wait of [`CLICK_GAP_MS`] (at least three 60 Hz frames)
+    /// stands between each two target clicks, so the reference player,
+    /// which reads one press a frame, takes each of them.
+    #[test]
+    fn target_clicks_are_frames_apart() {
+        const { assert!(CLICK_GAP_MS >= 50) };
+        for name in ["p1", "p4", "p5", "p1-ref", "p1-ref-75"] {
+            let steps = row(name, false).unwrap();
+            let clicks: Vec<usize> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(s, Step::Click { .. }))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(clicks.len(), 3, "{name}");
+            for pair in clicks.windows(2) {
+                assert_eq!(
+                    &steps[pair[0] + 1..pair[1]],
+                    [Step::Wait { ms: CLICK_GAP_MS }],
+                    "{name}"
+                );
+            }
+        }
+    }
 
     use super::super::guard::{Act, Guard, SLICE_MS, View};
     use super::super::link::Grant;

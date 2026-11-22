@@ -38,6 +38,10 @@ pub fn tag(prefix: u16, call: u16) -> u32 {
 pub struct Gui {
     /// A window of another process captures the mouse.
     pub foreign_capture: bool,
+    /// The process whose window captures the mouse (0: none, or unread):
+    /// named in the refusal, so a run shows whether the capture was its
+    /// own player's or another program's.
+    pub capture_process: u32,
     /// A menu is active.
     pub menu: bool,
 }
@@ -117,7 +121,9 @@ pub enum Refusal {
         want: (i32, i32),
     },
     ButtonDown,
-    ForeignCapture,
+    ForeignCapture {
+        process: u32,
+    },
     Menu,
     /// `SendInput` inserted `got` of `of` inputs.
     Inserted {
@@ -156,7 +162,10 @@ impl fmt::Display for Refusal {
                 write!(f, "the pointer is at {cursor:?}, not {want:?}")
             }
             Self::ButtonDown => f.write_str("a mouse button is down"),
-            Self::ForeignCapture => f.write_str("another process's window captures the mouse"),
+            Self::ForeignCapture { process } => write!(
+                f,
+                "another process's window captures the mouse (process {process})"
+            ),
             Self::Menu => f.write_str("a menu is active"),
             Self::Inserted { got, of } => write!(f, "SendInput inserted {got} of {of} inputs"),
             Self::NotInFront => f.write_str("the run's window did not come to the front"),
@@ -221,7 +230,9 @@ pub fn check(s: &Scene) -> Result<(i32, i32), Refusal> {
         return Err(Refusal::ButtonDown);
     }
     if s.gui.foreign_capture {
-        return Err(Refusal::ForeignCapture);
+        return Err(Refusal::ForeignCapture {
+            process: s.gui.capture_process,
+        });
     }
     if s.gui.menu {
         return Err(Refusal::Menu);
@@ -694,7 +705,10 @@ mod tests {
     fn no_click_under_a_foreign_capture_or_a_menu() {
         let mut f = Fake::new();
         f.gui.foreign_capture = true;
-        assert_eq!(run(&mut f, false), Err(Refusal::ForeignCapture));
+        f.gui.capture_process = 4242;
+        let e = run(&mut f, false).unwrap_err();
+        assert_eq!(e, Refusal::ForeignCapture { process: 4242 });
+        assert!(e.to_string().contains("process 4242"), "{e}");
         let mut f = Fake::new();
         f.gui.menu = true;
         assert_eq!(run(&mut f, false), Err(Refusal::Menu));
@@ -817,7 +831,7 @@ mod tests {
             (|s| s.buttons_down = true, |r| *r == Refusal::ButtonDown),
             (
                 |s| s.gui.foreign_capture = true,
-                |r| *r == Refusal::ForeignCapture,
+                |r| matches!(r, Refusal::ForeignCapture { .. }),
             ),
             (|s| s.gui.menu = true, |r| *r == Refusal::Menu),
         ];
