@@ -1655,9 +1655,10 @@ enum Alone {
 /// A choice to play under `alone`, where the pack can run only as
 /// foreground work: the choice's look claims it but begins nothing, so
 /// the cold bank's decode is granted every foreground permit its pool
-/// runs a worker for; the pack begins in the foreground once the decode
-/// has ended, and packs (design.md "beatoraja Lua Skins", the result
-/// skin's preload: begun as foreground work after the decode).
+/// runs a worker for; the load itself begins the pack in the foreground
+/// once the decode has ended, with no look after it, and the attempt
+/// finds it packed (design.md "beatoraja Lua Skins", the result skin's
+/// preload: begun as foreground work after the decode).
 fn a_foreground_only_preload_leaves_a_cold_bank_its_width(alone: Alone) {
     use crate::result_skin::preload_tests::{Opened, REACHED, Seam, gate, preloaded_with};
     let _serial = crate::imports::tests::serial();
@@ -1708,18 +1709,34 @@ fn a_foreground_only_preload_leaves_a_cold_bank_its_width(alone: Alone) {
                 [(Speed::NORMAL, granted(0, 4), 0)],
                 "{alone:?}"
             );
-            // After the decode it begins, in the foreground, and packs.
+            // Begun by the load after the decode, with no look since.
+            assert!(
+                rig.result_skin.preload_state().1.is_some(),
+                "{alone:?}: not begun after the decode"
+            );
             gate(0);
-            until("the pack's collection", || {
-                rig.poll_preload();
-                rig.result_skin.image().is_some()
-            });
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+            let claim = rig.preload_claim.take();
+            assert!(claim.is_some(), "{alone:?}: claimed");
+            assert!(control.claimed());
+            let stage = rig.result_skin.begin_image_stage(
+                crate::result_skin::tests::chart(),
+                Some(skin_beatoraja::JudgeClass::Normal),
+                claim,
+            );
+            assert!(
+                matches!(
+                    stage,
+                    crate::result_skin::ImageStage::Ready(crate::result_skin::Staged::Ready)
+                ),
+                "{alone:?}: the attempt finds it packed"
+            );
+            assert!(rig.result_skin.image().is_some(), "{alone:?}");
             assert!(
                 seam.left.lock().unwrap().is_empty(),
                 "{alone:?}: no mode change"
             );
             assert_eq!(crate::result_skin::builds(), builds + 1, "{alone:?}");
-            assert!(control.claimed());
         },
     );
 }
@@ -1806,6 +1823,53 @@ fn a_claimed_preload_stays_speculative_until_the_decode_ends() {
                 ["result-preload"],
                 "foreground after the decode"
             );
+        },
+    );
+}
+
+/// A discard in Preparing while the adopted pack holds a foreground permit
+/// between its checkpoints, held there whatever it is told, then a cold
+/// chart's load: the claim's end revokes the pack's permit at once, so the
+/// next decode is granted every foreground permit its pool runs a worker
+/// for though the pack has not yielded (design.md "Load Pipeline", the
+/// coordinator: the chosen chart's bank draws the foreground pool).
+#[test]
+fn a_discarded_adopted_pack_leaves_the_next_cold_bank_its_width() {
+    use crate::result_skin::preload_tests::{Opened, Seam, gate, step};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            // The attempt adopts the claimed pack, which moves to the
+            // foreground at its next checkpoint.
+            let stage = rig.result_skin.begin_image_stage(
+                crate::result_skin::tests::chart(),
+                Some(skin_beatoraja::JudgeClass::Normal),
+                Some(control.claim()),
+            );
+            assert!(matches!(stage, crate::result_skin::ImageStage::Adopted(_)));
+            assert!(step(), "a checkpoint in the foreground");
+            assert_eq!(b.coord.held(Class::Foreground), 1);
+            // The discard: the stage drops with its claim; the pack, held
+            // between its checkpoints, has not yielded its permit.
+            drop(stage);
+            assert!(!control.claimed());
+            assert_eq!(b.coord.held(Class::Foreground), 0, "revoked at once");
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+            assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
         },
     );
 }

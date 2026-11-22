@@ -3769,6 +3769,13 @@ impl PlayerRig<'_> {
         if let Some(claim) = &self.preload_claim {
             claim.promote();
         }
+        if self.preload_claim.is_some() {
+            // A pack that can run only in the foreground begins here, the
+            // one point every load passes after its decode, so the attempt
+            // adopts it whether or not a look comes first (design.md
+            // "beatoraja Lua Skins", the result skin's preload).
+            self.poll_preload();
+        }
         #[cfg(test)]
         if let Some(gate) = self.selection.as_ref().and_then(|s| s.after_bank.as_ref()) {
             gate();

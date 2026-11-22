@@ -7,15 +7,21 @@
 //! The pack is a cancellable job handle with cooperative cancellation and
 //! a deferred-destruction owner off the game thread: the game thread owns
 //! the handle ([`Preload`]) and changes it only through one transition
-//! table ([`ResultSkin::preload_on`] for the game thread's events,
-//! [`ResultSkin::collect_preload`] for the pack's outcome); the pack's
-//! thread observes a stop only at its checkpoints, and pages nobody takes
-//! are dropped on the pack's thread or on a disposal thread, never on the
-//! game thread. It reuses what the player has for each part: the adopted
-//! stage's sliced polling with the attempt's quit and run-end checks for
-//! every wait in Preparing ([`ResultSkin::wait_pack`]); the page job's
-//! checked priority ([`crate::page_jobs::JobMode`], its refusal read
-//! after each class hook) for background mode; and the shelf's pause,
+//! table ([`ResultSkin::preload_on`] for the game thread's events, a
+//! claim's included, [`ResultSkin::collect_preload`] for the pack's
+//! outcome); the pack's thread observes a stop only at its checkpoints,
+//! and pages nobody takes are dropped on the pack's thread or on the
+//! preload's disposal thread ([`Disposer`], reserved before a pack
+//! begins), never on the game thread. It reuses what the player has for
+//! each part: the adopted stage's sliced polling with the attempt's quit
+//! and run-end checks for every wait in Preparing
+//! ([`ResultSkin::wait_pack`]); the page job's checked priority
+//! ([`crate::page_jobs::JobMode`], its refusal read after each class hook)
+//! for background mode, from the class of its first actual permit
+//! ([`game::coord::Runner::on_new_thread`], as an owned job's thread);
+//! the coordinator's promotion, revoked at a claim's end
+//! ([`game::coord::Promoter::revoke`]), so the next chosen chart's bank
+//! has the foreground pool's full width; and the shelf's pause,
 //! acknowledgement and shared stop deadline ([`crate::shelf::Shelf`]) for
 //! the pause and the run's end.
 //!
@@ -34,8 +40,10 @@
 //!   ([`PreloadClaim`]): the pause does not stop it, and once the chosen
 //!   chart's bank no longer decodes it is promoted to the foreground. The
 //!   attempt's image stage adopts a claimed pack of its mode and waits for
-//!   it in place of its own import and build; the claim's end demotes it
-//!   and hands it back to the preload.
+//!   it in place of its own import and build; the claim's end demotes it,
+//!   its foreground permit revoked at once, and hands it back to the
+//!   preload. A pack that can run only in the foreground begins at the
+//!   chosen chart's bank's end.
 //! - **One warm-up.** Once a pack is collected, or an attempt runs its
 //!   own image stage, the preload ends for the installation.
 
@@ -108,12 +116,16 @@ pub(super) enum Then {
 }
 
 /// The game thread's events, which [`ResultSkin::preload_on`] applies
-/// through the preload's transition table.
+/// through the preload's transition table (a claim's events through
+/// [`PreloadControl::on_claim`], the same table's rows).
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Event {
+pub(super) enum Event<'a> {
     /// A look of selection, the decision screen or the practice page,
     /// `may_run` the practice page's jobs leaving room for a pack.
     Look { may_run: bool },
+    /// A pack begins on the coordinator, as a look said it may and after
+    /// the renderer's report was read again.
+    Start(&'a Coordinator),
     /// The practice page's gate before it admits a job, or at its entry
     /// before its pause is released: a running pack is stopped unless
     /// `may_run`; nothing is collected or begun.
@@ -197,15 +209,44 @@ enum End {
     NoBackground,
 }
 
-/// Drops `what` on a thread of its own, so pages nobody takes never free
-/// on the game thread (a deferred-destruction owner). Should the thread
-/// not start, they drop here, logged.
-fn dispose<T: Send + 'static>(what: T) {
-    if let Err(e) = std::thread::Builder::new()
-        .name("result-dispose".to_owned())
-        .spawn(move || drop(what))
-    {
-        log::warn!("skin: result: the preload's pages are freed in place: {e}");
+/// What the disposal thread runs: a drop, or a drain and a drop.
+type Disposal = Box<dyn FnOnce() + Send>;
+
+/// The preload's disposal thread, a deferred-destruction owner: what the
+/// game thread hands it drops there, so pages nobody takes never free on
+/// the game thread. It is reserved before the first pack begins, so every
+/// disposal after it, the run's end included, has it without starting a
+/// thread; it ends once the result skin lets it go and it has dropped
+/// everything handed to it.
+pub(super) struct Disposer(mpsc::Sender<Disposal>);
+
+impl std::fmt::Debug for Disposer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Disposer").finish_non_exhaustive()
+    }
+}
+
+impl Disposer {
+    /// Its thread, started.
+    fn start() -> std::io::Result<Self> {
+        let (sender, handed) = mpsc::channel::<Disposal>();
+        std::thread::Builder::new()
+            .name("result-dispose".to_owned())
+            .spawn(move || {
+                for disposal in handed {
+                    disposal();
+                }
+            })?;
+        Ok(Self(sender))
+    }
+
+    /// Runs `disposal` on its thread. Should the thread be gone (it
+    /// panicked), it runs here, logged.
+    fn run(&self, disposal: Disposal) {
+        if let Err(mpsc::SendError(disposal)) = self.0.send(disposal) {
+            log::warn!("skin: result: the preload's disposal thread is gone; freed in place");
+            disposal();
+        }
     }
 }
 
@@ -303,7 +344,7 @@ impl PreloadControl {
     /// not stop it. The claim's holder asks for it before it requests the
     /// pause, so a pack never sees the choice's pause unclaimed.
     pub fn claim(self: &Arc<Self>) -> PreloadClaim {
-        self.claims.fetch_add(1, Ordering::SeqCst);
+        self.on_claim(ClaimEvent::Claim);
         // The job it attaches to: the running pack's now, else the one
         // begun under it later (`pre:claim` at its begin).
         #[cfg(feature = "dev-tools")]
@@ -323,6 +364,35 @@ impl PreloadControl {
 
     fn promoter(&self) -> MutexGuard<'_, Option<Promoter>> {
         self.promoter.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A claim's event, the transition table's Claim, Promote and Drop rows
+    /// ([`ResultSkin::preload_on`]): on the game thread, on the shared
+    /// flags and the current job's promoter, under the promoter's lock so
+    /// a pack's begin ([`set_promoter`](Self::set_promoter)) sees each
+    /// whole. The preload's state is not changed: the next look or the
+    /// attempt reads the flags.
+    fn on_claim(&self, event: ClaimEvent) {
+        let current = self.promoter();
+        match event {
+            ClaimEvent::Claim => {
+                self.claims.fetch_add(1, Ordering::SeqCst);
+            }
+            ClaimEvent::Promote => {
+                self.foreground.store(true, Ordering::SeqCst);
+                if let Some(p) = current.as_ref() {
+                    p.promote();
+                }
+            }
+            ClaimEvent::Drop => {
+                if self.claims.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.foreground.store(false, Ordering::SeqCst);
+                    if let Some(p) = current.as_ref() {
+                        p.revoke();
+                    }
+                }
+            }
+        }
     }
 
     /// Job `promoter`'s begin: it is the one a claim promotes from now,
@@ -459,13 +529,24 @@ impl Drop for Ended<'_> {
     }
 }
 
+/// A claim's events ([`PreloadControl::on_claim`]).
+#[derive(Clone, Copy, Debug)]
+enum ClaimEvent {
+    /// A choice to play or a Start claims the pack.
+    Claim,
+    /// The chosen chart's bank no longer decodes, or the attempt adopts.
+    Promote,
+    /// A claim ends.
+    Drop,
+}
+
 /// A choice's claim on the result skin's preload pack (design.md "State
 /// Model", the decision screen and the practice page): held from a choice
 /// to play or a Start by its load, and moved into the attempt's
 /// preparation, so every end of the choice drops it. While it lives the
-/// pause does not stop the pack; dropped, the pack is demoted and handed
-/// back to the preload (with speculation off its next checkpoint then
-/// cancels it).
+/// pause does not stop the pack; dropped, the pack is demoted, the
+/// foreground permit it holds revoked at once, and handed back to the
+/// preload (with speculation off its next checkpoint then cancels it).
 pub struct PreloadClaim(Arc<PreloadControl>);
 
 impl std::fmt::Debug for PreloadClaim {
@@ -480,23 +561,13 @@ impl PreloadClaim {
     /// from now, is promoted to the foreground at its next checkpoint. A
     /// pack that can run only in the foreground begins from now on.
     pub fn promote(&self) {
-        let current = self.0.promoter();
-        self.0.foreground.store(true, Ordering::SeqCst);
-        if let Some(p) = current.as_ref() {
-            p.promote();
-        }
+        self.0.on_claim(ClaimEvent::Promote);
     }
 }
 
 impl Drop for PreloadClaim {
     fn drop(&mut self) {
-        let current = self.0.promoter();
-        if self.0.claims.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.foreground.store(false, Ordering::SeqCst);
-            if let Some(p) = current.as_ref() {
-                p.demote();
-            }
-        }
+        self.0.on_claim(ClaimEvent::Drop);
     }
 }
 
@@ -512,19 +583,20 @@ struct PackJob {
     stop: Cancel,
     control: Arc<PreloadControl>,
     mode: Arc<dyn ThreadMode>,
-    /// Begun promoted by a claim: it begins in the foreground, and its
-    /// thread enters no background mode first.
-    promoted: bool,
     done: mpsc::Sender<PackOut>,
 }
 
 impl PackJob {
-    /// The pack on its own thread: background mode entered through the
-    /// priority seam first (unless a claim began it promoted), then the
-    /// atlas step on `runner`, its checkpoint the build's stop. A refusal
-    /// of background mode, at the begin or at a later class change, is
-    /// recorded in the shared control at once, so the stop that the next
-    /// checkpoint reads holds it (the page job's checked priority).
+    /// The pack on its own thread, which begins in the normal mode as
+    /// `runner` records it ([`Runner::on_new_thread`]): its admission sets
+    /// the thread's mode for the class of its first actual permit through
+    /// the priority seam, background mode for a speculative one, whatever
+    /// class it was begun in; then, unless that entry was refused, the
+    /// atlas step, its checkpoint the build's stop. A refusal of
+    /// background mode, at the admission or at a later class change, is
+    /// recorded in the shared control at once, so no atlas work follows
+    /// the admission's and the stop that the next checkpoint reads holds a
+    /// later one (the page job's checked priority).
     fn run(self, runner: Runner<()>) {
         let Self {
             id,
@@ -537,7 +609,6 @@ impl PackJob {
             stop,
             control,
             mode,
-            promoted,
             done,
         } = self;
         let _ended = Ended(&control, id);
@@ -550,24 +621,8 @@ impl PackJob {
                 control.refused.store(true, Ordering::SeqCst);
             }
         };
-        if !promoted {
-            checked(Class::Speculative);
-        }
-        if mode.refused() {
-            drop(runner);
-            control.left(id, true);
-            #[cfg(feature = "dev-tools")]
-            mark_job("pre:end", id, "no-background");
-            let _ = done.send(PackOut {
-                id,
-                kept,
-                ran: PackRan::Ended {
-                    lent: None,
-                    end: End::NoBackground,
-                },
-            });
-            return;
-        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        tests::admission_gate();
         let stops = || stop.is_cancelled() || control.stops();
         let on_class = |class| {
             #[cfg(feature = "dev-tools")]
@@ -579,7 +634,13 @@ impl PackJob {
         #[cfg(feature = "dev-tools")]
         let progressed = AtomicBool::new(false);
         let mut packed = None;
+        let mut no_background = false;
         let outcome = runner.run(&stops, &on_class, |ctx| {
+            // Admitted: its thread's mode is set for its permit's class.
+            if mode.refused() {
+                no_background = true;
+                return;
+            }
             let check = || {
                 #[cfg(all(test, feature = "dev-tools"))]
                 tests::pack_gate(&stops);
@@ -598,7 +659,7 @@ impl PackJob {
             packed = Some(pack(&pending, imported, &slot, base, others, &stop, &check));
         });
         let cancelled = matches!(outcome, Outcome::Cancelled);
-        control.left(id, cancelled);
+        control.left(id, cancelled || no_background);
         // Pages it built that nobody takes drop here, on its own thread.
         let lent_of = |p: Option<Result<Packed, NotPacked>>| match p {
             Some(Ok((built, ..))) => {
@@ -610,6 +671,10 @@ impl PackJob {
         };
         let wanted = control.wanted.load(Ordering::SeqCst) == id;
         let ran = match (outcome, packed) {
+            _ if no_background => PackRan::Ended {
+                lent: None,
+                end: End::NoBackground,
+            },
             (Outcome::Done(()), Some(Ok(built))) if wanted => PackRan::Built(Box::new(built)),
             (Outcome::Done(()), Some(Err(not))) => {
                 let (why, lent) = *not;
@@ -681,32 +746,36 @@ impl ResultSkin {
         self.control.clone()
     }
 
-    /// The preload's transition table for the game thread's events. The
-    /// pack's outcome is collected by [`collect_preload`]'s table
-    /// (Look collects first; no event here waits except End).
+    /// The preload's transition table: every event changes the preload
+    /// here, the claim's rows through [`PreloadControl::on_claim`], all on
+    /// the game thread. The pack's outcome is collected by
+    /// [`collect_preload`]'s table. Retired stays Retired at every event.
+    /// Per row: the transition by state; who holds the pages after it
+    /// ("lent": the image state the slot lent the pack, which nothing else
+    /// takes until the collection, so a stopping pack quarantines it); and
+    /// what waits.
     ///
-    /// | Event | Idle | Running | Stopping { then } | Retired |
-    /// |---|---|---|---|---|
-    /// | Look { may_run } | stays (the caller begins it, [`poll_preload`]) | collected if ended; else stopped, then Idle, when `!may_run`, the pause holds unclaimed, or a foreground-only pack has no foreground claim | collected if ended | stays |
-    /// | Gate { may_run } | stays | stopped, then Idle, when `!may_run` | stays | stays |
-    /// | Invalidate | Retired | stopped, then Dropped | then Dropped | stays |
-    /// | Disable, Attempt | Retired | stopped, then Retired | then at least Retired | stays |
-    /// | End(bound) | Retired | stopped, its thread waited for until the run's shared deadline; Retired | as Running | stays |
+    /// | Event | Transition | Pages | Wait |
+    /// |---|---|---|---|
+    /// | Look { may_run } | Running, Stopping: collected if ended; Running then stopped, then Idle, when `!may_run`, the pause holds unclaimed, or a foreground-only pack has no foreground claim. Idle stays (the caller starts it, [`poll_preload`]) | as collected; else unchanged | none |
+    /// | Start(coord) | Idle, when the look said so: the disposal thread reserved first ([`Disposer`]); then, unless two result atlases are live, the image state taken into the slot, the job's promoter set (promoted when a claim wants the foreground) and its thread spawned: Running. A probe of a mode no longer preferred, or a disposal or pack thread that cannot start: Retired. Other states unchanged | lent to the pack; on a failed spawn, returned | none; the pack's thread sets its mode for the class of its first permit, checked, before any atlas work |
+    /// | Claim | unchanged: the pause no longer stops the pack | unchanged | none |
+    /// | Promote | unchanged: the current job promoted, in the foreground from its next checkpoint, and a foreground-only pack may start | unchanged | none |
+    /// | Drop (the last claim) | unchanged: the current job demoted, its foreground permit revoked at once ([`game::coord::Promoter::revoke`]), its own class taken at its next checkpoint | unchanged | none |
+    /// | Gate { may_run } | Running: stopped, then Idle, when `!may_run` | unchanged | none |
+    /// | Invalidate | Idle: Retired. Running: stopped, then Dropped. Stopping: then Dropped | lent, quarantined until collected; then disposed of | none |
+    /// | Disable, Attempt | Idle: Retired. Running: stopped, then Retired. Stopping: then at least Retired | lent, quarantined until collected; then returned | none here; the attempt's stage waits for the collection in Preparing's slices ([`wait_pack`]) |
+    /// | End(bound) | Running, Stopping: stopped, then the receiver and the slot handed to the disposal thread: Retired. Idle: Retired | an outcome queued or sent later, and the lent holdings, drop on the disposal thread or the pack's, never here | the pack's thread, until the run's shared stop deadline |
     ///
-    /// Who holds the pages and where they go: while a pack runs or stops,
-    /// the holdings the slot lent are the pack's, and nothing else takes
-    /// the image state (Stopping quarantines it: an attempt's stage waits
-    /// for the collection in slices, [`wait_pack`]); the pack drops pages
-    /// it built and that nobody wants on its own thread; the collection
-    /// restores only lent holdings, keeps new pages only of a pack still
-    /// wanted, and disposes of everything else on a disposal thread. At
-    /// End the receiver goes, so a late outcome drops on the pack's
-    /// thread.
+    /// Where pages nobody takes go: the pack drops pages it built and
+    /// that nobody wants on its own thread; the collection restores only
+    /// lent holdings, keeps new pages only of a pack still wanted, and
+    /// hands everything else to the disposal thread.
     ///
     /// [`collect_preload`]: Self::collect_preload
     /// [`poll_preload`]: Self::poll_preload
     /// [`wait_pack`]: Self::wait_pack
-    pub(super) fn preload_on(&mut self, event: Event) {
+    pub(super) fn preload_on(&mut self, event: Event<'_>) {
         let in_flight = matches!(self.preload, Preload::Running(_) | Preload::Stopping { .. });
         match event {
             Event::Look { may_run } => {
@@ -716,6 +785,7 @@ impl ResultSkin {
                     self.stop_preload(Then::Idle);
                 }
             }
+            Event::Start(coord) => self.start_pack(coord),
             Event::Gate { may_run } => {
                 if !may_run && matches!(self.preload, Preload::Running(_)) {
                     self.stop_preload(Then::Idle);
@@ -739,7 +809,19 @@ impl ResultSkin {
                     return;
                 }
                 self.stop_preload(Then::Retired);
-                self.preload = Preload::Retired;
+                // Its receiver, with an outcome already queued or one the
+                // pack sends later, and the lent slot go to the disposal
+                // thread: nothing of the pack is freed here.
+                if let Preload::Stopping { run, .. } = std::mem::take(&mut self.preload) {
+                    let Running { done, slot, .. } = run;
+                    self.dispose_with(Box::new(move || {
+                        while let Ok(out) = done.try_recv() {
+                            drop(out);
+                        }
+                        drop(done);
+                        drop(slot);
+                    }));
+                }
                 if let Some(c) = &self.control {
                     let began = Instant::now();
                     c.close_by(began + bound);
@@ -784,13 +866,19 @@ impl ResultSkin {
         self.preload_on(Event::Gate { may_run });
     }
 
-    /// Begins the pack on `coord`, after [`poll_preload`](Self::poll_preload)
-    /// said so and the renderer's report was read again: on the game
-    /// thread the atlases a build counts, then the image state taken for
-    /// it, then its thread. A probe imported in the other mode than the
-    /// one now preferred ends the preload; while two result atlases are
-    /// live it does not build and waits.
+    /// Begins the pack on `coord` ([`Event::Start`]), after
+    /// [`poll_preload`](Self::poll_preload) said so and the renderer's
+    /// report was read again.
     pub fn begin_preload(&mut self, coord: &Coordinator) {
+        self.preload_on(Event::Start(coord));
+    }
+
+    /// The Start row: on the game thread the disposal thread reserved, the
+    /// atlases a build counts, then the image state taken for it, then its
+    /// thread. A probe imported in the other mode than the one now
+    /// preferred ends the preload; while two result atlases are live it
+    /// does not build and waits.
+    fn start_pack(&mut self, coord: &Coordinator) {
         let Preload::Idle(input) = &self.preload else {
             return;
         };
@@ -798,6 +886,20 @@ impl ResultSkin {
             log::info!("skin: result: not preloaded: its probe's mode is no longer preferred");
             self.preload = Preload::Retired;
             return;
+        }
+        // The disposal thread before anything is lent: every disposal
+        // after this, the run's end included, starts no thread.
+        if self.disposer.is_none() {
+            match Disposer::start() {
+                Ok(d) => self.disposer = Some(d),
+                Err(e) => {
+                    log::info!(
+                        "skin: result: not preloaded: its disposal thread cannot start: {e}"
+                    );
+                    self.preload = Preload::Retired;
+                    return;
+                }
+            }
         }
         let (Some(control), Some(pending)) = (self.control.clone(), self.pending().map(Arc::clone))
         else {
@@ -830,9 +932,12 @@ impl ResultSkin {
         // Of the speculative class whatever begins it, so a claim's end
         // demotes it there (with no speculative permit, its next
         // checkpoint then cancels it); a claim that wants it in the
-        // foreground begins it promoted.
-        let runner = coord.task::<()>(Class::Speculative);
+        // foreground begins it promoted. Its new thread is in the normal
+        // mode, as the runner records, until its first permit.
+        let runner = coord.task::<()>(Class::Speculative).on_new_thread();
         let promoted = control.set_promoter(runner.promoter());
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = promoted;
         let job = PackJob {
             id,
             kept: input.kept,
@@ -847,7 +952,6 @@ impl ResultSkin {
                 .preload_mode
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::priority::Checked::SYSTEM)),
-            promoted,
             done,
         };
         control.began(id);
@@ -984,7 +1088,7 @@ impl ResultSkin {
             (PackRan::Built(built), then) => {
                 let (new, _, _) = *built;
                 if let Some(new) = new {
-                    dispose(new);
+                    self.dispose(new);
                 }
                 self.hand_back(None, &slot, then);
                 Preload::Retired
@@ -1003,6 +1107,21 @@ impl ResultSkin {
         };
     }
 
+    /// Drops `what` on the disposal thread ([`Disposer`]), reserved before
+    /// any pack began: nothing a pack leaves is freed on the game thread.
+    fn dispose<T: Send + 'static>(&self, what: T) {
+        self.dispose_with(Box::new(move || drop(what)));
+    }
+
+    /// Runs `disposal` on the disposal thread; with none (no pack ever
+    /// began, so it holds nothing of one) it runs here.
+    fn dispose_with(&self, disposal: Disposal) {
+        match &self.disposer {
+            Some(d) => d.run(disposal),
+            None => disposal(),
+        }
+    }
+
     /// The holdings the slot lent a collected pack, `lent` (what it left
     /// of what it took) or else what is still in `slot`: returned to the
     /// image state, or under [`Then::Dropped`] disposed of off the game
@@ -1010,7 +1129,7 @@ impl ResultSkin {
     fn hand_back(&mut self, lent: Option<Images>, slot: &Slot, then: Then) {
         if then == Then::Dropped {
             if let Some(images) = lent.or_else(|| lock(slot).take()) {
-                dispose(images);
+                self.dispose(images);
             }
         } else {
             self.restore(lent, slot);

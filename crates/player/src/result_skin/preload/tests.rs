@@ -115,6 +115,40 @@ fn hold_built(on: bool) {
     BUILT_GATE.store(on, SeqCst);
 }
 
+/// Whether a pack waits before its admission ([`admission_gate`]).
+static ADMISSION_GATE: AtomicBool = AtomicBool::new(false);
+/// Whether a pack reached [`admission_gate`] while it was armed.
+static ADMISSION_REACHED: AtomicBool = AtomicBool::new(false);
+
+/// On the pack's thread before its admission takes a permit: a pack waits
+/// while [`ADMISSION_GATE`] is armed.
+pub(super) fn admission_gate() {
+    if !ADMISSION_GATE.load(SeqCst) {
+        return;
+    }
+    ADMISSION_REACHED.store(true, SeqCst);
+    while ADMISSION_GATE.load(SeqCst) {
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+}
+
+/// Arms (`true`) or opens [`admission_gate`].
+fn hold_admission(on: bool) {
+    if on {
+        ADMISSION_REACHED.store(false, SeqCst);
+    }
+    ADMISSION_GATE.store(on, SeqCst);
+}
+
+/// The admission gate opens when the test ends, however it ends.
+struct AdmissionOpened;
+
+impl Drop for AdmissionOpened {
+    fn drop(&mut self) {
+        hold_admission(false);
+    }
+}
+
 /// Whether drops are witnessed ([`DropWitness`]).
 static WITNESSING: AtomicBool = AtomicBool::new(false);
 /// The threads image entries dropped on while witnessed, by name.
@@ -400,6 +434,31 @@ fn a_late_outcome_of_a_dropped_mode_is_not_restored() {
 #[test]
 fn a_published_outcome_of_a_disabled_run_is_disposed_off_the_game_thread() {
     a_published_outcome_retired_before_collection(false);
+}
+
+/// The run's end with a pack's packed outcome sent but not collected: the
+/// close hands the receiver, the outcome in it and the lent slot to the
+/// disposal thread, so the new pages' last reference goes there, not on
+/// the game thread (design.md "beatoraja Lua Skins", the result skin's
+/// preload).
+#[test]
+fn a_close_with_the_outcome_queued_frees_it_off_the_game_thread() {
+    let _s = crate::imports::tests::serial();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    let witness = Witness::on();
+    look(&mut rs, &coord, true);
+    let control = rs.preload_control().unwrap();
+    assert!(control.wait_ended(long()), "the pack's thread ends");
+    assert!(rs.preload_state().1.is_some(), "its outcome is queued");
+    drop(rs);
+    assert_eq!(
+        witness.dropped(1),
+        ["result-dispose"],
+        "freed off the game thread"
+    );
 }
 
 /// A pack retired (the run disabling the result skin) right after its
@@ -934,6 +993,70 @@ fn a_refusal_on_reentering_background_mode_stops_the_pack() {
     assert!(rs.image().is_none());
     look(&mut rs, &coord, true);
     assert_eq!(rs.preload_state(), (Some(true), None), "nothing begins");
+}
+
+/// A pack begun promoted under a claim and demoted before its admission
+/// (the claim dropped while it waits there): its thread, begun in the
+/// normal mode, enters background mode at its admission in the speculative
+/// class, checked, before any atlas work. Entered, it packs on its
+/// speculative permit; refused, it does no atlas work and no speculative
+/// pack begins again (design.md "Load Pipeline", System friendliness).
+fn a_promoted_pack_demoted_before_admission(refuse: bool) {
+    let _s = crate::imports::tests::serial();
+    let _g = Opened;
+    let _a = AdmissionOpened;
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    seam.refuse.store(refuse, SeqCst);
+    let coord = coordinator(1);
+    let mut rs = preloaded(d.path(), &seam);
+    let control = rs.preload_control().unwrap();
+    let before = builds();
+    let claim = control.claim();
+    claim.promote();
+    hold_admission(true);
+    gate(2);
+    look(&mut rs, &coord, true);
+    until("the pack's admission", || ADMISSION_REACHED.load(SeqCst));
+    assert!(
+        seam.entered.lock().unwrap().is_empty(),
+        "nothing entered yet"
+    );
+    drop(claim);
+    hold_admission(false);
+    if refuse {
+        assert!(control.wait_ended(long()), "the pack's thread ends");
+        assert!(!REACHED.load(SeqCst), "no atlas work after the refusal");
+        assert_eq!(*seam.entered.lock().unwrap(), ["result-preload"]);
+        collected(&mut rs, &coord);
+        assert_eq!(rs.preload_state(), (Some(true), None));
+        look(&mut rs, &coord, true);
+        assert_eq!(rs.preload_state(), (Some(true), None), "nothing begins");
+        assert_eq!(builds(), before);
+    } else {
+        until("the pack's checkpoint", || REACHED.load(SeqCst));
+        assert_eq!(
+            *seam.entered.lock().unwrap(),
+            ["result-preload"],
+            "background mode before its first checkpoint"
+        );
+        assert_eq!(coord.held(Class::Speculative), 1);
+        assert_eq!(coord.held(Class::Foreground), 0);
+        gate(0);
+        collected(&mut rs, &coord);
+        assert!(rs.image().is_some(), "packed");
+        assert_eq!(builds(), before + 1);
+    }
+}
+
+#[test]
+fn a_promoted_pack_demoted_before_admission_enters_background_mode() {
+    a_promoted_pack_demoted_before_admission(false);
+}
+
+#[test]
+fn a_promoted_pack_demoted_before_admission_refused_background_does_no_work() {
+    a_promoted_pack_demoted_before_admission(true);
 }
 
 /// With speculation off, a claim begins the pack in the foreground with

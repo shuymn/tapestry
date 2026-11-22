@@ -428,6 +428,8 @@ pub struct ResultSkin {
     preload_mode: Option<Arc<dyn crate::priority::ThreadMode>>,
     /// The packs begun, each one's job.
     preload_jobs: u64,
+    /// The preload's disposal thread, reserved before its first pack.
+    disposer: Option<preload::Disposer>,
 }
 
 impl std::fmt::Debug for ResultSkin {
