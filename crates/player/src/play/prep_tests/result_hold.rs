@@ -51,6 +51,8 @@ static FAIL_FACTORY_FONT: AtomicBool = AtomicBool::new(false);
 struct Frame {
     /// What its result stamp names; `None` for a frame of another screen.
     path: Option<ResultPath>,
+    /// The view it presented, by its key.
+    view: Option<u64>,
     /// Its texels with a channel above 200; `usize::MAX` when it was not
     /// read back.
     lit: usize,
@@ -221,6 +223,7 @@ impl FrameSink for Recorder {
         };
         self.0.log.lock().unwrap().push(Frame {
             path: drawn.result.map(|r| r.path),
+            view: drawn.result.and_then(|r| r.view),
             lit,
             sampled: drawn.result.map(|r| r.sampled),
             at: Instant::now(),
@@ -2233,6 +2236,438 @@ fn a_result_without_a_skin_draws_the_end_page_at_once() {
                 .iter()
                 .all(|f| f.path == Some(ResultPath::BuiltIn)),
             "the end page from its first frame: {shown:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// The played preset as a user file `mine` in `dir`'s shelf: the report
+/// played under it, its result screen, the shelf and the file.
+fn played_mine(
+    dir: &std::path::Path,
+) -> (
+    game::PlayReport,
+    game::ResultScreen,
+    game::Shelf,
+    std::path::PathBuf,
+) {
+    let presets = dir.join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let mut preset = rules::tapestry();
+    preset.id = "mine".to_owned();
+    let mine = presets.join("mine.toml");
+    std::fs::write(&mine, game::preset_to_toml(&preset)).unwrap();
+    let shelf = game::Shelf::open(presets, "tapestry").unwrap();
+    let read = shelf
+        .entries()
+        .into_iter()
+        .find(|e| e.name == "mine")
+        .and_then(|e| e.preset.cloned())
+        .expect("the user preset read");
+    let report = crate::end_screen::tests::report(read);
+    let screen = game::ResultScreen::new(
+        &report,
+        &shelf,
+        &crate::end_screen::tests::chart(),
+        game::RECORDING_MEMORY,
+    );
+    (report, screen, shelf, mine)
+}
+
+/// The played preset's file rewritten (a later BAD window) and reloaded
+/// through the shelf, as the flow's poll does: whether the screen changed.
+fn reload_mine(
+    mine: &std::path::Path,
+    shelf: &mut game::Shelf,
+    screen: &mut game::ResultScreen,
+    report: &game::PlayReport,
+) -> bool {
+    let mut late = report.preset.clone();
+    for t in [&mut late.tables.keys, &mut late.tables.scratch] {
+        t.windows.bad.late = TimeUs(400_000);
+    }
+    std::fs::write(mine, game::preset_to_toml(&late)).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(mine)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+    shelf.check();
+    screen.sync(report, shelf, &crate::end_screen::tests::chart())
+}
+
+/// A pending result skin as [`held_miss`]'s whose layout keeps a runtime
+/// (its image drawn by a `draw` callback), so each payload's `script` is
+/// its layout's generation; the attempt prepared and committed, a cleared
+/// page as the outgoing screen, the result's preparation begun and its
+/// layout landed. The frames' count at the begin, and the skin's folder.
+fn held_scripted_miss(
+    rig: &mut PlayerRig<'_>,
+    frames: &Frames,
+    a: &game::Loaded,
+    report: &game::PlayReport,
+    screen: &game::ResultScreen,
+) -> (usize, tempfile::TempDir) {
+    let d = result::skin(
+        "local calls = 0 rt_draw = function() calls = calls + 1 return calls > 0 end",
+        "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+    );
+    let p = result::pending(d.path(), result::LIMITS);
+    // The runtimes in the render thread's cell, as the player's are.
+    rig.result_skin =
+        ResultSkin::new(Some(ResultStart::Pending(p))).with_scripts(rig.render.scripts().clone());
+    prepared(rig, a);
+    rig.render.send(RenderMsg::Menu(Box::default()));
+    frames.arm();
+    let at = frames.len();
+    rig.begin_result(report, screen);
+    rig.result_compared(report, screen);
+    laid_out(rig);
+    frames.until(rig, at, "outgoing frames", |f| f.len() >= 3);
+    (at, d)
+}
+
+/// The presenter's payload published last.
+fn published(rig: &PlayerRig<'_>) -> Arc<crate::result_present::ViewPayload> {
+    Arc::clone(rig.presenter.payload().expect("a payload published"))
+}
+
+/// The reload's view published, with a runtime of its own: after `handed`.
+fn reloaded(
+    rig: &mut PlayerRig<'_>,
+    handed: &crate::result_present::ViewPayload,
+) -> Arc<crate::result_present::ViewPayload> {
+    until_true(rig, "the reload's layout published", |rig| {
+        rig.presenter
+            .payload()
+            .is_some_and(|p| p.key != handed.key && p.script.is_some() && p.script != handed.script)
+    });
+    published(rig)
+}
+
+/// The frames from the first view's to the reload's: the first is the
+/// hand-over's with its skin drawn, and every frame until the reload's
+/// view is it, with no pending or built-in frame between.
+fn first_then_reload(seen: &[Frame], handed: u64, reload: u64) {
+    let first = first_view(seen).expect("a first view");
+    assert_eq!(
+        seen[first].view,
+        Some(handed),
+        "the first committed view not the hand-over's: {seen:?}"
+    );
+    let second = seen
+        .iter()
+        .position(|f| f.view == Some(reload))
+        .expect("the reload's view");
+    assert!(
+        seen[first..second]
+            .iter()
+            .all(|f| f.path == Some(ResultPath::Skin) && f.view == Some(handed)),
+        "a frame not the first view's before the reload's: {seen:?}"
+    );
+    assert_eq!(seen[second].path, Some(ResultPath::Skin));
+}
+
+/// V19 (l1): a reload of the played preset changing 154 while the first
+/// view's staging is held: the first committed view is the hand-over's,
+/// its skin drawn with the runtime it was published with, though the
+/// reload's publication names another generation; after the first
+/// picture's acknowledgement the reload's view shows as a switch.
+#[test]
+fn a_reload_while_the_first_view_stages_commits_the_hand_over_view_first() {
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    let presets = tempfile::tempdir().unwrap();
+    on_warp(a.chart(), |rig, frames| {
+        let (report, mut screen, mut shelf, mine) = played_mine(presets.path());
+        let (from, _skin) = held_scripted_miss(rig, frames, &a, &report, &screen);
+        rig.render.pause_result_staging(true);
+        rig.show_end(&report, &screen);
+        let handed = published(rig);
+        assert!(
+            handed.script.is_some(),
+            "the hand-over's view keeps no runtime"
+        );
+        assert_eq!(rig.render.scripts().first(), handed.script, "no first mark");
+        assert!(
+            reload_mine(&mine, &mut shelf, &mut screen, &report),
+            "the reload changed nothing"
+        );
+        rig.show_end(&report, &screen);
+        let reload = reloaded(rig, &handed);
+        rig.render.hold_result_commit(true);
+        rig.render.pause_result_staging(false);
+        until_true(rig, "the first view's commit", |rig| {
+            rig.render.result_commit_held()
+        });
+        assert_eq!(
+            rig.render.scripts().presented(),
+            handed.script,
+            "the first commit not of the hand-over's generation"
+        );
+        rig.render.hold_result_commit(false);
+        let seen = frames.until(rig, from, "the reload's view", |f| {
+            f.iter().any(|f| f.view == Some(reload.key))
+        });
+        first_then_reload(&seen, handed.key, reload.key);
+        rig.leave_result();
+    });
+}
+
+/// V19 (l2): the render thread held inside the frame sink from before the
+/// hand-over until the reload's payload is published, so both offers come
+/// before it takes either: the same two views show in the same order.
+#[test]
+fn a_render_thread_held_across_both_publications_shows_the_hand_over_view_first() {
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    let presets = tempfile::tempdir().unwrap();
+    on_warp(a.chart(), |rig, frames| {
+        let (report, mut screen, mut shelf, mine) = played_mine(presets.path());
+        let (from, _skin) = held_scripted_miss(rig, frames, &a, &report, &screen);
+        frames.meet();
+        rig.show_end(&report, &screen);
+        let handed = published(rig);
+        assert!(reload_mine(&mine, &mut shelf, &mut screen, &report));
+        rig.show_end(&report, &screen);
+        let reload = reloaded(rig, &handed);
+        frames.part();
+        let seen = frames.until(rig, from, "the reload's view", |f| {
+            f.iter().any(|f| f.view == Some(reload.key))
+        });
+        first_then_reload(&seen, handed.key, reload.key);
+        rig.leave_result();
+    });
+}
+
+/// V19 (l3): the first view's text refused, which disables the kind before
+/// the first commit: the first committed view is the hand-over payload's
+/// built-in page, committed with no runtime (no fallback at the commit
+/// point), and the presenter's built-in payload shows after the
+/// acknowledgement.
+#[test]
+fn a_text_refused_first_view_commits_its_built_in_page_first() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (from, _skin) = held_miss_with_text(rig, frames, &a, &report, &screen);
+        laid_out(rig);
+        crate::dev::refuse_next_result_text();
+        rig.show_end(&report, &screen);
+        let handed = published(rig);
+        let seen = frames.until(rig, from, "the first committed view", |f| {
+            f.iter().any(|f| f.path.is_some() && !f.pending())
+        });
+        let first = seen
+            .iter()
+            .position(|f| f.path.is_some() && !f.pending())
+            .unwrap();
+        assert_eq!(
+            (seen[first].path, seen[first].view),
+            (Some(ResultPath::BuiltIn), Some(handed.key)),
+            "the first view not the hand-over's built-in page: {seen:?}"
+        );
+        until_true(rig, "the presenter's built-in payload", |rig| {
+            rig.presenter.payload().is_some_and(|p| p.skin.is_none())
+        });
+        let revision = rig.presenter.revision();
+        until_true(rig, "the built-in payload committed", |rig| {
+            let s = rig.render.result_status();
+            s.revision >= revision && s.shown == Some((handed.key, false))
+        });
+        let status = rig.render.result_status();
+        assert!(status.disabled.is_some(), "the kind not disabled");
+        assert!(
+            status
+                .refused
+                .as_ref()
+                .is_none_or(|(_, why)| !why.contains("could not be committed")),
+            "the first view fell back at the commit point: {status:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// A look of the flow's: the rig waits idly, reading the acknowledgement.
+fn look(rig: &mut PlayerRig<'_>) {
+    let until = TimeUs(rig.now().0 + 20_000);
+    rig.idle_wait(until);
+}
+
+/// Looks until the result handed over shows, at most 20 s.
+fn until_shown(rig: &mut PlayerRig<'_>) {
+    let end = Instant::now() + Duration::from_secs(20);
+    while !rig.result_view_shown() {
+        assert!(Instant::now() < end, "the result never showed");
+        look(rig);
+    }
+}
+
+/// V19a, the first run: while the pending presentation draws, the result
+/// has not shown (so the flow drops a preset step), no layout is asked
+/// for, the offset key is refused and the end screen not open; once the
+/// first view's picture is acknowledged, the look that reads it shows the
+/// result, the end screen open and the offset key working, and that view
+/// is the hand-over's.
+#[test]
+fn an_offset_key_before_the_first_view_is_refused() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (at, _skin) = pending_after_hand_over(rig, frames, &a, &report, &screen);
+        assert_eq!(rig.render.presented_origin(), None);
+        let key = rig.presenter.desired_key();
+        let requests = rig.result_skin.requests();
+        look(rig);
+        assert!(!rig.result_view_shown(), "shown on a pending frame");
+        assert_eq!(rig.result_timing(), None);
+        let tuning = rig.controls.tuning();
+        let offset = tuning.get().input_offset_us;
+        assert!(
+            !tuning.adjust(game::Adjust::InputOffsetUp),
+            "the offset key on a pending frame"
+        );
+        assert_eq!(tuning.get().input_offset_us, offset);
+        assert!(!tuning.end_screen_shown(), "the end screen open");
+        rig.render.pause_result_staging(false);
+        let seen = frames.until(rig, at, "the first view", |f| first_view(f).is_some());
+        assert_eq!(seen[first_view(&seen).unwrap()].view, key);
+        until_shown(rig);
+        let tuning = rig.controls.tuning();
+        assert!(tuning.end_screen_shown(), "the end screen closed");
+        assert!(tuning.adjust(game::Adjust::InputOffsetUp));
+        assert_eq!(rig.result_skin.requests(), requests, "a layout asked for");
+        rig.leave_result();
+    });
+}
+
+/// V19a, the second run: a retry during the pending frames begins its
+/// outro at once with none to play, no view committed.
+#[test]
+fn a_retry_before_the_first_view_is_served_at_once() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let _skin = pending_after_hand_over(rig, frames, &a, &report, &screen);
+        look(rig);
+        let now = rig.now();
+        assert_eq!(rig.begin_outro(now, Some(now)), game::Outro::Begun(None));
+        assert_eq!(rig.render.result_status().shown, None, "a view committed");
+        rig.leave_result();
+    });
+}
+
+/// V19a, the third run: with no result skin the result shows at the
+/// hand-over: the end screen open and the offset key working at once.
+#[test]
+fn with_no_result_skin_the_result_shows_at_the_hand_over() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        rig.result_skin = ResultSkin::new(None);
+        prepared(rig, &a);
+        frames.arm();
+        rig.begin_result(&report, &screen);
+        rig.show_end(&report, &screen);
+        assert!(rig.result_view_shown());
+        let tuning = rig.controls.tuning();
+        assert!(tuning.end_screen_shown());
+        assert!(tuning.adjust(game::Adjust::InputOffsetUp));
+        rig.leave_result();
+    });
+}
+
+/// The fixed skin with an input time of 300 ms and a fade-out of 5 s, its
+/// attempt prepared and the result's preparation begun: its folder.
+fn timed_hand_over(
+    rig: &mut PlayerRig<'_>,
+    frames: &Frames,
+    a: &game::Loaded,
+    report: &game::PlayReport,
+    screen: &game::ResultScreen,
+) -> tempfile::TempDir {
+    let (skin, fixed) = super::result_flow::fixed_skin_with("skin.input = 300 skin.fadeout = 5000");
+    rig.result_skin = ResultSkin::new(Some(ResultStart::Fixed(Arc::clone(&fixed), None)));
+    prepared(rig, a);
+    rig.render.send(RenderMsg::Menu(Box::default()));
+    frames.arm();
+    rig.begin_result(report, screen);
+    skin
+}
+
+/// The skin's timing as the flow reads it: input 300 ms, outro 5 s.
+const fn timed() -> game::ResultTiming {
+    game::ResultTiming {
+        outro: TimeUs(5_000_000),
+        input: TimeUs(300_000),
+        scene: None,
+    }
+}
+
+/// V19a, the fourth run (M6): the first view's frame held after its commit
+/// point, its timing and origin written: a look that reads no
+/// acknowledgement leaves the result not shown and no timing, and a back
+/// at origin + 100 ms begins with no gate and no outro, the first view
+/// pinned.
+#[test]
+fn a_command_after_the_commit_point_before_the_acknowledgement_has_no_outro() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let _skin = timed_hand_over(rig, frames, &a, &report, &screen);
+        rig.render.hold_result_commit(true);
+        rig.show_end(&report, &screen);
+        until_true(rig, "the first view's commit", |rig| {
+            rig.render.result_commit_held()
+        });
+        assert_eq!(
+            rig.render.presented_timing().map(crate::play::flow_timing),
+            Some(timed())
+        );
+        let o = rig.render.presented_origin().expect("the origin");
+        let key = rig.presenter.desired_key();
+        look(rig);
+        assert!(!rig.result_view_shown(), "shown before the acknowledgement");
+        assert_eq!(rig.result_timing(), None);
+        assert_eq!(
+            rig.begin_outro(TimeUs(o.0 + 100_000), Some(o)),
+            game::Outro::Begun(None)
+        );
+        rig.render.hold_result_commit(false);
+        until_true(rig, "the first view pinned", |rig| {
+            rig.render.result_status().pinned == key
+        });
+        rig.leave_result();
+    });
+}
+
+/// V19a, the fifth run: the same skin with no hold; after the look that
+/// reads the acknowledgement, a back at origin + 100 ms is gated and one
+/// at origin + 400 ms begins the skin's 5 s outro.
+#[test]
+fn after_the_acknowledging_look_the_skins_timing_applies() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let _skin = timed_hand_over(rig, frames, &a, &report, &screen);
+        rig.show_end(&report, &screen);
+        until_shown(rig);
+        assert_eq!(rig.result_timing(), Some(timed()));
+        let o = rig.render.presented_origin().expect("the origin");
+        assert_eq!(
+            rig.begin_outro(TimeUs(o.0 + 100_000), Some(o)),
+            game::Outro::Gated
+        );
+        assert_eq!(
+            rig.begin_outro(TimeUs(o.0 + 400_000), Some(o)),
+            game::Outro::Begun(Some(timed()))
         );
         rig.leave_result();
     });

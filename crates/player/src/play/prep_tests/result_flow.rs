@@ -236,7 +236,12 @@ fn lua_result(pre: &str, places: &str) -> tempfile::TempDir {
 
 /// A fixed result skin drawing the stage file: it reads no fact.
 pub(super) fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
-    let d = lua_result("", &format!("d[#d + 1] = {CHART_DST}"));
+    fixed_skin_with("")
+}
+
+/// [`fixed_skin`] running `pre` (its timing, say) before its destinations.
+pub(super) fn fixed_skin_with(pre: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let d = lua_result(pre, &format!("d[#d + 1] = {CHART_DST}"));
     let choice = game::SkinChoice {
         root: d.path().to_owned(),
         entry: "s.luaskin".to_owned(),

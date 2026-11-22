@@ -459,6 +459,13 @@ pub struct PlayerRig<'a> {
     /// later show (a view switch, a screen built again) numbers no other
     /// entry (design.md "State Model", system sounds, Result).
     pub(crate) result_entry: Option<ResultEntry>,
+    /// Whether the result handed over has shown (design.md "State Model",
+    /// Result): false from the hand-over of a result its skin may present
+    /// until the first look that reads the acknowledgement of its entry's
+    /// first picture, true otherwise. Until then preset steps are dropped,
+    /// the offset keys refused, and a leaving command has no gate and no
+    /// outro.
+    pub(crate) result_view_shown: bool,
     /// The views the result has changed to so far, each printed once
     /// (dev-tools: a scripted view command is over once its view shows).
     #[cfg(feature = "dev-tools")]
@@ -1349,6 +1356,7 @@ impl PlayerRig<'_> {
     /// so it does not sound over `resultclose` (design.md "State Model",
     /// system sounds, Result).
     fn start_result_sound(&mut self) {
+        self.latch_result_shown();
         let Some(entry) = self.result_entry.as_mut().filter(|e| e.due) else {
             return;
         };
@@ -1368,9 +1376,38 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// The result shows at the look that reads its entry's first picture
+    /// acknowledged, once: the offset keys work from here, and the skin's
+    /// timing applies (design.md "State Model", Result).
+    fn latch_result_shown(&mut self) {
+        if self.result_view_shown {
+            return;
+        }
+        let Some(entry) = &self.result_entry else {
+            return;
+        };
+        if self.render.result_acknowledged() != entry.number {
+            return;
+        }
+        self.result_view_shown = true;
+        self.open_end_screen();
+    }
+
+    /// The end screen opens: the input offset keys work, and the keys a
+    /// development run presses at it are pressed (dev-tools).
+    fn open_end_screen(&mut self) {
+        let tuning = self.controls.tuning();
+        tuning.open_end_screen();
+        #[cfg(feature = "dev-tools")]
+        for a in self.adjust_on_end.drain(..) {
+            tuning.adjust(a);
+        }
+    }
+
     /// [`leave_result`](Self::leave_result) but for the result's sounds.
     fn end_result(&mut self) {
         let _ = self.controls.tuning().close_end_screen();
+        self.result_view_shown = true;
         #[cfg(feature = "dev-tools")]
         if self.presenter.current() {
             crate::dev::print_result_work("left");
@@ -2442,7 +2479,15 @@ impl Rig for PlayerRig<'_> {
     /// `None` on any built-in result, so a command pending is served at
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
+        if !self.result_view_shown {
+            return None;
+        }
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_view_shown(&self) -> bool {
+        self.result_view_shown
     }
 
     /// The entry's sound not yet started at its first picture's look.
@@ -2461,10 +2506,17 @@ impl Rig for PlayerRig<'_> {
     /// settles the result skin. The pinned view's timing, read with it; a
     /// pressed command that view's input time still gates is refused under
     /// the same lock, nothing set.
+    ///
+    /// Until the result shows the view is pinned with no gate and no
+    /// outro, whatever timing the barrier holds, so the command takes
+    /// effect in the look that takes it (design.md "State Model", Result).
     fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> game::Outro {
+        let shown = self.result_view_shown;
+        let gate = gate.filter(|_| shown);
         let Some((pinned, timing)) = self.presenter.pin(&mut self.render, at, gate) else {
             return game::Outro::Gated;
         };
+        let timing = timing.filter(|_| shown);
         self.result_outro = Some(at);
         #[cfg(feature = "dev-tools")]
         println!("dev: result outro began, view {pinned:?} pinned");
@@ -3568,7 +3620,6 @@ impl Rig for PlayerRig<'_> {
                 .request(crate::result_skin::view_facts(screen, chart));
         }
         let tuning = self.controls.tuning();
-        tuning.open_end_screen();
         let queue = self.queue_line.unwrap_or(QueueLine {
             played: self.queued_now,
             steady_underruns: 0,
@@ -3595,7 +3646,8 @@ impl Rig for PlayerRig<'_> {
         // own the play did not clear), started once the entry's first
         // picture is acknowledged (design.md "State Model", system sounds,
         // Result).
-        if self.result_entry.is_none() {
+        let entered = self.result_entry.is_none();
+        if entered {
             self.result_entry = Some(ResultEntry {
                 number: self.render.enter_result_entry(self.controls.game_thread()),
                 cleared: screen.own_cleared() == Some(true),
@@ -3605,6 +3657,15 @@ impl Rig for PlayerRig<'_> {
         // The skin's presentation goes first, so the built-in page does not
         // draw before it.
         self.present_view(report, screen);
+        // A result its skin may present shows at its first picture's
+        // acknowledgement, the end screen opening then; any other at the
+        // hand-over (design.md "State Model", Result).
+        if entered {
+            self.result_view_shown = !(self.presenter.current() && !self.result_skin_suppressed());
+            if self.result_view_shown {
+                self.open_end_screen();
+            }
+        }
         self.send_end(tuning.get());
         // Its requests made: the rebuild it follows is over.
         #[cfg(test)]
@@ -3616,10 +3677,6 @@ impl Rig for PlayerRig<'_> {
         );
 
         self.result_shown();
-        #[cfg(feature = "dev-tools")]
-        for a in self.adjust_on_end.drain(..) {
-            tuning.adjust(a);
-        }
         #[cfg(feature = "dev-tools")]
         if self.auto_retries > 0 {
             self.auto_retries -= 1;

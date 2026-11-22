@@ -1066,6 +1066,7 @@ fn rig<'a>(
         result_offset: None,
         result_leaving: false,
         result_entry: None,
+        result_view_shown: true,
         #[cfg(feature = "dev-tools")]
         views_shown: 0,
         result_outro: None,

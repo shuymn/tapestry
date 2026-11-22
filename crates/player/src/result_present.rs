@@ -99,34 +99,63 @@ pub struct ResultPresentation {
     pub overlay: Overlay,
 }
 
-/// The newest presentation of the current result lifetime, until the
-/// render thread takes it, and whether a signal for it waits; and the
-/// result's hold's mark (design.md "Rendering and Skins", the result's
-/// hold): the number of the hold the game begun last and has not
-/// released, 0 for none.
+/// The current result lifetime's first presentation and its newest one,
+/// until the render thread takes them, and whether a signal for them
+/// waits; and the result's hold's mark (design.md "Rendering and Skins",
+/// the result's hold): the number of the hold the game begun last and has
+/// not released, 0 for none. The lifetime's first presentation, the one
+/// handed over, is kept apart so no later offer replaces it before the
+/// render thread takes it (design.md "beatoraja Lua Skins", the result
+/// skin).
 #[derive(Debug, Default)]
 pub struct ResultSlot {
     lifetime: u64,
+    first: Option<Box<ResultPresentation>>,
+    /// The lifetime's first offer was made.
+    firsted: bool,
     newest: Option<Box<ResultPresentation>>,
     signaled: bool,
     hold: u64,
 }
 
 impl ResultSlot {
-    /// Puts `p` in the slot, replacing the one waiting, when its lifetime
-    /// is current: whether a signal must be sent (none waits).
+    /// Whether `p` would be its lifetime's first presentation.
+    pub fn takes_first(&self, p: &ResultPresentation) -> bool {
+        self.current(p.lifetime) && !self.firsted
+    }
+
+    /// Puts `p` in the slot, when its lifetime is current: the lifetime's
+    /// first offer apart, a presentation of the first one's payload (a
+    /// newer overlay) in its place until it is taken, any other in place
+    /// of the newest waiting. Whether a signal must be sent (none waits).
     pub fn offer(&mut self, p: ResultPresentation) -> bool {
-        if p.lifetime != self.lifetime || self.lifetime == 0 {
+        if !self.current(p.lifetime) {
             return false;
         }
-        drop(self.newest.replace(Box::new(p)));
+        if !self.firsted {
+            self.firsted = true;
+            self.first = Some(Box::new(p));
+        } else if let Some(first) = self
+            .first
+            .as_mut()
+            .filter(|f| Arc::ptr_eq(&f.payload, &p.payload))
+        {
+            **first = p;
+        } else {
+            drop(self.newest.replace(Box::new(p)));
+        }
         !std::mem::replace(&mut self.signaled, true)
     }
 
-    /// Takes the waiting presentation of the current lifetime.
-    pub fn take(&mut self) -> Option<Box<ResultPresentation>> {
+    /// Takes the waiting presentations of the current lifetime: its first,
+    /// then its newest.
+    pub fn take(&mut self) -> [Option<Box<ResultPresentation>>; 2] {
         self.signaled = false;
-        self.newest.take().filter(|p| p.lifetime == self.lifetime)
+        let lifetime = self.lifetime;
+        [
+            self.first.take().filter(|p| p.lifetime == lifetime),
+            self.newest.take().filter(|p| p.lifetime == lifetime),
+        ]
     }
 
     /// Result lifetime `lifetime` begins (0 for none: the result is left,
@@ -134,6 +163,8 @@ impl ResultSlot {
     pub fn enter(&mut self, lifetime: u64) {
         self.lifetime = lifetime;
         self.signaled = false;
+        self.firsted = false;
+        drop(self.first.take());
         drop(self.newest.take());
         if lifetime == 0 {
             self.hold = 0;
@@ -605,6 +636,12 @@ impl Presenter {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn payload(&self) -> Option<&Arc<ViewPayload>> {
         self.payload.as_ref()
+    }
+
+    /// The revision published last (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The next attempt: the attempt's fallback is forgotten.
