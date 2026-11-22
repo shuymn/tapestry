@@ -2879,8 +2879,9 @@ pub mod tests {
     /// P5. A P4 run whose held copy is P5's mutated build, though the record
     /// expected the runner's (an otherwise valid run on the wrong player),
     /// fails; so do a P1 run whose expected digest is not the runner's, a
-    /// record with no expected digest, and a P5 run whose copy is not the
-    /// one it declared; a run with no `player` record is incomplete.
+    /// record with no expected digest, a P5 run whose copy is not the one it
+    /// declared, and a record whose digest is not the launched file's; a
+    /// run with no `player` record is incomplete.
     #[test]
     fn every_panel_row_runs_the_player_it_expected() {
         let (f, x) = panel_good();
@@ -2905,16 +2906,35 @@ pub mod tests {
             });
             panel_outcome(&f, &x, row, "p1.player-bound")
         };
-        let (o, d) = bound("p4", &[("sha256", json!("5a"))]);
+        // Each case a consistent copy (its digest the launched file's), so
+        // it fails on the binding alone.
+        let copy = |sha: &str| {
+            vec![
+                ("sha256", json!(sha)),
+                ("files", json!([{"name": "tapestry.exe", "sha256": sha}])),
+            ]
+        };
+        let (o, d) = bound("p4", &copy("5a"));
         assert_eq!(o, Outcome::Fail);
         assert!(d.contains("sha256 5a; expected \"4e\""), "{d}");
+        let mut own = copy("5a");
+        own.push(("expected", json!("5a")));
         assert_eq!(
-            bound("p1", &[("sha256", json!("5a")), ("expected", json!("5a"))]).0,
+            bound("p1", &own).0,
             Outcome::Fail,
             "a normal row expects the runner's own build"
         );
         assert_eq!(bound("p1", &[("expected", Value::Null)]).0, Outcome::Fail);
-        assert_eq!(bound("p5", &[("sha256", json!("3c"))]).0, Outcome::Fail);
+        assert_eq!(bound("p5", &copy("3c")).0, Outcome::Fail);
+        // The record's digest not the launched file's.
+        assert_eq!(
+            bound(
+                "p1",
+                &[("files", json!([{"name": "tapestry.exe", "sha256": "3c"}]))]
+            )
+            .0,
+            Outcome::Fail
+        );
         let (mut f, x) = panel_good();
         edit(&mut f.run, |r| r.retain(|v| v["t"] != "player"));
         assert_eq!(
