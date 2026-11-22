@@ -1851,6 +1851,7 @@ mod frame_tests {
                 dropped: 0,
                 outcome: render::FrameOutcome::Shown,
                 present_count: count,
+                movies: [false; skin_model::movie::MAX_MOVIES],
             },
             statistics,
             presentation: FIFO,

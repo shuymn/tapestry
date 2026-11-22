@@ -108,6 +108,24 @@ fn a_movie_with_nothing_to_show_draws_nothing() {
     assert_eq!(quads(&mut h, shows(FRAME, MovieShow::Nothing)).len(), 0);
 }
 
+/// The batch marks the movie slots whose frame it holds a quad of
+/// (design.md "Rendering and Skins", skin movies: a movie's clock starts at
+/// the first presented frame that draws it), and nothing for a slot with
+/// nothing to show, a lost one's black or a skin with no element of it;
+/// each frame's build starts the marks afresh.
+// Revert: the movie quad pushed without its mark -> "slot 1's frame
+// drawn".
+#[test]
+fn a_batch_marks_the_movie_slots_whose_frame_it_drew() {
+    let mut h = harness(vec![movie_element(1, FILL, Blend::Alpha)]);
+    let _ = quads(&mut h, shows(FRAME, FRAME));
+    assert_eq!(h.batch.movies(), [false, true], "slot 1's frame drawn");
+    let _ = quads(&mut h, shows(FRAME, MovieShow::Lost));
+    assert_eq!(h.batch.movies(), [false, false], "a lost movie's black");
+    let _ = quads(&mut h, shows(FRAME, MovieShow::Nothing));
+    assert_eq!(h.batch.movies(), [false, false], "nothing to show");
+}
+
 #[test]
 fn a_lost_movie_draws_opaque_black_whatever_its_blend_and_colour() {
     for blend in [Blend::Alpha, Blend::Add, Blend::Multiply] {

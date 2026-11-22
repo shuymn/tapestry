@@ -144,9 +144,9 @@ impl Ring {
     /// The stamp taken at `due`, if a new frame was.
     fn poll(&mut self, due: i64) -> Option<i64> {
         let words = Self::words(self.view, self.len);
-        let (taken, freed, first) = read_tight(&mut self.reader, words, due, &mut self.frame)
+        let (taken, freed) = read_tight(&mut self.reader, words, due, &mut self.frame)
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
-        if freed || first {
+        if freed {
             // SAFETY: the ring's event.
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
@@ -878,10 +878,7 @@ fn draw(movie: &media_host::session::Movie, drawn: &Drawn) {
         let origin = *origin.get_or_insert_with(Instant::now);
         let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
         match read_tight(r, live.ring.words(), due, &mut frame) {
-            Ok((taken, freed, first)) => {
-                if first {
-                    movie.wake();
-                }
+            Ok((taken, freed)) => {
                 if let Some(f) = taken {
                     drawn.staged.lock().unwrap().push((f.stamp, Instant::now()));
                     movie.staged_first();

@@ -5187,7 +5187,9 @@ impl Skin {
                             let f = crate::FrameUv { uv, layer };
                             let (r, f, native) = stretch.place(rect, size, f, canvas.scale());
                             let b = Brush { native, ..brush };
-                            b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+                            out.push_movie(usize::from(slot), |out| {
+                                b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+                            });
                         }
                         // Opaque black over the destination, whatever its
                         // blend and colour.

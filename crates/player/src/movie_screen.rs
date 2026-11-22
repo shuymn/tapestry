@@ -136,12 +136,6 @@ pub struct MovieSet {
     /// The generation it entered (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     generation: u64,
-    /// Its movie clock's origin on the render thread's frame clock (µs),
-    /// once known: a selection entry's first frame; a play's first loading
-    /// frame's lifetime origin, else its READY anchor
-    /// ([`ScreenMovies::begin_play`]). Its own: no other set's carries
-    /// over.
-    pub origin: Option<i64>,
     /// A play's: the loading lifetime its preparation's request was
     /// published in. Only that lifetime's loading frames show its movies;
     /// a frame of another (a later Start's) shows none of them.
@@ -151,14 +145,14 @@ pub struct MovieSet {
 
 impl MovieSet {
     /// Opens `bundle`'s movies for a `kind` screen, its preparation
-    /// starting at `start` on the monotonic clock, its movie clock from
-    /// `origin` if known: `None` when the skin has none.
+    /// starting at `start` on the monotonic clock: `None` when the skin has
+    /// none. Each movie's clock starts at the first presented frame that
+    /// draws it ([`Movies::presented`]).
     pub fn open(
         hub: &Arc<MediaHub>,
         kind: ScreenKind,
         bundle: &Arc<SkinBundle>,
         start: Instant,
-        origin: Option<i64>,
     ) -> Option<Self> {
         let sheet = bundle.skin().sheet();
         let names = sheet.movies();
@@ -167,7 +161,7 @@ impl MovieSet {
         }
         #[cfg(all(test, feature = "dev-tools"))]
         if let Some(movies) = hub.supply.lock().unwrap().pop_front() {
-            return Some(Self::of(hub, kind, bundle, movies, start, origin));
+            return Some(Self::of(hub, kind, movies, start));
         }
         let session = hub.session();
         let generation = hub.next_generation();
@@ -213,49 +207,27 @@ impl MovieSet {
             kind,
             #[cfg(all(test, feature = "dev-tools"))]
             generation,
-            origin,
             loading: None,
-            movies: Self::movies(kind, bundle, movies, start),
+            movies: Movies::new(movies, start),
         })
     }
 
-    /// A set of `movies` for `bundle`'s `kind` screen, opened at `start`,
-    /// its movie clock from `origin`, as [`open`](Self::open) makes it with
-    /// no session (tests).
+    /// A set of `movies` for a `kind` screen, opened at `start`, as
+    /// [`open`](Self::open) makes it with no session (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn of(
         hub: &Arc<MediaHub>,
         kind: ScreenKind,
-        bundle: &Arc<SkinBundle>,
         movies: [Option<Arc<Movie>>; MAX_MOVIES],
         start: Instant,
-        origin: Option<i64>,
     ) -> Self {
         hub.open.fetch_add(1, Ordering::SeqCst);
         Self {
             hub: Arc::downgrade(hub),
             kind,
             generation: hub.next_generation(),
-            origin,
             loading: None,
-            movies: Self::movies(kind, bundle, movies, start),
-        }
-    }
-
-    /// The hook's state of `movies` for `bundle`'s `kind` screen: a play's
-    /// READY opens at least the skin's loading minimum into its movie
-    /// clock (design.md "Timers"), which bounds its preparation's polls.
-    fn movies(
-        kind: ScreenKind,
-        bundle: &Arc<SkinBundle>,
-        movies: [Option<Arc<Movie>>; MAX_MOVIES],
-        start: Instant,
-    ) -> Movies {
-        match kind {
-            ScreenKind::Play => {
-                Movies::new(movies, start).floored(game::loading_minimum(bundle.skin().loadend()).0)
-            }
-            _ => Movies::new(movies, start),
+            movies: Movies::new(movies, start),
         }
     }
 
@@ -416,15 +388,14 @@ impl ScreenMovies {
     }
 
     /// The committed play begins: its screen draws its movies from here,
-    /// their clock from its first loading frame's origin or else from
-    /// `anchor`, its READY minus the play skin's loading minimum.
-    pub fn begin_play(&mut self, anchor: i64, renderer: &mut Renderer) {
+    /// each on the clock it started in a loading frame, or starting at the
+    /// first play frame presented that draws it.
+    pub fn begin_play(&mut self, renderer: &mut Renderer) {
         self.drawn(Drawn::Play, renderer);
-        if let Some((holder, set)) = &mut self.held
+        if let Some((holder, _)) = &mut self.held
             && matches!(holder, Holder::Committed(_))
         {
             *holder = Holder::Playing;
-            set.origin.get_or_insert(anchor);
         }
     }
 }

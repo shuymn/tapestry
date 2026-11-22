@@ -2,8 +2,9 @@
 //! Allocation"; "Rendering and Skins", video frames): setting the ring up, a
 //! peek that finds nothing due, a peek and the take that copies a frame of
 //! two chunks into a sink at a pitch, one that frees the frames of an
-//! earlier run unread, starting a run, a peek that fails the player and the
-//! peeks and takes after it.
+//! earlier run unread, starting a run, a first peek and its take (a
+//! movie's oldest frame), a peek that fails the player and the peeks and
+//! takes after it.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -117,6 +118,14 @@ fn ring_reads_do_not_allocate() {
     assert!(peeked.unwrap().freed);
 
     publish(3, 2, 3_000);
+    let (n, taken) = counted(|| {
+        let due = reader.peek_first(ring)?.due.ok_or(Fault::Section)?;
+        reader.take(ring, due, pitch, &mut |_: usize, _: &[u8]| true)
+    });
+    assert_eq!(n, 0, "a first peek and its take");
+    assert_eq!(taken.unwrap().seq, 3);
+
+    publish(4, 2, 4_000);
     mem[g.frame_start(0) - SLOT_HEADER_WORDS + 4].store(9, Ordering::Relaxed);
     let (n, peeked) = counted(|| reader.peek(ring, 5_000));
     assert_eq!(n, 0, "a fault");

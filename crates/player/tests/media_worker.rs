@@ -233,12 +233,12 @@ impl Ring {
     }
 
     /// Polls the ring at `due`, signalling the worker when slots were
-    /// freed or the peek was its run's first: the frame taken, if any.
+    /// freed: the frame taken, if any.
     fn poll(&mut self, due: i64) -> Option<Frame> {
         let words = Self::words(self.view, self.len);
-        let (taken, freed, first) = read_tight(&mut self.reader, words, due, &mut self.frame)
+        let (taken, freed) = read_tight(&mut self.reader, words, due, &mut self.frame)
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
-        if freed || first {
+        if freed {
             // SAFETY: the ring's event.
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
@@ -252,9 +252,9 @@ impl Ring {
     }
 
     /// Takes the oldest frame the ring holds ready, polling at its stamp
-    /// (at 0 while it holds none, the first peek the worker starts at): a
-    /// game whose clock is never ahead of the worker's frames, so it takes
-    /// every frame (design.md "Rendering and Skins", video frames).
+    /// (at 0 while it holds none): a game whose clock is never ahead of the
+    /// worker's frames, so it takes every frame (design.md "Rendering and
+    /// Skins", video frames).
     fn poll_next(&mut self) -> Option<Frame> {
         let oldest = self
             .slots()
@@ -878,20 +878,16 @@ fn take_seq(worker: &Worker, ring: &mut Ring, due: i64) -> (u64, i64, u32) {
     }
 }
 
-/// A play whose clock is already a second in when the game first polls,
-/// and that jumps on after a stall (design.md "Rendering and Skins", skin
-/// movies, "Video frames"): the worker publishes nothing before the game's
-/// first peek, then decodes to its time and publishes first the frame
-/// whose interval holds it, so the first frame the game takes is the one
-/// due. After the stall the game takes the newest frame the ring holds,
-/// late, and then the frames after it, the worker dropping none of them.
-// Revert: the target ignored (frame 0 published first) -> "the frame
-// holding the time first"; the worker publishing before the game's first
-// peek -> "a frame published before the game's first peek".
+/// A play starts at its clip's first frame as soon as the worker has the
+/// ring (design.md "Rendering and Skins", video frames): before the game
+/// looks, the worker fills every slot from frame 0, in order, and waits for
+/// a free one; the game then takes them one by one, none dropped.
+// Revert: the worker dropping the frame it holds for the next one decoded
+// -> "frame 0 first".
 #[cfg(feature = "dev-tools")]
 #[test]
-fn a_play_starts_on_the_frame_holding_the_game_s_first_time() {
-    use skin_model::media::State;
+fn a_play_publishes_from_its_first_frame_before_the_game_looks() {
+    use skin_model::media::{SLOTS, State};
     let dir = tempfile::tempdir().unwrap();
     let path = gen_clip(dir.path(), "b.mpg", "mpeg1video mpeg 320x240 24 48 12");
     let mut worker = Worker::start(&[]);
@@ -908,51 +904,43 @@ fn a_play_starts_on_the_frame_holding_the_game_s_first_time() {
             player: 1
         }
     );
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(
-        ring.published(),
-        0,
-        "a frame published before the game's first peek"
-    );
-    assert_eq!(ring.state(), Some(State::Starting));
-    // Inside frame 24's interval, a second in.
-    let first = take_seq(&worker, &mut ring, stamp_of(24, 24) + 10_000);
-    assert_eq!(
-        (first.0, first.1, first.2),
-        (1, stamp_of(24, 24), 24),
-        "the frame holding the time first; the worker's log:\n{}",
-        worker.log()
-    );
-    // A stall: the ring refills with frames 25 to 28 while the clock runs
-    // to 40.
-    std::thread::sleep(Duration::from_millis(300));
-    let late = take_seq(&worker, &mut ring, stamp_of(40, 24));
-    assert_eq!(
-        (late.1, late.2),
-        (stamp_of(28, 24), 28),
-        "the newest late frame"
-    );
-    let mut later = take_seq(&worker, &mut ring, stamp_of(40, 24));
-    while later.2 < 40 {
-        later = take_seq(&worker, &mut ring, stamp_of(40, 24));
+    let slots = u64::try_from(SLOTS).unwrap();
+    let deadline = Instant::now() + REPLY;
+    while ring.published() < slots || ring.state() != Some(State::Waiting) {
+        assert!(
+            Instant::now() < deadline,
+            "the ring never filled: {} published, {:?}; the worker's log:\n{}",
+            ring.published(),
+            ring.state(),
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!((later.1, later.2), (stamp_of(40, 24), 40));
+    assert_eq!(ring.published(), slots, "every slot, before the game looks");
+    let mut taken = Vec::new();
+    while taken.len() < 12 {
+        assert!(Instant::now() < deadline, "{taken:?}");
+        if let Some(frame) = ring.poll_next() {
+            taken.push((frame.seq, frame.stamp, painted(&ring.staged(), 320)));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let want: Vec<_> = (0..12_u32)
+        .map(|i| (u64::from(i) + 1, stamp_of(i64::from(i), 24), i))
+        .collect();
     assert_eq!(
-        later.0,
-        17,
-        "a frame dropped by the worker: frame 40 is sequence {}; the worker's log:\n{}",
-        later.0,
+        taken,
+        want,
+        "frame 0 first; the worker's log:\n{}",
         worker.log()
     );
     worker.close(1);
 }
 
-/// A seek back starts a run at its own time (design.md "Rendering and
+/// A seek back starts a run at its landing (design.md "Rendering and
 /// Skins", video frames): after the game has shown 5 s of a 10 s clip, a
 /// seek to 1 s shows the frame there, the worker decoding the new run from
 /// its landing whatever time the earlier run reached.
-// Revert: the worker waiting for the game's time at a seek -> "no frame
-// due at".
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_seek_back_is_judged_by_its_own_run_s_time() {
@@ -972,7 +960,10 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
             player: 1
         }
     );
-    let shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
+    let mut shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
+    while shown.2 < 120 {
+        shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
+    }
     assert_eq!(shown.2, 120);
     let at = stamp_of(24, 24);
     let run = ring.start_run(at);
@@ -997,11 +988,11 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
 /// real-time clock, takes the frame by the time it is due plus 60 ms,
 /// both for a clip's first frame (the second conversion blocks) and for a
 /// looping clip's last frame (the next pass's first conversion blocks).
-// Revert: the frame held until the next one is decoded (its end taken
-// from it before it is published) -> "taken while the next decode blocks".
+// Revert: the frame held until the next one is converted -> "taken while
+// the next conversion blocks".
 #[cfg(feature = "dev-tools")]
 #[test]
-fn a_due_frame_is_published_while_the_next_decode_blocks() {
+fn a_due_frame_is_published_while_the_next_conversion_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let path = gen_clip(dir.path(), "n.mpg", "mpeg1video mpeg 320x240 24 48 12");
     // (the conversion that blocks, looping, the frame due, its index)
@@ -1040,7 +1031,7 @@ fn a_due_frame_is_published_while_the_next_decode_blocks() {
         }
         assert!(
             taken.is_some(),
-            "frame {index} taken while the next decode blocks (by {limit} µs); the worker's log:\n{}",
+            "frame {index} taken while the next conversion blocks (by {limit} µs); the worker's log:\n{}",
             worker.log()
         );
         worker.close(1);
@@ -1091,16 +1082,14 @@ fn a_slow_decoder_shows_advancing_late_frames() {
     worker.close(1);
 }
 
-/// A play admitted inside a gap of a variable-rate clip (design.md
+/// A variable-rate clip shows the frame before a gap through it (design.md
 /// "Rendering and Skins", video frames): frames at 0, 40, 80, 120 and
-/// 160 ms, then 2 s. At a first look at 780 ms the frame due is the one at
-/// 160 ms, shown through the gap, not the panel's underlay until 2 s: the
-/// worker publishes it once the next frame it decodes is past the time.
-// Revert: the frame held dropped for any next frame -> "the frame before
-// the gap".
+/// 160 ms, then 2 s. A game whose clock stands at 780 ms takes the frames
+/// up to the one at 160 ms and keeps it, rather than the panel's underlay,
+/// until 2 s.
 #[cfg(feature = "dev-tools")]
 #[test]
-fn a_play_admitted_inside_a_gap_shows_the_frame_before_it() {
+fn a_variable_rate_gap_shows_the_frame_before_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = gen_clip(
         dir.path(),
@@ -1121,34 +1110,38 @@ fn a_play_admitted_inside_a_gap_shows_the_frame_before_it() {
             player: 1
         }
     );
-    let first = take_seq(&worker, &mut ring, 780_000);
+    let mut shown = take_seq(&worker, &mut ring, 780_000);
+    while shown.2 < 4 {
+        shown = take_seq(&worker, &mut ring, 780_000);
+    }
     assert_eq!(
-        (first.1, first.2),
+        (shown.1, shown.2),
         (160_000, 4),
         "the frame before the gap; the worker's log:\n{}",
         worker.log()
     );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(ring.poll(780_000).is_none(), "nothing newer is due");
     let next = take_seq(&worker, &mut ring, 2_000_000);
     assert_eq!((next.1, next.2), (2_000_000, 5));
     worker.close(1);
 }
 
-/// A conversion that blocks for 600 ms right after a play started a second
-/// in (design.md "Rendering and Skins", video frames): the frame holding
-/// the time is taken first, the ring holds nothing newer through the stall
-/// (the game keeps showing that frame), and after it the game takes the
-/// frame after it, late, then frames that advance until they reach its
-/// clock, the worker dropping none.
-// Revert: the worker dropping a frame behind the clock once started -> "a
-// frame dropped by the worker".
+/// A conversion that blocks for 1 s during a play (design.md "Rendering
+/// and Skins", video frames): the game, on a real-time clock from the
+/// play's start, keeps the frame it took last through the stall, takes no
+/// newer one during it, and after it takes the frames after it, late, then
+/// frames that advance until they reach its clock, the worker dropping
+/// none.
+// Revert: the worker dropping a frame behind the clock -> "a frame dropped
+// by the worker".
 #[cfg(feature = "dev-tools")]
 #[test]
-fn a_stall_right_after_the_start_shows_the_next_frame_late() {
+fn a_stall_mid_play_shows_the_next_frame_late() {
     let dir = tempfile::tempdir().unwrap();
     let path = gen_clip(dir.path(), "s.mpg", "mpeg1video mpeg 320x240 24 240 12");
-    // Frames 0 to 24 are converted while the worker decodes to the time,
-    // and the 26th conversion, frame 25's, blocks.
-    let mut worker = Worker::start(&["--dev-serve", "stall-convert=25:600"]);
+    // The 26th conversion, frame 25's, blocks.
+    let mut worker = Worker::start(&["--dev-serve", "stall-convert=25:1000"]);
     let probe = worker.open(1, &path);
     assert!(
         matches!(probe, Reply::Probed { player: 1, .. }),
@@ -1162,32 +1155,33 @@ fn a_stall_right_after_the_start_shows_the_next_frame_late() {
             player: 1
         }
     );
-    let start = stamp_of(24, 24) + 10_000;
-    let first = take_seq(&worker, &mut ring, start);
-    assert_eq!((first.1, first.2), (stamp_of(24, 24), 24));
     let origin = Instant::now();
-    let clock = || start + i64::try_from(origin.elapsed().as_micros()).unwrap();
+    let clock = || i64::try_from(origin.elapsed().as_micros()).unwrap();
     let mut shown = Vec::new();
-    while origin.elapsed() < Duration::from_millis(1_500) {
+    while origin.elapsed() < Duration::from_millis(3_000) {
         let now = clock();
         if let Some(frame) = ring.poll(now) {
             shown.push((now, frame.stamp));
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    // The frames after the stall come at once: the first taken is the
-    // newest of those the ring held at that look, at most a ring's slots on.
     let slots = i64::try_from(skin_model::media::SLOTS).unwrap();
+    let stall = stamp_of(25, 24);
+    let before = shown.iter().rev().find(|s| s.1 < stall).copied();
+    let after = shown.iter().find(|s| s.1 >= stall).copied();
+    let (Some(before), Some(after)) = (before, after) else {
+        panic!(
+            "frames on both sides of the stall: {shown:?}; the worker's log:\n{}",
+            worker.log()
+        );
+    };
     assert!(
-        shown
-            .first()
-            .is_some_and(|s| (stamp_of(25, 24)..=stamp_of(24 + slots, 24)).contains(&s.1)),
-        "the frame after the stall: {shown:?}; the worker's log:\n{}",
-        worker.log()
+        after.0 - before.0 >= 500_000,
+        "nothing newer during the stall: {shown:?}"
     );
     assert!(
-        shown.first().is_some_and(|s| s.0 >= start + 500_000),
-        "nothing newer during the stall: {shown:?}"
+        after.1 <= stamp_of(24 + slots, 24),
+        "the frame after the stall: {shown:?}"
     );
     assert!(shown.windows(2).all(|w| w[0].1 < w[1].1), "{shown:?}");
     // The worker drops none: between two takes it publishes at most a
@@ -1206,9 +1200,10 @@ fn a_stall_right_after_the_start_shows_the_next_frame_late() {
     worker.close(1);
 }
 
-/// A play first looked at past its video's end (design.md "Rendering and
-/// Skins", video frames): the worker decodes to the end and publishes the
-/// last frame, which the game takes and keeps, then the end is answered.
+/// A clip that does not loop keeps its last frame (design.md "Rendering
+/// and Skins", video frames): a game whose clock is past the end takes
+/// the newest frame each time until the last, which it keeps, every frame
+/// published and the end answered after the last.
 // Revert: the end taken before the frame held is published -> "the last
 // frame kept".
 #[cfg(feature = "dev-tools")]
@@ -1216,7 +1211,7 @@ fn a_stall_right_after_the_start_shows_the_next_frame_late() {
 fn the_last_frame_is_kept_past_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let path = gen_clip(dir.path(), "e.mpg", "mpeg1video mpeg 320x240 24 24 12");
-    // The clip's last frame, from a play the game takes frame by frame.
+    // The clip's frames, from a play the game takes frame by frame.
     let mut reference = Worker::start(&[]);
     assert!(matches!(
         reference.open(1, &path),
@@ -1239,6 +1234,7 @@ fn the_last_frame_is_kept_past_the_end() {
     }
     reference.close(1);
     let end = *stamps.last().unwrap();
+    let count = u64::try_from(stamps.len()).unwrap();
     let mut worker = Worker::start(&[]);
     let probe = worker.open(1, &path);
     assert!(
@@ -1253,14 +1249,18 @@ fn the_last_frame_is_kept_past_the_end() {
             player: 1
         }
     );
-    let last = take_seq(&worker, &mut ring, 5_000_000);
+    let mut last = take_seq(&worker, &mut ring, 5_000_000);
+    while last.1 < end {
+        last = take_seq(&worker, &mut ring, 5_000_000);
+    }
     assert_eq!(
         (last.0, last.1),
-        (1, end),
+        (count, end),
         "the last frame kept; the worker's log:\n{}",
         worker.log()
     );
     assert!(matches!(worker.reply(), Reply::Ended { player: 1, .. }));
+    assert!(ring.poll(5_000_000).is_none(), "nothing after the last");
     worker.close(1);
 }
 

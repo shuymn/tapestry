@@ -4015,24 +4015,24 @@ impl skin_model::media::Words for LoggedRing<'_> {
 /// the ring's words after the game set it up
 /// ([`skin_model::media::Reader::new`]), little-endian from its first word,
 /// the words past the input left as set up. A worker attaches to it, and
-/// the game reads it twice, at the due stamp and a second later: a peek,
-/// and a take of the frame due at the tight pitch.
+/// the game reads it three times, first for the run's oldest frame
+/// (`peek_first`, a movie's before its clock starts), then at the due stamp
+/// and a second later: each a peek and a take of the frame it finds at the
+/// tight pitch.
 ///
 /// # Panics
 ///
 /// If a worker accepts a header whose ring is larger than the section; if a
-/// read asks for a word outside the slots other than the watermark and the
-/// due time and its run, or a
+/// read asks for a word outside the slots other than the watermark, or a
 /// run of words other than one slot's frame; if a take writes outside the
-/// frame or not each of its bytes once; if a frame taken is not due, lies
+/// frame or not each of its bytes once; if a frame taken at a time is not
+/// due, if a frame taken lies
 /// outside the window, or does not follow the frame taken before it; or if
 /// a fault is not kept: the next peek must return it without reading the
 /// ring.
 #[must_use]
 pub fn ring_bytes(data: &[u8]) -> RingOutcome {
-    use skin_model::media::{
-        DUE_RUN_WORD, DUE_WORD, Geometry, HEADER_WORDS, Reader, SLOTS, WATERMARK_WORD, Writer,
-    };
+    use skin_model::media::{Geometry, HEADER_WORDS, Reader, SLOTS, WATERMARK_WORD, Writer};
     use std::sync::atomic::{AtomicU64, Ordering};
     let (size, rest) = data.split_first().unwrap_or((&0, &[]));
     let (due, words) = rest.split_at_checked(8).unwrap_or((&[0; 8], rest));
@@ -4062,9 +4062,13 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
     let mut outcome = RingOutcome::Nothing;
     let width = w as usize;
     let mut out = vec![0_u8; g.frame_bytes()];
-    for due in [due, due.saturating_add(1_000_000)] {
+    for due in [None, Some(due), Some(due.saturating_add(1_000_000))] {
         let mut written = vec![false; g.frame_bytes()];
-        let polled = reader.peek(&logged, due).and_then(|peek| {
+        let peeked = match due {
+            Some(due) => reader.peek(&logged, due),
+            None => reader.peek_first(&logged),
+        };
+        let polled = peeked.and_then(|peek| {
             peek.due
                 .map(|d| {
                     let mut sink = |at: usize, bytes: &[u8]| {
@@ -4083,8 +4087,6 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
         for (start, len) in logged.log.take() {
             assert!(
                 (start, len) == (WATERMARK_WORD, 1)
-                    || (start, len) == (DUE_WORD, 1)
-                    || (start, len) == (DUE_RUN_WORD, 1)
                     || (start >= HEADER_WORDS && start + len <= g.words()),
                 "a request outside the slots: {start}+{len}"
             );
@@ -4095,7 +4097,9 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
         }
         match polled {
             Ok(Some(f)) => {
-                assert!(f.stamp <= due, "a frame not due: {f:?} at {due}");
+                if let Some(due) = due {
+                    assert!(f.stamp <= due, "a frame not due: {f:?} at {due}");
+                }
                 assert!(
                     RING_WINDOW.first <= f.stamp && f.stamp <= RING_WINDOW.last,
                     "a frame outside the window: {f:?}"
@@ -4111,7 +4115,8 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
             }
             Ok(None) => {}
             Err(fault) => {
-                assert_eq!(reader.peek(&logged, due), Err(fault), "a kept fault");
+                assert_eq!(reader.peek(&logged, 0), Err(fault), "a kept fault");
+                assert_eq!(reader.peek_first(&logged), Err(fault), "a kept fault");
                 assert_eq!(logged.log.take(), [], "a failed player reads nothing more");
                 assert_eq!(reader.fault(), Some(fault), "the player failed");
                 return RingOutcome::Fault(fault);

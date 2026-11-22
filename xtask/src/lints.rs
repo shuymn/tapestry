@@ -638,6 +638,8 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::movie_frame",
             "MenuScreen::play_movies",
             "MenuScreen::selection_movies",
+            "MenuScreen::movies_presented",
+            "MenuScreen::movies_unhooked",
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",
             "MenuScreen::allocate_in_next_decision",

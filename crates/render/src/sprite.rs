@@ -188,6 +188,13 @@ impl SpriteBatch {
         self.quads.is_full()
     }
 
+    /// Which movie slots the batch holds a frame's sprite of
+    /// ([`QuadBatch::movies`]).
+    #[must_use]
+    pub const fn movies(&self) -> [bool; skin_model::movie::MAX_MOVIES] {
+        self.quads.movies()
+    }
+
     /// Sprites held.
     #[must_use]
     pub fn len(&self) -> usize {

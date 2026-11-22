@@ -18,9 +18,9 @@ use std::thread;
 use std::time::Duration;
 
 use skin_model::media::{
-    CHUNK_WORDS, DUE_RUN_WORD, DUE_WORD, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD,
-    Reader, Refused, SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window,
-    Words, Writer, supervision, watermark,
+    CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Reader, Refused,
+    SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window, Words, Writer,
+    supervision, watermark,
 };
 
 /// Run 1's window: the first minute.
@@ -297,18 +297,14 @@ fn copy_chunks(g: Geometry, slot: usize) -> [(usize, usize); 2] {
     ]
 }
 
-/// Whether a request is the watermark's word, the due time's or its run's
-/// (which a peek writes) or lies inside `g`'s slots, the only words a
-/// reader asks for.
+/// Whether a request is the watermark's word or lies inside `g`'s slots,
+/// the only words a reader asks for.
 fn in_ring(g: Geometry, (start, len): (usize, usize)) -> bool {
-    (start, len) == (WATERMARK_WORD, 1)
-        || (start, len) == (DUE_WORD, 1)
-        || (start, len) == (DUE_RUN_WORD, 1)
-        || (start >= HEADER_WORDS && start + len <= g.words())
+    (start, len) == (WATERMARK_WORD, 1) || (start >= HEADER_WORDS && start + len <= g.words())
 }
 
-/// Asserts every request in `log` is the watermark, the due time and its
-/// run, or lies inside `g`'s slots, and every run of more than one word inside slot `slot`'s frame.
+/// Asserts every request in `log` is the watermark or lies inside `g`'s
+/// slots, and every run of more than one word inside slot `slot`'s frame.
 #[track_caller]
 fn assert_bounded(log: &[(usize, usize)], g: Geometry, slot: usize) {
     let frame = g.frame_start(slot)..g.frame_start(slot) + g.frame_words();
@@ -971,34 +967,123 @@ fn ring_take_refused_fails_the_player() {
     }
 }
 
-/// The game writes the time it shows at each peek, for its run alone, and
-/// says which peek is its run's first (design.md "Rendering and Skins",
-/// video frames): a worker waiting to start a run reads that time as its
-/// target, and that peek signals it. A later run's time is not the
-/// earlier run's until its first peek.
-// Revert: every peek said to be a run's first -> "a second peek of the
-// run".
+/// A first peek takes the run's oldest frame (design.md "Rendering and
+/// Skins", video frames; skin movies, before a movie's clock starts),
+/// whatever the stamps, and frees nothing after it; the header's reserved
+/// words are written zero over whatever the section held.
+// Revert: the first peek choosing the newest frame -> "the run's oldest
+// frame".
 #[test]
-fn ring_writes_its_time_and_says_a_runs_first_peek() {
-    use skin_model::media::{NOTHING_DUE, peeked, shown};
+fn ring_first_peek_takes_the_runs_oldest_frame() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    for i in [9, 10] {
+        assert_eq!(
+            mem[i].load(Ordering::Relaxed),
+            0,
+            "header word {i} reserved"
+        );
+    }
+    for seq in 1..=4 {
+        publish(&mem, seq, 1, 500_000 + stamp(seq));
+    }
+    let r = first(&mut reader, &mem).unwrap();
+    assert_whole(&r, g, 1);
+    assert_eq!(reader.freed(), 1, "the run's oldest frame");
+    // The frames after it are later than it: none is due at its stamp.
+    assert_eq!(
+        read(&mut reader, &*mem, 500_000 + stamp(1)),
+        Ok(Read::default())
+    );
+    let r = read(&mut reader, &*mem, 500_000 + stamp(3)).unwrap();
+    assert_whole(&r, g, 3);
+}
+
+/// A first peek keeps the run boundary as a peek does (design.md
+/// "Rendering and Skins", video frames): over a full queue of an earlier
+/// run it frees that run unread and takes nothing, then takes the new
+/// run's oldest frame across a gap in its stamps; a frame of a run not
+/// started fails the player; and a later peek invalidates the frame the
+/// first one found.
+// Revert: the first peek skipping the old run's release -> "the old run
+// freed unread".
+#[test]
+fn ring_first_peek_keeps_the_run_boundary() {
     let g = Geometry::new(16, 9).unwrap();
     let mem = section(g);
     let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
-    assert_eq!(shown(&*mem, 1), None, "no peek yet");
-    assert_eq!(shown(&*mem, 0), Some(NOTHING_DUE));
-    assert!(!peeked(&*mem));
-    let peek = reader.peek(&*mem, 780_000).unwrap();
-    assert!(peek.first && peek.due.is_none(), "{peek:?}");
-    assert!(peeked(&*mem));
-    assert_eq!(shown(&*mem, 1), Some(780_000), "the time written");
-    let peek = reader.peek(&*mem, 790_000).unwrap();
-    assert!(!peek.first, "a second peek of the run");
+    for seq in 1..=4 {
+        publish(&mem, seq, 1, stamp(seq));
+    }
     let run = reader.start_run(WINDOW);
-    assert_eq!(shown(&*mem, run), None, "an earlier run's time");
-    let peek = reader.peek(&*mem, 2_000).unwrap();
-    assert!(peek.first, "the new run's first peek");
-    assert_eq!(shown(&*mem, run), Some(2_000));
-    assert_eq!(shown(&*mem, 1), None);
+    let peek = reader.peek_first(&*mem).unwrap();
+    assert!(
+        peek.freed && peek.due.is_none(),
+        "the old run freed unread: {peek:?}"
+    );
+    assert_eq!(reader.freed(), 4);
+    publish(&mem, 5, run, 0);
+    publish(&mem, 6, run, 2_000_000);
+    // The token of a first peek is gone once a later peek finds nothing.
+    let found = reader.peek_first(&*mem).unwrap().due.unwrap();
+    assert_eq!(found.seq(), 5);
+    assert_eq!(reader.peek(&*mem, -1).unwrap().due, None);
+    let mut sink = |_: usize, _: &[u8]| true;
+    assert_eq!(
+        reader.take(&*mem, found, tight(g), &mut sink),
+        Err(Fault::Changed {
+            slot: found_slot(&mem, g, 5)
+        }),
+    );
+
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    publish(&mem, 1, 1, 0);
+    publish(&mem, 2, 1, 2_000_000);
+    let r = first(&mut reader, &mem).unwrap();
+    assert_whole(&r, g, 1);
+    let r = read(&mut reader, &*mem, 2_000_000).unwrap();
+    assert_whole(&r, g, 2);
+    let slot = publish(&mem, 3, 2, 2_100_000);
+    assert_eq!(
+        reader.peek_first(&*mem),
+        Err(Fault::Run {
+            slot: u8::try_from(slot).unwrap(),
+            value: 2
+        }),
+        "a run not started"
+    );
+}
+
+/// A first peek and the take after it, as [`read`] does at a time.
+fn first(reader: &mut Reader, ring: &[AtomicU64]) -> Result<Read, Fault> {
+    let peek = reader.peek_first(ring)?;
+    let Some(d) = peek.due else {
+        return Ok(Read {
+            taken: None,
+            freed: peek.freed,
+        });
+    };
+    let g = reader.geometry();
+    let mut out = vec![0_u8; g.frame_bytes()];
+    let mut sink = |at: usize, bytes: &[u8]| {
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+        true
+    };
+    let f = reader.take(ring, d, tight(g), &mut sink)?;
+    Ok(Read {
+        taken: Some((f, out)),
+        freed: true,
+    })
+}
+
+/// The slot holding frame `seq`, as a fault names it.
+fn found_slot(ring: &[AtomicU64], g: Geometry, seq: u64) -> u8 {
+    let slot = (0..SLOTS)
+        .find(|&s| slot_word(ring, g, s, SEQ).load(Ordering::Relaxed) == seq)
+        .unwrap();
+    u8::try_from(slot).unwrap()
 }
 
 /// A late frame is dropped only for a newer one that is also due

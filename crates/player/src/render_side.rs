@@ -867,13 +867,9 @@ pub trait Screen: Send {
     fn abandon(&mut self, request: u64) {
         let _ = request;
     }
-    /// The committed play begins (its play message), its READY at `anchor`
-    /// µs on the frame clock less the play skin's loading minimum: its
-    /// movies' clock starts there unless its loading frames started it.
-    /// Nothing by default.
-    fn begin_play(&mut self, anchor: i64) {
-        let _ = anchor;
-    }
+    /// The committed play begins (its play message): its movies are the
+    /// play screen's. Nothing by default.
+    fn begin_play(&mut self) {}
     /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
     /// the start gate): the skin's runtime state for the attempt starts
     /// over, its chart and text resources kept. Nothing by default.
@@ -928,6 +924,7 @@ pub trait Screen: Send {
             dropped: 0,
             outcome: render::FrameOutcome::Shown,
             present_count: None,
+            movies: [false; skin_model::movie::MAX_MOVIES],
         })
     }
     /// Draws the select screen from `update` at `now`, with the
@@ -7551,10 +7548,9 @@ impl Run {
                 }) => {
                     let origin = measure.origin;
                     let screen_origin = self.resolve_screen_origin(&measure);
-                    // The play's movies: their clock, of this screen alone.
-                    let anchor = self.ready_anchor(&measure);
+                    // The play's movies: held by this screen alone.
                     if let Some(s) = self.screen.as_mut() {
-                        s.begin_play(anchor.0);
+                        s.begin_play();
                     }
                     self.turntable.play_starts();
                     // A decision screen is left by the loading state or
@@ -13572,6 +13568,7 @@ const fn timing_of(outcome: FrameOutcome) -> FrameTiming {
         dropped: 0,
         outcome,
         present_count: None,
+        movies: [false; skin_model::movie::MAX_MOVIES],
     }
 }
 
@@ -13607,6 +13604,7 @@ pub(crate) mod tests {
                 render::FrameOutcome::Retry
             },
             present_count: None,
+            movies: [false; skin_model::movie::MAX_MOVIES],
         }
     }
 

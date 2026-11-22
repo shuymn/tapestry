@@ -25,32 +25,34 @@
 //!
 //! The frame's hook ([`Movies::frame`]), per slot: a lost movie shows
 //! [`MovieShow::Lost`], a refused one nothing. An admitted movie whose
-//! planes are reserved peeks
-//! at the screen's time and, when a frame is due, takes it straight into
-//! the renderer's upload buffer ([`Planes::write`]); a fault loses it in
-//! the same frame. It shows its newest frame once one was taken on the
-//! screen, and nothing before: a late frame is taken, the newest the ring
-//! holds at or before the time, a stutter rather than a blank panel, and
-//! the frame taken last stays shown until a newer one is due. The first
-//! peek of a run signals the worker, which waits for that time before it
-//! starts the run ([`skin_model::media::Peek::first`]). A
-//! first frame whose take ends past the preparation deadline loses its
-//! movie (L5): it is judged when the frame is accepted, not when the poll
-//! began. Anything else shows nothing.
-//! Under dev-tools the app region covers each peek and each take, inside
-//! the upload's mapping, and nothing of wgpu's.
+//! planes are reserved reads its ring on its own clock ([`Clock`]) and,
+//! when a frame is due, takes it straight into the renderer's upload
+//! buffer ([`Planes::write`]); a fault loses it in the same frame. Until a
+//! frame is taken it shows nothing, so what is below shows.
 //!
-//! A play's preparation polls ([`Movies::prepare`]) select frames at the
-//! time since the movies opened, bounded by the earliest movie time READY
-//! can open at (the play skin's loading minimum, `floor`): with no loading
-//! lifetime the screen's movie clock is anchored the loading minimum
-//! before READY, so a bound below every time READY can start at keeps the
-//! frame held at READY from ever being ahead of the movie clock. A visible
-//! loading state polls them at its own time instead ([`Movies::poll`]),
-//! the clock READY opens on, so its frames move while it draws. Each poll
-//! ends with a fresh clock sample: past the deadline, every movie not
-//! settled is lost and shows black in that poll, however long its takes
-//! ran.
+//! A movie's clock starts at the first presented frame that draws it.
+//! Before, a poll takes its run's oldest frame once
+//! ([`skin_model::media::Reader::peek_first`]) and holds it, whatever
+//! polls come, the first frame staged. The first frame then presented
+//! whose build drew a quad of the movie ([`Movies::presented`]: the batch's
+//! marks and the frame's outcome) starts its clock at the frame time its
+//! hook was given, and from then each visible hook peeks at the first
+//! frame's stamp plus the frame time since that origin: it takes the
+//! newest frame the ring holds at or before it, late or not, a stutter
+//! rather than a blank panel, and the frame taken last stays shown until a
+//! newer one is due. A first frame whose take ends past the preparation
+//! deadline loses its movie (L5): it is judged when the frame is accepted,
+//! not when the poll began; once staged, the deadline no longer governs
+//! the movie. Under dev-tools the app region covers each peek and each
+//! take, inside the upload's mapping, and nothing of wgpu's.
+//!
+//! A play's preparation polls ([`Movies::prepare`]) are readiness only:
+//! they take each movie's first frame and nothing after it, and start no
+//! clock. A visible loading state polls the movies at its frame time
+//! ([`Movies::poll`]), the clock READY and the play frames go on with, so
+//! a movie first drawn there keeps moving through READY. Each poll ends
+//! with a fresh clock sample: past the deadline, every movie not settled
+//! is lost and shows black in that poll, however long its takes ran.
 //!
 //! Every slot's state is made when the screen's movies are opened: the
 //! frame's hook allocates nothing, panics nowhere and never waits on the
@@ -125,9 +127,6 @@ pub trait Source {
     /// The reader freed `total` slots over the ring's life; a rise signals
     /// the worker.
     fn freed(&self, total: u64);
-    /// The reader's first peek of its run wrote the time the worker may be
-    /// waiting for: signals the worker.
-    fn wake(&self);
     /// The preparation deadline passed.
     fn expire(&self);
     /// Whether it reached a terminal outcome for readiness.
@@ -165,10 +164,6 @@ impl Source for Movie {
         Self::freed(self, total);
     }
 
-    fn wake(&self) {
-        Self::wake(self);
-    }
-
     fn expire(&self) {
         Self::expire(self);
     }
@@ -179,6 +174,33 @@ impl Source for Movie {
 
     fn refused(&self) -> bool {
         self.loss() == Some(Loss::OverTotal)
+    }
+}
+
+/// Where a movie's clock stands (design.md "Skin movies").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clock {
+    /// No frame taken yet.
+    Unstaged,
+    /// Its first frame, stamped `first`, is in the planes and no presented
+    /// frame has drawn it yet: no more is taken.
+    Staged { first: i64 },
+    /// First drawn by the presented frame whose hook had frame time
+    /// `origin`: the frame due at frame time `t` is the newest at or
+    /// before `first + (t - origin)`.
+    Running { first: i64, origin: i64 },
+}
+
+impl Clock {
+    /// The media time due at frame time `at`, once running; never before
+    /// the first frame's stamp.
+    fn due(self, at: i64) -> Option<i64> {
+        match self {
+            Self::Running { first, origin } => {
+                Some(first.saturating_add(at.saturating_sub(origin).max(0)))
+            }
+            Self::Unstaged | Self::Staged { .. } => None,
+        }
     }
 }
 
@@ -194,8 +216,7 @@ struct Slot<S> {
     /// A frame was taken into the planes on this screen (and the planes
     /// have not been replaced since).
     shown: bool,
-    /// Its first frame was staged.
-    staged: bool,
+    clock: Clock,
     /// Seen live and not admitted at an admission turn: the next turn
     /// admits it.
     waited: bool,
@@ -214,7 +235,7 @@ impl<S: Source> Slot<S> {
             bt601: false,
             full: false,
             shown: false,
-            staged: false,
+            clock: Clock::Unstaged,
             waited: false,
             #[cfg(all(test, feature = "dev-tools"))]
             stamp: None,
@@ -230,11 +251,9 @@ pub struct Movies<S = Movie> {
     reserved: [[u32; 2]; MAX_MOVIES],
     /// The screen's preparation deadline (L5).
     deadline: Instant,
-    /// When its preparation started.
-    start: Instant,
-    /// The latest movie time a preparation poll selects at (µs): the
-    /// earliest screen time READY can open at.
-    floor: i64,
+    /// The frame time the last visible hook was given, until the frame it
+    /// built is judged ([`presented`](Self::presented)).
+    hook_at: Option<i64>,
 }
 
 impl<S: Source> Movies<S> {
@@ -246,37 +265,34 @@ impl<S: Source> Movies<S> {
             slots: [Slot::new(a), Slot::new(b)],
             reserved: [[0; 2]; MAX_MOVIES],
             deadline: preparation_deadline(start),
-            start,
-            floor: i64::MAX,
+            hook_at: None,
         }
     }
 
-    /// These movies with a preparation whose polls select frames at most
-    /// `floor` µs into the movie: the earliest screen time READY can open
-    /// at.
-    #[must_use]
-    pub const fn floored(mut self, floor: i64) -> Self {
-        self.floor = floor;
-        self
-    }
-
-    /// A preparation poll at `now`: [`poll`](Self::poll) at the time since
-    /// the movies opened, bounded by the floor. Readiness only: it admits
-    /// and reserves nothing, so a poll made with a frame's grant held
-    /// never allocates before that frame.
+    /// A preparation poll at `now`, readiness only: each movie's first
+    /// frame taken once, and nothing after it, no clock started. It admits
+    /// and reserves nothing, so a poll made with a frame's grant held never
+    /// allocates before that frame. As [`poll`](Self::poll) otherwise.
     pub fn prepare(&mut self, planes: &mut dyn Planes, now: Instant) -> (bool, MovieShows) {
-        let since = i64::try_from(now.saturating_duration_since(self.start).as_micros())
-            .unwrap_or(i64::MAX);
-        self.poll(planes, since.min(self.floor), now)
+        self.poll_at(planes, None, now)
     }
 
-    /// A poll at movie time `due` (µs) and `now`: the frame's hook; then,
-    /// at a fresh clock sample, the preparation deadline applied again, so
-    /// a movie it loses while the takes ran shows black in this poll.
-    /// Whether every movie is settled, and what each slot's destinations
-    /// show (for the loading frames). It admits nothing.
-    pub fn poll(&mut self, planes: &mut dyn Planes, due: i64, now: Instant) -> (bool, MovieShows) {
-        let mut shows = self.frame(planes, due, now);
+    /// A visible poll at frame time `at` (µs) and `now`: the frame's hook;
+    /// then, at a fresh clock sample, the preparation deadline applied
+    /// again, so a movie it loses while the takes ran shows black in this
+    /// poll. Whether every movie is settled, and what each slot's
+    /// destinations show (for the loading frames). It admits nothing.
+    pub fn poll(&mut self, planes: &mut dyn Planes, at: i64, now: Instant) -> (bool, MovieShows) {
+        self.poll_at(planes, Some(at), now)
+    }
+
+    fn poll_at(
+        &mut self,
+        planes: &mut dyn Planes,
+        at: Option<i64>,
+        now: Instant,
+    ) -> (bool, MovieShows) {
+        let mut shows = self.hook(planes, at, now);
         let settled = self.settle(Instant::now().max(now));
         for (show, slot) in shows.iter_mut().zip(&self.slots) {
             if slot
@@ -380,16 +396,24 @@ impl<S: Source> Movies<S> {
         }
     }
 
-    /// The frame's hook at `due`, the screen's time in µs: each admitted
-    /// slot peeked and taken into `planes` in slot order, after the
+    /// The frame's hook at frame time `at` (µs): each admitted slot read
+    /// and taken into `planes` in slot order on its own clock, after the
     /// preparation deadline is applied at `now`; what each slot's
-    /// destinations show. It admits and reserves nothing: a movie not
-    /// admitted at a boundary yet shows nothing.
-    pub fn frame(&mut self, planes: &mut dyn Planes, due: i64, now: Instant) -> MovieShows {
+    /// destinations show. The frame it builds is then judged by
+    /// [`presented`](Self::presented). It admits and reserves nothing: a
+    /// movie not admitted at a boundary yet shows nothing.
+    pub fn frame(&mut self, planes: &mut dyn Planes, at: i64, now: Instant) -> MovieShows {
+        self.hook(planes, Some(at), now)
+    }
+
+    fn hook(&mut self, planes: &mut dyn Planes, at: Option<i64>, now: Instant) -> MovieShows {
         let _ = self.settle(now);
+        if at.is_some() {
+            self.hook_at = at;
+        }
         let mut shows = MovieShows::default();
         for i in 0..MAX_MOVIES {
-            let show = self.slot_frame(planes, i, due);
+            let show = self.slot_frame(planes, i, at);
             if let Some(s) = shows.get_mut(i) {
                 *s = show;
             }
@@ -397,7 +421,37 @@ impl<S: Source> Movies<S> {
         shows
     }
 
-    fn slot_frame(&mut self, planes: &mut dyn Planes, i: usize, due: i64) -> MovieShow {
+    /// The frame the last visible hook was given for has been drawn:
+    /// `presented` whether it reached the target, `drawn` which slots its
+    /// build drew a quad of. A slot whose first frame is staged and drawn
+    /// by a presented frame starts its clock at that hook's frame time;
+    /// nothing else changes. A frame drawn with no visible hook before it
+    /// starts nothing.
+    pub fn presented(&mut self, presented: bool, drawn: [bool; MAX_MOVIES]) {
+        let Some(origin) = self.hook_at.take().filter(|_| presented) else {
+            return;
+        };
+        for (slot, drawn) in self.slots.iter_mut().zip(drawn) {
+            if let Clock::Staged { first } = slot.clock
+                && drawn
+                && slot.shown
+            {
+                slot.clock = Clock::Running { first, origin };
+            }
+        }
+    }
+
+    /// A frame is built without this set's hook, or the frame its last
+    /// hook was given for is not drawn: that hook's frame time starts no
+    /// clock.
+    pub fn unhook(&mut self) {
+        self.hook_at = None;
+    }
+
+    /// One slot's read at frame time `at` (`None` for a preparation's
+    /// poll): before its first frame, the run's oldest; once running and
+    /// visible, the newest due on its clock; otherwise nothing.
+    fn slot_frame(&mut self, planes: &mut dyn Planes, i: usize, at: Option<i64>) -> MovieShow {
         let reserved = self.reserved.get(i).copied();
         let deadline = self.deadline;
         let Some(slot) = self.slots.get_mut(i) else {
@@ -424,63 +478,67 @@ impl<S: Source> Movies<S> {
             return MovieShow::Nothing;
         };
         let [width, height] = slot.size;
-        let peeked = {
-            #[cfg(feature = "dev-tools")]
-            let _region = crate::alloc_count::AppRegion::enter();
-            reader.peek(live.words, due)
-        };
-        let peek = match peeked {
-            Ok(p) => p,
-            Err(_) => {
-                movie.lose(Loss::Fault);
-                return MovieShow::Lost;
-            }
-        };
-        if peek.freed {
-            movie.freed(reader.freed());
-        }
-        if peek.first {
-            movie.wake();
-        }
-        if let Some(d) = peek.due {
-            let mut took = None;
-            let words = live.words;
-            let written = planes.write(layer, width, height, &mut |sink, pitch| {
+        let staging = slot.clock == Clock::Unstaged;
+        let due = at.and_then(|at| slot.clock.due(at));
+        if staging || due.is_some() {
+            let peeked = {
                 #[cfg(feature = "dev-tools")]
                 let _region = crate::alloc_count::AppRegion::enter();
-                let taken = reader.take(words, d, pitch, sink);
-                let ok = taken.is_ok();
-                took = Some(taken.map(|f| f.stamp).ok());
-                ok
-            });
-            match took {
-                Some(None) => {
+                match due {
+                    Some(due) => reader.peek(live.words, due),
+                    None => reader.peek_first(live.words),
+                }
+            };
+            let peek = match peeked {
+                Ok(p) => p,
+                Err(_) => {
                     movie.lose(Loss::Fault);
                     return MovieShow::Lost;
                 }
-                Some(Some(_stamp)) => {
-                    movie.freed(reader.freed());
-                    if written {
-                        slot.shown = true;
-                        #[cfg(all(test, feature = "dev-tools"))]
-                        {
-                            slot.stamp = Some(_stamp);
-                        }
-                        if !slot.staged {
-                            // Accepted past the deadline: lost, never
-                            // ready, however early the poll began.
-                            if Instant::now() >= deadline {
-                                movie.expire();
-                                return MovieShow::Lost;
+            };
+            if peek.freed {
+                movie.freed(reader.freed());
+            }
+            if let Some(d) = peek.due {
+                let mut took = None;
+                let words = live.words;
+                let written = planes.write(layer, width, height, &mut |sink, pitch| {
+                    #[cfg(feature = "dev-tools")]
+                    let _region = crate::alloc_count::AppRegion::enter();
+                    let taken = reader.take(words, d, pitch, sink);
+                    let ok = taken.is_ok();
+                    took = Some(taken.map(|f| f.stamp).ok());
+                    ok
+                });
+                match took {
+                    Some(None) => {
+                        movie.lose(Loss::Fault);
+                        return MovieShow::Lost;
+                    }
+                    Some(Some(stamp)) => {
+                        movie.freed(reader.freed());
+                        if written {
+                            slot.shown = true;
+                            #[cfg(all(test, feature = "dev-tools"))]
+                            {
+                                slot.stamp = Some(stamp);
                             }
-                            slot.staged = true;
-                            movie.staged_first();
+                            if staging {
+                                // Accepted past the deadline: lost, never
+                                // ready, however early the poll began.
+                                if Instant::now() >= deadline {
+                                    movie.expire();
+                                    return MovieShow::Lost;
+                                }
+                                slot.clock = Clock::Staged { first: stamp };
+                                movie.staged_first();
+                            }
                         }
                     }
+                    // The frame did not fit the planes or the buffer could
+                    // not be mapped: it stays in the ring for a later frame.
+                    None => {}
                 }
-                // The frame did not fit the planes or the buffer could not
-                // be mapped: it stays in the ring for a later frame.
-                None => {}
             }
         }
         if slot.shown {
@@ -501,6 +559,15 @@ impl<S: Source> Movies<S> {
     pub fn stamps(&self) -> [Option<i64>; MAX_MOVIES] {
         let [a, b] = &self.slots;
         [a.stamp.filter(|_| a.shown), b.stamp.filter(|_| b.shown)]
+    }
+
+    /// Each slot's clock origin on the frame clock, once started (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn origins(&self) -> [Option<i64>; MAX_MOVIES] {
+        self.slots.each_ref().map(|s| match s.clock {
+            Clock::Running { origin, .. } => Some(origin),
+            Clock::Unstaged | Clock::Staged { .. } => None,
+        })
     }
 
     /// Makes slot `i`'s planes those of its admitted movie of `width` ×

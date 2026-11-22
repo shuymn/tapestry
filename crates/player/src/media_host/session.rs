@@ -217,15 +217,6 @@ impl Movie {
             live.ring.signal();
         }
     }
-
-    /// The render side's reader peeked its run for the first time, so the
-    /// ring holds the time a worker waiting to start reads
-    /// ([`media::State::Starting`]): signals the worker's event.
-    pub fn wake(&self) {
-        if let Some(live) = self.live() {
-            live.ring.signal();
-        }
-    }
 }
 
 /// A live video's ring and what its probe said.
@@ -1431,7 +1422,6 @@ fn progress(p: &mut Player, now: Instant, limit: Duration) -> Option<Loss> {
         state,
         published: media::watermark(words).unwrap_or(0),
         freed: p.movie.freed.load(Ordering::Acquire),
-        peeked: media::peeked(words),
     };
     stalled(&mut p.progress, seen, p.looping, now, limit)
 }
@@ -1446,17 +1436,14 @@ struct Seen {
     published: u64,
     /// The slots the game freed.
     freed: u64,
-    /// Whether the game has peeked the ring, so its time is there.
-    peeked: bool,
 }
 
 /// The progress rule (L3) on `seen`, `last` being the progress word's last
 /// value and when it rose or the window last restarted: lost when the word
 /// has not risen for more than `limit`, unless every slot holds a frame the
-/// game has not freed (published frames past the slots it freed), a
-/// player waits for the game's first peek before it starts and the game
-/// has not peeked yet, or a play that is not looping has ended, any of
-/// which restarts the window.
+/// game has not freed (published frames past the slots it freed) or a
+/// play that is not looping has ended, either of which restarts the
+/// window.
 fn stalled(
     last: &mut (u64, Instant),
     seen: Seen,
@@ -1473,7 +1460,6 @@ fn stalled(
             let slots = u64::try_from(media::SLOTS).unwrap_or(u64::MAX);
             seen.freed.saturating_add(slots) <= seen.published
         }
-        Some(State::Starting) => !seen.peeked,
         Some(State::Ended) => !looping,
         Some(State::Decoding) | None => false,
     };
@@ -1657,7 +1643,6 @@ mod tests {
             state: Some(state),
             published,
             freed,
-            peeked: false,
         }
     }
 
@@ -1726,24 +1711,6 @@ mod tests {
         let free = seen(0, State::Waiting, 10, 10);
         assert_eq!(
             verdicts(&[(LIMIT + MS(1), free)], true),
-            [Some(Loss::Progress)]
-        );
-    }
-
-    // Covers: T02
-    #[test]
-    fn a_start_is_excused_until_the_game_peeks() {
-        // Waiting for the game's first peek, which has not come: excused,
-        // however long the game takes to admit the movie.
-        let starting = seen(0, State::Starting, 0, 0);
-        assert_eq!(verdicts(&[(MS(10_000), starting)], true), [None]);
-        // Once the game has peeked, a player still waiting stalls.
-        let peeked = Seen {
-            peeked: true,
-            ..starting
-        };
-        assert_eq!(
-            verdicts(&[(LIMIT + MS(1), peeked)], true),
             [Some(Loss::Progress)]
         );
     }

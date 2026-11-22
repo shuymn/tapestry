@@ -11,40 +11,33 @@
 //! each frame whose stamp is not below the run's start and rises above the
 //! last it published, in order, as soon as the frame is converted and a
 //! slot is free, and waits on the event while every slot is full. A run
-//! starts at a target it decodes to before the run's first frame, as
-//! players decode to a start or a seek before the first present: a seek's
-//! landing (the first frame at or after the seek's time), or for the
-//! play's first run the game's time at its first peek of the ring, which
-//! it waits for, saying so, and publishes nothing before. Decoding to it,
-//! it reads each frame's stamp before converting it and drops the frame
-//! it holds only for a next frame at or before the target; it publishes
-//! the frame whose interval holds the target, a first frame already past
-//! it, or the video's last. From then on it drops no frame: one behind the
-//! game's clock is published as any other, and the game drops it only for
-//! a newer frame that is also due. A frame is published before the next
-//! one is converted, so a blocked conversion leaves the frame due in the
-//! ring. It answers the end of the video, a seek and a failure; a failed or
-//! refused player only waits to be closed. A looping play starts again at
-//! the video's start at each end, in the same run, its stamps rising on,
-//! and never ends. It counts every frame its decoder returns in the ring's
-//! progress word and says in its state word whether it decodes, waits for
-//! a free slot, waits for the game's first peek or has ended, which the
-//! game reads to supervise it. A refusal or a failure is sent once the
-//! player has closed its file (and its ring), so a worker that ends before
-//! sending it still has the file open as far as the game knows. Closing
-//! unmaps its view of the ring before it answers.
+//! starts at the video's start (its first frame with a time) or at a
+//! seek's landing (the first frame at or after the seek's time), and the
+//! player reads nothing of the game's time: it drops no frame, and the
+//! game drops one behind its clock only for a newer frame that is also
+//! due. A frame is published before the next one is converted, so a
+//! blocked conversion leaves the frame due in the ring. It answers the end
+//! of the video, a seek and a failure; a failed or refused player only
+//! waits to be closed. A looping play starts again at the video's start at
+//! each end, in the same run, its stamps rising on, and never ends. It
+//! counts every frame its decoder returns in the ring's progress word and
+//! says in its state word whether it decodes, waits for a free slot or has
+//! ended, which the game reads to supervise it. A refusal or a failure is
+//! sent once the player has closed its file (and its ring), so a worker
+//! that ends before sending it still has the file open as far as the game
+//! knows. Closing unmaps its view of the ring before it answers.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
-use skin_model::media::{PROGRESS_WORD, State, Writer, shown};
+use skin_model::media::{PROGRESS_WORD, State, Writer};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
 use crate::{Out, ToPlayer};
 
-/// How long a player with every slot full, or waiting for the game's first
-/// peek, waits on the ring's event before it looks for a command.
+/// How long a player with every slot full waits on the ring's event
+/// before it looks for a command.
 const SLOT_WAIT_MS: u32 = 50;
 
 /// Where a player freezes for good (dev-tools): its thread stops, answering
@@ -205,9 +198,6 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         last: None,
         seq: 0,
         held: None,
-        next: None,
-        start: Start::Unknown,
-        at_end: false,
         ended: false,
     };
     let stopped = playing.play(rx, out);
@@ -243,27 +233,8 @@ struct Playing {
     seq: u64,
     /// The stamp of the frame in `frame`, converted and not published yet.
     held: Option<i64>,
-    /// The stamp of the frame the decoder holds, decoded and not converted
-    /// yet: the frame after `held`, while it decodes to a run's target.
-    next: Option<i64>,
-    /// Where the run's start stands.
-    start: Start,
-    /// The video ended after `held`: it ends once that is published.
-    at_end: bool,
     /// The run's video has ended.
     ended: bool,
-}
-
-/// Where a run's start stands.
-#[derive(Clone, Copy)]
-enum Start {
-    /// The play's first run, before the game's first peek gives its time.
-    Unknown,
-    /// Decoding to the target, µs: the run's first frame is the one whose
-    /// interval holds it.
-    To(i64),
-    /// The run's first frame is chosen: every frame is published from here.
-    Begun,
 }
 
 impl Playing {
@@ -311,10 +282,6 @@ impl Playing {
         self.floor = at;
         self.last = None;
         self.held = None;
-        self.next = None;
-        self.at_end = false;
-        // The seek decodes to its time: its landing is the run's first frame.
-        self.start = Start::Begun;
         self.ended = false;
         self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
@@ -371,62 +338,21 @@ impl Playing {
         });
     }
 
-    /// One step: waits for the game's first peek while the run's target is
-    /// not known; decodes and converts a frame while it holds none; decodes
-    /// to the run's target, dropping the frame held only for a next frame
-    /// at or before it; or publishes the frame held, or waits a while for a
-    /// free slot, then converts the frame after it.
+    /// One step: decodes and converts a frame while it holds none, or
+    /// publishes the frame held, or waits a while for a free slot.
     fn step(&mut self, out: &Out) -> Result<(), (Failure, i32)> {
         let words = self.view.words();
-        if matches!(self.start, Start::Unknown) {
-            if let Some(time) = shown(words, self.run) {
-                self.start = Start::To(time);
-                self.writer.state(words, State::Decoding);
-            } else {
-                // The game's first peek signals the event.
-                self.writer.state(words, State::Starting);
-                self.event.wait(SLOT_WAIT_MS);
-            }
-            return Ok(());
-        }
         let Some(stamp) = self.held else {
             match self.decode(self.last)? {
                 Decoded::Frame(stamp) => {
                     self.input.convert(&mut self.frame)?;
                     self.held = Some(stamp);
-                    // A first frame past the target is the run's first.
-                    if let Start::To(target) = self.start
-                        && stamp > target
-                    {
-                        self.start = Start::Begun;
-                    }
                 }
                 Decoded::Skipped => {}
                 Decoded::End => self.end(out),
             }
             return Ok(());
         };
-        if let Start::To(target) = self.start {
-            match self.decode(Some(stamp))? {
-                // A newer frame due at the target replaces the one held.
-                Decoded::Frame(next) if next <= target => {
-                    self.input.convert(&mut self.frame)?;
-                    self.held = Some(next);
-                }
-                // The frame held holds the target: the run's first.
-                Decoded::Frame(next) => {
-                    self.next = Some(next);
-                    self.start = Start::Begun;
-                }
-                Decoded::Skipped => {}
-                // The video's last frame is the run's first.
-                Decoded::End => {
-                    self.at_end = true;
-                    self.start = Start::Begun;
-                }
-            }
-            return Ok(());
-        }
         let Some(slot) = self.writer.claim(words) else {
             self.writer.state(words, State::Waiting);
             if self.seq > 0 {
@@ -444,14 +370,6 @@ impl Playing {
         self.last = Some(stamp);
         self.held = None;
         freeze_at(self.player, Freeze::Decoding);
-        // The frame after it, decoded while the worker decoded to the
-        // target, converted once this one is out.
-        if let Some(next) = self.next.take() {
-            self.input.convert(&mut self.frame)?;
-            self.held = Some(next);
-        } else if std::mem::take(&mut self.at_end) {
-            self.end(out);
-        }
         Ok(())
     }
 }

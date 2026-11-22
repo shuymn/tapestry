@@ -575,7 +575,6 @@ impl MenuScreen {
                     ScreenKind::Play,
                     &bundle?,
                     std::time::Instant::now(),
-                    None,
                 )
                 .map(|mut set| {
                     set.loading = lifetime;
@@ -584,15 +583,10 @@ impl MenuScreen {
             });
     }
 
-    /// A frame of selection's entry `lifetime` with the skin `bundle` at
-    /// `now`: a set of another screen is retired, and the entry's own
-    /// movies are opened unless they are held already.
-    fn enter_selection_movies(
-        &mut self,
-        bundle: &Arc<SkinBundle>,
-        lifetime: u64,
-        now: bms_model::TimeUs,
-    ) {
+    /// A frame of selection's entry `lifetime` with the skin `bundle`: a set
+    /// of another screen is retired, and the entry's own movies are opened
+    /// unless they are held already.
+    fn enter_selection_movies(&mut self, bundle: &Arc<SkinBundle>, lifetime: u64) {
         self.movies
             .drawn(Drawn::Selection(lifetime), &mut self.renderer);
         if self.movies.get().is_some() {
@@ -606,35 +600,51 @@ impl MenuScreen {
                     ScreenKind::Selection,
                     bundle,
                     std::time::Instant::now(),
-                    Some(now.0),
                 )
             });
     }
 
     /// The loading frame `frame`'s movie poll: the movies of the play
-    /// being prepared or committed in `frame`'s loading lifetime, polled on
-    /// their own clock, from that lifetime's origin, the clock READY opens
-    /// on, and their shows published for the frame; a set of another
-    /// screen is retired first. A set whose preparation was published in
-    /// another lifetime (a Start quit after its commit, before READY)
-    /// shows nothing in this one: no frame, no loss, no clock taken from
-    /// it.
+    /// being prepared or committed in `frame`'s loading lifetime, polled at
+    /// the frame's time on the frame clock READY and the play go on with,
+    /// and their shows published for the frame; a set of another screen is
+    /// retired first. A set whose preparation was published in another
+    /// lifetime (a Start quit after its commit, before READY) shows nothing
+    /// in this one: no frame, no loss, no clock started by it.
     fn loading_movies(&mut self, frame: &LoadingFrame<'_>) {
         self.movies.drawn(Drawn::Other, &mut self.renderer);
         let Some((Holder::Preparing(_) | Holder::Committed(_), m)) = self.movies.get_mut() else {
             return;
         };
         if m.loading != Some(frame.lifetime) {
+            m.movies.unhook();
             self.renderer
                 .set_loading_movies(skin_model::movie::MovieShows::default());
             return;
         }
-        let origin = *m.origin.get_or_insert(frame.load.since.0);
-        let due = frame.now.0.saturating_sub(origin);
         let (_, shows) = m
             .movies
-            .poll(&mut self.renderer, due, std::time::Instant::now());
+            .poll(&mut self.renderer, frame.now.0, std::time::Instant::now());
         self.renderer.set_loading_movies(shows);
+    }
+
+    /// The frame the last movie hook built was drawn with `timing`: the
+    /// set held starts the clock of each movie the frame drew, presented
+    /// ([`crate::movie_frame::Movies::presented`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn movies_presented(&mut self, timing: &FrameTiming) {
+        if let Some((_, m)) = self.movies.get_mut() {
+            m.movies.presented(timing.presented(), timing.movies);
+        }
+    }
+
+    /// The frame the last movie hook built was not drawn: it starts no
+    /// clock ([`crate::movie_frame::Movies::unhook`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn movies_unhooked(&mut self) {
+        if let Some((_, m)) = self.movies.get_mut() {
+            m.movies.unhook();
+        }
     }
 
     /// The play frame's movie hook at `at` on the frame clock
@@ -643,9 +653,8 @@ impl MenuScreen {
     fn play_movies(&mut self, at: i64) -> skin_model::movie::MovieShows {
         match self.movies.get_mut() {
             Some((Holder::Playing, m)) => {
-                let due = at.saturating_sub(m.origin.unwrap_or(at));
                 m.movies
-                    .frame(&mut self.renderer, due, std::time::Instant::now())
+                    .frame(&mut self.renderer, at, std::time::Instant::now())
             }
             _ => skin_model::movie::MovieShows::default(),
         }
@@ -657,9 +666,8 @@ impl MenuScreen {
     fn selection_movies(&mut self, now: bms_model::TimeUs) -> skin_model::movie::MovieShows {
         match self.movies.get_mut() {
             Some((Holder::Selection(_), m)) => {
-                let due = now.0.saturating_sub(m.origin.unwrap_or(now.0));
                 m.movies
-                    .frame(&mut self.renderer, due, std::time::Instant::now())
+                    .frame(&mut self.renderer, now.0, std::time::Instant::now())
             }
             _ => skin_model::movie::MovieShows::default(),
         }
@@ -910,11 +918,15 @@ impl MenuScreen {
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        let timing = self.renderer.loading_frame_on(on, frame, text)?;
-        if let Ok(t) = &timing {
-            self.shown(t.presented());
+        let timing = self.renderer.loading_frame_on(on, frame, text);
+        match &timing {
+            Ok(Ok(t)) => {
+                self.movies_presented(t);
+                self.shown(t.presented());
+            }
+            Ok(Err(_)) | Err(_) => self.movies_unhooked(),
         }
-        Ok(timing)
+        timing
     }
 
     /// Tells `sink` of its first frame presented and the caret's area of
@@ -1767,8 +1779,8 @@ impl Screen for MenuScreen {
         self.movies.abandon(request, &mut self.renderer);
     }
 
-    fn begin_play(&mut self, anchor: i64) {
-        self.movies.begin_play(anchor, &mut self.renderer);
+    fn begin_play(&mut self) {
+        self.movies.begin_play(&mut self.renderer);
     }
 
     /// The play frame's movie hook at `at` on the frame clock
@@ -1782,7 +1794,12 @@ impl Screen for MenuScreen {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
-        let timing = self.renderer.submit()?;
+        let timing = self.renderer.submit();
+        let Ok(timing) = timing else {
+            self.movies_unhooked();
+            return timing;
+        };
+        self.movies_presented(&timing);
         self.shown(timing.presented());
         Ok(timing)
     }
@@ -1927,7 +1944,7 @@ impl Screen for MenuScreen {
                 skinned: false,
             });
         };
-        self.enter_selection_movies(&logic.bundle, u.lifetime, now);
+        self.enter_selection_movies(&logic.bundle, u.lifetime);
         let refused = match self.prepare_selection(u, logic, changed)? {
             // The frame's timers, then the runtime over that state, then
             // the build from it (docs/stage3.md S7-07).
@@ -1959,6 +1976,7 @@ impl Screen for MenuScreen {
             self.selection_key = None;
             self.send(self.page_caret);
             let timing = self.menu_frame(&u.page, false)?;
+            self.movies_presented(&timing);
             self.shown(timing.presented());
             return Ok(SelectionDrawn {
                 timing,
@@ -1975,6 +1993,7 @@ impl Screen for MenuScreen {
             Some(t) => self.renderer.submit_selection(&[t]),
             None => self.renderer.submit_selection(&[]),
         }?;
+        self.movies_presented(&timing);
         self.shown(timing.presented());
         Ok(SelectionDrawn {
             timing,

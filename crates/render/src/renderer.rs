@@ -1461,6 +1461,10 @@ pub struct FrameTiming {
     /// failed. It pairs the frame with its frame statistics (design.md "Latency
     /// Figures").
     pub present_count: Option<u32>,
+    /// Which movie slots the frame's batch held a frame's sprite of
+    /// ([`SpriteBatch::movies`]): with [`presented`](Self::presented),
+    /// whether the frame drew each movie (design.md "Skin movies").
+    pub movies: [bool; skin_model::movie::MAX_MOVIES],
 }
 
 impl FrameTiming {
@@ -7332,6 +7336,7 @@ impl Renderer {
                 dropped: 0,
                 outcome: FrameOutcome::NotBuilt,
                 present_count: None,
+                movies: [false; skin_model::movie::MAX_MOVIES],
             });
         };
         let projection = self.staging.projection();
@@ -8696,6 +8701,7 @@ impl Renderer {
             dropped: 0,
             outcome: FrameOutcome::NotBuilt,
             present_count: None,
+            movies: [false; skin_model::movie::MAX_MOVIES],
         };
         let Some(start) = self.started.take() else {
             return Ok(none);
@@ -9298,6 +9304,7 @@ impl Renderer {
             dropped: staging.batch().dropped(),
             outcome,
             present_count: None,
+            movies: staging.batch().movies(),
         };
         if self.minimized {
             let cpu = start.elapsed();

@@ -20,8 +20,6 @@ struct Fake {
     geometry: Geometry,
     staged: AtomicBool,
     freed: AtomicU64,
-    /// The times the hook signalled the worker for a first peek.
-    wakes: AtomicU64,
 }
 
 impl Fake {
@@ -41,7 +39,6 @@ impl Fake {
             geometry,
             staged: AtomicBool::new(false),
             freed: AtomicU64::new(0),
-            wakes: AtomicU64::new(0),
         })
     }
 
@@ -94,10 +91,6 @@ impl Source for Fake {
 
     fn freed(&self, total: u64) {
         self.freed.store(total, Ordering::SeqCst);
-    }
-
-    fn wake(&self) {
-        self.wakes.fetch_add(1, Ordering::SeqCst);
     }
 
     fn expire(&self) {
@@ -166,11 +159,24 @@ fn movies(a: Option<&Arc<Fake>>, b: Option<&Arc<Fake>>, start: Instant) -> Movie
     Movies::new([a.cloned(), b.cloned()], start)
 }
 
-/// A selection frame's movie work: the admission boundary, then the
-/// frame's hook.
-fn tick(m: &mut Movies<Fake>, planes: &mut dyn Planes, due: i64, now: Instant) -> MovieShows {
+/// A selection frame's movie work at frame time `at`: the admission
+/// boundary, the frame's hook, and the frame presented, drawing every slot
+/// that shows a frame.
+fn tick(m: &mut Movies<Fake>, planes: &mut dyn Planes, at: i64, now: Instant) -> MovieShows {
     m.admit(planes, now);
-    m.frame(planes, due, now)
+    let shows = m.frame(planes, at, now);
+    m.presented(true, drawn(shows));
+    shows
+}
+
+/// The slots `shows` gives a frame to: those a build draws.
+fn drawn(shows: MovieShows) -> [bool; MAX_MOVIES] {
+    shows.map(|s| matches!(s, MovieShow::Frame { .. }))
+}
+
+/// Whether slot `slot`'s planes hold a frame whose every byte is `id`.
+fn holds(planes: &Kept, slot: usize, id: u8) -> bool {
+    !planes.luma[slot].is_empty() && planes.luma[slot].iter().all(|&v| v == id)
 }
 
 #[test]
@@ -218,6 +224,10 @@ fn each_state_shows_what_it_should() {
     assert_eq!(tick(&mut m, &mut planes, 20, start)[1], MovieShow::Lost);
 }
 
+/// A live movie shows nothing before its first frame, and that frame is
+/// the run's first whatever its stamp (design.md "Rendering and Skins",
+/// skin movies): a clip whose first frame is stamped 1 ms shows it at once,
+/// and its clock then runs from that stamp.
 #[test]
 fn a_live_movie_shows_nothing_before_its_first_frame() {
     let start = Instant::now();
@@ -226,21 +236,26 @@ fn a_live_movie_shows_nothing_before_its_first_frame() {
     let mut m = movies(Some(&a), None, start);
     let mut planes = Kept::default();
     assert_eq!(tick(&mut m, &mut planes, 0, start)[0], MovieShow::Nothing);
-    // A frame not due yet stays in the ring.
     a.publish(1, 1_000, 3);
-    assert_eq!(tick(&mut m, &mut planes, 999, start)[0], MovieShow::Nothing);
-    assert!(!a.staged.load(Ordering::SeqCst));
-    // Planes that refuse the write keep it in the ring too.
+    // Planes that refuse the write keep it in the ring.
     planes.refuse = true;
-    assert_eq!(
-        tick(&mut m, &mut planes, 1_000, start)[0],
-        MovieShow::Nothing
-    );
+    assert_eq!(tick(&mut m, &mut planes, 500, start)[0], MovieShow::Nothing);
+    assert!(!a.staged.load(Ordering::SeqCst));
     planes.refuse = false;
     assert!(matches!(
-        tick(&mut m, &mut planes, 1_000, start)[0],
+        tick(&mut m, &mut planes, 999, start)[0],
         MovieShow::Frame { .. }
     ));
+    assert!(holds(&planes, 0, 3), "the first frame, stamped 1 ms");
+    // Its clock: 1 ms at frame time 999 µs.
+    a.publish(2, 1_600, 4);
+    let _ = tick(&mut m, &mut planes, 1_598, start);
+    assert!(holds(&planes, 0, 3), "not due yet");
+    let _ = tick(&mut m, &mut planes, 1_599, start);
+    assert!(
+        holds(&planes, 0, 4),
+        "due at its stamp on the movie's clock"
+    );
 }
 
 #[test]
@@ -253,10 +268,12 @@ fn movie_picks_newest_frame_at_or_before_screen_time() {
     }
     let mut m = movies(Some(&a), None, start);
     let mut planes = Kept::default();
-    let _ = tick(&mut m, &mut planes, 1_500, start);
-    assert!(planes.luma[0].iter().all(|&v| v == 2));
-    let _ = tick(&mut m, &mut planes, 2_000, start);
-    assert!(planes.luma[0].iter().all(|&v| v == 3));
+    let _ = tick(&mut m, &mut planes, 10_000, start);
+    assert!(holds(&planes, 0, 1), "its first frame first");
+    let _ = tick(&mut m, &mut planes, 11_500, start);
+    assert!(holds(&planes, 0, 2));
+    let _ = tick(&mut m, &mut planes, 12_000, start);
+    assert!(holds(&planes, 0, 3));
 }
 
 /// A movie the session refused at the pixel total draws nothing, never
@@ -374,34 +391,149 @@ fn a_take_crossing_the_preparation_deadline_is_lost() {
     }
 }
 
-/// A play's preparation selects frames at most the floor into the movie,
-/// the earliest screen time READY opens at: a preparation polled 2.5 s
-/// after the movies opened, with a 1 s floor, takes the frame stamped 1 s,
-/// and READY at screen time 1 s shows that frame, never one ahead of it.
+/// A play's preparation takes each movie's first frame once and starts no
+/// clock (design.md "Rendering and Skins", skin movies): polled again and
+/// again over a ring holding frames 0 to 3, it holds frame 0 and frees
+/// nothing more; a loading frame 1.2 s later shows frame 0, and the frames
+/// then advance from it on the frame clock.
+// Revert: a staged movie peeking at every poll -> "frame 0 held through
+// the polls"; the clock started at the preparation's take -> "frame 0 at
+// the first loading frame"; a preparation poll peeking a running movie at
+// its own time -> "no frame ahead of the frame clock".
 #[test]
-fn a_preparation_never_holds_a_frame_ahead_of_the_screen_clock() {
+fn a_preparation_takes_the_first_frame_once_and_starts_no_clock() {
     let a = Fake::new(16, 8);
     a.set(Status::Live);
-    for (seq, stamp, id) in [(1, 0, 1), (2, 1_000_000, 2), (3, 2_000_000, 3)] {
-        a.publish(seq, stamp, id);
+    let period = 100_000;
+    for seq in 1..=4_u64 {
+        let i = i64::try_from(seq - 1).unwrap();
+        a.publish(seq, i * period, u8::try_from(seq).unwrap());
     }
     let now = Instant::now();
-    let start = now - Duration::from_millis(2_500);
-    let mut m = movies(Some(&a), None, start).floored(1_000_000);
+    let mut m = movies(Some(&a), None, now);
     let mut planes = Kept::default();
     m.admit(&mut planes, now);
-    let (settled, shows) = m.prepare(&mut planes, now);
-    assert!(settled);
+    for _ in 0..5 {
+        let (settled, shows) = m.prepare(&mut planes, now);
+        assert!(settled);
+        assert!(matches!(shows[0], MovieShow::Frame { .. }));
+        m.presented(true, drawn(shows));
+    }
+    assert!(holds(&planes, 0, 1), "frame 0 held through the polls");
+    assert_eq!(a.freed.load(Ordering::SeqCst), 1, "frame 0 alone freed");
+    // The first loading frame, 1.2 s on.
+    let at = 1_200_000;
+    let (_, shows) = m.poll(&mut planes, at, now);
+    m.presented(true, drawn(shows));
+    assert!(holds(&planes, 0, 1), "frame 0 at the first loading frame");
+    // A preparation poll after the clock started takes nothing, however
+    // late its own clock: no second clock takes a frame ahead of the
+    // screen's.
+    let (_, shows) = m.prepare(&mut planes, now + Duration::from_secs(2));
+    m.presented(true, drawn(shows));
+    assert!(holds(&planes, 0, 1), "no frame ahead of the frame clock");
+    let (_, shows) = m.poll(&mut planes, at + period, now);
+    m.presented(true, drawn(shows));
+    assert!(holds(&planes, 0, 2), "frame 1 a period on");
+}
+
+/// A movie's clock starts at the first presented frame that draws it
+/// (design.md "Rendering and Skins", skin movies): a frame whose build drew
+/// no quad of it (a destination gated off), a frame not presented, and a
+/// presentation with no hook before it start nothing; the frame then
+/// presented that draws it does, and frames advance from there.
+// Revert: the clock started whatever the frame drew -> "frame 1 a period
+// after the frame that drew it"; the clock started by a frame not
+// presented -> the same.
+#[test]
+fn a_movie_s_clock_starts_only_at_a_presented_frame_that_draws_it() {
+    let start = Instant::now();
+    let a = Fake::new(16, 8);
+    a.set(Status::Live);
+    let period = 100_000;
+    for seq in 1..=4_u64 {
+        let i = i64::try_from(seq - 1).unwrap();
+        a.publish(seq, i * period, u8::try_from(seq).unwrap());
+    }
+    let mut m = movies(Some(&a), None, start);
+    let mut planes = Kept::default();
+    m.admit(&mut planes, start);
+    let shows = m.frame(&mut planes, 1_000_000, start);
     assert!(matches!(shows[0], MovieShow::Frame { .. }));
-    assert!(planes.luma[0].iter().all(|&v| v == 2), "the frame at 1 s");
-    // READY at screen time 1 s: nothing newer is due, and the frame held
-    // is the one stamped 1 s.
-    let shows = tick(&mut m, &mut planes, 1_000_000, now);
-    assert!(matches!(shows[0], MovieShow::Frame { .. }));
+    m.presented(true, [false, false]);
+    let _ = m.frame(&mut planes, 1_100_000, start);
+    m.presented(false, [true, false]);
+    m.presented(true, [true, false]);
+    let _ = m.frame(&mut planes, 2_000_000, start);
+    assert!(holds(&planes, 0, 1), "frame 0 until its clock starts");
+    m.presented(true, [true, false]);
+    let _ = m.frame(&mut planes, 2_000_000 + period - 1, start);
+    assert!(holds(&planes, 0, 1));
+    let _ = m.frame(&mut planes, 2_000_000 + period, start);
     assert!(
-        planes.luma[0].iter().all(|&v| v == 2),
-        "still the frame at 1 s"
+        holds(&planes, 0, 2),
+        "frame 1 a period after the frame that drew it"
     );
+}
+
+/// A movie drawn in a loading frame keeps its clock through READY, and its
+/// peer, its destination gated off in the loading frames, starts at READY's
+/// first presented frame that draws it (design.md "Rendering and Skins",
+/// skin movies): one frame clock through loading, READY and play.
+#[test]
+fn a_movie_keeps_its_clock_through_ready_while_its_peer_starts_there() {
+    let start = Instant::now();
+    let (a, b) = (Fake::new(16, 8), Fake::new(16, 8));
+    a.set(Status::Live);
+    b.set(Status::Live);
+    let period = 100_000;
+    for seq in 1..=4_u64 {
+        let i = i64::try_from(seq - 1).unwrap();
+        let id = u8::try_from(seq).unwrap();
+        a.publish(seq, i * period, id);
+        b.publish(seq, i * period, id + 10);
+    }
+    let mut m = movies(Some(&a), Some(&b), start);
+    let mut planes = Kept::default();
+    m.admit(&mut planes, start);
+    let (_, shows) = m.poll(&mut planes, 1_000_000, start);
+    assert!(matches!(
+        shows,
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
+    ));
+    m.presented(true, [true, false]);
+    // READY, 150 ms on.
+    let ready = 1_150_000;
+    let shows = m.frame(&mut planes, ready, start);
+    m.presented(true, drawn(shows));
+    assert!(holds(&planes, 0, 2), "a moves on its loading clock");
+    assert!(holds(&planes, 1, 11), "b's first frame at READY");
+    let _ = m.frame(&mut planes, ready + period, start);
+    assert!(holds(&planes, 0, 3));
+    assert!(holds(&planes, 1, 12), "b a period after READY");
+}
+
+/// A clip that is not looping and ended before the first take keeps its
+/// queued frames and its last one (design.md "Rendering and Skins", video
+/// frames): its first frame is taken, then the next, and the last stays.
+#[test]
+fn a_short_clip_that_ended_before_its_first_take_plays_its_frames() {
+    let start = Instant::now();
+    let a = Fake::new(16, 8);
+    a.set(Status::Live);
+    a.publish(1, 0, 1);
+    a.publish(2, 40_000, 2);
+    let mut m = movies(Some(&a), None, start);
+    let mut planes = Kept::default();
+    m.admit(&mut planes, start);
+    let (settled, _) = m.prepare(&mut planes, start);
+    assert!(settled);
+    let _ = tick(&mut m, &mut planes, 500_000, start);
+    assert!(holds(&planes, 0, 1));
+    let _ = tick(&mut m, &mut planes, 540_000, start);
+    assert!(holds(&planes, 0, 2));
+    let _ = tick(&mut m, &mut planes, 5_000_000, start);
+    assert!(holds(&planes, 0, 2), "the last frame kept");
 }
 
 /// A poll ends with a fresh clock sample: a first frame's take that runs
@@ -568,8 +700,9 @@ impl Planes for Preallocated {
 }
 
 /// The movie hook allocates nothing (design.md "Scope of No Allocation"):
-/// frames that peek a movie admitted at the boundary before them, take its
-/// due frames into the planes and show them, each counted on this thread
+/// frames that peek a movie admitted at the boundary before them (its first
+/// frame by a first peek), take its due frames into the planes, show them
+/// and start its clock at the first presented, each counted on this thread
 /// whole, the take's sink included; with a positive control.
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -595,6 +728,7 @@ fn movie_upload_hook_alloc() {
     let mut shown = 0;
     for k in 1..=4_i64 {
         let shows = m.frame(&mut planes, k * 16_667, start);
+        m.presented(true, drawn(shows));
         if matches!(shows[0], MovieShow::Frame { .. }) {
             shown += 1;
         }
@@ -609,64 +743,56 @@ fn movie_upload_hook_alloc() {
     drop(v);
 }
 
-/// A movie admitted with its clock several frame periods in (design.md
-/// "Rendering and Skins", skin movies, "Video frames"): its ring is empty
-/// until the worker knows the game's time, and the hook's first peek of the
-/// run signals the worker, once. The frame holding the time, published
-/// then, is the first drawn. Through a stall the frame taken last stays
-/// shown; after it, the ring refilled with late frames shows the newest of
-/// them, late, rather than nothing, until its due frame comes.
-// Revert: the reader's first peek not said -> "the worker woken at the
-// first peek"; a peek taking the oldest due frame -> "the newest late
-// frame after the stall".
+/// A stall before a movie's first frame loses it at the preparation
+/// deadline, opaque black; once its first frame is staged the deadline no
+/// longer governs it (design.md "Threat Model" T02): a peer staged before
+/// the deadline keeps its frame through a successor's stall past it, and
+/// after it the ring refilled with late frames shows the newest of them,
+/// late, rather than nothing, until its due frame comes.
+// Revert: a peek taking the oldest due frame -> "the newest late frame
+// after the stall".
 #[test]
-fn a_movie_wakes_its_worker_and_keeps_its_frame_through_a_stall() {
+fn a_first_frame_stall_loses_the_movie_and_a_later_one_keeps_its_frame() {
     let start = Instant::now();
-    let a = Fake::new(16, 8);
+    let (a, b) = (Fake::new(16, 8), Fake::new(16, 8));
     a.set(Status::Live);
+    b.set(Status::Live);
     let period = 16_667;
-    let mut m = movies(Some(&a), None, start);
+    b.publish(1, 0, 46);
+    let mut m = movies(Some(&a), Some(&b), start);
     let mut planes = Kept::default();
     m.admit(&mut planes, start);
-    for due in [780_000, 790_000] {
-        assert_eq!(m.frame(&mut planes, due, start)[0], MovieShow::Nothing);
+    let (settled, _) = m.prepare(&mut planes, start);
+    assert!(!settled, "a has no first frame");
+    // Past the deadline: a, whose first frame never came, is lost; b,
+    // staged, is not.
+    let late = preparation_deadline(start) + Duration::from_millis(1);
+    let shows = m.frame(&mut planes, 1_000_000, late);
+    m.presented(true, drawn(shows));
+    assert_eq!(shows[0], MovieShow::Lost, "the first frame's stall");
+    assert_eq!(a.loss(), Some(Loss::Preparation));
+    assert!(matches!(shows[1], MovieShow::Frame { .. }));
+    assert_eq!(b.loss(), None);
+    // b's successor stalls: nothing new while the clock runs on.
+    for at in [1_500_000, 4_000_000] {
+        assert!(matches!(
+            m.frame(&mut planes, at, late)[1],
+            MovieShow::Frame { .. }
+        ));
+        assert!(holds(&planes, 1, 46), "the frame kept");
     }
-    assert_eq!(
-        a.wakes.load(Ordering::SeqCst),
-        1,
-        "the worker woken at the first peek"
-    );
-    // The frame holding the time, at 766 667 µs.
-    a.publish(1, 766_667, 46);
-    assert!(matches!(
-        m.frame(&mut planes, 790_000, start)[0],
-        MovieShow::Frame { .. }
-    ));
-    assert!(planes.luma[0].iter().all(|&v| v == 46), "the due frame");
-    // A stall: nothing new while the clock runs on, the frame stays.
-    assert!(matches!(
-        m.frame(&mut planes, 1_500_000, start)[0],
-        MovieShow::Frame { .. }
-    ));
-    assert!(planes.luma[0].iter().all(|&v| v == 46), "the frame kept");
-    // The ring refills with frames from 800 ms while the clock is at 2 s.
+    // The ring refills with frames from 800 ms while b's clock is at 1 s.
     for (seq, id) in (2..=5).zip(50..) {
         let i = i64::try_from(seq - 2).unwrap();
-        a.publish(seq, 800_000 + i * period, id);
+        b.publish(seq, 800_000 + i * period, id);
     }
-    assert!(matches!(
-        m.frame(&mut planes, 2_000_000, start)[0],
-        MovieShow::Frame { .. }
-    ));
+    let _ = m.frame(&mut planes, 2_000_000, late);
     assert!(
-        planes.luma[0].iter().all(|&v| v == 53),
+        holds(&planes, 1, 53),
         "the newest late frame after the stall"
     );
-    a.publish(6, 1_983_333, 60);
-    assert!(matches!(
-        m.frame(&mut planes, 2_000_000, start)[0],
-        MovieShow::Frame { .. }
-    ));
-    assert!(planes.luma[0].iter().all(|&v| v == 60), "the due frame");
-    assert_eq!(a.wakes.load(Ordering::SeqCst), 1, "woken once");
+    b.publish(6, 983_333, 60);
+    let _ = m.frame(&mut planes, 2_000_000, late);
+    assert!(holds(&planes, 1, 60), "the due frame");
+    assert_eq!(b.loss(), None);
 }

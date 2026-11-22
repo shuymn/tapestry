@@ -52,30 +52,24 @@
 //! fails its player.
 //!
 //! The ring is a video player's frame queue: the worker decodes into it in
-//! stamp order and the game presents from it. The game writes the media
-//! time it shows at each peek in [`DUE_WORD`], then the run it shows in
-//! [`DUE_RUN_WORD`]. A run starts at a target the worker decodes to before
-//! it publishes the run's first frame, as players decode to a start or a
-//! seek before the first present: a seek's time, or for the play's first
-//! run the game's time at its first peek, which the worker waits for
-//! ([`State::Starting`]) and which wakes it ([`Peek::first`]). It drops a
-//! decoded frame there only for the next frame at or before the target,
-//! and publishes the frame whose interval holds the target (or the video's
-//! last). From then on it publishes every frame it decodes, in order, and
-//! drops none: a frame behind the clock is dropped only by the game, and
-//! only for a newer frame that is also due, since a peek takes the newest
-//! frame of the run at or before its time and frees the frames before it.
-//! A decoder slower than the clock thus shows late frames that advance,
-//! and a stalled one leaves its last frame shown, never a blank panel.
+//! stamp order from a run's start, as soon as it has the ring, and the
+//! game presents from it. The worker reads nothing of the game's time and
+//! publishes every frame it decodes, in order, dropping none: a frame
+//! behind the clock is dropped only by the game, and only for a newer
+//! frame that is also due, since a peek takes the newest frame of the run
+//! at or before its time and frees the frames before it. A first peek
+//! ([`Reader::peek_first`]) takes the run's oldest frame instead, from the
+//! same checked slots. A decoder slower than the clock thus shows late
+//! frames that advance, and a stalled one leaves its last frame shown,
+//! never a blank panel.
 //!
 //! The layout, in words: a header of [`HEADER_WORDS`] (a magic word, the
 //! version, the slot count, the width, the height, a frame's bytes and, at
 //! [`WATERMARK_WORD`], the watermark, then the worker's supervision words,
 //! the decoder's progress at [`PROGRESS_WORD`] and its [`State`] at
 //! [`STATE_WORD`], which the game reads only to supervise the worker
-//! ([`supervision`]), then the game's due time at [`DUE_WORD`] and its
-//! run at [`DUE_RUN_WORD`]), then the
-//! slots, each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its
+//! ([`supervision`]), then two words reserved, written zero and not
+//! read), then the slots, each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its
 //! own index, its frame's bytes and two words reserved, written zero and
 //! not read) followed by its frame: the
 //! luma plane, then
@@ -109,7 +103,7 @@ pub const SLOT_HEADER_WORDS: usize = 8;
 pub const CHUNK_WORDS: usize = 8_192;
 
 /// The layout's version, in the header.
-pub const VERSION: u64 = 4;
+pub const VERSION: u64 = 5;
 
 /// The header's first word.
 const MAGIC: u64 = u64::from_le_bytes(*b"TAPRING1");
@@ -137,44 +131,9 @@ pub const PROGRESS_WORD: usize = 7;
 /// writes and the game reads only to supervise it.
 pub const STATE_WORD: usize = 8;
 
-/// The header word holding the media time the game showed last (µs, as
-/// a two's-complement `i64`): the game writes it at each peek, before it
-/// looks at the slots, and never reads it back; the worker reads it for
-/// the time the play's first run starts at, the target it decodes to
-/// before that run's first frame. [`NOTHING_DUE`] until the first peek.
-pub const DUE_WORD: usize = 9;
-
-/// The header word holding the run of the time in [`DUE_WORD`]: the game
-/// writes it after that time at each peek, 0 until the first.
-pub const DUE_RUN_WORD: usize = 10;
-
-/// [`DUE_WORD`]'s value before the game's first peek: no frame is due.
-pub const NOTHING_DUE: i64 = i64::MIN;
-
-/// The media time the game showed last in run `run`, from `ring`'s
-/// [`DUE_WORD`]; `None` when the game's last peek was of another run (or
-/// none yet) or the ring does not hold the header. The game writes the
-/// time before its run, so a run read here is never older than the time
-/// read after it. The pair is not one atomic read: between the game's two
-/// stores, the worker of the run being left can read that run with the
-/// next run's time. Only a superseded run's worker reads such a pair, and
-/// a seek gives its run's target by command, so no run starts at it.
-#[must_use]
-pub fn shown<W: Words + ?Sized>(ring: &W, run: u64) -> Option<i64> {
-    if word(ring, DUE_RUN_WORD)?.load(Ordering::Acquire) != run {
-        return None;
-    }
-    Some(word(ring, DUE_WORD)?.load(Ordering::Acquire).cast_signed())
-}
-
-/// Whether the game has peeked `ring`, so a time is in its header: a
-/// worker waiting for it ([`State::Starting`]) is woken by that peek.
-/// Untrusted, as the header's words are to the worker; `false` when the
-/// ring does not hold the header.
-#[must_use]
-pub fn peeked<W: Words + ?Sized>(ring: &W) -> bool {
-    word(ring, DUE_RUN_WORD).is_some_and(|w| w.load(Ordering::Acquire) != 0)
-}
+/// The header's words after [`STATE_WORD`] that are reserved: the game
+/// writes them zero and nothing reads them.
+const H_RESERVED: [usize; 2] = [9, 10];
 
 /// What a player is doing, as its worker says in [`STATE_WORD`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,9 +144,6 @@ pub enum State {
     Waiting,
     /// Its video ended, for good (a looping play never ends).
     Ended,
-    /// Waiting for the game's first peek, whose time its first run starts
-    /// at: it publishes nothing before.
-    Starting,
 }
 
 impl State {
@@ -198,7 +154,6 @@ impl State {
             Self::Decoding => 1,
             Self::Waiting => 2,
             Self::Ended => 3,
-            Self::Starting => 4,
         }
     }
 
@@ -210,7 +165,6 @@ impl State {
             1 => Some(Self::Decoding),
             2 => Some(Self::Waiting),
             3 => Some(Self::Ended),
-            4 => Some(Self::Starting),
             _ => None,
         }
     }
@@ -375,11 +329,6 @@ pub struct Peek {
     /// Whether it freed slots (of earlier runs): the game then signals the
     /// worker, which may be waiting for one.
     pub freed: bool,
-    /// Whether it was the reader's first peek of its run, so the time it
-    /// wrote is the first the worker can read for that run: the game then
-    /// signals the worker, which may be waiting for it
-    /// ([`State::Starting`]).
-    pub first: bool,
 }
 
 /// A frame [`Reader::peek`] found due, which [`Reader::take`] copies.
@@ -473,6 +422,15 @@ struct Plane {
     pitch: usize,
 }
 
+/// Which frame of the run a peek finds.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// The newest stamped at or before this media time.
+    Due(i64),
+    /// The oldest.
+    First,
+}
+
 /// The game's side of a ring: its geometry, the run it started last and
 /// what it has taken.
 #[derive(Debug)]
@@ -489,8 +447,6 @@ pub struct Reader {
     /// The frame the last peek found due, until it is taken or a run
     /// starts: the only one a take copies.
     peeked: Option<Found>,
-    /// The run of its last peek, 0 before the first.
-    timed: u64,
     fault: Option<Fault>,
 }
 
@@ -523,8 +479,8 @@ impl Reader {
             (WATERMARK_WORD, 0),
             (PROGRESS_WORD, 0),
             (STATE_WORD, 0),
-            (DUE_WORD, NOTHING_DUE.cast_unsigned()),
-            (DUE_RUN_WORD, 0),
+            (H_RESERVED[0], 0),
+            (H_RESERVED[1], 0),
         ];
         for (i, v) in header {
             if let Some(w) = word(ring, i) {
@@ -545,7 +501,6 @@ impl Reader {
             freed: 0,
             last_stamp: None,
             peeked: None,
-            timed: 0,
             fault: None,
         })
     }
@@ -609,18 +564,26 @@ impl Reader {
     /// The [`Fault`] that fails the player. The reader keeps it: every later
     /// peek or take returns it without reading the ring.
     pub fn peek<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Peek, Fault> {
+        self.look_at(ring, Pick::Due(due))
+    }
+
+    /// Reads the ring as [`Self::peek`] does, every check and free the
+    /// same, but finds the run's oldest published frame, whatever its
+    /// stamp: a movie's first frame, before its clock starts. A frame
+    /// above the watermark read before the scan stays for a later peek.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::peek`].
+    pub fn peek_first<W: Words + ?Sized>(&mut self, ring: &W) -> Result<Peek, Fault> {
+        self.look_at(ring, Pick::First)
+    }
+
+    fn look_at<W: Words + ?Sized>(&mut self, ring: &W, pick: Pick) -> Result<Peek, Fault> {
         if let Some(f) = self.fault {
             return Err(f);
         }
-        if let Some(w) = word(ring, DUE_WORD) {
-            w.store(due.cast_unsigned(), Ordering::Release);
-        }
-        if let Some(w) = word(ring, DUE_RUN_WORD) {
-            w.store(self.run, Ordering::Release);
-        }
-        let first = self.timed != self.run;
-        self.timed = self.run;
-        let peeked = self.scan(ring, due).map(|p| Peek { first, ..p });
+        let peeked = self.scan(ring, pick);
         match peeked {
             Ok(p) => self.peeked = p.due.map(|d| d.chosen),
             Err(f) => {
@@ -689,7 +652,7 @@ impl Reader {
         })
     }
 
-    fn scan<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Peek, Fault> {
+    fn scan<W: Words + ?Sized>(&mut self, ring: &W, pick: Pick) -> Result<Peek, Fault> {
         // Every frame at or below it was published before this load, so the
         // scan finds each one still in its slot: none is passed over while a
         // later one is taken.
@@ -737,22 +700,19 @@ impl Reader {
             self.free(ring, a)?;
             freed = true;
         }
-        let due = current()
-            .filter(|a| a.seq <= committed && a.stamp <= due)
-            .max_by_key(|a| a.seq)
-            .copied()
-            .map(|chosen| {
-                let mut up_to = [None; SLOTS];
-                for (u, a) in up_to.iter_mut().zip(&found) {
-                    *u = a.filter(|a| a.run == run && a.seq <= chosen.seq);
-                }
-                Due { chosen, up_to }
-            });
-        Ok(Peek {
-            due,
-            freed,
-            first: false,
-        })
+        let published = current().filter(|a| a.seq <= committed);
+        let chosen = match pick {
+            Pick::Due(due) => published.filter(|a| a.stamp <= due).max_by_key(|a| a.seq),
+            Pick::First => published.min_by_key(|a| a.seq),
+        };
+        let due = chosen.copied().map(|chosen| {
+            let mut up_to = [None; SLOTS];
+            for (u, a) in up_to.iter_mut().zip(&found) {
+                *u = a.filter(|a| a.run == run && a.seq <= chosen.seq);
+            }
+            Due { chosen, up_to }
+        });
+        Ok(Peek { due, freed })
     }
 
     /// Slot `slot`'s published frame, checked, or `None` while it holds
