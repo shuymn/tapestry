@@ -1397,13 +1397,15 @@ impl PlayerRig<'_> {
 
     /// Whether the result being handed over is one its skin may present,
     /// from the state its first payload was published with: a lifetime
-    /// whose run and attempt have not fallen back to the built-in result.
-    /// A refusal the render thread reports after that publication changes
-    /// nothing here; its fallback page's acknowledgement shows the result.
+    /// whose run and attempt have not fallen back to the built-in result,
+    /// the attempt's image stage having kept the skin. A refusal the
+    /// render thread reports after that publication changes nothing here;
+    /// its fallback page's acknowledgement shows the result.
     fn result_gated(&self) -> bool {
         self.presenter.current()
             && self.presenter.disabled().is_none()
             && self.presenter.attempt_fallen().is_none()
+            && !self.result_skin.attempt_built_in()
     }
 
     /// The end screen opens: the input offset keys work, and the keys a

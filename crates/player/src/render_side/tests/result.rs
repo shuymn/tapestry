@@ -5296,6 +5296,102 @@ fn a_take_carrying_both_payloads_draws_the_newer_overlay_first() {
     rig.link.exit();
 }
 
+/// A sink that, from the first result frame drawing a skin on, holds the
+/// next result frame until `release`, saying so in `waiting`: the frame
+/// after the first picture, its receipt already written.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct AfterFirst {
+    first: Arc<AtomicBool>,
+    waiting: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for AfterFirst {
+    fn frame(&mut self, _screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if !drawn.timing.presented() {
+            return;
+        }
+        let Some(r) = drawn.result else {
+            return;
+        };
+        if self.first.load(Ordering::SeqCst) {
+            self.waiting.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        } else if r.path == crate::measure::ResultPath::Skin {
+            self.first.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The draw receipt (dev-tools) counts a result frame only once nothing
+/// newer of it waits: with the first view A's picture drawn and a newer
+/// payload B, whose end page was shown after it, waiting for that
+/// picture's acknowledgement, the frame after A's first picture finds B's
+/// page not drawn; it is once B shows.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_waiting_payloads_page_is_not_drawn_with_the_first_picture() {
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let sink = AfterFirst::default();
+    let rig = Rig::with_sink(Box::new(sink.clone()));
+    let lifetime = installed(&rig, &x0);
+    rig.link.pause_result_staging(true);
+    let taken = rig.link.messages_taken();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    let taken = rig.link.messages_taken();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    let taken = rig.link.messages_taken();
+    rig.link.show_end(EndPage {
+        lines: vec!["b".to_owned()],
+        graphs: None,
+        id: None,
+    });
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    rig.link.pause_result_staging(false);
+    assert!(
+        wait_until(|| sink.waiting.load(Ordering::SeqCst)),
+        "no frame after the first picture: {:?}",
+        rig.link.result_status()
+    );
+    assert!(
+        !rig.link.end_page_drawn(),
+        "B's page counted drawn while B waits: {:?}",
+        rig.link.result_status()
+    );
+    sink.release.store(true, Ordering::SeqCst);
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "B never shown: {:?}",
+        rig.link.result_status()
+    );
+    assert!(
+        wait_until(|| rig.link.end_page_drawn()),
+        "B's page never drawn"
+    );
+    rig.link.exit();
+}
+
 /// The first payload is owned only where the atlas report counts it
 /// (design.md "Memory Budget"): after a switch from the first view A to
 /// B, once the report no longer names A's atlas nothing of the render

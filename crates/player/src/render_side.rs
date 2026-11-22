@@ -10017,13 +10017,15 @@ impl Run {
                     // The end page drawn, for a script waiting on it
                     // (dev-tools).
                     // A result's frame counts once nothing newer of it waits
-                    // to be prepared or committed.
+                    // to be prepared or committed, a payload waiting for the
+                    // first picture included.
                     #[cfg(feature = "dev-tools")]
                     if timing.presented()
                         && (matches!(mode, Mode::End)
                             || matches!(mode, Mode::Result)
                                 && self.result.as_ref().is_none_or(|r| {
                                     r.incoming.is_none()
+                                        && r.later.is_none()
                                         && r.staging.is_none()
                                         && r.prepared.is_none()
                                 }))

@@ -2659,6 +2659,53 @@ fn a_scripted_step_is_sent_from_the_acknowledging_look() {
     });
 }
 
+/// V19a with an attempt on the built-in result: a configured result skin
+/// whose image stage refused before any result fact chose the built-in
+/// result for the attempt, so its result shows at the hand-over, though
+/// its first frame is held: the end screen open, the offset key working
+/// and a preset step taken (design.md "State Model", Result).
+#[test]
+fn an_attempt_on_the_built_in_result_shows_at_the_hand_over() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let d = result::skin(
+            "",
+            "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+        );
+        let entry = std::fs::read_to_string(d.path().join("s.luaskin"))
+            .unwrap()
+            .replace(
+                "local nr = ms.number(154)",
+                "error(\"refused\")\nlocal nr = ms.number(154)",
+            );
+        std::fs::write(d.path().join("s.luaskin"), entry).unwrap();
+        let p = result::pending(d.path(), result::LIMITS);
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(p)))
+            .with_scripts(rig.render.scripts().clone());
+        prepared(rig, &a);
+        assert!(
+            rig.result_skin.attempt_built_in(),
+            "the image stage kept the skin"
+        );
+        rig.render.send(RenderMsg::Menu(Box::default()));
+        frames.arm();
+        rig.begin_result(&report, &screen);
+        rig.render.hold_result_commit(true);
+        rig.show_end(&report, &screen);
+        assert!(
+            rig.result_view_shown(),
+            "the attempt's built-in result gated"
+        );
+        let tuning = rig.controls.tuning();
+        assert!(tuning.end_screen_shown(), "the end screen closed");
+        assert!(tuning.adjust(game::Adjust::InputOffsetUp));
+        rig.render.hold_result_commit(false);
+        rig.leave_result();
+    });
+}
+
 /// A look of the flow's: the rig waits idly, reading the acknowledgement.
 fn look(rig: &mut PlayerRig<'_>) {
     let until = TimeUs(rig.now().0 + 20_000);
