@@ -15,7 +15,8 @@ use eval::Tally;
 use render::SkinBundle;
 use rules::PerJudgment;
 use skin_beatoraja::{
-    Cancel, Config, Fact, FactDeps, ImportFacts, JudgeClass, LuaHeader, LuaOutcome,
+    Cancel, Config, Fact, FactDeps, FactId, ImportFacts, JudgeClass, LuaHeader, LuaImported,
+    LuaOutcome,
 };
 use skin_model::{
     Atlas, AtlasId, BestFigures, BestRate, BestView, FileSource, ImageFacts, KeptLayers, LampKey,
@@ -71,6 +72,106 @@ impl PendingResult {
     pub fn source_counts(&self) -> skin_model::SourceCounts {
         self.source.counts()
     }
+
+    /// The startup probe's import (design.md "beatoraja Lua Skins", the
+    /// result skin's preload), on the job's thread: the probe's result
+    /// values with every attempt input pending, over a chart with no
+    /// facts, which no read reaches. With `permit` it is imported as a
+    /// shown layout is, its runtime kept, then dropped here with the
+    /// permit before the outcome returns; without one it is imported
+    /// plain and keeps no VM.
+    pub(crate) fn import_probe(
+        &self,
+        permit: Option<ScriptPermit>,
+        cancel: &Cancel,
+    ) -> ProbeOutcome {
+        let facts = ImportFacts::result_probe(probe_fields(ResultChart::default()));
+        let kept = permit.is_some();
+        let outcome = if kept {
+            self.header
+                .import_runtime_reading(&self.config, &facts, cancel)
+        } else {
+            self.header.import_reading(&self.config, &facts, cancel)
+        };
+        match outcome {
+            Ok(LuaOutcome::Imported(mut imported)) => {
+                drop(imported.runtime.take());
+                drop(permit);
+                if !reads_result(&imported.facts) {
+                    return ProbeOutcome::Bundle;
+                }
+                let deps = imported.facts.clone();
+                ProbeOutcome::Probe(Box::new(StartupProbe {
+                    imported,
+                    deps,
+                    kept,
+                }))
+            }
+            Ok(LuaOutcome::Pending(p)) => ProbeOutcome::Stopped(p.pending),
+            Err(refused) => ProbeOutcome::Refused(imports::chain(&refused.0)),
+        }
+    }
+}
+
+/// What the startup probe's import gave ([`PendingResult::import_probe`]).
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// It read a fact pending in its snapshot, an attempt input: the skin
+    /// takes its image stage at each attempt.
+    Stopped(FactId),
+    /// Refused, with the reason: the skin takes its image stage at each
+    /// attempt.
+    Refused(String),
+    /// It read no fact of the viewed result: a bundle for every view, not
+    /// preloaded.
+    Bundle,
+    /// It read the viewed result: the preload's input.
+    Probe(Box<StartupProbe>),
+}
+
+/// A completed startup probe that read the viewed result: its import,
+/// its runtime dropped, which the preload's pack lays out from with no
+/// further Lua; the facts it read; and the mode it actually took, kept
+/// only when a permit was taken and the kept import completed.
+#[derive(Debug)]
+pub struct StartupProbe {
+    #[cfg_attr(
+        not(all(test, feature = "dev-tools")),
+        expect(dead_code, reason = "the preload's pack lays out from it")
+    )]
+    imported: LuaImported,
+    deps: FactDeps,
+    kept: bool,
+}
+
+impl StartupProbe {
+    /// Whether it was imported kept.
+    pub const fn kept(&self) -> bool {
+        self.kept
+    }
+
+    /// Its import (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn imported(&self) -> &LuaImported {
+        &self.imported
+    }
+}
+
+/// The result skin's preload (design.md "beatoraja Lua Skins", the result
+/// skin's preload), owned and changed on the game thread only.
+#[derive(Debug, Default)]
+enum Preload {
+    /// The startup probe, waiting for its pack.
+    Idle(
+        #[cfg_attr(
+            not(all(test, feature = "dev-tools")),
+            expect(dead_code, reason = "the preload's pack takes it")
+        )]
+        Box<StartupProbe>,
+    ),
+    /// No preload for this installation: none was imported, or it ended.
+    #[default]
+    Retired,
 }
 
 /// A prepared atlas and the sheet it was packed from: the cells a union
@@ -327,6 +428,8 @@ pub struct ResultSkin {
     /// its kept import ([`kept_probe_fits`]), else from a plain one; `None`
     /// until first decided, a plain one meanwhile.
     kept: Option<bool>,
+    /// The preload of a skin whose startup probe read the viewed result.
+    preload: Preload,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -693,7 +796,9 @@ fn layout(
     #[cfg(feature = "dev-tools")]
     IMPORT_PERMIT.set(permit.is_some());
     let script = ScriptSlot::staged_with(imported.runtime.take(), permit);
-    let mut laid = lay_out(pending, imported, slot, base, others, cancel);
+    let mut laid = lay_out(pending, imported, slot, base, others, cancel, &|| {
+        cancel.is_cancelled()
+    });
     // A chart slot the result half does not fit: the images derived from
     // the attempt's sources at its size, here, off the game thread.
     if let (Ok(spec), Some(chart)) = (&mut laid.result, chart)
@@ -760,7 +865,9 @@ fn probe_miss(e: &ImageEntry, sheet: &Sheet, variant: Variant, kept: skin_model:
     );
 }
 
-/// [`layout`]'s atlas step and bundle, from its import `imported`.
+/// [`layout`]'s atlas step and bundle, from its import `imported`; the
+/// atlas build stops once `check` turns true (the job's cancel, or a
+/// task's checkpoint).
 #[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
 fn lay_out(
     pending: &PendingResult,
@@ -769,6 +876,7 @@ fn lay_out(
     base: Option<Arc<ImageEntry>>,
     others: Others,
     cancel: &Cancel,
+    check: &dyn Fn() -> bool,
 ) -> Laid {
     let deps = imported.facts;
     let mut skin = imported.imported.skin;
@@ -887,8 +995,7 @@ fn lay_out(
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "dev-tools")]
             let p_t = render::probe::Span::start();
-            let built = match packed.atlas_keeping(variant, limits, kept, &|| cancel.is_cancelled())
-            {
+            let built = match packed.atlas_keeping(variant, limits, kept, check) {
                 Ok(a) => {
                     #[cfg(feature = "dev-tools")]
                     {
@@ -1063,9 +1170,10 @@ impl ResultSkin {
     }
 
     /// Whether the kept probe fits, decided from the charges the
-    /// renderer last reported ([`kept_probe_fits`]), before each image
-    /// stage, when no job runs. A change of a decision made drops what was
-    /// packed or bound the other way: the probe's record, the prepared
+    /// renderer last reported ([`kept_probe_fits`]), at startup on the
+    /// selection path and before each image stage, when no job runs. A
+    /// change of a decision made drops what was packed, bound or imported
+    /// the other way: the preload, the probe's record, the prepared
     /// atlas, the kept cells, and the cached layouts and the publication
     /// bound to a prepared atlas (the publication's would be the next
     /// probe's union base), so no later probe or view packs or binds cells
@@ -1081,7 +1189,48 @@ impl ResultSkin {
             self.presented.take_if(|l| l.entry.is_some());
             self.published
                 .take_if(|p| matches!(p, Published::Skin(_, Some(_), _)));
+            self.preload = Preload::Retired;
         }
+    }
+
+    /// The startup probe's `outcome` ([`imports::result_probe`]): a probe
+    /// that read the viewed result waits for its pack; any other outcome
+    /// leaves no preload, the skin taking its image stage at each attempt.
+    pub fn set_preload(&mut self, outcome: ProbeOutcome) {
+        self.preload = match outcome {
+            ProbeOutcome::Probe(p) => {
+                log::info!(
+                    "skin: result: preloaded: {} probe, {} facts read",
+                    if p.kept() { "kept" } else { "plain" },
+                    p.deps.reads.len()
+                );
+                Preload::Idle(p)
+            }
+            ProbeOutcome::Stopped(fact) => {
+                log::info!("skin: result: not preloaded: it reads {fact:?}, an attempt's input");
+                Preload::Retired
+            }
+            ProbeOutcome::Refused(why) => {
+                log::info!("skin: result: not preloaded: {why}");
+                Preload::Retired
+            }
+            ProbeOutcome::Bundle => Preload::Retired,
+        };
+    }
+
+    /// The preload's probe mode while it waits for its pack, kept or
+    /// plain; `None` with no preload (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn preloaded(&self) -> Option<bool> {
+        match &self.preload {
+            Preload::Idle(p) => Some(p.kept),
+            Preload::Retired => None,
+        }
+    }
+
+    /// The pending skin startup left, if any.
+    pub fn pending_start(&self) -> Option<Arc<PendingResult>> {
+        self.pending().map(Arc::clone)
     }
 
     /// A fresh report of the atlases the renderer references, read before
@@ -1477,7 +1626,9 @@ impl ResultSkin {
                     drop(i.runtime.take());
                     drop(permit);
                     let laid = if kept {
-                        lay_out(&pending, i, &slot, base, others, cancel)
+                        lay_out(&pending, i, &slot, base, others, cancel, &|| {
+                            cancel.is_cancelled()
+                        })
                     } else {
                         drop(i);
                         let view = ViewFacts(Some(match facts.result {
