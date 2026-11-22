@@ -2543,6 +2543,7 @@ dependencies = [
  "proptest",
  "rules",
  "tempfile",
+ "test-device",
  "thiserror 2.0.21",
 ]
 
