@@ -3,7 +3,7 @@
 //! timing. A wait for something that never happens fails its test by
 //! name after `TAPESTRY_TEST_WATCHDOG` seconds.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,27 +23,58 @@ use crate::shelf::{PAUSE_SLICE, Paused, Shelf};
 static GATE: AtomicU8 = AtomicU8::new(0);
 /// Whether a pack reached the armed gate.
 pub(crate) static REACHED: AtomicBool = AtomicBool::new(false);
+/// The times a pack came to the armed gate.
+static ARRIVALS: AtomicU32 = AtomicU32::new(0);
+/// The checkpoints the armed gate lets pass while it holds ([`step`]).
+static STEPS: AtomicU32 = AtomicU32::new(0);
 
 /// A pack's checkpoint, before the coordinator's: it waits at the armed
-/// [`GATE`], `stop` saying whether it should stop.
+/// [`GATE`], `stop` saying whether it should stop, unless a [`step`] lets
+/// it pass this once.
 pub(super) fn pack_gate(stop: &dyn Fn() -> bool) {
     if GATE.load(SeqCst) == 0 {
         return;
     }
+    ARRIVALS.fetch_add(1, SeqCst);
     REACHED.store(true, SeqCst);
     loop {
         match GATE.load(SeqCst) {
             0 => return,
             1 if stop() => return,
+            _ if STEPS
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok() =>
+            {
+                return;
+            }
             _ => std::thread::park_timeout(Duration::from_millis(1)),
         }
     }
+}
+
+/// Lets the pack held at the armed gate pass one checkpoint (the
+/// coordinator's after it included) and waits until it is held at the
+/// gate again, so that checkpoint has returned. Whether it came back
+/// within [`long`] (a pack that ended its build, or waits in its
+/// checkpoint for a permit, does not).
+pub(crate) fn step() -> bool {
+    let arrived = ARRIVALS.load(SeqCst);
+    STEPS.fetch_add(1, SeqCst);
+    let began = Instant::now();
+    while ARRIVALS.load(SeqCst) == arrived {
+        if began.elapsed() > long() {
+            return false;
+        }
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+    true
 }
 
 /// Arms the gate at `level` (0 opens it).
 pub(crate) fn gate(level: u8) {
     if level > 0 && GATE.load(SeqCst) == 0 {
         REACHED.store(false, SeqCst);
+        STEPS.store(0, SeqCst);
     }
     GATE.store(level, SeqCst);
 }

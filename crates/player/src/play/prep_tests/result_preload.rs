@@ -253,6 +253,62 @@ fn the_runs_end_joins_the_adopted_pack() {
     });
 }
 
+/// The run disabled the result skin (a view's text refused) before an
+/// attempt whose choice claimed the running pack: the attempt's result
+/// step drops the claim and cancels the pack, collected before the
+/// attempt's PrepareAttempt is sent, and the preload ends; the built-in
+/// result shows (design.md "beatoraja Lua Skins", the result skin's
+/// preload).
+#[test]
+fn a_run_disabled_result_retires_the_claimed_pack_before_the_attempt() {
+    let _serial = imports::serial();
+    let _g = Opened;
+    crate::dev::loop_probe::tests::turn_on();
+    let (dir, l) = chart(None);
+    on_warp(l.chart(), true, |rig, _| {
+        // The first attempt's view refused: the run disables the kind.
+        let d = crate::result_skin::tests::runtime_drawn_skin();
+        let p = crate::result_skin::tests::pending(d.path(), crate::result_skin::tests::LIMITS);
+        rig.result_skin =
+            crate::result_skin::ResultSkin::new(Some(crate::result_skin::ResultStart::Pending(p)))
+                .with_scripts(rig.render.scripts().clone());
+        super::result_flow::prepared(rig, &l);
+        let report = crate::end_screen::tests::report(rules::tapestry());
+        let screen = crate::end_screen::tests::screen(dir.path(), &report);
+        crate::dev::refuse_next_result_text();
+        rig.show_end(&report, &screen);
+        until("the kind disabled", || {
+            rig.land_result();
+            rig.render.result_status().disabled.is_some()
+        });
+        rig.leave_result();
+        // The next choice claims the pack, held until it is told to stop.
+        let seam = Arc::new(Seam::default());
+        let (control, _skin) = held_on_rig(rig, &seam, 1);
+        choose(rig, &l);
+        let mut h = begin(rig, &l);
+        readied(rig, &mut h);
+        assert!(!control.claimed(), "the claim dropped");
+        assert!(rig.preload_claim.is_none());
+        assert!(
+            control.wait_ended(Duration::ZERO),
+            "the pack's thread ended"
+        );
+        assert_eq!(rig.result_skin.preload_state(), (None, None), "retired");
+        assert!(rig.result_skin.image().is_none(), "nothing packed");
+        assert!(rig.pages_ticket.is_none(), "no pages ticket");
+        // Collected before the second attempt's PrepareAttempt.
+        let marks = crate::dev::loop_probe::tests::marks();
+        let at = |tag: &str| marks.iter().rposition(|m| m.1 == tag);
+        let (collected, sent) = (at("pre:collect"), at("att:send"));
+        assert!(
+            collected.is_some() && collected < sent,
+            "collected {collected:?}, sent {sent:?}"
+        );
+        rig.commit_attempt().unwrap();
+    });
+}
+
 /// The chosen chart left before Preparing (Back, a refused load, a quit
 /// during the load, each through the chart's leaving): the claim ends,
 /// and the pack goes on speculative.

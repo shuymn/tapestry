@@ -1643,5 +1643,169 @@ fn a_claimed_preload_leaves_the_decode_its_width() {
     );
 }
 
+/// The rig's result skin preloaded, its pack begun at a look and held at
+/// its checkpoint whatever it is told, on its speculative permit, the
+/// shelf's pause requested as a choice's would be. Its control, and the
+/// skin's folder.
+fn held_preload(
+    rig: &mut PlayerRig<'_>,
+    seam: &Arc<crate::result_skin::preload_tests::Seam>,
+    coord: &Coordinator,
+) -> (Arc<crate::result_skin::PreloadControl>, tempfile::TempDir) {
+    use crate::result_skin::preload_tests::{REACHED, gate, preloaded_with};
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    rig.result_skin = preloaded_with(skin.path(), seam, Some(rig.render.scripts().clone()));
+    let control = rig.result_skin.preload_control().unwrap();
+    sel(rig).shelf.set_preload(Arc::clone(&control));
+    gate(2);
+    rig.poll_preload();
+    until("the pack's checkpoint", || REACHED.load(Ordering::SeqCst));
+    assert_eq!(coord.held(Class::Speculative), 1);
+    sel(rig).shelf.pause();
+    (control, skin)
+}
+
+/// The claimed pack passes one checkpoint while the chosen chart's bank
+/// decodes, and is still speculative there; it moves to the foreground
+/// only at a checkpoint after the decode has ended (design.md "Load
+/// Pipeline", Pauses: the claimed pack is promoted once the chosen chart's
+/// bank no longer decodes).
+#[test]
+fn a_claimed_preload_stays_speculative_until_the_decode_ends() {
+    use crate::result_skin::preload_tests::{Opened, Seam, gate, step};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    // At the Bank's decode (the first decode begun): the pack let through
+    // one checkpoint, and the classes it left background mode for then.
+    let at_decode: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
+    let first = Arc::new(AtomicBool::new(true));
+    let decodes = {
+        let (seam, at_decode) = (Arc::clone(&seam), Arc::clone(&at_decode));
+        decodes_with(hook(move |p, _, _| {
+            if matches!(p, Probe::Decode(_)) && first.swap(false, Ordering::SeqCst) {
+                assert!(step(), "the pack's checkpoint during the decode");
+                *at_decode.lock().unwrap() = Some(seam.left.lock().unwrap().clone());
+            }
+        }))
+    };
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert!(control.claimed(), "the load claimed it");
+            assert_eq!(
+                *at_decode.lock().unwrap(),
+                Some(Vec::new()),
+                "speculative at its checkpoint during the decode"
+            );
+            assert!(seam.left.lock().unwrap().is_empty(), "held since");
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+            assert_eq!(
+                *seam.left.lock().unwrap(),
+                ["result-preload"],
+                "foreground after the decode"
+            );
+        },
+    );
+}
+
+/// How a choice's load ends before Preparing.
+#[derive(Clone, Copy, Debug)]
+enum LoadEnd {
+    /// The quit key while the chosen chart's bank decodes.
+    Quit,
+    /// The bank refused (a sound past the length cap).
+    Refused,
+}
+
+/// A load that claimed the running pack ends before Preparing, `how`, and
+/// the chart is left as App leaves it (`left_chart`): the claim ends there,
+/// and the pack, never promoted (its chart's bank never decoded), goes on
+/// in the speculative class and packs (design.md "State Model", the
+/// decision screen).
+fn a_load_ending_before_preparing_ends_the_claim(how: LoadEnd) {
+    use crate::result_skin::preload_tests::{Opened, Seam, gate};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let (decodes, stopped) = match how {
+        LoadEnd::Quit => {
+            let (hook, stopped) = leave_at(Probe::Decode(Speed::NORMAL), Leave::Quit);
+            (decodes_with(hook), Some(stopped))
+        }
+        LoadEnd::Refused => {
+            // 600 s + 1 frame declared at 8 kHz, past the length cap (as
+            // `a_bank_too_large_is_refused_through_its_job`).
+            let mut bytes = wav(&square(0.01, 1_000));
+            let data: u32 = 4_800_001 * 2;
+            bytes[4..8].copy_from_slice(&(36 + data).to_le_bytes());
+            bytes[40..44].copy_from_slice(&data.to_le_bytes());
+            std::fs::write(dir.path().join("song").join("key.wav"), bytes).unwrap();
+            (Decodes::default(), None)
+        }
+    };
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            let (_, job) = rig.result_skin.preload_state();
+            let got = rig.load_chart(&loaded, &mut game::Decision::off());
+            match how {
+                LoadEnd::Quit => assert_eq!(outcome(got), Loading::Cancelled),
+                LoadEnd::Refused => assert!(matches!(got, Err(ChartLoadError::Sounds(_)))),
+            }
+            if let Some(stopped) = stopped {
+                assert!(stopped.load(Ordering::SeqCst), "{how:?}: the decode's stop");
+            }
+            assert!(
+                control.claimed(),
+                "{how:?}: claimed until the chart is left"
+            );
+            while game::Rig::take(rig).is_some() {}
+            rig.left_chart().unwrap();
+            assert!(!control.claimed(), "{how:?}: the claim ended");
+            assert!(rig.preload_claim.is_none());
+            assert_eq!(rig.result_skin.preload_state(), (None, job), "{how:?}");
+            sel(rig).shelf.release();
+            gate(0);
+            until("the pack's collection", || {
+                rig.poll_preload();
+                rig.result_skin.preload_state().1.is_none()
+            });
+            assert!(
+                seam.left.lock().unwrap().is_empty(),
+                "{how:?}: never promoted"
+            );
+            assert!(rig.result_skin.image().is_some(), "{how:?}: packed");
+        },
+    );
+}
+
+#[test]
+fn a_quit_during_the_decode_ends_the_preload_claim() {
+    a_load_ending_before_preparing_ends_the_claim(LoadEnd::Quit);
+}
+
+#[test]
+fn a_refused_load_ends_the_preload_claim() {
+    a_load_ending_before_preparing_ends_the_claim(LoadEnd::Refused);
+}
+
 mod page;
 mod served;
