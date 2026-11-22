@@ -319,6 +319,13 @@ const READY: u64 = 2;
 /// A frame taken from a ring.
 struct Taken {
     stamp: i64,
+    #[cfg_attr(
+        not(feature = "dev-tools"),
+        expect(
+            dead_code,
+            reason = "the duration tests generate their clips with dev-tools"
+        )
+    )]
     duration: i64,
     bytes: Vec<u8>,
 }
