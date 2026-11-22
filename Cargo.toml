@@ -137,7 +137,7 @@ pulldown-cmark = { version = "0.13.6", default-features = false }
 # The lint site check parses Rust source.
 proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
 quote = { version = "1.0.47", default-features = false }
-syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+syn = { version = "3.0.0", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 # `cargo xtask ffmpeg fetch` finds MSVC's lib.exe as cc finds MSVC's tools.
 cc = "1.10.0"
 # `cargo xtask media fixtures` compresses a clip's movie header with zlib.
