@@ -190,12 +190,12 @@ fn the_probe_marks_a_resident_attempts_steps_in_order() {
                 ("pre:begin", id),
                 ("pre:end", id),
                 ("pre:collect", id),
-                ("pre:claim", Some(0)),
+                ("pre:claim_open", Some(1)),
                 ("img:resident", Some(1)),
                 ("att:send", None),
                 ("res:pages_begun", None),
             ],
-            &["img:job", "img:adopted", "pre:class"],
+            &["img:job", "img:adopted", "pre:class", "pre:claim"],
         );
     });
 }
@@ -255,10 +255,11 @@ fn the_runs_end_joins_the_adopted_pack() {
 
 /// The run disabled the result skin (a view's text refused) before an
 /// attempt whose choice claimed the running pack: the attempt's result
-/// step drops the claim and cancels the pack, collected before the
-/// attempt's PrepareAttempt is sent, and the preload ends; the built-in
-/// result shows (design.md "beatoraja Lua Skins", the result skin's
-/// preload).
+/// step drops the claim and stops the pack before the attempt's
+/// PrepareAttempt is sent, without waiting for it; its holdings stay
+/// with it until a later look collects it, restoring nothing, and the
+/// preload ends; the built-in result shows (design.md "beatoraja Lua
+/// Skins", the result skin's preload).
 #[test]
 fn a_run_disabled_result_retires_the_claimed_pack_before_the_attempt() {
     let _serial = imports::serial();
@@ -284,28 +285,30 @@ fn a_run_disabled_result_retires_the_claimed_pack_before_the_attempt() {
         rig.leave_result();
         // The next choice claims the pack, held until it is told to stop.
         let seam = Arc::new(Seam::default());
-        let (control, _skin) = held_on_rig(rig, &seam, 1);
+        // Held whatever it is told: nothing waits for it.
+        let (control, _skin) = held_on_rig(rig, &seam, 2);
+        let (_, job) = rig.result_skin.preload_state();
         choose(rig, &l);
         let mut h = begin(rig, &l);
         readied(rig, &mut h);
         assert!(!control.claimed(), "the claim dropped");
         assert!(rig.preload_claim.is_none());
-        assert!(
-            control.wait_ended(Duration::ZERO),
-            "the pack's thread ended"
-        );
-        assert_eq!(rig.result_skin.preload_state(), (None, None), "retired");
-        assert!(rig.result_skin.image().is_none(), "nothing packed");
+        assert_eq!(rig.result_skin.preload_state(), (None, job), "quarantined");
         assert!(rig.pages_ticket.is_none(), "no pages ticket");
-        // Collected before the second attempt's PrepareAttempt.
+        // Stopped before the second attempt's PrepareAttempt.
         let marks = crate::dev::loop_probe::tests::marks();
         let at = |tag: &str| marks.iter().rposition(|m| m.1 == tag);
-        let (collected, sent) = (at("pre:collect"), at("att:send"));
+        let (stopped, sent) = (at("pre:stop"), at("att:send"));
         assert!(
-            collected.is_some() && collected < sent,
-            "collected {collected:?}, sent {sent:?}"
+            stopped.is_some() && stopped < sent,
+            "stopped {stopped:?}, sent {sent:?}"
         );
         rig.commit_attempt().unwrap();
+        gate(0);
+        assert!(control.wait_ended(long()), "the pack's thread ends");
+        rig.poll_preload();
+        assert_eq!(rig.result_skin.preload_state(), (None, None), "retired");
+        assert!(rig.result_skin.image().is_none(), "nothing packed");
     });
 }
 

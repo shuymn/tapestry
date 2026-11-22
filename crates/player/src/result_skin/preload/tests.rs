@@ -12,6 +12,8 @@ use skin_model::AtlasId;
 
 use skin_beatoraja::JudgeClass;
 
+use crate::imports::STOP_WAIT;
+use crate::imports::tests::jobs_counted;
 use crate::priority::{PriorityError, ThreadMode};
 use crate::result_skin::tests::{LIMITS, chart, pending, runtime_drawn_skin};
 use crate::result_skin::{ImageStage, ResultSkin, ResultStart, Staged, builds};
@@ -88,6 +90,78 @@ impl Drop for Opened {
     }
 }
 
+/// Whether a pack waits right after its atlas build ([`built_gate`]).
+static BUILT_GATE: AtomicBool = AtomicBool::new(false);
+/// Whether a pack reached [`built_gate`] while it was armed.
+static BUILT_REACHED: AtomicBool = AtomicBool::new(false);
+
+/// Right after the atlas build, before the layout is bound to it: a pack
+/// waits while [`BUILT_GATE`] is armed, whatever it is told.
+pub(in crate::result_skin) fn built_gate() {
+    if !BUILT_GATE.load(SeqCst) {
+        return;
+    }
+    BUILT_REACHED.store(true, SeqCst);
+    while BUILT_GATE.load(SeqCst) {
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+}
+
+/// Arms (`true`) or opens [`built_gate`].
+fn hold_built(on: bool) {
+    if on {
+        BUILT_REACHED.store(false, SeqCst);
+    }
+    BUILT_GATE.store(on, SeqCst);
+}
+
+/// Whether drops are witnessed ([`DropWitness`]).
+static WITNESSING: AtomicBool = AtomicBool::new(false);
+/// The threads image entries dropped on while witnessed, by name.
+static DROPPED_ON: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Held by each image entry: while [`WITNESSING`], its drop records the
+/// thread it drops on, the one its last reference goes on.
+#[derive(Debug)]
+pub(crate) struct DropWitness;
+
+impl Drop for DropWitness {
+    fn drop(&mut self) {
+        if WITNESSING.load(SeqCst) {
+            let name = std::thread::current().name().unwrap_or("").to_owned();
+            DROPPED_ON.lock().unwrap().push(name);
+        }
+    }
+}
+
+/// Witnesses image entries' drops from now until it drops, which stops
+/// it and clears what was recorded.
+struct Witness;
+
+impl Witness {
+    fn on() -> Self {
+        DROPPED_ON.lock().unwrap().clear();
+        WITNESSING.store(true, SeqCst);
+        Self
+    }
+
+    /// The threads witnessed drops ran on, once `n` came.
+    fn dropped(&self, n: usize) -> Vec<String> {
+        until("the witnessed drops", || {
+            DROPPED_ON.lock().unwrap().len() >= n
+        });
+        DROPPED_ON.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Witness {
+    fn drop(&mut self) {
+        WITNESSING.store(false, SeqCst);
+        DROPPED_ON.lock().unwrap().clear();
+        hold_built(false);
+    }
+}
+
 pub(crate) fn long() -> Duration {
     let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
     Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600))
@@ -106,7 +180,7 @@ pub(crate) fn until(what: &str, mut done: impl FnMut() -> bool) {
 /// refuses entries when told.
 #[derive(Default)]
 pub(crate) struct Seam {
-    refuse: AtomicBool,
+    pub(crate) refuse: AtomicBool,
     pub(crate) entered: Mutex<Vec<String>>,
     pub(crate) left: Mutex<Vec<String>>,
 }
@@ -279,24 +353,81 @@ fn a_pause_is_acknowledged_by_the_pack_and_a_release_packs_again() {
     assert_eq!(builds(), before + 2);
 }
 
-/// A pack's outcome that comes after its probe's mode was dropped is not
-/// restored: the image state stays empty and the preload ends.
-#[test]
-fn a_late_outcome_of_a_dropped_mode_is_not_restored() {
+/// A pack's outcome published before its retirement (the mode dropped,
+/// or the run disabling the result skin), collected after it: nothing of
+/// it is restored, and its new pages are freed on a disposal thread, not
+/// on the game thread.
+fn a_published_outcome_retired_before_collection(mode_change: bool) {
     let _s = crate::imports::tests::serial();
     let d = runtime_drawn_skin();
     let seam = Arc::new(Seam::default());
     let mut rs = preloaded(d.path(), &seam);
     let coord = coordinator(1);
+    let witness = Witness::on();
     look(&mut rs, &coord, true);
     let control = rs.preload_control().unwrap();
     assert!(control.wait_ended(long()), "the pack's thread ends");
-    // Its outcome is in, not collected; the mode changes first.
-    rs.set_kept_probe(false);
-    assert_eq!(rs.preload_state(), (None, None));
-    assert!(rs.image().is_none(), "nothing of the pack was restored");
+    // Its outcome is in, not collected; the retirement comes first.
+    let (_, job) = rs.preload_state();
+    if mode_change {
+        rs.set_kept_probe(false);
+    } else {
+        rs.retire_preload();
+    }
+    assert_eq!(
+        rs.preload_state(),
+        (None, job),
+        "quarantined until collected"
+    );
+    assert!(rs.image().is_none());
     look(&mut rs, &coord, true);
     assert_eq!(rs.preload_state(), (None, None));
+    assert!(rs.image().is_none(), "nothing of the pack was restored");
+    assert_eq!(
+        witness.dropped(1),
+        ["result-dispose"],
+        "freed off the game thread"
+    );
+    look(&mut rs, &coord, true);
+    assert_eq!(rs.preload_state(), (None, None));
+}
+
+#[test]
+fn a_late_outcome_of_a_dropped_mode_is_not_restored() {
+    a_published_outcome_retired_before_collection(true);
+}
+
+#[test]
+fn a_published_outcome_of_a_disabled_run_is_disposed_off_the_game_thread() {
+    a_published_outcome_retired_before_collection(false);
+}
+
+/// A pack retired (the run disabling the result skin) right after its
+/// atlas build, before it is bound or published: the pack drops the new
+/// pages on its own thread, and the collection restores nothing.
+#[test]
+fn a_pack_retired_right_after_its_atlas_build_keeps_nothing() {
+    let _s = crate::imports::tests::serial();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    let witness = Witness::on();
+    hold_built(true);
+    look(&mut rs, &coord, true);
+    until("the built gate", || BUILT_REACHED.load(SeqCst));
+    rs.retire_preload();
+    hold_built(false);
+    let control = rs.preload_control().unwrap();
+    assert!(control.wait_ended(long()), "the pack's thread ends");
+    look(&mut rs, &coord, true);
+    assert_eq!(rs.preload_state(), (None, None));
+    assert!(rs.image().is_none(), "nothing of the pack was restored");
+    assert_eq!(
+        witness.dropped(1),
+        ["result-preload"],
+        "freed on its thread"
+    );
 }
 
 /// With no speculative permit (speculation off), no pack begins.
@@ -600,16 +731,209 @@ fn a_mode_change_while_claimed_runs_the_attempts_own_stage() {
     let coord = coordinator(1);
     let mut rs = held_pack(d.path(), &seam, &coord, 1);
     let claim = rs.preload_control().unwrap().claim();
+    let (before, jobs) = (builds(), jobs_counted());
     rs.set_kept_probe(false);
-    assert_eq!(rs.preload_state(), (None, None));
     assert!(rs.image().is_none(), "nothing of the pack restored");
     let stage = rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim));
     let ImageStage::Running(mut own) = stage else {
         panic!("not its own stage");
     };
-    let _ = rs.settle_image_stage(&mut own, || false);
+    let staged = rs.poll_image_stage(&mut own, None, || false, || false);
+    assert_eq!(staged, Some(Staged::Ready));
+    assert_eq!(
+        jobs_counted().0,
+        jobs.0 + 1,
+        "its own job, once the pack left"
+    );
+    assert_eq!(builds(), before + 1, "its own build");
     look(&mut rs, &coord, true);
     assert_eq!(rs.preload_state(), (None, None));
+}
+
+/// Opens the gate after `after` unless dropped first, so a wait that
+/// would never end without it fails its test by its time.
+struct Unstick(Arc<AtomicBool>);
+
+impl Unstick {
+    fn after(after: Duration) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&cancelled);
+        std::thread::spawn(move || {
+            let began = Instant::now();
+            while began.elapsed() < after {
+                if c.load(SeqCst) {
+                    return;
+                }
+                std::thread::park_timeout(Duration::from_millis(5));
+            }
+            gate(0);
+        });
+        Self(cancelled)
+    }
+}
+
+impl Drop for Unstick {
+    fn drop(&mut self) {
+        self.0.store(true, SeqCst);
+    }
+}
+
+/// How the pack the attempt finds in flight is stopping.
+#[derive(Clone, Copy, Debug)]
+enum Stopping {
+    /// Its probe's mode is no longer preferred.
+    ModeChange,
+    /// The pause stopped it, unclaimed.
+    Pause,
+}
+
+/// The attempt finds a pack stopping that does not reach its checkpoint
+/// (a blocked read, say): its stage waits for the pack's collection in
+/// Preparing's slices, taking nothing of the image state meanwhile, and
+/// a new stage after the quit key still waits; the shelf's end and then
+/// the run's end in the stage leave within one shared stop deadline
+/// (design.md "State Model", Preparing).
+fn a_close_while_the_attempt_waits_for_a_stopping_pack(how: Stopping) {
+    let _s = crate::imports::tests::serial();
+    let _g = Opened;
+    let d = runtime_drawn_skin();
+    let data = tempfile::tempdir().unwrap();
+    let seam = Arc::new(Seam::default());
+    let coord = coordinator(1);
+    // Held whatever it is told.
+    let mut rs = held_pack(d.path(), &seam, &coord, 2);
+    let control = rs.preload_control().unwrap();
+    let mut shelf = shelf(data.path());
+    shelf.set_preload(Arc::clone(&control));
+    shelf.set_stop_timeout(Duration::from_millis(50));
+    let (_, job) = rs.preload_state();
+    let (before, jobs) = (builds(), jobs_counted());
+    let unstick = Unstick::after(STOP_WAIT * 3);
+    let began = Instant::now();
+    match how {
+        Stopping::ModeChange => rs.set_kept_probe(false),
+        Stopping::Pause => {
+            shelf.pause();
+            look(&mut rs, &coord, true);
+        }
+    }
+    let ImageStage::Running(mut stage) =
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
+    else {
+        panic!("{how:?}: the stage does not wait for the pack");
+    };
+    let soon = Some(Instant::now() + Duration::from_millis(10));
+    assert_eq!(
+        rs.poll_image_stage(&mut stage, soon, || false, || false),
+        None
+    );
+    assert_eq!(rs.preload_state().1, job, "{how:?}: the pack's still");
+    assert!(rs.image().is_none());
+    // The quit key leaves at once; the next stage waits as well.
+    let quit = rs.poll_image_stage(&mut stage, None, || true, || false);
+    assert_eq!(quit, Some(Staged::Cancelled));
+    drop(stage);
+    let ImageStage::Running(mut stage) =
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
+    else {
+        panic!("{how:?}: a successor took the image state");
+    };
+    // The run ends: the shelf's end first, then the stage's.
+    drop(shelf);
+    let end = rs.poll_image_stage(&mut stage, None, || false, || true);
+    assert_eq!(end, Some(Staged::Cancelled));
+    assert!(
+        began.elapsed() < STOP_WAIT,
+        "{how:?}: left in {:?}",
+        began.elapsed()
+    );
+    drop(unstick);
+    assert_eq!(jobs_counted(), jobs, "{how:?}: no job of the stage's own");
+    assert_eq!(builds(), before, "{how:?}: no build of the stage's own");
+    gate(0);
+    assert!(control.wait_ended(long()), "{how:?}: its thread ends");
+}
+
+#[test]
+fn a_close_while_the_attempt_waits_for_a_pack_of_a_dropped_mode() {
+    a_close_while_the_attempt_waits_for_a_stopping_pack(Stopping::ModeChange);
+}
+
+#[test]
+fn a_close_while_the_attempt_waits_for_a_paused_pack() {
+    a_close_while_the_attempt_waits_for_a_stopping_pack(Stopping::Pause);
+}
+
+/// The practice choice's look (its pause, no claim) latches the stop of
+/// a pack between its checkpoints on the one speculative permit, so the
+/// page's entry releasing the pause before the pack's next checkpoint
+/// does not let it go on (design.md "State Model", the practice page).
+#[test]
+fn a_practice_choices_look_latches_the_packs_stop_before_the_release() {
+    let _s = crate::imports::tests::serial();
+    let _g = Opened;
+    let d = runtime_drawn_skin();
+    let data = tempfile::tempdir().unwrap();
+    let seam = Arc::new(Seam::default());
+    let coord = coordinator(1);
+    let mut rs = held_pack(d.path(), &seam, &coord, 2);
+    let control = rs.preload_control().unwrap();
+    let mut shelf = shelf(data.path());
+    shelf.set_preload(Arc::clone(&control));
+    // The practice choice and its look; then the page's entry.
+    shelf.pause();
+    look(&mut rs, &coord, true);
+    shelf.release();
+    // Its next checkpoint: it stops, and the permit goes back.
+    gate(1);
+    assert!(
+        control.wait_ended(Duration::from_secs(10)),
+        "the pack went on past the release"
+    );
+    collected(&mut rs, &coord);
+    assert_eq!(coord.held(Class::Speculative), 0);
+    assert_eq!(rs.preload_state(), (Some(true), None), "it waits");
+}
+
+/// Background mode entered at the begin, left at a promotion, and
+/// refused at the entry again after the claim's end demoted the pack:
+/// the refusal is recorded at that class change, and the pack stops at
+/// that checkpoint, packing nothing more on its speculative permit at
+/// normal priority; no speculative pack begins again (design.md "Load
+/// Pipeline", System friendliness).
+#[test]
+fn a_refusal_on_reentering_background_mode_stops_the_pack() {
+    let _s = crate::imports::tests::serial();
+    let _g = Opened;
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let coord = coordinator(1);
+    let mut rs = held_pack(d.path(), &seam, &coord, 2);
+    let control = rs.preload_control().unwrap();
+    let claim = control.claim();
+    claim.promote();
+    assert!(step(), "a checkpoint in the foreground");
+    assert_eq!(*seam.left.lock().unwrap(), ["result-preload"]);
+    seam.refuse.store(true, SeqCst);
+    drop(claim);
+    // One checkpoint more: it stops there, or comes back to the gate.
+    let arrived = ARRIVALS.load(SeqCst);
+    STEPS.fetch_add(1, SeqCst);
+    until("the pack's next checkpoint or its end", || {
+        ARRIVALS.load(SeqCst) != arrived || control.wait_ended(Duration::ZERO)
+    });
+    assert_eq!(
+        ARRIVALS.load(SeqCst),
+        arrived,
+        "the pack went on after the refusal"
+    );
+    assert_eq!(seam.entered.lock().unwrap().len(), 2, "entered again");
+    assert!(control.wait_ended(long()));
+    collected(&mut rs, &coord);
+    assert_eq!(rs.preload_state(), (Some(true), None));
+    assert!(rs.image().is_none());
+    look(&mut rs, &coord, true);
+    assert_eq!(rs.preload_state(), (Some(true), None), "nothing begins");
 }
 
 /// With speculation off, a claim begins the pack in the foreground with
@@ -625,6 +949,14 @@ fn with_speculation_off_a_claim_runs_the_pack_in_the_foreground() {
     let mut rs = preloaded(d.path(), &seam);
     let claim = rs.preload_control().unwrap().claim();
     gate(2);
+    // Not before the chosen chart's bank no longer decodes.
+    look(&mut rs, &coord, true);
+    assert_eq!(
+        rs.preload_state(),
+        (Some(true), None),
+        "it waits for the bank"
+    );
+    claim.promote();
     look(&mut rs, &coord, true);
     until("the pack's checkpoint", || REACHED.load(SeqCst));
     assert_eq!(coord.held(Class::Foreground), 1);

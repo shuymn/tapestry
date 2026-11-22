@@ -4,11 +4,26 @@
 //! a coordinator task of the speculative class whose thread is in
 //! background mode.
 //!
-//! - **One owner.** The state ([`Preload`]) is the game thread's alone:
-//!   it takes the image state for a pack ([`ResultSkin::slot_for_job`])
-//!   and restores it when it collects the pack's outcome, which the pack's
-//!   thread sends tagged with its job and its probe's mode. The thread
-//!   never writes [`ResultSkin`].
+//! The pack is a cancellable job handle with cooperative cancellation and
+//! a deferred-destruction owner off the game thread: the game thread owns
+//! the handle ([`Preload`]) and changes it only through one transition
+//! table ([`ResultSkin::preload_on`] for the game thread's events,
+//! [`ResultSkin::collect_preload`] for the pack's outcome); the pack's
+//! thread observes a stop only at its checkpoints, and pages nobody takes
+//! are dropped on the pack's thread or on a disposal thread, never on the
+//! game thread. It reuses what the player has for each part: the adopted
+//! stage's sliced polling with the attempt's quit and run-end checks for
+//! every wait in Preparing ([`ResultSkin::wait_pack`]); the page job's
+//! checked priority ([`crate::page_jobs::JobMode`], its refusal read
+//! after each class hook) for background mode; and the shelf's pause,
+//! acknowledgement and shared stop deadline ([`crate::shelf::Shelf`]) for
+//! the pause and the run's end.
+//!
+//! - **One owner.** The state is the game thread's alone: it takes the
+//!   image state for a pack ([`ResultSkin::slot_for_job`]) and, when it
+//!   collects the pack's outcome, takes back the holdings the slot lent
+//!   and keeps the new pages only of a pack still wanted. The thread never
+//!   writes [`ResultSkin`].
 //! - **The pause.** The shelf requests, waits for and releases the pause
 //!   through the [`PreloadControl`] it shares: a pack stops at its next
 //!   checkpoint while the pause holds and no choice claims it, says so
@@ -30,11 +45,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use game::coord::{Class, Coordinator, Outcome, Promoter, Runner};
-use skin_beatoraja::{Cancel, FactDeps, Imported, LuaImported};
+use skin_beatoraja::{Cancel, Imported, LuaImported};
 
 use super::{
-    ImageEntry, Images, Laid, Needs, Others, PendingResult, ResultSkin, Slot, StartupProbe,
-    Unbuilt, lay_out,
+    ImageEntry, Images, NotPacked, Others, Packed, PendingResult, ResultSkin, Slot, StartupProbe,
+    Unbuilt, lock, pack,
 };
 use crate::page_jobs::JobMode;
 use crate::priority::ThreadMode;
@@ -47,16 +62,18 @@ pub(super) enum Preload {
     /// Its pack runs.
     Running(Running),
     /// Its pack was told to stop by the game thread; `then` once its
-    /// outcome is collected.
+    /// outcome is collected. Until then the image state it took stays
+    /// with it: nothing else takes the image state (an attempt's stage
+    /// waits for the collection, [`ResultSkin::wait_pack`]).
     Stopping { run: Running, then: Then },
     /// No preload for this installation: none was imported, or it ended.
     #[default]
     Retired,
 }
 
-/// How long an adopted pack's wait looks for its outcome before it asks
-/// the attempt's signals again.
-const ADOPTED_SLICE: Duration = Duration::from_millis(5);
+/// How long a wait in Preparing for a pack's outcome looks for it before
+/// it asks the attempt's signals again.
+const PACK_SLICE: Duration = Duration::from_millis(5);
 
 /// A running pack the attempt's image stage adopted, with the claim that
 /// let it: dropped with the stage (the quit key, a discard), the claim
@@ -67,20 +84,50 @@ pub(super) struct Adopted {
 }
 
 impl Adopted {
-    /// Its pack's job (dev-tools).
-    #[cfg(feature = "dev-tools")]
+    /// Its pack's job.
     pub(super) const fn id(&self) -> u64 {
         self.id
     }
 }
 
-/// What a stopped pack's preload becomes once its outcome is collected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a stopped pack's preload becomes once its outcome is collected,
+/// in order: a later stop's `then` never lowers an earlier one's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Then {
-    /// It waits for the next pack.
+    /// It waits for the next pack: the holdings the slot lent are
+    /// returned, and a pack that completed anyway is kept.
     Idle,
-    /// It ends: its mode changed, or the installation ends.
+    /// It ends (the attempt runs its own stage, the run disabled the
+    /// result skin, the installation ends): the holdings the slot lent are
+    /// returned, and new pages are disposed of off the game thread.
     Retired,
+    /// It ends because its mode is no longer preferred: nothing of it is
+    /// returned, the lent holdings included (they are the other mode's),
+    /// and all of it is disposed of off the game thread.
+    Dropped,
+}
+
+/// The game thread's events, which [`ResultSkin::preload_on`] applies
+/// through the preload's transition table.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Event {
+    /// A look of selection, the decision screen or the practice page,
+    /// `may_run` the practice page's jobs leaving room for a pack.
+    Look { may_run: bool },
+    /// The practice page's gate before it admits a job, or at its entry
+    /// before its pause is released: a running pack is stopped unless
+    /// `may_run`; nothing is collected or begun.
+    Gate { may_run: bool },
+    /// The kept probe's rule changed ([`ResultSkin::set_kept_probe`]).
+    Invalidate,
+    /// The run disabled the result skin: no skin work follows.
+    Disable,
+    /// The attempt's image stage begins without a pack to adopt.
+    Attempt,
+    /// The installation or the run ends: a pack is stopped and its thread
+    /// waited for until the run's shared stop deadline, set `bound` from
+    /// now unless the run's end set it already.
+    End(Duration),
 }
 
 /// A pack in flight.
@@ -89,11 +136,11 @@ pub(super) struct Running {
     /// The probe it packs from, the preload's again when it stops.
     input: Box<StartupProbe>,
     /// The game thread's stop (a gate that no longer holds, a changed
-    /// mode, the installation's end).
+    /// mode, the installation's end), latched for this job.
     stop: Cancel,
     /// Its outcome, once sent.
     done: Receiver<PackOut>,
-    /// The holdings it took.
+    /// The holdings it was lent.
     slot: Slot,
 }
 
@@ -121,20 +168,45 @@ struct PackOut {
     ran: PackRan,
 }
 
-/// How a pack ended, with the holdings it took (the image entry it
-/// packed, or what it left of them), `None` when it took none.
+/// How a pack ended.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one outcome per pack, sent once and taken apart at once"
+)]
 enum PackRan {
-    /// Packed: the facts its probe read and the cells its layout needs.
-    Built(Box<(Option<Images>, FactDeps, Needs)>),
+    /// Packed and still wanted as it ended: the new entry (`None` when the
+    /// lent entry held the layout's cells and stays in the slot), the
+    /// facts its probe read and the cells its layout needs.
+    Built(Box<Packed>),
+    /// It packed nothing the preload keeps. `lent` is what is left of the
+    /// holdings the slot lent, `None` when it took none; any pages it
+    /// built were dropped on its thread.
+    Ended { lent: Option<Images>, end: End },
+}
+
+/// Why a pack ended with nothing kept.
+enum End {
     /// Its build would make a third live atlas.
-    Deferred(Option<Images>),
-    /// Stopped, its partial pages dropped on its thread.
-    Cancelled(Option<Images>),
+    Deferred,
+    /// Stopped (at a checkpoint or waiting for a permit), or packed after
+    /// the game thread stopped wanting it.
+    Cancelled,
     /// Refused, with the reason.
-    Refused(String, Option<Images>),
-    /// Its thread could not enter background mode: no speculative pack
-    /// runs again.
+    Refused(String),
+    /// Its thread could not enter background mode.
     NoBackground,
+}
+
+/// Drops `what` on a thread of its own, so pages nobody takes never free
+/// on the game thread (a deferred-destruction owner). Should the thread
+/// not start, they drop here, logged.
+fn dispose<T: Send + 'static>(what: T) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("result-dispose".to_owned())
+        .spawn(move || drop(what))
+    {
+        log::warn!("skin: result: the preload's pages are freed in place: {e}");
+    }
 }
 
 /// The preload's control, shared by the game thread, the shelf
@@ -155,10 +227,16 @@ pub struct PreloadControl {
     promoter: Mutex<Option<Promoter>>,
     /// The run ends: the pack stops.
     closing: AtomicBool,
-    /// A pack's thread could not enter background mode.
+    /// The run's stop deadline, shared by every wait at its end (the
+    /// shelf's, the result skin's): set by the first.
+    deadline: Mutex<Option<Instant>>,
+    /// A pack's thread could not enter background mode, at its begin or
+    /// at a later class change.
     refused: AtomicBool,
-    /// The job whose outcome the game thread still wants: one whose
-    /// mode changed drops its pages on its own thread.
+    /// The coordinator has no speculative permit.
+    speculation_off: AtomicBool,
+    /// The job whose outcome the game thread still wants: one it stopped
+    /// for good drops its pages on its own thread.
     wanted: AtomicU64,
     live: Mutex<Live>,
     changed: Condvar,
@@ -169,7 +247,8 @@ pub struct PreloadControl {
 struct Live {
     /// The job whose thread runs.
     job: Option<u64>,
-    /// It has left its build: stopped at a checkpoint, or its build ended.
+    /// It has left its build: stopped at a checkpoint or waiting for a
+    /// permit, or its build ended.
     left: bool,
 }
 
@@ -207,15 +286,38 @@ impl PreloadControl {
         self.claims.load(Ordering::SeqCst) > 0
     }
 
+    /// Whether a claim lives and wants its pack in the foreground.
+    fn foreground_claimed(&self) -> bool {
+        self.claimed() && self.foreground.load(Ordering::SeqCst)
+    }
+
+    /// Whether no speculative pack can run: speculation is off, or a
+    /// pack's thread could not enter background mode. A pack then runs
+    /// only as foreground work, once a claim wants it there.
+    fn alone(&self) -> bool {
+        self.refused.load(Ordering::SeqCst) || self.speculation_off.load(Ordering::SeqCst)
+    }
+
     /// A choice to play or a Start claims the pack (design.md "Load
     /// Pipeline", Pauses): from now until the claim drops, the pause does
     /// not stop it. The claim's holder asks for it before it requests the
     /// pause, so a pack never sees the choice's pause unclaimed.
     pub fn claim(self: &Arc<Self>) -> PreloadClaim {
         self.claims.fetch_add(1, Ordering::SeqCst);
-        // The job claimed: the running pack's, 0 when none runs.
+        // The job it attaches to: the running pack's now, else the one
+        // begun under it later (`pre:claim` at its begin).
         #[cfg(feature = "dev-tools")]
-        mark_job("pre:claim", self.live().job.unwrap_or(0), "");
+        {
+            let live = *self.live();
+            match live.job.filter(|_| !live.left) {
+                Some(id) => mark_job("pre:claim", id, ""),
+                None => mark_job(
+                    "pre:claim_open",
+                    u64::try_from(self.claims.load(Ordering::SeqCst)).unwrap_or(0),
+                    "",
+                ),
+            }
+        }
         PreloadClaim(Arc::clone(self))
     }
 
@@ -224,12 +326,11 @@ impl PreloadControl {
     }
 
     /// Job `promoter`'s begin: it is the one a claim promotes from now,
-    /// promoted at once when a claim lives and either wants it in the
-    /// foreground already or `alone` (no speculative pack can run:
-    /// speculation off, or background mode refused). Whether it was.
-    fn set_promoter(&self, promoter: Promoter, alone: bool) -> bool {
+    /// promoted at once when a claim lives and wants it in the foreground
+    /// already. Whether it was.
+    fn set_promoter(&self, promoter: Promoter) -> bool {
         let mut current = self.promoter();
-        let promote = self.claimed() && (alone || self.foreground.load(Ordering::SeqCst));
+        let promote = self.foreground_claimed();
         if promote {
             promoter.promote();
         }
@@ -237,10 +338,14 @@ impl PreloadControl {
         promote
     }
 
-    /// Whether a running pack stops: the run ends, or the pause holds
-    /// unclaimed.
+    /// Whether a running pack stops: the run ends; the pause holds
+    /// unclaimed; or no speculative pack can run and no claim wants it in
+    /// the foreground (a claim's end demoted it, or its thread's mode was
+    /// refused at a class change).
     fn stops(&self) -> bool {
-        self.closing.load(Ordering::SeqCst) || self.held()
+        self.closing.load(Ordering::SeqCst)
+            || self.held()
+            || (self.alone() && !self.foreground_claimed())
     }
 
     /// Before a READY state: whether the pack acknowledges the pause, that
@@ -256,16 +361,25 @@ impl PreloadControl {
         quiet(&live)
     }
 
-    /// The run ends: a running pack stops at its next checkpoint.
-    pub fn close(&self) {
+    /// The run ends: a running pack stops at its next checkpoint, and the
+    /// run's stop deadline is `deadline` unless an earlier end set it.
+    /// The deadline every wait of the run's end shares.
+    pub fn close_by(&self, deadline: Instant) -> Instant {
         self.closing.store(true, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
         self.mark_stop("close");
+        let mut set = self.deadline.lock().unwrap_or_else(PoisonError::into_inner);
+        *set.get_or_insert(deadline)
     }
 
-    /// Whether the run's end was signalled ([`close`](Self::close)).
-    fn closed(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
+    /// After [`close_by`](Self::close_by): waits until no pack's thread
+    /// runs, until the run's stop deadline at most: whether none does.
+    pub fn wait_closed(&self) -> bool {
+        let deadline = *self.deadline.lock().unwrap_or_else(PoisonError::into_inner);
+        let bound = deadline.map_or(Duration::ZERO, |d| {
+            d.saturating_duration_since(Instant::now())
+        });
+        self.wait_ended(bound)
     }
 
     /// Waits until no pack's thread runs, at most `bound`: whether none
@@ -288,12 +402,23 @@ impl PreloadControl {
         };
     }
 
-    /// Job `id` has left its build.
-    fn left(&self, id: u64) {
+    /// Job `id` has left its build, `stopped` there (at a checkpoint or
+    /// waiting for a permit) or ended. Marked once per job (dev-tools:
+    /// `pre:ack` for a stop, then the terminal `pre:left`).
+    fn left(&self, id: u64, stopped: bool) {
         let mut live = self.live();
         if live.job == Some(id) && !live.left {
             live.left = true;
             drop(live);
+            #[cfg(feature = "dev-tools")]
+            {
+                if stopped {
+                    mark_job("pre:ack", id, "");
+                }
+                mark_job("pre:left", id, if stopped { "stopped" } else { "ended" });
+            }
+            #[cfg(not(feature = "dev-tools"))]
+            let _ = stopped;
             self.changed.notify_all();
         }
     }
@@ -352,7 +477,8 @@ impl std::fmt::Debug for PreloadClaim {
 impl PreloadClaim {
     /// The chosen chart's bank no longer decodes (or the attempt adopts
     /// the pack): the claimed pack, and any pack begun under the claim
-    /// from now, is promoted to the foreground at its next checkpoint.
+    /// from now, is promoted to the foreground at its next checkpoint. A
+    /// pack that can run only in the foreground begins from now on.
     pub fn promote(&self) {
         let current = self.0.promoter();
         self.0.foreground.store(true, Ordering::SeqCst);
@@ -395,7 +521,10 @@ struct PackJob {
 impl PackJob {
     /// The pack on its own thread: background mode entered through the
     /// priority seam first (unless a claim began it promoted), then the
-    /// layout's atlas step on `runner`, its checkpoint the build's stop.
+    /// atlas step on `runner`, its checkpoint the build's stop. A refusal
+    /// of background mode, at the begin or at a later class change, is
+    /// recorded in the shared control at once, so the stop that the next
+    /// checkpoint reads holds it (the page job's checked priority).
     fn run(self, runner: Runner<()>) {
         let Self {
             id,
@@ -415,73 +544,95 @@ impl PackJob {
         #[cfg(feature = "dev-tools")]
         super::IMPORT_PERMIT.set(kept);
         let mode = JobMode::new(mode, "skin: result: preload");
+        let checked = |class| {
+            mode.on_class(class);
+            if mode.refused() {
+                control.refused.store(true, Ordering::SeqCst);
+            }
+        };
         if !promoted {
-            mode.on_class(Class::Speculative);
+            checked(Class::Speculative);
         }
         if mode.refused() {
-            control.refused.store(true, Ordering::SeqCst);
             drop(runner);
+            control.left(id, true);
             #[cfg(feature = "dev-tools")]
             mark_job("pre:end", id, "no-background");
             let _ = done.send(PackOut {
                 id,
                 kept,
-                ran: PackRan::NoBackground,
+                ran: PackRan::Ended {
+                    lent: None,
+                    end: End::NoBackground,
+                },
             });
             return;
         }
-        // A pack with no background mode runs only while claimed.
-        let stops = || {
-            stop.is_cancelled()
-                || control.stops()
-                || (control.refused.load(Ordering::SeqCst) && !control.claimed())
-        };
-        let mut laid: Option<Laid> = None;
+        let stops = || stop.is_cancelled() || control.stops();
         let on_class = |class| {
             #[cfg(feature = "dev-tools")]
             if class == Class::Foreground {
                 mark_job("pre:class", id, "fg");
             }
-            mode.on_class(class);
+            checked(class);
         };
+        #[cfg(feature = "dev-tools")]
+        let progressed = AtomicBool::new(false);
+        let mut packed = None;
         let outcome = runner.run(&stops, &on_class, |ctx| {
             let check = || {
                 #[cfg(all(test, feature = "dev-tools"))]
                 tests::pack_gate(&stops);
                 let stopped = ctx.checkpoint();
                 if stopped {
-                    #[cfg(feature = "dev-tools")]
-                    mark_job("pre:ack", id, "");
-                    control.left(id);
+                    control.left(id, true);
+                }
+                // Its first progress (dev-tools): the latency from a
+                // release or a begin to its work.
+                #[cfg(feature = "dev-tools")]
+                if !stopped && !progressed.swap(true, Ordering::SeqCst) {
+                    mark_job("pre:progress", id, "");
                 }
                 stopped
             };
-            laid = Some(lay_out(
-                &pending, imported, &slot, base, others, &stop, &check,
-            ));
+            packed = Some(pack(&pending, imported, &slot, base, others, &stop, &check));
         });
-        control.left(id);
-        let taken = |l: Option<Laid>| l.and_then(|l| l.taken);
-        let ran = match (outcome, laid) {
-            (Outcome::Done(()), Some(l)) => match l.result {
-                Ok(spec) => match l.needs {
-                    Some(needs) => PackRan::Built(Box::new((l.taken, spec.facts, needs))),
-                    None => PackRan::Refused("no cells".to_owned(), l.taken),
-                },
-                Err(Unbuilt::Deferred) => PackRan::Deferred(l.taken),
-                Err(Unbuilt::Refused(why)) => PackRan::Refused(why, l.taken),
-            },
-            (Outcome::Done(()), None) => PackRan::Refused("no layout".to_owned(), None),
-            (Outcome::Cancelled, l) => PackRan::Cancelled(taken(l)),
-            (Outcome::Panicked(p), l) => PackRan::Refused(format!("it panicked: {p}"), taken(l)),
-        };
-        // A pack whose mode changed meanwhile: its pages go here.
-        let ran = match ran {
-            PackRan::Built(..) if control.wanted.load(Ordering::SeqCst) != id => {
-                drop(ran);
-                PackRan::Cancelled(None)
+        let cancelled = matches!(outcome, Outcome::Cancelled);
+        control.left(id, cancelled);
+        // Pages it built that nobody takes drop here, on its own thread.
+        let lent_of = |p: Option<Result<Packed, NotPacked>>| match p {
+            Some(Ok((built, ..))) => {
+                drop(built);
+                None
             }
-            ran => ran,
+            Some(Err(not)) => not.1,
+            None => None,
+        };
+        let wanted = control.wanted.load(Ordering::SeqCst) == id;
+        let ran = match (outcome, packed) {
+            (Outcome::Done(()), Some(Ok(built))) if wanted => PackRan::Built(Box::new(built)),
+            (Outcome::Done(()), Some(Err(not))) => {
+                let (why, lent) = *not;
+                PackRan::Ended {
+                    lent,
+                    end: match why {
+                        Unbuilt::Deferred => End::Deferred,
+                        Unbuilt::Refused(why) => End::Refused(why),
+                    },
+                }
+            }
+            (Outcome::Done(()), None) => PackRan::Ended {
+                lent: None,
+                end: End::Refused("no layout".to_owned()),
+            },
+            (Outcome::Done(()) | Outcome::Cancelled, p) => PackRan::Ended {
+                lent: lent_of(p),
+                end: End::Cancelled,
+            },
+            (Outcome::Panicked(why), p) => PackRan::Ended {
+                lent: lent_of(p),
+                end: End::Refused(format!("it panicked: {why}")),
+            },
         };
         #[cfg(feature = "dev-tools")]
         mark_job(
@@ -489,10 +640,12 @@ impl PackJob {
             id,
             match &ran {
                 PackRan::Built(..) => "built",
-                PackRan::Deferred(_) => "deferred",
-                PackRan::Cancelled(_) => "cancelled",
-                PackRan::Refused(..) => "refused",
-                PackRan::NoBackground => "no-background",
+                PackRan::Ended { end, .. } => match end {
+                    End::Deferred => "deferred",
+                    End::Cancelled => "cancelled",
+                    End::Refused(_) => "refused",
+                    End::NoBackground => "no-background",
+                },
             },
         );
         // A receiver gone (the installation's end): the outcome, its pages
@@ -528,28 +681,107 @@ impl ResultSkin {
         self.control.clone()
     }
 
+    /// The preload's transition table for the game thread's events. The
+    /// pack's outcome is collected by [`collect_preload`]'s table
+    /// (Look collects first; no event here waits except End).
+    ///
+    /// | Event | Idle | Running | Stopping { then } | Retired |
+    /// |---|---|---|---|---|
+    /// | Look { may_run } | stays (the caller begins it, [`poll_preload`]) | collected if ended; else stopped, then Idle, when `!may_run`, the pause holds unclaimed, or a foreground-only pack has no foreground claim | collected if ended | stays |
+    /// | Gate { may_run } | stays | stopped, then Idle, when `!may_run` | stays | stays |
+    /// | Invalidate | Retired | stopped, then Dropped | then Dropped | stays |
+    /// | Disable, Attempt | Retired | stopped, then Retired | then at least Retired | stays |
+    /// | End(bound) | Retired | stopped, its thread waited for until the run's shared deadline; Retired | as Running | stays |
+    ///
+    /// Who holds the pages and where they go: while a pack runs or stops,
+    /// the holdings the slot lent are the pack's, and nothing else takes
+    /// the image state (Stopping quarantines it: an attempt's stage waits
+    /// for the collection in slices, [`wait_pack`]); the pack drops pages
+    /// it built and that nobody wants on its own thread; the collection
+    /// restores only lent holdings, keeps new pages only of a pack still
+    /// wanted, and disposes of everything else on a disposal thread. At
+    /// End the receiver goes, so a late outcome drops on the pack's
+    /// thread.
+    ///
+    /// [`collect_preload`]: Self::collect_preload
+    /// [`poll_preload`]: Self::poll_preload
+    /// [`wait_pack`]: Self::wait_pack
+    pub(super) fn preload_on(&mut self, event: Event) {
+        let in_flight = matches!(self.preload, Preload::Running(_) | Preload::Stopping { .. });
+        match event {
+            Event::Look { may_run } => {
+                self.collect_preload(Duration::ZERO);
+                let latch = !may_run || self.control.as_ref().is_some_and(|c| c.stops());
+                if latch && matches!(self.preload, Preload::Running(_)) {
+                    self.stop_preload(Then::Idle);
+                }
+            }
+            Event::Gate { may_run } => {
+                if !may_run && matches!(self.preload, Preload::Running(_)) {
+                    self.stop_preload(Then::Idle);
+                }
+            }
+            Event::Invalidate | Event::Disable | Event::Attempt => {
+                let then = if matches!(event, Event::Invalidate) {
+                    Then::Dropped
+                } else {
+                    Then::Retired
+                };
+                if in_flight {
+                    self.stop_preload(then);
+                } else {
+                    self.preload = Preload::Retired;
+                }
+            }
+            Event::End(bound) => {
+                if !in_flight {
+                    self.preload = Preload::Retired;
+                    return;
+                }
+                self.stop_preload(Then::Retired);
+                self.preload = Preload::Retired;
+                if let Some(c) = &self.control {
+                    let began = Instant::now();
+                    c.close_by(began + bound);
+                    if !c.wait_closed() {
+                        log::warn!(
+                            "skin: result: the preload did not stop within {} ms; it ends with the process",
+                            began.elapsed().as_millis()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The preload at a look of selection, the decision screen or the
     /// practice page (design.md "beatoraja Lua Skins", the result skin's
-    /// preload): a pack that ended is collected; a running one is stopped
-    /// unless `may_run` (the practice page's jobs leave it room,
-    /// [`crate::page_jobs::PageJobs::preload_may_run`]). Whether a pack is
-    /// to begin now ([`begin_preload`](Self::begin_preload), after a fresh
-    /// report): the preload waits, `may_run`, no pause holds unclaimed,
-    /// and either a claim lives or `coord` has a speculative permit and
-    /// background mode was never refused.
+    /// preload): [`Event::Look`]. Whether a pack is to begin now
+    /// ([`begin_preload`](Self::begin_preload), after a fresh report): the
+    /// preload waits, `may_run`, no pause holds unclaimed, and either a
+    /// speculative pack can run (`coord` has a speculative permit and
+    /// background mode was never refused) or a claim wants it in the
+    /// foreground (its chart's bank no longer decodes), so a
+    /// foreground-only pack never takes a permit the bank's decode draws.
     pub fn poll_preload(&mut self, coord: &Coordinator, may_run: bool) -> bool {
-        self.collect_preload(Duration::ZERO);
-        if !may_run {
-            self.stop_preload(Then::Idle);
-        }
+        self.preload_on(Event::Look { may_run });
         let Some(control) = &self.control else {
             return false;
         };
-        let speculative = coord.caps().speculative > 0 && !control.refused.load(Ordering::SeqCst);
+        control
+            .speculation_off
+            .store(coord.caps().speculative == 0, Ordering::SeqCst);
         matches!(self.preload, Preload::Idle(_))
             && may_run
             && !control.held()
-            && (speculative || control.claimed())
+            && (!control.alone() || control.foreground_claimed())
+    }
+
+    /// The practice page's gate ([`Event::Gate`]): a running pack is
+    /// stopped unless `may_run`, before the page releases its pause or
+    /// admits a job.
+    pub fn gate_preload(&mut self, may_run: bool) {
+        self.preload_on(Event::Gate { may_run });
     }
 
     /// Begins the pack on `coord`, after [`poll_preload`](Self::poll_preload)
@@ -597,11 +829,10 @@ impl ResultSkin {
         let (done, received) = mpsc::channel();
         // Of the speculative class whatever begins it, so a claim's end
         // demotes it there (with no speculative permit, its next
-        // checkpoint then cancels it); a claim that no speculative pack
-        // can serve begins it promoted.
+        // checkpoint then cancels it); a claim that wants it in the
+        // foreground begins it promoted.
         let runner = coord.task::<()>(Class::Speculative);
-        let alone = coord.caps().speculative == 0 || control.refused.load(Ordering::SeqCst);
-        let promoted = control.set_promoter(runner.promoter(), alone);
+        let promoted = control.set_promoter(runner.promoter());
         let job = PackJob {
             id,
             kept: input.kept,
@@ -627,7 +858,13 @@ impl ResultSkin {
             Ok(_) => {
                 log::info!("skin: result: preload {id} begins");
                 #[cfg(feature = "dev-tools")]
-                mark_job("pre:begin", id, if promoted { "fg" } else { "speculative" });
+                {
+                    mark_job("pre:begin", id, if promoted { "fg" } else { "speculative" });
+                    // A claim that came before it attaches to it now.
+                    if control.claimed() {
+                        mark_job("pre:claim", id, "");
+                    }
+                }
                 self.preload = Preload::Running(Running {
                     id,
                     input,
@@ -645,10 +882,12 @@ impl ResultSkin {
         }
     }
 
-    /// The game thread stops a running pack: its stop is set, and once its
-    /// outcome is collected the preload becomes `then` (a pack that
-    /// stops for an ending preload stays ending).
-    pub(super) fn stop_preload(&mut self, then: Then) {
+    /// The game thread stops a running pack: its stop is latched, and once
+    /// its outcome is collected the preload becomes `then` (a later stop
+    /// never lowers an earlier one's `then`). A `then` past Idle no longer
+    /// wants its outcome, so a pack that packs anyway drops its pages on
+    /// its own thread when it can tell.
+    fn stop_preload(&mut self, then: Then) {
         self.preload = match std::mem::take(&mut self.preload) {
             Preload::Running(run) => {
                 run.stop.cancel();
@@ -659,31 +898,36 @@ impl ResultSkin {
                     match then {
                         Then::Idle => "gate",
                         Then::Retired => "retired",
+                        Then::Dropped => "dropped",
                     },
                 );
                 Preload::Stopping { run, then }
             }
             Preload::Stopping { run, then: was } => Preload::Stopping {
                 run,
-                then: if was == Then::Retired { was } else { then },
+                then: was.max(then),
             },
-            Preload::Idle(_) if then == Then::Retired => Preload::Retired,
             other => other,
         };
-        if then == Then::Retired
+        if then > Then::Idle
             && let Some(c) = &self.control
         {
             c.wanted.store(0, Ordering::SeqCst);
         }
     }
 
-    /// The pack's outcome collected, waited for at most `wait` (`MAX` to
-    /// its end, once its stop is set). A pack is taken while its mode is
-    /// the one preferred: its image entry restored and its probe's facts
-    /// and cells kept, so the attempt reuses it, and the preload ends. A
-    /// deferred or stopped pack hands its holdings back and the preload
-    /// waits again (or ends, as its stop said); a refused one, or a thread
-    /// that ended without an outcome, ends it.
+    /// The pack's outcome collected, waited for at most `wait` (zero at a
+    /// look; a slice in Preparing). Its table, by the outcome and the
+    /// state's `then` (Idle for a running pack):
+    ///
+    /// | Outcome | then Idle | then Retired | then Dropped |
+    /// |---|---|---|---|
+    /// | Built, its mode preferred | new entry restored, probe kept; Retired | new entry disposed of; what the slot still holds returned; Retired | new entry and slot disposed of; Retired |
+    /// | Ended { lent } | lent returned; Idle (Retired when refused) | lent returned; Retired | lent and slot disposed of; Retired |
+    /// | none (its thread ended without one) | slot returned; Retired | slot returned; Retired | slot disposed of; Retired |
+    ///
+    /// A Built outcome of a mode no longer preferred is collected as under
+    /// Dropped. "Disposed of" is on a disposal thread, never here.
     pub(super) fn collect_preload(&mut self, wait: Duration) {
         let got = match &self.preload {
             Preload::Running(r) | Preload::Stopping { run: r, .. } => {
@@ -716,51 +960,60 @@ impl ResultSkin {
         };
         #[cfg(feature = "dev-tools")]
         mark_job("pre:collect", run.id, "");
-        let Some(out) = out.filter(|o| o.id == run.id) else {
-            log::info!("skin: result: preload {} ended without its outcome", run.id);
-            self.restore(None, &run.slot);
+        let Running {
+            id, input, slot, ..
+        } = run;
+        let Some(out) = out.filter(|o| o.id == id) else {
+            log::info!("skin: result: preload {id} ended without its outcome");
+            self.hand_back(None, &slot, then);
             return;
         };
-        let current = self.kept == Some(out.kept) && then == Then::Idle;
-        let waits = |input| match then {
-            Then::Idle => Preload::Idle(input),
-            Then::Retired => Preload::Retired,
+        let then = if self.kept == Some(out.kept) {
+            then
+        } else {
+            Then::Dropped
         };
-        self.preload = match out.ran {
-            PackRan::Built(built) if current => {
-                let (taken, deps, needs) = *built;
-                log::info!("skin: result: preload {} packed", run.id);
-                self.restore(taken, &run.slot);
+        self.preload = match (out.ran, then) {
+            (PackRan::Built(built), Then::Idle) => {
+                let (new, deps, needs) = *built;
+                log::info!("skin: result: preload {id} packed");
+                self.restore(new, &slot);
                 self.probe = Some((deps, needs));
                 Preload::Retired
             }
-            // Its mode is no longer preferred: nothing of it is restored.
-            PackRan::Built(..) => {
-                self.restore(None, &run.slot);
+            (PackRan::Built(built), then) => {
+                let (new, _, _) = *built;
+                if let Some(new) = new {
+                    dispose(new);
+                }
+                self.hand_back(None, &slot, then);
                 Preload::Retired
             }
-            PackRan::Deferred(taken) | PackRan::Cancelled(taken) => {
-                self.restore(taken, &run.slot);
-                waits(run.input)
-            }
-            PackRan::NoBackground => {
-                self.restore(None, &run.slot);
-                waits(run.input)
-            }
-            PackRan::Refused(why, taken) => {
-                log::info!("skin: result: not preloaded: {why}");
-                self.restore(taken, &run.slot);
-                Preload::Retired
+            (PackRan::Ended { lent, end }, then) => {
+                self.hand_back(lent, &slot, then);
+                match (then, end) {
+                    (Then::Idle, End::Refused(why)) => {
+                        log::info!("skin: result: not preloaded: {why}");
+                        Preload::Retired
+                    }
+                    (Then::Idle, _) => Preload::Idle(input),
+                    _ => Preload::Retired,
+                }
             }
         };
     }
 
-    /// A running pack stopped and its outcome collected, waited for (its
-    /// next checkpoint), before anything else takes the image state.
-    pub(super) fn settle_preload(&mut self, then: Then) {
-        if matches!(self.preload, Preload::Running(_) | Preload::Stopping { .. }) {
-            self.stop_preload(then);
-            self.collect_preload(Duration::MAX);
+    /// The holdings the slot lent a collected pack, `lent` (what it left
+    /// of what it took) or else what is still in `slot`: returned to the
+    /// image state, or under [`Then::Dropped`] disposed of off the game
+    /// thread.
+    fn hand_back(&mut self, lent: Option<Images>, slot: &Slot, then: Then) {
+        if then == Then::Dropped {
+            if let Some(images) = lent.or_else(|| lock(slot).take()) {
+                dispose(images);
+            }
+        } else {
+            self.restore(lent, slot);
         }
     }
 
@@ -786,34 +1039,43 @@ impl ResultSkin {
         })
     }
 
-    /// The adopted pack `adopted` waited for until `until` at most:
-    /// `Some(true)` once its outcome is collected (the attempt's stage is
-    /// then decided from what it left), `Some(false)` when `quit` (the
-    /// attempt's quit key: the stage drops its claim, the pack goes on
-    /// and the preload keeps it, nothing waited for) or `end_run` (the
-    /// run ends: the pack is cancelled and its thread waited for within
-    /// [`crate::imports::STOP_WAIT`]) came first, `None` at `until`.
-    pub(super) fn wait_adopted(
+    /// The job of the pack in flight, running or stopping.
+    pub(super) const fn pack_in_flight(&self) -> Option<u64> {
+        match &self.preload {
+            Preload::Running(r) | Preload::Stopping { run: r, .. } => Some(r.id),
+            Preload::Idle(_) | Preload::Retired => None,
+        }
+    }
+
+    /// Preparing's wait for pack `id`'s outcome (an adopted pack, or one
+    /// the attempt's stage stopped and must collect before it takes the
+    /// image state), until `until` at most, in slices that ask the
+    /// attempt's signals: `Some(true)` once its outcome is collected,
+    /// `Some(false)` when `quit` (the attempt's quit key: nothing waited
+    /// for, the pack stays the preload's) or `end_run` ([`Event::End`]
+    /// within the run's shared stop deadline) came first, `None` at
+    /// `until`. No wait here is unbounded.
+    pub(super) fn wait_pack(
         &mut self,
-        adopted: &Adopted,
+        id: u64,
         until: Option<Instant>,
         mut quit: impl FnMut() -> bool,
         mut end_run: impl FnMut() -> bool,
     ) -> Option<bool> {
         loop {
             if end_run() {
-                self.end_preload(crate::imports::STOP_WAIT);
+                self.preload_on(Event::End(crate::imports::STOP_WAIT));
                 return Some(false);
             }
             if quit() {
                 return Some(false);
             }
             let now = Instant::now();
-            let slice = until.map_or(ADOPTED_SLICE, |u| {
-                ADOPTED_SLICE.min(u.saturating_duration_since(now))
+            let slice = until.map_or(PACK_SLICE, |u| {
+                PACK_SLICE.min(u.saturating_duration_since(now))
             });
             self.collect_preload(slice.max(Duration::from_micros(1)));
-            if !matches!(&self.preload, Preload::Running(r) if r.id == adopted.id) {
+            if self.pack_in_flight() != Some(id) {
                 return Some(true);
             }
             if until.is_some_and(|u| Instant::now() >= u) {
@@ -822,34 +1084,18 @@ impl ResultSkin {
         }
     }
 
-    /// The run disabled the result skin: a running pack is stopped and
-    /// its outcome collected (its next checkpoint), and the preload ends.
+    /// The run disabled the result skin ([`Event::Disable`]): a running
+    /// pack is stopped, not waited for; its outcome is collected at a
+    /// later look or the end, and the preload ends.
     pub fn retire_preload(&mut self) {
-        self.settle_preload(Then::Retired);
-        self.preload = Preload::Retired;
+        self.preload_on(Event::Disable);
     }
 
-    /// The installation ends: a running pack is stopped and its thread
-    /// waited for at most `bound`, unless the shelf's end already waited
-    /// for it within the run's shared bound.
+    /// The installation ends ([`Event::End`]): a running pack is stopped
+    /// and its thread waited for until the run's shared stop deadline,
+    /// set `bound` from now unless the run's end set it already.
     pub(super) fn end_preload(&mut self, bound: Duration) {
-        if !matches!(self.preload, Preload::Running(_) | Preload::Stopping { .. }) {
-            return;
-        }
-        self.stop_preload(Then::Retired);
-        self.preload = Preload::Retired;
-        if let Some(c) = &self.control
-            && !c.closed()
-        {
-            c.close();
-            let began = Instant::now();
-            if !c.wait_ended(bound) {
-                log::warn!(
-                    "skin: result: the preload did not stop within {} ms; it ends with the process",
-                    began.elapsed().as_millis()
-                );
-            }
-        }
+        self.preload_on(Event::End(bound));
     }
 
     /// The preload's pack thread mode in place of the system's (tests).

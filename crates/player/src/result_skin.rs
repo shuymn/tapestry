@@ -33,7 +33,7 @@ mod preload;
 
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) use preload::tests as preload_tests;
-use preload::{Adopted, Preload, Then};
+use preload::{Adopted, Event, Preload};
 pub use preload::{PreloadClaim, PreloadControl};
 
 /// A result skin whose base import read a fact the base snapshot has
@@ -170,6 +170,9 @@ pub struct ImageEntry {
     /// kept (the transition probe's `dev: probe-miss`).
     #[cfg(feature = "dev-tools")]
     import_permit: bool,
+    /// Records the thread its last reference drops on (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    _dropped: preload::tests::DropWitness,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -702,6 +705,9 @@ enum InFlight {
         slot: Slot,
     },
     Adopted(Adopted),
+    /// It waits for the preload's pack `0`, stopped for the attempt, to be
+    /// collected before it takes the image state.
+    Draining(u64),
 }
 
 /// `slot`'s holdings, a poisoned lock included.
@@ -876,7 +882,6 @@ fn probe_miss(e: &ImageEntry, sheet: &Sheet, variant: Variant, kept: skin_model:
 /// [`layout`]'s atlas step and bundle, from its import `imported`; the
 /// atlas build stops once `check` turns true (the job's cancel, or a
 /// task's checkpoint).
-#[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
 fn lay_out(
     pending: &PendingResult,
     imported: skin_beatoraja::LuaImported,
@@ -889,8 +894,117 @@ fn lay_out(
     let deps = imported.facts;
     let mut skin = imported.imported.skin;
     let scratch = imported.imported.scratch;
+    let bound = match atlas_step(pending, &mut skin, slot, base, others, cancel, check) {
+        Ok(bound) => bound,
+        Err(not) => {
+            let NotBound { why, lent, built } = *not;
+            return Laid {
+                result: Err(why),
+                taken: built.or(lent),
+                needs: None,
+            };
+        }
+    };
+    let result = imports::bundle_of(skin, scratch, bound.atlas, &pending.target, cancel)
+        .map(|bundle| Specialized {
+            bundle,
+            facts: deps,
+            entry: bound.entry,
+            script: None,
+            derived: None,
+        })
+        .map_err(Unbuilt::from);
+    Laid {
+        result,
+        taken: bound.taken,
+        needs: Some(bound.needs),
+    }
+}
+
+/// What the atlas step binds a layout to: its atlas, the image entry
+/// that holds it, what is left of the slot's holdings it took (the new
+/// entry when it packed one; `None` when it took none), and the cells
+/// the layout needs.
+struct Bound {
+    atlas: Atlas,
+    entry: Option<Arc<ImageEntry>>,
+    taken: Option<Images>,
+    needs: Needs,
+}
+
+/// An atlas step that bound nothing: why, what is left of the slot's
+/// holdings it took (`lent`: the image state the job was lent, for the
+/// game thread to have back), and the entry it packed before the
+/// binding failed (`built`: new pages, which only a layout may keep).
+struct NotBound {
+    why: Unbuilt,
+    lent: Option<Images>,
+    built: Option<Images>,
+}
+
+impl NotBound {
+    fn refused(why: String) -> Self {
+        Self {
+            why: why.into(),
+            lent: None,
+            built: None,
+        }
+    }
+}
+
+/// What a pack packed ([`pack`]): the new entry (or `None`, the slot's
+/// held the layout's cells), the facts the probe read and the cells its
+/// layout needs.
+type Packed = (Option<Images>, FactDeps, Needs);
+
+/// Why a pack packed nothing, and what is left of the holdings the slot
+/// lent ([`pack`]).
+type NotPacked = Box<(Unbuilt, Option<Images>)>;
+
+/// The preload's pack of `imported` (design.md "beatoraja Lua Skins", the
+/// result skin's preload): [`lay_out`]'s atlas step alone, its stop the
+/// coordinator's checkpoint `check`. The bundle and its font reads are
+/// left to the attempt's layout, which makes the view's bundle anyway, so
+/// nothing after the atlas build is cancellable here. Pages it packed and
+/// could not bind drop here, on the pack's thread.
+fn pack(
+    pending: &PendingResult,
+    imported: skin_beatoraja::LuaImported,
+    slot: &Slot,
+    base: Option<Arc<ImageEntry>>,
+    others: Others,
+    cancel: &Cancel,
+    check: &dyn Fn() -> bool,
+) -> Result<Packed, NotPacked> {
+    let deps = imported.facts;
+    let mut skin = imported.imported.skin;
+    match atlas_step(pending, &mut skin, slot, base, others, cancel, check) {
+        Ok(bound) => Ok((bound.taken, deps, bound.needs)),
+        Err(not) => {
+            let NotBound { why, lent, built } = *not;
+            drop(built);
+            Err(Box::new((why, lent)))
+        }
+    }
+}
+
+/// The atlas step of `skin` for [`lay_out`] and [`pack`]: the slot's
+/// image entry rebound when it holds the layout's cells, else the plan
+/// packed (D13, "The atlas step").
+#[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
+fn atlas_step(
+    pending: &PendingResult,
+    skin: &mut skin_model::Skin,
+    slot: &Slot,
+    base: Option<Arc<ImageEntry>>,
+    others: Others,
+    cancel: &Cancel,
+    check: &dyn Fn() -> bool,
+) -> Result<Bound, Box<NotBound>> {
+    #[cfg(not(all(test, feature = "dev-tools")))]
+    let _ = cancel;
     let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
-    let (kept, _) = imports::plan_layers(&mut skin, variant, pending.target.limits);
+    let (kept, _) = imports::plan_layers(skin, variant, pending.target.limits);
     let entry = lock(slot).as_ref().and_then(|i| i.entry.clone());
     let held = entry
         .as_ref()
@@ -977,9 +1091,9 @@ fn lay_out(
                     None => {
                         #[cfg(feature = "dev-tools")]
                         crate::dev::loop_probe::mark("rl:branch_refused", 1);
-                        return Laid::refused(
+                        return Err(Box::new(NotBound::refused(
                             "the layout's images do not fit one atlas".to_owned(),
-                        );
+                        )));
                     }
                 }
             };
@@ -989,11 +1103,11 @@ fn lay_out(
             drop(guard);
             let (images, room) = release(images, base.as_ref(), others);
             if !room {
-                return Laid {
-                    result: Err(Unbuilt::Deferred),
-                    taken: Some(images),
-                    needs: None,
-                };
+                return Err(Box::new(NotBound {
+                    why: Unbuilt::Deferred,
+                    lent: Some(images),
+                    built: None,
+                }));
             }
             let kept_cells = images.cells;
             drop(images.entry);
@@ -1025,14 +1139,14 @@ fn lay_out(
                     a
                 }
                 Err(e) => {
-                    return Laid {
-                        result: Err(format!("the atlas cannot be built: {e}").into()),
-                        taken: Some(Images {
+                    return Err(Box::new(NotBound {
+                        why: format!("the atlas cannot be built: {e}").into(),
+                        lent: Some(Images {
                             cells: kept_cells,
                             ..Images::default()
                         }),
-                        needs: None,
-                    };
+                        built: None,
+                    }));
                 }
             };
             let new = Arc::new(ImageEntry {
@@ -1040,7 +1154,11 @@ fn lay_out(
                 packed,
                 #[cfg(feature = "dev-tools")]
                 import_permit: IMPORT_PERMIT.get(),
+                #[cfg(all(test, feature = "dev-tools"))]
+                _dropped: preload::tests::DropWitness,
             });
+            #[cfg(all(test, feature = "dev-tools"))]
+            preload::tests::built_gate();
             let taken = Some(Images {
                 entry: Some(Arc::clone(&new)),
                 ..Images::default()
@@ -1048,34 +1166,25 @@ fn lay_out(
             match new.atlas.rebind_keeping(skin.sheet(), variant, kept) {
                 Ok(a) => (a, Some(new), taken),
                 Err(e) => {
-                    return Laid {
-                        result: Err(format!("the layout cannot be bound: {e}").into()),
-                        taken,
-                        needs: None,
-                    };
+                    return Err(Box::new(NotBound {
+                        why: format!("the layout cannot be bound: {e}").into(),
+                        lent: None,
+                        built: taken,
+                    }));
                 }
             }
         }
     };
-    let needs = Needs {
-        sheet: skin.sheet().clone(),
-        variant,
-        kept,
-    };
-    let result = imports::bundle_of(skin, scratch, atlas, &pending.target, cancel)
-        .map(|bundle| Specialized {
-            bundle,
-            facts: deps,
-            entry,
-            script: None,
-            derived: None,
-        })
-        .map_err(Unbuilt::from);
-    Laid {
-        result,
+    Ok(Bound {
+        atlas,
+        entry,
         taken,
-        needs: Some(needs),
-    }
+        needs: Needs {
+            sheet: skin.sheet().clone(),
+            variant,
+            kept,
+        },
+    })
 }
 
 impl ResultSkin {
@@ -1190,9 +1299,9 @@ impl ResultSkin {
     /// either mode, and stays. The first decision drops nothing.
     pub fn set_kept_probe(&mut self, kept: bool) {
         if self.kept.replace(kept).is_some_and(|was| was != kept) {
-            // A running pack hands the image state back first; its pages
-            // are not kept.
-            self.settle_preload(Then::Retired);
+            // A running pack is stopped, its holdings quarantined until its
+            // outcome is collected and disposed of; nothing of it is kept.
+            self.preload_on(Event::Invalidate);
             self.probe = None;
             self.image = None;
             self.cells = None;
@@ -1200,7 +1309,6 @@ impl ResultSkin {
             self.presented.take_if(|l| l.entry.is_some());
             self.published
                 .take_if(|p| matches!(p, Published::Skin(_, Some(_), _)));
-            self.preload = Preload::Retired;
         }
     }
 
@@ -1523,16 +1631,19 @@ impl ResultSkin {
     }
 
     /// The attempt's image stage for the chart and judgment class set,
-    /// with no pack to adopt. A pack still running hands the image state
-    /// back first: an unclaimed one (the pause's acknowledgement before
-    /// Preparing leaves none in its build; should one be, it takes this
-    /// path) or one whose mode is no longer preferred is stopped and its
-    /// outcome discarded, waited for to its next checkpoint; a packed one
-    /// is reused below. The stage ends the preload either way (design.md
-    /// "beatoraja Lua Skins", the result skin's preload).
+    /// with no pack to adopt ([`Event::Attempt`]): the stage ends the
+    /// preload (design.md "beatoraja Lua Skins", the result skin's
+    /// preload). A pack still in flight (an unclaimed one, which the
+    /// pause's acknowledgement before Preparing leaves out of its build,
+    /// or one whose mode is no longer preferred) is stopped, and the stage
+    /// first waits for its outcome to be collected in Preparing's polls
+    /// ([`ImageStage::Running`]): nothing else takes the image state
+    /// meanwhile. A packed one is reused below.
     fn attempt_stage(&mut self) -> ImageStage {
-        self.settle_preload(Then::Idle);
-        self.preload = Preload::Retired;
+        self.preload_on(Event::Attempt);
+        if let Some(id) = self.pack_in_flight() {
+            return ImageStage::Running(Box::new(ImageJob(InFlight::Draining(id))));
+        }
         let (Some(chart), Some(class)) = (self.chart, self.class) else {
             return ImageStage::Ready(Staged::Ready);
         };
@@ -1739,7 +1850,7 @@ impl ResultSkin {
     ) -> Option<Staged> {
         let (mut quit, mut end_run) = (quit, end_run);
         loop {
-            match &mut job.0 {
+            let id = match &mut job.0 {
                 InFlight::Own { job, slot } => {
                     let ran = job.wait_until(until, &mut quit, &mut end_run)?;
                     let staged = self.finish_image_stage(slot, ran);
@@ -1749,17 +1860,17 @@ impl ResultSkin {
                         staged
                     });
                 }
-                InFlight::Adopted(a) => {
-                    if !self.wait_adopted(a, until, &mut quit, &mut end_run)? {
-                        return Some(Staged::Cancelled);
-                    }
-                    // Collected: the stage is decided from what the pack
-                    // left, its own job begun only when it left nothing.
-                    match self.attempt_stage() {
-                        ImageStage::Ready(staged) => return Some(staged),
-                        ImageStage::Running(next) | ImageStage::Adopted(next) => *job = *next,
-                    }
-                }
+                InFlight::Adopted(a) => a.id(),
+                InFlight::Draining(id) => *id,
+            };
+            if !self.wait_pack(id, until, &mut quit, &mut end_run)? {
+                return Some(Staged::Cancelled);
+            }
+            // Collected: the stage is decided from what the pack left, its
+            // own job begun only when it left nothing.
+            match self.attempt_stage() {
+                ImageStage::Ready(staged) => return Some(staged),
+                ImageStage::Running(next) | ImageStage::Adopted(next) => *job = *next,
             }
         }
     }
@@ -1773,7 +1884,9 @@ impl ResultSkin {
     /// images are handed back; an abandoned one keeps them. An adopted
     /// pack is handed back to the preload as its claim drops, its thread
     /// not waited for, unless the run ends: then it is cancelled and
-    /// waited for within the same bound.
+    /// waited for until the run's shared stop deadline. A stage waiting
+    /// for a stopped pack's collection leaves it to the preload the same
+    /// way.
     pub fn settle_image_stage(
         &mut self,
         job: &mut ImageJob,
@@ -1781,7 +1894,7 @@ impl ResultSkin {
     ) -> imports::Settled {
         let (job, slot) = match &mut job.0 {
             InFlight::Own { job, slot } => (job, slot),
-            InFlight::Adopted(_) => {
+            InFlight::Adopted(_) | InFlight::Draining(_) => {
                 if end_run() {
                     self.end_preload(imports::STOP_WAIT);
                 }

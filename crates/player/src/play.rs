@@ -1108,6 +1108,19 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// The practice page's gate on the result skin's preload, before the
+    /// page releases its pause or admits a job (design.md "State Model",
+    /// the practice page): a running pack is stopped, latched for its job,
+    /// while the page's jobs want the room
+    /// ([`crate::page_jobs::PageJobs::preload_may_run`]).
+    pub(crate) fn gate_preload(&mut self) {
+        let Some(sel) = &self.selection else {
+            return;
+        };
+        let may_run = sel.page.preload_may_run();
+        self.result_skin.gate_preload(may_run);
+    }
+
     /// Whether the render thread disabled the result skin for the run (the
     /// S10-09i design's D7), as the presenter now knows too.
     fn result_run_disabled(&mut self) -> bool {

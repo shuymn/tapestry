@@ -970,14 +970,15 @@ impl Drop for Shelf {
     /// background completed are stored with the load's.
     fn drop(&mut self) {
         let background = self.background.take();
-        // Both stop at once, and share one deadline.
+        // All stop at once, and share one deadline: the run's, which the
+        // result skin's end may have set already.
         let bound = self.stop_timeout();
-        let deadline = Instant::now() + bound;
+        let mut deadline = Instant::now() + bound;
+        if let Some(preload) = &self.preload {
+            deadline = preload.close_by(deadline);
+        }
         if let Some(worker) = &background {
             worker.stop();
-        }
-        if let Some(preload) = &self.preload {
-            preload.close();
         }
         let (quiet, stopped) = stop_together(
             deadline,
@@ -1009,7 +1010,7 @@ impl Drop for Shelf {
         // The result skin's preload, stopped with the others, within what
         // is left of the same bound.
         if let Some(preload) = &self.preload
-            && !preload.wait_ended(deadline.saturating_duration_since(Instant::now()))
+            && !preload.wait_closed()
         {
             let line = format!(
                 "skin: result: the preload did not stop within {} s; it ends with the process",

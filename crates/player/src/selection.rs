@@ -4461,6 +4461,8 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn poll_page(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // The preload's pack stops before the page admits its jobs.
+        self.gate_preload();
         match self.begin_page_when_ready() {
             Ok(()) => {}
             Err(PageBegin::Failed(failure)) => return Err(game::LiveError::Load(failure)),
@@ -4511,8 +4513,10 @@ impl AppRig for PlayerRig<'_> {
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.leave_result();
         // A Start's claim on the result skin's preload ends with its
-        // return to the page, where the page's jobs decide again.
+        // return to the page, where the page's jobs decide again: the
+        // pack's stop latched before the pause is released below.
         self.preload_claim = None;
+        self.gate_preload();
         // A result left for the practice page (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
