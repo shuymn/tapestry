@@ -1109,7 +1109,7 @@ impl ResultSkin {
 
     /// Drops `what` on the disposal thread ([`Disposer`]), reserved before
     /// any pack began: nothing a pack leaves is freed on the game thread.
-    fn dispose<T: Send + 'static>(&self, what: T) {
+    pub(super) fn dispose<T: Send + 'static>(&self, what: T) {
         self.dispose_with(Box::new(move || drop(what)));
     }
 

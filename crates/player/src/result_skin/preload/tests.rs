@@ -449,6 +449,31 @@ fn a_published_outcome_of_a_disabled_run_is_disposed_off_the_game_thread() {
     a_published_outcome_retired_before_collection(false);
 }
 
+/// A pack collected into the image state, its atlas resident, then the
+/// kept probe's decision changed before the first attempt: the atlas and
+/// what is bound to it go to the disposal thread, so its last reference
+/// drops there, not on the game thread (design.md "beatoraja Lua Skins",
+/// the result skin's preload).
+#[test]
+fn a_collected_atlas_dropped_by_a_mode_change_is_freed_off_the_game_thread() {
+    let _s = crate::imports::tests::serial();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    let witness = Witness::on();
+    look(&mut rs, &coord, true);
+    collected(&mut rs, &coord);
+    assert!(rs.image().is_some(), "the pack's atlas is resident");
+    rs.set_kept_probe(false);
+    assert!(rs.image().is_none(), "dropped with the mode");
+    assert_eq!(
+        witness.dropped(1),
+        ["result-dispose"],
+        "freed off the game thread"
+    );
+}
+
 /// The run's end with a pack's packed outcome sent but not collected: the
 /// close hands the receiver, the outcome in it and the lent slot to the
 /// disposal thread, so the new pages' last reference goes there, not on

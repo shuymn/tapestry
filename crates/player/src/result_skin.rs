@@ -1298,19 +1298,25 @@ impl ResultSkin {
     /// probe's union base), so no later probe or view packs or binds cells
     /// only the other mode keeps. A bundle for every view of a skin that
     /// reads no fact of the viewed result has its own atlas, the same in
-    /// either mode, and stays. The first decision drops nothing.
+    /// either mode, and stays. The first decision drops nothing. What is
+    /// dropped goes to the preload's disposal thread once a pack began
+    /// (a collected pack's atlas among it), never freed here (design.md
+    /// "beatoraja Lua Skins", the result skin's preload).
     pub fn set_kept_probe(&mut self, kept: bool) {
         if self.kept.replace(kept).is_some_and(|was| was != kept) {
             // A running pack is stopped, its holdings quarantined until its
             // outcome is collected and disposed of; nothing of it is kept.
             self.preload_on(Event::Invalidate);
-            self.probe = None;
-            self.image = None;
-            self.cells = None;
-            self.layout.take_if(|l| l.entry.is_some());
-            self.presented.take_if(|l| l.entry.is_some());
-            self.published
-                .take_if(|p| matches!(p, Published::Skin(_, Some(_), _)));
+            let dropped = (
+                self.probe.take(),
+                self.image.take(),
+                self.cells.take(),
+                self.layout.take_if(|l| l.entry.is_some()),
+                self.presented.take_if(|l| l.entry.is_some()),
+                self.published
+                    .take_if(|p| matches!(p, Published::Skin(_, Some(_), _))),
+            );
+            self.dispose(dropped);
         }
     }
 
