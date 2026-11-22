@@ -15547,7 +15547,7 @@ pub(crate) mod tests {
             list_revision: 1,
             page: one_line("select"),
             view: skin_model::SelectionView::default(),
-            labels: crate::select::labels(),
+            labels: crate::select::labels(game::ScoreTarget::Max),
             strip: crate::selection_skin::StripText::default(),
             events: crate::selection_skin::SelectionEvents::default(),
             settings: None,

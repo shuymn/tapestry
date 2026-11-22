@@ -577,6 +577,7 @@ fn paced_attempt(chart: &Chart, pace: Arc<[u32]>) -> AttemptContext {
             best,
             best_known: true,
             target: best,
+            setting: Some(game::ScoreTarget::Max),
         },
         pace: Some(pace),
         ..game::Attempt::new(

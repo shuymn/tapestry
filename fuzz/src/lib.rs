@@ -537,6 +537,7 @@ fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
     let uvs = atlas_uvs(skin);
     let labels = ResultLabels {
         title: "t".to_owned(),
+        target: "MAX".to_owned(),
         ..ResultLabels::default()
     };
     let mut res = skin.prepare_result();
@@ -671,6 +672,12 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
     let labels = SelectionLabels {
         all_charts: "all".to_owned(),
         search_results: "found".to_owned(),
+        // Names a skin's target texts draw (texts 3 and 200-219).
+        targets: skin_model::TargetNames {
+            chosen: "MAX".to_owned(),
+            before: std::array::from_fn(|i| format!("RANK {i}")),
+            after: std::array::from_fn(|i| format!("NEXT {i}")),
+        },
     };
     let mut sel = skin.prepare_selection();
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());

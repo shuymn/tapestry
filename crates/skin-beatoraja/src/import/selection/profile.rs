@@ -15,7 +15,7 @@
 //! Every reader of an id, a JSON field's `ref` or `op` and a Lua host
 //! read alike, goes through these functions, so the two cannot differ.
 
-use skin_model::{RatioSource, SelectionText, TextField, selection_timer};
+use skin_model::{RatioSource, SelectionText, TargetName, TextField, selection_timer};
 
 /// What the profile does with an id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,6 +398,8 @@ pub(crate) enum SelText {
     /// The cursor's row and chart, as the chart fields read on selection.
     Field(TextField),
     Screen(SelectionText),
+    /// A target's name.
+    Target(TargetName),
 }
 
 /// The selection text `id`.
@@ -411,8 +413,19 @@ pub(crate) fn text(id: i32) -> Option<Class<SelText>> {
         16 => Bridge(SelText::Field(TextField::FullArtist)),
         30 => Bridge(SelText::Screen(SelectionText::Query)),
         1000 => Bridge(SelText::Screen(SelectionText::Place)),
-        // Rivals, targets, IR, rankings and courses.
-        1 | 3 | 120..=124 | 150..=154 | 201..=218 | 1020 => Omit,
+        // The chosen target's name, and the ten before (200 the tenth,
+        // 209 the first) and after it (210 the first, 219 the tenth)
+        // (`StringPropertyFactory.java:86-88` at `0.8.9`).
+        3 => Bridge(SelText::Target(TargetName::Chosen)),
+        // Source: SF-023
+        200..=209 => Bridge(SelText::Target(TargetName::Before(
+            u8::try_from(210 - id).ok()?,
+        ))),
+        210..=219 => Bridge(SelText::Target(TargetName::After(
+            u8::try_from(id - 209).ok()?,
+        ))),
+        // Rivals, IR, rankings and courses.
+        1 | 120..=124 | 150..=154 | 1020 => Omit,
         _ => return None,
     })
 }
@@ -763,13 +776,13 @@ mod tests {
 
     const TEXT: &[(i32, i32, C)] = &[
         (1, 1, C::D),
-        (3, 3, C::D),
+        (3, 3, C::N),
         (10, 13, C::N),
         (16, 16, C::N),
         (30, 30, C::N),
         (120, 124, C::D),
         (150, 154, C::D),
-        (201, 218, C::D),
+        (200, 219, C::N),
         (1000, 1000, C::N),
         (1020, 1020, C::D),
     ];

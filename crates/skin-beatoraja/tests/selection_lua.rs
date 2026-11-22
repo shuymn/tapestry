@@ -247,7 +247,8 @@ fn lua_timer_reads_take_the_selection_timers() {
 }
 
 /// Lua text and image index reads take the selection bridges as their
-/// JSON `ref`s do: text 30 (the query) and image index 370 (the selected
+/// JSON `ref`s do: text 30 (the query), 1000 (the place) and 205 (the
+/// fifth target before the chosen one) and image index 370 (the selected
 /// row's clear type).
 #[test]
 fn lua_reads_take_the_selection_text_and_index_bridges() {
@@ -256,6 +257,9 @@ fn lua_reads_take_the_selection_text_and_index_bridges() {
                 table.insert(skin.text, { id = \"pl\", font = \"f\", size = 10,\n\
                   value = function() return ms.text(1000) end })\n\
                 table.insert(skin.destination, { id = \"pl\", dst = { { x = 0, y = 20, w = 100, h = 10 } } })\n\
+                table.insert(skin.text, { id = \"tn\", font = \"f\", size = 10,\n\
+                  value = function() return ms.text(205) end })\n\
+                table.insert(skin.destination, { id = \"tn\", dst = { { x = 0, y = 40, w = 100, h = 10 } } })\n\
                 table.insert(skin.imageset, { id = \"ct\",\n\
                   images = { \"b0\", \"b0\", \"b0\", \"b0\", \"b0\", \"b1\" },\n\
                   value = function() return ms.event_index(370) end })\n\
@@ -268,7 +272,7 @@ fn lua_reads_take_the_selection_text_and_index_bridges() {
             .iter()
             .filter(|d| **d == Disposition::Lowered)
             .count(),
-        3,
+        4,
         "{:?}",
         i.callbacks
     );
@@ -282,6 +286,7 @@ fn lua_reads_take_the_selection_text_and_index_bridges() {
     let (texts, _) = s.requests();
     assert!(texts.iter().any(|(_, t)| t == "Q"), "{texts:?}");
     assert!(texts.iter().any(|(_, t)| t == "X > "), "{texts:?}");
+    assert!(texts.iter().any(|(_, t)| t == "P5"), "{texts:?}");
     // A normal clear: the source's clear type 5, image 5 of the set.
     let at_700: Vec<[u8; 2]> = s
         .drawn(0)

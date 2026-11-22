@@ -183,6 +183,8 @@ fn skin() -> Fx {
         // The cursor's chart's notes and BPM graphs.
         element(Source::JudgeGraph(0), [NOTES_AT[0], NOTES_AT[1], 300, 60]),
         element(Source::BpmGraph(0), [BPM_AT[0], BPM_AT[1], 300, 60]),
+        // The tenth target before the chosen one (S10-44).
+        element(Source::Text(2), [500, 110, 200, 20]),
     ];
     let hover = HoverRect {
         x: 0,
@@ -236,6 +238,7 @@ fn skin() -> Fx {
             texts: vec![
                 text(TextValue::Field(TextField::FullTitle)),
                 text(TextValue::Selection(skin_model::SelectionText::Place)),
+                text(TextValue::Target(skin_model::TargetName::Before(10))),
             ],
             ..WidgetDefs::default()
         },
@@ -472,7 +475,17 @@ fn a_selection_build_allocates_nothing() {
             c.best = None;
             c.clears = 0;
         }
-        fx.view(&v);
+        // The labels every view takes, the target names among them: the
+        // player's own, the same each view.
+        let labels = skin_model::SelectionLabels {
+            targets: skin_model::TargetNames {
+                chosen: "MAX".to_owned(),
+                before: std::array::from_fn(|i| format!("RANK {i}")),
+                after: std::array::from_fn(|i| format!("NEXT {i}")),
+            },
+            ..selection_support::labels_of()
+        };
+        fx.skin.update_selection(&mut fx.sel, &v, &labels).unwrap();
         let texts = TextTable::new(vec![line; fx.skin.text_slots()]);
         let row_texts = TextTable::new(vec![line; fx.skin.song_list_slots()]);
         fx.skin
@@ -505,7 +518,6 @@ fn a_selection_build_allocates_nothing() {
         // A view change, its strings' capacity reached: the fields, the
         // best play's numbers and the bars' ratios are filled in place.
         // The labels are made before the count, as the player keeps its own.
-        let labels = selection_support::labels_of();
         total += counted(|| {
             for view in [&bare, &v] {
                 fx.skin

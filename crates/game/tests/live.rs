@@ -7045,11 +7045,13 @@ fn a_play_reads_its_best_once_however_often_it_is_prepared() {
         best: 0,
         best_known: true,
         target: 3,
+        setting: Some(game::ScoreTarget::Next),
     };
     let retry = game::ScoreBasis {
         best: 3,
         best_known: true,
         target: 4,
+        setting: Some(game::ScoreTarget::Next),
     };
     assert_eq!(scores, [first, first, first, retry]);
     // One read per play, under the play preset.

@@ -90,6 +90,7 @@ pub fn decision_strings(l: &skin_model::ChartLabels) -> DecisionStrings {
         artist: l.artist.clone(),
         subartist: l.subartist.clone(),
         genre: l.genre.clone(),
+        target: String::new(),
     })
 }
 

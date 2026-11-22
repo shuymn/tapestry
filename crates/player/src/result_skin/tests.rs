@@ -452,6 +452,19 @@ fn at_target(
     target: game::ScoreTarget,
     answer: Option<game::BestLookup>,
 ) -> (tempfile::TempDir, game::Loaded) {
+    at_target_chart(
+        target,
+        answer,
+        &format!("#BPM 120\n#00111:{}\n", "01".repeat(27)),
+    )
+}
+
+/// The chart `bms` loaded as [`at_target`] loads its own.
+fn at_target_chart(
+    target: game::ScoreTarget,
+    answer: Option<game::BestLookup>,
+    bms: &str,
+) -> (tempfile::TempDir, game::Loaded) {
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings {
@@ -461,7 +474,7 @@ fn at_target(
     };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.bms");
-    fs::write(&path, format!("#BPM 120\n#00111:{}\n", "01".repeat(27))).unwrap();
+    fs::write(&path, bms).unwrap();
     let config = game::SessionConfig {
         lead_in: bms_model::TimeUs(1_000_000),
         step: bms_model::TimeUs(1_000),
@@ -525,6 +538,58 @@ fn the_result_carries_the_plays_target() {
         .unwrap();
     drop(loaded.begin_play());
     assert_eq!(target(&loaded), 0, "a practice round");
+}
+
+/// The result names the target its play was paced against, the choice its
+/// score captured with T (design.md "Personal Bests", Target): on a chart
+/// that declares `#RANDOM`, `"next"` and `"max"` both pace at 54 and are
+/// named "NEXT RANK" and "MAX"; on a fixed chart `"next"` over a best of
+/// 40 paces at rank 21's 42 and is still "NEXT RANK"; a practice round
+/// after a full play under the same setting names none.
+#[test]
+fn the_result_names_the_plays_target_choice() {
+    let known = || {
+        Some(game::BestLookup::Known(game::BestScore {
+            plays: 1,
+            ex: Some(40),
+            bp: Some(0),
+            max_combo: None,
+            clear: None,
+        }))
+    };
+    let name = |l: &game::Loaded| {
+        let a = l.attempt();
+        crate::result_present::labels_of(&a.labels, a.score.setting).target
+    };
+    let notes = "01".repeat(27);
+    let random = format!(
+        "#BPM 120\n#RANDOM 2\n#IF 1\n#00111:{notes}\n#ENDIF\n#IF 2\n#00112:{notes}\n#ENDIF\n#ENDRANDOM\n"
+    );
+    for (setting, want) in [
+        (game::ScoreTarget::Next, "NEXT RANK"),
+        (game::ScoreTarget::Max, "MAX"),
+    ] {
+        let (_dir, mut loaded) = at_target_chart(setting, known(), &random);
+        drop(loaded.begin_play());
+        assert_eq!(loaded.attempt().score.target, 54, "{setting:?}");
+        assert_eq!(name(&loaded), want, "{setting:?}");
+    }
+    let (_dir, mut loaded) = at_target(game::ScoreTarget::Next, known());
+    drop(loaded.begin_play());
+    assert_eq!(loaded.attempt().score.target, 42);
+    assert_eq!(name(&loaded), "NEXT RANK");
+    let gauges = loaded.attempt().gauges.len();
+    loaded
+        .set_practice(Some(game::Practice {
+            start: bms_model::TimeUs(0),
+            end: bms_model::TimeUs(3_000_000),
+            lead_in: bms_model::TimeUs(1_000_000),
+            initial_gauges: vec![rules::GaugeValue(20 * rules::GaugeValue::PERCENT); gauges],
+            repeat: true,
+        }))
+        .unwrap();
+    drop(loaded.begin_play());
+    assert_eq!(name(&loaded), "", "a practice round");
 }
 
 /// A renderer that lags: it holds the bundles it took and reports their

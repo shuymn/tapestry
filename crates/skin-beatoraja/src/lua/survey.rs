@@ -251,6 +251,7 @@ fn decision_frames(skin: &skin_model::Skin, widget_quads: u32) -> Option<Frames>
         artist: "Artist".into(),
         subartist: "Subartist".into(),
         genre: "Genre".into(),
+        target: String::new(),
     };
     skin.update_decision(&mut dec, &labels).ok()?;
     skin.attach_decision_bitmap_text(&mut dec);

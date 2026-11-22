@@ -158,6 +158,8 @@ fn skin() -> Skin {
                 [600, TARGET_AT[2], 10, 10],
                 Some("result.valid"),
             ),
+            // The play's target's name (S10-44).
+            relement(Source::Text(1), [600, 300, 200, 20], None),
         ],
         WidgetDefs {
             numbers: vec![
@@ -174,7 +176,13 @@ fn skin() -> Skin {
                 number("target.rate_bp / 100", 3),
                 number("ex_score - target.ex", 6),
             ],
-            texts: vec![text(TextField::FullTitle)],
+            texts: vec![
+                text(TextField::FullTitle),
+                TextDef {
+                    value: TextValue::Target(skin_model::TargetName::Chosen),
+                    ..text(TextField::FullTitle)
+                },
+            ],
             image_choices: vec![choice],
             ..WidgetDefs::default()
         },
@@ -369,7 +377,7 @@ fn a_result_build_allocates_nothing() {
             );
         }
         fx.skin
-            .attach_result_text(&mut fx.res, TextTable::new(vec![line; 1]))
+            .attach_result_text(&mut fx.res, TextTable::new(vec![line; 2]))
             .unwrap();
         // The first build after each view change counts too.
         total += counted(|| fx.frame(0));

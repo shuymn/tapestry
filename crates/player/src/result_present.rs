@@ -534,14 +534,20 @@ pub fn view_of(screen: &ResultScreen, chart: ResultChart) -> ResultView {
     }
 }
 
-/// The chart's strings a result skin shows, from the attempt's labels.
-pub fn labels_of(l: &game::ChartLabels) -> ResultLabels {
+/// The strings a result skin shows: the attempt's chart labels, and the
+/// name of the target its play was paced against, `setting` as its score
+/// captured it, none for a practice round (design.md "Personal Bests",
+/// Target).
+pub fn labels_of(l: &game::ChartLabels, setting: Option<game::ScoreTarget>) -> ResultLabels {
     ResultLabels {
         title: l.title.clone(),
         subtitle: l.subtitle.clone(),
         artist: l.artist.clone(),
         subartist: l.subartist.clone(),
         genre: l.genre.clone(),
+        target: setting.map_or_else(String::new, |t| {
+            crate::ui_text::Label::Target(t).text().to_owned()
+        }),
     }
 }
 

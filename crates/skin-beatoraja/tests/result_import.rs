@@ -1692,6 +1692,51 @@ fn the_target_reads_while_a_lua_skin_loads() {
     );
 }
 
+/// S10-44: text 3 on the result is the name of the play's target, the
+/// result's labels' own, read by a Lua function as by `ref`; a practice
+/// round's labels name none, so nothing is requested.
+#[test]
+fn result_text_3_is_the_plays_target_name() {
+    let ex = lua_value("ex", 4, "value = function() return ms.number(71) end");
+    let pre = "skin.text = { { id = \"t\", font = \"f\", size = 10,\n\
+                 value = function() return ms.text(3) end },\n\
+               { id = \"r\", font = \"f\", size = 10, ref = 3 } }";
+    let dsts = lua_dst("ex", 100, 4, "")
+        + ", "
+        + &lua_dst("t", 400, 64, "")
+        + ", "
+        + &lua_dst("dot", 300, 8, "draw = function() return ms.option(91) end,")
+        + ", "
+        + &lua_dst("r", 500, 64, "");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &dsts).as_bytes(),
+    );
+    let lua = lua_result(d.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let mut r = Res::new(lua.imported.skin);
+    let view = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    let texts = |r: &Res| -> Vec<String> {
+        r.skin
+            .result_text_requests(&r.res, [1_920, 1_080], &skin_model::Layout::AUTHOR)
+            .into_iter()
+            .map(|t| t.text)
+            .collect()
+    };
+    let named = skin_model::ResultLabels {
+        target: "RANK AA".to_owned(),
+        ..common::result::labels()
+    };
+    r.skin.update_result(&mut r.res, &view, &named).unwrap();
+    assert_eq!(texts(&r), ["RANK AA", "RANK AA"]);
+    r.skin
+        .update_result(&mut r.res, &view, &common::result::labels())
+        .unwrap();
+    assert!(texts(&r).is_empty(), "{:?}", texts(&r));
+}
+
 /// A result skin's text reading the chart's gauge total and note count
 /// keeps the record it has with those facts unavailable: the chart facts
 /// are a play text's alone, and none is recorded.

@@ -335,6 +335,25 @@ impl ScoreTarget {
         Self::Next,
     ];
 
+    /// The target `k` places after this one in [`ALL`](Self::ALL), `k`
+    /// before it for a negative `k`, wrapping around the list both ways
+    /// (design.md "Personal Bests", Target: a selection skin names the ten
+    /// before and after the chosen one).
+    // Source: SF-023
+    #[must_use]
+    pub fn offset(self, k: i32) -> Self {
+        const LEN: i32 = 12;
+        let at = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        // Both terms are below 12, so the sum fits; `k` is reduced first so
+        // no `k` overflows.
+        let i = (i32::try_from(at).unwrap_or(0) + k.rem_euclid(LEN)) % LEN;
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| Self::ALL.get(i))
+            .copied()
+            .unwrap_or(self)
+    }
+
     /// A rank target's 27ths.
     const fn rank(self) -> Option<u64> {
         Some(match self {
@@ -404,6 +423,26 @@ mod tests {
         Judgment::Perfect,
         Judgment::Poor,
     ];
+
+    /// `offset` wraps around the twelve targets both ways, from the first
+    /// and the last, and for any `k`, the extremes included (design.md
+    /// "Personal Bests", Target).
+    // Source: SF-023
+    #[test]
+    fn offset_wraps_around_the_list() {
+        use ScoreTarget::{A, AMinus, APlus, MaxMinus, Next};
+        assert_eq!(AMinus.offset(-1), Next);
+        assert_eq!(AMinus.offset(-10), ScoreTarget::ALL[2]);
+        assert_eq!(Next.offset(1), AMinus);
+        assert_eq!(Next.offset(10), ScoreTarget::ALL[9]);
+        assert_eq!(A.offset(0), A);
+        assert_eq!(A.offset(12), A);
+        assert_eq!(A.offset(-13), AMinus);
+        // `i32::MIN` is 4 mod 12 and `i32::MAX` 7.
+        assert_eq!(APlus.offset(i32::MIN), ScoreTarget::ALL[6]);
+        assert_eq!(APlus.offset(i32::MAX), ScoreTarget::ALL[9]);
+        assert_eq!(ScoreTarget::ALL[9], MaxMinus);
+    }
 
     /// The series follows the preset's weights: with GREAT weighted 3,
     /// the entry after the GREAT rises by 3, not by the default 1.

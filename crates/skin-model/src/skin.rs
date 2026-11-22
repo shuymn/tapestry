@@ -79,8 +79,9 @@ use crate::widget::song_list::{
 };
 use crate::widget::text::clean;
 use crate::widget::text::{
-    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, SelectionText, Text,
-    TextDef, TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
+    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, ScreenText,
+    SelectionText, TargetName, Text, TextDef, TextError, TextRequest, TextSlots, TextTable,
+    TextTableError, TextValue,
 };
 use crate::widget::timing_graph::{TimingGraph, TimingGraphDef, TimingGraphDraw};
 use crate::widget::timing_vis::{
@@ -1151,6 +1152,12 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
                 let error = TextError::Literal;
                 return Err(LoadError::Text { element, error });
             }
+            if let Some(TextValue::Target(t)) = w.texts.get(index(i)).map(|t| &t.value)
+                && !t.valid()
+            {
+                let error = TextError::TargetOffset;
+                return Err(LoadError::Text { element, error });
+            }
         }
         Source::Image(_)
         | Source::Lanes
@@ -1590,6 +1597,17 @@ fn check_bar_groups(
     Ok(())
 }
 
+/// The target name `source` shows, if it is a text showing one.
+fn target_text(def: &SkinDef, source: Source) -> Option<TargetName> {
+    match source {
+        Source::Text(i) => match def.widgets.texts.get(index(i)).map(|t| &t.value) {
+            Some(TextValue::Target(t)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether `source` is a text showing a selection screen's string.
 fn selection_text(def: &SkinDef, source: Source) -> bool {
     match source {
@@ -1637,7 +1655,9 @@ fn check_kind(
                     .image_choices
                     .get(index(i))
                     .is_none_or(|c| c.value.constant().is_some()),
-                Source::Text(_) => !selection_text(def, e.source),
+                Source::Text(_) => {
+                    !selection_text(def, e.source) && target_text(def, e.source).is_none()
+                }
                 Source::Lanes
                 | Source::Number(_)
                 | Source::Gauge(_)
@@ -1679,6 +1699,10 @@ fn check_kind(
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
+                            target_text(def, e.source),
+                            Some(TargetName::Before(_) | TargetName::After(_))
+                        )
+                        && !matches!(
                             e.source,
                             Source::Lanes
                                 | Source::Gauge(_)
@@ -1701,6 +1725,7 @@ fn check_kind(
                 Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
+                        && target_text(def, e.source).is_none()
                         && !matches!(
                             e.source,
                             Source::SongList | Source::GaugeGraph(_) | Source::TimingGraph(_)
@@ -3406,6 +3431,17 @@ impl Skin {
         target: [u32; 2],
         layout: &Layout,
     ) -> Vec<TextRequest> {
+        self.text_requests_with(chart, &ScreenText::default(), target, layout)
+    }
+
+    /// [`text_requests`](Self::text_requests) with `screen`'s strings.
+    fn text_requests_with(
+        &self,
+        chart: &ChartText<'_>,
+        screen: &ScreenText<'_>,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> Vec<TextRequest> {
         let (fit, ..) = self.fit(target);
         let mut out = Vec::new();
         for e in &self.elements {
@@ -3421,7 +3457,7 @@ impl Skin {
             if t.bitmap.is_some() {
                 continue;
             }
-            let s = text::clean(&def.value.resolve(chart));
+            let s = text::clean(&def.value.resolve_with(chart, screen));
             if s.is_empty() {
                 continue;
             }
@@ -3457,12 +3493,16 @@ impl Skin {
     /// visibility folds to false, or whose line has a value beyond
     /// ±[`MAX_TEXT_EM`](crate::MAX_TEXT_EM) em, gets no line.
     pub fn attach_bitmap_text(&self, play: &mut Play, chart: &ChartText<'_>) {
-        play.set_bitmap(self.bitmap_lines(chart));
+        play.set_bitmap(self.bitmap_lines(chart, &ScreenText::default()));
     }
 
     /// The bitmap lines of `chart`, one per text slot, as
     /// [`attach_bitmap_text`](Self::attach_bitmap_text) lays them out.
-    fn bitmap_lines(&self, chart: &ChartText<'_>) -> Box<[Option<GlyphLine>]> {
+    fn bitmap_lines(
+        &self,
+        chart: &ChartText<'_>,
+        screen: &ScreenText<'_>,
+    ) -> Box<[Option<GlyphLine>]> {
         let mut lines = vec![None; self.text_slots()];
         for e in &self.elements {
             let Kind::Text(i, t) = e.kind else {
@@ -3474,7 +3514,7 @@ impl Skin {
             if e.visible.as_ref().and_then(Program::constant) == Some(0) {
                 continue;
             }
-            let s = text::clean(&def.value.resolve(chart));
+            let s = text::clean(&def.value.resolve_with(chart, screen));
             if let Some(slot) = lines.get_mut(usize::from(t.slot)) {
                 *slot = glyphs::layout(&self.sheet, font, &s);
             }
@@ -4008,10 +4048,7 @@ impl Skin {
             if t.bitmap.is_some() || e.visible.as_ref().and_then(Program::constant) == Some(0) {
                 continue;
             }
-            let s = clean(
-                &def.value
-                    .resolve_with(&chart, &strings.query, &strings.place),
-            );
+            let s = clean(&def.value.resolve_with(&chart, &strings.screen()));
             if !s.is_empty() {
                 out.texts.push(TextRequest {
                     slot: t.slot,
@@ -4108,10 +4145,7 @@ impl Skin {
                 if e.visible.as_ref().and_then(Program::constant) == Some(0) {
                     continue;
                 }
-                let s = clean(
-                    &def.value
-                        .resolve_with(&chart, &strings.query, &strings.place),
-                );
+                let s = clean(&def.value.resolve_with(&chart, &strings.screen()));
                 if let Some(slot) = lines.get_mut(usize::from(t.slot)) {
                     *slot = glyphs::layout(&self.sheet, font, &s);
                 }
@@ -4387,7 +4421,7 @@ impl Skin {
         if !self.owns_result(res) {
             return Vec::new();
         }
-        self.text_requests(&res.strings.chart(), target, layout)
+        self.text_requests_with(&res.strings.chart(), &res.strings.screen(), target, layout)
     }
 
     /// Attaches the rasterized lines for `res`'s text elements; a slot in a
@@ -4412,7 +4446,7 @@ impl Skin {
         if !self.owns_result(res) {
             return;
         }
-        res.bitmap = self.bitmap_lines(&res.strings.chart());
+        res.bitmap = self.bitmap_lines(&res.strings.chart(), &res.strings.screen());
     }
 
     /// Prepares `res`'s frame at `now`: the application's readouts from
@@ -4595,7 +4629,7 @@ impl Skin {
         if self.kind != ScreenKind::Decision {
             return BitmapLines::default();
         }
-        BitmapLines::new(self.bitmap_lines(&strings.chart()))
+        BitmapLines::new(self.bitmap_lines(&strings.chart(), &ScreenText::default()))
     }
 
     /// Attaches the rasterized lines for `dec`'s text elements; a slot in
@@ -4620,7 +4654,7 @@ impl Skin {
         if !self.owns_decision(dec) {
             return;
         }
-        dec.bitmap = self.bitmap_lines(&dec.strings.chart());
+        dec.bitmap = self.bitmap_lines(&dec.strings.chart(), &ScreenText::default());
     }
 
     /// Builds one decision frame of `dec`, which must come from this

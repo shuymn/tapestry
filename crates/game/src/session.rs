@@ -1507,6 +1507,7 @@ impl Loaded {
             best,
             best_known,
             target: score_target(self.settings.player.target, notes, best, play),
+            setting: Some(self.settings.player.target),
         };
         (score, pace)
     }

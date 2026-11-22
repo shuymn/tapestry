@@ -89,6 +89,7 @@ impl Cx<'_> {
             TextFold::Literal(s) => self.cleaned(at, &s).map(TextValue::Literal),
             TextFold::Field(id) => match property::str_in(self.kind, id) {
                 StrProp::Screen(s) => Some(TextValue::Selection(s)),
+                StrProp::Target(t) => Some(TextValue::Target(t)),
                 _ => field(id).map(TextValue::Field),
             },
             TextFold::FieldOr(id, s) => {
@@ -146,6 +147,7 @@ impl Cx<'_> {
             };
             match resolved {
                 StrProp::Screen(s) => TextValue::Selection(s),
+                StrProp::Target(t) => TextValue::Target(t),
                 StrProp::Field(id) => match field(id) {
                     Some(f) => TextValue::Field(f),
                     None => {
@@ -201,6 +203,7 @@ impl Cx<'_> {
                 FontRef::Bitmap(_),
                 TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
             ) => MAX_TEXT_BYTES,
+            (FontRef::Bitmap(_), TextValue::Target(_)) => skin_model::MAX_TARGET_NAME_CHARS,
             _ => 1,
         };
         self.budget

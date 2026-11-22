@@ -426,6 +426,7 @@ mod tests {
                 best: 5,
                 best_known: true,
                 target: 8,
+                setting: Some(game::ScoreTarget::Max),
             },
             pace: Some(std::sync::Arc::from([0, 5])),
             profile: Some(std::sync::Arc::clone(&profile)),

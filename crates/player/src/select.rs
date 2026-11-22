@@ -1858,11 +1858,23 @@ impl SelectScreen {
 
 /// The player's strings a selection skin draws, in the chosen language
 /// (docs/stage3.md S10-09d, #176 C10): the results' name holds no query,
-/// which a skin reads as data.
-pub fn labels() -> SelectionLabels {
+/// which a skin reads as data; and the names of `target`, the chosen
+/// target, and of the ten before and after it in the list, wrapping
+/// (design.md "Personal Bests", Target).
+pub fn labels(target: game::ScoreTarget) -> SelectionLabels {
+    let name = |k: i32| Label::Target(target.offset(k)).text().to_owned();
+    let mut targets = skin_model::TargetNames {
+        chosen: name(0),
+        ..skin_model::TargetNames::default()
+    };
+    for (k, (before, after)) in (1..).zip(targets.before.iter_mut().zip(&mut targets.after)) {
+        *before = name(-k);
+        *after = name(k);
+    }
     SelectionLabels {
         all_charts: Label::AllCharts.text().to_owned(),
         search_results: Label::SearchResults.text().to_owned(),
+        targets,
     }
 }
 
@@ -3557,12 +3569,83 @@ mod tests {
     /// query.
     #[test]
     fn the_skin_labels_are_the_players_strings() {
+        let l = super::labels(game::ScoreTarget::Max);
+        assert_eq!(l.all_charts, "全譜面");
+        assert_eq!(l.search_results, "検索結果");
+    }
+
+    /// The target names are the chosen target's and the ten before and
+    /// after it, nearest first, wrapping around the list both ways from
+    /// its first and its last target (design.md "Personal Bests",
+    /// Target).
+    #[test]
+    fn the_target_names_wrap_around_the_list() {
+        let names = |t: game::ScoreTarget| {
+            let l = super::labels(t).targets;
+            (l.chosen, l.before.to_vec(), l.after.to_vec())
+        };
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // The first: one before is the last, and ten after is MAX.
         assert_eq!(
-            super::labels(),
-            skin_model::SelectionLabels {
-                all_charts: "全譜面".to_owned(),
-                search_results: "検索結果".to_owned(),
-            }
+            names(game::ScoreTarget::AMinus),
+            (
+                "RANK A-".to_owned(),
+                s(&[
+                    "NEXT RANK",
+                    "MAX",
+                    "RANK MAX-",
+                    "RANK AAA+",
+                    "RANK AAA",
+                    "RANK AAA-",
+                    "RANK AA+",
+                    "RANK AA",
+                    "RANK AA-",
+                    "RANK A+",
+                ]),
+                s(&[
+                    "RANK A",
+                    "RANK A+",
+                    "RANK AA-",
+                    "RANK AA",
+                    "RANK AA+",
+                    "RANK AAA-",
+                    "RANK AAA",
+                    "RANK AAA+",
+                    "RANK MAX-",
+                    "MAX",
+                ]),
+            )
+        );
+        // The last: one after is the first, and ten before is RANK A+.
+        assert_eq!(
+            names(game::ScoreTarget::Next),
+            (
+                "NEXT RANK".to_owned(),
+                s(&[
+                    "MAX",
+                    "RANK MAX-",
+                    "RANK AAA+",
+                    "RANK AAA",
+                    "RANK AAA-",
+                    "RANK AA+",
+                    "RANK AA",
+                    "RANK AA-",
+                    "RANK A+",
+                    "RANK A",
+                ]),
+                s(&[
+                    "RANK A-",
+                    "RANK A",
+                    "RANK A+",
+                    "RANK AA-",
+                    "RANK AA",
+                    "RANK AA+",
+                    "RANK AAA-",
+                    "RANK AAA",
+                    "RANK AAA+",
+                    "RANK MAX-",
+                ]),
+            )
         );
     }
 }
