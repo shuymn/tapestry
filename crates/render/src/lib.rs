@@ -109,8 +109,8 @@ pub use renderer::{
     Destruction, FrameOutcome, FrameTiming, GrantProbe, GrantWait, Handoff, HeavyOps, LoadingOn,
     LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness, PagesBegun, PagesStep, Part,
     PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError,
-    Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, TextDone, TextFault,
-    VM_TEXELS, letterbox,
+    Renderer, ResultChartBegin, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, TextDone,
+    TextFault, VM_TEXELS, letterbox,
 };
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::{DestroyRecord, RECORD_LEN};

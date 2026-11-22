@@ -2380,6 +2380,10 @@ impl FrameSink for ScenarioFrames {
         self.recorder.hold(hold);
     }
 
+    fn result_hold(&mut self, hold: crate::measure::HoldStamp) {
+        self.recorder.result_hold(hold);
+    }
+
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
         if !drawn.timing.presented() {
             self.recorder.unpresented();
@@ -2394,9 +2398,13 @@ impl FrameSink for ScenarioFrames {
         let shot = change
             .zip(self.shots.as_ref())
             .and_then(|(e, s)| s.next(&change_name(&e)).map(|path| (path, e)));
-        // A result's origin: its first presented frame, whatever drew it.
+        // A result's origin: its first presented frame, whatever drew it,
+        // the pending presentation excepted (it is no result view).
         if drawn.screen.is_result()
-            && let Some(id) = drawn.result.and_then(|r| r.id)
+            && let Some(id) = drawn
+                .result
+                .filter(|r| r.path != crate::measure::ResultPath::Pending)
+                .and_then(|r| r.id)
             && self.result_origin.is_none_or(|(seq, _)| seq != id.seq)
         {
             self.result_origin = Some((id.seq, drawn.presented_at));
@@ -2614,7 +2622,11 @@ fn capture_due(
             if !drawn.screen.is_result() {
                 return None;
             }
-            let drew = drawn.result?;
+            // The pending presentation is no result view: a capture waits
+            // for the first view's frame.
+            let drew = drawn
+                .result
+                .filter(|r| r.path != crate::measure::ResultPath::Pending)?;
             if drew.id?.seq != seq || drew.page < page {
                 return None;
             }
@@ -5300,6 +5312,53 @@ pub(crate) mod tests {
         let second = side(1);
         assert!(second.contains("\"result_origin_us\":2000000,"), "{second}");
         assert!(second.contains("\"result_seq\":2,"), "{second}");
+    }
+
+    /// The result's pending presentation is no result view: its frames,
+    /// stamped with the result's id after the hand-over, set no origin and
+    /// take no capture, even one with no view filter, while the transition
+    /// record keeps them; the first view's frame is the origin and the
+    /// capture's.
+    #[test]
+    fn a_pending_result_frame_sets_no_origin_and_takes_no_capture() {
+        use super::FrameSink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(dir.path(), &[(super::Axis::Result(TimeUs(0)), true)]);
+        c.set_state(
+            0,
+            CaptureState::Resulting {
+                seq: 1,
+                page: 0,
+                view: None,
+            },
+        );
+        let pending = |at_ms| {
+            let mut d = result_frame(1, 1, None, at_ms);
+            if let Some(r) = d.result.as_mut() {
+                r.path = crate::measure::ResultPath::Pending;
+            }
+            d
+        };
+        {
+            let mut list = c.0.lock().unwrap();
+            assert!(
+                super::capture_due(&mut list[0], &pending(900), Some((1, TimeUs(0)))).is_none(),
+                "a pending frame taken by a capture"
+            );
+        }
+        let (mut sink, screen) = released(&c);
+        sink.frame(&screen, &pending(900));
+        sink.frame(&screen, &pending(950));
+        assert!(
+            matches!(c.states()[0], CaptureState::Resulting { .. }),
+            "a pending frame saved: {:?}",
+            c.states()[0]
+        );
+        sink.frame(&screen, &result_frame(1, 1, None, 1_000));
+        sink.finish();
+        let first = fs::read_to_string(dir.path().join("0.json")).unwrap();
+        assert!(first.contains("\"result_origin_us\":1000000,"), "{first}");
+        assert!(first.contains("\"result_us\":0,"), "{first}");
     }
 
     /// A capture written on a result takes only a frame that drew the end

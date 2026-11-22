@@ -291,7 +291,7 @@ fn both_skins_show_the_snapshot_when_effects_are_dropped() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let noted = Arc::clone(&seen);
     let made = Mutex::new(Some((model, uvs)));
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let (model, uvs) = made.lock().unwrap().take().unwrap();
         Ok(Box::new(Skins {
             simple: SimpleSkin::new(),
@@ -423,7 +423,7 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
     let looks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let built = Arc::new(Mutex::new(Vec::new()));
     let (l, b) = (Arc::clone(&looks), Arc::clone(&built));
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         Ok(Box::new(Paced {
             looks: Arc::clone(&l),
             built: Arc::clone(&b),

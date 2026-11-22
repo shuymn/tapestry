@@ -405,7 +405,7 @@ impl Rig {
         let fake = Arc::new(Fake::default());
         let f = Arc::clone(&fake);
         let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Timed(Arc::clone(&f))) as Box<dyn Screen>));
+            Box::new(move |_| Ok(Box::new(Timed(Arc::clone(&f))) as Box<dyn Screen>));
         let link = spawn_empty(make);
         link.record_heavy(64);
         Self { link, fake }
@@ -1478,7 +1478,8 @@ fn play_passes_destroy_nothing() {
     );
     let fake = Arc::new(Fake::default());
     let f = Arc::clone(&fake);
-    let make: MakeScreen = Box::new(move || Ok(Box::new(Timed(Arc::clone(&f))) as Box<dyn Screen>));
+    let make: MakeScreen =
+        Box::new(move |_| Ok(Box::new(Timed(Arc::clone(&f))) as Box<dyn Screen>));
     let clock = QpcClock::start();
     let link = spawn(
         make,

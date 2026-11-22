@@ -60,7 +60,7 @@ fn chart_skin(
 /// Two bundles of `bundle`'s skin over one new atlas: a view of the
 /// second staged while the first is installed is a layout on the
 /// installed array.
-fn pair(bundle: &Arc<render::SkinBundle>) -> [Arc<render::SkinBundle>; 2] {
+pub(super) fn pair(bundle: &Arc<render::SkinBundle>) -> [Arc<render::SkinBundle>; 2] {
     let skin = bundle.skin();
     let variant = bundle.atlas_pages().variant();
     let limits = AtlasLimits {
@@ -534,7 +534,12 @@ fn a_superseded_or_refused_view_draws_no_table_of_its_own() {
         &viewed(2, &y, 2_222, &["B"], &green),
         &Overlay::default(),
     );
-    rig.gate.step();
+    // B's staging steps between frames, a frame let go at a time, until
+    // its images are written: its frame is then held before its commit.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while writes(&rig) < 2 && std::time::Instant::now() < end {
+        rig.gate.step();
+    }
     assert_eq!(writes(&rig), 2, "B's images written at its staging");
     assert!(rig.link.result_status().retained.contains(&y.atlas_id()));
     let discards = rig.faults.discards.load(Ordering::Acquire);
@@ -978,6 +983,7 @@ fn result_chart_frame_alloc() {
             Some(&mut side),
             now,
             fadeout,
+            false,
             &skin_model::AppReadouts::LAUNCH,
         );
         counts.push(crate::alloc_count::this_thread() - before);

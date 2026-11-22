@@ -2416,6 +2416,8 @@ impl Rig for PlayerRig<'_> {
         {
             self.pending_retry = Some(at);
         }
+        // No pending presentation after the game's next screen message.
+        self.render.release_result_hold();
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: withdrawn");
@@ -3480,6 +3482,15 @@ impl Rig for PlayerRig<'_> {
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;
+        }
+        // A result its skin may present is held from here (design.md
+        // "Rendering and Skins", the result's hold); the built-in result is
+        // ready at once and takes none.
+        if self.result_chart.is_some()
+            && self.result_skin.has_skin()
+            && !self.result_skin_suppressed()
+        {
+            self.render.hold_result(self.clock.now());
         }
         // A new result's identity (dev-tools).
         #[cfg(feature = "dev-tools")]

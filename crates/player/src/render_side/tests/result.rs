@@ -27,6 +27,12 @@ pub(super) enum Drawn {
     Page(Vec<String>),
 }
 
+/// The swap chain's grant a boundary looks at without waiting while the
+/// frames are paced and the target visible: set by a test, taken by the
+/// look that finds it (one test uses it; each test runs in a process of
+/// its own).
+static GRANT: AtomicBool = AtomicBool::new(false);
+
 /// The frames' pacing: while `pace` is set each frame wait takes one of
 /// `permits`, holding until there is one.
 #[derive(Default)]
@@ -60,6 +66,9 @@ impl Gate {
 /// A result frame built: its time, its `screen` start, and the `screen`
 /// timer's ms its state held as the build began.
 pub(super) type Build = (TimeUs, Option<TimeUs>, Option<i32>);
+
+/// A test's setup run on the menu screen's renderer ([`Faults::on_renderer`]).
+pub(crate) type OnRenderer = Box<dyn FnOnce(&mut render::Renderer) + Send>;
 
 /// Faults a test turns on.
 #[derive(Default)]
@@ -135,6 +144,10 @@ pub(super) struct Faults {
     pub(super) samples: Mutex<Vec<(usize, Vec<[u8; 3]>)>>,
     /// Stagings discarded.
     pub(super) discards: AtomicU32,
+    /// The page font reads as not in hand, as a screen made for plays only
+    /// whose read has not ended: the pending presentation draws its
+    /// bitmap line.
+    pub(super) no_font: AtomicBool,
     /// The renderer's result chart writes that wrote pixels, after the
     /// last write asked, and each write's table.
     pub(super) chart_writes: std::sync::atomic::AtomicU64,
@@ -174,6 +187,17 @@ pub(super) struct Faults {
     pub(crate) lose_in_staging: AtomicBool,
     /// A result-kind staging was left stepping by its last look.
     pub(crate) result_stepping: AtomicBool,
+    /// A result-kind staging that creates an array of its own is taken
+    /// first at a boundary its allowance admits, once it has room, as the
+    /// menu screen's renderer answers (`install_creates`, `install_room`);
+    /// at once otherwise.
+    pub(crate) step_creations: AtomicBool,
+    /// Run on the menu screen's renderer at the next upload boundary, in
+    /// order (a test's setup of charges and pools on the render thread).
+    pub(crate) on_renderer: Mutex<Vec<OnRenderer>>,
+    /// The next selection installation's chart-image pool arrays refused
+    /// this many times, as the device refuses one.
+    pub(crate) refuse_pools: AtomicU32,
 }
 
 impl Recorded {
@@ -196,6 +220,12 @@ impl Recorded {
         }
         if kind == ScreenKind::Result && self.faults.cancel_install.swap(false, Ordering::AcqRel) {
             return Some(Ok(Preparation::Cancelled));
+        }
+        if kind == ScreenKind::Selection {
+            let n = self.faults.refuse_pools.swap(0, Ordering::AcqRel);
+            if n > 0 {
+                self.menu.renderer_mut().refuse_next_pools(n);
+            }
         }
         if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
             self.menu.remove(ScreenKind::Result);
@@ -301,6 +331,10 @@ impl Screen for Recorded {
         })
     }
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        let setups = std::mem::take(&mut *self.faults.on_renderer.lock().unwrap());
+        for f in setups {
+            f(self.menu.renderer_mut());
+        }
         if self.faults.result_stepping.swap(false, Ordering::AcqRel)
             && self.faults.lose_in_staging.swap(false, Ordering::AcqRel)
         {
@@ -392,6 +426,12 @@ impl Screen for Recorded {
             return answer;
         }
         self.menu.install(kind, skin, request)
+    }
+    fn install_creates(&self, kind: ScreenKind, skin: &Arc<render::SkinBundle>) -> bool {
+        self.faults.step_creations.load(Ordering::Acquire) && self.menu.install_creates(kind, skin)
+    }
+    fn install_room(&self, kind: ScreenKind, skin: &Arc<render::SkinBundle>) -> bool {
+        !self.faults.step_creations.load(Ordering::Acquire) || self.menu.install_room(kind, skin)
     }
     fn install_stepped(
         &mut self,
@@ -685,6 +725,10 @@ impl Screen for Recorded {
     fn paced(&self) -> bool {
         self.gate.pace.load(Ordering::Acquire) || self.menu.paced()
     }
+    fn grant_probe(&self) -> Option<render::GrantProbe> {
+        (self.gate.pace.load(Ordering::Acquire) && !self.menu.minimized())
+            .then_some(render::GrantProbe::Flag(&GRANT))
+    }
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
         self.menu.build(f)
     }
@@ -693,6 +737,15 @@ impl Screen for Recorded {
     }
     fn text(&mut self, lines: &[&str]) -> Result<bool, render::RenderError> {
         self.menu.text(lines)
+    }
+    fn text_frame(&mut self, lines: &[&str]) -> Result<render::FrameTiming, render::RenderError> {
+        self.menu.text_frame(lines)
+    }
+    fn page_font_ready(&mut self) -> bool {
+        !self.faults.no_font.load(Ordering::Acquire) && self.menu.page_font_ready()
+    }
+    fn minimized(&self) -> bool {
+        self.menu.minimized()
     }
     fn resize(&mut self, width: u32, height: u32) {
         self.menu.resize(width, height);
@@ -728,7 +781,7 @@ impl Rig {
         let faults = Arc::new(Faults::default());
         let drawn = Arc::new(Mutex::new(Vec::new()));
         let (g, f, d) = (Arc::clone(&gate), Arc::clone(&faults), Arc::clone(&drawn));
-        let make: MakeScreen = Box::new(move || {
+        let make: MakeScreen = Box::new(move |_| {
             let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
@@ -2285,6 +2338,7 @@ fn result_frame_alloc() {
             Some(&mut side),
             now,
             fadeout,
+            false,
             &skin_model::AppReadouts::LAUNCH,
         );
         counts.push(commit + crate::alloc_count::this_thread() - before);
@@ -2315,6 +2369,7 @@ fn result_frame_alloc() {
         Some(&mut side),
         TimeUs(2_000_000),
         fadeout,
+        false,
         &skin_model::AppReadouts::LAUNCH,
     );
     counts.push(crate::alloc_count::this_thread() - before);
@@ -3396,6 +3451,7 @@ fn the_build_mark_precedes_the_result_build() {
             Some(&mut side),
             now,
             fadeout,
+            false,
             &skin_model::AppReadouts::LAUNCH,
         );
         assert_eq!(drawn, ResultDrawn::Built);
@@ -4482,5 +4538,516 @@ fn a_result_bundle_is_staged_in_the_uploaders_steps() {
     assert!(wait_until(
         || rig.link.result_status().installed == Some(skin.atlas_id())
     ));
+    rig.link.exit();
+}
+
+/// The result frames' paths a sink saw, in order.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct Paths(Arc<Mutex<Vec<Option<crate::measure::ResultPath>>>>);
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for Paths {
+    fn frame(&mut self, _screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if drawn.timing.presented() {
+            self.0.lock().unwrap().push(drawn.result.map(|r| r.path));
+        }
+    }
+}
+
+/// A view switch whose union fits only once a retired array is destroyed
+/// (the installation before the lifetime, charged the whole shared limit,
+/// retired at the first view's commit): its creation is not taken while
+/// that entry stands, so it waits on no destruction in its call; the
+/// shown view draws on every frame meanwhile, with no pending
+/// presentation or built-in page; the entry is destroyed at a boundary of
+/// its own, the creation comes at a later one, and no presenting pass
+/// waits for the GPU (V19 (k), the switch; V9b (c)).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
+    use crate::measure::ResultPath;
+    use crate::render_side::HeavyKind;
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let paths = Paths::default();
+    let rig = Rig::with_sink(Box::new(paths.clone()));
+    rig.faults.step_creations.store(true, Ordering::Release);
+    rig.faults
+        .charge_result
+        .store(render::SHARED_TEXELS, Ordering::Release);
+    rig.link.hold_destruction(true);
+    let lifetime = installed(&rig, &x0);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((1, true))),
+        "the first view: {:?}",
+        rig.link.result_status()
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.link.record_heavy(256);
+    render::probe::count_gpu_waits(Some(false));
+    let from = paths.0.lock().unwrap().len();
+    // Frame by frame from here: the switch is taken, then four frames
+    // follow its admission with the retired entry standing.
+    rig.gate.hold();
+    let taken = rig.link.messages_taken();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    let end = Instant::now() + Duration::from_secs(20);
+    while rig.link.messages_taken() == taken {
+        assert!(Instant::now() < end, "the switch never taken");
+        rig.gate.step();
+    }
+    // The retired entry stands: no creation, the first view drawn on each
+    // frame.
+    for i in 1..=4 {
+        let before = paths.0.lock().unwrap().len();
+        rig.gate.step();
+        let seen = paths.0.lock().unwrap().clone();
+        assert!(
+            seen.len() > before && seen[before..].iter().all(|p| *p == Some(ResultPath::Skin)),
+            "frame {i} after the switch's admission not the shown view's: {:?}",
+            &seen[before..]
+        );
+        assert_eq!(
+            rig.link.result_status().shown,
+            Some((1, true)),
+            "the switch committed while its admission needed a destruction no boundary made"
+        );
+        assert!(
+            rig.link
+                .heavy_record()
+                .iter()
+                .all(|r| r.kind != HeavyKind::ResultCreation),
+            "the switch's creation taken with no room: {:?}",
+            rig.link.heavy_record()
+        );
+    }
+    rig.gate.release();
+    // The boundaries destroy it, then the creation follows.
+    rig.link.hold_destruction(false);
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "the switch: {:?}",
+        rig.link.result_status()
+    );
+    let presenting: Vec<_> = render::probe::gpu_waits()
+        .into_iter()
+        .filter(|w| w.pass == render::probe::PASS_PRESENTING)
+        .collect();
+    render::probe::count_gpu_waits(None);
+    let heavy = rig.link.heavy_record();
+    let destroyed = heavy
+        .iter()
+        .position(|r| r.kind == HeavyKind::Destruction)
+        .expect("the retired entry destroyed at a boundary");
+    let created = heavy
+        .iter()
+        .position(|r| r.kind == HeavyKind::ResultCreation)
+        .expect("the switch's creation at a boundary");
+    assert!(
+        destroyed < created && heavy[created].start >= heavy[destroyed].end,
+        "the creation before the destruction, or in its boundary: {heavy:?}"
+    );
+    let seen = paths.0.lock().unwrap().clone();
+    let seen = seen.get(from..).unwrap_or(&[]);
+    assert!(
+        seen.iter().all(|p| *p == Some(ResultPath::Skin)),
+        "a frame not the shown view's while the switch staged: {seen:?}"
+    );
+    assert_eq!(presenting, Vec::new(), "a blocking wait presenting");
+    rig.link.exit();
+}
+
+/// A swap-paced window minimized past the result's hold bound, the menu
+/// font not in hand: the pending presentation's bitmap frames end
+/// invisible, so each refills the frame interval's allowance as a shown
+/// one does. The first view's creation spends it; a view superseding it,
+/// whose own creation waits for a refill, is created while the window
+/// stays minimized (design.md "Load Pipeline", the allowance; "Rendering
+/// and Skins", the result's hold).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_minimized_bitmap_frame_refills_the_allowance_for_a_second_creation() {
+    use crate::render_side::{Extent, HeavyKind};
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let rig = Rig::new();
+    rig.faults.step_creations.store(true, Ordering::Release);
+    let lifetime = installed(&rig, &x0);
+    let extent = Arc::new(Extent::default());
+    extent.publish(1_920, 1_080);
+    rig.link.follow(&extent);
+    // Paced as a swap chain, every grant given.
+    rig.gate.permits.store(u32::MAX, Ordering::Release);
+    rig.gate.pace.store(true, Ordering::Release);
+    rig.faults.no_font.store(true, Ordering::Release);
+    // A cleared page drawing as the outgoing screen, then the hold, past
+    // its bound at once: the bitmap line.
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_first_frame_hold(TimeUs(200_000));
+    rig.link.set_hold_clock(Some(200_001));
+    rig.link.hold_result(bms_model::TimeSource::now(&rig.clock));
+    let bitmap = rig.link.bitmap_frames();
+    assert!(
+        wait_until(|| rig.link.bitmap_frames() > bitmap + 2),
+        "no bitmap frame past the bound"
+    );
+    extent.publish(0, 0);
+    let bitmap = rig.link.bitmap_frames();
+    assert!(
+        wait_until(|| rig.link.bitmap_frames() > bitmap + 2),
+        "no bitmap frame minimized"
+    );
+    rig.link.record_heavy(64);
+    rig.link.pause_result_staging(true);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    let creations = |rig: &Rig| {
+        rig.link
+            .heavy_record()
+            .iter()
+            .filter(|r| r.kind == HeavyKind::ResultCreation)
+            .count()
+    };
+    assert!(
+        wait_until(|| creations(&rig) >= 1),
+        "the first view's creation"
+    );
+    let bitmap = rig.link.bitmap_frames();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while creations(&rig) < 2 {
+        assert!(
+            Instant::now() < end,
+            "the superseding view's creation never admitted, {} bitmap frames drawn minimized since: {:?}",
+            rig.link.bitmap_frames() - bitmap,
+            rig.link.heavy_record()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(rig.link.bitmap_frames() > bitmap, "no bitmap frame between");
+    rig.link.pause_result_staging(false);
+    rig.gate.release();
+    rig.link.exit();
+}
+
+/// Waits until the render loop waits at `gate`, at most 20 s.
+#[cfg(feature = "dev-tools")]
+fn held_at(gate: &crate::render_side::TestGate, what: &str) {
+    assert!(
+        wait_until(|| gate.waiting()),
+        "the render thread never held {what}"
+    );
+}
+
+/// A swap-paced window drawing the loading state, the result's pages
+/// owed: the pass's boundary takes the swap chain's grant, and a minimize
+/// applies in the same pass, after that boundary. The grant is kept for
+/// the restore, and the pages are created and written while the window
+/// stays minimized, paced by the clock (design.md "Memory Budget", the
+/// uploader's admission gate; "Resize").
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_grant_kept_across_a_minimize_lets_the_pages_stage_while_minimized() {
+    use crate::render_side::{Extent, HeavyKind, PagesAnswer};
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let extent = Arc::new(Extent::default());
+    extent.publish(1_920, 1_080);
+    rig.link.follow(&extent);
+    // Paced as a swap chain, every frame granted.
+    rig.gate.permits.store(u32::MAX, Ordering::Release);
+    rig.gate.pace.store(true, Ordering::Release);
+    rig.link.loading().show(super::one_line("loading"));
+    let [after_boundary, _, after_draw] = &rig.link.shared.frame_gates;
+    // The pages owed from the next pass on.
+    after_boundary.hold(true);
+    held_at(after_boundary, "after a boundary");
+    rig.link.record_heavy(64);
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    // This pass draws; the next one's boundary takes the pages and finds
+    // the grant, then holds before its frame reads the window's size.
+    after_draw.hold(true);
+    after_boundary.hold(false);
+    held_at(after_draw, "after its frame");
+    after_boundary.hold(true);
+    GRANT.store(true, Ordering::SeqCst);
+    after_draw.hold(false);
+    held_at(after_boundary, "after the next boundary");
+    assert!(
+        !GRANT.load(Ordering::SeqCst),
+        "the boundary never looked at the grant"
+    );
+    // Minimized from this pass's frame on.
+    extent.publish(0, 0);
+    let minimized = Instant::now();
+    after_boundary.hold(false);
+    let end = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        if let Some(a) = t.poll(Duration::from_millis(5)) {
+            break a.unwrap();
+        }
+        assert!(
+            Instant::now() < end,
+            "minimized, the pages never staged: {:?}",
+            rig.link.heavy_record()
+        );
+    };
+    assert_eq!(answer, PagesAnswer::Ready);
+    assert!(
+        rig.link
+            .heavy_record()
+            .iter()
+            .any(|r| r.kind == HeavyKind::PagesCreation && r.start >= minimized),
+        "the pages not created while minimized: {:?}",
+        rig.link.heavy_record()
+    );
+    // The pages' steps are the uploader's only ones here (none of a
+    // staging's atlas).
+    assert!(
+        rig.link.step_records().iter().any(|r| r.at >= minimized),
+        "no step of the pages written while minimized: {:?}",
+        rig.link.step_records()
+    );
+    extent.publish(1_920, 1_080);
+    rig.gate.release();
+    rig.link.end_loading().unwrap();
+    rig.link.exit();
+}
+
+/// A view switch whose union fits only once the selection's chart-image
+/// pool yields optional layers (a reduction), while the smaller pool a
+/// regrowth replaced still stands retired beside the live one: the
+/// reduction retires the live pool, one retired pool at a time, so the old
+/// one must be destroyed first. The switch's creation is not taken while
+/// it stands, and the shown view draws meanwhile; a boundary destroys it,
+/// then the creation retires the live pool on its own allowance. No
+/// destruction runs inside the creation's call, and no presenting pass
+/// waits for the GPU (V19 (k), the switch; V9b (c)).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_switch_reducing_the_pool_waits_for_the_retired_pools_destruction() {
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    switch_reducing_the_pool(&a, &b);
+}
+
+/// [`a_switch_reducing_the_pool_waits_for_the_retired_pools_destruction`]
+/// for a rebind, a layout on the installed array that creates none: it is
+/// taken at the first pass its staging needs no destruction, never refused
+/// for want of room, and draws once the boundary destroyed the retired
+/// pool.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_rebind_reducing_the_pool_waits_for_the_retired_pools_destruction() {
+    let (_ad, skin) = fixed_skin();
+    let [a, b] = super::result_chart::pair(&skin);
+    switch_reducing_the_pool(&a, &b);
+}
+
+/// The switch from `a` to `b` of the two tests above; a creation's heavy
+/// record checked when `b` creates an array.
+#[cfg(feature = "dev-tools")]
+fn switch_reducing_the_pool(a: &Arc<render::SkinBundle>, b: &Arc<render::SkinBundle>) {
+    use crate::measure::ResultPath;
+    use crate::render_side::HeavyKind;
+    type Setup = (Option<u32>, Option<u32>, render::Admission, usize);
+    type After = (u64, Vec<render::DestroyRecord>);
+    let creates = a.atlas_id() != b.atlas_id();
+    let (_x0d, x0) = fixed_skin();
+    let sel_dir = crate::selection_skin::chart_fixture();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let (sel, _script) =
+        crate::selection_skin::fixture_scripted(limits, sel_dir.path(), "chart.luaskin");
+    let paths = Paths::default();
+    let rig = Rig::with_sink(Box::new(paths.clone()));
+    rig.faults.step_creations.store(true, Ordering::Release);
+    let lifetime = installed(&rig, &x0);
+    // The selection's pool made at its firm layer alone: the device
+    // refuses its whole array once.
+    rig.faults.refuse_pools.store(1, Ordering::Release);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Selection, Some(Arc::clone(&sel)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.link.record_heavy(256);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((1, true))),
+        "the first view: {:?}",
+        rig.link.result_status()
+    );
+    // The installation before the lifetime, retired at the first view's
+    // commit, destroyed at a boundary before the pool's pair is set up.
+    assert!(wait_until(|| rig
+        .link
+        .heavy_record()
+        .iter()
+        .any(|r| r.kind == HeavyKind::Destruction)));
+    rig.link.hold_destruction(true);
+    // The pool regrown: the live pool beside the firm-layer one it
+    // replaced, retired and left standing; b charged so it fits once the
+    // live pool keeps one layer fewer.
+    let setup: Arc<Mutex<Option<Setup>>> = Arc::default();
+    let s2 = Arc::clone(&setup);
+    let b2 = Arc::clone(b);
+    rig.faults
+        .on_renderer
+        .lock()
+        .unwrap()
+        .push(Box::new(move |r| {
+            let before = r.pool().map(|p| p.layers);
+            let grown = r.regrow_pool().map(|p| p.layers);
+            let adm = r.admission();
+            let kept = u64::from(grown.unwrap_or(0).saturating_sub(2));
+            let others = adm.committed_total() - adm.charge(ScreenKind::Result);
+            r.state_candidate_charge(
+                &b2,
+                render::SHARED_TEXELS - others - adm.filled - kept * adm.firm,
+            );
+            *s2.lock().unwrap() = Some((before, grown, adm, r.destructions_recorded()));
+        }));
+    assert!(wait_until(|| setup.lock().unwrap().is_some()));
+    let (before, grown, adm, recorded) = setup.lock().unwrap().take().unwrap();
+    assert_eq!(before, Some(1), "the pool at its firm layer before");
+    let grown = grown.expect("a live pool");
+    assert!(grown >= 2, "the regrowth: {grown} layers");
+    assert!(
+        adm.retired_pool > 0,
+        "no retired pool beside the live one: {adm:?}"
+    );
+    assert_eq!(adm.filled, 0, "an entry still charged: {adm:?}");
+    rig.link.record_heavy(256);
+    render::probe::count_gpu_waits(Some(false));
+    let from = paths.0.lock().unwrap().len();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    // The retired pool stands: no creation, the first view drawn.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        rig.link.result_status().shown,
+        Some((1, true)),
+        "the switch committed while the retired pool stood"
+    );
+    assert!(
+        rig.link
+            .heavy_record()
+            .iter()
+            .all(|r| r.kind != HeavyKind::ResultCreation),
+        "the switch's creation taken with the retired pool standing: {:?}",
+        rig.link.heavy_record()
+    );
+    let waiting = paths.0.lock().unwrap().len();
+    assert!(waiting > from + 3, "frames stopped while the switch waited");
+    // A boundary destroys it, then the creation follows.
+    rig.link.hold_destruction(false);
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "the switch: {:?}",
+        rig.link.result_status()
+    );
+    let presenting: Vec<_> = render::probe::gpu_waits()
+        .into_iter()
+        .filter(|w| w.pass == render::probe::PASS_PRESENTING)
+        .collect();
+    render::probe::count_gpu_waits(None);
+    // What the creation did to the pool, and every destruction since the
+    // setup, read on the render thread.
+    let after: Arc<Mutex<Option<After>>> = Arc::default();
+    let a2 = Arc::clone(&after);
+    rig.faults
+        .on_renderer
+        .lock()
+        .unwrap()
+        .push(Box::new(move |r| {
+            let adm = r.admission();
+            let all: Vec<_> = r.destructions().copied().collect();
+            let n = (r.destructions_recorded() - recorded).min(all.len());
+            *a2.lock().unwrap() = Some((
+                adm.firm + adm.pool,
+                all.get(all.len() - n..).unwrap_or(&[]).to_vec(),
+            ));
+        }));
+    assert!(wait_until(|| after.lock().unwrap().is_some()));
+    let (pooled, destroyed) = after.lock().unwrap().take().unwrap();
+    assert!(
+        pooled < u64::from(grown) * adm.firm,
+        "the switch's creation did not reduce the pool: {pooled} texels of {grown} layers"
+    );
+    assert!(
+        destroyed
+            .iter()
+            .any(|d| d.class == render::Class::RetiredPool),
+        "the retired pool never destroyed: {destroyed:?}"
+    );
+    assert!(
+        destroyed.iter().all(|d| !d.in_call),
+        "a destruction inside a creation's call: {destroyed:?}"
+    );
+    let heavy = rig.link.heavy_record();
+    let destroyed_at = heavy
+        .iter()
+        .position(|r| r.kind == HeavyKind::Destruction)
+        .expect("the retired pool destroyed at a boundary");
+    if creates {
+        let created = heavy
+            .iter()
+            .position(|r| r.kind == HeavyKind::ResultCreation)
+            .expect("the switch's creation at a boundary");
+        assert!(
+            destroyed_at < created && heavy[created].start >= heavy[destroyed_at].end,
+            "the creation before the destruction, or in its boundary: {heavy:?}"
+        );
+    }
+    let seen = paths.0.lock().unwrap().clone();
+    let seen = seen.get(from..).unwrap_or(&[]);
+    assert!(
+        seen.iter().all(|p| *p == Some(ResultPath::Skin)),
+        "a frame not the shown view's while the switch staged: {seen:?}"
+    );
+    assert_eq!(presenting, Vec::new(), "a blocking wait presenting");
     rig.link.exit();
 }

@@ -100,12 +100,16 @@ pub struct ResultPresentation {
 }
 
 /// The newest presentation of the current result lifetime, until the
-/// render thread takes it, and whether a signal for it waits.
+/// render thread takes it, and whether a signal for it waits; and the
+/// result's hold's mark (design.md "Rendering and Skins", the result's
+/// hold): the number of the hold the game begun last and has not
+/// released, 0 for none.
 #[derive(Debug, Default)]
 pub struct ResultSlot {
     lifetime: u64,
     newest: Option<Box<ResultPresentation>>,
     signaled: bool,
+    hold: u64,
 }
 
 impl ResultSlot {
@@ -125,11 +129,30 @@ impl ResultSlot {
         self.newest.take().filter(|p| p.lifetime == self.lifetime)
     }
 
-    /// Result lifetime `lifetime` begins (0 for none).
+    /// Result lifetime `lifetime` begins (0 for none: the result is left,
+    /// and its hold released with it).
     pub fn enter(&mut self, lifetime: u64) {
         self.lifetime = lifetime;
         self.signaled = false;
         drop(self.newest.take());
+        if lifetime == 0 {
+            self.hold = 0;
+        }
+    }
+
+    /// The result's hold `number` begins: its mark.
+    pub const fn hold(&mut self, number: u64) {
+        self.hold = number;
+    }
+
+    /// The result's hold is released: no hold is marked.
+    pub const fn release_hold(&mut self) {
+        self.hold = 0;
+    }
+
+    /// Whether hold `number` is the one marked.
+    pub const fn holds(&self, number: u64) -> bool {
+        number != 0 && self.hold == number
     }
 
     /// Whether `lifetime` is the current one.
