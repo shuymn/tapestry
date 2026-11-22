@@ -554,9 +554,10 @@ fn result_text_is_the_charts_and_bounded() {
         subtitle: long.clone(),
         artist: long.clone(),
         subartist: long.clone(),
-        genre: long,
+        genre: long.clone(),
+        target: long,
     };
-    let bound = fx.res.resident_bytes() + 5 * 2 * u64::try_from(MAX_TEXT_BYTES).unwrap();
+    let bound = fx.res.resident_bytes() + 6 * 2 * u64::try_from(MAX_TEXT_BYTES).unwrap();
     fx.skin
         .update_result(&mut fx.res, &ready(1, BestView::Unavailable, 1), &big)
         .unwrap();
@@ -564,7 +565,7 @@ fn result_text_is_the_charts_and_bounded() {
     // Strings growing view after view, from a fresh state, keep at most
     // twice `MAX_TEXT_BYTES` each, however often they grow.
     let mut res = fx.skin.prepare_result();
-    let bound = res.resident_bytes() + 5 * 2 * u64::try_from(MAX_TEXT_BYTES).unwrap();
+    let bound = res.resident_bytes() + 6 * 2 * u64::try_from(MAX_TEXT_BYTES).unwrap();
     let mut no_bins = ready(1, BestView::Unavailable, 1);
     no_bins.timelines = None;
     for n in (1..=3 * MAX_TEXT_BYTES).step_by(37) {
@@ -574,7 +575,8 @@ fn result_text_is_the_charts_and_bounded() {
             subtitle: s.clone(),
             artist: s.clone(),
             subartist: s.clone(),
-            genre: s,
+            genre: s.clone(),
+            target: s,
         };
         fx.skin.update_result(&mut res, &no_bins, &grown).unwrap();
         assert!(res.resident_bytes() <= bound, "{n}");

@@ -377,6 +377,8 @@ pub struct SelectionLabels {
     pub all_charts: String,
     /// The name of a query's results.
     pub search_results: String,
+    /// The target names (design.md "Personal Bests", Target).
+    pub targets: crate::TargetNames,
 }
 
 /// The chart under the cursor.

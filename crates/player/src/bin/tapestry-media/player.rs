@@ -3,21 +3,29 @@
 //!
 //! A player answers its open with the probe or a refusal, each echoing the
 //! open's id, as every answer to a command echoes that command's. Once the game
-//! hands it the ring and the ring's free-slot event, it decodes from the
-//! video's start in the ring's first run, 1, and from a seek's landing in
+//! hands it the ring and the ring's free-slot event, it plays the video
+//! from its start in the ring's first run, 1, and from a seek's landing in
 //! the run the seek names (runs reach it by command alone, never through
-//! the ring; a seek drops the frame it held for the run before), publishing
+//! the ring; a seek drops the frames it held for the run before). The ring
+//! is its frame queue, as a video player's decoder feeds one: it publishes
 //! each frame whose stamp is not below the run's start and rises above the
-//! last it published, and waits on the event while every slot is full. It
-//! answers the end of the video, a seek and a failure; a failed or refused
-//! player only waits to be closed. A looping play starts again at the
-//! video's start at each end, in the same run, its stamps rising on, and
-//! never ends. It counts every frame its decoder returns in the ring's
-//! progress word and says in its state word whether it decodes, waits for
-//! a free slot or has ended, which the game reads to supervise it. A refusal or a failure is sent once the
-//! player has closed its file (and its ring), so a worker that ends before
-//! sending it still has the file open as far as the game knows. Closing
-//! unmaps its view of the ring before it answers.
+//! last it published, in order, as soon as the frame is converted and a
+//! slot is free, and waits on the event while every slot is full. A run
+//! starts at the video's start (its first frame with a time) or at a
+//! seek's landing (the first frame at or after the seek's time), and the
+//! player reads nothing of the game's time: it drops no frame, and the
+//! game drops one behind its clock only for a newer frame that is also
+//! due. A frame is published before the next one is converted, so a
+//! blocked conversion leaves the frame due in the ring. It answers the end
+//! of the video, a seek and a failure; a failed or refused player only
+//! waits to be closed. A looping play starts again at the video's start at
+//! each end, in the same run, its stamps rising on, and never ends. It
+//! counts every frame its decoder returns in the ring's progress word and
+//! says in its state word whether it decodes, waits for a free slot or has
+//! ended, which the game reads to supervise it. A refusal or a failure is
+//! sent once the player has closed its file (and its ring), so a worker
+//! that ends before sending it still has the file open as far as the game
+//! knows. Closing unmaps its view of the ring before it answers.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -28,7 +36,7 @@ use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
 use crate::{Out, ToPlayer};
 
-/// How long a player with every slot full waits on the free-slot event
+/// How long a player with every slot full waits on the ring's event
 /// before it looks for a command.
 const SLOT_WAIT_MS: u32 = 50;
 
@@ -189,7 +197,7 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         floor: 0,
         last: None,
         seq: 0,
-        pending: None,
+        held: None,
         ended: false,
     };
     let stopped = playing.play(rx, out);
@@ -223,8 +231,8 @@ struct Playing {
     last: Option<i64>,
     /// The sequence of the last frame published in the ring.
     seq: u64,
-    /// The stamp of the frame in `frame`, while it waits for a slot.
-    pending: Option<i64>,
+    /// The stamp of the frame in `frame`, converted and not published yet.
+    held: Option<i64>,
     /// The run's video has ended.
     ended: bool,
 }
@@ -273,12 +281,12 @@ impl Playing {
         self.run = run;
         self.floor = at;
         self.last = None;
-        self.pending = None;
+        self.held = None;
         self.ended = false;
         self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
             Some(landed) => {
-                self.pending = Some(landed.stamp);
+                self.held = Some(landed.stamp);
                 out.send(&Reply::Sought {
                     id,
                     player: self.player,
@@ -299,33 +307,52 @@ impl Playing {
         Ok(())
     }
 
-    /// Decodes the next frame to publish, or publishes the one waiting, or
-    /// waits a while for a free slot.
+    /// Decodes the next frame, not converted yet: a frame to publish when
+    /// it is not below the run's start and rises above `after`, one skipped
+    /// otherwise, or the video's end (a looping play starts again instead).
+    fn decode(&mut self, after: Option<i64>) -> Result<Decoded, (Failure, i32)> {
+        let floor = self.floor;
+        let keep = |stamp: i64| stamp >= floor && after.is_none_or(|l| stamp > l);
+        Ok(match self.input.next()? {
+            Some(stamp) if keep(stamp) => Decoded::Frame(stamp),
+            Some(_) => Decoded::Skipped,
+            None if self.looping => {
+                let stamp = self.input.restart()?;
+                if keep(stamp) {
+                    Decoded::Frame(stamp)
+                } else {
+                    Decoded::Skipped
+                }
+            }
+            None => Decoded::End,
+        })
+    }
+
+    /// The run's video ended: said once, in its state word and a reply.
+    fn end(&mut self, out: &Out) {
+        self.ended = true;
+        self.writer.state(self.view.words(), State::Ended);
+        out.send(&Reply::Ended {
+            player: self.player,
+            run: self.run,
+        });
+    }
+
+    /// One step: decodes and converts a frame while it holds none, or
+    /// publishes the frame held, or waits a while for a free slot.
     fn step(&mut self, out: &Out) -> Result<(), (Failure, i32)> {
-        let Some(stamp) = self.pending else {
-            match self.input.next(&mut self.frame)? {
-                Some(stamp) if stamp >= self.floor && self.last.is_none_or(|l| stamp > l) => {
-                    self.pending = Some(stamp);
+        let words = self.view.words();
+        let Some(stamp) = self.held else {
+            match self.decode(self.last)? {
+                Decoded::Frame(stamp) => {
+                    self.input.convert(&mut self.frame)?;
+                    self.held = Some(stamp);
                 }
-                Some(_) => {}
-                None if self.looping => {
-                    let stamp = self.input.restart(&mut self.frame)?;
-                    if stamp >= self.floor && self.last.is_none_or(|l| stamp > l) {
-                        self.pending = Some(stamp);
-                    }
-                }
-                None => {
-                    self.ended = true;
-                    self.writer.state(self.view.words(), State::Ended);
-                    out.send(&Reply::Ended {
-                        player: self.player,
-                        run: self.run,
-                    });
-                }
+                Decoded::Skipped => {}
+                Decoded::End => self.end(out),
             }
             return Ok(());
         };
-        let words = self.view.words();
         let Some(slot) = self.writer.claim(words) else {
             self.writer.state(words, State::Waiting);
             if self.seq > 0 {
@@ -341,10 +368,20 @@ impl Playing {
             .map_err(|_| (Failure::Ring, 0))?;
         self.seq = seq;
         self.last = Some(stamp);
-        self.pending = None;
+        self.held = None;
         freeze_at(self.player, Freeze::Decoding);
         Ok(())
     }
+}
+
+/// What a decode gave.
+enum Decoded {
+    /// A frame to publish, by its stamp, for the input to convert.
+    Frame(i64),
+    /// A frame not to publish (below the run's start, or not rising).
+    Skipped,
+    /// The video's end.
+    End,
 }
 
 /// Answers a player's failure, once it holds nothing.

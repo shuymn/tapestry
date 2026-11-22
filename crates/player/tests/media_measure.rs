@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use media_support::{Kind, Launched, Setup, Stage, media_host, recipe};
+use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe};
 use skin_model::media::control::{Command as Order, Reply};
 use skin_model::media::{Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
@@ -96,6 +96,8 @@ struct Ring {
     len: usize,
     event: OwnedHandle,
     reader: Reader,
+    /// The last frame taken.
+    frame: Vec<u8>,
 }
 
 impl Ring {
@@ -130,6 +132,7 @@ impl Ring {
             len,
             event,
             reader,
+            frame: Vec::new(),
         }
     }
 
@@ -138,17 +141,16 @@ impl Ring {
         unsafe { std::slice::from_raw_parts(view.Value.cast::<AtomicU64>(), len) }
     }
 
-    /// The stamp staged at `due`, if a new frame was.
+    /// The stamp taken at `due`, if a new frame was.
     fn poll(&mut self, due: i64) -> Option<i64> {
-        let poll = self
-            .reader
-            .poll(Self::words(self.view, self.len), due)
+        let words = Self::words(self.view, self.len);
+        let (taken, freed) = read_tight(&mut self.reader, words, due, &mut self.frame)
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
-        if poll.freed {
+        if freed {
             // SAFETY: the ring's event.
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
-        poll.staged.map(|f| f.stamp)
+        taken.map(|f| f.stamp)
     }
 }
 
@@ -858,10 +860,11 @@ struct Drawn {
 }
 
 /// Polls `movie`'s ring every 4 ms at the media time since its first
-/// poll, telling the session what it freed and staged, until stopped.
+/// poll, telling the session what it freed and took, until stopped.
 fn draw(movie: &media_host::session::Movie, drawn: &Drawn) {
     let mut reader: Option<Reader> = None;
     let mut origin = None;
+    let mut frame = Vec::new();
     while !drawn.stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(4));
         if movie.status() == media_host::session::Status::Lost {
@@ -874,13 +877,13 @@ fn draw(movie: &media_host::session::Movie, drawn: &Drawn) {
         let Some(r) = reader.as_mut() else { continue };
         let origin = *origin.get_or_insert_with(Instant::now);
         let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
-        match r.poll(live.ring.words(), due) {
-            Ok(p) => {
-                if let Some(f) = p.staged {
+        match read_tight(r, live.ring.words(), due, &mut frame) {
+            Ok((taken, freed)) => {
+                if let Some(f) = taken {
                     drawn.staged.lock().unwrap().push((f.stamp, Instant::now()));
                     movie.staged_first();
                 }
-                if p.freed {
+                if freed {
                     movie.freed(r.freed());
                 }
             }

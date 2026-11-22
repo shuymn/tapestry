@@ -342,8 +342,9 @@ impl Screen for Recorder {
         a: &render::AttemptInput<'_>,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
-        self.menu.prepare_attempt(a, skin, request)
+        self.menu.prepare_attempt(a, skin, request, lifetime)
     }
     fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
         self.menu.upload_boundary(past)
@@ -804,7 +805,7 @@ impl Rig {
             list_revision: 1,
             page: one_line("select"),
             view: view_on(chart, title),
-            labels: crate::select::labels(),
+            labels: crate::select::labels(game::ScoreTarget::Max),
             strip: StripText::default(),
             events: SelectionEvents::default(),
             settings: None,
@@ -1989,7 +1990,7 @@ fn selection_frame_during_decision_prep_alloc() {
         list_revision: 1,
         page: one_line("select"),
         view: view_on("a", "A"),
-        labels: crate::select::labels(),
+        labels: crate::select::labels(game::ScoreTarget::Max),
         strip: StripText::default(),
         events: SelectionEvents::default(),
         settings: None,

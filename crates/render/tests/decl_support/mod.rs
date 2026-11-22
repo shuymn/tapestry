@@ -145,6 +145,10 @@ pub struct Look {
     pub bga: bool,
     /// The loading time the skin declares ([`skin_model::Skin::loadend`]).
     pub loadend: Option<TimeUs>,
+    /// Two skin movies filling [`MOVIE_A`] (slot 0) and [`MOVIE_B`]
+    /// (slot 1) on the untimed `screen` timer, so loading frames draw
+    /// them too, over the image drawn across [`MOVIES_UNDER`].
+    pub movies: bool,
 }
 
 /// The images of the full lane fixture's categories, each its own texel
@@ -258,6 +262,13 @@ pub const BACKGROUND: [i32; 4] = [0, 900, 100, 100];
 pub const ANIMATION: [i32; 4] = [200, 900, 100, 100];
 /// Where the `when` timer's mark draws.
 pub const WHEN_MARK: [i32; 4] = [1_700, 900, 100, 100];
+/// Where skin movie 0 draws.
+pub const MOVIE_A: [i32; 4] = [400, 900, 100, 100];
+/// Where skin movie 1 draws.
+pub const MOVIE_B: [i32; 4] = [600, 900, 100, 100];
+/// The image under both movies' destinations, so a destination that draws
+/// nothing is told from a black one.
+pub const MOVIES_UNDER: [i32; 4] = [380, 880, 340, 140];
 /// The `when` timer's slot: the first after the built-in timers.
 pub const WHEN_SLOT: u16 = skin_model::timer::BUILTIN;
 
@@ -324,6 +335,7 @@ impl Look {
             chart: false,
             bga: false,
             loadend: None,
+            movies: false,
         }
     }
 }
@@ -411,6 +423,27 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
     let clipped = look.clip.is_some();
     let [x, y, ..] = look.rect;
     let mut elements = vec![image(look.rect, clipped)];
+    let sheet = if look.movies {
+        elements.push(ElementDef {
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..image(MOVIES_UNDER, false)
+        });
+        for (slot, rect) in [(0, MOVIE_A), (1, MOVIE_B)] {
+            elements.push(ElementDef {
+                source: Source::Movie {
+                    slot,
+                    stretch: skin_model::bga::BgaStretch::Whole(
+                        skin_model::chart_image::ChartStretch::Fill,
+                    ),
+                },
+                timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                ..image(rect, false)
+            });
+        }
+        sheet.with_movies(["a.mp4".to_owned(), "b.mp4".to_owned()])
+    } else {
+        sheet
+    };
     elements.extend(std::iter::repeat_n(
         image([x, y, 10, 10], clipped),
         look.copies,

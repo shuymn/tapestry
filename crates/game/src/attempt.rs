@@ -10,6 +10,7 @@ use bms_model::{Chart, ChartProfile, JudgmentHeader, NoteKind, Speed, Tempo, Tim
 use eval::Section;
 use rules::{DefaultTotal, GaugeRule, HeaderPolicy, LnMode, RulePreset};
 
+use crate::bests::ScoreTarget;
 use crate::policy::GaugeIndex;
 use crate::practice::mapped;
 use crate::prepare::ChartLabels;
@@ -66,6 +67,11 @@ pub struct ScoreBasis {
     /// The target EX score ([`crate::score_target`]): 0 in a practice
     /// round.
     pub target: u32,
+    /// The target setting the play was paced against, read with `target`:
+    /// `None` in a practice round, which has no target, so a result names
+    /// the choice whatever `target` came to (design.md "Personal Bests",
+    /// Target).
+    pub setting: Option<ScoreTarget>,
 }
 
 /// What an attempt plays.

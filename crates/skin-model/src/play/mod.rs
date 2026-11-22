@@ -636,6 +636,8 @@ pub enum BuildError {
 #[derive(Clone, Debug)]
 pub struct Play {
     reducer: Reducer,
+    /// What each skin movie's destinations show this frame.
+    movies: crate::movie::MovieShows,
     /// Per lane, the note facts' visual hold as of the last build, off
     /// once its long note's end is at or before the frame's `now`.
     holds: [Option<NoteHold>; LANE_COUNT],
@@ -1052,6 +1054,7 @@ impl Play {
         Ok(Self {
             reducer,
             holds: [None; LANE_COUNT],
+            movies: crate::movie::MovieShows::default(),
             empty_poor_counted: ctx.empty_poor_counted,
             poisoned: None,
             starts: vec![None; slots].into_boxed_slice(),
@@ -1313,6 +1316,17 @@ impl Play {
     /// window); and the placeholder alone while no table for the live
     /// array is published (none yet, or one whose array is no longer in
     /// use), the miss window's included.
+    /// Sets what each skin movie's destinations show from the next build
+    /// on.
+    pub fn set_movies(&mut self, movies: crate::movie::MovieShows) {
+        self.movies = movies;
+    }
+
+    /// What each skin movie's destinations show.
+    pub(crate) const fn movies(&self) -> &crate::movie::MovieShows {
+        &self.movies
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, crate::bga::NullMedia) {
         let table = &*self.bga_table;

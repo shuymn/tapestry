@@ -79,8 +79,9 @@ use crate::widget::song_list::{
 };
 use crate::widget::text::clean;
 use crate::widget::text::{
-    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, SelectionText, Text,
-    TextDef, TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
+    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, ScreenText,
+    SelectionText, TargetName, Text, TextDef, TextError, TextRequest, TextSlots, TextTable,
+    TextTableError, TextValue,
 };
 use crate::widget::timing_graph::{TimingGraph, TimingGraphDef, TimingGraphDraw};
 use crate::widget::timing_vis::{
@@ -178,6 +179,12 @@ pub enum Source {
     /// drawn size; the black placeholder before chart time 0, for a
     /// chart with no BGA and for a base with no picture.
     Bga { stretch: BgaStretch },
+    /// The skin movie in this slot of the sheet's
+    /// ([`Sheet::movies`](crate::Sheet::movies)): its frame as the
+    /// frame's [`MovieShow`](crate::movie::MovieShow) gives it, met by
+    /// `stretch` against the movie's size as a BGA picture is, on the
+    /// play and selection screens.
+    Movie { slot: u8, stretch: BgaStretch },
 }
 
 /// What only a result skin has: the widgets it draws and the timing it
@@ -513,6 +520,8 @@ enum Kind {
     ChartImage(ChartImage, Filter, ChartStretch),
     /// The chart's BGA and its stretch.
     Bga(BgaStretch),
+    /// The skin movie's slot and its stretch.
+    Movie(u8, BgaStretch),
 }
 
 /// What a press on an element other than a slider gives, recorded in its
@@ -616,6 +625,8 @@ enum Phase<'a> {
     Loading {
         gauge: Option<LoadingGauge>,
         chosen: u8,
+        /// What each skin movie's destinations show while loading.
+        movies: &'a crate::movie::MovieShows,
     },
     /// A selection frame: its rows, ratios and pointer targets, and the
     /// pointer in target pixels.
@@ -941,6 +952,7 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
                     | Source::Text(_)
                     | Source::ChartImage { .. }
                     | Source::Bga { .. }
+                    | Source::Movie { .. }
             )
         {
             return Err(LoadError::UnsupportedFollow { element });
@@ -1093,7 +1105,8 @@ fn check_widget_images(
         | Source::TimingVisualizer(_)
         | Source::HitErrorVisualizer(_)
         | Source::ChartImage { .. }
-        | Source::Bga { .. } => {}
+        | Source::Bga { .. }
+        | Source::Movie { .. } => {}
     }
     Ok(())
 }
@@ -1139,6 +1152,12 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
                 let error = TextError::Literal;
                 return Err(LoadError::Text { element, error });
             }
+            if let Some(TextValue::Target(t)) = w.texts.get(index(i)).map(|t| &t.value)
+                && !t.valid()
+            {
+                let error = TextError::TargetOffset;
+                return Err(LoadError::Text { element, error });
+            }
         }
         Source::Image(_)
         | Source::Lanes
@@ -1153,7 +1172,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::TimingVisualizer(_)
         | Source::HitErrorVisualizer(_)
         | Source::ChartImage { .. }
-        | Source::Bga { .. } => {}
+        | Source::Bga { .. }
+        | Source::Movie { .. } => {}
     }
     Ok(())
 }
@@ -1193,6 +1213,8 @@ fn worst(
         | Source::ChartImage { .. } => 0,
         // The base, or the placeholder, and the layer.
         Source::Bga { .. } => 2,
+        // Its frame, or the black.
+        Source::Movie { .. } => 1,
         Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
@@ -1338,7 +1360,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::TimingVisualizer(_)
             | Source::HitErrorVisualizer(_)
             | Source::ChartImage { .. }
-            | Source::Bga { .. } => {
+            | Source::Bga { .. }
+            | Source::Movie { .. } => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
                         l.placements
@@ -1376,7 +1399,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::TimingVisualizer(_)
                     | Source::HitErrorVisualizer(_)
                     | Source::ChartImage { .. }
-                    | Source::Bga { .. } => e.track.bounds(),
+                    | Source::Bga { .. }
+                    | Source::Movie { .. } => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -1573,6 +1597,17 @@ fn check_bar_groups(
     Ok(())
 }
 
+/// The target name `source` shows, if it is a text showing one.
+fn target_text(def: &SkinDef, source: Source) -> Option<TargetName> {
+    match source {
+        Source::Text(i) => match def.widgets.texts.get(index(i)).map(|t| &t.value) {
+            Some(TextValue::Target(t)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether `source` is a text showing a selection screen's string.
 fn selection_text(def: &SkinDef, source: Source) -> bool {
     match source {
@@ -1620,7 +1655,9 @@ fn check_kind(
                     .image_choices
                     .get(index(i))
                     .is_none_or(|c| c.value.constant().is_some()),
-                Source::Text(_) => !selection_text(def, e.source),
+                Source::Text(_) => {
+                    !selection_text(def, e.source) && target_text(def, e.source).is_none()
+                }
                 Source::Lanes
                 | Source::Number(_)
                 | Source::Gauge(_)
@@ -1635,7 +1672,8 @@ fn check_kind(
                 | Source::TimingVisualizer(_)
                 | Source::HitErrorVisualizer(_)
                 | Source::ChartImage { .. }
-                | Source::Bga { .. } => false,
+                | Source::Bga { .. }
+                | Source::Movie { .. } => false,
             },
             ScreenKind::Selection => match e.source {
                 Source::RatioBar(i) => score(i) != Some(true),
@@ -1661,6 +1699,10 @@ fn check_kind(
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
+                            target_text(def, e.source),
+                            Some(TargetName::Before(_) | TargetName::After(_))
+                        )
+                        && !matches!(
                             e.source,
                             Source::Lanes
                                 | Source::Gauge(_)
@@ -1672,6 +1714,7 @@ fn check_kind(
                                 | Source::TimingVisualizer(_)
                                 | Source::HitErrorVisualizer(_)
                                 | Source::Bga { .. }
+                                | Source::Movie { .. }
                         )
                 }
             },
@@ -1682,6 +1725,7 @@ fn check_kind(
                 Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
+                        && target_text(def, e.source).is_none()
                         && !matches!(
                             e.source,
                             Source::SongList | Source::GaugeGraph(_) | Source::TimingGraph(_)
@@ -2278,7 +2322,8 @@ impl Skin {
                 | Source::TimingVisualizer(_)
                 | Source::HitErrorVisualizer(_)
                 | Source::ChartImage { .. }
-                | Source::Bga { .. } => {}
+                | Source::Bga { .. }
+                | Source::Movie { .. } => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -2305,6 +2350,7 @@ impl Skin {
             Source::Image(_) | Source::Lanes | Source::ChartImage { .. } | Source::Bga { .. } => {
                 false
             }
+            Source::Movie { slot, .. } => def.sheet.movies().get(usize::from(slot)).is_none(),
             Source::CoverPaint(p) => w.cover_paints.get(index(p)).is_none(),
             Source::Number(i) => w.numbers.get(index(i)).is_none(),
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
@@ -2340,7 +2386,8 @@ impl Skin {
             | Source::TimingVisualizer(_)
             | Source::HitErrorVisualizer(_)
             | Source::ChartImage { .. }
-            | Source::Bga { .. } => false,
+            | Source::Bga { .. }
+            | Source::Movie { .. } => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -2805,6 +2852,7 @@ impl Skin {
                         stretch,
                     } => Kind::ChartImage(which, filter, stretch),
                     Source::Bga { stretch } => Kind::Bga(stretch),
+                    Source::Movie { slot, stretch } => Kind::Movie(slot, stretch),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -3383,6 +3431,17 @@ impl Skin {
         target: [u32; 2],
         layout: &Layout,
     ) -> Vec<TextRequest> {
+        self.text_requests_with(chart, &ScreenText::default(), target, layout)
+    }
+
+    /// [`text_requests`](Self::text_requests) with `screen`'s strings.
+    fn text_requests_with(
+        &self,
+        chart: &ChartText<'_>,
+        screen: &ScreenText<'_>,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> Vec<TextRequest> {
         let (fit, ..) = self.fit(target);
         let mut out = Vec::new();
         for e in &self.elements {
@@ -3398,7 +3457,7 @@ impl Skin {
             if t.bitmap.is_some() {
                 continue;
             }
-            let s = text::clean(&def.value.resolve(chart));
+            let s = text::clean(&def.value.resolve_with(chart, screen));
             if s.is_empty() {
                 continue;
             }
@@ -3434,12 +3493,16 @@ impl Skin {
     /// visibility folds to false, or whose line has a value beyond
     /// ±[`MAX_TEXT_EM`](crate::MAX_TEXT_EM) em, gets no line.
     pub fn attach_bitmap_text(&self, play: &mut Play, chart: &ChartText<'_>) {
-        play.set_bitmap(self.bitmap_lines(chart));
+        play.set_bitmap(self.bitmap_lines(chart, &ScreenText::default()));
     }
 
     /// The bitmap lines of `chart`, one per text slot, as
     /// [`attach_bitmap_text`](Self::attach_bitmap_text) lays them out.
-    fn bitmap_lines(&self, chart: &ChartText<'_>) -> Box<[Option<GlyphLine>]> {
+    fn bitmap_lines(
+        &self,
+        chart: &ChartText<'_>,
+        screen: &ScreenText<'_>,
+    ) -> Box<[Option<GlyphLine>]> {
         let mut lines = vec![None; self.text_slots()];
         for e in &self.elements {
             let Kind::Text(i, t) = e.kind else {
@@ -3451,7 +3514,7 @@ impl Skin {
             if e.visible.as_ref().and_then(Program::constant) == Some(0) {
                 continue;
             }
-            let s = text::clean(&def.value.resolve(chart));
+            let s = text::clean(&def.value.resolve_with(chart, screen));
             if let Some(slot) = lines.get_mut(usize::from(t.slot)) {
                 *slot = glyphs::layout(&self.sheet, font, &s);
             }
@@ -3812,6 +3875,7 @@ impl Skin {
             phase: Phase::Loading {
                 gauge: frame.gauge,
                 chosen: loading.chosen(frame),
+                movies: loading.movies(),
             },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
@@ -3984,10 +4048,7 @@ impl Skin {
             if t.bitmap.is_some() || e.visible.as_ref().and_then(Program::constant) == Some(0) {
                 continue;
             }
-            let s = clean(
-                &def.value
-                    .resolve_with(&chart, &strings.query, &strings.place),
-            );
+            let s = clean(&def.value.resolve_with(&chart, &strings.screen()));
             if !s.is_empty() {
                 out.texts.push(TextRequest {
                     slot: t.slot,
@@ -4084,10 +4145,7 @@ impl Skin {
                 if e.visible.as_ref().and_then(Program::constant) == Some(0) {
                     continue;
                 }
-                let s = clean(
-                    &def.value
-                        .resolve_with(&chart, &strings.query, &strings.place),
-                );
+                let s = clean(&def.value.resolve_with(&chart, &strings.screen()));
                 if let Some(slot) = lines.get_mut(usize::from(t.slot)) {
                     *slot = glyphs::layout(&self.sheet, font, &s);
                 }
@@ -4363,7 +4421,7 @@ impl Skin {
         if !self.owns_result(res) {
             return Vec::new();
         }
-        self.text_requests(&res.strings.chart(), target, layout)
+        self.text_requests_with(&res.strings.chart(), &res.strings.screen(), target, layout)
     }
 
     /// Attaches the rasterized lines for `res`'s text elements; a slot in a
@@ -4388,7 +4446,7 @@ impl Skin {
         if !self.owns_result(res) {
             return;
         }
-        res.bitmap = self.bitmap_lines(&res.strings.chart());
+        res.bitmap = self.bitmap_lines(&res.strings.chart(), &res.strings.screen());
     }
 
     /// Prepares `res`'s frame at `now`: the application's readouts from
@@ -4571,7 +4629,7 @@ impl Skin {
         if self.kind != ScreenKind::Decision {
             return BitmapLines::default();
         }
-        BitmapLines::new(self.bitmap_lines(&strings.chart()))
+        BitmapLines::new(self.bitmap_lines(&strings.chart(), &ScreenText::default()))
     }
 
     /// Attaches the rasterized lines for `dec`'s text elements; a slot in
@@ -4596,7 +4654,7 @@ impl Skin {
         if !self.owns_decision(dec) {
             return;
         }
-        dec.bitmap = self.bitmap_lines(&dec.strings.chart());
+        dec.bitmap = self.bitmap_lines(&dec.strings.chart(), &ScreenText::default());
     }
 
     /// Builds one decision frame of `dec`, which must come from this
@@ -4827,7 +4885,7 @@ impl Skin {
             // While loading, an element reading what loading lacks draws
             // nothing: its condition is false, its value or selector
             // unread.
-            if let Phase::Loading { gauge, chosen } = scene.phase
+            if let Phase::Loading { gauge, chosen, .. } = scene.phase
                 && !e.loading.met(gauge.is_some(), chosen)
             {
                 continue;
@@ -5144,6 +5202,44 @@ impl Skin {
                         scale: canvas.scale(),
                     };
                     parts.draw(out, &brush, rect, trim);
+                }
+                Kind::Movie(slot, stretch) => {
+                    let shows = match (play, sel, scene.phase) {
+                        (Some((play, _)), _, _) => Some(play.movies()),
+                        (None, Some(sel), _) => Some(sel.movies()),
+                        (None, None, Phase::Loading { movies, .. }) => Some(movies),
+                        (None, None, _) => None,
+                    };
+                    match shows.and_then(|m| m.get(usize::from(slot))) {
+                        Some(&crate::movie::MovieShow::Frame {
+                            uv,
+                            layer,
+                            size,
+                            bt601,
+                            full,
+                        }) => {
+                            let f = crate::FrameUv { uv, layer };
+                            let (r, f, native) = stretch.place(rect, size, f, canvas.scale());
+                            let b = Brush { native, ..brush };
+                            out.push_movie(usize::from(slot), |out| {
+                                b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+                            });
+                        }
+                        // Opaque black over the destination, whatever its
+                        // blend and colour.
+                        Some(crate::movie::MovieShow::Lost) => {
+                            let black = Brush {
+                                key: RunKey {
+                                    blend: Blend::Alpha,
+                                    ..brush.key
+                                },
+                                color: [0.0, 0.0, 0.0, 1.0],
+                                ..brush
+                            };
+                            black.push_clipped(out, rect, crate::bga::SOLID, Filter::Linear, trim);
+                        }
+                        Some(crate::movie::MovieShow::Nothing) | None => {}
+                    }
                 }
                 Kind::Number(i) => {
                     if let Some(n) = self.numbers.get(i) {

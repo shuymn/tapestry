@@ -54,6 +54,10 @@ pub enum Filter {
     /// A BGA layer picture: the nearest texel at level 0 of the BGA
     /// array, a pure black texel keyed transparent.
     BgaLayer,
+    /// A skin movie's frame: bilinear at level 0 of the movies' plane
+    /// arrays, its layer the movie's, converted from Y'CbCr by the matrix
+    /// (BT.601, else BT.709) and range (full, else limited).
+    Movie { bt601: bool, full: bool },
 }
 
 /// How a quad is blended over what is under it.
@@ -135,6 +139,10 @@ pub struct QuadBatch {
     /// Those with the reserve: quads, runs.
     all: (u32, u32),
     dropped: u32,
+    /// Which movie slots a quad of a frame was held for since the last
+    /// [`clear`](Self::clear): a movie's clock starts at the first
+    /// presented frame that draws it (design.md "Skin movies").
+    movies: [bool; crate::movie::MAX_MOVIES],
     /// What each element's draw evaluated, allocated once for the most
     /// elements a skin has.
     #[cfg(feature = "dev-tools")]
@@ -182,6 +190,7 @@ impl QuadBatch {
             own,
             all: (quad_all, run_all),
             dropped: 0,
+            movies: [false; crate::movie::MAX_MOVIES],
             #[cfg(feature = "dev-tools")]
             observations: Vec::with_capacity(crate::MAX_ELEMENTS),
             #[cfg(feature = "dev-tools")]
@@ -200,6 +209,7 @@ impl QuadBatch {
         self.runs.clear();
         (self.quad_cap, self.run_cap) = self.own;
         self.dropped = 0;
+        self.movies = [false; crate::movie::MAX_MOVIES];
         #[cfg(feature = "dev-tools")]
         {
             self.observations.clear();
@@ -410,6 +420,24 @@ impl QuadBatch {
     #[must_use]
     pub fn dropped(&self) -> u32 {
         self.dropped
+    }
+
+    /// Pushes a movie frame's quad through `push`, and marks movie slot
+    /// `slot` drawn when the batch then holds one more quad.
+    pub fn push_movie(&mut self, slot: usize, push: impl FnOnce(&mut Self)) {
+        let before = self.len();
+        push(self);
+        if self.len() > before
+            && let Some(m) = self.movies.get_mut(slot)
+        {
+            *m = true;
+        }
+    }
+
+    /// Which movie slots the batch holds a frame's quad of.
+    #[must_use]
+    pub const fn movies(&self) -> [bool; crate::movie::MAX_MOVIES] {
+        self.movies
     }
 
     /// Whether the quad list is full, so every push would be dropped.

@@ -532,6 +532,10 @@ pub const IN_PLAY: &[Site] = &[
     // A video's state, which the game thread's preparation deadline and
     // the render side's staged frames and ring faults change each frame.
     Site::File("crates/player/src/media_host/movie.rs"),
+    // The skin movie hook: each play and selection frame reads, peeks and
+    // takes the screen's movies before the build (their admission is a
+    // boundary's of its own, before the frame's grant).
+    Site::File("crates/player/src/movie_frame.rs"),
     Site::Fns(
         "crates/skin-model/src/bga.rs",
         &[
@@ -549,6 +553,17 @@ pub const IN_PLAY: &[Site] = &[
     ),
     // Each play frame's live BGA key.
     Site::Fns("crates/render/src/bga.rs", &["BgaArray::key"]),
+    // The skin movie hook's write path: a due frame taken into its
+    // movie's mapped upload buffer, and each frame's copies into the
+    // planes.
+    Site::Fns(
+        "crates/render/src/video.rs",
+        &["Video::write_with", "Video::record"],
+    ),
+    Site::Fns(
+        "crates/render/src/upload.rs",
+        &["write_buffer_with_unpaced"],
+    ),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
@@ -620,6 +635,11 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::pool",
             "MenuScreen::pool_table",
             "MenuScreen::build_selection_frame",
+            "MenuScreen::movie_frame",
+            "MenuScreen::play_movies",
+            "MenuScreen::selection_movies",
+            "MenuScreen::movies_presented",
+            "MenuScreen::movies_unhooked",
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",
             "MenuScreen::allocate_in_next_decision",

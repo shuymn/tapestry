@@ -31,7 +31,7 @@ use crate::widget::Starts;
 use crate::widget::bpm_graph::{BpmGraphDef, BpmInput, BpmRaster};
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::song_list::{LampKey, RowBind, RowStyle};
-use crate::widget::text::{ChartText, MAX_TEXT_BYTES, TextTable};
+use crate::widget::text::{ChartText, MAX_TEXT_BYTES, ScreenText, TargetNames, TextTable};
 use crate::{AppReadouts, BuildError, GaugeLook};
 
 /// The starts of the selection screen's built-in timers this frame, each
@@ -88,6 +88,8 @@ pub(crate) struct Strings {
     pub(crate) query: String,
     /// The place's names, each followed by `" > "`.
     pub(crate) place: String,
+    /// The target names, as the labels give them.
+    pub(crate) targets: TargetNames,
 }
 
 impl Strings {
@@ -100,6 +102,24 @@ impl Strings {
             genre: &self.genre,
         }
     }
+
+    /// The screen's strings besides the chart's.
+    pub(crate) fn screen(&self) -> ScreenText<'_> {
+        ScreenText {
+            query: &self.query,
+            place: &self.place,
+            target: &self.targets.chosen,
+            before: &self.targets.before,
+            after: &self.targets.after,
+        }
+    }
+
+    /// The target names' strings.
+    fn target_strings(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.targets.chosen)
+            .chain(&self.targets.before)
+            .chain(&self.targets.after)
+    }
 }
 
 /// The selection screen's state as of its last view and build.
@@ -110,6 +130,8 @@ impl Strings {
 pub struct Selection {
     /// Whether a selection skin made it.
     pub(crate) live: bool,
+    /// What each skin movie's destinations show this frame.
+    movies: crate::movie::MovieShows,
     /// The identity of the skin that made it.
     pub(crate) skin: u64,
     /// The schema's fields, then the callbacks' output slots.
@@ -186,6 +208,7 @@ impl Selection {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         Self {
             live,
+            movies: crate::movie::MovieShows::default(),
             skin,
             fields: vec![0; field::COUNT.saturating_add(crate::output::slots(outputs))]
                 .into_boxed_slice(),
@@ -218,6 +241,17 @@ impl Selection {
 
     /// A state with no timer, text, row or pointer slot, which a skin of
     /// another kind gives: nothing accepts it.
+    /// Sets what each skin movie's destinations show from the next build
+    /// on.
+    pub fn set_movies(&mut self, movies: crate::movie::MovieShows) {
+        self.movies = movies;
+    }
+
+    /// What each skin movie's destinations show.
+    pub(crate) const fn movies(&self) -> &crate::movie::MovieShows {
+        &self.movies
+    }
+
     pub(crate) fn inert(skin: u64) -> Self {
         let mut s = Self::new(skin, false, 0, 0, 0, [0, 0, 0], 0);
         s.starts = Box::default();
@@ -248,6 +282,7 @@ impl Selection {
             &self.strings.place,
         ]
         .into_iter()
+        .chain(self.strings.target_strings())
         .chain(self.row_strings.iter())
         .map(String::capacity)
         .sum::<usize>();
@@ -507,6 +542,16 @@ impl Selection {
             _ => {}
         }
         push(&mut s.query, &view.query);
+        // On every row kind, as the setting is the screen's, not a row's;
+        // each name cut to `MAX_TARGET_NAME_CHARS`.
+        let t = &mut s.targets;
+        for (to, from) in std::iter::once((&mut t.chosen, &labels.targets.chosen))
+            .chain(t.before.iter_mut().zip(&labels.targets.before))
+            .chain(t.after.iter_mut().zip(&labels.targets.after))
+        {
+            to.clear();
+            push(to, crate::widget::text::target_name(from));
+        }
         match &view.place {
             SelectionPlace::Top => {}
             SelectionPlace::Folder(names) => {

@@ -93,6 +93,7 @@ pub fn labels() -> ResultLabels {
         artist: "Someone".to_owned(),
         subartist: String::new(),
         genre: String::new(),
+        target: String::new(),
     }
 }
 

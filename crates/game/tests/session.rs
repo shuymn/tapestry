@@ -2961,6 +2961,7 @@ fn a_play_begins_with_its_best_and_target_by_case() {
         best,
         best_known,
         target,
+        setting: None,
     };
     let random = || {
         let mut chart = taps_n(27);
@@ -3044,6 +3045,12 @@ fn a_play_begins_with_its_best_and_target_by_case() {
             "{name}: before"
         );
         loaded.begin_play();
+        // The play's choice is captured with its target, an autoplay's
+        // too.
+        let expected = ScoreBasis {
+            setting: Some(target),
+            ..expected
+        };
         assert_eq!(loaded.attempt().score, expected, "{name}");
         let key = game::BestKey {
             chart_sha256: [7; 32],
@@ -3085,7 +3092,8 @@ fn a_practice_round_reads_no_best() {
         ScoreBasis {
             best: 40,
             best_known: true,
-            target: 54
+            target: 54,
+            setting: Some(ScoreTarget::Max),
         }
     );
     assert_eq!(asked.lock().unwrap().len(), 1);

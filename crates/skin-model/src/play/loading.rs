@@ -508,6 +508,9 @@ pub struct Loading {
     /// The live key of the array its frames draw from, set by the frame's
     /// renderer before each build.
     chart_live: Option<ChartKey>,
+    /// What each skin movie's destinations show, set by the frame's
+    /// renderer before each build.
+    movies: crate::movie::MovieShows,
 }
 
 impl Loading {
@@ -524,6 +527,7 @@ impl Loading {
             bitmap: Box::default(),
             chart: None,
             chart_live: None,
+            movies: crate::movie::MovieShows::default(),
         }
     }
 
@@ -541,6 +545,7 @@ impl Loading {
             bitmap: vec![None; text_slots].into_boxed_slice(),
             chart: None,
             chart_live: None,
+            movies: crate::movie::MovieShows::default(),
         }
     }
 
@@ -563,6 +568,18 @@ impl Loading {
     /// Allocates nothing.
     pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
         self.chart_live = live;
+    }
+
+    /// Sets what each skin movie's destinations show in its next frames:
+    /// the frame's renderer sets it before each build, from the movies'
+    /// preparation. Allocates nothing.
+    pub fn set_movies(&mut self, movies: crate::movie::MovieShows) {
+        self.movies = movies;
+    }
+
+    /// What each skin movie's destinations show.
+    pub(crate) const fn movies(&self) -> &crate::movie::MovieShows {
+        &self.movies
     }
 
     /// The chart images its frames draw: the table set for it when it

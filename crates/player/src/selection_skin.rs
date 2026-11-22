@@ -396,6 +396,9 @@ pub struct SkinFeed {
     /// The settings the flow gave at the entry and at each preset change
     /// ([`settings_of`]), each update with the list's order.
     pub settings: Option<SelectionSettings>,
+    /// The target setting whose names the skin shows, as the flow gave it
+    /// with the settings (design.md "Personal Bests", Target).
+    pub target: game::ScoreTarget,
     /// The panel open and when it opened.
     panel: Option<(usize, TimeUs)>,
     /// The generation of the panels' level last read in the lifetime.
@@ -483,7 +486,7 @@ impl SkinFeed {
             },
             page,
             view,
-            labels: crate::select::labels(),
+            labels: crate::select::labels(self.target),
             events: SelectionEvents {
                 entered: self.entered,
                 changed: self.changed,
@@ -1208,7 +1211,7 @@ mod tests {
             list_revision: 0,
             page: crate::menu_screen::MenuPage::default(),
             view: skin_model::SelectionView::default(),
-            labels: crate::select::labels(),
+            labels: crate::select::labels(game::ScoreTarget::Max),
             strip: StripText::default(),
             events: SelectionEvents::default(),
             settings: None,

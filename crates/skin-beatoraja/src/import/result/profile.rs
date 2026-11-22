@@ -258,14 +258,16 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
 }
 
 /// The result text `id`: the chart's labels, as on play
-/// ([`super::super::property::str_by_id`] reads them); the rest omitted.
+/// ([`super::super::property::str_by_id`] reads them), and the name of
+/// the play's target (3, [`super::super::property::str_in`]); the rest
+/// omitted.
 pub(crate) fn text(id: i32) -> Option<Class<()>> {
     use Class::{Bridge, Omit};
     Some(match id {
-        10 | 12 | 14 | 16 => Bridge(()),
-        // The target player, IR rankings and name; the table's full
-        // name, the source's empty string without difficulty tables.
-        3 | 120..=129 | 1003 | 1020 => Omit,
+        3 | 10 | 12 | 14 | 16 => Bridge(()),
+        // IR rankings and name; the table's full name, the source's empty
+        // string without difficulty tables.
+        120..=129 | 1003 | 1020 => Omit,
         _ => return None,
     })
 }

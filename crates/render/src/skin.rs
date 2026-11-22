@@ -274,6 +274,12 @@ pub trait PlaySkin: Send {
     /// BGA table draws only when its key equals it. Nothing by default.
     fn set_bga_live(&mut self, _live: Option<skin_model::bga::BgaKey>) {}
 
+    /// What the skin movies' destinations show in the next builds, by
+    /// slot: the render side sets it each play frame from the movies'
+    /// states and the frames it took. Nothing by default: a skin that
+    /// draws no movie.
+    fn set_movies(&mut self, _movies: skin_model::movie::MovieShows) {}
+
     /// The most sprites a frame of the skin pushes: the renderer's batch,
     /// staging and instance buffer hold this many, and never fewer than
     /// [`MAX_SPRITES`], which the built-in screens use, and the

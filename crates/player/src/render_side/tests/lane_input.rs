@@ -99,6 +99,7 @@ impl Screen for Skins {
         a: &render::AttemptInput<'_>,
         _skin: Option<&Arc<render::SkinBundle>>,
         _request: u64,
+        _lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
         self.simple.prepare_attempt(a.chart, a.section()).unwrap();
         self.play = Some(self.model.prepare(a.chart, a.context).unwrap());

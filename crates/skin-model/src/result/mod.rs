@@ -30,7 +30,7 @@ use crate::select::value;
 use crate::widget::Starts;
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::text::MAX_TEXT_BYTES;
-use crate::widget::text::{ChartText, TextTable};
+use crate::widget::text::{ChartText, ScreenText, TextTable};
 
 /// The starts of the result screen's built-in timers this frame, each
 /// `None` while it is off.
@@ -87,7 +87,7 @@ pub enum ResultError {
 }
 
 /// The chart strings a result or decision skin's text shows, as of the
-/// last view or labels.
+/// last view or labels, and the name of the play's target.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Strings {
     title: String,
@@ -95,6 +95,7 @@ pub(crate) struct Strings {
     artist: String,
     subartist: String,
     genre: String,
+    target: String,
 }
 
 impl Strings {
@@ -108,17 +109,30 @@ impl Strings {
         }
     }
 
-    /// Sets the strings to `labels`, each as [`kept`] keeps it.
+    /// The screen's strings besides the chart's: the target's name.
+    pub(crate) fn screen(&self) -> ScreenText<'_> {
+        ScreenText {
+            target: &self.target,
+            ..ScreenText::default()
+        }
+    }
+
+    /// Sets the strings to `labels`, each as [`kept`] keeps it, the
+    /// target's name cut to [`MAX_TARGET_NAME_CHARS`](crate::MAX_TARGET_NAME_CHARS).
     /// Allocates only to replace a string too small for its new text, with
     /// one of exactly that text's length, so each keeps at most twice
     /// [`MAX_TEXT_BYTES`] however often it grows.
     pub(crate) fn set(&mut self, labels: &ResultLabels) {
         for (to, from) in [
-            (&mut self.title, &labels.title),
+            (&mut self.title, labels.title.as_str()),
             (&mut self.subtitle, &labels.subtitle),
             (&mut self.artist, &labels.artist),
             (&mut self.subartist, &labels.subartist),
             (&mut self.genre, &labels.genre),
+            (
+                &mut self.target,
+                crate::widget::text::target_name(&labels.target),
+            ),
         ] {
             let len = kept(from).map(char::len_utf8).sum();
             if to.capacity() < len {
@@ -137,6 +151,7 @@ impl Strings {
             &self.artist,
             &self.subartist,
             &self.genre,
+            &self.target,
         ]
         .into_iter()
         .map(String::capacity)

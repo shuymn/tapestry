@@ -48,10 +48,12 @@ mod loudness;
 mod measure;
 #[expect(
     dead_code,
-    reason = "the media worker's host lands before the change that plays videos through it"
+    reason = "parts of the media worker's host serve its tests alone"
 )]
 mod media_host;
 mod menu_screen;
+mod movie_frame;
+mod movie_screen;
 mod page_jobs;
 mod play;
 mod pointer;
@@ -1012,6 +1014,7 @@ fn rig<'a>(
         ready_state_at: None,
         origin: None,
         declared: crate::render_side::Declared::default(),
+        committed: None,
         steps,
         steps_dropped: 0,
         figures: None,
@@ -1345,6 +1348,7 @@ fn play(
         }
     };
     let link = window_thread.link();
+    let media = movie_screen::MediaHub::new(loaded.root().path());
     let make: MakeScreen = Box::new(move |_| {
         let target = Target::Window {
             window: surface.into(),
@@ -1352,7 +1356,9 @@ fn play(
             height: surface.height,
         };
         Renderer::new(target, AdapterChoice::HighPerformance).map(|r| {
-            let screen = MenuScreen::new(r, None).with_sink(Box::new(link.clone()));
+            let screen = MenuScreen::new(r, None)
+                .with_sink(Box::new(link.clone()))
+                .with_media(Arc::clone(&media));
             Box::new(screen) as Box<dyn Screen>
         })
     });
@@ -1790,6 +1796,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let ime = window_thread.as_ref().map(window::WindowThread::ime);
     let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
+    let media = movie_screen::MediaHub::new(root.path());
     // The window's own shots, asked for on a runner's pipe
     // (`--dev-shot-pipe`): every window renderer made copies for the tap.
     // The select skin's clock frozen for a test device's shots
@@ -1820,7 +1827,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 eprintln!("dev: the window's shots: {e}");
             }
             let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
-                .with_sink(Box::new(link.clone()));
+                .with_sink(Box::new(link.clone()))
+                .with_media(Arc::clone(&media));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // Headless (dev-tools): offscreen on WARP, or on the hardware
@@ -1840,7 +1848,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             println!("{line}");
             log::info!("{line}");
             dev::scenario::admit(adapter, &got)?;
-            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?;
+            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
+                .with_media(Arc::clone(&media));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // A production run always has its window.
@@ -2148,13 +2157,15 @@ fn headless(
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),
         None => Box::new(NoFrames),
     };
+    let media = movie_screen::MediaHub::new(loaded.root().path());
     let make: MakeScreen = Box::new(move |_| {
         let target = Target::Offscreen {
             width: size.0,
             height: size.1,
         };
-        Renderer::new(target, AdapterChoice::Warp)
-            .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
+        Renderer::new(target, AdapterChoice::Warp).map(|r| {
+            Box::new(MenuScreen::new(r, None).with_media(Arc::clone(&media))) as Box<dyn Screen>
+        })
     });
     // Offscreen: no refresh rate and no frame statistics.
     let measure = measure(
@@ -2860,6 +2871,7 @@ mod tests {
                 dropped: 0,
                 outcome: render::FrameOutcome::Shown,
                 present_count: None,
+                movies: [false; skin_model::movie::MAX_MOVIES],
             })
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {
@@ -2917,6 +2929,7 @@ mod tests {
                 dropped: 0,
                 outcome: render::FrameOutcome::Shown,
                 present_count: None,
+                movies: [false; skin_model::movie::MAX_MOVIES],
             })
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {

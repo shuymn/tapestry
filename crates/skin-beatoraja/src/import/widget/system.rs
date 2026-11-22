@@ -144,6 +144,72 @@ impl Cx<'_> {
         )
     }
 
+    /// Whether image source `s` is a movie: its slot among the screen's
+    /// movies, the same file's shared whatever name reaches it; or why it
+    /// is refused: a pattern no file choice covers (the source plays a
+    /// match picked at random), a file that cannot be opened inside the
+    /// skin folder, or a third movie file on the screen. `None` for any
+    /// other source.
+    pub(in super::super) fn movie_source(
+        &mut self,
+        s: &super::SrcImage,
+        at: super::super::Span,
+    ) -> Result<Option<Result<u8, NoteKind>>, ImportError> {
+        let Some(source) = self.source_rec(s.src.as_deref())? else {
+            return Ok(None);
+        };
+        let Some(path) = self.source_path(source)? else {
+            return Ok(None);
+        };
+        Ok(match self.resolve_path(&path, at)? {
+            super::super::prepare::Resolved::Movie(Some(name)) => {
+                Some(self.assets.add_movie(&name).map_err(|why| match why {
+                    skin_model::movie::MovieRefusal::Missing(_) => NoteKind::MissingAsset,
+                    skin_model::movie::MovieRefusal::OverCap => NoteKind::OverCap {
+                        cap: "two movies a screen",
+                    },
+                }))
+            }
+            super::super::prepare::Resolved::Movie(None) => Some(Err(NoteKind::UnsupportedField {
+                field: "source glob",
+            })),
+            _ => None,
+        })
+    }
+
+    /// A skin movie's destination (design.md "Rendering and Skins", skin
+    /// movies): an element of [`Source::Movie`] for the screen's movie
+    /// `slot`, its keys' rects unbaked, as the movie's size is known only
+    /// once it is probed, and its stretch kept for placement as a BGA
+    /// picture's is (none, or an unknown mode, fills the destination).
+    /// Its blend and colour are the destination's, its source rectangle
+    /// ignored. Charges no image.
+    pub(in super::super) fn movie(
+        &mut self,
+        dst: Dst,
+        slot: u8,
+        charged: bool,
+        role: super::super::policy::Role,
+    ) -> Result<(), ImportError> {
+        let at = dst.span;
+        let stretch = skin_model::bga::BgaStretch::of(dst.stretch).unwrap_or(
+            skin_model::bga::BgaStretch::Whole(skin_model::chart_image::ChartStretch::Fill),
+        );
+        let Some(c) = self.turning_image_common(&dst, charged, (Lowered::Image, role))? else {
+            return Ok(());
+        };
+        let mut rects = Vec::with_capacity(c.track.keys.len());
+        for k in &c.track.keys {
+            let r = self.key_rect(&c, k)?;
+            rects.push(
+                r.model_from(self.flip)
+                    .ok_or_else(|| self.range(at, "dst"))?,
+            );
+        }
+        let t = self.model_track(&c, &rects)?;
+        self.push_native(c, Source::Movie { slot, stretch }, t, None)
+    }
+
     /// A play skin's `bga` destination (design.md "Rendering and Skins",
     /// BGA): an element of [`Source::Bga`], its keys' rects unbaked, as
     /// each picture's size is known only at the frame, and its stretch

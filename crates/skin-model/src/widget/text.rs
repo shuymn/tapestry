@@ -61,12 +61,74 @@ pub enum SelectionText {
     Place,
 }
 
+/// How many targets before and after the chosen one a selection skin may
+/// name ([`TargetName`]).
+pub const TARGET_NEIGHBOURS: u8 = 10;
+
+/// The most characters of a target's name a text shows (design.md
+/// "Personal Bests", Target): the player's names fit, and a bitmap-font
+/// text showing one is charged this many quads.
+pub const MAX_TARGET_NAME_CHARS: usize = 16;
+
+/// `name` cut to its first [`MAX_TARGET_NAME_CHARS`] characters.
+pub(crate) fn target_name(name: &str) -> &str {
+    name.char_indices()
+        .nth(MAX_TARGET_NAME_CHARS)
+        .map_or(name, |(at, _)| name.get(..at).unwrap_or(name))
+}
+
+/// Which target's name a text shows (design.md "Personal Bests", Target):
+/// the chosen one, or the `n`th before or after it in the player's list of
+/// targets, `n` from 1 to [`TARGET_NEIGHBOURS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetName {
+    Chosen,
+    Before(u8),
+    After(u8),
+}
+
+impl TargetName {
+    /// Whether a neighbour's `n` is 1 to [`TARGET_NEIGHBOURS`].
+    pub(crate) const fn valid(self) -> bool {
+        match self {
+            Self::Chosen => true,
+            Self::Before(n) | Self::After(n) => n >= 1 && n <= TARGET_NEIGHBOURS,
+        }
+    }
+}
+
+/// The target names a skin shows, in the player's language: the chosen
+/// target's, and the ten before and after it, `before[0]` and `after[0]`
+/// the nearest. The player fills them; this crate never names a target.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TargetNames {
+    pub chosen: String,
+    pub before: [String; TARGET_NEIGHBOURS as usize],
+    pub after: [String; TARGET_NEIGHBOURS as usize],
+}
+
+/// The strings of a screen, besides the chart's, that a text element may
+/// show: selection's query and place, and the target names, a result's
+/// chosen one alone. Every slice may be shorter than its kind's, its
+/// missing names empty.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScreenText<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) place: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) before: &'a [String],
+    pub(crate) after: &'a [String],
+}
+
 /// What a text element shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextValue {
     Field(TextField),
     /// A selection screen's string; only a selection skin shows one.
     Selection(SelectionText),
+    /// A target's name: a selection skin shows any, a result skin the
+    /// chosen one alone, a play or decision skin none.
+    Target(TargetName),
     /// `field`, or `empty` where its string is empty: chosen when the text
     /// is prepared. `empty` is as a [`Literal`](Self::Literal).
     FieldOr {
@@ -123,6 +185,9 @@ impl TextDef {
                 FontRef::Bitmap(_),
                 TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
             ) => u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX),
+            (FontRef::Bitmap(_), TextValue::Target(_)) => {
+                u32::try_from(MAX_TARGET_NAME_CHARS).unwrap_or(u32::MAX)
+            }
             (FontRef::Default | FontRef::File(_), _) => 1,
         }
     }
@@ -141,6 +206,8 @@ pub enum TextError {
     Literal,
     #[error("the text's font does not exist")]
     UnknownFont,
+    #[error("the text names a target more than {TARGET_NEIGHBOURS} away, or none")]
+    TargetOffset,
 }
 
 /// The chart's header strings a text element may show.
@@ -322,7 +389,7 @@ impl TextSlots {
     pub(crate) fn names(self, value: &TextValue) -> bool {
         let f = match value {
             TextValue::Literal(_) => return self.literals,
-            TextValue::Selection(_) => return false,
+            TextValue::Selection(_) | TextValue::Target(_) => return false,
             TextValue::Field(f) | TextValue::FieldOr { field: f, .. } => *f,
         };
         let parts = match f {
@@ -395,21 +462,28 @@ impl TextValue {
     /// emptiness is its string's as written, so one of control characters
     /// alone keeps the field and draws nothing.
     pub(crate) fn resolve<'a>(&'a self, chart: &ChartText<'a>) -> Cow<'a, str> {
-        self.resolve_with(chart, "", "")
+        self.resolve_with(chart, &ScreenText::default())
     }
 
-    /// The string it shows with `chart`'s header, the selection screen's
-    /// `query` and `place`.
+    /// The string it shows with `chart`'s header and `screen`'s strings.
     pub(crate) fn resolve_with<'a>(
         &'a self,
         chart: &ChartText<'a>,
-        query: &'a str,
-        place: &'a str,
+        screen: &ScreenText<'a>,
     ) -> Cow<'a, str> {
+        let near = |names: &'a [String], n: u8| {
+            usize::from(n)
+                .checked_sub(1)
+                .and_then(|i| names.get(i))
+                .map_or("", String::as_str)
+        };
         match self {
             Self::Literal(s) => Cow::Borrowed(s),
-            Self::Selection(SelectionText::Query) => Cow::Borrowed(query),
-            Self::Selection(SelectionText::Place) => Cow::Borrowed(place),
+            Self::Selection(SelectionText::Query) => Cow::Borrowed(screen.query),
+            Self::Selection(SelectionText::Place) => Cow::Borrowed(screen.place),
+            Self::Target(TargetName::Chosen) => Cow::Borrowed(screen.target),
+            Self::Target(TargetName::Before(n)) => Cow::Borrowed(near(screen.before, *n)),
+            Self::Target(TargetName::After(n)) => Cow::Borrowed(near(screen.after, *n)),
             Self::Field(f) => f.resolve(chart),
             Self::FieldOr { field, empty } => {
                 let s = field.resolve(chart);
@@ -520,5 +594,28 @@ impl Text {
             let rect = [x + off + ix * h * sx, y + iy * h, iw * h * sx, ih * h];
             brush.push_about(out, rect, pivot, uv, Filter::Linear);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bitmap text is charged the most glyph quads its string can take:
+    /// a target's name its cap, a chart field its byte bound (design.md
+    /// "Personal Bests", Target).
+    #[test]
+    fn a_bitmap_target_name_is_charged_its_cap() {
+        let def = |value| TextDef {
+            value,
+            font: FontRef::Bitmap(0),
+            align: Align::Left,
+            overflow: Overflow::Spill,
+        };
+        assert_eq!(def(TextValue::Target(TargetName::Chosen)).quads(), 16);
+        assert_eq!(def(TextValue::Target(TargetName::After(10))).quads(), 16);
+        assert_eq!(def(TextValue::Field(TextField::Title)).quads(), 256);
+        assert_eq!(target_name(&"Aé".repeat(16)), "AéAéAéAéAéAéAéAé");
+        assert_eq!(target_name("MAX"), "MAX");
     }
 }

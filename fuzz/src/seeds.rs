@@ -44,6 +44,8 @@ const RING_RUN: usize = 2;
 const RING_STAMP: usize = 3;
 const RING_INDEX: usize = 4;
 const RING_BYTES: usize = 5;
+/// The first of a slot header's two reserved words.
+const RING_RESERVED: usize = 6;
 
 /// A frame ring of `size` ([`crate::RING_SIZES`], with
 /// [`crate::RING_SECOND_RUN`] in its run started) as the game sets it up,
@@ -136,6 +138,15 @@ pub fn rings() -> Vec<Seed> {
         (
             "stamp_outside",
             ring_seed(3, 1_000, &two, &[(1, RING_STAMP, 1 << 21)]),
+        ),
+        (
+            "reserved",
+            ring_seed(
+                1,
+                1_500,
+                &[(1, 1, 1_000)],
+                &[(0, RING_RESERVED, u64::MAX), (0, RING_RESERVED + 1, 1)],
+            ),
         ),
     ]
 }

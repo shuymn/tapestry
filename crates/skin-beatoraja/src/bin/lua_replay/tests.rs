@@ -71,7 +71,12 @@ pub(crate) fn options(script: Script) -> Options {
 
 pub(crate) fn run_with(body: &str, o: &Options) -> Report {
     let d = folder(body);
-    match replay(d.path(), "s.luaskin", o) {
+    replay_in(d.path(), o)
+}
+
+/// The replay of the skin folder `dir`'s `s.luaskin` with `o`.
+fn replay_in(dir: &std::path::Path, o: &Options) -> Report {
+    match replay(dir, "s.luaskin", o) {
         Ok(r) => r,
         Err(Stop::Failed(e)) => panic!("failed: {e}"),
         Err(Stop::Differs) => panic!("the imports differ"),
@@ -553,8 +558,9 @@ fn pruning_invokes_nothing() {
 /// evidence it sees without reading a file, so it keeps the compiled draw
 /// and runs it every frame (design.md "Differences from the source",
 /// play program schedule: noted at the callback, never drawn), found as
-/// invocations with no source point. A movie source makes the object
-/// unmodelled: its compiled draw is one finding.
+/// invocations with no source point. A movie source, its file present
+/// (a missing one takes no movie slot and is dropped as an image's is),
+/// makes the object unmodelled: its compiled draw is one finding.
 #[test]
 fn an_unloadable_image_is_removed() {
     let body = format!(
@@ -566,7 +572,9 @@ fn an_unloadable_image_is_removed() {
         dst("\"g\"", 0, &format!("draw = {HALF_POINT},")),
         dst("\"mv\"", 0, &format!("draw = {HALF_POINT},"))
     );
-    let r = run(&body);
+    let d = folder(&body);
+    std::fs::write(d.path().join("m.mp4"), b"not read").unwrap();
+    let r = replay_in(d.path(), &options(Script::full()));
     assert!(
         r.removed.iter().any(|l| l.what == "invalid"),
         "{}",

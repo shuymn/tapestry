@@ -369,6 +369,7 @@ pub fn labels_of() -> SelectionLabels {
     SelectionLabels {
         all_charts: "ALL".to_owned(),
         search_results: "FOUND".to_owned(),
+        targets: Default::default(),
     }
 }
 

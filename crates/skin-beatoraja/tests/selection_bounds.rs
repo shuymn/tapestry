@@ -288,3 +288,53 @@ fn bitmap_row_text_quads_count_to_the_cap() {
     let (l, _) = limit(run(1));
     assert_eq!(l, ImportLimit::WidgetQuads);
 }
+
+/// A bitmap target text charges a target name's cap of glyphs, not a
+/// chart field's 256 (design.md "Personal Bests", Target): text 3 and a
+/// neighbour each add `MAX_TARGET_NAME_CHARS` widget quads, a title 256.
+#[test]
+fn bitmap_target_texts_charge_a_names_cap() {
+    let quads = |refs: &[i32]| {
+        let texts: Vec<String> = refs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!(r#"{{"id": "tt{i}", "font": "b", "size": 4, "ref": {r}}}"#))
+            .collect();
+        let dsts: Vec<String> = (0..refs.len())
+            .map(|i| format!(r#"{{"id": "tt{i}", "dst": [{}]}}"#, at(0, 0, 100, 4)))
+            .collect();
+        let body = skin(
+            &at(0, 900, 300, 40),
+            &dsts,
+            1,
+            TITLE,
+            r#""font": [{"id": "f", "path": "f.ttf"}, {"id": "b", "path": "b.fnt"}]"#,
+        )
+        .replace(
+            &format!(r#""text": [{TEXT_T}]"#),
+            &format!(
+                r#""text": [{}]"#,
+                [TEXT_T.to_owned()]
+                    .into_iter()
+                    .chain(texts)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        );
+        let d = folder(&body);
+        common::big_fnt(d.path(), "b.fnt", 4, 0, 0);
+        import_selection(d.path())
+            .unwrap()
+            .report
+            .usage
+            .widget_quads
+    };
+    let cap = u32::try_from(skin_model::MAX_TARGET_NAME_CHARS).unwrap();
+    let base = quads(&[]);
+    assert_eq!(quads(&[3]), base + cap);
+    assert_eq!(quads(&[3, 205, 214]), base + 3 * cap);
+    assert_eq!(
+        quads(&[10]),
+        base + u32::try_from(skin_model::MAX_TEXT_BYTES).unwrap()
+    );
+}

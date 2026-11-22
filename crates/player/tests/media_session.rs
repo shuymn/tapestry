@@ -29,7 +29,7 @@ use media_support::media_host::launch::Launches;
 use media_support::media_host::session::{
     Deadlines, Event, Launching, Loss, Movie, PREPARATION, Session, Status,
 };
-use media_support::{Made, Stage, Step, WORKER, recipe};
+use media_support::{Made, Stage, Step, WORKER, read_tight, recipe};
 use skin_model::media::{self, Reader, State};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
@@ -126,6 +126,30 @@ impl Rig {
         let started = Instant::now();
         self.session.open(movie, file, looping);
         started.elapsed()
+    }
+
+    /// A clip of `spec` (`--dev-gen-clip`'s codec, container, size, rate,
+    /// frames and group) named `name` beside the rig's own.
+    fn clip_of(&self, name: &str, spec: &str) -> PathBuf {
+        let path = self.clip.with_file_name(name);
+        let out = Command::new(WORKER)
+            .arg("--dev-gen-clip")
+            .arg(&path)
+            .args(spec.split(' '))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        path
+    }
+
+    /// Asks for the file at `path` as `movie`, looping.
+    fn open_path(&self, movie: &Arc<Movie>, path: &std::path::Path) {
+        self.session
+            .open(movie, std::fs::File::open(path).unwrap(), true);
     }
 
     /// Shows the screen of `generation`: how long the hand-off took.
@@ -227,14 +251,14 @@ struct Drawn {
     stop: AtomicBool,
     /// It reads nothing of the ring while set.
     hold: AtomicBool,
-    /// The frames it staged.
+    /// The frames it took.
     staged: AtomicU64,
     /// When it first freed a slot.
     first_free: Mutex<Option<Instant>>,
 }
 
 /// The render side's stand-in for one movie: a reader polling its ring
-/// every 4 ms (240 Hz) at the media time since its first poll, staging the
+/// every 4 ms (240 Hz) at the media time since its first poll, taking the
 /// frame due, telling the session the slots it freed and the movie its
 /// first frame; a fault loses the movie, a lost movie is no more read.
 struct Render {
@@ -289,9 +313,10 @@ impl Drop for Render {
 fn draw(movie: &Movie, drawn: &Drawn) {
     let mut reader: Option<Reader> = None;
     let mut origin = None;
+    let mut frame = Vec::new();
     while !drawn.stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(4));
-        if drawn.hold.load(Ordering::Acquire) || movie.status() == Status::Lost {
+        if movie.status() == Status::Lost {
             continue;
         }
         let Some(live) = movie.live() else { continue };
@@ -299,15 +324,18 @@ fn draw(movie: &Movie, drawn: &Drawn) {
             reader = live.reader.lock().unwrap().take();
         }
         let Some(r) = reader.as_mut() else { continue };
+        if drawn.hold.load(Ordering::Acquire) {
+            continue;
+        }
         let origin = *origin.get_or_insert_with(Instant::now);
         let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
-        match r.poll(live.ring.words(), due) {
-            Ok(p) => {
-                if p.staged.is_some() {
+        match read_tight(r, live.ring.words(), due, &mut frame) {
+            Ok((taken, freed)) => {
+                if taken.is_some() {
                     drawn.staged.fetch_add(1, Ordering::AcqRel);
                     movie.staged_first();
                 }
-                if p.freed {
+                if freed {
                     drawn
                         .first_free
                         .lock()
@@ -876,6 +904,41 @@ fn live_movie_without_a_frame_is_lost_at_the_preparation_deadline() {
     assert_eq!(movie.loss(), Some(Loss::Preparation));
     assert!(movie.live().is_some());
     drop(render);
+}
+
+/// The screen's pixel total is applied at a movie's probe, before its
+/// ring is made (design.md "Memory Budget"): with a 2048 × 1536 movie live,
+/// a 1280 × 1024 peer passes the 2048 × 2048 total and is refused, lost
+/// over its cap with no ring mapped; the control, a 1024 × 1024 peer,
+/// meets the total exactly and plays.
+// Covers: T02
+#[test]
+fn a_movie_past_the_total_maps_no_ring() {
+    for (peer, refused) in [("1280x1024", true), ("1024x1024", false)] {
+        let rig = Rig::serving(&[]);
+        rig.session.enter(1);
+        let big = Movie::new(1);
+        rig.open_path(
+            &big,
+            &rig.clip_of("big.mpg", "mpeg1video mpeg 2048x1536 30 10 5"),
+        );
+        until(LAUNCH, || big.status() == Status::Live).expect("the first never live");
+        let spec = format!("mpeg1video mpeg {peer} 30 10 5");
+        let movie = Movie::new(1);
+        rig.open_path(&movie, &rig.clip_of("peer.mpg", &spec));
+        until(LAUNCH, || movie.status() != Status::Pending).expect("the peer never judged");
+        if refused {
+            assert_eq!(movie.loss(), Some(Loss::OverTotal), "{peer}");
+            // Its player closed: the session is done with it.
+            rig.event(Deadlines::GAME.close + SLACK, |e| *e == Event::Closed)
+                .expect("the refused player never closed");
+            assert!(movie.live().is_none(), "{peer}: a ring mapped");
+        } else {
+            assert_eq!(movie.status(), Status::Live, "{peer}");
+            assert!(movie.live().is_some());
+        }
+        assert_eq!(big.status(), Status::Live, "{peer}: the first plays on");
+    }
 }
 
 // Covers: T02

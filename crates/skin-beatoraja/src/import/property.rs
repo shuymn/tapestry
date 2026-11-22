@@ -2,7 +2,7 @@
 //! property factories return for an id or a name, and which of those the
 //! model shows, on each kind of screen.
 
-use skin_model::{ScreenKind, SelectionText};
+use skin_model::{ScreenKind, SelectionText, TargetName};
 
 use super::result::{self, profile::ResValue};
 use super::selection::profile::{Class, SelText, SelValue};
@@ -1111,6 +1111,10 @@ pub(crate) enum StrProp {
     Field(i32),
     /// A selection screen's own string.
     Screen(SelectionText),
+    /// A target's name (design.md "Personal Bests", Target): on selection
+    /// any, on the result the chosen one. Only [`str_in`] makes one, so
+    /// a screen that does not bridge it never sees it.
+    Target(TargetName),
     /// The empty string, as the scene always holds it: on play the table
     /// level and name, `tablefull` (1003, `StringPropertyFactory.java:261`),
     /// as there are no difficulty tables (stage3.md §1). Nothing draws.
@@ -1120,6 +1124,9 @@ pub(crate) enum StrProp {
 
 /// `tablefull`, the difficulty table's level and name.
 const TABLE_FULL: i32 = 1_003;
+
+/// `target`, the chosen target's name.
+const TARGET: i32 = 3;
 
 /// String property `id` on a `kind` screen: play's mapping, or the
 /// selection, decision or result profile's ([`selection::profile::text`],
@@ -1137,6 +1144,9 @@ pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
     };
     if let Some(class) = profile {
         return match class {
+            Some(Class::Bridge(())) if kind == ScreenKind::Result && id == TARGET => {
+                StrProp::Target(TargetName::Chosen)
+            }
             Some(Class::Bridge(())) => str_by_id(id),
             Some(Class::Unavailable | Class::Omit) => StrProp::Unsupported(Some(id)),
             None => match str_by_id(id) {
@@ -1151,6 +1161,7 @@ pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
     match selection::profile::text(id) {
         Some(Class::Bridge(SelText::Field(_))) => str_by_id(id),
         Some(Class::Bridge(SelText::Screen(s))) => StrProp::Screen(s),
+        Some(Class::Bridge(SelText::Target(t))) => StrProp::Target(t),
         Some(Class::Unavailable | Class::Omit) => StrProp::Unsupported(Some(id)),
         None => str_by_id(id),
     }
@@ -1161,7 +1172,23 @@ pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
 pub(crate) fn str_by_name_in(kind: ScreenKind, name: &str) -> Option<StrProp> {
     match STRING_TYPES.iter().find(|(_, n)| *n == name) {
         Some(&(id, _)) => Some(str_in(kind, id)),
-        None => str_by_name(name),
+        None => match target_name_id(name) {
+            Some(id) => Some(str_in(kind, id)),
+            None => str_by_name(name),
+        },
+    }
+}
+
+/// The id a neighbouring target's name reads by its name
+/// (`StringPropertyFactory.java:86-88`, `:143-150` at `0.8.9`):
+/// `targetnamep<v>`, `v` before the chosen one, is 210 − `v`, and
+/// `targetnamen<v>`, `v` after it, 209 + `v`, `v` from 1 to 10.
+// Source: SF-023
+fn target_name_id(name: &str) -> Option<i32> {
+    if let Some(v) = numbered(name, "targetnamep", "", 1, 10) {
+        Some(210 - v)
+    } else {
+        numbered(name, "targetnamen", "", 1, 10).map(|v| 209 + v)
     }
 }
 
@@ -1569,6 +1596,56 @@ mod tests {
             str_by_name("targetnamep10"),
             Some(StrProp::Unsupported(None))
         );
+    }
+
+    /// S10-44: the target names bind on selection by id and by name, 200
+    /// the tenth before the chosen one to 209 the first, 210 the first
+    /// after it to 219 the tenth (`StringPropertyFactory.java:86-88` at
+    /// `0.8.9`); the result binds the chosen one alone; decision and play
+    /// bind none.
+    // Source: SF-023
+    #[test]
+    fn target_names_bind_by_id_and_by_name() {
+        use TargetName::{After, Before, Chosen};
+        let sel = ScreenKind::Selection;
+        for (id, name, want) in [
+            (3, "target", Chosen),
+            (200, "targetnamep10", Before(10)),
+            (201, "targetnamep9", Before(9)),
+            (209, "targetnamep1", Before(1)),
+            (210, "targetnamen1", After(1)),
+            (211, "targetnamen2", After(2)),
+            (219, "targetnamen10", After(10)),
+        ] {
+            assert_eq!(str_in(sel, id), StrProp::Target(want), "{id}");
+            assert_eq!(
+                str_by_name_in(sel, name),
+                Some(StrProp::Target(want)),
+                "{name}"
+            );
+        }
+        assert_eq!(str_by_name_in(sel, "targetnamep0"), None);
+        assert_eq!(str_by_name_in(sel, "targetnamen11"), None);
+        assert_eq!(str_in(ScreenKind::Result, 3), StrProp::Target(Chosen));
+        assert_eq!(
+            str_by_name_in(ScreenKind::Result, "target"),
+            Some(StrProp::Target(Chosen))
+        );
+        for id in [200, 219] {
+            assert_eq!(
+                str_in(ScreenKind::Result, id),
+                StrProp::Unsupported(Some(id))
+            );
+        }
+        for kind in [ScreenKind::Decision, ScreenKind::Play] {
+            for id in [3, 200, 219] {
+                assert_eq!(str_in(kind, id), StrProp::Unsupported(Some(id)), "{kind:?}");
+            }
+            assert_eq!(
+                str_by_name_in(kind, "targetnamen1"),
+                Some(StrProp::Unsupported(Some(210)))
+            );
+        }
     }
 
     #[test]
