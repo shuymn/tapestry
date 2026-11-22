@@ -748,17 +748,35 @@ pub(crate) fn absent_table() -> Arc<BgaTable> {
     Arc::new(BgaTable::ABSENT)
 }
 
-/// The media provider standing in until videos are decoded: no video has
-/// a frame, so each draws as a missing picture.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NullMedia;
+/// An attempt's chart videos (design.md "Rendering and Skins", BGA): the
+/// chart movie slot ([`crate::movie::CHART_SLOTS`]) each `#BMPxx` id of a
+/// video plays in, by the id's index. An id with none, or a play with no
+/// chart videos set, draws as a picture that cannot be prepared. Made
+/// before the attempt's READY; a frame only reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChartVideos {
+    slots: Box<[Option<u8>]>,
+}
 
-impl NullMedia {
-    /// The frame `id`'s video shows: none.
+impl ChartVideos {
+    /// The videos whose ids, by index, play in `slots` (each one of
+    /// [`crate::movie::CHART_SLOTS`]; any other slot is none).
+    #[must_use]
+    pub fn new(slots: &[Option<u8>]) -> Self {
+        let chart = |s: &u8| crate::movie::CHART_SLOTS.contains(&usize::from(*s));
+        let slots = slots.iter().map(|s| s.filter(chart)).collect();
+        Self { slots }
+    }
+
+    /// The chart movie slot id `id`'s video plays in, if any.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn frame(self, _id: BgaImageId) -> Option<BgaCell> {
-        None
+    pub fn slot(&self, id: BgaImageId) -> Option<usize> {
+        self.slots
+            .get(usize::from(id.0))
+            .copied()
+            .flatten()
+            .map(usize::from)
     }
 }
 

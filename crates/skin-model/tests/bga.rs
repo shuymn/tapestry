@@ -5,7 +5,10 @@
 //! sequence has passed; the black placeholder before chart time 0, for a
 //! base with no picture and while the table is not drawable; a cropping
 //! stretch crops at each frame against the picture's drawn size; and only
-//! a play skin may draw it.
+//! a play skin may draw it. A video id draws its chart movie slot's frame,
+//! placed against the video's size, on every channel, or its channel's
+//! absence while the slot shows nothing or no slots are set; a lost chart
+//! video draws one opaque black quad over each element.
 
 mod lanes_support;
 mod play_support;
@@ -15,8 +18,9 @@ use std::sync::Arc;
 
 use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga, PoorSequence, TimeUs};
 use rules::Judgment;
-use skin_model::bga::{BgaCell, BgaEntry, BgaKey, BgaStretch, BgaTable, Crop, SOLID};
+use skin_model::bga::{BgaCell, BgaEntry, BgaKey, BgaStretch, BgaTable, ChartVideos, Crop, SOLID};
 use skin_model::chart_image::ChartStretch;
+use skin_model::movie::{MovieShow, MovieShows};
 use skin_model::{
     ElementDef, Filter, FrameUv, Place, PlayContext, Quad, ScreenKind, Skin, Source, TimerRef,
     timer,
@@ -111,7 +115,7 @@ fn drawn(quads: &[Quad]) -> Vec<(Option<u16>, Filter)> {
     quads
         .iter()
         .map(|q| match q.filter {
-            Filter::Bga | Filter::BgaLayer => (Some(q.layer), q.filter),
+            Filter::Bga | Filter::BgaLayer | Filter::Movie { .. } => (Some(q.layer), q.filter),
             _ => {
                 assert_eq!((q.uv, q.layer), (SOLID.uv, SOLID.layer));
                 assert_eq!(&q.color[..3], &[0.0, 0.0, 0.0], "the placeholder is black");
@@ -358,4 +362,176 @@ fn only_a_play_skin_draws_the_bga() {
         );
     }
     assert!(load(Vec::new(), vec![bga_element(FILL)]).is_ok());
+}
+
+/// A video's frame in movie slot `slot`, `size` pixels, BT.601 and full
+/// range.
+fn video_frame(slot: u16, size: [u32; 2]) -> MovieShow {
+    MovieShow::Frame {
+        uv: [0.0, 0.0, 1.0, 1.0],
+        layer: slot,
+        size,
+        bt601: true,
+        full: true,
+    }
+}
+
+const MOVIE: Filter = Filter::Movie {
+    bt601: true,
+    full: true,
+};
+const fn video(slot: u16) -> (Option<u16>, Filter) {
+    (Some(slot), MOVIE)
+}
+
+/// Shows of slots 2 and 3, the skin's slots nothing.
+fn shows(two: MovieShow, three: MovieShow) -> MovieShows {
+    [MovieShow::Nothing, MovieShow::Nothing, two, three]
+}
+
+/// The table with base 0, layer 2 and poor 3 videos, the rest pictures.
+fn video_table() -> BgaTable {
+    let mut entries: Vec<BgaEntry> = (0..5).map(|i| cell(i, [256, 256])).collect();
+    for i in [0, 2, 3] {
+        entries[i] = BgaEntry::Video;
+    }
+    BgaTable::new(entries).keyed(KEY)
+}
+
+/// Base 0 and poor 3 in slot 2, layer 2 in slot 3.
+fn video_slots() -> ChartVideos {
+    ChartVideos::new(&[Some(2), None, Some(3), Some(2), None])
+}
+
+/// A combo break at `ms`: the poor window from then.
+fn miss(h: &mut Harness, ms: i64) -> Vec<(Option<u16>, Filter)> {
+    h.frame(
+        ms,
+        &[ev(ms, judged(1, 0, Judgment::Bad, Some(90), None, 0))],
+    );
+    drawn(h.batch.quads())
+}
+
+/// A video id whose slot shows nothing draws as its channel's absence:
+/// the base the placeholder, the layer and the poor frame nothing.
+#[test]
+fn a_video_with_nothing_to_show_draws_as_absent_per_channel() {
+    let mut h = harness(FILL, video_table());
+    h.play.set_chart_videos(video_slots());
+    h.play
+        .set_movies(shows(MovieShow::Nothing, MovieShow::Nothing));
+    h.frame(600, &[]);
+    assert_eq!(drawn(h.batch.quads()), [PLACEHOLDER], "base and layer");
+    assert_eq!(miss(&mut h, 3_200), [], "the poor frame");
+    // With frames, each channel draws its slot's: the base and the poor
+    // frame slot 2's, the layer slot 3's.
+    let mut h = harness(FILL, video_table());
+    h.play.set_chart_videos(video_slots());
+    h.play.set_movies(shows(
+        video_frame(2, [256, 256]),
+        video_frame(3, [256, 256]),
+    ));
+    h.frame(600, &[]);
+    assert_eq!(drawn(h.batch.quads()), [video(2), video(3)]);
+    assert_eq!(h.batch.movies(), [false, false, true, true]);
+}
+
+/// A poor frame naming a video draws its slot's frame as a movie quad,
+/// sampled bilinearly, in place of the base and the layer.
+#[test]
+fn a_poor_frame_naming_a_video_draws_its_slot_s_frame() {
+    let mut entries: Vec<BgaEntry> = (0..5).map(|i| cell(i, [256, 256])).collect();
+    entries[3] = BgaEntry::Video;
+    let mut h = harness(FILL, BgaTable::new(entries).keyed(KEY));
+    h.play
+        .set_chart_videos(ChartVideos::new(&[None, None, None, Some(3), None]));
+    h.play
+        .set_movies(shows(MovieShow::Nothing, video_frame(3, [256, 256])));
+    assert_eq!(miss(&mut h, 3_200), [video(3)]);
+    assert_eq!(h.batch.movies(), [false, false, false, true]);
+    // The poor sequence's next frame, a picture.
+    h.frame(3_450, &[]);
+    assert_eq!(drawn(h.batch.quads()), [base(4)]);
+}
+
+/// A video is placed by the element's stretch against the video's own
+/// size: a 640×360 video under stretch 3 in a square destination fills
+/// its height and keeps the middle 9/16 of its width.
+#[test]
+fn a_video_is_placed_by_the_stretch_against_its_size() {
+    let mut h = harness(BgaStretch::Crop(Crop::Outer), video_table());
+    h.play.set_chart_videos(video_slots());
+    h.play
+        .set_movies(shows(video_frame(2, [640, 360]), MovieShow::Nothing));
+    h.frame(100, &[]);
+    let q = h.batch.quads()[0];
+    assert_eq!(q.filter, MOVIE);
+    assert_eq!(q.rect, [100.0, 100.0, 512.0, 512.0]);
+    assert_eq!(q.uv, [0.21875, 0.0, 0.78125, 1.0]);
+}
+
+/// Without chart video slots set, as before chart videos play, every
+/// video id draws as absent on each channel, whatever the movie slots
+/// show.
+#[test]
+fn without_chart_videos_every_video_id_is_absent() {
+    let mut h = harness(FILL, video_table());
+    h.play.set_movies(shows(
+        video_frame(2, [256, 256]),
+        video_frame(3, [256, 256]),
+    ));
+    h.frame(600, &[]);
+    assert_eq!(drawn(h.batch.quads()), [PLACEHOLDER]);
+    assert_eq!(miss(&mut h, 3_200), []);
+    assert_eq!(h.batch.movies(), [false; 4]);
+}
+
+/// While a chart video is lost, each `bga` element draws exactly one
+/// opaque black quad over its rect, alpha-blended whatever its own blend
+/// and colour, and nothing else; a skin movie lost does not black the
+/// panel.
+#[test]
+fn a_lost_panel_draws_one_black_quad_per_element() {
+    let second = ElementDef {
+        blend: skin_model::Blend::Add,
+        track: rect([700, 100, 300, 300]),
+        ..bga_element(FILL)
+    };
+    let skin = load(Vec::new(), vec![bga_element(FILL), second]).unwrap();
+    let mut c = chart();
+    c.bga = Some(bga());
+    let mut h = Harness::new(skin, &c, &full(1_000));
+    h.play.set_bga_images(Arc::new(table()));
+    h.play.set_bga_live(Some(KEY));
+    h.play.set_movies([
+        MovieShow::Lost,
+        MovieShow::Nothing,
+        MovieShow::Nothing,
+        MovieShow::Nothing,
+    ]);
+    h.frame(600, &[]);
+    assert_eq!(
+        drawn(h.batch.quads()),
+        [base(0), layer(2), base(0), layer(2)]
+    );
+    for lost in [
+        shows(MovieShow::Lost, MovieShow::Nothing),
+        shows(video_frame(2, [256, 256]), MovieShow::Lost),
+    ] {
+        h.play.set_movies(lost);
+        h.frame(600, &[]);
+        let quads = h.batch.quads();
+        assert_eq!(drawn(quads), [PLACEHOLDER, PLACEHOLDER], "{lost:?}");
+        assert_eq!(quads[0].rect, [100.0, 100.0, 512.0, 512.0]);
+        assert_eq!(quads[1].rect, [700.0, 100.0, 300.0, 300.0]);
+        for q in quads {
+            assert_eq!(q.color, [0.0, 0.0, 0.0, 1.0], "opaque black");
+        }
+        let blends: Vec<_> = h.batch.runs().iter().map(|r| r.key.blend).collect();
+        assert!(
+            blends.iter().all(|b| *b == skin_model::Blend::Alpha),
+            "{blends:?}"
+        );
+        assert_eq!(h.batch.movies(), [false; 4]);
+    }
 }

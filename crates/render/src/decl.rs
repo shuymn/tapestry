@@ -920,6 +920,13 @@ impl PlaySkin for DeclSkin {
         self.movies = movies;
     }
 
+    /// The prepared attempt's chart video slots; nothing without one.
+    fn set_chart_videos(&mut self, videos: skin_model::bga::ChartVideos) {
+        if let Some(play) = &mut self.play {
+            play.set_chart_videos(videos);
+        }
+    }
+
     /// The prepared attempt's images; nothing without one.
     fn set_chart_images(&mut self, table: ChartTable) {
         if let Some(play) = &mut self.play {

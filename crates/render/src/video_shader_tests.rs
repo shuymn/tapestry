@@ -330,7 +330,9 @@ fn the_movie_planes_stay_within_the_memory_budget() {
             assert!(past(w, h) <= over, "{w}×{h}");
         }
     }
-    let movies = u64::from(MAX_MOVIES);
+    // The skin's movies; the chart's videos share the pixel total in
+    // their own slots.
+    let movies = u64::try_from(skin_model::movie::MAX_MOVIES).unwrap();
     assert!(3 * MAX_MOVIE_PIXELS + movies * over <= BUDGET);
     // The shapes past the old arrays' maximum of each axis, and a
     // narrow movie of the tallest side beside one filling the rest.
@@ -368,4 +370,68 @@ fn a_wide_and_a_tall_movie_reserve_their_own_sizes() {
     let want = reference(100.0, 128.0, 128.0, false, false);
     near(at(&pixels, 24, 24), want, "the wide movie");
     near(at(&pixels, 72, 24), want, "the tall movie");
+}
+
+/// Four movies of their own sizes and colours, one a slot (design.md
+/// "Rendering and Skins", skin movies: two slots for the skin's movies,
+/// two for the chart's videos): a quad on slot `i` reads slot `i`'s
+/// colour at its last column and row, and no other slot's.
+#[test]
+fn each_of_four_slots_samples_its_own_planes() {
+    let mut rig = Rig::new();
+    let movies: [(u32, u32, [u8; 3], [u8; 3]); 4] = [
+        (64, 32, [81, 90, 240], [60, 170, 70]),
+        (128, 48, [145, 54, 34], [200, 16, 240]),
+        (96, 80, [41, 240, 110], [170, 100, 30]),
+        (32, 16, [210, 128, 128], [100, 60, 200]),
+    ];
+    for (slot, &(w, h, inner, edge)) in (0..).zip(&movies) {
+        rig.reserve(slot, w, h);
+        rig.write(slot, w, h, &planes(w, h, inner, edge));
+    }
+    let quads: Vec<_> = (0..)
+        .zip(&movies)
+        .map(|(slot, &(w, h, _, _))| {
+            let x = (w as f32 - 0.5) / w as f32;
+            let y = (h as f32 - 0.5) / h as f32;
+            quad(4.0 + 48.0 * slot as f32, [x, y, x, y], slot, 0)
+        })
+        .collect();
+    let pixels = rig.draw(&quads);
+    for (slot, &(_, _, _, edge)) in movies.iter().enumerate() {
+        let [y, u, v] = edge.map(f64::from);
+        near(
+            at(&pixels, 4 + 48 * slot + 20, 24),
+            reference(y, u, v, false, false),
+            &format!("slot {slot}'s last texel"),
+        );
+    }
+}
+
+/// The sprite pipelines' sampled textures, counted from their layouts'
+/// entries as built (the atlas and the chart-image pool, the BGA array,
+/// three planes a movie slot), fit the device's limit a shader stage,
+/// and the pipelines are made without a validation error.
+#[test]
+fn the_pipeline_s_texture_bindings_fit_the_device_limit() {
+    let r = crate::test_common::offscreen(64, 64);
+    let gpu = r.gpu();
+    let sampled: u32 = crate::renderer::sprite_layout_entries()
+        .iter()
+        .flatten()
+        .filter(|e| {
+            matches!(e.ty, wgpu::BindingType::Texture { .. })
+                && e.visibility.contains(wgpu::ShaderStages::FRAGMENT)
+        })
+        .map(|e| e.count.map_or(1, std::num::NonZeroU32::get))
+        .sum();
+    assert_eq!(
+        sampled,
+        3 + 3 * MAX_MOVIES,
+        "the atlas, pool, BGA and planes"
+    );
+    let limit = gpu.device().limits().max_sampled_textures_per_shader_stage;
+    assert!(sampled <= limit, "{sampled} sampled textures over {limit}");
+    let (_, refused) = crate::skin_atlas::scoped(gpu.device(), || pipelines(gpu, FORMAT));
+    assert!(refused.is_none(), "{refused:?}");
 }

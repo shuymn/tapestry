@@ -166,7 +166,7 @@ impl Planes for Kept {
 }
 
 fn movies(a: Option<&Arc<Fake>>, b: Option<&Arc<Fake>>, start: Instant) -> Movies<Fake> {
-    Movies::new([a.cloned(), b.cloned()], start)
+    Movies::skin([a.cloned(), b.cloned()], start)
 }
 
 /// A selection frame's movie work at frame time `at`: the admission
@@ -180,7 +180,7 @@ fn tick(m: &mut Movies<Fake>, planes: &mut dyn Planes, at: i64, now: Instant) ->
 }
 
 /// The slots `shows` gives a frame to: those a build draws.
-fn drawn(shows: MovieShows) -> [bool; MAX_MOVIES] {
+fn drawn(shows: MovieShows) -> [bool; SLOTS] {
     shows.map(|s| matches!(s, MovieShow::Frame { .. }))
 }
 
@@ -198,7 +198,12 @@ fn each_state_shows_what_it_should() {
     // Both pending: nothing.
     assert_eq!(
         tick(&mut m, &mut planes, 0, start),
-        [MovieShow::Nothing, MovieShow::Nothing]
+        [
+            MovieShow::Nothing,
+            MovieShow::Nothing,
+            MovieShow::Nothing,
+            MovieShow::Nothing
+        ]
     );
     // Slot 1 live while slot 0 is pending (the session judged its total):
     // admitted, its frame taken and shown.
@@ -318,7 +323,7 @@ fn a_ring_fault_loses_the_movie_in_that_frame_and_it_stays_black() {
     let mut planes = Kept::default();
     assert!(matches!(
         tick(&mut m, &mut planes, 0, start),
-        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }, ..]
     ));
     // Slot 1's state word set to one the protocol has not.
     let state = a.geometry.frame_start(1) - SLOT_HEADER_WORDS;
@@ -470,13 +475,13 @@ fn a_movie_s_clock_starts_only_at_a_presented_frame_that_draws_it() {
     m.admit(&mut planes, start);
     let shows = m.frame(&mut planes, 1_000_000, start);
     assert!(matches!(shows[0], MovieShow::Frame { .. }));
-    m.presented(true, [false, false]);
+    m.presented(true, [false, false, false, false]);
     let _ = m.frame(&mut planes, 1_100_000, start);
-    m.presented(false, [true, false]);
-    m.presented(true, [true, false]);
+    m.presented(false, [true, false, false, false]);
+    m.presented(true, [true, false, false, false]);
     let _ = m.frame(&mut planes, 2_000_000, start);
     assert!(holds(&planes, 0, 1), "frame 0 until its clock starts");
-    m.presented(true, [true, false]);
+    m.presented(true, [true, false, false, false]);
     let _ = m.frame(&mut planes, 2_000_000 + period - 1, start);
     assert!(holds(&planes, 0, 1));
     let _ = m.frame(&mut planes, 2_000_000 + period, start);
@@ -509,9 +514,9 @@ fn a_movie_keeps_its_clock_through_ready_while_its_peer_starts_there() {
     let (_, shows) = m.poll(&mut planes, 1_000_000, start);
     assert!(matches!(
         shows,
-        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }, ..]
     ));
-    m.presented(true, [true, false]);
+    m.presented(true, [true, false, false, false]);
     // READY, 150 ms on.
     let ready = 1_150_000;
     let shows = m.frame(&mut planes, ready, start);
@@ -567,7 +572,15 @@ fn a_take_crossing_the_deadline_expires_a_pending_peer_in_the_same_poll() {
     let (settled, shows) = m.prepare(&mut planes, now);
     assert_eq!(a.loss(), Some(Loss::Preparation));
     assert_eq!(b.loss(), Some(Loss::Preparation), "the pending peer");
-    assert_eq!(shows, [MovieShow::Lost, MovieShow::Lost]);
+    assert_eq!(
+        shows,
+        [
+            MovieShow::Lost,
+            MovieShow::Lost,
+            MovieShow::Nothing,
+            MovieShow::Nothing
+        ]
+    );
     assert!(settled);
 }
 
@@ -677,7 +690,12 @@ fn the_preparation_deadline_loses_what_is_not_settled() {
     let mut planes = Kept::default();
     assert_eq!(
         tick(&mut m, &mut planes, 0, deadline + Duration::from_millis(1)),
-        [MovieShow::Lost, MovieShow::Lost]
+        [
+            MovieShow::Lost,
+            MovieShow::Lost,
+            MovieShow::Nothing,
+            MovieShow::Nothing
+        ]
     );
 }
 

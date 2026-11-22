@@ -2,7 +2,9 @@
 //! pictures written to the array draw where a play skin's `bga` element
 //! is; the layer's black is transparent, so the base shows through it;
 //! and each channel's absence draws as its own: a base with no picture
-//! the black placeholder, a layer or poor picture nothing.
+//! the black placeholder, a layer or poor picture nothing. A video id
+//! draws its chart movie slot's frame, opaque on the layer too, and a lost
+//! chart video draws every destination opaque black.
 
 mod common;
 mod decl_support;
@@ -11,8 +13,9 @@ use bms_model::{
     BgaEvent, BgaImage, BgaImageId, Chart, ChartBga, ChartBuilder, PoorSequence, TimeUs,
 };
 use common::{GAUGES, attempt, context, input, install, read_back, view};
-use decl_support::{BGA_RECT, Look, bundle};
-use skin_model::bga::{BgaCell, BgaEntry, CellPlace};
+use decl_support::{BGA_RECT, BGA_RECT_2, Look, bundle};
+use skin_model::bga::{BgaCell, BgaEntry, CellPlace, ChartVideos};
+use skin_model::movie::{MovieShow, MovieShows};
 
 const WHITE: [u8; 3] = [255; 3];
 const BLACK: [u8; 3] = [0; 3];
@@ -111,9 +114,16 @@ fn chart(bga: ChartBga) -> Chart {
 
 /// A renderer drawing `chart` under a white image with the BGA over it.
 fn renderer(dir: &std::path::Path, chart: &Chart) -> render::Renderer {
+    renderer_of(dir, chart, false)
+}
+
+/// As [`renderer`], with a second BGA destination when `second`
+/// ([`Look::bga_second`]).
+fn renderer_of(dir: &std::path::Path, chart: &Chart, second: bool) -> render::Renderer {
     let mut r = common::offscreen(1_920, 1_080);
     let look = Look {
         bga: true,
+        bga_second: second,
         ..Look::left([255, 255, 255, 255])
     };
     let (b, _) = bundle(&r, dir, &look);
@@ -337,4 +347,163 @@ fn a_batch_whose_array_is_replaced_ends_stale() {
         Err(render::BgaFault::Cell)
     );
     assert_eq!(r.bga_boundary_within(ONE_STEP), render::BgaStep::Idle);
+}
+
+/// Writes a 64×64 frame into movie slot `slot`'s planes, its left half of
+/// Y'CbCr `left` and its right half of `right` (limited range).
+fn movie(r: &mut render::Renderer, slot: u32, left: [u8; 3], right: [u8; 3]) -> MovieShow {
+    r.video_reserve(slot, 64, 64);
+    let whole = r.video_write_with(slot, 64, 64, |sink, [luma, chroma]| {
+        let mut at = 0;
+        for (plane, rows, width, pitch) in
+            [(0, 64, 64, luma), (1, 32, 32, chroma), (2, 32, 32, chroma)]
+        {
+            let row: Vec<u8> = (0..width)
+                .map(|x| {
+                    if x < width / 2 {
+                        left[plane]
+                    } else {
+                        right[plane]
+                    }
+                })
+                .collect();
+            for _ in 0..rows {
+                if !sink(at, &row) {
+                    return false;
+                }
+                at += pitch;
+            }
+        }
+        true
+    });
+    assert!(whole);
+    MovieShow::Frame {
+        uv: render::VIDEO_UV,
+        layer: u16::try_from(slot).unwrap(),
+        size: [64, 64],
+        bt601: false,
+        full: false,
+    }
+}
+
+/// Black and white, limited range.
+const Y_BLACK: [u8; 3] = [16, 128, 128];
+const Y_WHITE: [u8; 3] = [235, 128, 128];
+
+/// Asserts `got` is within 2 levels of `want` in each channel.
+#[track_caller]
+fn near(got: [u8; 3], want: [u8; 3], what: &str) {
+    let off = got
+        .iter()
+        .zip(want)
+        .map(|(g, w)| g.abs_diff(w))
+        .max()
+        .unwrap_or(0);
+    assert!(off <= 2, "{what}: {got:?} against {want:?}");
+}
+
+/// A layer that shows a video frame is opaque (design.md "Rendering and
+/// Skins", BGA): the frame's black covers the base, where a layer
+/// picture's black in the same place lets the base through.
+// Source: SF-023
+#[test]
+fn a_layer_video_is_opaque_over_the_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = chart(
+        ChartBga::new(
+            vec![image(1), image(2)],
+            vec![event(0, Some(0))],
+            vec![event(0, Some(1))],
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let mut r = renderer(dir.path(), &c);
+    let key = r.begin_bga(1).unwrap();
+    let base = write(&mut r, key, 0, BLUE, BLUE);
+    let keyed = write(&mut r, key, 1, BLACK, GREEN);
+    r.publish_bga(Some(key), vec![base, BgaEntry::Video])
+        .unwrap();
+    r.set_chart_videos(ChartVideos::new(&[None, Some(2)]));
+    let mut shows = MovieShows::default();
+    shows[2] = movie(&mut r, 2, Y_BLACK, Y_WHITE);
+    r.set_play_movies(shows);
+    let p = frame(&mut r, 100, &[]);
+    near(at(&p, LEFT), BLACK, "the video's black covers the base");
+    near(at(&p, RIGHT), WHITE, "the video's white");
+    r.publish_bga(Some(key), vec![base, keyed]).unwrap();
+    let p = frame(&mut r, 200, &[]);
+    assert_eq!(at(&p, LEFT), BLUE, "a layer picture's black is keyed");
+    assert_eq!(at(&p, RIGHT), GREEN);
+}
+
+/// A lost chart video draws every `bga` destination opaque black over its
+/// whole rect (design.md "Rendering and Skins", BGA), whatever its colour
+/// and blend: the first alpha-blended, the second additive, tinted and at
+/// half alpha, each over white beside the other, with a base, a layer and
+/// a poor picture of their own colours under the loss.
+#[test]
+fn a_lost_panel_is_black_over_every_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = chart(
+        ChartBga::new(
+            (1..=3).map(image).collect(),
+            vec![event(0, Some(0))],
+            vec![event(0, Some(1))],
+            vec![PoorSequence {
+                time: TimeUs(0),
+                frames: vec![Some(BgaImageId(2))].into_boxed_slice(),
+            }],
+        )
+        .unwrap(),
+    );
+    let mut r = renderer_of(dir.path(), &c, true);
+    let key = r.begin_bga(1).unwrap();
+    let base = write(&mut r, key, 0, BLUE, BLUE);
+    let layer = write(&mut r, key, 1, GREEN, GREEN);
+    let poor = write(&mut r, key, 2, BLUE, GREEN);
+    r.publish_bga(Some(key), vec![base, layer, poor]).unwrap();
+    let rects = [BGA_RECT, BGA_RECT_2].map(|q| q.map(|v| u32::try_from(v).unwrap()));
+    let corners = |[x, y, w, h]: [u32; 4]| {
+        [
+            (x + 1, y + 1),
+            (x + w - 2, y + 1),
+            (x + 1, y + h - 2),
+            (x + w - 2, y + h - 2),
+            (x + w / 2, y + h / 2),
+        ]
+    };
+    // Shown first: the panel's own colours over the alpha destination,
+    // and the additive one's over white.
+    let p = frame(&mut r, 100, &[]);
+    assert_eq!(at(&p, LEFT), GREEN, "the layer before the loss");
+    let mut shows = MovieShows::default();
+    shows[3] = MovieShow::Lost;
+    r.set_play_movies(shows);
+    let miss = eval::JudgeEvent {
+        seq: 1,
+        time: TimeUs(300_000),
+        origin: None,
+        kind: eval::JudgeEventKind::EmptyPoor {
+            lane: common::lane(1),
+            deviation: TimeUs(0),
+            presses: 0,
+        },
+    };
+    for (ms, effects) in [(200, &[][..]), (300, &[miss][..])] {
+        let p = frame(&mut r, ms, effects);
+        for (i, rect) in rects.iter().enumerate() {
+            for xy in corners(*rect) {
+                assert_eq!(
+                    common::rgb_at(&p, 1_920, xy),
+                    BLACK,
+                    "destination {i} at {xy:?}, {ms} ms"
+                );
+            }
+        }
+        // Between and beside them, the image.
+        for xy in [(530, 250), (880, 250)] {
+            assert_eq!(common::rgb_at(&p, 1_920, xy), WHITE, "{xy:?}, {ms} ms");
+        }
+    }
 }

@@ -208,7 +208,7 @@ impl MovieSet {
             #[cfg(all(test, feature = "dev-tools"))]
             generation,
             loading: None,
-            movies: Movies::new(movies, start),
+            movies: Movies::skin(movies, start),
         })
     }
 
@@ -227,7 +227,7 @@ impl MovieSet {
             kind,
             generation: hub.next_generation(),
             loading: None,
-            movies: Movies::new(movies, start),
+            movies: Movies::skin(movies, start),
         }
     }
 

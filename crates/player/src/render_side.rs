@@ -1046,7 +1046,7 @@ pub trait Screen: Send {
             dropped: 0,
             outcome: render::FrameOutcome::Shown,
             present_count: None,
-            movies: [false; skin_model::movie::MAX_MOVIES],
+            movies: [false; skin_model::movie::SLOTS],
         })
     }
     /// Draws the select screen from `update` at `now`, with the
@@ -15070,7 +15070,7 @@ const fn timing_of(outcome: FrameOutcome) -> FrameTiming {
         dropped: 0,
         outcome,
         present_count: None,
-        movies: [false; skin_model::movie::MAX_MOVIES],
+        movies: [false; skin_model::movie::SLOTS],
     }
 }
 
@@ -15106,7 +15106,7 @@ pub(crate) mod tests {
                 render::FrameOutcome::Retry
             },
             present_count: None,
-            movies: [false; skin_model::movie::MAX_MOVIES],
+            movies: [false; skin_model::movie::SLOTS],
         }
     }
 

@@ -66,7 +66,7 @@ use std::time::Instant;
 
 use skin_model::media::Reader;
 use skin_model::media::control::{Matrix, Range};
-use skin_model::movie::{MAX_MOVIES, MovieShow, MovieShows};
+use skin_model::movie::{MAX_MOVIES, MovieShow, MovieShows, SLOTS};
 
 use crate::media_host::session::{Loss, Movie, Status, preparation_deadline};
 
@@ -245,10 +245,10 @@ impl<S: Source> Slot<S> {
 
 /// A screen's movies, by slot, with what the hook keeps of each.
 pub struct Movies<S = Movie> {
-    slots: [Slot<S>; MAX_MOVIES],
+    slots: [Slot<S>; SLOTS],
     /// Each slot's planes' size as last reserved through this value; zero
     /// before and once released.
-    reserved: [[u32; 2]; MAX_MOVIES],
+    reserved: [[u32; 2]; SLOTS],
     /// The screen's preparation deadline (L5).
     deadline: Instant,
     /// The frame time the last visible hook was given, until the frame it
@@ -259,14 +259,20 @@ pub struct Movies<S = Movie> {
 impl<S: Source> Movies<S> {
     /// The movies of a screen whose preparation started at `start`, by
     /// slot (`None` for an absent one).
-    pub fn new(movies: [Option<Arc<S>>; MAX_MOVIES], start: Instant) -> Self {
-        let [a, b] = movies;
+    pub fn new(movies: [Option<Arc<S>>; SLOTS], start: Instant) -> Self {
         Self {
-            slots: [Slot::new(a), Slot::new(b)],
-            reserved: [[0; 2]; MAX_MOVIES],
+            slots: movies.map(Slot::new),
+            reserved: [[0; 2]; SLOTS],
             deadline: preparation_deadline(start),
             hook_at: None,
         }
+    }
+
+    /// The skin's movies of a screen whose preparation started at `start`,
+    /// in its first slots, the chart's slots empty.
+    pub fn skin(movies: [Option<Arc<S>>; MAX_MOVIES], start: Instant) -> Self {
+        let mut skin = movies.into_iter();
+        Self::new(std::array::from_fn(|_| skin.next().flatten()), start)
     }
 
     /// A preparation poll at `now`, readiness only: each movie's first
@@ -324,7 +330,7 @@ impl<S: Source> Movies<S> {
     /// reader taken and its planes reserved. It allocates on the GPU only.
     pub fn admit(&mut self, planes: &mut dyn Planes, now: Instant) {
         let _ = self.settle(now);
-        for i in 0..MAX_MOVIES {
+        for i in 0..SLOTS {
             self.slot_admit(planes, i);
         }
     }
@@ -337,7 +343,7 @@ impl<S: Source> Movies<S> {
     /// a movie takes no turn again. It releases nothing.
     pub fn turn(&mut self, planes: &mut dyn Planes, now: Instant) {
         let _ = self.settle(now);
-        for i in 0..MAX_MOVIES {
+        for i in 0..SLOTS {
             let Some(slot) = self.slots.get_mut(i) else {
                 continue;
             };
@@ -412,7 +418,7 @@ impl<S: Source> Movies<S> {
             self.hook_at = at;
         }
         let mut shows = MovieShows::default();
-        for i in 0..MAX_MOVIES {
+        for i in 0..SLOTS {
             let show = self.slot_frame(planes, i, at);
             if let Some(s) = shows.get_mut(i) {
                 *s = show;
@@ -427,7 +433,7 @@ impl<S: Source> Movies<S> {
     /// by a presented frame starts its clock at that hook's frame time;
     /// nothing else changes. A frame drawn with no visible hook before it
     /// starts nothing.
-    pub fn presented(&mut self, presented: bool, drawn: [bool; MAX_MOVIES]) {
+    pub fn presented(&mut self, presented: bool, drawn: [bool; SLOTS]) {
         let Some(origin) = self.hook_at.take().filter(|_| presented) else {
             return;
         };
@@ -556,14 +562,13 @@ impl<S: Source> Movies<S> {
 
     /// The stamp of the frame each slot's planes hold (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn stamps(&self) -> [Option<i64>; MAX_MOVIES] {
-        let [a, b] = &self.slots;
-        [a.stamp.filter(|_| a.shown), b.stamp.filter(|_| b.shown)]
+    pub fn stamps(&self) -> [Option<i64>; SLOTS] {
+        self.slots.each_ref().map(|s| s.stamp.filter(|_| s.shown))
     }
 
     /// Each slot's clock origin on the frame clock, once started (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn origins(&self) -> [Option<i64>; MAX_MOVIES] {
+    pub fn origins(&self) -> [Option<i64>; SLOTS] {
         self.slots.each_ref().map(|s| match s.clock {
             Clock::Running { origin, .. } => Some(origin),
             Clock::Unstaged | Clock::Staged { .. } => None,

@@ -543,7 +543,7 @@ pub const IN_PLAY: &[Site] = &[
             "BgaTable::published",
             "BgaTable::key",
             "BgaTable::get",
-            "NullMedia::frame",
+            "ChartVideos::slot",
             "BgaStretch::place",
         ],
     ),

@@ -142,7 +142,7 @@ pub struct QuadBatch {
     /// Which movie slots a quad of a frame was held for since the last
     /// [`clear`](Self::clear): a movie's clock starts at the first
     /// presented frame that draws it (design.md "Skin movies").
-    movies: [bool; crate::movie::MAX_MOVIES],
+    movies: [bool; crate::movie::SLOTS],
     /// What each element's draw evaluated, allocated once for the most
     /// elements a skin has.
     #[cfg(feature = "dev-tools")]
@@ -190,7 +190,7 @@ impl QuadBatch {
             own,
             all: (quad_all, run_all),
             dropped: 0,
-            movies: [false; crate::movie::MAX_MOVIES],
+            movies: [false; crate::movie::SLOTS],
             #[cfg(feature = "dev-tools")]
             observations: Vec::with_capacity(crate::MAX_ELEMENTS),
             #[cfg(feature = "dev-tools")]
@@ -209,7 +209,7 @@ impl QuadBatch {
         self.runs.clear();
         (self.quad_cap, self.run_cap) = self.own;
         self.dropped = 0;
-        self.movies = [false; crate::movie::MAX_MOVIES];
+        self.movies = [false; crate::movie::SLOTS];
         #[cfg(feature = "dev-tools")]
         {
             self.observations.clear();
@@ -436,7 +436,7 @@ impl QuadBatch {
 
     /// Which movie slots the batch holds a frame's quad of.
     #[must_use]
-    pub const fn movies(&self) -> [bool; crate::movie::MAX_MOVIES] {
+    pub const fn movies(&self) -> [bool; crate::movie::SLOTS] {
         self.movies
     }
 
