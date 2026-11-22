@@ -47,6 +47,10 @@ fn publish(movie: &Movie, seq: u64, stamp: i64, id: u8) {
     let writer = Writer::attach(words).unwrap();
     let slot = writer.claim(words).unwrap();
     let frame = vec![id; geometry.frame_bytes()];
+    let stamp = skin_model::media::Stamp {
+        at: stamp,
+        duration: 33_333,
+    };
     writer.publish(words, slot, &frame, seq, 1, stamp).unwrap();
 }
 

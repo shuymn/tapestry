@@ -2136,7 +2136,11 @@ fn clip() -> Arc<Movie> {
     let writer = skin_model::media::Writer::attach(words).unwrap();
     let slot = writer.claim(words).unwrap();
     let frame = vec![9; geometry.frame_bytes()];
-    writer.publish(words, slot, &frame, 1, 1, 0).unwrap();
+    let at = skin_model::media::Stamp {
+        at: 0,
+        duration: 33_333,
+    };
+    writer.publish(words, slot, &frame, 1, 1, at).unwrap();
     movie
 }
 

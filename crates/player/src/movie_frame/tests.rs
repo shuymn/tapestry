@@ -56,7 +56,17 @@ impl Fake {
         let slot = writer.claim(self.words.as_slice()).unwrap();
         let frame = vec![id; self.geometry.frame_bytes()];
         writer
-            .publish(self.words.as_slice(), slot, &frame, seq, 1, stamp)
+            .publish(
+                self.words.as_slice(),
+                slot,
+                &frame,
+                seq,
+                1,
+                skin_model::media::Stamp {
+                    at: stamp,
+                    duration: 33_333,
+                },
+            )
             .unwrap();
     }
 }

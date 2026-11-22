@@ -58,7 +58,7 @@ fn bga_images_seeds_read_or_fail_as_built() {
 
 /// The frame ring seeds stage a due frame, then the next a second later,
 /// wait for one not due, stage the newest of a full ring, free an earlier
-/// run's frame unread, stage a frame whatever its reserved words hold, and
+/// run's frame unread, stage a frame whatever its reserved word holds, and
 /// fail the player for each broken slot they were built with.
 #[test]
 fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
@@ -83,13 +83,22 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
             "stamp_order",
             "stamp_outside",
             "reserved",
+            "duration_zero",
+            "duration_long",
+            "duration_end",
         ],
     );
     let outcome = |name: &str| {
         let (_, bytes) = seeds.iter().find(|(n, _)| *n == name).unwrap();
         ring_bytes(bytes)
     };
-    let staged = |seq, stamp| RingOutcome::Staged(Frame { seq, stamp });
+    let staged = |seq, stamp| {
+        RingOutcome::Staged(Frame {
+            seq,
+            stamp,
+            duration: seeds::RING_FRAME_US,
+        })
+    };
     assert_eq!(outcome("empty"), RingOutcome::Nothing);
     assert_eq!(outcome("due"), staged(2, 1_000_000));
     assert_eq!(outcome("not_due"), staged(1, 1_000), "due a second later");
@@ -128,7 +137,22 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
     assert_eq!(
         outcome("reserved"),
         staged(1, 1_000),
-        "the reserved words not read"
+        "the reserved word not read"
+    );
+    assert_eq!(
+        outcome("duration_zero"),
+        fault(Fault::Duration { slot: 1, value: 0 })
+    );
+    assert_eq!(
+        outcome("duration_long"),
+        fault(Fault::Duration {
+            slot: 0,
+            value: 3_600_000_001
+        })
+    );
+    assert_eq!(
+        outcome("duration_end"),
+        fault(Fault::Duration { slot: 1, value: 2 })
     );
 }
 

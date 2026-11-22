@@ -14,7 +14,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use skin_model::media::{Fault, Geometry, Reader, SLOT_HEADER_WORDS, Window, Writer};
+use skin_model::media::{Fault, Geometry, Reader, SLOT_HEADER_WORDS, Stamp, Window, Writer};
 
 struct Counting;
 
@@ -90,7 +90,19 @@ fn ring_reads_do_not_allocate() {
     let frame: Vec<u8> = (0..g.frame_bytes()).map(|i| (i % 253) as u8).collect();
     let publish = |seq: u64, run: u64, stamp: i64| {
         let slot = writer.claim(ring).unwrap();
-        writer.publish(ring, slot, &frame, seq, run, stamp).unwrap();
+        writer
+            .publish(
+                ring,
+                slot,
+                &frame,
+                seq,
+                run,
+                Stamp {
+                    at: stamp,
+                    duration: 33_333,
+                },
+            )
+            .unwrap();
     };
     publish(1, 1, 1_000);
     publish(2, 1, 2_000);

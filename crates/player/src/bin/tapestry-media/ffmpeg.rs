@@ -1140,6 +1140,8 @@ pub struct Input {
     start: i64,
     /// The stamps of the frames, each pass of a loop following the last.
     clock: LoopClock,
+    /// How long the frame stamped last lasts, in µs ([`Input::duration`]).
+    duration: i64,
     /// A seek has positioned the video: the next frame decoded is no longer
     /// the clip's first usable one.
     sought: bool,
@@ -1193,6 +1195,7 @@ impl Input {
             time_base: ff::AVRational { num: 0, den: 1 },
             start: 0,
             clock: LoopClock::new(0, None),
+            duration: 1,
             sought: false,
             colour: Colour {
                 matrix: Matrix::Bt709,
@@ -1714,7 +1717,18 @@ impl Input {
             self.clock.set_first(pts);
         }
         let ticks = self.clock.ticks(pts, Some(duration))?;
-        Some(rescale_us(ticks, self.time_base.num, self.time_base.den))
+        let tb = self.time_base;
+        self.duration = self.clock.frame_us(ticks, duration, tb.num, tb.den);
+        Some(rescale_us(ticks, tb.num, tb.den))
+    }
+
+    /// How long the frame decoded last lasts, in µs, from its own duration,
+    /// else the stream's average frame period, else the interval between
+    /// the last two frames decoded, else one tick; at least 1 µs and at
+    /// most [`skin_model::media::MAX_FRAME_US`] (design.md "Rendering and
+    /// Skins", video frames).
+    pub const fn duration(&self) -> i64 {
+        self.duration
     }
 
     /// The decoded frame into `out`, I420 at the probed size, scaled when
