@@ -437,6 +437,37 @@ fn a_layer_video_is_opaque_over_the_base() {
     assert_eq!(at(&p, RIGHT), GREEN);
 }
 
+/// A chart whose names resolve to videos alone publishes its table with
+/// no array (design.md "Rendering and Skins", BGA): its base video still
+/// draws its slot's frame, which reads back, where a picture of a table
+/// with no array is absent.
+#[test]
+fn a_video_only_table_with_no_array_draws_its_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = chart(
+        ChartBga::new(
+            vec![image(1)],
+            vec![event(0, Some(0))],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let mut r = renderer(dir.path(), &c);
+    r.publish_bga(None, vec![BgaEntry::Video]).unwrap();
+    r.set_chart_videos(ChartVideos::new(&[Some(2)]));
+    let mut shows = MovieShows::default();
+    shows[2] = movie(&mut r, 2, Y_WHITE, Y_BLACK);
+    r.set_play_movies(shows);
+    let p = frame(&mut r, 100, &[]);
+    near(at(&p, LEFT), WHITE, "the video's white half");
+    near(at(&p, RIGHT), BLACK, "the video's black half");
+    // Nothing to show: the base's placeholder.
+    r.set_play_movies(MovieShows::default());
+    let p = frame(&mut r, 200, &[]);
+    assert_eq!((at(&p, LEFT), at(&p, RIGHT)), (BLACK, BLACK));
+}
+
 /// A lost chart video draws every `bga` destination opaque black over its
 /// whole rect (design.md "Rendering and Skins", BGA), whatever its colour
 /// and blend: the first alpha-blended, the second additive, tinted and at

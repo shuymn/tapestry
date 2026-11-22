@@ -5154,11 +5154,12 @@ impl Skin {
                 Kind::Bga(stretch) => {
                     const NO_SHOWS: crate::movie::MovieShows =
                         [crate::movie::MovieShow::Nothing; crate::movie::SLOTS];
-                    let (show, table, media) = match scene.phase {
+                    let (show, table, pictures, media) = match scene.phase {
                         Phase::Play { play, .. } => play.bga_frame(),
                         _ => (
                             crate::play::bga::Show::Placeholder,
                             &crate::bga::NO_TABLE,
+                            false,
                             crate::play::bga::Media {
                                 videos: None,
                                 shows: &NO_SHOWS,
@@ -5168,6 +5169,7 @@ impl Skin {
                     let parts = crate::play::bga::Parts {
                         show,
                         table,
+                        pictures,
                         media,
                         stretch,
                         scale: canvas.scale(),

@@ -148,6 +148,9 @@ impl Media<'_> {
 pub(crate) struct Parts<'a> {
     pub(crate) show: Show,
     pub(crate) table: &'a BgaTable,
+    /// Whether the table's pictures may draw: it describes the live
+    /// array. Its videos draw either way.
+    pub(crate) pictures: bool,
     pub(crate) media: Media<'a>,
     pub(crate) stretch: BgaStretch,
     /// Target pixels per canvas pixel.
@@ -231,7 +234,7 @@ impl Parts<'_> {
         }
         let picture = |out: &mut QuadBatch, id: BgaImageId, filter: Filter| {
             let cell = match self.table.get(id) {
-                BgaEntry::Picture(c) => Some(c),
+                BgaEntry::Picture(c) => self.pictures.then_some(c),
                 BgaEntry::Video => return self.video(out, brush, rect, trim, id),
                 BgaEntry::Absent => None,
             };

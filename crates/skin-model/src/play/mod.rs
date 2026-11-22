@@ -1317,13 +1317,6 @@ impl Play {
         self.bga_live = live;
     }
 
-    /// What the last build's BGA destinations show and the table they draw
-    /// from: the table when it describes the live array; a table published
-    /// with no array as every picture absent, channel by channel (the
-    /// placeholder on the base, nothing on the layer or in the miss
-    /// window); and the placeholder alone while no table for the live
-    /// array is published (none yet, or one whose array is no longer in
-    /// use), the miss window's included.
     /// Sets what each skin movie's destinations show from the next build
     /// on.
     pub fn set_movies(&mut self, movies: crate::movie::MovieShows) {
@@ -1335,19 +1328,28 @@ impl Play {
         &self.movies
     }
 
+    /// What the last build's BGA destinations show, the table they draw
+    /// from, whether its pictures may draw, and where its videos' frames
+    /// come from: the table, pictures and all, when it describes the live
+    /// array; a table published with no array with every picture absent,
+    /// channel by channel (the placeholder on the base, nothing on the
+    /// layer or in the miss window), its videos drawing from their slots;
+    /// and the placeholder alone while no table for the live array is
+    /// published (none yet, or one whose array is no longer in use), the
+    /// miss window's included.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, bga::Media<'_>) {
+    pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, bool, bga::Media<'_>) {
         let table = &*self.bga_table;
         let media = bga::Media {
             videos: self.chart_videos.as_ref(),
             shows: &self.movies,
         };
         if table.drawable(self.bga_live) {
-            (self.bga_show, table, media)
+            (self.bga_show, table, true, media)
         } else if table.published() && table.key().is_none() {
-            (self.bga_show, &crate::bga::NO_TABLE, media)
+            (self.bga_show, table, false, media)
         } else {
-            (bga::Show::Placeholder, &crate::bga::NO_TABLE, media)
+            (bga::Show::Placeholder, &crate::bga::NO_TABLE, false, media)
         }
     }
 
