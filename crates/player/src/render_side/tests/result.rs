@@ -2686,6 +2686,19 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                     asked + 1,
                     "a view asks for its layout"
                 );
+                // The result handed over shows at the look that reads its
+                // first picture's acknowledgement.
+                let end = Instant::now() + Duration::from_secs(20);
+                while !p.result_view_shown() {
+                    assert!(Instant::now() < end, "the result never showed");
+                    p.idle_wait(TimeUs(p.now().0 + 20_000));
+                }
+                // The view shown again, waiting until then, is presented
+                // before the pin, so the pin holds it.
+                assert!(
+                    wait_until(|| p.render.result_status().shown.map(|s| s.0) == Some(2)),
+                    "the second view is presented after the acknowledgement"
+                );
                 let lifetime = p.render.result_status().lifetime;
                 let at = p.now();
                 assert_eq!(
@@ -2740,7 +2753,7 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                         p.now()
                     );
                     assert_eq!(p.result_timing(), Some(t));
-                    assert_eq!(p.render.result_status().pinned, Some(1));
+                    assert_eq!(p.render.result_status().pinned, Some(2));
                 }
                 // Shown again after the recovery: still no layout, and
                 // the same lifetime.
@@ -4675,10 +4688,13 @@ fn a_switch_needing_a_union_waits_for_the_boundarys_destruction() {
 /// A swap-paced window minimized past the result's hold bound, the menu
 /// font not in hand: the pending presentation's bitmap frames end
 /// invisible, so each refills the frame interval's allowance as a shown
-/// one does. The first view's creation spends it; a view superseding it,
-/// whose own creation waits for a refill, is created while the window
-/// stays minimized (design.md "Load Pipeline", the allowance; "Rendering
-/// and Skins", the result's hold).
+/// one does. A first view's creation spends it; that result is left
+/// before its first picture and the next one's hold begins, whose first
+/// view's creation waits for a refill that only bitmap frames give: it is
+/// created while the window stays minimized (design.md "Load Pipeline",
+/// the allowance; "Rendering and Skins", the result's hold). A newer
+/// payload of one lifetime waits for its first picture, so the second
+/// creation is the next lifetime's.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_minimized_bitmap_frame_refills_the_allowance_for_a_second_creation() {
@@ -4735,9 +4751,12 @@ fn a_minimized_bitmap_frame_refills_the_allowance_for_a_second_creation() {
         "the first view's creation"
     );
     let bitmap = rig.link.bitmap_frames();
+    rig.link.end_result();
+    rig.link.hold_result(bms_model::TimeSource::now(&rig.clock));
+    let next = rig.link.begin_result();
     show(
         &rig.link,
-        lifetime,
+        next,
         2,
         &payload(2, Some(&b), 2_000, &[]),
         &Overlay::default(),
@@ -4746,7 +4765,7 @@ fn a_minimized_bitmap_frame_refills_the_allowance_for_a_second_creation() {
     while creations(&rig) < 2 {
         assert!(
             Instant::now() < end,
-            "the superseding view's creation never admitted, {} bitmap frames drawn minimized since: {:?}",
+            "the next result's creation never admitted, {} bitmap frames drawn minimized since: {:?}",
             rig.link.bitmap_frames() - bitmap,
             rig.link.heavy_record()
         );
@@ -5049,5 +5068,436 @@ fn switch_reducing_the_pool(a: &Arc<render::SkinBundle>, b: &Arc<render::SkinBun
         "a frame not the shown view's while the switch staged: {seen:?}"
     );
     assert_eq!(presenting, Vec::new(), "a blocking wait presenting");
+    rig.link.exit();
+}
+
+/// A result frame's path and the view it presented.
+#[cfg(feature = "dev-tools")]
+type Seen = (crate::measure::ResultPath, Option<u64>);
+
+/// The result frames' paths and the view each presented, a sink saw, in
+/// order.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct Views(Arc<Mutex<Vec<Seen>>>);
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for Views {
+    fn frame(&mut self, _screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if drawn.timing.presented()
+            && let Some(r) = drawn.result
+        {
+            self.0.lock().unwrap().push((r.path, r.view));
+        }
+    }
+}
+
+/// V19 (i) (design.md "beatoraja Lua Skins", the result skin): a second
+/// view payload published while the first view's staging is held commits
+/// after the first: the first committed view is the first payload's, the
+/// second stages once the first picture is acknowledged, and every frame
+/// from the first picture to the second's commit is the first view's.
+/// With `replaced`, the installation before the lifetime (X0) is charged
+/// the whole shared limit, so the second fits only once X0's entry, filled
+/// at the first view's commit, is destroyed: that destruction comes after
+/// the first view's creation, and the second's creation after it.
+#[cfg(feature = "dev-tools")]
+fn a_second_payload_waits_for_the_first_picture(replaced: bool) {
+    use crate::measure::ResultPath;
+    use crate::render_side::HeavyKind;
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let views = Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    if replaced {
+        rig.faults.step_creations.store(true, Ordering::Release);
+        rig.faults
+            .charge_result
+            .store(render::SHARED_TEXELS, Ordering::Release);
+    }
+    let lifetime = installed(&rig, &x0);
+    rig.link.record_heavy(256);
+    rig.link.pause_result_staging(true);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(
+        wait_until(|| views
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| *p == ResultPath::Pending)),
+        "the first view's staging never held"
+    );
+    let taken = rig.link.messages_taken();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    let pending = views.0.lock().unwrap().len();
+    assert!(wait_until(|| views.0.lock().unwrap().len() > pending + 3));
+    rig.link.pause_result_staging(false);
+    // The status is published before the frame reaches the sink: the
+    // second's frame is waited for there.
+    assert!(
+        wait_until(|| views.0.lock().unwrap().iter().any(|(_, v)| *v == Some(2))),
+        "the second never committed: {:?}",
+        rig.link.result_status()
+    );
+    assert_eq!(rig.link.result_status().shown, Some((2, true)));
+    let seen = views.0.lock().unwrap().clone();
+    let first = seen
+        .iter()
+        .position(|(p, _)| *p == ResultPath::Skin)
+        .unwrap();
+    assert_eq!(
+        seen[first].1,
+        Some(1),
+        "the first committed view not the first payload's: {seen:?}"
+    );
+    let second = seen.iter().position(|(_, v)| *v == Some(2)).unwrap();
+    assert!(
+        seen[first..second]
+            .iter()
+            .all(|f| *f == (ResultPath::Skin, Some(1))),
+        "a frame not the first view's before the second committed: {seen:?}"
+    );
+    if replaced {
+        let heavy = rig.link.heavy_record();
+        let created: Vec<usize> = heavy
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == HeavyKind::ResultCreation)
+            .map(|(i, _)| i)
+            .collect();
+        let destroyed = heavy
+            .iter()
+            .position(|r| r.kind == HeavyKind::Destruction)
+            .expect("X0's entry destroyed at a boundary");
+        let [a_made, b_made] = created[..] else {
+            panic!("two result creations: {heavy:?}");
+        };
+        assert!(
+            a_made < destroyed && destroyed < b_made && heavy[b_made].start >= heavy[destroyed].end,
+            "the second created before X0's destruction: {heavy:?}"
+        );
+    }
+    rig.link.exit();
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_second_payload_before_the_first_picture_waits_for_it() {
+    a_second_payload_waits_for_the_first_picture(false);
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_second_payload_needing_the_replaced_installations_room_waits_for_it() {
+    a_second_payload_waits_for_the_first_picture(true);
+}
+
+/// A sink that holds every frame while `hold` is set, saying so in
+/// `waiting`, and records the result frames' views as [`Views`] does.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct Holding {
+    views: Views,
+    hold: Arc<AtomicBool>,
+    waiting: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for Holding {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if self.hold.load(Ordering::SeqCst) {
+            self.waiting.store(true, Ordering::SeqCst);
+            while self.hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        }
+        self.views.frame(screen, drawn);
+    }
+}
+
+/// One take carrying both the lifetime's first payload and a newer one
+/// (the render thread held in a page's frame while both are offered):
+/// the first picture is the first payload's, with the newer offer's strip
+/// lines, the newest overlay merged whichever payload it came with.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_take_carrying_both_payloads_draws_the_newer_overlay_first() {
+    use crate::measure::ResultPath;
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let sink = Holding::default();
+    let rig = Rig::with_sink(Box::new(sink.clone()));
+    let lifetime = installed(&rig, &x0);
+    sink.hold.store(true, Ordering::SeqCst);
+    rig.link.show_end(EndPage {
+        lines: vec!["end".to_owned()],
+        graphs: None,
+        id: None,
+    });
+    assert!(
+        wait_until(|| sink.waiting.load(Ordering::SeqCst)),
+        "no frame held"
+    );
+    let notice = Overlay {
+        lines: vec!["NOTICE".to_owned()],
+        ..Overlay::default()
+    };
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &notice,
+    );
+    sink.hold.store(false, Ordering::SeqCst);
+    assert!(
+        wait_until(|| sink
+            .views
+            .0
+            .lock()
+            .unwrap()
+            .contains(&(ResultPath::Skin, Some(1)))),
+        "the first view never drawn: {:?}",
+        rig.link.result_status()
+    );
+    let first = rig
+        .drawn()
+        .iter()
+        .find_map(|d| skin_frame(d).map(|(_, n)| n))
+        .expect("a skin frame");
+    assert_eq!(
+        first, 1,
+        "the first picture without the newer offer's strip line"
+    );
+    rig.link.exit();
+}
+
+/// A sink that, from the first result frame drawing a skin on, holds the
+/// next result frame until `release`, saying so in `waiting`: the frame
+/// after the first picture, its receipt already written.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct AfterFirst {
+    first: Arc<AtomicBool>,
+    waiting: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for AfterFirst {
+    fn frame(&mut self, _screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if !drawn.timing.presented() {
+            return;
+        }
+        let Some(r) = drawn.result else {
+            return;
+        };
+        if self.first.load(Ordering::SeqCst) {
+            self.waiting.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        } else if r.path == crate::measure::ResultPath::Skin {
+            self.first.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The draw receipt (dev-tools) counts a result frame only once nothing
+/// newer of it waits: with the first view A's picture drawn and a newer
+/// payload B, whose end page was shown after it, waiting for that
+/// picture's acknowledgement, the frame after A's first picture finds B's
+/// page not drawn; it is once B shows.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_waiting_payloads_page_is_not_drawn_with_the_first_picture() {
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let sink = AfterFirst::default();
+    let rig = Rig::with_sink(Box::new(sink.clone()));
+    let lifetime = installed(&rig, &x0);
+    rig.link.pause_result_staging(true);
+    let taken = rig.link.messages_taken();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    let taken = rig.link.messages_taken();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    let taken = rig.link.messages_taken();
+    rig.link.show_end(EndPage {
+        lines: vec!["b".to_owned()],
+        graphs: None,
+        id: None,
+    });
+    assert!(wait_until(|| rig.link.messages_taken() > taken));
+    rig.link.pause_result_staging(false);
+    assert!(
+        wait_until(|| sink.waiting.load(Ordering::SeqCst)),
+        "no frame after the first picture: {:?}",
+        rig.link.result_status()
+    );
+    assert!(
+        !rig.link.end_page_drawn(),
+        "B's page counted drawn while B waits: {:?}",
+        rig.link.result_status()
+    );
+    sink.release.store(true, Ordering::SeqCst);
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "B never shown: {:?}",
+        rig.link.result_status()
+    );
+    assert!(
+        wait_until(|| rig.link.end_page_drawn()),
+        "B's page never drawn"
+    );
+    rig.link.exit();
+}
+
+/// The first payload is owned only where the atlas report counts it
+/// (design.md "Memory Budget"): after a switch from the first view A to
+/// B, once the report no longer names A's atlas nothing of the render
+/// side keeps A's bundle, and a third distinct view C switches with only
+/// B's and C's atlases named.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_first_payload_switched_from_is_owned_only_where_the_report_counts_it() {
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let (_cd, c) = fixed_skin();
+    let views = Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    let lifetime = installed(&rig, &x0);
+    let shown = |key| wait_until(|| views.0.lock().unwrap().iter().any(|(_, v)| *v == Some(key)));
+    let (a_id, b_id, c_id) = (a.atlas_id(), b.atlas_id(), c.atlas_id());
+    let weak_a = Arc::downgrade(&a);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    drop(a);
+    assert!(shown(1), "A never drawn: {:?}", rig.link.result_status());
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(shown(2), "B never drawn: {:?}", rig.link.result_status());
+    assert!(
+        wait_until(|| !rig.link.result_status().retained.contains(&a_id)),
+        "A's atlas still named: {:?}",
+        rig.link.result_status()
+    );
+    assert!(
+        wait_until(|| weak_a.upgrade().is_none()),
+        "A's bundle kept past the report: {:?}",
+        rig.link.result_status()
+    );
+    show(
+        &rig.link,
+        lifetime,
+        3,
+        &payload(3, Some(&c), 3_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(shown(3), "C never drawn: {:?}", rig.link.result_status());
+    let retained = rig.link.result_status().retained;
+    assert!(
+        !retained.contains(&a_id) && retained.contains(&c_id),
+        "the report after C: {retained:?} (A {a_id:?}, B {b_id:?}, C {c_id:?})"
+    );
+    rig.link.exit();
+}
+
+/// The lifetime's first view whose commit is refused falls back to its
+/// built-in page (design.md "beatoraja Lua Skins", the result skin): no
+/// built-in end page with nothing presented, the view's own page next, and
+/// it is the lifetime's first committed view.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_first_view_whose_commit_is_refused_falls_back_to_its_page() {
+    use crate::measure::ResultPath;
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let views = Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    let lifetime = installed(&rig, &x0);
+    rig.faults.refuse_commit.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    // The status is published before the frame reaches the sink: the
+    // page's frame is waited for there.
+    assert!(
+        wait_until(|| views
+            .0
+            .lock()
+            .unwrap()
+            .contains(&(ResultPath::BuiltIn, Some(1)))),
+        "the first view not committed as its page: {:?}",
+        rig.link.result_status()
+    );
+    assert_eq!(rig.link.result_status().shown, Some((1, false)));
+    assert!(
+        !rig.faults.refuse_commit.load(Ordering::Acquire),
+        "never refused"
+    );
+    let seen = views.0.lock().unwrap().clone();
+    let page = seen
+        .iter()
+        .position(|f| *f == (ResultPath::BuiltIn, Some(1)))
+        .expect("the view's page");
+    assert!(
+        seen[..page].iter().all(|(p, _)| *p == ResultPath::Pending),
+        "a frame other than pending before the view's page: {seen:?}"
+    );
     rig.link.exit();
 }

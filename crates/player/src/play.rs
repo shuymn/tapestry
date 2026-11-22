@@ -485,6 +485,10 @@ pub struct PlayerRig<'a> {
     /// Tests: set when a look starts the result's sound.
     #[cfg(test)]
     pub result_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: run once, right after the result's first show published its
+    /// view and before the show decides the gate.
+    #[cfg(test)]
+    pub after_present: Option<crate::render_side::LinkHook>,
     /// Tests: set by the idle wait right before it parks.
     #[cfg(test)]
     pub park_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1348,14 +1352,29 @@ impl PlayerRig<'_> {
     /// acknowledged, once per entry; never once the entry's fade-out began,
     /// so it does not sound over `resultclose` (design.md "State Model",
     /// system sounds, Result).
+    ///
+    /// The same read opens the result's gate: the look that reads the
+    /// acknowledgement shows the result, the offset keys working from
+    /// here and the skin's timing applying (design.md "State Model",
+    /// Result), so no look starts the sound with the gate still closed.
     fn start_result_sound(&mut self) {
-        let Some(entry) = self.result_entry.as_mut().filter(|e| e.due) else {
+        let acknowledged = self.render.result_acknowledged();
+        let Some(entry) = self
+            .result_entry
+            .as_mut()
+            .filter(|e| e.number == acknowledged)
+        else {
             return;
         };
-        if self.render.result_acknowledged() != entry.number {
+        let opens = !std::mem::replace(&mut entry.shown, true);
+        let due = std::mem::replace(&mut entry.due, false);
+        let cleared = entry.cleared;
+        if opens {
+            self.open_end_screen();
+        }
+        if !due {
             return;
         }
-        entry.due = false;
         if self.result_outro.is_some() {
             return;
         }
@@ -1364,7 +1383,39 @@ impl PlayerRig<'_> {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(sounds) = self.system_sounds.as_mut() {
             // Source: SF-015
-            sounds.result_shown(&mut self.audio.control, entry.cleared);
+            sounds.result_shown(&mut self.audio.control, cleared);
+        }
+    }
+
+    /// Whether the result handed over has shown (design.md "State Model",
+    /// Result): its entry's gate, true with no entry. Until it shows preset
+    /// steps are dropped, the offset keys refused, and a leaving command
+    /// has no gate and no outro.
+    pub(crate) fn view_shown(&self) -> bool {
+        self.result_entry.as_ref().is_none_or(|e| e.shown)
+    }
+
+    /// Whether the result being handed over is one its skin may present,
+    /// from the state its first payload was published with: a lifetime
+    /// whose run and attempt have not fallen back to the built-in result,
+    /// the attempt's image stage having kept the skin. A refusal the
+    /// render thread reports after that publication changes nothing here;
+    /// its fallback page's acknowledgement shows the result.
+    fn result_gated(&self) -> bool {
+        self.presenter.current()
+            && self.presenter.disabled().is_none()
+            && self.presenter.attempt_fallen().is_none()
+            && !self.result_skin.attempt_built_in()
+    }
+
+    /// The end screen opens: the input offset keys work, and the keys a
+    /// development run presses at it are pressed (dev-tools).
+    fn open_end_screen(&mut self) {
+        let tuning = self.controls.tuning();
+        tuning.open_end_screen();
+        #[cfg(feature = "dev-tools")]
+        for a in self.adjust_on_end.drain(..) {
+            tuning.adjust(a);
         }
     }
 
@@ -2442,7 +2493,15 @@ impl Rig for PlayerRig<'_> {
     /// `None` on any built-in result, so a command pending is served at
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
+        if !self.view_shown() {
+            return None;
+        }
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_view_shown(&self) -> bool {
+        self.view_shown()
     }
 
     /// The entry's sound not yet started at its first picture's look.
@@ -2461,10 +2520,17 @@ impl Rig for PlayerRig<'_> {
     /// settles the result skin. The pinned view's timing, read with it; a
     /// pressed command that view's input time still gates is refused under
     /// the same lock, nothing set.
+    ///
+    /// Until the result shows the view is pinned with no gate and no
+    /// outro, whatever timing the barrier holds, so the command takes
+    /// effect in the look that takes it (design.md "State Model", Result).
     fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> game::Outro {
+        let shown = self.view_shown();
+        let gate = gate.filter(|_| shown);
         let Some((pinned, timing)) = self.presenter.pin(&mut self.render, at, gate) else {
             return game::Outro::Gated;
         };
+        let timing = timing.filter(|_| shown);
         self.result_outro = Some(at);
         #[cfg(feature = "dev-tools")]
         println!("dev: result outro began, view {pinned:?} pinned");
@@ -3568,7 +3634,6 @@ impl Rig for PlayerRig<'_> {
                 .request(crate::result_skin::view_facts(screen, chart));
         }
         let tuning = self.controls.tuning();
-        tuning.open_end_screen();
         let queue = self.queue_line.unwrap_or(QueueLine {
             played: self.queued_now,
             steady_underruns: 0,
@@ -3595,16 +3660,34 @@ impl Rig for PlayerRig<'_> {
         // own the play did not clear), started once the entry's first
         // picture is acknowledged (design.md "State Model", system sounds,
         // Result).
-        if self.result_entry.is_none() {
+        let entered = self.result_entry.is_none();
+        if entered {
             self.result_entry = Some(ResultEntry {
                 number: self.render.enter_result_entry(self.controls.game_thread()),
                 cleared: screen.own_cleared() == Some(true),
                 due: true,
+                shown: true,
             });
         }
         // The skin's presentation goes first, so the built-in page does not
         // draw before it.
         self.present_view(report, screen);
+        #[cfg(test)]
+        if let Some(f) = self.after_present.take() {
+            f(&self.render);
+        }
+        // A result its skin may present shows at its first picture's
+        // acknowledgement, the end screen opening then; any other at the
+        // hand-over, decided from the state its first payload was
+        // published with. A result shown before, shown again after a
+        // recovery, opens it again (design.md "State Model", Result).
+        let gated = entered && self.result_gated();
+        if let Some(entry) = self.result_entry.as_mut() {
+            entry.shown &= !gated;
+            if entry.shown {
+                self.open_end_screen();
+            }
+        }
         self.send_end(tuning.get());
         // Its requests made: the rebuild it follows is over.
         #[cfg(test)]
@@ -3616,10 +3699,6 @@ impl Rig for PlayerRig<'_> {
         );
 
         self.result_shown();
-        #[cfg(feature = "dev-tools")]
-        for a in self.adjust_on_end.drain(..) {
-            tuning.adjust(a);
-        }
         #[cfg(feature = "dev-tools")]
         if self.auto_retries > 0 {
             self.auto_retries -= 1;
@@ -3643,6 +3722,11 @@ pub(crate) struct ResultEntry {
     /// reads the acknowledgement, which starts it or, once the entry's
     /// fade-out began, forgoes it.
     pub due: bool,
+    /// Whether the result has shown, its gate (design.md "State Model",
+    /// Result): false from the hand-over of a result its skin may present
+    /// until the first look that reads the entry's acknowledgement, true
+    /// otherwise; kept through a recovery.
+    pub shown: bool,
 }
 
 /// The retries a result's flow took (`take_menu`), by receipt, since the
@@ -4128,6 +4212,7 @@ mod tests {
                         number,
                         cleared: true,
                         due: true,
+                        shown: true,
                     });
                     let relooked = Arc::clone(&rig.relooked);
                     let started = Arc::clone(&rig.result_started);
@@ -4176,6 +4261,7 @@ mod tests {
                         number,
                         cleared: true,
                         due: true,
+                        shown: true,
                     });
                     let parked = Arc::clone(&rig.park_probe);
                     parked.store(false, Ordering::SeqCst);

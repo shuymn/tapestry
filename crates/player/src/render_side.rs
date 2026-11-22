@@ -2159,6 +2159,14 @@ struct Shared {
     /// whether one holds (tests).
     #[cfg(test)]
     result_frame_hold: [AtomicBool; 2],
+    /// Result frames hold after their commit point and runtime step,
+    /// outside the barrier's lock, while set, and whether one holds
+    /// (tests).
+    #[cfg(test)]
+    result_commit_hold: [AtomicBool; 2],
+    /// Run once right after the next read of the acknowledgement (tests).
+    #[cfg(test)]
+    after_acknowledged_read: AckReadHook,
     /// Play frames hold right before they acquire the view while set, and
     /// whether one holds (tests).
     #[cfg(test)]
@@ -2223,6 +2231,9 @@ struct Shared {
     /// The result view stagings ended, ready or not (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     stagings_ended: AtomicU64,
+    /// Result views committed (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    result_commits: AtomicU64,
     /// No boundary destroys a filled entry while set (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     destruction_held: AtomicBool,
@@ -2406,6 +2417,10 @@ impl Shared {
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
             #[cfg(test)]
+            result_commit_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            after_acknowledged_read: AckReadHook::default(),
+            #[cfg(test)]
             play_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
             #[cfg(all(test, feature = "dev-tools"))]
             result_runtime_timers: Mutex::new(Vec::new()),
@@ -2439,6 +2454,8 @@ impl Shared {
             withdrawals: Mutex::new(Vec::new()),
             #[cfg(all(test, feature = "dev-tools"))]
             stagings_ended: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            result_commits: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
             destruction_held: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -3335,10 +3352,17 @@ impl RenderLink {
     }
 
     /// Shows the result's presentation `p`: it replaces one the render
-    /// thread has not taken, and a signal goes only when none waits. One
-    /// of a lifetime not current is dropped.
+    /// thread has not taken, the lifetime's first excepted, and a signal
+    /// goes only when none waits. One of a lifetime not current is
+    /// dropped. The lifetime's first protects its runtime from here to the
+    /// lifetime's first commit, marked under the slot's lock before it is
+    /// offered, so no commit comes before the mark (the slot's lock is
+    /// taken before the runtimes' cell's, never the reverse).
     pub fn show_result(&self, p: ResultPresentation) {
         let mut slot = self.shared.result_slot();
+        if slot.takes_first(&p) {
+            self.scripts.set_first(p.payload.script, p.lifetime);
+        }
         if slot.offer(p) {
             self.send(RenderMsg::ResultChanged);
         }
@@ -3430,10 +3454,37 @@ impl RenderLink {
     /// acknowledged, 0 before any.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn result_acknowledged(&self) -> u64 {
-        self.shared
+        let acknowledged = self
+            .shared
             .result_entries
             .acknowledged
-            .load(Ordering::Acquire)
+            .load(Ordering::Acquire);
+        // Taken before it runs: the hook may read the acknowledgement too.
+        #[cfg(test)]
+        let hook = self
+            .shared
+            .after_acknowledged_read
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(f) = hook {
+            f(self);
+        }
+        acknowledged
+    }
+
+    /// Runs `f` once, right after the next read of the acknowledgement
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn after_acknowledged_read(&self, f: impl FnOnce(&Self) + Send + 'static) {
+        *self
+            .shared
+            .after_acknowledged_read
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -4118,6 +4169,19 @@ impl RenderLink {
             .store(elapsed.unwrap_or(i64::MIN), Ordering::SeqCst);
     }
 
+    /// Holds each result frame after its commit point and runtime step
+    /// from now on (`true`), or lets them go (`false`) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn hold_result_commit(&self, on: bool) {
+        self.shared.result_commit_hold[0].store(on, Ordering::SeqCst);
+    }
+
+    /// Whether a result frame holds after its commit point (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_commit_held(&self) -> bool {
+        self.shared.result_commit_hold[1].load(Ordering::SeqCst)
+    }
+
     /// Holds every step of a result view's staging unwritten from now on
     /// (`true`), its staging answering not ready while the loop goes on,
     /// or lets it step (`false`) (tests).
@@ -4208,6 +4272,12 @@ impl RenderLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The result views committed so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn result_commits(&self) -> u64 {
+        self.shared.result_commits.load(Ordering::SeqCst)
     }
 
     /// The result view stagings ended so far, ready or not (tests).
@@ -9291,6 +9361,12 @@ impl Run {
                         self.result_hold = None;
                     }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
+                    // A test holds the frame here, its view committed and
+                    // its barrier written, before it is built.
+                    #[cfg(test)]
+                    if self.result.as_ref().is_some_and(|s| s.presented.is_some()) {
+                        Shared::hold_frame(&self.shared.result_commit_hold);
+                    }
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
                         self.shared
@@ -9637,6 +9713,15 @@ impl Run {
             {
                 self.shared.result_entries.acknowledge(entry);
                 self.result_unacked = false;
+                // A newer payload waiting for this picture stages from the
+                // next pass (design.md "beatoraja Lua Skins", the result
+                // skin).
+                if matches!(mode, Mode::Result)
+                    && let Some(side) = &mut self.result
+                {
+                    side.acked = true;
+                    side.first = None;
+                }
             }
             // What the frame drew, fixed before a refused decision frame
             // hands the screen to its page (dev-tools: a scenario's
@@ -9932,13 +10017,15 @@ impl Run {
                     // The end page drawn, for a script waiting on it
                     // (dev-tools).
                     // A result's frame counts once nothing newer of it waits
-                    // to be prepared or committed.
+                    // to be prepared or committed, a payload waiting for the
+                    // first picture included.
                     #[cfg(feature = "dev-tools")]
                     if timing.presented()
                         && (matches!(mode, Mode::End)
                             || matches!(mode, Mode::Result)
                                 && self.result.as_ref().is_none_or(|r| {
                                     r.incoming.is_none()
+                                        && r.later.is_none()
                                         && r.staging.is_none()
                                         && r.prepared.is_none()
                                 }))
@@ -13019,6 +13106,17 @@ struct PreparedView {
 struct ResultSide {
     lifetime: u64,
     incoming: Option<Box<ResultPresentation>>,
+    /// The lifetime's first payload, the one handed over (design.md
+    /// "beatoraja Lua Skins", the result skin), until its first picture's
+    /// acknowledgement: after it no payload waits, and the payload is
+    /// owned only where the atlas report counts it (presented, staged or
+    /// taken), never by this identity.
+    first: Option<Arc<ViewPayload>>,
+    /// The latest presentation of another payload taken before the first
+    /// picture's acknowledgement: staged as a switch once it is.
+    later: Option<Box<ResultPresentation>>,
+    /// A frame of the side's first picture counted: the acknowledgement.
+    acked: bool,
     /// The view payload whose staging steps (design.md "beatoraja Lua
     /// Skins", the result skin), asked again each pass with the same
     /// request until its last step completes, when it is prepared.
@@ -13061,13 +13159,45 @@ struct ResultSide {
     refused: Option<(ViewKey, String)>,
     /// The view prepared again after a rebuild keeps its request.
     restaged: bool,
+    /// The lifetime's first view was refused at the commit point: the
+    /// next preparation gives it its built-in page.
+    commit_refused: bool,
+}
+
+/// A test's one-shot hook on the link (tests).
+#[cfg(test)]
+pub(crate) type LinkHook = Box<dyn FnOnce(&RenderLink) + Send>;
+
+/// A test's hook, run once right after the next read of the
+/// acknowledgement.
+#[cfg(test)]
+#[derive(Default)]
+struct AckReadHook(Mutex<Option<LinkHook>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AckReadHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AckReadHook")
+    }
 }
 
 impl ResultSide {
+    /// Keeps `overlay`, of `revision`, as the newest not yet merged,
+    /// unless a newer one already waits: one take carrying both the first
+    /// payload and a newer one keeps the newer's.
+    fn merge_overlay(&mut self, revision: u64, overlay: Overlay) {
+        if self.overlay.as_ref().is_none_or(|(r, _)| *r <= revision) {
+            self.overlay = Some((revision, overlay));
+        }
+    }
+
     fn new(lifetime: u64) -> Self {
         Self {
             lifetime,
             incoming: None,
+            first: None,
+            later: None,
+            acked: false,
             staging: None,
             prepared: None,
             presented: None,
@@ -13084,6 +13214,7 @@ impl ResultSide {
             end_changed: false,
             refused: None,
             restaged: false,
+            commit_refused: false,
         }
     }
 
@@ -13129,6 +13260,7 @@ impl ResultSide {
     /// Whether it has something to draw.
     const fn shows(&self) -> bool {
         self.incoming.is_some()
+            || self.later.is_some()
             || self.staging.is_some()
             || self.prepared.is_some()
             || self.presented.is_some()
@@ -13186,25 +13318,47 @@ fn strip_lines<'a>(
 }
 
 impl Run {
-    /// Takes the newest result presentation from the slot, if its lifetime
-    /// is current: a new lifetime starts the result side afresh.
+    /// Takes the result presentations from the slot, if their lifetime is
+    /// current: a new lifetime starts the result side afresh. The
+    /// lifetime's first is the side's first payload; until the side's
+    /// first picture is acknowledged a presentation of another payload
+    /// waits in `later`, the latest kept, its overlay merged at once
+    /// (design.md "beatoraja Lua Skins", the result skin).
     fn take_result(&mut self) {
-        let Some(p) = self.shared.result_slot().take() else {
-            return;
-        };
-        if self
-            .result
-            .as_ref()
-            .is_none_or(|r| r.lifetime != p.lifetime)
-        {
-            self.drop_result();
-            self.result = Some(ResultSide::new(p.lifetime));
-            // The lifetime's page base is its own complete page, sent with
-            // it, never an earlier attempt's: its own `End` follows.
-            self.end_page.1 = p.payload.page.clone();
-        }
-        if let Some(side) = &mut self.result {
-            side.incoming = Some(p);
+        let [first, newest] = self.shared.result_slot().take();
+        for (is_first, p) in [(true, first), (false, newest)] {
+            let Some(p) = p else {
+                continue;
+            };
+            if self
+                .result
+                .as_ref()
+                .is_none_or(|r| r.lifetime != p.lifetime)
+            {
+                self.drop_result();
+                self.result = Some(ResultSide::new(p.lifetime));
+                // The lifetime's page base is its own complete page, sent
+                // with it, never an earlier attempt's: its own `End`
+                // follows.
+                self.end_page.1 = p.payload.page.clone();
+            }
+            let Some(side) = &mut self.result else {
+                continue;
+            };
+            if is_first {
+                side.first = Some(Arc::clone(&p.payload));
+            }
+            let waits = !side.acked
+                && side
+                    .first
+                    .as_ref()
+                    .is_some_and(|f| !Arc::ptr_eq(f, &p.payload));
+            if waits {
+                side.merge_overlay(p.revision, p.overlay.clone());
+                side.later = Some(p);
+            } else {
+                side.incoming = Some(p);
+            }
         }
     }
 
@@ -13655,6 +13809,35 @@ impl Run {
         let Some(screen) = &mut self.screen else {
             return;
         };
+        // From the first picture's acknowledgement the newer payload that
+        // waited for it stages as a switch, the shown view kept; an
+        // overlay of the first payload taken since goes with it, the
+        // newer revision's kept.
+        if side.acked
+            && let Some(p) = side.later.take()
+            && side
+                .incoming
+                .as_ref()
+                .is_none_or(|i| i.revision < p.revision)
+        {
+            side.incoming = Some(p);
+        }
+        // The first view the commit point refused draws its built-in page,
+        // with the reason, recorded as the view's refusal: it commits with
+        // no generation at the next commit point.
+        if std::mem::take(&mut side.commit_refused)
+            && let Some(v) = &mut side.prepared
+        {
+            const WHY: &str = "the view's runtime could not be committed";
+            eprintln!("render: the result's first view was refused at its commit");
+            v.held.state = None;
+            v.held.page = Some(crate::result_present::compose_page(
+                &v.held.payload.page,
+                &self.end_page.1,
+                Some(WHY),
+            ));
+            side.refused = Some((v.held.payload.key, WHY.to_owned()));
+        }
         let mut refused: Option<String> = None;
         let mut failed: Option<RenderError> = None;
         // The strip's lines asked for before the font was read.
@@ -13786,7 +13969,7 @@ impl Run {
                     side.prepared = Some(PreparedView { held, token: None });
                 }
             }
-            side.overlay = Some((p.revision, p.overlay));
+            side.merge_overlay(p.revision, p.overlay);
         }
         // The staging in hand, asked again with the same request each pass
         // until its last step completes (design.md "beatoraja Lua Skins",
@@ -14097,23 +14280,42 @@ impl Run {
                 let mut committed = None;
                 if let Some(v) = side.prepared.take() {
                     let lifetime = side.lifetime;
-                    let commit =
-                        scripts.commit_view(v.held.payload.script, lifetime, || match v.token {
-                            Some(token) => match screen.commit(token) {
-                                Ok(()) => {
-                                    screen.install_result_text();
-                                    true
-                                }
-                                Err(_) => false,
-                            },
-                            None => true,
-                        });
+                    // A view drawing its built-in page runs no runtime: it
+                    // commits with no generation, so a kind disabled
+                    // before its first commit still commits it.
+                    let script = v.held.payload.script.filter(|_| v.held.state.is_some());
+                    let commit = scripts.commit_view(script, lifetime, || match v.token {
+                        Some(token) => match screen.commit(token) {
+                            Ok(()) => {
+                                screen.install_result_text();
+                                true
+                            }
+                            Err(_) => false,
+                        },
+                        None => true,
+                    });
                     match commit {
                         ViewCommit::Committed => {
+                            #[cfg(all(test, feature = "dev-tools"))]
+                            shared.result_commits.fetch_add(1, Ordering::SeqCst);
                             if v.token.is_some() {
                                 side.reconcile = true;
                             }
                             committed = Some(v.held);
+                        }
+                        // The lifetime's first view refused (its generation
+                        // gone or its commit refused): kept without its
+                        // staging, discarded after the frame, to draw its
+                        // built-in page from the next preparation, so no
+                        // later payload waits for a picture that cannot
+                        // come.
+                        ViewCommit::Gone | ViewCommit::Refused if side.presented.is_none() => {
+                            side.discard = v.token.or(side.discard);
+                            side.prepared = Some(PreparedView {
+                                held: v.held,
+                                token: None,
+                            });
+                            side.commit_refused = true;
                         }
                         // Its generation was evicted: it never commits,
                         // its staging discarded after the frame.
@@ -14243,7 +14445,10 @@ impl Run {
         // committed, the pending presentation, never the built-in end page
         // (design.md "Rendering and Skins", the result's hold).
         let Some(h) = side.presented.as_mut() else {
-            return if side.staging.is_some() || (held && fadeout.is_some()) {
+            return if side.staging.is_some()
+                || side.prepared.is_some()
+                || (held && fadeout.is_some())
+            {
                 ResultDrawn::Pending
             } else {
                 ResultDrawn::BuiltIn

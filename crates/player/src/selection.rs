@@ -3118,7 +3118,9 @@ impl PlayerRig<'_> {
             leaving: self.result_outro.is_some() || self.result_leaving,
             left: self.result_leaving,
             scene: timing.and_then(|t| t.scene),
-            accepts: accepts_input(timing, origin, now),
+            // Until the result shows a preset step is dropped: a scripted
+            // step waits for it (design.md "State Model", Result).
+            accepts: self.view_shown() && accepts_input(timing, origin, now),
             input: timing.map(|t| t.input),
             origin,
             now,

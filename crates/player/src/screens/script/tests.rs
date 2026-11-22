@@ -904,3 +904,84 @@ fn the_probe_runs_while_another_thread_holds_the_cell() {
     assert_eq!(ran, Ok(true), "the probe waited on the cell's lock");
     drop(visit);
 }
+
+/// V19 (l4) (design.md "beatoraja Lua Skins", the result skin): a result
+/// lifetime's first payload's generation, marked first, is spared by the
+/// eviction and commits after a newer publication names another; that
+/// lifetime's commit clears the mark, so after a switch's commit the
+/// eviction retires it and a permit is given.
+#[test]
+fn a_first_generation_is_kept_until_its_lifetimes_first_commit() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    scripts.enter_result(1);
+    let (_a, first, va) = offered(&scripts, false);
+    let (_b, newer, vb) = offered(&scripts, false);
+    scripts.set_first(Some(first), 1);
+    scripts.set_published(Some(newer));
+    assert!(
+        scripts.result_permit(&[]).is_none(),
+        "the first generation evicted for a permit"
+    );
+    assert!(!gone(&va) && !gone(&vb));
+    assert_eq!(
+        scripts.commit_view(Some(first), 1, || true),
+        super::ViewCommit::Committed,
+        "the first view's commit after a newer publication"
+    );
+    assert_eq!(scripts.first(), None, "the mark kept past the first commit");
+    // The switch to the newer view commits: the first generation is
+    // neither presented, first nor published any more.
+    assert_eq!(
+        scripts.commit_view(Some(newer), 1, || true),
+        super::ViewCommit::Committed
+    );
+    assert!(
+        scripts.result_permit(&[]).is_some(),
+        "no permit after the switch's commit"
+    );
+    assert!(gone(&va) && !gone(&vb));
+}
+
+/// V19 (l4): a commit of an earlier result lifetime leaves the current
+/// lifetime's first mark, which still spares its generation.
+#[test]
+fn an_earlier_lifetimes_commit_leaves_the_first_mark() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    scripts.enter_result(2);
+    let (_a, first, va) = offered(&scripts, false);
+    let (_b, newer, vb) = offered(&scripts, false);
+    scripts.set_first(Some(first), 2);
+    scripts.set_published(Some(newer));
+    assert_eq!(
+        scripts.commit_view(None, 1, || true),
+        super::ViewCommit::Committed
+    );
+    assert_eq!(
+        scripts.first(),
+        Some(first),
+        "an earlier lifetime's commit ended it"
+    );
+    assert!(scripts.result_permit(&[]).is_none());
+    assert!(!gone(&va) && !gone(&vb));
+}
+
+/// V19 (l4): the first mark protects only within its lifetime: once the
+/// result is left the eviction retires its generation and gives a permit.
+#[test]
+fn leaving_the_result_ends_the_first_mark() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    scripts.enter_result(1);
+    let (_a, first, va) = offered(&scripts, false);
+    let (_b, newer, vb) = offered(&scripts, false);
+    scripts.set_first(Some(first), 1);
+    scripts.set_published(Some(newer));
+    scripts.leave_result();
+    assert!(
+        scripts.result_permit(&[]).is_some(),
+        "the first mark spared its generation after the result was left"
+    );
+    assert!(gone(&va) && !gone(&vb));
+}

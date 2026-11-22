@@ -1077,6 +1077,8 @@ fn rig<'a>(
         #[cfg(test)]
         result_started: std::sync::Arc::default(),
         #[cfg(test)]
+        after_present: None,
+        #[cfg(test)]
         park_probe: std::sync::Arc::default(),
         #[cfg(all(test, feature = "dev-tools"))]
         audio_lost,

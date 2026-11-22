@@ -3328,8 +3328,22 @@ pub fn hold_result_settle() {
     RESULT_SETTLE_WAITING.store(false, Ordering::SeqCst);
 }
 
+/// The next view's text preparation is refused (tests).
+#[cfg(test)]
+static REFUSE_NEXT_TEXT: AtomicBool = AtomicBool::new(false);
+
+/// Refuses the next view's text preparation (tests).
+#[cfg(test)]
+pub fn refuse_next_result_text() {
+    REFUSE_NEXT_TEXT.store(true, Ordering::SeqCst);
+}
+
 /// Whether this view's text preparation is refused.
 pub fn refuse_result_text() -> bool {
+    #[cfg(test)]
+    if REFUSE_NEXT_TEXT.swap(false, Ordering::SeqCst) {
+        return true;
+    }
     result_fault("text", RESULT_TEXTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
