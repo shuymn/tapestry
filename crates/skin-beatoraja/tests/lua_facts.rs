@@ -50,6 +50,7 @@ fn play(autoplay: Fact<bool>, judge_class: Fact<Option<JudgeClass>>) -> ImportFa
         judge_class,
         play_level: Fact::Unavailable,
         result: Fact::Unavailable,
+        result_inputs: Fact::Unavailable,
         total: Fact::Unavailable,
         chart_notes: Fact::Unavailable,
     }

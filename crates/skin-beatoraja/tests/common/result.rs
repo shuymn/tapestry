@@ -63,6 +63,7 @@ pub fn import_result(root: &Path) -> Result<Imported, ImportError> {
 pub fn facts(view: Option<&ResultView>) -> ImportFacts {
     ImportFacts {
         result: view.map_or(Fact::Unavailable, |v| Fact::Known(ResultFields::of(v))),
+        result_inputs: view.map_or(Fact::Unavailable, |_| Fact::Known(())),
         ..ImportFacts::unavailable(ScreenKind::Result)
     }
 }

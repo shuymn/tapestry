@@ -900,6 +900,7 @@ fn known() -> super::facts::ImportFacts {
         judge_class: Fact::Known(Some(JudgeClass::Normal)),
         play_level: Fact::Known(12),
         result: Fact::Unavailable,
+        result_inputs: Fact::Unavailable,
         total: Fact::Unavailable,
         chart_notes: Fact::Unavailable,
     }

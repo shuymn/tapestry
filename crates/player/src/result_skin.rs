@@ -364,6 +364,7 @@ fn reads_result(deps: &FactDeps) -> bool {
 fn result_facts(fields: ResultFields, class: Option<Option<JudgeClass>>) -> ImportFacts {
     ImportFacts {
         result: Fact::Known(fields),
+        result_inputs: Fact::Known(()),
         judge_class: class.map_or(Fact::Unavailable, Fact::Known),
         ..ImportFacts::unavailable(ScreenKind::Result)
     }

@@ -13,9 +13,11 @@ use common::result::{
 use common::selection::{B0, B1, BAR, DIGITS, DOT, LABEL as LAB, LAMP, lua_images};
 use skin_beatoraja::{
     Cancel, Config, EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts,
-    LuaOutcome, LuaWhy, NoteKind, Object, Report, Severity, read_lua_header,
+    JudgeClass, LuaOutcome, LuaWhy, NoteKind, Object, Report, Severity, read_lua_header,
 };
-use skin_model::{BestView, MAX_RESULT_OUTRO, ResultNumber, ResultTiming, ResultView, ScreenKind};
+use skin_model::{
+    BestView, MAX_RESULT_OUTRO, ResultFields, ResultNumber, ResultTiming, ResultView, ScreenKind,
+};
 
 /// The top of a quad drawn from a source rect at `y` of height `h`.
 fn top(y: f32, h: f32) -> f32 {
@@ -840,6 +842,94 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
     match lua_outcome(d.path(), &base) {
         Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::ResultNumber(154)),
         other => panic!("{other:?}"),
+    }
+}
+
+/// A result skin whose configured pass runs `read` while it loads, with
+/// its essential parts.
+fn reading(read: &str) -> tempfile::TempDir {
+    let d = sheet();
+    let ex = lua_value("ex", 4, "ref = 71");
+    let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(&format!("local x = {read}"), &ex, "", &dsts).as_bytes(),
+    );
+    d
+}
+
+/// The snapshot of an attempt showing `view`: its result and attempt
+/// inputs known, the chart's judgment class among them.
+fn attempt(view: &ResultView) -> ImportFacts {
+    ImportFacts {
+        judge_class: Fact::Known(Some(JudgeClass::Normal)),
+        ..facts(Some(view))
+    }
+}
+
+/// The startup probe (design.md "beatoraja Lua Skins", the result skin's
+/// preload): a read whose expression or validity names an attempt input
+/// (the chart's level and notes, the play's target, the judgment class)
+/// ends the import pending on it, while an attempt's snapshot of the same
+/// fields reads each as before.
+#[test]
+fn the_startup_probe_stops_on_an_attempt_input() {
+    let view = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    let probe = ImportFacts::result_probe(ResultFields::of(&view));
+    for (read, fact) in [
+        ("ms.number(96)", FactId::ResultNumber(96)),
+        ("ms.number(74)", FactId::ResultNumber(74)),
+        // The play's target.
+        ("ms.number(151)", FactId::ResultNumber(151)),
+        // The target's rate, valid with the chart's notes.
+        ("ms.number(157)", FactId::ResultNumber(157)),
+        ("ms.option(352)", FactId::ResultOption(352)),
+        ("ms.option(353)", FactId::ResultOption(353)),
+        ("ms.option(354)", FactId::ResultOption(354)),
+        ("ms.option(180)", FactId::JudgeClass),
+    ] {
+        let d = reading(read);
+        match lua_outcome(d.path(), &probe) {
+            Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, fact, "{read}"),
+            other => panic!("{read}: {other:?}"),
+        }
+        let i = lua_result(d.path(), &attempt(&view)).unwrap_or_else(|e| panic!("{read}: {e:?}"));
+        assert_eq!(
+            i.facts.reads.iter().map(|r| r.fact).collect::<Vec<_>>(),
+            [fact],
+            "{read}"
+        );
+        assert!(i.facts.holds(&attempt(&view)), "{read}");
+        assert!(!i.facts.holds(&probe), "{read}");
+    }
+}
+
+/// The startup probe reads a result value that names no attempt input
+/// (a count, the next rank, the best's BP difference) from its fields, as
+/// an attempt's snapshot of the same fields does: the import completes
+/// with the same reads, and holds for both.
+#[test]
+fn the_startup_probe_reads_the_result_s_own_values() {
+    let view = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    let probe = ImportFacts::result_probe(ResultFields::of(&view));
+    for n in [110, 154, 178] {
+        let d = reading(&format!("ms.number({n})"));
+        let p = lua_result(d.path(), &probe).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+        let a = lua_result(d.path(), &attempt(&view)).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+        assert_eq!(p.facts.reads, a.facts.reads, "{n}");
+        assert!(
+            matches!(
+                p.facts.reads.as_slice(),
+                [FactRead { fact: FactId::ResultNumber(m), value: FactValue::Int(_) }] if *m == n
+            ),
+            "{n}: {:?}",
+            p.facts.reads
+        );
+        assert!(
+            p.facts.holds(&probe) && p.facts.holds(&attempt(&view)),
+            "{n}"
+        );
     }
 }
 
