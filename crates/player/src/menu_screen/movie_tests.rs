@@ -47,6 +47,10 @@ fn publish(movie: &Movie, seq: u64, stamp: i64, id: u8) {
     let writer = Writer::attach(words).unwrap();
     let slot = writer.claim(words).unwrap();
     let frame = vec![id; geometry.frame_bytes()];
+    let stamp = skin_model::media::Stamp {
+        at: stamp,
+        duration: 33_333,
+    };
     writer.publish(words, slot, &frame, seq, 1, stamp).unwrap();
 }
 
@@ -108,7 +112,7 @@ fn present(s: &mut super::MenuScreen) {
         dropped: 0,
         outcome: render::FrameOutcome::Shown,
         present_count: None,
-        movies: [true, false],
+        movies: [true, false, false, false],
     });
 }
 
@@ -142,7 +146,7 @@ fn a_screen_s_movies_never_outlive_it() {
     s.loading_movies(&loading_frame(1, 0));
     assert!(matches!(
         s.renderer.loading_movies(),
-        [MovieShow::Frame { .. }, MovieShow::Lost]
+        [MovieShow::Frame { .. }, MovieShow::Lost, ..]
     ));
     assert!(s.renderer.video_bytes().0 > 0, "the play's planes");
     s.commit(token(&s, 1)).unwrap();
@@ -152,7 +156,7 @@ fn a_screen_s_movies_never_outlive_it() {
     s.enter_selection_movies(&selection, 7);
     assert_eq!(
         s.renderer.loading_movies(),
-        [MovieShow::Nothing; 2],
+        [MovieShow::Nothing; 4],
         "the play's shows left with it"
     );
     assert_eq!(s.renderer.video_bytes(), (0, 0), "the play's planes left");
@@ -167,7 +171,7 @@ fn a_screen_s_movies_never_outlive_it() {
     // movies.
     s.loading_movies(&loading_frame(2, 0));
     assert!(s.movies.get().is_none(), "selection's movies left");
-    assert_eq!(s.renderer.loading_movies(), [MovieShow::Nothing; 2]);
+    assert_eq!(s.renderer.loading_movies(), [MovieShow::Nothing; 4]);
     assert_eq!(s.renderer.video_bytes(), (0, 0), "selection's planes left");
     assert_eq!(hub.open_sets(), 0);
 }
@@ -195,7 +199,7 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     s.loading_movies(&loading_frame(1, 0));
     assert!(matches!(
         s.renderer.loading_movies(),
-        [MovieShow::Frame { .. }, MovieShow::Lost]
+        [MovieShow::Frame { .. }, MovieShow::Lost, ..]
     ));
     s.commit(token(&s, 1)).unwrap();
     assert!(matches!(s.movies.get(), Some((Holder::Committed(1), _))));
@@ -203,7 +207,7 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     present(&mut s);
     assert_eq!(
         s.renderer.loading_movies(),
-        [MovieShow::Nothing; 2],
+        [MovieShow::Nothing; 4],
         "the first Start's frame and loss in the second's loading frames"
     );
     assert_eq!(origin(&s), None, "no clock started by the second lifetime");
@@ -214,7 +218,7 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     s.loading_movies(&loading_frame(2, 3_000_000));
     assert!(matches!(
         s.renderer.loading_movies(),
-        [MovieShow::Frame { .. }, MovieShow::Nothing]
+        [MovieShow::Frame { .. }, MovieShow::Nothing, ..]
     ));
     assert_eq!(hub.open_sets(), 1);
 }
@@ -259,7 +263,7 @@ fn an_abandoned_committed_start_retires_its_movies() {
     assert_eq!(hub.open_sets(), 0, "the set left");
     assert!(hub.generation() > generation, "its generation left");
     assert_eq!(s.renderer.video_bytes(), (0, 0), "its planes left");
-    assert_eq!(s.renderer.loading_movies(), [MovieShow::Nothing; 2]);
+    assert_eq!(s.renderer.loading_movies(), [MovieShow::Nothing; 4]);
 }
 
 /// A selection entry whose render loop never finds slack for the

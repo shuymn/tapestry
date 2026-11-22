@@ -4035,8 +4035,9 @@ impl skin_model::media::Words for LoggedRing<'_> {
 /// frame or not each of its bytes once; if a frame taken at a time is not
 /// due, if a frame taken lies
 /// outside the window, or does not follow the frame taken before it; or if
-/// a fault is not kept: the next peek must return it without reading the
-/// ring.
+/// a frame taken lasts 0, past [`skin_model::media::MAX_FRAME_US`] or
+/// past the range of stamps; or if a fault is not kept: the next peek must
+/// return it without reading the ring.
 #[must_use]
 pub fn ring_bytes(data: &[u8]) -> RingOutcome {
     use skin_model::media::{Geometry, HEADER_WORDS, Reader, SLOTS, WATERMARK_WORD, Writer};
@@ -4117,6 +4118,11 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
                         "{f:?} after {before:?}"
                     );
                 }
+                assert!(
+                    (1..=skin_model::media::MAX_FRAME_US).contains(&f.duration)
+                        && f.stamp.checked_add(f.duration).is_some(),
+                    "a frame's duration out of range: {f:?}"
+                );
                 assert!(written.iter().all(|w| *w), "the whole frame taken");
                 outcome = RingOutcome::Staged(f);
             }

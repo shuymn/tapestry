@@ -30,7 +30,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
-use skin_model::media::{PROGRESS_WORD, State, Writer};
+use skin_model::media::{PROGRESS_WORD, Stamp, State, Writer};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
@@ -232,7 +232,7 @@ struct Playing {
     /// The sequence of the last frame published in the ring.
     seq: u64,
     /// The stamp of the frame in `frame`, converted and not published yet.
-    held: Option<i64>,
+    held: Option<Stamp>,
     /// The run's video has ended.
     ended: bool,
 }
@@ -286,7 +286,10 @@ impl Playing {
         self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
             Some(landed) => {
-                self.held = Some(landed.stamp);
+                self.held = Some(Stamp {
+                    at: landed.stamp,
+                    duration: self.input.duration(),
+                });
                 out.send(&Reply::Sought {
                     id,
                     player: self.player,
@@ -313,13 +316,17 @@ impl Playing {
     fn decode(&mut self, after: Option<i64>) -> Result<Decoded, (Failure, i32)> {
         let floor = self.floor;
         let keep = |stamp: i64| stamp >= floor && after.is_none_or(|l| stamp > l);
+        let timed = |input: &Input, at: i64| Stamp {
+            at,
+            duration: input.duration(),
+        };
         Ok(match self.input.next()? {
-            Some(stamp) if keep(stamp) => Decoded::Frame(stamp),
+            Some(stamp) if keep(stamp) => Decoded::Frame(timed(&self.input, stamp)),
             Some(_) => Decoded::Skipped,
             None if self.looping => {
                 let stamp = self.input.restart()?;
                 if keep(stamp) {
-                    Decoded::Frame(stamp)
+                    Decoded::Frame(timed(&self.input, stamp))
                 } else {
                     Decoded::Skipped
                 }
@@ -367,7 +374,7 @@ impl Playing {
             .publish(words, slot, &self.frame, seq, self.run, stamp)
             .map_err(|_| (Failure::Ring, 0))?;
         self.seq = seq;
-        self.last = Some(stamp);
+        self.last = Some(stamp.at);
         self.held = None;
         freeze_at(self.player, Freeze::Decoding);
         Ok(())
@@ -376,8 +383,9 @@ impl Playing {
 
 /// What a decode gave.
 enum Decoded {
-    /// A frame to publish, by its stamp, for the input to convert.
-    Frame(i64),
+    /// A frame to publish, by its stamp and duration, for the input to
+    /// convert.
+    Frame(Stamp),
     /// A frame not to publish (below the run's start, or not rising).
     Skipped,
     /// The video's end.

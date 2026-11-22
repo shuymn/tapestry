@@ -280,6 +280,11 @@ pub trait PlaySkin: Send {
     /// draws no movie.
     fn set_movies(&mut self, _movies: skin_model::movie::MovieShows) {}
 
+    /// The movie slots the prepared attempt's chart videos play in
+    /// ([`skin_model::Play::set_chart_videos`]). Nothing by default: a
+    /// skin that draws no BGA.
+    fn set_chart_videos(&mut self, _videos: skin_model::bga::ChartVideos) {}
+
     /// The most sprites a frame of the skin pushes: the renderer's batch,
     /// staging and instance buffer hold this many, and never fewer than
     /// [`MAX_SPRITES`], which the built-in screens use, and the

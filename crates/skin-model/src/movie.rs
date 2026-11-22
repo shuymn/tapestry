@@ -4,8 +4,16 @@
 //! each frame from the movies' states and the frames it took; the skin's
 //! build reads it.
 
-/// The movies a screen plays at most.
+/// The movies a skin's screen plays at most.
 pub const MAX_MOVIES: usize = 2;
+
+/// The movie slots a frame draws from (design.md "Rendering and Skins",
+/// skin movies): slots 0 and 1 hold the skin's movies, in its declaration
+/// order, and [`CHART_SLOTS`] the chart's videos (BGA).
+pub const SLOTS: usize = 4;
+
+/// The slots of the chart's videos.
+pub const CHART_SLOTS: [usize; 2] = [2, 3];
 
 /// The luma pixels a screen's live movies total at most: one movie at the
 /// worker's size cap, or two at 1920 × 1080 (design.md "Memory Budget";
@@ -44,4 +52,4 @@ pub enum MovieShow {
 }
 
 /// A frame's shows, by the movie's slot.
-pub type MovieShows = [MovieShow; MAX_MOVIES];
+pub type MovieShows = [MovieShow; SLOTS];

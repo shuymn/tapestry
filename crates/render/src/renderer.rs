@@ -195,6 +195,12 @@ struct Proj {
 @group(2) @binding(3) var video_y1: texture_2d<f32>;
 @group(2) @binding(4) var video_u1: texture_2d<f32>;
 @group(2) @binding(5) var video_v1: texture_2d<f32>;
+@group(2) @binding(6) var video_y2: texture_2d<f32>;
+@group(2) @binding(7) var video_u2: texture_2d<f32>;
+@group(2) @binding(8) var video_v2: texture_2d<f32>;
+@group(2) @binding(9) var video_y3: texture_2d<f32>;
+@group(2) @binding(10) var video_u3: texture_2d<f32>;
+@group(2) @binding(11) var video_v3: texture_2d<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -293,6 +299,10 @@ fn movie(uv: vec2f, layer: i32, flags: u32) -> vec4f {
     var s = yuv(video_y0, video_u0, video_v0, uv);
     if layer == 1 {
         s = yuv(video_y1, video_u1, video_v1, uv);
+    } else if layer == 2 {
+        s = yuv(video_y2, video_u2, video_v2, uv);
+    } else if layer == 3 {
+        s = yuv(video_y3, video_u3, video_v3, uv);
     }
     let y0 = s.x;
     let u0 = s.y;
@@ -1526,7 +1536,7 @@ pub struct FrameTiming {
     /// Which movie slots the frame's batch held a frame's sprite of
     /// ([`SpriteBatch::movies`]): with [`presented`](Self::presented),
     /// whether the frame drew each movie (design.md "Skin movies").
-    pub movies: [bool; skin_model::movie::MAX_MOVIES],
+    pub movies: [bool; skin_model::movie::SLOTS],
 }
 
 impl FrameTiming {
@@ -6921,6 +6931,12 @@ impl Renderer {
         self.skin.set_movies(movies);
     }
 
+    /// The movie slots the committed attempt's chart videos play in
+    /// ([`skin_model::Play::set_chart_videos`]), from the next frame on.
+    pub fn set_chart_videos(&mut self, videos: skin_model::bga::ChartVideos) {
+        self.skin.set_chart_videos(videos);
+    }
+
     /// What the play skin's movie destinations show in the loading frames
     /// that follow, whichever installation draws them (the skin in use or
     /// the one staged): the movies' preparation sets it at each of its
@@ -7761,7 +7777,7 @@ impl Renderer {
                 dropped: 0,
                 outcome: FrameOutcome::NotBuilt,
                 present_count: None,
-                movies: [false; skin_model::movie::MAX_MOVIES],
+                movies: [false; skin_model::movie::SLOTS],
             });
         };
         let projection = self.staging.projection();
@@ -9126,7 +9142,7 @@ impl Renderer {
             dropped: 0,
             outcome: FrameOutcome::NotBuilt,
             present_count: None,
-            movies: [false; skin_model::movie::MAX_MOVIES],
+            movies: [false; skin_model::movie::SLOTS],
         };
         let Some(start) = self.started.take() else {
             return Ok(none);
@@ -10806,48 +10822,9 @@ fn pipelines(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let sampler = |binding| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        count: None,
-    };
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("atlas"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            sampler(1),
-            sampler(2),
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(PROJECTION_BYTES),
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-                count: None,
-            },
-        ],
+        entries: &atlas_entries(),
     });
     let bga = crate::bga::layout(device);
     // The pool binding of every bind group without a pool: one zeroed
@@ -10896,6 +10873,63 @@ fn pipelines(
         placeholder,
     };
     (alpha, additive, multiply, bindings)
+}
+
+/// The atlas group's layout entries: the atlas array, the smooth and
+/// nearest samplers, the projection and the chart-image pool.
+fn atlas_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+    let sampler = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        },
+        sampler(1),
+        sampler(2),
+        wgpu::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(PROJECTION_BYTES),
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        },
+    ]
+}
+
+/// The sprite pipelines' bind group layouts' entries, by group: the
+/// atlas's, the BGA array's and the movies' planes (tests count their
+/// sampled textures against the device's limit).
+#[cfg(test)]
+pub(crate) fn sprite_layout_entries() -> [Vec<wgpu::BindGroupLayoutEntry>; 3] {
+    [
+        atlas_entries().to_vec(),
+        crate::bga::entries().to_vec(),
+        crate::video::entries().to_vec(),
+    ]
 }
 
 /// The alpha, additive and multiply pipelines of the sprite shader

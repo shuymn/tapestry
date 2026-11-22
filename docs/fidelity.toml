@@ -510,3 +510,19 @@ tests = [
     "crates/player/src/ui_text.rs::targets_are_named_in_the_sources_wording",
     "crates/skin-beatoraja/src/import/property.rs::target_names_bind_by_id_and_by_name",
 ]
+
+[[entry]]
+id = "SF-024"
+summary = "A BGA video draws opaque on the layer too: its black is not keyed"
+class = "rule"
+reason = """
+A player sees the layer channel's video cover the base where its frame is \
+black, where a layer picture's black lets the base through: a video on any \
+channel is drawn as a movie, not as a keyed picture (design.md "Rendering and \
+Skins", BGA)."""
+source = [
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:358 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:367 @beatoraja-0.8.9",
+]
+sites = ["crates/skin-model/src/play/bga.rs"]
+tests = ["crates/render/tests/bga.rs::a_layer_video_is_opaque_over_the_base"]

@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use skin_model::media::{
     CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Reader, Refused,
-    SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window, Words, Writer,
-    supervision, watermark,
+    SLOT_HEADER_WORDS, SLOTS, STATE_WORD, Stamp, State, VERSION, WATERMARK_WORD, Window, Words,
+    Writer, supervision, watermark,
 };
 
 /// Run 1's window: the first minute.
@@ -127,13 +127,24 @@ fn assert_whole(read: &Read, g: Geometry, seq: u64) {
     assert!(*bytes == frame(g, seq), "frame {seq} is taken whole");
 }
 
+/// How long the test frames last.
+const DURATION: i64 = 33_333;
+
+/// A frame at `at` lasting [`DURATION`].
+const fn timed(at: i64) -> Stamp {
+    Stamp {
+        at,
+        duration: DURATION,
+    }
+}
+
 /// Publishes frame `seq` of run `run` in a slot it claims.
 #[track_caller]
 fn publish(ring: &[AtomicU64], seq: u64, run: u64, at: i64) -> usize {
     let w = Writer::attach(ring).unwrap();
     let slot = w.claim(ring).expect("a free slot");
     let index = slot.index();
-    w.publish(ring, slot, &frame(w.geometry(), seq), seq, run, at)
+    w.publish(ring, slot, &frame(w.geometry(), seq), seq, run, timed(at))
         .unwrap();
     index
 }
@@ -408,7 +419,8 @@ fn ring_round_trip_writer_to_reader() {
         (
             Some(Frame {
                 seq: 2,
-                stamp: stamp(2)
+                stamp: stamp(2),
+                duration: DURATION,
             }),
             true
         )
@@ -444,14 +456,15 @@ fn ring_round_trip_writer_to_reader() {
         })
     );
     writer
-        .publish(ring, free, &frame(g, 7), 7, 2, 5_000_000)
+        .publish(ring, free, &frame(g, 7), 7, 2, timed(5_000_000))
         .unwrap();
     let at_seven = read(&mut reader, ring, 5_000_000).unwrap();
     assert_eq!(
         at_seven.frame(),
         Some(Frame {
             seq: 7,
-            stamp: 5_000_000
+            stamp: 5_000_000,
+            duration: DURATION,
         })
     );
     assert_whole(&at_seven, g, 7);
@@ -461,7 +474,7 @@ fn ring_round_trip_writer_to_reader() {
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     let claimed = writer.claim(ring).unwrap();
     assert_eq!(
-        writer.publish(ring, claimed, &[0; 10], 1, 1, 0),
+        writer.publish(ring, claimed, &[0; 10], 1, 1, timed(0)),
         Err(Refused::Frame(10)),
         "a frame of another size is not published"
     );
@@ -718,6 +731,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         ("its stamp", STAMP, 999),
         ("its index", INDEX, 3),
         ("its frame size", BYTES, 8),
+        ("its duration", DURATION_WORD, 20_000),
     ] {
         let mem = section(g);
         let ring = &*mem;
@@ -777,6 +791,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
                 (RUN, r >> 2 & 1),
                 (SEQ, 1 + (r >> 3 & 7)),
                 (STAMP, r >> 6 & 0xffff),
+                (DURATION_WORD, 1 + (r >> 22 & 0xffff)),
             ];
             for (i, near) in fields {
                 let v = if rng.next().is_multiple_of(8) {
@@ -862,7 +877,8 @@ fn ring_take_into_writes_the_due_frame_at_the_pitch() {
         f,
         Frame {
             seq: 2,
-            stamp: stamp(2)
+            stamp: stamp(2),
+            duration: DURATION,
         }
     );
     assert!(longest_row <= w, "no write runs past a row");
@@ -1107,4 +1123,140 @@ fn ring_takes_the_newest_late_frame() {
     assert_eq!(reader.freed(), 3, "the newest late frame taken");
     let r = read(&mut reader, &*mem, 900_000).unwrap();
     assert_whole(&r, g, 4);
+}
+
+/// The slot header's duration word.
+const DURATION_WORD: usize = 6;
+
+/// Publishes frame `seq` of run 1 at `at`, lasting `duration`.
+#[track_caller]
+fn publish_lasting(ring: &[AtomicU64], seq: u64, at: i64, duration: i64) -> usize {
+    let w = Writer::attach(ring).unwrap();
+    let slot = w.claim(ring).expect("a free slot");
+    let index = slot.index();
+    let frame = frame(w.geometry(), seq);
+    w.publish(ring, slot, &frame, seq, 1, Stamp { at, duration })
+        .unwrap();
+    index
+}
+
+/// A frame taken carries the duration the worker published with it
+/// (design.md "Rendering and Skins", video frames), and a ring of the
+/// version before durations is not this layout.
+// Covers: T02
+#[test]
+fn a_taken_frame_carries_its_duration() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    publish_lasting(&mem, 1, 1_000, 41_667);
+    let due = reader.peek(&*mem, 1_000).unwrap().due.unwrap();
+    assert_eq!(due.duration(), 41_667, "the peek's choice");
+    let f = reader.take(&*mem, due, tight(g), &mut |_, _| true).unwrap();
+    assert_eq!(
+        f,
+        Frame {
+            seq: 1,
+            stamp: 1_000,
+            duration: 41_667
+        }
+    );
+    mem[1].store(5, Ordering::Relaxed);
+    assert_eq!(
+        Writer::attach(&*mem).err(),
+        Some(Refused::Layout),
+        "a version 5 ring"
+    );
+}
+
+/// A duration of 0, past the longest frame, or whose end overflows the
+/// stamps fails the player ("Threat Model" T02), which then reads nothing
+/// more; a duration of the longest frame passes.
+// Covers: T02
+#[test]
+fn a_duration_out_of_range_fails_the_player() {
+    let g = Geometry::new(16, 9).unwrap();
+    let longest = skin_model::media::MAX_FRAME_US;
+    let past = longest.cast_unsigned() + 1;
+    let cases: [(&str, i64, u64); 4] = [
+        ("a duration of 0", 2_000, 0),
+        ("past the longest frame", 2_000, past),
+        ("a negative duration", 2_000, u64::MAX),
+        ("an end past the stamps", i64::MAX - 10, 11),
+    ];
+    for (what, at, value) in cases {
+        let (mem, mut reader) = taken_one(g);
+        slot_word(&mem, g, 1, STAMP).store(at.cast_unsigned(), Ordering::Relaxed);
+        slot_word(&mem, g, 1, DURATION_WORD).store(value, Ordering::Relaxed);
+        let fault = Fault::Duration { slot: 1, value };
+        assert_eq!(reader.peek(&*mem, 5_000), Err(fault), "{what}");
+        assert_eq!(reader.fault(), Some(fault), "{what}: the player failed");
+        let watched = Watched::new(&mem);
+        assert_eq!(reader.peek(&watched, 6_000), Err(fault), "{what}: kept");
+        assert_eq!(watched.take_log(), [], "{what}: nothing more read");
+    }
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    publish_lasting(&mem, 1, 1_000, longest);
+    let r = read(&mut reader, &*mem, 1_000).unwrap();
+    assert_eq!(
+        r.frame().map(|f| f.duration),
+        Some(longest),
+        "the longest frame"
+    );
+}
+
+/// A duration that changes while its frame is copied fails the take: the
+/// words read again after the copy name another frame.
+// Covers: T02
+#[test]
+fn a_duration_changed_during_the_copy_fails_the_take() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let ring = &*mem;
+    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+    assert_eq!(publish_lasting(ring, 1, 1_000, 41_667), 0);
+    let due = reader.peek(ring, 1_000).unwrap().due.unwrap();
+    let word = slot_word(ring, g, 0, DURATION_WORD);
+    let mut sink = |_: usize, _: &[u8]| {
+        word.store(20_000, Ordering::Relaxed);
+        true
+    };
+    assert_eq!(
+        reader.take(ring, due, tight(g), &mut sink),
+        Err(Fault::Changed { slot: 0 })
+    );
+    assert_eq!(reader.fault(), Some(Fault::Changed { slot: 0 }));
+}
+
+/// A peek says whether a published frame of the current run stays untaken
+/// once its choice is taken (design.md "Rendering and Skins", video
+/// frames): a newer frame not due yet does, a frame of an earlier run does
+/// not.
+// Covers: T02
+#[test]
+fn left_tells_whether_frames_of_the_run_remain() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let ring = &*mem;
+    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+    publish(ring, 1, 1, 100_000);
+    publish(ring, 2, 1, 200_000);
+    let peek = reader.peek(ring, 150_000).unwrap();
+    assert_eq!(peek.due.map(|d| d.seq()), Some(1));
+    assert!(peek.left, "frame 2 is not due yet");
+    read(&mut reader, ring, 150_000).unwrap();
+    let peek = reader.peek(ring, 250_000).unwrap();
+    assert_eq!(peek.due.map(|d| d.seq()), Some(2));
+    assert!(!peek.left, "frame 2 is the last");
+    read(&mut reader, ring, 250_000).unwrap();
+    // A frame of run 1 the game never took, then run 2.
+    publish(ring, 3, 1, 300_000);
+    assert_eq!(reader.start_run(WINDOW), 2);
+    let peek = reader.peek(ring, 0).unwrap();
+    assert!(!peek.left, "run 1's frame is not the run's");
+    publish(ring, 4, 2, 400_000);
+    let peek = reader.peek(ring, 0).unwrap();
+    assert_eq!(peek.due.map(|d| d.seq()), None);
+    assert!(peek.left, "run 2's frame, none due");
 }

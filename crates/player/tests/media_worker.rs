@@ -319,6 +319,14 @@ const READY: u64 = 2;
 /// A frame taken from a ring.
 struct Taken {
     stamp: i64,
+    #[cfg_attr(
+        not(feature = "dev-tools"),
+        expect(
+            dead_code,
+            reason = "the duration tests generate their clips with dev-tools"
+        )
+    )]
+    duration: i64,
     bytes: Vec<u8>,
 }
 
@@ -368,6 +376,7 @@ fn take_to_last(
         if let Some(frame) = ring.poll(due) {
             taken.push(Taken {
                 stamp: frame.stamp,
+                duration: frame.duration,
                 bytes: ring.staged(),
             });
             due = frame.stamp + interval * 3 / 2;
@@ -395,6 +404,7 @@ fn take_one(worker: &Worker, ring: &mut Ring, due: i64) -> Taken {
         if let Some(frame) = ring.poll(due) {
             return Taken {
                 stamp: frame.stamp,
+                duration: frame.duration,
                 bytes: ring.staged(),
             };
         }
@@ -3719,4 +3729,88 @@ fn a_worker_ending_with_the_watchers_code_is_its_own_end() {
     // SAFETY: the worker's process handle, which has every access.
     unsafe { TerminateProcess(worker.process(), verdict::ENDED_BY_MESSAGE) }.unwrap();
     assert_eq!(ended(&worker), End::Exited(verdict::ENDED_BY_MESSAGE));
+}
+
+/// Each frame goes out with its duration (design.md "Rendering and
+/// Skins", video frames): a constant-rate clip's durations tile its
+/// stamps, the next frame's stamp minus its own to the µs, and the last
+/// one's is the frame period.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_frame_is_published_with_its_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "d.mpg", LOOPED);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let taken = take_all(&worker, &mut ring, 1, 0, stamp_of(1, 24));
+    assert_eq!(taken.len(), 48, "every frame");
+    let durations: Vec<i64> = taken.iter().map(|t| t.duration).collect();
+    let mut want: Vec<i64> = taken.windows(2).map(|w| w[1].stamp - w[0].stamp).collect();
+    want.push(stamp_of(48, 24) - stamp_of(47, 24));
+    assert_eq!(
+        durations,
+        want,
+        "the worker's log:
+{}",
+        worker.log()
+    );
+    assert!(want.contains(&41_666) && want.contains(&41_667), "{want:?}");
+    worker.close(1);
+}
+
+/// A seek's landing goes out with its own duration: frame 24 of a 24 fps
+/// clip, sought at 1 s, lasts until frame 25's stamp.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_seek_landing_carries_its_own_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "s.mpg", LOOPED);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(2, &path);
+    assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(2, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 2
+        }
+    );
+    let first = take_one(&worker, &mut ring, 0);
+    assert_eq!((first.stamp, first.duration), (0, stamp_of(1, 24)));
+    let run = ring.start_run(1_000_000);
+    worker.send(&Order::Seek {
+        player: 2,
+        run,
+        at: 1_000_000,
+    });
+    assert!(
+        matches!(
+            worker.reply(),
+            Reply::Sought {
+                landed: 1_000_000,
+                ..
+            }
+        ),
+        "the worker's log:
+{}",
+        worker.log()
+    );
+    let landed = take_one(&worker, &mut ring, 1_000_000);
+    assert_eq!(
+        (landed.stamp, landed.duration, painted(&landed.bytes, 320)),
+        (1_000_000, stamp_of(25, 24) - 1_000_000, 24)
+    );
+    worker.close(2);
 }

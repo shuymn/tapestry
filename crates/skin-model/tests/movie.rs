@@ -54,7 +54,7 @@ const FRAME: MovieShow = MovieShow::Frame {
 };
 
 fn shows(first: MovieShow, second: MovieShow) -> MovieShows {
-    [first, second]
+    [first, second, MovieShow::Nothing, MovieShow::Nothing]
 }
 
 /// The frame's quads after a build with `movies`.
@@ -119,11 +119,15 @@ fn a_movie_with_nothing_to_show_draws_nothing() {
 fn a_batch_marks_the_movie_slots_whose_frame_it_drew() {
     let mut h = harness(vec![movie_element(1, FILL, Blend::Alpha)]);
     let _ = quads(&mut h, shows(FRAME, FRAME));
-    assert_eq!(h.batch.movies(), [false, true], "slot 1's frame drawn");
+    assert_eq!(
+        h.batch.movies(),
+        [false, true, false, false],
+        "slot 1's frame drawn"
+    );
     let _ = quads(&mut h, shows(FRAME, MovieShow::Lost));
-    assert_eq!(h.batch.movies(), [false, false], "a lost movie's black");
+    assert_eq!(h.batch.movies(), [false; 4], "a lost movie's black");
     let _ = quads(&mut h, shows(FRAME, MovieShow::Nothing));
-    assert_eq!(h.batch.movies(), [false, false], "nothing to show");
+    assert_eq!(h.batch.movies(), [false; 4], "nothing to show");
 }
 
 #[test]

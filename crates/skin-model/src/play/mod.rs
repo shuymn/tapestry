@@ -735,8 +735,9 @@ pub struct Play {
     /// The live key of the BGA array, set by the frame's renderer before
     /// each build ([`set_bga_live`](Self::set_bga_live)).
     bga_live: Option<crate::bga::BgaKey>,
-    /// Where a video's frames come from: none yet.
-    media: crate::bga::NullMedia,
+    /// The slots the chart's videos play in: none until set
+    /// ([`set_chart_videos`](Self::set_chart_videos)).
+    chart_videos: Option<crate::bga::ChartVideos>,
     /// The bar groups' per-frame work, for a skin with lanes and groups;
     /// a build lends it to the lanes.
     bars: Option<BarScratch>,
@@ -1103,7 +1104,7 @@ impl Play {
             bga_show: bga::Show::Placeholder,
             bga_table: crate::bga::absent_table(),
             bga_live: None,
-            media: crate::bga::NullMedia,
+            chart_videos: None,
             bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
             graphs: Graphs::new(plan, chart, ctx),
         })
@@ -1303,19 +1304,19 @@ impl Play {
         &self.bga_table
     }
 
+    /// Sets the slots the chart's videos play in, from the next frame on;
+    /// kept by [`rearm`](Self::rearm). Set before the attempt's READY and
+    /// never during it.
+    pub fn set_chart_videos(&mut self, videos: crate::bga::ChartVideos) {
+        self.chart_videos = Some(videos);
+    }
+
     /// Sets the live key of the BGA array its next frames draw from: the
     /// frame's renderer sets it before each build. Allocates nothing.
     pub fn set_bga_live(&mut self, live: Option<crate::bga::BgaKey>) {
         self.bga_live = live;
     }
 
-    /// What the last build's BGA destinations show and the table they draw
-    /// from: the table when it describes the live array; a table published
-    /// with no array as every picture absent, channel by channel (the
-    /// placeholder on the base, nothing on the layer or in the miss
-    /// window); and the placeholder alone while no table for the live
-    /// array is published (none yet, or one whose array is no longer in
-    /// use), the miss window's included.
     /// Sets what each skin movie's destinations show from the next build
     /// on.
     pub fn set_movies(&mut self, movies: crate::movie::MovieShows) {
@@ -1327,15 +1328,28 @@ impl Play {
         &self.movies
     }
 
+    /// What the last build's BGA destinations show, the table they draw
+    /// from, whether its pictures may draw, and where its videos' frames
+    /// come from: the table, pictures and all, when it describes the live
+    /// array; a table published with no array with every picture absent,
+    /// channel by channel (the placeholder on the base, nothing on the
+    /// layer or in the miss window), its videos drawing from their slots;
+    /// and the placeholder alone while no table for the live array is
+    /// published (none yet, or one whose array is no longer in use), the
+    /// miss window's included.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, crate::bga::NullMedia) {
+    pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, bool, bga::Media<'_>) {
         let table = &*self.bga_table;
+        let media = bga::Media {
+            videos: self.chart_videos.as_ref(),
+            shows: &self.movies,
+        };
         if table.drawable(self.bga_live) {
-            (self.bga_show, table, self.media)
+            (self.bga_show, table, true, media)
         } else if table.published() && table.key().is_none() {
-            (self.bga_show, &crate::bga::NO_TABLE, self.media)
+            (self.bga_show, table, false, media)
         } else {
-            (bga::Show::Placeholder, &crate::bga::NO_TABLE, self.media)
+            (bga::Show::Placeholder, &crate::bga::NO_TABLE, false, media)
         }
     }
 

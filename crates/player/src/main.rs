@@ -2838,7 +2838,7 @@ mod tests {
                 dropped: 0,
                 outcome: render::FrameOutcome::Shown,
                 present_count: None,
-                movies: [false; skin_model::movie::MAX_MOVIES],
+                movies: [false; skin_model::movie::SLOTS],
             })
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {
@@ -2896,7 +2896,7 @@ mod tests {
                 dropped: 0,
                 outcome: render::FrameOutcome::Shown,
                 present_count: None,
-                movies: [false; skin_model::movie::MAX_MOVIES],
+                movies: [false; skin_model::movie::SLOTS],
             })
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {

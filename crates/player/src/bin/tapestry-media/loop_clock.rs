@@ -71,6 +71,29 @@ impl LoopClock {
         pts.checked_sub(self.start)?.checked_add(self.offset)
     }
 
+    /// The ticks a frame lasting `duration` (0 or less when unknown) lasts:
+    /// its own duration, else the stream's average frame interval, else the
+    /// interval between the last two frames, else one tick.
+    pub fn length(&self, duration: i64) -> i64 {
+        Some(duration)
+            .filter(|d| *d > 0)
+            .or(self.interval)
+            .or(self.delta)
+            .unwrap_or(1)
+    }
+
+    /// How long a frame at `ticks` lasting `duration` ([`Self::length`])
+    /// lasts in µs, at a time base of `num`/`den`: its end's stamp minus
+    /// its own, each rounded from ticks as stamps are, so a constant-rate
+    /// clip's durations tile its stamps; at least 1 µs and at most
+    /// [`skin_model::media::MAX_FRAME_US`].
+    pub fn frame_us(&self, ticks: i64, duration: i64, num: i32, den: i32) -> i64 {
+        let end = ticks.saturating_add(self.length(duration));
+        rescale_us(end, num, den)
+            .saturating_sub(rescale_us(ticks, num, den))
+            .clamp(1, skin_model::media::MAX_FRAME_US)
+    }
+
     /// The ticks every pass before this one lasted together.
     pub const fn pass_start(&self) -> i64 {
         self.offset
@@ -111,7 +134,7 @@ impl LoopClock {
         let Some((pts, duration)) = self.last.take() else {
             return false;
         };
-        let length = duration.or(self.interval).or(self.delta).unwrap_or(1);
+        let length = self.length(duration.unwrap_or(0));
         self.delta = None;
         let end = pts
             .checked_add(length)
@@ -173,6 +196,38 @@ mod tests {
         // the assertion above told them apart.
         assert!(differs.contains(&9), "{differs:?}");
         assert!(differs.len() > 50, "{differs:?}");
+    }
+
+    /// A frame's duration in µs (design.md "Rendering and Skins", video
+    /// frames): its own, else the average period, else the interval
+    /// between the last two frames, else one tick, never 0 µs.
+    // Covers: T02
+    #[test]
+    fn a_frame_without_a_duration_falls_back_in_order() {
+        let us = |clock: &LoopClock, duration| clock.frame_us(9_000, duration, TB.0, TB.1);
+        // Its own duration first: 3003 ticks, 33 366.7 µs, the end's
+        // stamp rounded (133 367) minus its own (100 000).
+        let mut clock = LoopClock::new(0, Some(1800));
+        clock.ticks(0, None);
+        clock.ticks(2700, None);
+        assert_eq!(us(&clock, 3003), 33_367);
+        // None: the average period, 1800 ticks, 20 ms.
+        assert_eq!(us(&clock, 0), 20_000);
+        // No average period: the last interval, 2700 ticks, 30 ms.
+        let mut clock = LoopClock::new(0, None);
+        clock.ticks(0, None);
+        clock.ticks(2700, None);
+        assert_eq!(us(&clock, -1), 30_000);
+        // Nothing: one tick, 11.1 µs.
+        let clock = LoopClock::new(0, None);
+        assert_eq!(us(&clock, 0), 11);
+        // One tick of a finer base rounds to no µs: 1 µs, never 0.
+        assert_eq!(clock.frame_us(9_000, 0, 1, 10_000_000), 1);
+        // A duration past an hour: an hour.
+        assert_eq!(
+            clock.frame_us(0, 400_000_000, TB.0, TB.1),
+            skin_model::media::MAX_FRAME_US
+        );
     }
 
     // Covers: T02

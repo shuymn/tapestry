@@ -2136,7 +2136,11 @@ fn clip() -> Arc<Movie> {
     let writer = skin_model::media::Writer::attach(words).unwrap();
     let slot = writer.claim(words).unwrap();
     let frame = vec![9; geometry.frame_bytes()];
-    writer.publish(words, slot, &frame, 1, 1, 0).unwrap();
+    let at = skin_model::media::Stamp {
+        at: 0,
+        duration: 33_333,
+    };
+    writer.publish(words, slot, &frame, 1, 1, at).unwrap();
     movie
 }
 
@@ -2169,7 +2173,7 @@ impl Rig {
 fn a_selection_movie_without_slack_is_admitted_after_a_frame() {
     let r = Rig::selection();
     let start = Instant::now();
-    *r.fake.movies.lock().unwrap() = Some(Movies::new([Some(clip()), None], start));
+    *r.fake.movies.lock().unwrap() = Some(Movies::skin([Some(clip()), None], start));
     r.fake.probe.store(true, Ordering::SeqCst);
     r.fake.starve.store(true, Ordering::SeqCst);
     GRANT.store(true, Ordering::SeqCst);
@@ -2221,7 +2225,7 @@ fn a_staging_ending_with_a_grant_reserves_after_its_frame() {
     r.fake.gate.hold();
     r.fake.movie_prep.store(true, Ordering::SeqCst);
     *r.fake.staging_movies.lock().unwrap() =
-        Some(Movies::new([Some(clip()), None], Instant::now()));
+        Some(Movies::skin([Some(clip()), None], Instant::now()));
     let mut pending = r
         .link
         .begin_attempt(attempt(&chart, None), AttemptSkin::InUse);
@@ -2296,7 +2300,7 @@ fn an_idle_preparation_admits_its_movie_with_a_grant_kept() {
     let start = Instant::now();
     r.fake.movie_prep.store(true, Ordering::SeqCst);
     r.fake.staged.store(true, Ordering::SeqCst);
-    *r.fake.movies.lock().unwrap() = Some(Movies::new([Some(Arc::clone(&movie)), None], start));
+    *r.fake.movies.lock().unwrap() = Some(Movies::skin([Some(Arc::clone(&movie)), None], start));
     let ready = r.link.prepare_attempt(attempt(&chart, None), || false);
     assert_eq!(ready.unwrap(), Preparation::Ready);
     assert_eq!(
@@ -2354,7 +2358,7 @@ fn an_idle_preparation_admits_its_movie() {
     let start = Instant::now();
     r.fake.movie_prep.store(true, Ordering::SeqCst);
     r.fake.staged.store(true, Ordering::SeqCst);
-    *r.fake.movies.lock().unwrap() = Some(Movies::new([Some(Arc::clone(&movie)), None], start));
+    *r.fake.movies.lock().unwrap() = Some(Movies::skin([Some(Arc::clone(&movie)), None], start));
     let frames = r.fake.state().frames.len();
     let ready = r.link.prepare_attempt(attempt(&chart, None), || false);
     assert_eq!(ready.unwrap(), Preparation::Ready);
