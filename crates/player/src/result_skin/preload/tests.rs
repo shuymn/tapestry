@@ -60,16 +60,29 @@ pub(super) fn pack_gate(stop: &dyn Fn() -> bool) {
 /// within [`long`] (a pack that ended its build, or waits in its
 /// checkpoint for a permit, does not).
 pub(crate) fn step() -> bool {
-    let arrived = ARRIVALS.load(SeqCst);
-    STEPS.fetch_add(1, SeqCst);
+    let arrived = pass();
     let began = Instant::now();
-    while ARRIVALS.load(SeqCst) == arrived {
+    while !back_since(arrived) {
         if began.elapsed() > long() {
             return false;
         }
         std::thread::park_timeout(Duration::from_millis(1));
     }
     true
+}
+
+/// Lets the pack held at the armed gate pass one checkpoint without
+/// waiting for it to come back; the arrivals so far, for [`back_since`].
+pub(crate) fn pass() -> u32 {
+    let arrived = ARRIVALS.load(SeqCst);
+    STEPS.fetch_add(1, SeqCst);
+    arrived
+}
+
+/// Whether a pack came to the armed gate again since [`pass`] returned
+/// `arrived`.
+pub(crate) fn back_since(arrived: u32) -> bool {
+    ARRIVALS.load(SeqCst) != arrived
 }
 
 /// Arms the gate at `level` (0 opens it).

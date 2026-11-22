@@ -1874,6 +1874,86 @@ fn a_discarded_adopted_pack_leaves_the_next_cold_bank_its_width() {
     );
 }
 
+/// A quit right after the adopted pack's checkpoint read that it should
+/// move to the foreground, before it moves its permit there: the pack is
+/// held between the two, the claim's end (the stage dropped) withdraws
+/// the promotion, the pack goes on unpaused, and once let go its move
+/// reads the class again
+/// under the lock that takes the permit, so it stays speculative and the
+/// next cold chart's bank is granted every foreground permit its pool
+/// runs a worker for (design.md "Load Pipeline", the coordinator: the
+/// chosen chart's bank draws the foreground pool).
+#[test]
+fn a_quit_before_the_promoted_pack_moves_leaves_the_next_cold_bank_its_width() {
+    use crate::result_skin::preload_tests::{Opened, Seam, back_since, gate, pass};
+    /// Lets the held move go however the test ends.
+    struct Released(Arc<AtomicBool>);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            // The pack's next move is held, once, after its read.
+            let (armed, reached, release) = (
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let _released = Released(Arc::clone(&release));
+            {
+                let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+                b.coord.before_move(move || {
+                    if !armed.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    reached.store(true, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                });
+            }
+            // The attempt adopts the claimed pack, promoting it.
+            let stage = rig.result_skin.begin_image_stage(
+                crate::result_skin::tests::chart(),
+                Some(skin_beatoraja::JudgeClass::Normal),
+                Some(control.claim()),
+            );
+            assert!(matches!(stage, crate::result_skin::ImageStage::Adopted(_)));
+            let arrived = pass();
+            until("the pack's move", || reached.load(Ordering::SeqCst));
+            assert_eq!(b.coord.held(Class::Foreground), 0, "not moved yet");
+            // The quit: the stage drops with its claim, and the select
+            // screen's pause ends, so the pack goes on speculatively.
+            drop(stage);
+            assert!(!control.claimed());
+            sel(rig).shelf.release();
+            release.store(true, Ordering::SeqCst);
+            until("the pack's next checkpoint", || back_since(arrived));
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+            assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
+            assert_eq!(b.coord.held(Class::Speculative), 1, "its own class");
+            assert!(seam.left.lock().unwrap().is_empty(), "never promoted");
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+        },
+    );
+}
+
 /// How a choice's load ends before Preparing.
 #[derive(Clone, Copy, Debug)]
 enum LoadEnd {

@@ -510,7 +510,15 @@ struct Shared {
     /// Where tests hold a job's finish.
     #[cfg(test)]
     cuts: Mutex<Cuts>,
+    /// Run on a job's own thread at each checkpoint that holds a permit,
+    /// before the permit is moved ([`Coordinator::before_move`]).
+    #[cfg(any(test, feature = "dev-tools"))]
+    before_move: Mutex<Option<MoveHook>>,
 }
+
+/// A hook a test holds a job's checkpoint with ([`Coordinator::before_move`]).
+#[cfg(any(test, feature = "dev-tools"))]
+type MoveHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Where a test holds a job: as its admission begins, between its
 /// computation and its finish, and inside the finish between the registry
@@ -617,8 +625,24 @@ impl Coordinator {
                 unsettled: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 cuts: Mutex::new(Cuts::default()),
+                #[cfg(any(test, feature = "dev-tools"))]
+                before_move: Mutex::new(None),
             }),
         }
+    }
+
+    /// Runs `hook` from now on, on a job's own thread, at each checkpoint
+    /// that holds a permit, after the checkpoint first read the class the
+    /// job should run in and before it moves the permit there (tests and
+    /// dev-tools builds): a test holds the job between the two.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[doc(hidden)]
+    pub fn before_move(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .shared
+            .before_move
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
     }
 
     /// Holds each job from now on as its admission begins, before it reads
@@ -916,8 +940,12 @@ impl Lease {
         self.class
     }
 
-    /// Moves it to `class` if a permit of `class` is free and it was not
-    /// revoked; whether it is of `class` now.
+    /// Moves it to `class` if a permit of `class` is free, it was not
+    /// revoked and its job, if any, still wants `class`; whether it is of
+    /// `class` now. The job's wanted class is read under the lock that
+    /// takes the permit, as an admission reads it, so a promotion revoked
+    /// or withdrawn after its caller read the class never takes a
+    /// foreground permit.
     pub fn move_to(&mut self, class: Class) -> bool {
         if self.class == class {
             return true;
@@ -926,7 +954,7 @@ impl Lease {
         let moved = self.shared.update(|state| {
             if job
                 .and_then(|id| state.jobs.get(&id))
-                .is_some_and(|j| j.revoked)
+                .is_some_and(|j| j.revoked || j.want() != class)
             {
                 return false;
             }
@@ -1385,7 +1413,10 @@ impl Ctx<'_> {
 
     /// Moves the permit to the class wanted now; `false` when the wait for
     /// one was stopped. A revoked permit is let go, giving nothing back,
-    /// and a permit of the class wanted is waited for.
+    /// and a permit of the class wanted is waited for. The move reads the
+    /// wanted class again under its own lock ([`Lease::move_to`]): one
+    /// that changed since the read here lets the permit go and waits for
+    /// one of the class wanted then.
     fn retarget(&self) -> bool {
         let (want, revoked) = self
             .shared
@@ -1400,6 +1431,18 @@ impl Ctx<'_> {
         };
         if !revoked && held.class() == want {
             return true;
+        }
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            let hook = self
+                .shared
+                .before_move
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         if !revoked && held.move_to(want) {
             drop(lease);
