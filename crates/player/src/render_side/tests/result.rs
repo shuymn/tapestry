@@ -2693,6 +2693,12 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                     assert!(Instant::now() < end, "the result never showed");
                     p.idle_wait(TimeUs(p.now().0 + 20_000));
                 }
+                // The view shown again, waiting until then, is presented
+                // before the pin, so the pin holds it.
+                assert!(
+                    wait_until(|| p.render.result_status().shown.map(|s| s.0) == Some(2)),
+                    "the second view is presented after the acknowledgement"
+                );
                 let lifetime = p.render.result_status().lifetime;
                 let at = p.now();
                 assert_eq!(
@@ -2747,7 +2753,7 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                         p.now()
                     );
                     assert_eq!(p.result_timing(), Some(t));
-                    assert_eq!(p.render.result_status().pinned, Some(1));
+                    assert_eq!(p.render.result_status().pinned, Some(2));
                 }
                 // Shown again after the recovery: still no layout, and
                 // the same lifetime.
