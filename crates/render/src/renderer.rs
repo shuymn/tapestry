@@ -162,7 +162,9 @@ const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
 // the layer (low 15 bits), the pool bit (bit 15), the nearest and base
-// filter bits (16, 17), the BGA bit (18) and the key bit (19).
+// filter bits (16, 17), the BGA bit (18), the key bit (19), and the video
+// bit (20) with the movie's matrix (21: BT.601, else BT.709) and range
+// (22: full, else limited).
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
@@ -187,6 +189,12 @@ struct Proj {
 @group(0) @binding(3) var<uniform> proj: Proj;
 @group(0) @binding(4) var pool: texture_2d_array<f32>;
 @group(1) @binding(0) var bga: texture_2d_array<f32>;
+@group(2) @binding(0) var video_y0: texture_2d<f32>;
+@group(2) @binding(1) var video_u0: texture_2d<f32>;
+@group(2) @binding(2) var video_v0: texture_2d<f32>;
+@group(2) @binding(3) var video_y1: texture_2d<f32>;
+@group(2) @binding(4) var video_u1: texture_2d<f32>;
+@group(2) @binding(5) var video_v1: texture_2d<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -220,7 +228,13 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // sprite with the base bit takes it. One result is chosen. A sprite with
 // the BGA bit reads the BGA array instead, at level 0 by explicit level:
 // bilinear, or at the nearest texel with the nearest bit, and with the key
-// bit a pure black texel is transparent.
+// bit a pure black texel is transparent. A sprite with the video bit
+// reads its movie's (the layer's slot) Y, U and V planes bilinearly at
+// level 0 and converts them by the movie's matrix and range to opaque
+// R'G'B' (limited range expanded from 16-235 luma and 16-240 chroma, full
+// range read as is). Each plane is the movie's own size, so its edge
+// clamps to its own texels; a chroma plane's uv is scaled by its luma
+// width over twice its own, the half of an odd side rounded up.
 //
 // A quad with the pool bit samples the chart-image pool instead, by the
 // same filters, never the built-in read (its layer 0 holds ordinary
@@ -258,7 +272,49 @@ fn tinted(v: VOut) -> vec4f {
             c = vec4f(0.0);
         }
     }
+    if (v.flags & 0x100000u) != 0u {
+        c = movie(v.uv, layer, v.flags);
+    }
     return c * v.color;
+}
+
+// A movie's raw Y, U and V at luma `uv` from its planes `y`, `u` and `v`.
+fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f) -> vec3f {
+    let cuv = uv * vec2f(textureDimensions(y)) / (2.0 * vec2f(textureDimensions(u)));
+    return vec3f(
+        textureSampleLevel(y, smooth_samp, uv, 0.0).r,
+        textureSampleLevel(u, smooth_samp, cuv, 0.0).r,
+        textureSampleLevel(v, smooth_samp, cuv, 0.0).r,
+    );
+}
+
+// A movie's texel: Y'CbCr by its matrix and range to opaque R'G'B'.
+fn movie(uv: vec2f, layer: i32, flags: u32) -> vec4f {
+    var s = yuv(video_y0, video_u0, video_v0, uv);
+    if layer == 1 {
+        s = yuv(video_y1, video_u1, video_v1, uv);
+    }
+    let y0 = s.x;
+    let u0 = s.y;
+    let v0 = s.z;
+    var y = (y0 * 255.0 - 16.0) / 219.0;
+    var cb = (u0 * 255.0 - 128.0) / 224.0;
+    var cr = (v0 * 255.0 - 128.0) / 224.0;
+    if (flags & 0x400000u) != 0u {
+        y = y0;
+        cb = (u0 * 255.0 - 128.0) / 255.0;
+        cr = (v0 * 255.0 - 128.0) / 255.0;
+    }
+    var kr = 0.2126;
+    var kb = 0.0722;
+    if (flags & 0x200000u) != 0u {
+        kr = 0.299;
+        kb = 0.114;
+    }
+    let r = y + 2.0 * (1.0 - kr) * cr;
+    let b = y + 2.0 * (1.0 - kb) * cb;
+    let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    return vec4f(clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0)), 1.0);
 }
 
 @fragment
@@ -1467,6 +1523,10 @@ pub struct FrameTiming {
     /// failed. It pairs the frame with its frame statistics (design.md "Latency
     /// Figures").
     pub present_count: Option<u32>,
+    /// Which movie slots the frame's batch held a frame's sprite of
+    /// ([`SpriteBatch::movies`]): with [`presented`](Self::presented),
+    /// whether the frame drew each movie (design.md "Skin movies").
+    pub movies: [bool; skin_model::movie::MAX_MOVIES],
 }
 
 impl FrameTiming {
@@ -1602,6 +1662,8 @@ struct Bindings {
     nearest: wgpu::Sampler,
     /// The second group's layout: the BGA array.
     bga: wgpu::BindGroupLayout,
+    /// The third group's layout: the movies' planes, by slot.
+    video: wgpu::BindGroupLayout,
     /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
     projection: wgpu::Buffer,
     /// The half last written to [`projection`](Self::projection), `None`
@@ -1714,6 +1776,11 @@ pub struct Renderer {
     text_counts: Vec<(u64, crate::TextCount)>,
     #[cfg(feature = "dev-tools")]
     text_last: Option<(LoadingTextKey, [u32; 2], u64, u64)>,
+    /// The movies' planes and upload buffers, by slot.
+    video: crate::video::Video,
+    /// What the play skin's movie destinations show in loading frames
+    /// ([`set_loading_movies`](Self::set_loading_movies)).
+    loading_movies: skin_model::movie::MovieShows,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -2046,6 +2113,7 @@ impl Renderer {
         let atlas = AtlasTexture::builtin(&gpu);
         let atlas_bind = bindings.bind(device, &atlas, None);
         let bga = crate::bga::BgaArray::stand_in(&gpu, &bindings.bga);
+        let video = crate::video::Video::new(&gpu, &bindings.video);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
         // The simple skin's runs are as many as its sprites, the staging's
         // default.
@@ -2091,6 +2159,8 @@ impl Renderer {
             text_counts: Vec::new(),
             #[cfg(feature = "dev-tools")]
             text_last: None,
+            video,
+            loading_movies: skin_model::movie::MovieShows::default(),
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -6844,6 +6914,81 @@ impl Renderer {
             .map_or(0, crate::bga::BgaUpload::bytes)
     }
 
+    /// What the play skin's movie destinations show in the next builds
+    /// ([`PlaySkin::set_movies`]); a selection skin's are set on its
+    /// [`Selection`](skin_model::Selection).
+    pub fn set_play_movies(&mut self, movies: skin_model::movie::MovieShows) {
+        self.skin.set_movies(movies);
+    }
+
+    /// What the play skin's movie destinations show in the loading frames
+    /// that follow, whichever installation draws them (the skin in use or
+    /// the one staged): the movies' preparation sets it at each of its
+    /// polls.
+    pub fn set_loading_movies(&mut self, movies: skin_model::movie::MovieShows) {
+        self.loading_movies = movies;
+    }
+
+    /// Replaces movie slot `slot`'s planes and upload buffer with ones of
+    /// a movie of `width` × `height`: its admission, never a frame's
+    /// upload. The other slot keeps its planes, frame and queued copy.
+    pub fn video_reserve(&mut self, slot: u32, width: u32, height: u32) {
+        self.video.reserve(&self.gpu, slot, width, height);
+    }
+
+    /// Releases movie slot `slot`'s planes and upload buffer: its movie
+    /// was lost or refused. The other slot keeps its own.
+    pub fn video_release(&mut self, slot: u32) {
+        self.video.release(&self.gpu, slot);
+    }
+
+    /// The screen whose movies these were is left: every slot's planes
+    /// and upload buffer are released, and neither the loading frames nor
+    /// the play skin's builds show any movie until the next screen's
+    /// movies set them.
+    pub fn retire_movies(&mut self) {
+        for slot in 0..crate::video::MAX_MOVIES {
+            self.video.release(&self.gpu, slot);
+        }
+        self.loading_movies = skin_model::movie::MovieShows::default();
+        self.skin
+            .set_movies(skin_model::movie::MovieShows::default());
+    }
+
+    /// What the play skin's movie destinations show in the loading frames
+    /// that follow ([`set_loading_movies`](Self::set_loading_movies)).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn loading_movies(&self) -> skin_model::movie::MovieShows {
+        self.loading_movies
+    }
+
+    /// The GPU bytes the movie slots hold (their planes' texels, their
+    /// upload buffers), the stand-in left out.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn video_bytes(&self) -> (u64, u64) {
+        self.video.bytes()
+    }
+
+    /// The movie hook's upload: `fill` writes a frame of `width` ×
+    /// `height` into movie slot `slot`'s mapped upload buffer through the
+    /// sink it is given (a byte offset and the bytes), each plane's rows
+    /// at the pitch it is given (luma, chroma), and says whether the frame
+    /// is whole; the next frame drawn then copies it into the slot's
+    /// planes before its pass. `false` when the frame is not the size the
+    /// slot was reserved for, the buffer cannot be mapped or `fill` says
+    /// no; the planes then keep the frame they hold.
+    pub fn video_write_with(
+        &mut self,
+        slot: u32,
+        width: u32,
+        height: u32,
+        fill: impl FnOnce(&mut dyn FnMut(usize, &[u8]) -> bool, [usize; 2]) -> bool,
+    ) -> bool {
+        self.video.write_with(&self.gpu, slot, width, height, fill)
+    }
+
     /// Publishes `entries` as the BGA table of the array `key` names
     /// (`None`: no array, every picture absent), which the play skin in
     /// use, a staged one and every attempt prepared later draw from the
@@ -7616,6 +7761,7 @@ impl Renderer {
                 dropped: 0,
                 outcome: FrameOutcome::NotBuilt,
                 present_count: None,
+                movies: [false; skin_model::movie::MAX_MOVIES],
             });
         };
         let projection = self.staging.projection();
@@ -7769,6 +7915,7 @@ impl Renderer {
         }
         let f = LoadingFrame { target, ..*f };
         skin.set_chart_live(live);
+        skin.set_movies(self.loading_movies);
         if let Err(e) = staging.build_loading(skin, &f) {
             self.loading_refused = Some((f.lifetime, e));
             return Ok(Err(e));
@@ -7862,6 +8009,7 @@ impl Renderer {
         };
         let live = self.chart_key();
         self.skin.set_chart_live(live);
+        self.skin.set_movies(self.loading_movies);
         if let Err(e) = self.staging.build_loading(self.skin.as_mut(), &f) {
             self.loading_refused = Some((f.lifetime, e));
             return Err(e);
@@ -8978,6 +9126,7 @@ impl Renderer {
             dropped: 0,
             outcome: FrameOutcome::NotBuilt,
             present_count: None,
+            movies: [false; skin_model::movie::MAX_MOVIES],
         };
         let Some(start) = self.started.take() else {
             return Ok(none);
@@ -9818,6 +9967,7 @@ impl Renderer {
             dropped: staging.batch().dropped(),
             outcome,
             present_count: None,
+            movies: staging.batch().movies(),
         };
         if self.minimized {
             let cpu = start.elapsed();
@@ -9952,6 +10102,9 @@ impl Renderer {
             .gpu
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // The movie frames this frame took, into their planes before the
+        // pass samples them.
+        self.video.record(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -9972,6 +10125,7 @@ impl Renderer {
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_bind_group(0, atlas_bind, &[]);
             pass.set_bind_group(1, &self.bga.bind, &[]);
+            pass.set_bind_group(crate::video::GROUP, &self.video.bind, &[]);
             pass.set_vertex_buffer(0, instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
@@ -10728,12 +10882,15 @@ fn pipelines(
         label: Some("sprites"),
         source: wgpu::ShaderSource::Wgsl(SPRITE_WGSL.into()),
     });
-    let (alpha, additive, multiply) = sprite_pipelines(device, &layout, &bga, &module, format);
+    let video = crate::video::layout(device);
+    let (alpha, additive, multiply) =
+        sprite_pipelines(device, &layout, &bga, &video, &module, format);
     let bindings = Bindings {
         layout,
         smooth,
         nearest,
         bga,
+        video,
         projection,
         uploaded: None,
         placeholder,
@@ -10742,12 +10899,13 @@ fn pipelines(
 }
 
 /// The alpha, additive and multiply pipelines of the sprite shader
-/// `module` over bind group `layout` and the BGA array's `bga`
-/// ([`pipelines`]).
+/// `module` over bind group `layout`, the BGA array's `bga` and the
+/// movies' `video` ([`pipelines`]).
 fn sprite_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     bga: &wgpu::BindGroupLayout,
+    video: &wgpu::BindGroupLayout,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
 ) -> (
@@ -10757,7 +10915,7 @@ fn sprite_pipelines(
 ) {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sprites"),
-        bind_group_layouts: &[Some(layout), Some(bga)],
+        bind_group_layouts: &[Some(layout), Some(bga), Some(video)],
         immediate_size: 0,
     });
     let pipeline = |blend, fragment| {
@@ -10840,6 +10998,10 @@ const PROJECTION_BYTES: u64 = 16;
 #[cfg(test)]
 #[path = "pool_shader_tests.rs"]
 mod pool_shader_tests;
+
+#[cfg(test)]
+#[path = "video_shader_tests.rs"]
+mod video_shader_tests;
 
 #[cfg(test)]
 #[path = "pool_tests.rs"]

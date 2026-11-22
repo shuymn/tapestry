@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use skin_model::media::{
-    CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Poll, Reader, Refused,
+    CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Reader, Refused,
     SLOT_HEADER_WORDS, SLOTS, STATE_WORD, State, VERSION, WATERMARK_WORD, Window, Words, Writer,
     supervision, watermark,
 };
@@ -56,26 +56,75 @@ fn stamp(seq: u64) -> i64 {
     i64::try_from(seq).unwrap() * 1_000_000 / 30
 }
 
-/// The staged frame and the bytes of its words, its last word's spare
-/// bytes included.
-fn staged_bytes(reader: &Reader) -> (Frame, Vec<u8>) {
-    let (frame, words) = reader.staged().expect("a staged frame");
-    assert_eq!(words.len(), reader.geometry().frame_words());
-    (frame, words.iter().flat_map(|w| w.to_le_bytes()).collect())
+/// What a peek and the take after it did: the frame taken and its bytes,
+/// and whether slots were freed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Read {
+    taken: Option<(Frame, Vec<u8>)>,
+    freed: bool,
 }
 
-/// Asserts the staged frame is frame `seq`, whole, with its spare bytes
-/// zero.
-#[track_caller]
-fn assert_whole(reader: &Reader, seq: u64) {
-    let (f, bytes) = staged_bytes(reader);
-    let len = reader.geometry().frame_bytes();
-    assert_eq!(f.seq, seq);
+impl Read {
+    /// The frame taken, if any.
+    fn frame(&self) -> Option<Frame> {
+        self.taken.as_ref().map(|(f, _)| *f)
+    }
+}
+
+/// The tight pitch of `g`'s planes: rows of the luma and chroma widths.
+fn tight(g: Geometry) -> [usize; 2] {
+    let w = g.width() as usize;
+    [w, w.div_ceil(2)]
+}
+
+/// Peeks at `due` and takes the frame due, if any, at the tight pitch into
+/// a buffer of the frame's bytes; asserts the take handed it every byte of
+/// the frame once and nothing outside it.
+fn read<W: Words + ?Sized>(reader: &mut Reader, ring: &W, due: i64) -> Result<Read, Fault> {
+    let peek = reader.peek(ring, due)?;
+    let Some(d) = peek.due else {
+        return Ok(Read {
+            taken: None,
+            freed: peek.freed,
+        });
+    };
+    let g = reader.geometry();
+    let pitch = tight(g);
+    assert_eq!(reader.pitched_bytes(pitch), g.frame_bytes());
+    let mut out = vec![0_u8; g.frame_bytes()];
+    let mut written = vec![false; g.frame_bytes()];
+    let mut sink = |at: usize, bytes: &[u8]| {
+        let end = at + bytes.len();
+        assert!(
+            end <= out.len(),
+            "a write past the frame: {at}+{}",
+            bytes.len()
+        );
+        for w in &mut written[at..end] {
+            assert!(!*w, "a byte written twice, in {at}+{}", bytes.len());
+            *w = true;
+        }
+        out[at..end].copy_from_slice(bytes);
+        true
+    };
+    let f = reader.take(ring, d, pitch, &mut sink)?;
+    assert_eq!((f.seq, f.stamp), (d.seq(), d.stamp()));
     assert!(
-        bytes[..len] == frame(reader.geometry(), seq),
-        "frame {seq} is staged whole"
+        written.iter().all(|w| *w),
+        "every byte of the frame written"
     );
-    assert!(bytes[len..].iter().all(|b| *b == 0), "the spare bytes");
+    Ok(Read {
+        taken: Some((f, out)),
+        freed: true,
+    })
+}
+
+/// Asserts `read` took frame `seq` of `g`, whole.
+#[track_caller]
+fn assert_whole(read: &Read, g: Geometry, seq: u64) {
+    let (f, bytes) = read.taken.as_ref().expect("a frame taken");
+    assert_eq!(f.seq, seq);
+    assert!(*bytes == frame(g, seq), "frame {seq} is taken whole");
 }
 
 /// Publishes frame `seq` of run `run` in a slot it claims.
@@ -306,10 +355,10 @@ fn ring_supervision_words_read_back_what_the_worker_wrote() {
     }
     assert_eq!(watermark(&ring[..]), Some(3));
     assert_eq!(reader.freed(), 0);
-    let poll = reader.poll(&ring[..], stamp(1)).unwrap();
-    assert_eq!((poll.staged.map(|f| f.seq), poll.freed), (Some(2), true));
+    let r = read(&mut reader, &ring[..], stamp(1)).unwrap();
+    assert_eq!((r.frame().map(|f| f.seq), r.freed), (Some(2), true));
     assert_eq!(reader.freed(), 2);
-    reader.poll(&ring[..], stamp(2)).unwrap();
+    read(&mut reader, &ring[..], stamp(2)).unwrap();
     assert_eq!(reader.freed(), 3);
     // A ring of the version before is not this layout.
     ring[1].store(VERSION - 1, Ordering::Relaxed);
@@ -349,29 +398,27 @@ fn ring_round_trip_writer_to_reader() {
     for seq in 1..=3 {
         publish(ring, seq, 1, stamp(seq));
     }
-    assert_eq!(reader.poll(ring, stamp(1) - 1), Ok(Poll::default()));
-    assert_eq!(reader.staged(), None);
+    assert_eq!(read(&mut reader, ring, stamp(1) - 1), Ok(Read::default()));
 
-    // At the second's stamp it is staged whole, freed with the first; the
+    // At the second's stamp it is taken whole, freed with the first; the
     // third stays.
-    let at_two = reader.poll(ring, stamp(2)).unwrap();
+    let at_two = read(&mut reader, ring, stamp(2)).unwrap();
     assert_eq!(
-        at_two,
-        Poll {
-            staged: Some(Frame {
+        (at_two.frame(), at_two.freed),
+        (
+            Some(Frame {
                 seq: 2,
                 stamp: stamp(2)
             }),
-            freed: true
-        }
+            true
+        )
     );
-    assert_whole(&reader, 2);
+    assert_whole(&at_two, g, 2);
     assert_eq!(
-        reader.poll(ring, stamp(2) + 1),
-        Ok(Poll::default()),
-        "the staged frame stays while nothing newer is due"
+        read(&mut reader, ring, stamp(2) + 1),
+        Ok(Read::default()),
+        "nothing is taken while nothing newer is due"
     );
-    assert_whole(&reader, 2);
 
     // The two freed slots and the first one claimed take three more
     // frames: the ring is full, with frames 3 to 6.
@@ -379,37 +426,35 @@ fn ring_round_trip_writer_to_reader() {
         publish(ring, seq, 1, stamp(seq));
     }
     assert!(writer.claim(ring).is_none(), "every slot holds a frame");
-    let at_five = reader.poll(ring, stamp(5) + 1).unwrap();
-    assert_eq!(at_five.staged.map(|f| f.seq), Some(5));
-    assert_whole(&reader, 5);
+    let at_five = read(&mut reader, ring, stamp(5) + 1).unwrap();
+    assert_whole(&at_five, g, 5);
     let free = writer.claim(ring).expect("frames 3 to 5 freed a slot");
 
-    // A new run: the staged frame is no longer shown, and frame 6 of run 1,
-    // due as it is, is freed unread.
+    // A new run: frame 6 of run 1, due as it is, is freed unread.
     let window = Window {
         first: 5_000_000,
         last: 9_000_000,
     };
     assert_eq!(reader.start_run(window), 2);
-    assert_eq!(reader.staged(), None);
     assert_eq!(
-        reader.poll(ring, 9_000_000),
-        Ok(Poll {
-            staged: None,
+        read(&mut reader, ring, 9_000_000),
+        Ok(Read {
+            taken: None,
             freed: true
         })
     );
     writer
         .publish(ring, free, &frame(g, 7), 7, 2, 5_000_000)
         .unwrap();
+    let at_seven = read(&mut reader, ring, 5_000_000).unwrap();
     assert_eq!(
-        reader.poll(ring, 5_000_000).unwrap().staged,
+        at_seven.frame(),
         Some(Frame {
             seq: 7,
             stamp: 5_000_000
         })
     );
-    assert_whole(&reader, 7);
+    assert_whole(&at_seven, g, 7);
 
     let mem = section(g);
     let ring = &*mem;
@@ -420,7 +465,7 @@ fn ring_round_trip_writer_to_reader() {
         Err(Refused::Frame(10)),
         "a frame of another size is not published"
     );
-    assert_eq!(reader.poll(ring, 0), Ok(Poll::default()));
+    assert_eq!(read(&mut reader, ring, 0), Ok(Read::default()));
 }
 
 /// A ring with frame 1 (stamp 1 000) taken and frame 2 (stamp 2 000) in
@@ -430,7 +475,14 @@ fn taken_one(g: Geometry) -> (Vec<AtomicU64>, Reader) {
     let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
     assert_eq!(publish(&mem, 1, 1, 1_000), 0);
     assert_eq!(publish(&mem, 2, 1, 2_000), 1);
-    assert_eq!(reader.poll(&*mem, 1_000).unwrap().staged.unwrap().seq, 1);
+    assert_eq!(
+        read(&mut reader, &*mem, 1_000)
+            .unwrap()
+            .frame()
+            .unwrap()
+            .seq,
+        1
+    );
     (mem, reader)
 }
 
@@ -512,12 +564,15 @@ fn ring_rejects_bad_index_sequence_stamp_state() {
         let (other_mem, mut other) = taken_one(g);
         corrupt(&mem, g);
         let watched = Watched::new(&mem);
-        assert_eq!(reader.poll(&watched, 5_000), Err(fault), "{what}");
+        assert_eq!(
+            reader.peek(&watched, 5_000),
+            Err(fault),
+            "{what}: nothing is due"
+        );
         assert_eq!(reader.fault(), Some(fault), "{what}: the player failed");
-        assert_eq!(reader.staged(), None, "{what}: nothing is shown");
         watched.take_log();
         assert_eq!(
-            reader.poll(&watched, 6_000),
+            read(&mut reader, &watched, 6_000),
             Err(fault),
             "{what}: the fault is kept"
         );
@@ -527,10 +582,9 @@ fn ring_rejects_bad_index_sequence_stamp_state() {
             "{what}: a failed player reads nothing more"
         );
         assert_eq!(
-            other
-                .poll(&*other_mem, 5_000)
+            read(&mut other, &*other_mem, 5_000)
                 .unwrap()
-                .staged
+                .frame()
                 .map(|f| f.seq),
             Some(2),
             "{what}: another player keeps serving"
@@ -570,7 +624,7 @@ fn ring_reader_copies_only_parent_sized_bytes() {
         claim(bytes);
         let mut reader = Reader::new(&*section(g), g, WINDOW).unwrap();
         let watched = Watched::new(ring);
-        let polled = reader.poll(&watched, 1_000);
+        let polled = read(&mut reader, &watched, 1_000);
         let log = watched.take_log();
         assert_bounded(&log, g, 1);
         assert_eq!(
@@ -589,10 +643,7 @@ fn ring_reader_copies_only_parent_sized_bytes() {
 
     claim(frame_bytes);
     let watched = Watched::new(ring);
-    assert_eq!(
-        reader.poll(&watched, 1_000).unwrap().staged.map(|f| f.seq),
-        Some(1)
-    );
+    let one = read(&mut reader, &watched, 1_000).unwrap();
     let log = watched.take_log();
     assert_bounded(&log, g, 1);
     let runs: Vec<_> = log.into_iter().filter(|&(_, len)| len > 1).collect();
@@ -601,12 +652,8 @@ fn ring_reader_copies_only_parent_sized_bytes() {
         copy_chunks(g, 1),
         "the copy reads the slot's frame, word for word"
     );
-    assert_whole(&reader, 1);
-    assert_eq!(
-        reader.staged().unwrap().1.len(),
-        g.frame_words(),
-        "the staging buffer keeps the game's size"
-    );
+    // `read` asserts the take wrote nothing outside the frame's bytes.
+    assert_whole(&one, g, 1);
 }
 
 /// A small generator of words, the same for every run.
@@ -628,7 +675,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
     let scribble = 0x5a5a_5a5a_5a5a_5a5a;
 
     // A writer that rewrites the frame being copied, its slot's words left
-    // as they were: the copy stays inside the slot and the staging buffer,
+    // as they were: the copy stays inside the slot and the sink's frame,
     // and the frame it gives is torn, which no check can tell.
     let mem = section(g);
     let ring = &*mem;
@@ -636,20 +683,21 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
     assert_eq!(publish(ring, 1, 1, 1_000), 0);
     let meeting = Meeting::default();
     let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
-    thread::scope(|s| {
-        let read = s.spawn(|| {
+    let torn = thread::scope(|s| {
+        let reading = s.spawn(|| {
             let _done = Done(&meeting);
-            reader.poll(&watched, 1_000)
+            read(&mut reader, &watched, 1_000)
         });
         let release = meeting.meet();
         for w in &mem[g.frame_start(0)..g.frame_start(0) + g.frame_words()] {
             w.store(scribble, Ordering::Relaxed);
         }
         drop(release);
-        assert_eq!(read.join().unwrap().unwrap().staged.unwrap().seq, 1);
+        reading.join().unwrap().unwrap()
     });
     assert_bounded(&watched.take_log(), g, 0);
-    let (_, bytes) = staged_bytes(&reader);
+    let (f, bytes) = torn.taken.unwrap();
+    assert_eq!(f.seq, 1);
     let published = frame(g, 1);
     let split = CHUNK_WORDS * 8;
     assert!(
@@ -678,26 +726,30 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         let meeting = Meeting::default();
         let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
         thread::scope(|s| {
-            let read = s.spawn(|| {
+            let reading = s.spawn(|| {
                 let _done = Done(&meeting);
-                reader.poll(&watched, 1_000)
+                read(&mut reader, &watched, 1_000)
             });
             let release = meeting.meet();
             slot_word(ring, g, 0, i).store(value, Ordering::Relaxed);
             drop(release);
             assert_eq!(
-                read.join().unwrap(),
+                reading.join().unwrap(),
                 Err(Fault::Changed { slot: 0 }),
                 "{what} rewritten during the copy"
             );
         });
         assert_bounded(&watched.take_log(), g, 0);
-        assert_eq!(reader.staged(), None, "{what}: nothing is shown");
+        assert_eq!(
+            reader.fault(),
+            Some(Fault::Changed { slot: 0 }),
+            "{what}: the player failed"
+        );
     }
 
     // Arbitrary words in every slot, some of them near a valid frame's:
-    // each poll stays inside the ring, runs of words inside one slot's
-    // frame; a frame it stages is due and in the window, and a fault is
+    // each read stays inside the ring, runs of words inside one slot's
+    // frame; a frame it takes is due and in the window, and a fault is
     // kept.
     let g = Geometry::new(16, 9).unwrap();
     let mut rng = Xorshift(0x9e37_79b9_7f4a_7c15);
@@ -737,7 +789,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         }
         let due = (rng.next() & 0x1_ffff).cast_signed();
         let watched = Watched::new(&mem);
-        let polled = reader.poll(&watched, due);
+        let polled = read(&mut reader, &watched, due);
         let log = watched.take_log();
         for &(start, len) in &log {
             assert!(in_ring(g, (start, len)));
@@ -749,24 +801,310 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
             }
         }
         match polled {
-            Ok(Poll {
-                staged: Some(f), ..
+            Ok(Read {
+                taken: Some((f, bytes)),
+                ..
             }) => {
                 assert!(f.stamp <= due && WINDOW.first <= f.stamp && f.stamp <= WINDOW.last);
-                assert_eq!(reader.staged().unwrap().1.len(), g.frame_words());
+                assert_eq!(bytes.len(), g.frame_bytes());
                 outcomes[0] += 1;
             }
             Ok(_) => outcomes[1] += 1,
             Err(fault) => {
-                assert_eq!(reader.poll(&watched, due), Err(fault));
+                assert_eq!(read(&mut reader, &watched, due), Err(fault));
                 assert_eq!(watched.take_log(), []);
-                assert_eq!(reader.staged(), None);
+                assert_eq!(reader.fault(), Some(fault));
                 outcomes[2] += 1;
             }
         }
     }
     assert!(
         outcomes.iter().all(|n| *n > 0),
-        "staged, nothing and faults all reached: {outcomes:?}"
+        "taken, nothing and faults all reached: {outcomes:?}"
     );
+}
+
+/// `peek` then `take` writes the frame due, each plane's rows at the pitch,
+/// the planes back to back, touches no row's padding, and frees the frames
+/// up to it.
+#[test]
+fn ring_take_into_writes_the_due_frame_at_the_pitch() {
+    let g = large();
+    let mem = section(g);
+    let ring = &*mem;
+    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+    for seq in 1..=3 {
+        publish(ring, seq, 1, stamp(seq));
+    }
+    let peek = reader.peek(ring, stamp(2)).unwrap();
+    assert!(!peek.freed, "no earlier run's frame");
+    let due = peek.due.expect("frame 2 is due");
+    assert_eq!((due.seq(), due.stamp()), (2, stamp(2)));
+    let pitch = [256, 128];
+    let (w, h) = (255, 193);
+    let (cw, ch) = (128, 97);
+    assert_eq!(reader.pitched_bytes(pitch), 256 * h + 2 * 128 * ch);
+    let mut out = vec![0xAA_u8; reader.pitched_bytes(pitch)];
+    let mut longest_row = 0;
+    let mut put = |at: usize, bytes: &[u8]| {
+        longest_row = longest_row.max(bytes.len());
+        match out.get_mut(at..at + bytes.len()) {
+            Some(d) => {
+                d.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    };
+    let watched = Watched::new(ring);
+    let f = reader.take(&watched, due, pitch, &mut put).unwrap();
+    assert_eq!(
+        f,
+        Frame {
+            seq: 2,
+            stamp: stamp(2)
+        }
+    );
+    assert!(longest_row <= w, "no write runs past a row");
+    let runs: Vec<_> = watched
+        .take_log()
+        .into_iter()
+        .filter(|&(_, len)| len > 1)
+        .collect();
+    assert_eq!(
+        runs,
+        copy_chunks(g, 1),
+        "the take reads the slot's frame in chunks"
+    );
+    let tight = frame(g, 2);
+    let mut want = vec![0xAA_u8; out.len()];
+    for r in 0..h {
+        want[r * 256..r * 256 + w].copy_from_slice(&tight[r * w..(r + 1) * w]);
+    }
+    for p in 0..2 {
+        let (src, dst) = (w * h + p * cw * ch, 256 * h + p * 128 * ch);
+        for r in 0..ch {
+            want[dst + r * 128..dst + r * 128 + cw]
+                .copy_from_slice(&tight[src + r * cw..src + (r + 1) * cw]);
+        }
+    }
+    assert!(
+        out == want,
+        "each plane's rows at the pitch, the padding untouched"
+    );
+    // Frames 1 and 2 are free, 3 is not due.
+    assert_eq!(reader.freed(), 2);
+    assert_eq!(reader.peek(ring, stamp(2)).unwrap().due, None);
+    publish(ring, 4, 1, stamp(4));
+    publish(ring, 5, 1, stamp(5));
+    let five = read(&mut reader, ring, stamp(5)).unwrap();
+    assert_whole(&five, g, 5);
+}
+
+/// A take refuses a pitch below its plane's width, a sink that refuses
+/// bytes, and a frame peeked before a new run or taken already: each fails
+/// the player, which then reads nothing more.
+#[test]
+fn ring_take_refused_fails_the_player() {
+    let g = Geometry::new(16, 9).unwrap();
+    type Take = fn(&mut Reader, &[AtomicU64], skin_model::media::Due) -> Result<Frame, Fault>;
+    let cases: [(&str, Take); 5] = [
+        ("a sink that refuses", |reader, ring, due| {
+            let mut n = 0;
+            reader.take(ring, due, tight(reader.geometry()), &mut |_, _| {
+                n += 1;
+                n < 3
+            })
+        }),
+        ("a luma pitch below the width", |reader, ring, due| {
+            let [l, c] = tight(reader.geometry());
+            reader.take(ring, due, [l - 1, c], &mut |_, _| true)
+        }),
+        ("a chroma pitch below its width", |reader, ring, due| {
+            let [l, c] = tight(reader.geometry());
+            reader.take(ring, due, [l, c - 1], &mut |_, _| true)
+        }),
+        ("a frame of an earlier run", |reader, ring, due| {
+            reader.start_run(WINDOW);
+            reader.take(ring, due, tight(reader.geometry()), &mut |_, _| true)
+        }),
+        ("a frame taken already", |reader, ring, due| {
+            reader.take(ring, due, tight(reader.geometry()), &mut |_, _| true)?;
+            reader.take(ring, due, tight(reader.geometry()), &mut |_, _| true)
+        }),
+    ];
+    for (what, take) in cases {
+        let mem = section(g);
+        let ring = &*mem;
+        let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+        assert_eq!(publish(ring, 1, 1, 1_000), 0);
+        let due = reader.peek(ring, 1_000).unwrap().due.unwrap();
+        let fault = take(&mut reader, ring, due).expect_err(what);
+        let want = if what.starts_with("a frame") {
+            Fault::Changed { slot: 0 }
+        } else {
+            Fault::Section
+        };
+        assert_eq!(fault, want, "{what}");
+        assert_eq!(reader.fault(), Some(fault), "{what}: the player failed");
+        publish(ring, 2, reader.run(), 2_000);
+        let watched = Watched::new(ring);
+        assert_eq!(
+            reader.peek(&watched, 2_000),
+            Err(fault),
+            "{what}: the fault is kept"
+        );
+        assert_eq!(
+            reader.take(&watched, due, tight(g), &mut |_, _| true),
+            Err(fault),
+            "{what}: a take after it returns it too"
+        );
+        assert_eq!(
+            watched.take_log(),
+            [],
+            "{what}: a failed player reads nothing more"
+        );
+    }
+}
+
+/// A first peek takes the run's oldest frame (design.md "Rendering and
+/// Skins", video frames; skin movies, before a movie's clock starts),
+/// whatever the stamps, and frees nothing after it; the header's reserved
+/// words are written zero over whatever the section held.
+// Revert: the first peek choosing the newest frame -> "the run's oldest
+// frame".
+#[test]
+fn ring_first_peek_takes_the_runs_oldest_frame() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    for i in [9, 10] {
+        assert_eq!(
+            mem[i].load(Ordering::Relaxed),
+            0,
+            "header word {i} reserved"
+        );
+    }
+    for seq in 1..=4 {
+        publish(&mem, seq, 1, 500_000 + stamp(seq));
+    }
+    let r = first(&mut reader, &mem).unwrap();
+    assert_whole(&r, g, 1);
+    assert_eq!(reader.freed(), 1, "the run's oldest frame");
+    // The frames after it are later than it: none is due at its stamp.
+    assert_eq!(
+        read(&mut reader, &*mem, 500_000 + stamp(1)),
+        Ok(Read::default())
+    );
+    let r = read(&mut reader, &*mem, 500_000 + stamp(3)).unwrap();
+    assert_whole(&r, g, 3);
+}
+
+/// A first peek keeps the run boundary as a peek does (design.md
+/// "Rendering and Skins", video frames): over a full queue of an earlier
+/// run it frees that run unread and takes nothing, then takes the new
+/// run's oldest frame across a gap in its stamps; a frame of a run not
+/// started fails the player; and a later peek invalidates the frame the
+/// first one found.
+// Revert: the first peek skipping the old run's release -> "the old run
+// freed unread".
+#[test]
+fn ring_first_peek_keeps_the_run_boundary() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    for seq in 1..=4 {
+        publish(&mem, seq, 1, stamp(seq));
+    }
+    let run = reader.start_run(WINDOW);
+    let peek = reader.peek_first(&*mem).unwrap();
+    assert!(
+        peek.freed && peek.due.is_none(),
+        "the old run freed unread: {peek:?}"
+    );
+    assert_eq!(reader.freed(), 4);
+    publish(&mem, 5, run, 0);
+    publish(&mem, 6, run, 2_000_000);
+    // The token of a first peek is gone once a later peek finds nothing.
+    let found = reader.peek_first(&*mem).unwrap().due.unwrap();
+    assert_eq!(found.seq(), 5);
+    assert_eq!(reader.peek(&*mem, -1).unwrap().due, None);
+    let mut sink = |_: usize, _: &[u8]| true;
+    assert_eq!(
+        reader.take(&*mem, found, tight(g), &mut sink),
+        Err(Fault::Changed {
+            slot: found_slot(&mem, g, 5)
+        }),
+    );
+
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    publish(&mem, 1, 1, 0);
+    publish(&mem, 2, 1, 2_000_000);
+    let r = first(&mut reader, &mem).unwrap();
+    assert_whole(&r, g, 1);
+    let r = read(&mut reader, &*mem, 2_000_000).unwrap();
+    assert_whole(&r, g, 2);
+    let slot = publish(&mem, 3, 2, 2_100_000);
+    assert_eq!(
+        reader.peek_first(&*mem),
+        Err(Fault::Run {
+            slot: u8::try_from(slot).unwrap(),
+            value: 2
+        }),
+        "a run not started"
+    );
+}
+
+/// A first peek and the take after it, as [`read`] does at a time.
+fn first(reader: &mut Reader, ring: &[AtomicU64]) -> Result<Read, Fault> {
+    let peek = reader.peek_first(ring)?;
+    let Some(d) = peek.due else {
+        return Ok(Read {
+            taken: None,
+            freed: peek.freed,
+        });
+    };
+    let g = reader.geometry();
+    let mut out = vec![0_u8; g.frame_bytes()];
+    let mut sink = |at: usize, bytes: &[u8]| {
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+        true
+    };
+    let f = reader.take(ring, d, tight(g), &mut sink)?;
+    Ok(Read {
+        taken: Some((f, out)),
+        freed: true,
+    })
+}
+
+/// The slot holding frame `seq`, as a fault names it.
+fn found_slot(ring: &[AtomicU64], g: Geometry, seq: u64) -> u8 {
+    let slot = (0..SLOTS)
+        .find(|&s| slot_word(ring, g, s, SEQ).load(Ordering::Relaxed) == seq)
+        .unwrap();
+    u8::try_from(slot).unwrap()
+}
+
+/// A late frame is dropped only for a newer one that is also due
+/// (design.md "Rendering and Skins", video frames): with the ring holding
+/// four frames and the time 780 ms in, the peek takes the newest, late,
+/// and frees the three before it unread; a frame not due yet stays.
+// Revert: a peek taking the oldest due frame -> "the newest late frame
+// taken".
+#[test]
+fn ring_takes_the_newest_late_frame() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    for seq in 1..=3 {
+        publish(&mem, seq, 1, stamp(seq - 1));
+    }
+    publish(&mem, 4, 1, 900_000);
+    let r = read(&mut reader, &*mem, 780_000).unwrap();
+    assert!(r.taken.is_some());
+    assert_whole(&r, g, 3);
+    assert_eq!(reader.freed(), 3, "the newest late frame taken");
+    let r = read(&mut reader, &*mem, 900_000).unwrap();
+    assert_whole(&r, g, 4);
 }

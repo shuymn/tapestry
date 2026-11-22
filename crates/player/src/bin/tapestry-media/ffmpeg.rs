@@ -116,6 +116,25 @@ pub fn slow_convert(ms: u64) {
     SLOW_CONVERT_MS.store(ms, Ordering::Relaxed);
 }
 
+/// The conversions made so far in the process, counted from 0 (dev-tools).
+#[cfg(feature = "dev-tools")]
+static CONVERSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The conversion that stalls ([`stall_convert`]), and for how long.
+#[cfg(feature = "dev-tools")]
+static STALL_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "dev-tools")]
+static STALL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the process's conversion number `at` (counted from 0) sleep `ms`
+/// milliseconds first (dev-tools): one decode that blocks, the frames
+/// around it at full speed.
+#[cfg(feature = "dev-tools")]
+pub fn stall_convert(at: u64, ms: u64) {
+    STALL_MS.store(ms, Ordering::Relaxed);
+    STALL_AT.store(at, Ordering::Relaxed);
+}
+
 /// The codec whitelist, as the option an open sets.
 fn codec_list() -> &'static [(&'static CStr, &'static CStr)] {
     #[cfg(feature = "dev-tools")]
@@ -1386,8 +1405,8 @@ impl Input {
 
     /// Starts the next pass of a looping play at the clip's first usable
     /// frame, after its end was taken from [`Input::next`] (which parked
-    /// and checked), and decodes that frame into `out`: its stamp, which
-    /// follows this pass's last frame's end. The seek is [`Input::seek`]'s,
+    /// and checked), and decodes that frame, for [`Input::convert`]: its
+    /// stamp, which follows this pass's last frame's end. The seek is [`Input::seek`]'s,
     /// to that frame: a demuxer that lands past it (an MPEG program stream
     /// lands on its second group of pictures) is sought again from further
     /// back, and a landing on any other frame fails the player. A play
@@ -1399,7 +1418,7 @@ impl Input {
     /// When the pass yielded no frame, or the next has none (a loop of
     /// nothing never spins), when the seek does not land on the clip's
     /// first usable frame ([`Failure::Seek`]), and as [`Input::seek`].
-    pub fn restart(&mut self, out: &mut [u8]) -> Result<i64, (Failure, c_int)> {
+    pub fn restart(&mut self) -> Result<i64, (Failure, c_int)> {
         if !self.clock.wrap() {
             return Err((Failure::Decode, 0));
         }
@@ -1411,7 +1430,7 @@ impl Input {
             return Err((Failure::Decode, 0));
         };
         let stamped = rescale_us(stamped, tb.num, tb.den);
-        match self.seek_stamped(target, stamped, out)? {
+        match self.seek_stamped(target, stamped, None)? {
             Some(landed) => {
                 // SAFETY: this input's frame, the landing's.
                 let pts = unsafe { (*self.frame).best_effort_timestamp };
@@ -1427,9 +1446,10 @@ impl Input {
         }
     }
 
-    /// Decodes the next frame into `out`, I420 at the probed size: its
-    /// stamp, in µs from the stream's start, or `None` at the end. A frame
-    /// with no time is decoded but not returned.
+    /// Decodes the next frame, for [`Input::convert`]: its stamp, in µs
+    /// from the stream's start, or `None` at the end. A frame with no time
+    /// is decoded but not returned. The frame stays the decoder's until the
+    /// next decode, so its stamp is known before its conversion is paid.
     ///
     /// # Errors
     ///
@@ -1437,29 +1457,40 @@ impl Input {
     /// refused, a frame over the cap among them (one FFmpeg went on from as
     /// well), or the decoder fails; a damaged packet FFmpeg skips is not an
     /// error.
-    pub fn next(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
-        let next = self.next_unchecked(out);
+    pub fn next(&mut self) -> Result<Option<i64>, (Failure, c_int)> {
+        let next = self.next_unchecked();
         if matches!(next, Ok(None)) {
             self.park();
         }
-        // A refusal made while the frame was decoded and converted, or while
-        // the decoder drained, fails the player before the frame or the end
-        // is taken.
+        // A refusal made while the frame was decoded, or while the decoder
+        // drained, fails the player before the frame or the end is taken.
         self.check()?;
         next
     }
 
     /// [`Input::next`] before its last look for a refusal.
-    fn next_unchecked(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
+    fn next_unchecked(&mut self) -> Result<Option<i64>, (Failure, c_int)> {
         loop {
             if !self.decode()? {
                 return Ok(None);
             }
             if let Some(stamp) = self.stamp() {
-                self.convert(out)?;
                 return Ok(Some(stamp));
             }
         }
+    }
+
+    /// Converts the frame [`Input::next`] or [`Input::restart`] last
+    /// decoded into `out`, I420 at the probed size.
+    ///
+    /// # Errors
+    ///
+    /// As [`Input::next`], for a refusal made while the frame was
+    /// converted.
+    pub fn convert(&mut self, out: &mut [u8]) -> Result<(), (Failure, c_int)> {
+        let converted = self.convert_frame(out);
+        self.check()?;
+        converted
     }
 
     /// Positions the video so its first frame at or after `target` µs of
@@ -1481,16 +1512,16 @@ impl Input {
         // The stamps the frames get count the passes before this one.
         let tb = self.time_base;
         let pass = rescale_us(self.clock.pass_start(), tb.num, tb.den);
-        self.seek_stamped(target, target.saturating_add(pass), out)
+        self.seek_stamped(target, target.saturating_add(pass), Some(out))
     }
 
     /// [`Input::seek`] to `target` µs of the clip, whose frame's stamp is
-    /// `stamped`.
+    /// `stamped`, the landing converted into `out` when one is given.
     fn seek_stamped(
         &mut self,
         target: i64,
         stamped: i64,
-        out: &mut [u8],
+        out: Option<&mut [u8]>,
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         self.sought = true;
         self.budget(Some(BUDGET));
@@ -1511,7 +1542,7 @@ impl Input {
         &mut self,
         target: i64,
         stamped: i64,
-        out: &mut [u8],
+        mut out: Option<&mut [u8]>,
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         for (attempts, back) in (1..).zip(BACK_OFF) {
             let to = target.saturating_sub(back);
@@ -1545,7 +1576,9 @@ impl Input {
             if exact || back == MAX_BACK_OFF || landed.is_none() {
                 return match landed {
                     Some(stamp) => {
-                        self.convert(out)?;
+                        if let Some(out) = out.as_deref_mut() {
+                            self.convert_frame(out)?;
+                        }
                         Ok(Some(Landed { stamp, attempts }))
                     }
                     None => Ok(None),
@@ -1686,11 +1719,17 @@ impl Input {
 
     /// The decoded frame into `out`, I420 at the probed size, scaled when
     /// its size or format differs.
-    fn convert(&mut self, out: &mut [u8]) -> Result<(), (Failure, c_int)> {
+    fn convert_frame(&mut self, out: &mut [u8]) -> Result<(), (Failure, c_int)> {
         #[cfg(feature = "dev-tools")]
         match SLOW_CONVERT_MS.load(Ordering::Relaxed) {
             0 => {}
             ms => std::thread::sleep(std::time::Duration::from_millis(ms)),
+        }
+        #[cfg(feature = "dev-tools")]
+        if CONVERSIONS.fetch_add(1, Ordering::Relaxed) == STALL_AT.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(
+                STALL_MS.load(Ordering::Relaxed),
+            ));
         }
         // SAFETY: this input's frames and scaler.
         unsafe {
@@ -2034,6 +2073,9 @@ pub struct Clip {
     pub frames: u32,
     /// Frames between key frames.
     pub gop: c_int,
+    /// A gap: this frame and every one after it come this many frame
+    /// periods later.
+    pub gap: Option<(u32, u32)>,
 }
 
 /// Writes `clip` to `path` through the build's encoder and muxer, frame `i`
@@ -2218,7 +2260,11 @@ impl Encoding {
                     }
                     self.conv
                 };
-                (*frame).pts = i64::from(i);
+                (*frame).pts = i64::from(i)
+                    + clip
+                        .gap
+                        .filter(|&(at, _)| i >= at)
+                        .map_or(0, |(_, periods)| i64::from(periods));
                 (*frame).quality = (*ctx).global_quality;
                 let r = ff::avcodec_send_frame(ctx, frame);
                 if r < 0 {

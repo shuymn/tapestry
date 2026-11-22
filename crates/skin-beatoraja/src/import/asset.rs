@@ -767,6 +767,14 @@ impl Assets {
         Ok(outcome)
     }
 
+    /// The slot of the skin movie in file `name`, shared by every
+    /// destination of the same file; refused when the file cannot be
+    /// opened or past the screen's movies
+    /// ([`SheetBuilder::add_movie`](skin_model::SheetBuilder::add_movie)).
+    pub(crate) fn add_movie(&mut self, name: &str) -> Result<u8, skin_model::movie::MovieRefusal> {
+        self.builder.add_movie(name)
+    }
+
     pub(crate) fn finish(self) -> Sheet {
         self.builder.finish()
     }

@@ -417,3 +417,33 @@ pub fn ends_refused(e: &LaunchError) {
         other => panic!("{other:?}: {e}"),
     }
 }
+
+/// Peeks at `due` in the frame ring `reader` reads and takes the frame
+/// due, if any, at the tight pitch (rows of the luma and chroma widths)
+/// into `out`, which it sizes to a frame's bytes: the frame taken and
+/// whether slots were freed (a take always frees its frame's).
+///
+/// # Errors
+///
+/// The fault that failed the player, as `peek` and `take` return it.
+pub fn read_tight(
+    reader: &mut skin_model::media::Reader,
+    words: &[std::sync::atomic::AtomicU64],
+    due: i64,
+    out: &mut Vec<u8>,
+) -> Result<(Option<skin_model::media::Frame>, bool), skin_model::media::Fault> {
+    let peek = reader.peek(words, due)?;
+    let Some(d) = peek.due else {
+        return Ok((None, peek.freed));
+    };
+    let g = reader.geometry();
+    out.resize(g.frame_bytes(), 0);
+    let w = g.width() as usize;
+    let mut sink = |at: usize, bytes: &[u8]| {
+        out.get_mut(at..at + bytes.len())
+            .map(|d| d.copy_from_slice(bytes))
+            .is_some()
+    };
+    let f = reader.take(words, d, [w, w.div_ceil(2)], &mut sink)?;
+    Ok((Some(f), true))
+}

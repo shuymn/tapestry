@@ -1,11 +1,13 @@
 //! The worker's development commands (dev-tools only):
 //!
 //! - `--dev-tools-probe`: prints the dev-tools marker.
-//! - `--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>`:
-//!   encodes a synthesized clip through the build's encoder and muxer of
-//!   those FFmpeg names. Frame `i` shows `i` in its top row of 16 × 16
-//!   blocks, bit `b` of `i` in block `b` (luma 235 for a one, 16 for a
-//!   zero), over a pattern that moves with `i`.
+//! - `--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>
+//!   [gap=<frame>:<periods>]`: encodes a synthesized clip through the
+//!   build's encoder and muxer of those FFmpeg names. Frame `i` shows `i`
+//!   in its top row of 16 × 16 blocks, bit `b` of `i` in block `b` (luma
+//!   235 for a one, 16 for a zero), over a pattern that moves with `i`.
+//!   With a gap, frame `frame` and every one after it come `periods` frame
+//!   periods later: a clip of variable rate.
 //! - `--dev-secondary-open <file> <refuse|default>`: opens `file` as the
 //!   worker opens a video, with its own `io_open` or FFmpeg's, and prints
 //!   what a secondary open through the opened file's context gives, as a
@@ -33,7 +35,9 @@
 //!   without) while the control loop still beats; `freeze=<player>:<play|decoding|waiting>` freezes that player
 //!   for good before it answers its play, or once it has published a frame
 //!   while it says it decodes, or while it says it waits for a free slot;
-//!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion.
+//!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion;
+//!   `stall-convert=<n>:<ms>` sleeps `ms` before the process's conversion
+//!   number `n`, counted from 0.
 //! - `--dev-balloon <step> <total> [<last> [free]]`: answers the hello and
 //!   serves the control pipe while a thread commits memory the worker never
 //!   frees, `step` MiB at a time about 10 ms apart up to `total` MiB and
@@ -100,6 +104,14 @@ fn serve_options(options: &[String]) -> Result<(), String> {
             "slow-convert" => {
                 let ms = value.parse().map_err(|e| format!("{option}: {e}"))?;
                 ffmpeg::slow_convert(ms);
+            }
+            "stall-convert" => {
+                let (at, ms) = value
+                    .split_once(':')
+                    .ok_or_else(|| format!("{option}: <conversion>:<ms>"))?;
+                let at = at.parse().map_err(|e| format!("{option}: {e}"))?;
+                let ms = ms.parse().map_err(|e| format!("{option}: {e}"))?;
+                ffmpeg::stall_convert(at, ms);
             }
             _ => return Err(format!("--dev-serve: unknown option {option}")),
         }
@@ -293,12 +305,26 @@ fn usage(message: &str) -> ExitCode {
 
 /// `--dev-gen-clip`.
 fn gen_clip(args: &[String]) -> Result<(), String> {
-    let [out, codec, format, size, rate, frames, gop] = args else {
-        return Err(
-            "--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>".to_owned(),
-        );
+    let usage = "--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>                  [gap=<frame>:<periods>]";
+    let (fixed, gap) = match args {
+        [fixed @ .., last] if last.starts_with("gap=") => (fixed, Some(last.as_str())),
+        _ => (args, None),
+    };
+    let [out, codec, format, size, rate, frames, gop] = fixed else {
+        return Err(usage.to_owned());
     };
     let number = |s: &str| s.parse::<i32>().map_err(|e| format!("{s}: {e}"));
+    let gap = match gap.and_then(|g| g.strip_prefix("gap=")) {
+        None => None,
+        Some(g) => {
+            let (at, periods) = g.split_once(':').ok_or_else(|| usage.to_owned())?;
+            let at = at.parse::<u32>().map_err(|e| format!("{at}: {e}"))?;
+            let periods = periods
+                .parse::<u32>()
+                .map_err(|e| format!("{periods}: {e}"))?;
+            Some((at, periods))
+        }
+    };
     let (w, h) = size
         .split_once('x')
         .ok_or_else(|| format!("{size}: not <W>x<H>"))?;
@@ -310,6 +336,7 @@ fn gen_clip(args: &[String]) -> Result<(), String> {
         rate: number(rate)?,
         frames: frames.parse().map_err(|e| format!("{frames}: {e}"))?,
         gop: number(gop)?,
+        gap,
     };
     if clip.width <= 0 || clip.height <= 0 || clip.rate <= 0 || clip.gop <= 0 {
         return Err("sizes, the rate and the GOP are positive".to_owned());

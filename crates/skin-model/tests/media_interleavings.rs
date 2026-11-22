@@ -20,9 +20,9 @@
 //! progress (the reader's state before it, the due stamp and every word it
 //! read so far), the ring, the worker and what the game has sent.
 //!
-//! It checks, at every poll, that the reader faults nothing and stages the
+//! It checks, at every poll, that the reader faults nothing and takes the
 //! newest frame of its run due and published before its watermark read,
-//! whole, after every frame it staged before, leaving behind only frames of
+//! whole, after every frame it took before, leaving behind only frames of
 //! its run not due yet and every frame above the watermark, published before
 //! the poll or during it; and, at the end of the game's script, that once
 //! the worker has nothing left to publish the polls drain the ring and show
@@ -106,7 +106,8 @@ pub struct RunPlan {
 /// What the game does next.
 #[derive(Clone, Copy, Debug)]
 pub enum Game {
-    /// Polls the ring at this due stamp.
+    /// Polls the ring at this due stamp: a peek and the take of the frame
+    /// it finds due.
     Poll(i64),
     /// Starts the plan's next run and sends the worker the seek naming it.
     Start,
@@ -370,7 +371,7 @@ fn assert_publication_order(log: &[(usize, usize)], g: Geometry, slot: usize) {
     }
 }
 
-/// What the game has staged so far: the last frame and its run.
+/// What the game has taken so far: the last frame and its run.
 #[derive(Clone, Copy, Debug, Default, Hash)]
 struct Shown(Option<(u64, i64, u64)>);
 
@@ -389,7 +390,7 @@ pub struct Reached {
     pub unread: u64,
     /// The worker with frames to publish and no free slot.
     pub blocked: u64,
-    /// A poll that staged a frame.
+    /// A poll that took a frame.
     pub staged: u64,
 }
 
@@ -561,26 +562,27 @@ impl Exec<'_> {
         self.watermark.set(None);
         self.below.borrow_mut().clear();
         let run = reader.run();
-        let polled = reader.poll(&ReaderView(self), due)?;
+        let polled = read(reader, &ReaderView(self), due)?;
 
         let w = self.watermark.get().expect("the poll read the watermark");
         let below = self.below.borrow();
         let due_frames = below.iter().filter(|f| f.1 == run && f.2 <= due);
         let newest = due_frames.max_by_key(|f| f.0).map(|f| (f.0, f.2));
         assert_eq!(
-            polled.staged.map(|f| (f.seq, f.stamp)),
+            polled.taken.as_ref().map(|(f, _)| (f.seq, f.stamp)),
             newest,
-            "the poll at {due} stages the newest frame of run {run} due and at or below the watermark {w}, of {below:?}"
+            "the poll at {due} takes the newest frame of run {run} due and at or below the watermark {w}, of {below:?}"
         );
         let mut reached = self.reached.borrow_mut();
         reached.polls += 1;
-        if let Some(f) = polled.staged {
-            assert_shown_whole(reader, f);
+        if let Some((f, bytes)) = &polled.taken {
+            let f = *f;
+            assert!(*bytes == frame(f.seq), "frame {} taken whole", f.seq);
             if let Some((seq, stamp, r)) = shown.0 {
-                assert!(f.seq > seq, "{f:?} staged after frame {seq}");
+                assert!(f.seq > seq, "{f:?} taken after frame {seq}");
                 assert!(
                     r != run || f.stamp > stamp,
-                    "{f:?} staged after stamp {stamp} in run {run}"
+                    "{f:?} taken after stamp {stamp} in run {run}"
                 );
             }
             shown.0 = Some((f.seq, f.stamp, run));
@@ -618,14 +620,46 @@ impl Exec<'_> {
     }
 }
 
-/// Asserts the staged frame is `f`, whole, its spare bytes zero.
-#[track_caller]
-fn assert_shown_whole(reader: &Reader, f: Frame) {
-    let (staged, words) = reader.staged().expect("a staged frame");
-    assert_eq!(staged, f);
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    assert!(bytes[..12] == frame(f.seq), "frame {} staged whole", f.seq);
-    assert!(bytes[12..].iter().all(|b| *b == 0), "the spare bytes");
+/// What a peek and the take after it did: the frame taken and its bytes,
+/// and whether slots were freed.
+struct Read {
+    taken: Option<(Frame, Vec<u8>)>,
+    freed: bool,
+}
+
+/// Peeks at `due` and takes the frame due, if any, at the tight pitch into
+/// a buffer of the frame's bytes, each written once.
+fn read<W: Words + ?Sized>(reader: &mut Reader, ring: &W, due: i64) -> Result<Read, Fault> {
+    let peek = reader.peek(ring, due)?;
+    let Some(d) = peek.due else {
+        return Ok(Read {
+            taken: None,
+            freed: peek.freed,
+        });
+    };
+    let g = reader.geometry();
+    let w = g.width() as usize;
+    let mut out = vec![0_u8; g.frame_bytes()];
+    let mut written = vec![false; g.frame_bytes()];
+    let mut sink = |at: usize, bytes: &[u8]| {
+        let end = at + bytes.len();
+        for w in &mut written[at..end] {
+            assert!(!*w, "a byte written twice");
+            *w = true;
+        }
+        out[at..end].copy_from_slice(bytes);
+        true
+    };
+    let f = reader.take(ring, d, [w, w.div_ceil(2)], &mut sink)?;
+    assert_eq!((f.seq, f.stamp), (d.seq(), d.stamp()));
+    assert!(
+        written.iter().all(|w| *w),
+        "every byte of the frame written"
+    );
+    Ok(Read {
+        taken: Some((f, out)),
+        freed: true,
+    })
 }
 
 /// How one execution ended.
@@ -717,7 +751,7 @@ fn execute(
         .max_by_key(|p| p.0)
         .map(|p| p.0);
     assert_eq!(
-        reader.staged().map(|(f, _)| f.seq),
+        shown.0.filter(|s| s.2 == reader.run()).map(|s| s.0),
         last,
         "the run's last frame shows once the ring drains"
     );

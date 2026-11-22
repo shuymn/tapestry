@@ -2,12 +2,12 @@
 //! uploader): every byte the render thread puts on the GPU queue goes
 //! through one write function.
 //!
-//! - No workspace crate's sources call a method named `write_texture` or
-//!   `write_buffer` outside [`QUEUE_WRITER`] (render's `upload` module): the
+//! - No workspace crate's sources call a method named `write_texture`,
+//!   `write_buffer` or `write_buffer_with` outside [`QUEUE_WRITER`] (render's `upload` module): the
 //!   uploader's write function and its unpaced forms are the only callers
 //!   of the queue's writes.
-//! - A call of `write_unpaced` or `write_buffer_unpaced` (the forms that
-//!   read no admission gate) sits only in a function [`UNPACED`] lists, by
+//! - A call of `write_unpaced`, `write_buffer_unpaced` or
+//!   `write_buffer_with_unpaced` (the forms that read no admission gate) sits only in a function [`UNPACED`] lists, by
 //!   file and name: a write that is no uploader payload's. A new caller is
 //!   either an uploader payload, written through the gated form, or added
 //!   here with its reason.
@@ -46,6 +46,10 @@ pub const UNPACED: &[(&str, &str)] = &[
     ("crates/render/src/skin_atlas.rs", "make"),
     // An attempt's text prepared in one call, which waits for it.
     ("crates/render/src/text_upload.rs", "prepare"),
+    // A skin movie's due frame, copied from its ring in the frame that
+    // shows it ("Rendering and Skins", skin movies): one frame a movie,
+    // bounded by the screen's pixel total.
+    ("crates/render/src/video.rs", "write_with"),
 ];
 
 /// Every R7 violation in the workspace at `root`.
@@ -167,7 +171,11 @@ impl<'ast> syn::visit::Visit<'ast> for Scan<'_> {
 
     fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
         let name = c.method.to_string();
-        if (name == "write_texture" || name == "write_buffer") && self.shown != QUEUE_WRITER {
+        if matches!(
+            name.as_str(),
+            "write_texture" | "write_buffer" | "write_buffer_with"
+        ) && self.shown != QUEUE_WRITER
+        {
             self.found.push(format!(
                 "R7: {}:{} calls the queue's `{name}` outside {QUEUE_WRITER}; every write goes \
                  through the uploader's write function (design.md \"Memory Budget\", the uploader)",
@@ -183,7 +191,10 @@ impl<'ast> syn::visit::Visit<'ast> for Scan<'_> {
             && let Some(last) = p.path.segments.last()
         {
             let name = last.ident.to_string();
-            if name == "write_unpaced" || name == "write_buffer_unpaced" {
+            if matches!(
+                name.as_str(),
+                "write_unpaced" | "write_buffer_unpaced" | "write_buffer_with_unpaced"
+            ) {
                 let inside = self.fns.last().map_or("", String::as_str);
                 if !UNPACED.contains(&(self.shown, inside)) {
                     self.found.push(format!(
@@ -210,9 +221,9 @@ mod tests {
     // Revert: the method-name check dropped -> the first case finds nothing.
     #[test]
     fn queue_writes_stay_in_the_writer() {
-        let outside = "fn f(q: &Q) { q.write_texture(a, b, c, d); q.write_buffer(a, 0, b); }";
+        let outside = "fn f(q: &Q) { q.write_texture(a, b, c, d); q.write_buffer(a, 0, b);                        q.write_buffer_with(a, 0, s); }";
         let found = scan("crates/render/src/bga.rs", outside).unwrap();
-        assert_eq!(found.len(), 2, "{found:#?}");
+        assert_eq!(found.len(), 3, "{found:#?}");
         assert!(
             found[0]
                 .starts_with("R7: crates/render/src/bga.rs:1 calls the queue's `write_texture`")
@@ -222,6 +233,10 @@ mod tests {
         let found = scan("crates/render/src/renderer.rs", unpaced).unwrap();
         assert_eq!(found.len(), 1, "{found:#?}");
         assert!(found[0].contains("`write_unpaced` in `step`"), "{found:#?}");
+        let mapped =
+            "impl A { fn step(&self) { upload::write_buffer_with_unpaced(g, b, 0, s, f); } }";
+        let found = scan("crates/render/src/video.rs", mapped).unwrap();
+        assert_eq!(found.len(), 1, "{found:#?}");
         let listed = "impl A { fn draw_on(&self) { upload::write_buffer_unpaced(g, b, 0, x); } }";
         assert!(
             scan("crates/render/src/renderer.rs", listed)

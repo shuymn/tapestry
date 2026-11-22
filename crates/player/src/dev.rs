@@ -1492,6 +1492,9 @@ pub struct MenuStats {
     steady_allocs: Vec<u64>,
     /// Frames that laid a new page out.
     changed_allocs: Vec<u64>,
+    /// The allocations inside the frames' app regions (the skin movie
+    /// hook's reads), over every frame.
+    app: u64,
     last: Option<std::time::Instant>,
 }
 
@@ -1512,6 +1515,11 @@ impl MenuStats {
         } else {
             self.steady_allocs.push(allocs);
         }
+    }
+
+    /// One frame's allocations inside its app regions.
+    pub const fn app(&mut self, allocs: u64) {
+        self.app = self.app.saturating_add(allocs);
     }
 
     /// Prints what was kept, if anything, as the frames of the `screen`
@@ -1542,13 +1550,15 @@ impl MenuStats {
         println!(
             "dev: {screen} frames {}: cpu p50 {cpu50} us, p99 {cpu99} us, max {cpumax} us; \
              interval p50 {gap50} us, p99 {gap99} us; allocations per frame: \
-             steady mean {:.1} max {}, new page mean {:.1} max {} ({} pages)",
+             steady mean {:.1} max {}, new page mean {:.1} max {} ({} pages); \
+             app regions {}",
             self.cpu_us.len(),
             mean(&self.steady_allocs),
             self.steady_allocs.iter().max().copied().unwrap_or(0),
             mean(&self.changed_allocs),
             self.changed_allocs.iter().max().copied().unwrap_or(0),
             self.changed_allocs.len(),
+            self.app,
         );
         *self = Self::default();
     }

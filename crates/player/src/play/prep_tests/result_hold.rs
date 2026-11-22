@@ -18,6 +18,7 @@ use super::result_flow::{RED, chart, fixed_skin, prepared};
 use super::{LetGo, imports, result, settings};
 use crate::measure::ResultPath;
 use crate::menu_screen::MenuScreen;
+use crate::movie_screen::MediaHub;
 use crate::play::PlayerRig;
 use crate::render_side::tests::{bundle, measure, view};
 use crate::render_side::{FrameSink, MakeScreen, RenderLink, RenderMsg, Screen};
@@ -256,17 +257,26 @@ fn on_warp_fonts(
     fonts: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Frames),
 ) {
-    on_warp_paced(chart, fonts, None, f);
+    on_warp_paced(chart, fonts, None, None, f);
 }
 
 /// [`on_warp_fonts`], its frames paced by `grants` as a swap chain's when
-/// given.
+/// given, and its screen playing movies through `hub` when given, a play
+/// skin naming one movie chosen for play.
 fn on_warp_paced(
     chart: &bms_model::Chart,
     fonts: bool,
     grants: Option<Arc<crate::menu_screen::TestGrants>>,
+    hub: Option<Arc<MediaHub>>,
     f: impl FnOnce(&mut PlayerRig<'_>, &Frames),
 ) {
+    let play = if hub.is_some() {
+        crate::render_side::tests::movies::movie_bundle_in(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )))
+    } else {
+        bundle()
+    };
     let frames = Frames::default();
     let make: MakeScreen = Box::new(move |font| {
         let r = render::Renderer::new(
@@ -298,6 +308,10 @@ fn on_warp_paced(
             Some(g) => screen.with_test_grants(Arc::clone(g)),
             None => screen,
         };
+        let screen = match &hub {
+            Some(h) => screen.with_media(Arc::clone(h)),
+            None => screen,
+        };
         Ok(Box::new(screen) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
@@ -313,10 +327,7 @@ fn on_warp_paced(
     .unwrap();
     render.load(Arc::new(chart.clone()), None).unwrap();
     assert_eq!(
-        render
-            .select(ScreenKind::Play, Some(bundle()))
-            .wait()
-            .unwrap(),
+        render.select(ScreenKind::Play, Some(play)).wait().unwrap(),
         game::Preparation::Ready
     );
     render.set_first_frame_hold(TimeUs(BOUND));
@@ -1848,6 +1859,86 @@ fn a_failed_font_read_keeps_the_bitmap_line() {
     });
 }
 
+/// A play skin's movie playing as the play ends into a result whose
+/// page font is not there: the first frame of the pending presentation in
+/// the bitmap font retires the play's movies, as every frame of another
+/// screen does, so their set, worker and planes do not outlive the play
+/// screen. The font held past the bound before the hand-over and after
+/// it, and the font's read failed (design.md "Rendering and Skins", skin
+/// movies; the result's hold).
+// Revert: `MenuScreen::text_frame` without the movies' retirement -> "the
+// play's set open at the first bitmap frame".
+#[test]
+fn the_bitmap_wait_page_retires_the_play_s_movies() {
+    use crate::menu_screen::{FAIL_FONT_READ, FONT_READS, HOLD_FONT_READ};
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    for case in ["before the hand-over", "after the hand-over", "failed read"] {
+        let hub = MediaHub::with(None);
+        let h = Arc::clone(&hub);
+        on_warp_paced(a.chart(), false, None, Some(hub), |rig, frames| {
+            let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
+            let (report, screen) = result_of(dir.path());
+            h.supply([Some(crate::menu_screen::movie_tests::clip(&[0])), None]);
+            let _skin = pending_skin(rig, &a);
+            let _play = playing(rig);
+            frames.arm();
+            let _go = FontGo;
+            let ahead = reads(1);
+            if case == "failed read" {
+                FAIL_FONT_READ.store(true, Ordering::SeqCst);
+            } else {
+                HOLD_FONT_READ.store(true, Ordering::SeqCst);
+            }
+            rig.begin_result(&report, &screen);
+            rig.result_compared(&report, &screen);
+            laid_out(rig);
+            if case == "failed read" {
+                until_true(rig, "the failed read", |_| reads(1) > ahead);
+            }
+            assert_eq!(h.open_sets(), 1, "{case}: the play's set open");
+            rig.render.pause_result_staging(true);
+            if case == "after the hand-over" {
+                rig.show_end(&report, &screen);
+                until_true(rig, "the view's creation", |rig| {
+                    rig.render.creation_pass() > 0
+                });
+            }
+            rig.render.set_hold_clock(Some(BOUND + 1));
+            // The frames up to the first of the pending presentation: the
+            // play's, then the wait page's, no other screen's between.
+            let from = frames.len();
+            let drawn = frames.until(rig, from, "the first bitmap frame", |f| {
+                f.iter().any(|f| f.path == Some(ResultPath::Pending))
+            });
+            let open = h.open_sets();
+            let first = drawn
+                .iter()
+                .position(|f| f.path == Some(ResultPath::Pending))
+                .unwrap();
+            assert!(
+                drawn[..first].iter().all(|f| f.path.is_none()),
+                "{case}: a result frame before the wait page: {drawn:?}"
+            );
+            assert!(drawn[first].pending(), "{case}: the wait line not drawn");
+            assert!(
+                rig.render.bitmap_frames() > 0,
+                "{case}: no frame in the bitmap font"
+            );
+            assert_eq!(
+                open, 0,
+                "{case}: the play's set open at the first bitmap frame"
+            );
+            if case != "after the hand-over" {
+                rig.show_end(&report, &screen);
+            }
+            rig.render.pause_result_staging(false);
+            HOLD_FONT_READ.store(false, Ordering::SeqCst);
+            rig.leave_result();
+        });
+    }
+}
+
 /// A screen made for plays only whose font is still being read when the
 /// first view's staging ends: the view commits without waiting for the
 /// font, drawing no strip, and the strip's lines are laid out once the
@@ -1975,7 +2066,7 @@ fn a_swap_paced_pending_frame_presents_on_each_grant() {
     // Ungated until the test holds it.
     grants.permits.store(u32::MAX, Ordering::SeqCst);
     let g = Arc::clone(&grants);
-    on_warp_paced(a.chart(), false, Some(grants), |rig, frames| {
+    on_warp_paced(a.chart(), false, Some(grants), None, |rig, frames| {
         let reads = |i: usize| FONT_READS[i].load(Ordering::SeqCst);
         let (report, screen) = result_of(dir.path());
         let _skin = pending_skin(rig, &a);

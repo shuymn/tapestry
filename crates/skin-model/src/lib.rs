@@ -108,6 +108,7 @@ mod expr;
 mod image;
 mod layout;
 pub mod media;
+pub mod movie;
 #[cfg(feature = "dev-tools")]
 mod observation;
 pub mod output;

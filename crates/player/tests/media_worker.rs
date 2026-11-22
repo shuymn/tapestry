@@ -42,7 +42,7 @@ use media_support::WORKER;
 use media_support::media_host::strikes::{FileId, Strikes};
 use media_support::media_host::verdict;
 use media_support::media_host::watch::{self, End, Event, LINE};
-use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
+use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe, root};
 use skin_model::media::control::{Command as Order, Matrix, Range, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
@@ -182,6 +182,8 @@ struct Ring {
     len: usize,
     event: OwnedHandle,
     reader: Reader,
+    /// The last frame taken, I420.
+    frame: Vec<u8>,
 }
 
 impl Ring {
@@ -221,6 +223,7 @@ impl Ring {
             len,
             event,
             reader,
+            frame: Vec::new(),
         }
     }
 
@@ -230,18 +233,45 @@ impl Ring {
     }
 
     /// Polls the ring at `due`, signalling the worker when slots were
-    /// freed: the frame staged, if any.
+    /// freed: the frame taken, if any.
     fn poll(&mut self, due: i64) -> Option<Frame> {
         let words = Self::words(self.view, self.len);
-        let poll = self
-            .reader
-            .poll(words, due)
+        let (taken, freed) = read_tight(&mut self.reader, words, due, &mut self.frame)
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
-        if poll.freed {
+        if freed {
             // SAFETY: the ring's event.
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
-        poll.staged
+        taken
+    }
+
+    /// The highest sequence the worker has published, its watermark.
+    #[cfg(feature = "dev-tools")]
+    fn published(&self) -> u64 {
+        skin_model::media::watermark(Self::words(self.view, self.len)).unwrap()
+    }
+
+    /// Takes the oldest frame the ring holds ready, polling at its stamp
+    /// (at 0 while it holds none): a game whose clock is never ahead of the
+    /// worker's frames, so it takes every frame (design.md "Rendering and
+    /// Skins", video frames).
+    fn poll_next(&mut self) -> Option<Frame> {
+        let oldest = self
+            .slots()
+            .iter()
+            .filter(|s| s[0] == READY)
+            .map(|s| s[3].cast_signed())
+            .min()
+            .unwrap_or(0);
+        self.poll(oldest)
+    }
+
+    /// The state the worker says its player is in.
+    #[cfg(feature = "dev-tools")]
+    fn state(&self) -> Option<skin_model::media::State> {
+        skin_model::media::supervision(Self::words(self.view, self.len))
+            .unwrap()
+            .1
     }
 
     /// The ring's section's size in bytes.
@@ -269,12 +299,10 @@ impl Ring {
             .collect()
     }
 
-    /// The staged frame's bytes, I420.
+    /// The last frame taken's bytes, I420.
     fn staged(&self) -> Vec<u8> {
-        let (_, words) = self.reader.staged().unwrap();
-        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        bytes.truncate(self.reader.geometry().frame_bytes());
-        bytes
+        assert_eq!(self.frame.len(), self.reader.geometry().frame_bytes());
+        self.frame.clone()
     }
 }
 
@@ -284,6 +312,9 @@ impl Drop for Ring {
         let _ = unsafe { UnmapViewOfFile(self.view) };
     }
 }
+
+/// A slot's state word for a published frame.
+const READY: u64 = 2;
 
 /// A frame taken from a ring.
 struct Taken {
@@ -828,6 +859,411 @@ fn colour_changes_mid_stream_are_converted_to_the_contract() {
 #[cfg(feature = "dev-tools")]
 const LOOPED: &str = "mpeg1video mpeg 320x240 24 48 12";
 
+/// Polls `ring` at `due` until a frame is staged: its sequence, stamp and
+/// painted index.
+#[cfg(feature = "dev-tools")]
+fn take_seq(worker: &Worker, ring: &mut Ring, due: i64) -> (u64, i64, u32) {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        if let Some(frame) = ring.poll(due) {
+            return (frame.seq, frame.stamp, painted(&ring.staged(), 320));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no frame due at {due}, slots {:?}; the worker's log:\n{}",
+            ring.slots(),
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A play starts at its clip's first frame as soon as the worker has the
+/// ring (design.md "Rendering and Skins", video frames): before the game
+/// looks, the worker fills every slot from frame 0, in order, and waits for
+/// a free one; the game then takes them one by one, none dropped.
+// Revert: the worker dropping the frame it holds for the next one decoded
+// -> "frame 0 first".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_play_publishes_from_its_first_frame_before_the_game_looks() {
+    use skin_model::media::{SLOTS, State};
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "b.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let slots = u64::try_from(SLOTS).unwrap();
+    let deadline = Instant::now() + REPLY;
+    while ring.published() < slots || ring.state() != Some(State::Waiting) {
+        assert!(
+            Instant::now() < deadline,
+            "the ring never filled: {} published, {:?}; the worker's log:\n{}",
+            ring.published(),
+            ring.state(),
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(ring.published(), slots, "every slot, before the game looks");
+    let mut taken = Vec::new();
+    while taken.len() < 12 {
+        assert!(Instant::now() < deadline, "{taken:?}");
+        if let Some(frame) = ring.poll_next() {
+            taken.push((frame.seq, frame.stamp, painted(&ring.staged(), 320)));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let want: Vec<_> = (0..12_u32)
+        .map(|i| (u64::from(i) + 1, stamp_of(i64::from(i), 24), i))
+        .collect();
+    assert_eq!(
+        taken,
+        want,
+        "frame 0 first; the worker's log:\n{}",
+        worker.log()
+    );
+    worker.close(1);
+}
+
+/// A seek back starts a run at its landing (design.md "Rendering and
+/// Skins", video frames): after the game has shown 5 s of a 10 s clip, a
+/// seek to 1 s shows the frame there, the worker decoding the new run from
+/// its landing whatever time the earlier run reached.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_seek_back_is_judged_by_its_own_run_s_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "k.mpg", "mpeg1video mpeg 320x240 24 240 12");
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let mut shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
+    while shown.2 < 120 {
+        shown = take_seq(&worker, &mut ring, stamp_of(120, 24));
+    }
+    assert_eq!(shown.2, 120);
+    let at = stamp_of(24, 24);
+    let run = ring.start_run(at);
+    worker.send(&Order::Seek { player: 1, run, at });
+    let landed = match worker.reply() {
+        Reply::Sought { landed, .. } => landed,
+        other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+    };
+    assert_eq!(landed, at);
+    // The worker decodes the new run before the game polls it, with only
+    // the earlier run's time in the ring.
+    std::thread::sleep(Duration::from_millis(200));
+    let taken = take_seq(&worker, &mut ring, landed);
+    assert_eq!((taken.1, taken.2), (at, 24));
+    worker.close(1);
+}
+
+/// A frame due is published as soon as it is converted, never held for
+/// the next conversion (design.md "Rendering and Skins", video frames):
+/// with the
+/// conversion after it blocking for 600 ms, the game, polling on a
+/// real-time clock, takes the frame by the time it is due plus 60 ms,
+/// both for a clip's first frame (the second conversion blocks) and for a
+/// looping clip's last frame (the next pass's first conversion blocks).
+// Revert: the frame held until the next one is converted -> "taken while
+// the next conversion blocks".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_due_frame_is_published_while_the_next_conversion_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "n.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    // (the conversion that blocks, looping, the frame due, its index)
+    for (stall, looping, index) in [(1, false, 0), (48, true, 47)] {
+        let option = format!("stall-convert={stall}:600");
+        let mut worker = Worker::start(&["--dev-serve", &option]);
+        let probe = worker.open(1, &path);
+        assert!(
+            matches!(probe, Reply::Probed { player: 1, .. }),
+            "{probe:?}"
+        );
+        let mut ring = Ring::new(320, 240);
+        assert_eq!(
+            worker.play_as(1, &ring, looping),
+            Reply::Playing {
+                id: worker.last,
+                player: 1
+            }
+        );
+        let due = stamp_of(index, 24);
+        let limit = due + 60_000;
+        let origin = Instant::now();
+        let mut taken = None;
+        loop {
+            let now = i64::try_from(origin.elapsed().as_micros()).unwrap();
+            if now > limit {
+                break;
+            }
+            if let Some(frame) = ring.poll(now)
+                && frame.stamp == due
+            {
+                taken = Some(now);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            taken.is_some(),
+            "frame {index} taken while the next conversion blocks (by {limit} µs); the worker's log:\n{}",
+            worker.log()
+        );
+        worker.close(1);
+    }
+}
+
+/// A decoder slower than the game's clock (each frame's conversion takes
+/// 100 ms, a 24 fps clip's frame lasting 42 ms) shows frames that advance
+/// (design.md "Rendering and Skins", video frames: a late frame is dropped
+/// only for a newer one): the worker publishes every frame, late, and the
+/// game takes each, so over two seconds of polls on a real-time clock the
+/// panel shows several frames, each newer than the last.
+// Revert: the worker dropping a late frame for the next one decoded ->
+// "a slow decoder shows advancing frames".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_slow_decoder_shows_advancing_late_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "w.mpg", "mpeg1video mpeg 320x240 24 240 12");
+    let mut worker = Worker::start(&["--dev-serve", "slow-convert=100"]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let origin = Instant::now();
+    let mut shown = Vec::new();
+    while origin.elapsed() < Duration::from_secs(2) {
+        let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
+        if let Some(frame) = ring.poll(due) {
+            shown.push(frame.stamp);
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    assert!(
+        shown.len() >= 4 && shown.windows(2).all(|w| w[0] < w[1]),
+        "a slow decoder shows advancing frames: {shown:?}; the worker's log:\n{}",
+        worker.log()
+    );
+    worker.close(1);
+}
+
+/// A variable-rate clip shows the frame before a gap through it (design.md
+/// "Rendering and Skins", video frames): frames at 0, 40, 80, 120 and
+/// 160 ms, then 2 s. A game whose clock stands at 780 ms takes the frames
+/// up to the one at 160 ms and keeps it, rather than the panel's underlay,
+/// until 2 s.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_variable_rate_gap_shows_the_frame_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(
+        dir.path(),
+        "g.mkv",
+        "mjpeg matroska 320x240 25 12 1 gap=5:45",
+    );
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let mut shown = take_seq(&worker, &mut ring, 780_000);
+    while shown.2 < 4 {
+        shown = take_seq(&worker, &mut ring, 780_000);
+    }
+    assert_eq!(
+        (shown.1, shown.2),
+        (160_000, 4),
+        "the frame before the gap; the worker's log:\n{}",
+        worker.log()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(ring.poll(780_000).is_none(), "nothing newer is due");
+    let next = take_seq(&worker, &mut ring, 2_000_000);
+    assert_eq!((next.1, next.2), (2_000_000, 5));
+    worker.close(1);
+}
+
+/// A conversion that blocks for 1 s during a play (design.md "Rendering
+/// and Skins", video frames): the game, on a real-time clock from the
+/// play's start, keeps the frame it took last through the stall, takes no
+/// newer one during it, and after it takes the frames after it, late, then
+/// frames that advance until they reach its clock, the worker dropping
+/// none.
+// Revert: the worker dropping a frame behind the clock -> "a frame dropped
+// by the worker".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_stall_mid_play_shows_the_next_frame_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "s.mpg", "mpeg1video mpeg 320x240 24 240 12");
+    // The 26th conversion, frame 25's, blocks.
+    let mut worker = Worker::start(&["--dev-serve", "stall-convert=25:1000"]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let origin = Instant::now();
+    let clock = || i64::try_from(origin.elapsed().as_micros()).unwrap();
+    let mut shown = Vec::new();
+    while origin.elapsed() < Duration::from_millis(3_000) {
+        let now = clock();
+        if let Some(frame) = ring.poll(now) {
+            shown.push((now, frame.stamp));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let slots = i64::try_from(skin_model::media::SLOTS).unwrap();
+    let stall = stamp_of(25, 24);
+    let before = shown.iter().rev().find(|s| s.1 < stall).copied();
+    let after = shown.iter().find(|s| s.1 >= stall).copied();
+    let (Some(before), Some(after)) = (before, after) else {
+        panic!(
+            "frames on both sides of the stall: {shown:?}; the worker's log:\n{}",
+            worker.log()
+        );
+    };
+    assert!(
+        after.0 - before.0 >= 500_000,
+        "nothing newer during the stall: {shown:?}"
+    );
+    assert!(
+        after.1 <= stamp_of(24 + slots, 24),
+        "the frame after the stall: {shown:?}"
+    );
+    assert!(shown.windows(2).all(|w| w[0].1 < w[1].1), "{shown:?}");
+    // The worker drops none: between two takes it publishes at most a
+    // ring's slots, so no take is further on than that.
+    assert!(
+        shown
+            .windows(2)
+            .all(|w| w[1].1 - w[0].1 <= stamp_of(slots, 24) + 1),
+        "a frame dropped by the worker: {shown:?}"
+    );
+    let (at, last) = *shown.last().unwrap();
+    assert!(
+        at - last < 2 * stamp_of(1, 24) + 50_000,
+        "caught up to the clock: {shown:?}"
+    );
+    worker.close(1);
+}
+
+/// A clip that does not loop keeps its last frame (design.md "Rendering
+/// and Skins", video frames): a game whose clock is past the end takes
+/// the newest frame each time until the last, which it keeps, every frame
+/// published and the end answered after the last.
+// Revert: the end taken before the frame held is published -> "the last
+// frame kept".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_last_frame_is_kept_past_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "e.mpg", "mpeg1video mpeg 320x240 24 24 12");
+    // The clip's frames, from a play the game takes frame by frame.
+    let mut reference = Worker::start(&[]);
+    assert!(matches!(
+        reference.open(1, &path),
+        Reply::Probed { player: 1, .. }
+    ));
+    let mut all = Ring::new(320, 240);
+    reference.play(1, &all);
+    let deadline = Instant::now() + REPLY;
+    let mut stamps = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "the reference play never ended");
+        if let Some(frame) = all.poll_next() {
+            stamps.push(frame.stamp);
+        } else if all.state() == Some(skin_model::media::State::Ended)
+            && all.slots().iter().all(|s| s[0] != READY)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    reference.close(1);
+    let end = *stamps.last().unwrap();
+    let count = u64::try_from(stamps.len()).unwrap();
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let mut last = take_seq(&worker, &mut ring, 5_000_000);
+    while last.1 < end {
+        last = take_seq(&worker, &mut ring, 5_000_000);
+    }
+    assert_eq!(
+        (last.0, last.1),
+        (count, end),
+        "the last frame kept; the worker's log:\n{}",
+        worker.log()
+    );
+    assert!(matches!(worker.reply(), Reply::Ended { player: 1, .. }));
+    assert!(ring.poll(5_000_000).is_none(), "nothing after the last");
+    worker.close(1);
+}
+
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -1205,7 +1641,7 @@ fn worker_caps_the_pixels_of_frames_after_the_probe() {
             ring.slots(),
             worker.log()
         );
-        if let Some(frame) = ring.poll(i64::MAX) {
+        if let Some(frame) = ring.poll_next() {
             taken.push(frame.stamp);
             continue;
         }
@@ -1214,7 +1650,7 @@ fn worker_caps_the_pixels_of_frames_after_the_probe() {
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    while let Some(frame) = ring.poll(i64::MAX) {
+    while let Some(frame) = ring.poll_next() {
         taken.push(frame.stamp);
     }
     // The decoder refuses the first frame past the cap, which fails the
@@ -1259,6 +1695,15 @@ fn concat(dir: &Path, name: &str, parts: &[PathBuf]) -> PathBuf {
 /// scheduled.
 #[cfg(feature = "dev-tools")]
 const HOLD: i64 = 30_000_000;
+
+/// Player 2's media time once player 1 has failed: on from [`HOLD`] in
+/// real time since `resumed`, so its frames come due one by one rather than
+/// all behind the clock and dropped (design.md "Rendering and Skins", video
+/// frames).
+#[cfg(feature = "dev-tools")]
+fn after_hold(resumed: Instant) -> i64 {
+    HOLD + i64::try_from(resumed.elapsed().as_micros()).unwrap()
+}
 
 // Covers: T02
 #[cfg(feature = "dev-tools")]
@@ -1320,7 +1765,7 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[0] += usize::from(one.poll_next().is_some());
         frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
@@ -1340,13 +1785,14 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
     // The worker goes on: player 2's frames keep coming, and it answers a
     // new open.
     let before = frames[1];
+    let resumed = Instant::now();
     while frames[1] < before + 24 {
         assert!(
             Instant::now() < deadline,
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(after_hold(resumed)).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
     assert!(!worker.launched.ended());
@@ -2091,7 +2537,7 @@ fn worker_caps_the_coded_size_of_h264_frames_after_the_probe() {
             taken.len(),
             worker.log()
         );
-        if let Some(frame) = ring.poll(i64::MAX) {
+        if let Some(frame) = ring.poll_next() {
             taken.push(frame.stamp);
             continue;
         }
@@ -2100,7 +2546,7 @@ fn worker_caps_the_coded_size_of_h264_frames_after_the_probe() {
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    while let Some(frame) = ring.poll(i64::MAX) {
+    while let Some(frame) = ring.poll_next() {
         taken.push(frame.stamp);
     }
     // The first frame past the cap fails the player, with the error the
@@ -2185,7 +2631,7 @@ fn h264_decoder_enomem_fails_one_player_and_the_worker_lives() {
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[0] += usize::from(one.poll_next().is_some());
         frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
@@ -2204,13 +2650,14 @@ fn h264_decoder_enomem_fails_one_player_and_the_worker_lives() {
     assert!(frames[0] > 0, "player 1 showed no frame before it failed");
     // Player 2's frames keep coming.
     let before = frames[1];
+    let resumed = Instant::now();
     while frames[1] < before + 24 {
         assert!(
             Instant::now() < deadline,
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(after_hold(resumed)).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
     for player in [1, 2] {
@@ -2352,7 +2799,7 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[0] += usize::from(one.poll_next().is_some());
         frames[1] += usize::from(two.poll(HOLD).is_some());
         if let Some(reply) = worker.try_reply() {
             break reply;
@@ -2370,13 +2817,14 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
     );
     assert!(frames[0] > 0, "player 1 showed no frame before it failed");
     let before = frames[1];
+    let resumed = Instant::now();
     while frames[1] < before + 24 {
         assert!(
             Instant::now() < deadline,
             "the worker's log:\n{}",
             worker.log()
         );
-        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(after_hold(resumed)).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
     for player in [1, 2] {
@@ -2979,7 +3427,7 @@ fn drain(worker: &Worker, rings: &mut BTreeMap<u8, Ring>) -> BTreeMap<u8, usize>
             worker.log()
         );
         for (player, ring) in rings.iter_mut() {
-            if ring.poll(i64::MAX).is_some() {
+            if ring.poll_next().is_some() {
                 *shown.get_mut(player).unwrap() += 1;
             }
         }

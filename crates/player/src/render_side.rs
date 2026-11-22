@@ -113,7 +113,7 @@ pub trait Screen: Send {
     fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError>;
     /// Prepares the attempt `a` (its chart, its context and its labels,
     /// borrowed for this call only) for preparation request `request`,
-    /// staging `skin`'s installation when one is chosen, else readying the
+    /// published in loading lifetime `lifetime` (`None`: in none), staging `skin`'s installation when one is chosen, else readying the
     /// skin in use; nothing it stages draws before its
     /// [`commit`](Self::commit). `None` while the answer is not ready: it
     /// is asked again between frames with the same attempt, until it
@@ -132,8 +132,9 @@ pub trait Screen: Send {
         a: &AttemptInput<'_>,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
+        lifetime: Option<u64>,
     ) -> Option<Result<Preparation, RenderError>> {
-        let _ = request;
+        let _ = (request, lifetime);
         if skin.is_some() {
             return Some(Ok(refusal("this screen draws no declarative skin")));
         }
@@ -952,6 +953,34 @@ pub trait Screen: Send {
     /// again; the screen stays usable, and the next attempt's preparation
     /// builds again.
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), BuildError>;
+    /// The play frame's skin movie hook at `at` µs on the frame clock,
+    /// before its [`build`](Self::build) ([`crate::movie_frame`]): it may
+    /// upload a movie's frame through wgpu, so it runs outside the frame's
+    /// app region and enters its own around the reads. Nothing by default.
+    fn movie_frame(&mut self, at: i64) {
+        let _ = at;
+    }
+    /// The skin movies' admission boundary, in each pass that finds no
+    /// frame due (no grant held or found, no clock deadline passed),
+    /// before it waits for the frame's grant, an Idle pass's included
+    /// ([`crate::movie_frame::Movies::admit`]): a movie's planes are
+    /// reserved or released here, never in a frame or a preparation's
+    /// poll. Nothing by default.
+    fn movie_boundary(&mut self) {}
+    /// The skin movies' admission turn, after each frame drawn and before
+    /// the next grant is taken ([`crate::movie_frame::Movies::turn`]): a
+    /// movie the boundary found no slack for in a frame's interval is
+    /// admitted here, once. Nothing by default.
+    fn movie_turn(&mut self) {}
+    /// The game left the committed play of preparation `request` before
+    /// it began (a quit after its commit and before READY): its movies
+    /// are retired. Nothing by default.
+    fn abandon(&mut self, request: u64) {
+        let _ = request;
+    }
+    /// The committed play begins (its play message): its movies are the
+    /// play screen's. Nothing by default.
+    fn begin_play(&mut self) {}
     /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
     /// the start gate): the skin's runtime state for the attempt starts
     /// over, its chart and text resources kept. Nothing by default.
@@ -1017,6 +1046,7 @@ pub trait Screen: Send {
             dropped: 0,
             outcome: render::FrameOutcome::Shown,
             present_count: None,
+            movies: [false; skin_model::movie::MAX_MOVIES],
         })
     }
     /// Draws the select screen from `update` at `now`, with the
@@ -1485,6 +1515,10 @@ pub enum RenderMsg {
     /// Drop the preparation of this request, answered or not, unless
     /// committed: it was cancelled, refused or timed out.
     Discard(u64),
+    /// The game left the play of this request before it began, after its
+    /// commit (a quit before READY): its movies are retired. The
+    /// installation stays; a request not committed is left as it is.
+    Abandon(u64),
     /// Publish the chart's images (S10-12): into the staged array of the
     /// attempt `request` prepared when it has one of its own, else into the
     /// committed play installation; `set` `None` publishes them absent.
@@ -3961,6 +3995,18 @@ impl RenderLink {
         self.send(RenderMsg::Discard(self.requests.load(Ordering::Relaxed)));
     }
 
+    /// The play of the attempt prepared as `request` is left before it
+    /// began: once committed, its movies are retired
+    /// ([`RenderMsg::Abandon`]); its installation stays.
+    pub fn abandon_attempt(&self, request: u64) {
+        self.send(RenderMsg::Abandon(request));
+    }
+
+    /// The request of the last attempt prepared, which a commit commits.
+    pub fn last_request(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
     /// Starts installing the declarative `skin` for screen `kind`, as a
     /// request of the same sequence as the attempts' preparations: for
     /// play, every later attempt prepares with it, or with the skin in
@@ -5597,7 +5643,7 @@ fn take_loading(
 /// state yet it is the lifetime's first moment: from `now`, nothing
 /// loaded. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn loading_frame_of(
+pub(crate) fn loading_frame_of(
     lifetime: u64,
     now: TimeUs,
     update: Option<&LoadingUpdate>,
@@ -7613,6 +7659,7 @@ impl Run {
                         | RenderMsg::Commit { .. }
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
+                        | RenderMsg::Abandon(_)
                         | RenderMsg::ChartImages { .. }
                         | RenderMsg::Bga { .. }
                         | RenderMsg::PoolWrite(_)
@@ -7979,6 +8026,12 @@ impl Run {
                     self.discard(request);
                     continue;
                 }
+                Ok(RenderMsg::Abandon(request)) => {
+                    if let Some(screen) = &mut self.screen {
+                        screen.abandon(request);
+                    }
+                    continue;
+                }
                 Ok(RenderMsg::ChartImages {
                     generation,
                     request,
@@ -8067,6 +8120,10 @@ impl Run {
                 }) => {
                     let origin = measure.origin;
                     let screen_origin = self.resolve_screen_origin(&measure);
+                    // The play's movies: held by this screen alone.
+                    if let Some(s) = self.screen.as_mut() {
+                        s.begin_play();
+                    }
                     self.turntable.play_starts();
                     // A decision screen is left by the loading state or
                     // the practice page before any play (dev-tools).
@@ -8322,7 +8379,10 @@ impl Run {
             }
             // An Idle pass ends here, before any frame's pacing (design.md
             // "Load Pipeline", the Idle loop): its wait is the message's.
+            // It draws no frame, so the skin movies' admission runs, a
+            // grant held kept for the next frame.
             if matches!(mode, Mode::Idle) {
+                self.movie_admission(&mode);
                 continue;
             }
             // The play skin's loading text, once per pass after the newest
@@ -8522,6 +8582,10 @@ impl Run {
                     }
                 }
             }
+            // The skin movies' admission, before the grant is waited for
+            // and after the held pass, which presents nothing and so takes
+            // no grant.
+            self.movie_admission(&mode);
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -8935,6 +8999,15 @@ impl Run {
                     {
                         screen_stamp = Some(screen_us);
                     }
+                    // The skin movies' frames, taken on their own clock
+                    // before the build: their upload maps wgpu's buffer,
+                    // so the app region pauses around the hook, which
+                    // enters its own around its reads.
+                    #[cfg(feature = "dev-tools")]
+                    drop(region);
+                    screen.movie_frame(frame_at.0);
+                    #[cfg(feature = "dev-tools")]
+                    let region = crate::alloc_count::AppRegion::enter();
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -8997,6 +9070,8 @@ impl Run {
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
+                    #[cfg(feature = "dev-tools")]
+                    let app_before = crate::alloc_count::app_allocations();
                     let presented = loading_frame.map(|l| {
                         presentation_of(
                             &self.committed,
@@ -9114,6 +9189,7 @@ impl Run {
                             &mut self.menu_stats
                         };
                         stats.frame(t.cpu, after - before, *changed);
+                        stats.app(crate::alloc_count::app_allocations().saturating_sub(app_before));
                         if loading_frame.is_some() && t.presented() {
                             self.shared.loading_drawn.fetch_add(1, Ordering::Relaxed);
                         }
@@ -9153,6 +9229,10 @@ impl Run {
                     );
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
+                    // The app regions' allocations in the frame (its movie
+                    // hook's reads).
+                    #[cfg(feature = "dev-tools")]
+                    let app_before = crate::alloc_count::app_allocations();
                     // The settings the skin shows, the volume and the
                     // display offset as they are now: F3 to F6 show at the
                     // next frame, with no view of the game thread's.
@@ -9248,6 +9328,8 @@ impl Run {
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
                         self.menu_stats.frame(d.timing.cpu, after - before, changed);
+                        self.menu_stats
+                            .app(crate::alloc_count::app_allocations().saturating_sub(app_before));
                         skin_frame = shown.logic.is_some() && d.refused.is_none();
                         // What a refusal put on the screen, once drawn.
                         if changed
@@ -9810,6 +9892,12 @@ impl Run {
             if !minimized {
                 self.granted = false;
             }
+            // The skin movies' admission turn: after the frame its grant
+            // drew, before the next is taken; it admits only a movie the
+            // boundary found no slack for since the frame before.
+            if let Some(screen) = &mut self.screen {
+                screen.movie_turn();
+            }
             // A frame that ended shown or invisible refills the frame
             // interval's allowance and ends a stall (design.md "Load
             // Pipeline"); an offscreen frame that ended `Retry` stalls the
@@ -10091,20 +10179,28 @@ impl Run {
         if let Some(origin) = self.screen_resolved {
             return origin;
         }
-        let origin = self.screen_pending.take().unwrap_or_else(|| {
-            let loadend = self
-                .committed
-                .get(ScreenKind::Play)
-                .and_then(|i| i.bundle().skin().loadend());
-            TimeUs(
-                measure
-                    .ready_state_at
-                    .0
-                    .saturating_sub(game::loading_minimum(loadend).0),
-            )
-        });
+        let origin = self
+            .screen_pending
+            .take()
+            .unwrap_or_else(|| self.ready_anchor(measure));
         self.screen_resolved = Some(origin);
         origin
+    }
+
+    /// The play skin's loading minimum before the READY a play starting
+    /// with `measure` opens at (recording's opening,
+    /// [`PlayMeasure::ready_state_at`]).
+    fn ready_anchor(&self, measure: &PlayMeasure) -> TimeUs {
+        let loadend = self
+            .committed
+            .get(ScreenKind::Play)
+            .and_then(|i| i.bundle().skin().loadend());
+        TimeUs(
+            measure
+                .ready_state_at
+                .0
+                .saturating_sub(game::loading_minimum(loadend).0),
+        )
     }
 
     /// The answer to the end or pause of loading lifetime `lifetime`:
@@ -11069,6 +11165,25 @@ impl Run {
         self.note_heavy();
     }
 
+    /// The skin movies' admission boundary, the one place a pass reserves
+    /// their planes (design.md "Scope of No Allocation"): behind the
+    /// uploader's admission gate's frame check, so only while no frame is
+    /// due, never with a grant held (taken by this pass's boundary, or kept
+    /// from a pass whose lifetime was left during its wait) nor once one is
+    /// found, which is kept for the frame, nor past the offscreen deadline;
+    /// a reservation never delays a granted frame. An Idle pass draws no
+    /// frame, so it reserves whatever grant it holds (kept from a lifetime
+    /// left during its wait), which stays for the next presenting pass's
+    /// frame: a play prepared while the loop is Idle is admitted there.
+    fn movie_admission(&mut self, mode: &Mode) {
+        let frame = self.frame_due_by(mode, None);
+        let due = !matches!(mode, Mode::Idle)
+            && (self.granted || self.heavy_state(frame, None).frame_due);
+        if !due && let Some(screen) = &mut self.screen {
+            screen.movie_boundary();
+        }
+    }
+
     /// The admission gate's state for a heavy operation (design.md "Memory
     /// Budget", the uploader's admission gate): `frame` looked at (a grant
     /// found is kept for the frame), READY's cutoff as found (a cutoff
@@ -11316,7 +11431,7 @@ impl Run {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
-        let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request);
+        let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request, p.lifetime);
         // Play's admission released the result's installation: recorded
         // with the staging's request and published before its answer
         // (design.md "Memory Budget", R5).
@@ -14955,6 +15070,7 @@ const fn timing_of(outcome: FrameOutcome) -> FrameTiming {
         dropped: 0,
         outcome,
         present_count: None,
+        movies: [false; skin_model::movie::MAX_MOVIES],
     }
 }
 
@@ -14990,6 +15106,7 @@ pub(crate) mod tests {
                 render::FrameOutcome::Retry
             },
             present_count: None,
+            movies: [false; skin_model::movie::MAX_MOVIES],
         }
     }
 
@@ -20212,6 +20329,7 @@ pub(crate) mod tests {
             a: &render::AttemptInput<'_>,
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
+            _lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
@@ -20289,6 +20407,9 @@ pub(crate) mod tests {
                 self.shared.committed_paces.lock().unwrap().push(pace);
             }
             Ok(())
+        }
+        fn abandon(&mut self, request: u64) {
+            self.note(&format!("abandon {request}"));
         }
         fn discard(&mut self) {
             self.note("discard");
@@ -23998,8 +24119,9 @@ pub(crate) mod tests {
             a: &render::AttemptInput<'_>,
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
+            lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
-            let answer = self.menu.prepare_attempt(a, skin, request);
+            let answer = self.menu.prepare_attempt(a, skin, request, lifetime);
             if matches!(answer, Some(Ok(Preparation::Ready))) {
                 let staged = self.menu.renderer_mut().memory().staged_atlas;
                 self.probed().staged_atlas.push(staged);
@@ -24448,8 +24570,9 @@ pub(crate) mod tests {
             a: &render::AttemptInput<'_>,
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
+            lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
-            self.menu.prepare_attempt(a, skin, request)
+            self.menu.prepare_attempt(a, skin, request, lifetime)
         }
         fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
             if self.hold_up.load(Ordering::Acquire) {
@@ -25816,6 +25939,10 @@ pub(crate) mod tests {
     // The play state's screen origin through loading lifetimes, play
     // states, rearms and practice Starts into each play's frames.
     mod screen_clock;
+    // The skin movies' holder through a play preparation's commit and
+    // cancel.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) mod movies;
     // The chart images' tables: their generation, attempt and target.
     mod chart;
     // The decision labels' preparation, the skinned decision screen, its

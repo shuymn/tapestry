@@ -416,6 +416,8 @@ pub struct Sheet {
     cells: Box<[Cell]>,
     /// The font files' names.
     fonts: Box<[String]>,
+    /// The skin movies' file names, by slot, in declaration order.
+    movies: Box<[String]>,
     /// The bitmap font files, each with its pages.
     fnts: Box<[fnt::Fnt]>,
     /// The bitmap fonts: each a primary file, then its fallbacks.
@@ -790,11 +792,19 @@ impl Sheet {
             frames: Box::new([]),
             cells: Box::new([]),
             fonts: Box::new([]),
+            movies: Box::new([]),
             fnts: Box::new([]),
             bitmap_fonts: Box::new([]),
             #[cfg(any(test, feature = "dev-tools"))]
             charged: Vec::new(),
         }
+    }
+
+    /// The skin movies' file names, by slot: names inside the skin
+    /// folder, as [`Root::open`](crate::Root) takes them.
+    #[must_use]
+    pub fn movies(&self) -> &[String] {
+        &self.movies
     }
 
     /// Loads `files` and `images` against the skin folder `root`.
@@ -879,6 +889,7 @@ impl Sheet {
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
             fonts: Box::new([]),
+            movies: Box::new([]),
             fnts: Box::new([]),
             bitmap_fonts: Box::new([]),
             #[cfg(any(test, feature = "dev-tools"))]
@@ -935,6 +946,7 @@ impl Sheet {
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
             fonts: Box::new([]),
+            movies: Box::new([]),
             fnts: Box::new([]),
             bitmap_fonts: Box::new([]),
             #[cfg(any(test, feature = "dev-tools"))]
@@ -964,6 +976,33 @@ impl Sheet {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// This sheet with `movies` as its skin movies' file names, by slot,
+    /// the first [`MAX_MOVIES`](crate::movie::MAX_MOVIES) kept: a sheet
+    /// made with [`Sheet::new`] has none.
+    #[must_use]
+    pub fn with_movies(mut self, movies: impl IntoIterator<Item = String>) -> Self {
+        self.movies = movies.into_iter().take(crate::movie::MAX_MOVIES).collect();
+        self
+    }
+
+    /// Opens skin movie `slot`'s file inside the skin folder
+    /// ([`Root::open`](crate::Root::open)): the handle and the canonical
+    /// path it was opened by, which the caller checks the handle's final
+    /// path against.
+    ///
+    /// # Errors
+    ///
+    /// [`RootError::Missing`](crate::RootError::Missing) for a slot the
+    /// sheet has not, or the first check that fails.
+    pub fn open_movie(
+        &self,
+        slot: usize,
+    ) -> Result<(std::fs::File, std::path::PathBuf), crate::RootError> {
+        let name = self.movies.get(slot).ok_or(crate::RootError::Missing)?;
+        let (file, id) = crate::Root::new(&self.root)?.open(name)?;
+        Ok((file, id.canonical().to_path_buf()))
     }
 
     /// What its image and font files are read through.

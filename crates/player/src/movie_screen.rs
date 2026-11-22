@@ -1,0 +1,464 @@
+//! A screen's skin movies opened through the run's media session
+//! (design.md "Rendering and Skins", skin movies; "Threat Model" T02).
+//!
+//! The run has one session ([`MediaHub`]), started the first time a screen
+//! with movies is prepared and kept until the run's screens and their
+//! factory are dropped, which quits its worker. Each screen that shows
+//! movies takes a new generation and enters it, then hands the session
+//! each of its movie files in slot order, opened inside the skin folder
+//! ([`skin_model::Sheet::open_movie`]) and checked on the handle: its
+//! final path must be the canonical path the folder check passed, so a
+//! name swapped for a link between the check and the open is refused. A
+//! slot whose file cannot be opened or checked is absent, logged once.
+//! Dropping the screen's [`MovieSet`] leaves it: a new generation is
+//! entered, and the session closes the players of the one left.
+//!
+//! A set belongs to exactly one screen instance ([`Holder`]): one
+//! selection entry, or one play preparation that becomes one play screen.
+//! Every entry and every preparation (each practice round, each retry)
+//! opens its own set, so its movies start from their start; nothing is
+//! handed back to a request, kept for a later screen or taken over by
+//! another. The screen holds its set through [`ScreenMovies`], whose
+//! [`retire`](ScreenMovies::retire) is the one place a set is let go while
+//! its renderer lives: the set (its generation left, so the session closes
+//! its players and their rings go), the renderer's planes of every slot and
+//! the loading frames' shows go together, when the instance ends by
+//! whichever path: another set opened, a frame of another screen drawn
+//! ([`Drawn`]), its preparation cancelled or discarded before its commit,
+//! its committed play left before it began
+//! ([`abandon`](ScreenMovies::abandon)), its skin's installation removed. A screen dropped (its device lost, or
+//! the run's end) drops its set with its renderer; the screen built again
+//! opens new sets, whose movies start again, a movie lost before included.
+//!
+//! None of this waits on the session: entering stores a word and an open
+//! only queues a request.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Instant;
+
+use render::{Renderer, SkinBundle};
+use skin_model::ScreenKind;
+use skin_model::movie::MAX_MOVIES;
+
+use crate::media_host::launch::Setup;
+use crate::media_host::session::{Deadlines, Launching, Loss, Movie, Session};
+use crate::movie_frame::Movies;
+
+/// The run's media session, made when a screen first needs it.
+pub struct MediaHub {
+    /// How the worker is launched; `None` when the installation could not
+    /// be found, and every movie is then lost.
+    launching: Option<Launching>,
+    session: OnceLock<Option<Session>>,
+    generation: AtomicU64,
+    /// The sets open (tests).
+    #[cfg(test)]
+    open: AtomicU64,
+    /// The movies the next sets opened play, in place of their files'
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    supply: std::sync::Mutex<std::collections::VecDeque<[Option<Arc<Movie>>; MAX_MOVIES]>>,
+}
+
+impl MediaHub {
+    /// The hub of a run whose worker is installed beside the running
+    /// executable and stages its copies in the data folder `data`.
+    pub fn new(data: &Path) -> Arc<Self> {
+        let installation = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        if installation.is_none() {
+            log::warn!("skin movies: the game's folder cannot be found, so none is played");
+        }
+        Self::with(installation.map(|installation| Launching {
+            installation,
+            data: data.to_path_buf(),
+            setup: Setup::recipe(),
+        }))
+    }
+
+    /// The hub launching as `launching` says.
+    pub fn with(launching: Option<Launching>) -> Arc<Self> {
+        Arc::new(Self {
+            launching,
+            session: OnceLock::new(),
+            generation: AtomicU64::new(0),
+            #[cfg(test)]
+            open: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            supply: std::sync::Mutex::default(),
+        })
+    }
+
+    /// The next set opened plays `movies` in place of its files' (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn supply(&self, movies: [Option<Arc<Movie>>; MAX_MOVIES]) {
+        self.supply.lock().unwrap().push_back(movies);
+    }
+
+    /// How many sets are open (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn open_sets(&self) -> u64 {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// The newest generation taken (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// The session, started on first use.
+    fn session(&self) -> Option<&Session> {
+        self.session
+            .get_or_init(|| {
+                let launching = self.launching.clone()?;
+                Session::start(launching, Deadlines::GAME)
+                    .inspect_err(|e| log::warn!("skin movies: the media session cannot start: {e}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// The next screen's generation.
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// A screen's movies: what the session plays for it, and what the render
+/// side's hook keeps of each. Dropped, the screen is left.
+pub struct MovieSet {
+    hub: Weak<MediaHub>,
+    kind: ScreenKind,
+    /// The generation it entered (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    generation: u64,
+    /// A play's: the loading lifetime its preparation's request was
+    /// published in. Only that lifetime's loading frames show its movies;
+    /// a frame of another (a later Start's) shows none of them.
+    pub loading: Option<u64>,
+    pub movies: Movies,
+}
+
+impl MovieSet {
+    /// Opens `bundle`'s movies for a `kind` screen, its preparation
+    /// starting at `start` on the monotonic clock: `None` when the skin has
+    /// none. Each movie's clock starts at the first presented frame that
+    /// draws it ([`Movies::presented`]).
+    pub fn open(
+        hub: &Arc<MediaHub>,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+        start: Instant,
+    ) -> Option<Self> {
+        let sheet = bundle.skin().sheet();
+        let names = sheet.movies();
+        if names.is_empty() {
+            return None;
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        if let Some(movies) = hub.supply.lock().unwrap().pop_front() {
+            return Some(Self::of(hub, kind, movies, start));
+        }
+        let session = hub.session();
+        let generation = hub.next_generation();
+        if let Some(s) = session {
+            s.enter(generation);
+        }
+        let mut movies: [Option<Arc<Movie>>; MAX_MOVIES] = Default::default();
+        for (slot, (name, out)) in names.iter().zip(movies.iter_mut()).enumerate() {
+            let file = match sheet.open_movie(slot) {
+                Ok((file, canonical)) => match final_path(&file) {
+                    Ok(at) if at == canonical => file,
+                    Ok(at) => {
+                        log::warn!(
+                            "skin movie {name}: the file opened is {} rather than {}, so it is not played",
+                            at.display(),
+                            canonical.display()
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("skin movie {name}: its opened path cannot be read: {e}");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    log::warn!("{}", missing_note(name, &e));
+                    continue;
+                }
+            };
+            let movie = Movie::new(generation);
+            match session {
+                Some(s) => s.open(&movie, file, true),
+                None => {
+                    let _ = movie.lose(Loss::Launch);
+                }
+            }
+            *out = Some(movie);
+        }
+        #[cfg(test)]
+        hub.open.fetch_add(1, Ordering::SeqCst);
+        Some(Self {
+            hub: Arc::downgrade(hub),
+            kind,
+            #[cfg(all(test, feature = "dev-tools"))]
+            generation,
+            loading: None,
+            movies: Movies::new(movies, start),
+        })
+    }
+
+    /// A set of `movies` for a `kind` screen, opened at `start`, as
+    /// [`open`](Self::open) makes it with no session (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn of(
+        hub: &Arc<MediaHub>,
+        kind: ScreenKind,
+        movies: [Option<Arc<Movie>>; MAX_MOVIES],
+        start: Instant,
+    ) -> Self {
+        hub.open.fetch_add(1, Ordering::SeqCst);
+        Self {
+            hub: Arc::downgrade(hub),
+            kind,
+            generation: hub.next_generation(),
+            loading: None,
+            movies: Movies::new(movies, start),
+        }
+    }
+
+    /// The generation it entered (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The screen kind it was opened for.
+    pub const fn kind(&self) -> ScreenKind {
+        self.kind
+    }
+}
+
+impl Drop for MovieSet {
+    fn drop(&mut self) {
+        // The screen is left: its players close. A session never started
+        // has none, and a hub gone took its session with it.
+        let Some(hub) = self.hub.upgrade() else {
+            return;
+        };
+        #[cfg(test)]
+        hub.open.fetch_sub(1, Ordering::SeqCst);
+        let generation = hub.next_generation();
+        if let Some(Some(s)) = hub.session.get() {
+            s.enter(generation);
+        }
+    }
+}
+
+/// The screen instance a set of movies belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// The selection entry of this lifetime.
+    Selection(u64),
+    /// The play preparation of this request, not committed yet.
+    Preparing(u64),
+    /// That preparation committed, its play not begun.
+    Committed(u64),
+    /// The play screen it became.
+    Playing,
+}
+
+/// The screen a frame drawn belongs to, as a set's holder judges it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    /// The selection skin's frame of this lifetime.
+    Selection(u64),
+    /// Selection's built-in page, drawn when no selection skin draws (none
+    /// installed, or not the one its state is for): selection was entered
+    /// all the same.
+    BuiltInSelection,
+    /// A play's frame.
+    Play,
+    /// Anything else: a page (the decision or practice page), a loading
+    /// frame, a result, the end page, a splash or a text.
+    Other,
+}
+
+impl Holder {
+    /// Whether its screen instance goes on while a `drawn` frame is drawn:
+    /// a selection entry's while its own skinned frames draw; a play's
+    /// preparation whatever draws meanwhile (its cancel ends it), and once
+    /// committed until a selection frame draws, skinned or built-in; a
+    /// play screen while play frames draw.
+    const fn keeps(self, drawn: Drawn) -> bool {
+        match (self, drawn) {
+            (Self::Selection(l), Drawn::Selection(d)) => l == d,
+            (Self::Preparing(_), _)
+            | (Self::Committed(_), Drawn::Play | Drawn::Other)
+            | (Self::Playing, Drawn::Play) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The movies of the screen instance shown or being prepared, with their
+/// holder; the renderer's part of them goes with them.
+pub struct ScreenMovies {
+    held: Option<(Holder, MovieSet)>,
+}
+
+impl ScreenMovies {
+    /// None held.
+    pub const fn new() -> Self {
+        Self { held: None }
+    }
+
+    /// The set held and its holder.
+    pub fn get(&self) -> Option<(Holder, &MovieSet)> {
+        self.held.as_ref().map(|(h, s)| (*h, s))
+    }
+
+    /// The set held and its holder.
+    pub fn get_mut(&mut self) -> Option<(Holder, &mut MovieSet)> {
+        self.held.as_mut().map(|(h, s)| (*h, s))
+    }
+
+    /// Its screen instance ends: the set is dropped (its generation left,
+    /// its players closed), and `renderer` releases every slot's planes
+    /// and shows no movie in its loading frames or play builds. The one
+    /// place a set is let go while its renderer lives.
+    pub fn retire(&mut self, renderer: &mut Renderer) {
+        if self.held.take().is_some() {
+            renderer.retire_movies();
+        }
+    }
+
+    /// The set held retired, then `open`'s held for `holder`, opened once
+    /// the one before it is left.
+    pub fn open(
+        &mut self,
+        holder: Holder,
+        renderer: &mut Renderer,
+        open: impl FnOnce() -> Option<MovieSet>,
+    ) {
+        self.retire(renderer);
+        self.held = open().map(|set| (holder, set));
+    }
+
+    /// A `drawn` frame is drawn: the set held is retired unless its screen
+    /// instance goes on ([`Holder::keeps`]).
+    pub fn drawn(&mut self, drawn: Drawn, renderer: &mut Renderer) {
+        if self.held.as_ref().is_some_and(|(h, _)| !h.keeps(drawn)) {
+            self.retire(renderer);
+        }
+    }
+
+    /// Play preparation `request` (`None`: whichever) is cancelled or
+    /// discarded: the set it holds, not committed, is retired.
+    pub fn cancel(&mut self, request: Option<u64>, renderer: &mut Renderer) {
+        if let Some((Holder::Preparing(r), _)) = &self.held
+            && request.is_none_or(|q| q == *r)
+        {
+            self.retire(renderer);
+        }
+    }
+
+    /// The committed play of preparation `request` is left before it
+    /// began (a quit after its commit and before READY): the set it holds
+    /// is retired. A set of another request, or one not committed (a
+    /// preparation kept for a local retry), is left as it is.
+    pub fn abandon(&mut self, request: u64, renderer: &mut Renderer) {
+        if matches!(&self.held, Some((Holder::Committed(r), _)) if *r == request) {
+            self.retire(renderer);
+        }
+    }
+
+    /// Play preparation `request` is committed: the set it holds is its
+    /// play's.
+    pub fn commit(&mut self, request: u64) {
+        if let Some((holder, _)) = &mut self.held
+            && *holder == Holder::Preparing(request)
+        {
+            *holder = Holder::Committed(request);
+        }
+    }
+
+    /// The committed play begins: its screen draws its movies from here,
+    /// each on the clock it started in a loading frame, or starting at the
+    /// first play frame presented that draws it.
+    pub fn begin_play(&mut self, renderer: &mut Renderer) {
+        self.drawn(Drawn::Play, renderer);
+        if let Some((holder, _)) = &mut self.held
+            && matches!(holder, Holder::Committed(_))
+        {
+            *holder = Holder::Playing;
+        }
+    }
+}
+
+/// The note of movie `name`'s file that could not be opened again at
+/// screen entry (`e`): the import's note for a missing asset, in the form
+/// the skin's import log writes its notes (where, severity, kind).
+fn missing_note(name: &str, e: &dyn std::fmt::Display) -> String {
+    format!(
+        "skin movie {name}: {:?}: {} ({e})",
+        skin_beatoraja::Severity::Dropped,
+        skin_beatoraja::NoteKind::MissingAsset
+    )
+}
+
+/// The final path of the file `file` has open, as the system resolves it
+/// (`GetFinalPathNameByHandleW`, normalized, with a drive letter): the
+/// form [`std::fs::canonicalize`] gives.
+fn final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+    let handle = HANDLE(file.as_raw_handle());
+    let mut buf = vec![0_u16; 512];
+    loop {
+        // SAFETY: `handle` is the open file's; the buffer is writable for
+        // its length.
+        let n = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, VOLUME_NAME_DOS) } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+        }
+        // Too small: `n` is the length it needs, nul included.
+        buf.resize(n, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file gone between the import and the screen's entry is noted as
+    /// the import notes a missing asset, and takes no player.
+    #[test]
+    fn a_failed_reopen_is_noted_as_a_missing_asset() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let note = missing_note("a.mp4", &e);
+        assert!(
+            note.starts_with("skin movie a.mp4: Dropped: a missing or unreadable file ("),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn final_path_is_the_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.mp4");
+        std::fs::write(&path, b"x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(final_path(&file).unwrap(), path.canonicalize().unwrap());
+    }
+}

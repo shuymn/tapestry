@@ -115,12 +115,12 @@ fn fs_multiply(v: VOut) -> @location(0) vec4f {
 
 /// The target the quads are drawn on: a row per blend, a column per
 /// filter and source.
-const W: u32 = 576;
-const H: u32 = 144;
+pub(super) const W: u32 = 576;
+pub(super) const H: u32 = 144;
 /// Each quad's side, and the step between quads.
 const QUAD: f32 = 40.0;
 const STEP: f32 = 48.0;
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub(super) const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// The atlas's side and the pool's: unequal.
 const ATLAS_SIDE: u32 = 256;
 const POOL_SIDE: u32 = 512;
@@ -154,12 +154,12 @@ fn level(side: u32, z: u32, k: u32) -> Vec<u8> {
 }
 
 /// Every level of image `z` at `side`.
-fn image(side: u32, z: u32) -> Vec<Vec<u8>> {
+pub(super) fn image(side: u32, z: u32) -> Vec<Vec<u8>> {
     (0..4).map(|k| level(side, z, k)).collect()
 }
 
 /// An atlas array of `images` at `side` after the built-in layer.
-fn atlas_of(gpu: &crate::Gpu, side: u32, images: &[Vec<Vec<u8>>]) -> AtlasTexture {
+pub(super) fn atlas_of(gpu: &crate::Gpu, side: u32, images: &[Vec<Vec<u8>>]) -> AtlasTexture {
     let pages: Vec<PageLevels<'_>> = images
         .iter()
         .map(|i| [&i[0][..], &i[1][..], &i[2][..], &i[3][..]])
@@ -206,13 +206,14 @@ fn quads(sources: &[([f32; 4], u32, u32)]) -> Vec<(usize, Instance)> {
     out
 }
 
-/// `quads` drawn with `pipes` (by blend), `bind` and the BGA group `bga`
-/// over a cleared target, read back: RGBA8 rows tightly packed.
-fn draw(
+/// `quads` drawn with `pipes` (by blend), `bind`, the BGA group `bga`
+/// and the video group `video` over a cleared target, read back: RGBA8 rows tightly packed.
+pub(super) fn draw(
     gpu: &crate::Gpu,
     pipes: [&wgpu::RenderPipeline; 3],
     bind: &wgpu::BindGroup,
     bga: &wgpu::BindGroup,
+    video: &wgpu::BindGroup,
     quads: &[(usize, Instance)],
 ) -> Vec<u8> {
     let device = gpu.device();
@@ -263,6 +264,7 @@ fn draw(
         });
         pass.set_bind_group(0, bind, &[]);
         pass.set_bind_group(1, bga, &[]);
+        pass.set_bind_group(crate::video::GROUP, video, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         for (i, &(blend, _)) in (0..).zip(quads) {
             pass.set_pipeline(pipes[blend]);
@@ -416,8 +418,14 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
         label: Some("before"),
         source: wgpu::ShaderSource::Wgsl(BEFORE_WGSL.into()),
     });
-    let (old_alpha, old_additive, old_multiply) =
-        sprite_pipelines(device, &old_layout, &bindings.bga, &old_module, FORMAT);
+    let (old_alpha, old_additive, old_multiply) = sprite_pipelines(
+        device,
+        &old_layout,
+        &bindings.bga,
+        &bindings.video,
+        &old_module,
+        FORMAT,
+    );
     let old_bind = |a: &AtlasTexture| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("before"),
@@ -447,14 +455,23 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
     let bind = bindings.bind(device, &atlas, Some(pool.view()));
     // No BGA quad is drawn: both shaders read the stand-in.
     let bga = crate::bga::BgaArray::stand_in(gpu, &bindings.bga);
+    let video = crate::video::Video::new(gpu, &bindings.video);
 
     // Atlas quads: the built-in read and the page, as before.
     let builtin = [0.0, 0.0, 0.3, 0.3];
     let page = [0.1, 0.1, 0.6, 0.6];
     let atlas_quads = quads(&[(builtin, 0, 0), (page, 1, 0)]);
-    let drawn = draw(gpu, now, &bind, &bga.bind, &atlas_quads);
+    let drawn = draw(gpu, now, &bind, &bga.bind, &video.bind, &atlas_quads);
     assert!(
-        drawn == draw(gpu, before, &old_bind(&atlas), &bga.bind, &atlas_quads),
+        drawn
+            == draw(
+                gpu,
+                before,
+                &old_bind(&atlas),
+                &bga.bind,
+                &video.bind,
+                &atlas_quads
+            ),
         "atlas quads draw as before"
     );
 
@@ -465,6 +482,7 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
         now,
         &bind,
         &bga.bind,
+        &video.bind,
         &quads(&[(cell, 0, FLAG_POOL), (cell, 1, FLAG_POOL)]),
     );
     let expected = draw(
@@ -472,6 +490,7 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
         before,
         &old_bind(&reference),
         &bga.bind,
+        &video.bind,
         &quads(&[(cell, 1, 0), (cell, 2, 0)]),
     );
     let difference = largest_difference(&pooled, &expected);
@@ -485,6 +504,7 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
         now,
         &bind,
         &bga.bind,
+        &video.bind,
         &quads(&[(cell, 0, 0), (cell, 1, 0)]),
     );
     assert!(largest_difference(&pooled, &unflagged) > 32);

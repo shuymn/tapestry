@@ -110,6 +110,8 @@ impl Strings {
 pub struct Selection {
     /// Whether a selection skin made it.
     pub(crate) live: bool,
+    /// What each skin movie's destinations show this frame.
+    movies: crate::movie::MovieShows,
     /// The identity of the skin that made it.
     pub(crate) skin: u64,
     /// The schema's fields, then the callbacks' output slots.
@@ -186,6 +188,7 @@ impl Selection {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         Self {
             live,
+            movies: crate::movie::MovieShows::default(),
             skin,
             fields: vec![0; field::COUNT.saturating_add(crate::output::slots(outputs))]
                 .into_boxed_slice(),
@@ -218,6 +221,17 @@ impl Selection {
 
     /// A state with no timer, text, row or pointer slot, which a skin of
     /// another kind gives: nothing accepts it.
+    /// Sets what each skin movie's destinations show from the next build
+    /// on.
+    pub fn set_movies(&mut self, movies: crate::movie::MovieShows) {
+        self.movies = movies;
+    }
+
+    /// What each skin movie's destinations show.
+    pub(crate) const fn movies(&self) -> &crate::movie::MovieShows {
+        &self.movies
+    }
+
     pub(crate) fn inert(skin: u64) -> Self {
         let mut s = Self::new(skin, false, 0, 0, 0, [0, 0, 0], 0);
         s.starts = Box::default();

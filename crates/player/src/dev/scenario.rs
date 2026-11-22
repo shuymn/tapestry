@@ -4949,6 +4949,7 @@ pub(crate) mod tests {
                 dropped: 0,
                 outcome: render::FrameOutcome::Shown,
                 present_count: None,
+                movies: [false; skin_model::movie::MAX_MOVIES],
             },
             statistics: None,
             presentation: None,

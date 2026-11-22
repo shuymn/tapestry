@@ -546,6 +546,19 @@ impl Cx<'_> {
                 super::prepare::Prepare::Selector((!index.non_negative()).then(|| src.to_owned()));
             return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
         }
+        // A movie source on a screen that plays movies (design.md
+        // "Rendering and Skins", skin movies); elsewhere, and as a paint
+        // or in a group above, a movie stays unsupported.
+        if matches!(
+            self.kind,
+            skin_model::ScreenKind::Play | skin_model::ScreenKind::Selection
+        ) && let Some(movie) = self.movie_source(&s, at)?
+        {
+            return match movie {
+                Ok(slot) => self.movie(dst, slot, charged, role),
+                Err(why) => self.drop_el(role, at, why),
+            };
+        }
         // A plain image lowered as a paint left above.
         let Some(c) = self.turning_image_common(&dst, charged, (Lowered::Image, role))? else {
             return Ok(());

@@ -245,6 +245,12 @@ pub struct FileId {
 }
 
 impl FileId {
+    /// The canonical path the file was opened or read by.
+    #[must_use]
+    pub fn canonical(&self) -> &Path {
+        &self.canonical
+    }
+
     /// The name the file was read by, relative to the folder, normalised:
     /// `/` separators, no `.`, `..` or empty components.
     #[must_use]
@@ -523,6 +529,44 @@ impl Root {
         }
         Ok((
             bytes,
+            FileId {
+                canonical,
+                name: normal,
+            },
+        ))
+    }
+
+    /// Opens the regular file `name` for reading without reading it, and
+    /// returns the handle and the file's identity: a skin movie's file,
+    /// which the media worker reads through the handle ("Threat Model"
+    /// T02).
+    ///
+    /// The name, the canonical path and the file's type are checked as in
+    /// [`Root::read`], on its metadata before it is opened and on the
+    /// opened handle; no length bound applies. What the handle reaches
+    /// after a swap between the canonical check and the open is the
+    /// caller's to check on the handle (the player reads its final path).
+    ///
+    /// # Errors
+    ///
+    /// The first check that fails, or [`RootError::Io`].
+    pub fn open(&self, name: &str) -> Result<(File, FileId), RootError> {
+        let (canonical, normal) = self.locate(name)?;
+        if normal.is_empty() {
+            return Err(RootError::NotAFile);
+        }
+        let regular = |meta: &fs::Metadata| {
+            if meta.is_file() {
+                Ok(())
+            } else {
+                Err(RootError::NotAFile)
+            }
+        };
+        regular(&fs::metadata(&canonical).map_err(RootError::Io)?)?;
+        let file = File::open(&canonical).map_err(RootError::Io)?;
+        regular(&file.metadata().map_err(RootError::Io)?)?;
+        Ok((
+            file,
             FileId {
                 canonical,
                 name: normal,
