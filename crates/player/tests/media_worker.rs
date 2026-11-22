@@ -281,6 +281,7 @@ impl Ring {
     /// Whether every frame the ring holds ready has its end resolved: the
     /// worker has decoded the frame after each (the slot's seventh word,
     /// `until`, is no longer open).
+    #[cfg(feature = "dev-tools")]
     fn ends_resolved(&self) -> bool {
         let words = Self::words(self.view, self.len);
         let geometry = self.reader.geometry();
