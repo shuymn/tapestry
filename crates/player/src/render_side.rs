@@ -8521,8 +8521,6 @@ impl Run {
                 }
                 self.first_frame = Some(first);
             }
-            // The skin movies' admission, before the grant is waited for.
-            self.movie_admission(&mode);
             // The result's held pass after the hand-over: nothing built or
             // presented while the first view stages within the bound; its
             // outgoing phase ends at the bound, a size notice, a target
@@ -8584,6 +8582,10 @@ impl Run {
                     }
                 }
             }
+            // The skin movies' admission, before the grant is waited for
+            // and after the held pass, which presents nothing and so takes
+            // no grant.
+            self.movie_admission(&mode);
             let Some(screen) = &mut self.screen else {
                 continue;
             };

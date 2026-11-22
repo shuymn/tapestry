@@ -51,7 +51,7 @@ fn publish(movie: &Movie, seq: u64, stamp: i64, id: u8) {
 }
 
 /// A live 64 × 32 movie with a frame at each of `stamps` (µs).
-fn clip(stamps: &[i64]) -> Arc<Movie> {
+pub(crate) fn clip(stamps: &[i64]) -> Arc<Movie> {
     let m = Movie::live_here(1, 64, 32);
     for (k, &stamp) in stamps.iter().enumerate() {
         let k = u64::try_from(k).unwrap();

@@ -2272,11 +2272,11 @@ impl Screen for MenuScreen {
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
-        self.movies.drawn(Drawn::Other, &mut self.renderer);
         self.text_frame(lines).map(|t| t.presented())
     }
 
     fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
+        self.movies.drawn(Drawn::Other, &mut self.renderer);
         let timing = self.renderer.text_frame(lines)?;
         self.shown(timing.presented());
         Ok(timing)
@@ -2667,7 +2667,7 @@ impl MenuScreen {
 
 #[cfg(test)]
 #[cfg(feature = "dev-tools")]
-mod movie_tests;
+pub(crate) mod movie_tests;
 
 #[cfg(test)]
 mod tests {
