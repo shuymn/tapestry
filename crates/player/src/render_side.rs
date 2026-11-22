@@ -2164,6 +2164,9 @@ struct Shared {
     /// (tests).
     #[cfg(test)]
     result_commit_hold: [AtomicBool; 2],
+    /// Run once right after the next read of the acknowledgement (tests).
+    #[cfg(test)]
+    after_acknowledged_read: AckReadHook,
     /// Play frames hold right before they acquire the view while set, and
     /// whether one holds (tests).
     #[cfg(test)]
@@ -2415,6 +2418,8 @@ impl Shared {
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
             #[cfg(test)]
             result_commit_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            after_acknowledged_read: AckReadHook::default(),
             #[cfg(test)]
             play_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
             #[cfg(all(test, feature = "dev-tools"))]
@@ -3449,10 +3454,37 @@ impl RenderLink {
     /// acknowledged, 0 before any.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn result_acknowledged(&self) -> u64 {
-        self.shared
+        let acknowledged = self
+            .shared
             .result_entries
             .acknowledged
-            .load(Ordering::Acquire)
+            .load(Ordering::Acquire);
+        // Taken before it runs: the hook may read the acknowledgement too.
+        #[cfg(test)]
+        let hook = self
+            .shared
+            .after_acknowledged_read
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(f) = hook {
+            f(self);
+        }
+        acknowledged
+    }
+
+    /// Runs `f` once, right after the next read of the acknowledgement
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn after_acknowledged_read(&self, f: impl FnOnce(&Self) + Send + 'static) {
+        *self
+            .shared
+            .after_acknowledged_read
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -9332,7 +9364,9 @@ impl Run {
                     // A test holds the frame here, its view committed and
                     // its barrier written, before it is built.
                     #[cfg(test)]
-                    Shared::hold_frame(&self.shared.result_commit_hold);
+                    if self.result.as_ref().is_some_and(|s| s.presented.is_some()) {
+                        Shared::hold_frame(&self.shared.result_commit_hold);
+                    }
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
                         self.shared
@@ -9686,6 +9720,7 @@ impl Run {
                     && let Some(side) = &mut self.result
                 {
                     side.acked = true;
+                    side.first = None;
                 }
             }
             // What the frame drew, fixed before a refused decision frame
@@ -13070,7 +13105,10 @@ struct ResultSide {
     lifetime: u64,
     incoming: Option<Box<ResultPresentation>>,
     /// The lifetime's first payload, the one handed over (design.md
-    /// "beatoraja Lua Skins", the result skin).
+    /// "beatoraja Lua Skins", the result skin), until its first picture's
+    /// acknowledgement: after it no payload waits, and the payload is
+    /// owned only where the atlas report counts it (presented, staged or
+    /// taken), never by this identity.
     first: Option<Arc<ViewPayload>>,
     /// The latest presentation of another payload taken before the first
     /// picture's acknowledgement: staged as a switch once it is.
@@ -13124,7 +13162,33 @@ struct ResultSide {
     commit_refused: bool,
 }
 
+/// A test's one-shot hook on the link (tests).
+#[cfg(test)]
+pub(crate) type LinkHook = Box<dyn FnOnce(&RenderLink) + Send>;
+
+/// A test's hook, run once right after the next read of the
+/// acknowledgement.
+#[cfg(test)]
+#[derive(Default)]
+struct AckReadHook(Mutex<Option<LinkHook>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AckReadHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AckReadHook")
+    }
+}
+
 impl ResultSide {
+    /// Keeps `overlay`, of `revision`, as the newest not yet merged,
+    /// unless a newer one already waits: one take carrying both the first
+    /// payload and a newer one keeps the newer's.
+    fn merge_overlay(&mut self, revision: u64, overlay: Overlay) {
+        if self.overlay.as_ref().is_none_or(|(r, _)| *r <= revision) {
+            self.overlay = Some((revision, overlay));
+        }
+    }
+
     fn new(lifetime: u64) -> Self {
         Self {
             lifetime,
@@ -13288,7 +13352,7 @@ impl Run {
                     .as_ref()
                     .is_some_and(|f| !Arc::ptr_eq(f, &p.payload));
             if waits {
-                side.overlay = Some((p.revision, p.overlay.clone()));
+                side.merge_overlay(p.revision, p.overlay.clone());
                 side.later = Some(p);
             } else {
                 side.incoming = Some(p);
@@ -13903,7 +13967,7 @@ impl Run {
                     side.prepared = Some(PreparedView { held, token: None });
                 }
             }
-            side.overlay = Some((p.revision, p.overlay));
+            side.merge_overlay(p.revision, p.overlay);
         }
         // The staging in hand, asked again with the same request each pass
         // until its last step completes (design.md "beatoraja Lua Skins",

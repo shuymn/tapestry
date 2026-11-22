@@ -5207,6 +5207,156 @@ fn a_second_payload_needing_the_replaced_installations_room_waits_for_it() {
     a_second_payload_waits_for_the_first_picture(true);
 }
 
+/// A sink that holds every frame while `hold` is set, saying so in
+/// `waiting`, and records the result frames' views as [`Views`] does.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Default)]
+struct Holding {
+    views: Views,
+    hold: Arc<AtomicBool>,
+    waiting: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for Holding {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if self.hold.load(Ordering::SeqCst) {
+            self.waiting.store(true, Ordering::SeqCst);
+            while self.hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        }
+        self.views.frame(screen, drawn);
+    }
+}
+
+/// One take carrying both the lifetime's first payload and a newer one
+/// (the render thread held in a page's frame while both are offered):
+/// the first picture is the first payload's, with the newer offer's strip
+/// lines, the newest overlay merged whichever payload it came with.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_take_carrying_both_payloads_draws_the_newer_overlay_first() {
+    use crate::measure::ResultPath;
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let sink = Holding::default();
+    let rig = Rig::with_sink(Box::new(sink.clone()));
+    let lifetime = installed(&rig, &x0);
+    sink.hold.store(true, Ordering::SeqCst);
+    rig.link.show_end(EndPage {
+        lines: vec!["end".to_owned()],
+        graphs: None,
+        id: None,
+    });
+    assert!(
+        wait_until(|| sink.waiting.load(Ordering::SeqCst)),
+        "no frame held"
+    );
+    let notice = Overlay {
+        lines: vec!["NOTICE".to_owned()],
+        ..Overlay::default()
+    };
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &notice,
+    );
+    sink.hold.store(false, Ordering::SeqCst);
+    assert!(
+        wait_until(|| sink
+            .views
+            .0
+            .lock()
+            .unwrap()
+            .contains(&(ResultPath::Skin, Some(1)))),
+        "the first view never drawn: {:?}",
+        rig.link.result_status()
+    );
+    let first = rig
+        .drawn()
+        .iter()
+        .find_map(|d| skin_frame(d).map(|(_, n)| n))
+        .expect("a skin frame");
+    assert_eq!(
+        first, 1,
+        "the first picture without the newer offer's strip line"
+    );
+    rig.link.exit();
+}
+
+/// The first payload is owned only where the atlas report counts it
+/// (design.md "Memory Budget"): after a switch from the first view A to
+/// B, once the report no longer names A's atlas nothing of the render
+/// side keeps A's bundle, and a third distinct view C switches with only
+/// B's and C's atlases named.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_first_payload_switched_from_is_owned_only_where_the_report_counts_it() {
+    let (_x0d, x0) = fixed_skin();
+    let (_ad, a) = fixed_skin();
+    let (_bd, b) = fixed_skin();
+    let (_cd, c) = fixed_skin();
+    let views = Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    let lifetime = installed(&rig, &x0);
+    let shown = |key| wait_until(|| views.0.lock().unwrap().iter().any(|(_, v)| *v == Some(key)));
+    let (a_id, b_id, c_id) = (a.atlas_id(), b.atlas_id(), c.atlas_id());
+    let weak_a = Arc::downgrade(&a);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&a), 1_000, &[]),
+        &Overlay::default(),
+    );
+    drop(a);
+    assert!(shown(1), "A never drawn: {:?}", rig.link.result_status());
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&b), 2_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(shown(2), "B never drawn: {:?}", rig.link.result_status());
+    assert!(
+        wait_until(|| !rig.link.result_status().retained.contains(&a_id)),
+        "A's atlas still named: {:?}",
+        rig.link.result_status()
+    );
+    assert!(
+        wait_until(|| weak_a.upgrade().is_none()),
+        "A's bundle kept past the report: {:?}",
+        rig.link.result_status()
+    );
+    show(
+        &rig.link,
+        lifetime,
+        3,
+        &payload(3, Some(&c), 3_000, &[]),
+        &Overlay::default(),
+    );
+    assert!(shown(3), "C never drawn: {:?}", rig.link.result_status());
+    let retained = rig.link.result_status().retained;
+    assert!(
+        !retained.contains(&a_id) && retained.contains(&c_id),
+        "the report after C: {retained:?} (A {a_id:?}, B {b_id:?}, C {c_id:?})"
+    );
+    rig.link.exit();
+}
+
 /// The lifetime's first view whose commit is refused falls back to its
 /// built-in page (design.md "beatoraja Lua Skins", the result skin): no
 /// built-in end page with nothing presented, the view's own page next, and

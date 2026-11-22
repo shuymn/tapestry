@@ -3089,7 +3089,7 @@ impl PlayerRig<'_> {
             scene: timing.and_then(|t| t.scene),
             // Until the result shows a preset step is dropped: a scripted
             // step waits for it (design.md "State Model", Result).
-            accepts: self.result_view_shown && accepts_input(timing, origin, now),
+            accepts: self.view_shown() && accepts_input(timing, origin, now),
             input: timing.map(|t| t.input),
             origin,
             now,

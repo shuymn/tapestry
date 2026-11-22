@@ -2445,7 +2445,11 @@ fn a_render_thread_held_across_both_publications_shows_the_hand_over_view_first(
 /// the first commit and retires every runtime: the first committed view is
 /// the hand-over payload's built-in page, committed with no runtime (no
 /// fallback at the commit point), and the presenter's built-in payload
-/// commits after the acknowledgement.
+/// commits after the acknowledgement. The refusal reported before the show
+/// decides the gate, and that page held before its submission: the result
+/// has not shown and the offset key is refused until the page's
+/// acknowledgement, as the gate is decided from the state the first
+/// payload was published with (design.md "State Model", Result).
 #[test]
 fn a_text_refused_first_view_commits_its_built_in_page_first() {
     let _serial = imports::serial();
@@ -2455,12 +2459,33 @@ fn a_text_refused_first_view_commits_its_built_in_page_first() {
         let (from, _skin) = held_scripted_miss(rig, frames, &a, &report, &screen);
         crate::dev::refuse_next_result_text();
         let commits = rig.render.result_commits();
+        rig.render.hold_result_commit(true);
+        rig.after_present = Some(Box::new(|render| {
+            let end = Instant::now() + Duration::from_secs(20);
+            while render.result_status().disabled.is_none() {
+                assert!(Instant::now() < end, "the text never refused");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }));
         rig.show_end(&report, &screen);
         let handed = published(rig);
         assert!(
             handed.script.is_some(),
             "the hand-over's view keeps no runtime"
         );
+        until_true(rig, "the page's commit", |rig| {
+            rig.render.result_commit_held()
+        });
+        look(rig);
+        assert!(
+            !rig.result_view_shown(),
+            "shown before the fallback page's acknowledgement"
+        );
+        assert!(
+            !rig.controls.tuning().adjust(game::Adjust::InputOffsetUp),
+            "the offset key before the fallback page shows"
+        );
+        rig.render.hold_result_commit(false);
         let seen = frames.until(rig, from, "the first committed view", |f| {
             f.iter().any(|f| f.path.is_some() && !f.pending())
         });
@@ -2473,6 +2498,7 @@ fn a_text_refused_first_view_commits_its_built_in_page_first() {
             (Some(ResultPath::BuiltIn), Some(handed.key)),
             "the first view not the hand-over's built-in page: {seen:?}"
         );
+        until_shown(rig);
         until_true(rig, "the presenter's built-in payload", |rig| {
             rig.presenter.payload().is_some_and(|p| p.skin.is_none())
         });
@@ -2492,6 +2518,143 @@ fn a_text_refused_first_view_commits_its_built_in_page_first() {
                 .is_none_or(|(_, why)| !why.contains("could not be committed")),
             "the first view fell back at the commit point: {status:?}"
         );
+        rig.leave_result();
+    });
+}
+
+/// V19a with a recovery: a result with no result skin, shown at its
+/// hand-over, whose screen is built again: the end screen closes for the
+/// rebuild and opens again at the re-show, the offset key working, and
+/// the result's entry (its sound with it) is kept (design.md "State
+/// Model", Result; "Recovery").
+#[test]
+fn a_skinless_result_shown_again_after_a_rebuild_gets_its_offset_keys_back() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        rig.result_skin = ResultSkin::new(None);
+        prepared(rig, &a);
+        frames.arm();
+        rig.begin_result(&report, &screen);
+        rig.show_end(&report, &screen);
+        assert!(rig.controls.tuning().end_screen_shown());
+        let number = rig.result_entry.as_ref().map(|e| e.number);
+        rig.prepare_screen().unwrap();
+        assert!(
+            !rig.controls.tuning().end_screen_shown(),
+            "the end screen open during the rebuild"
+        );
+        rig.show_end(&report, &screen);
+        assert!(rig.result_view_shown());
+        let tuning = rig.controls.tuning();
+        assert!(
+            tuning.end_screen_shown(),
+            "the end screen closed after the re-show"
+        );
+        assert!(tuning.adjust(game::Adjust::InputOffsetUp));
+        assert_eq!(
+            rig.result_entry.as_ref().map(|e| e.number),
+            number,
+            "the entry not kept"
+        );
+        rig.leave_result();
+    });
+}
+
+/// A look reads the acknowledgement once, for the gate and the sound: the
+/// first picture acknowledged right after that read starts neither, and
+/// the next read both, so no look starts the result's sound with the gate
+/// still closed, where a command it takes would skip the skin's input time
+/// or outro (design.md "State Model", Result and system sounds).
+#[test]
+fn an_acknowledgement_during_a_look_opens_the_gate_with_the_sound() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let _skin = timed_hand_over(rig, frames, &a, &report, &screen);
+        rig.render.hold_result_commit(true);
+        rig.show_end(&report, &screen);
+        until_true(rig, "the first view's commit", |rig| {
+            rig.render.result_commit_held()
+        });
+        let number = rig.result_entry.as_ref().expect("an entry").number;
+        rig.render.after_acknowledged_read(move |render| {
+            render.hold_result_commit(false);
+            let end = Instant::now() + Duration::from_secs(20);
+            while render.result_acknowledged() != number {
+                assert!(Instant::now() < end, "the first picture never acknowledged");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let flag = Arc::clone(&rig.result_started);
+        let started = || flag.load(Ordering::SeqCst);
+        rig.start_result_sound();
+        assert_eq!(
+            (started(), rig.result_view_shown()),
+            (false, false),
+            "the acknowledgement read twice in one look"
+        );
+        rig.start_result_sound();
+        assert_eq!((started(), rig.result_view_shown()), (true, true));
+        rig.leave_result();
+    });
+}
+
+/// A scripted preset step waits for the result to show (design.md "State
+/// Model", Result): polled with the first picture drawn and acknowledged
+/// and the skin's input time passed, before a look read the
+/// acknowledgement, nothing is sent; from the look that reads it exactly
+/// one step is sent.
+#[test]
+fn a_scripted_step_is_sent_from_the_acknowledging_look() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let _skin = timed_hand_over(rig, frames, &a, &report, &screen);
+        rig.result_script = Some(crate::dev::SelectScript::parse("next").unwrap());
+        rig.show_end(&report, &screen);
+        // The result's input queue read from here, as the flow's entry does.
+        rig.result_input.enter();
+        let number = rig.result_entry.as_ref().expect("an entry").number;
+        let end = Instant::now() + Duration::from_secs(20);
+        while rig.render.result_acknowledged() != number || !rig.render.end_page_drawn() {
+            assert!(Instant::now() < end, "the first picture never drawn");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let o = rig.render.presented_origin().expect("the origin");
+        while rig.now().0 < o.0 + timed().input.0 + 50_000 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sent = |rig: &PlayerRig<'_>| {
+            rig.result_script
+                .as_ref()
+                .and_then(|s| s.sent_views)
+                .is_some()
+        };
+        rig.poll_result_script();
+        assert!(!sent(rig), "a step sent before the result showed");
+        assert_eq!(
+            rig.take_menu(),
+            None,
+            "a step queued before the result showed"
+        );
+        // From the acknowledging look the step goes once its page is drawn.
+        look(rig);
+        assert!(rig.result_view_shown());
+        let end = Instant::now() + Duration::from_secs(20);
+        while !sent(rig) {
+            assert!(
+                Instant::now() < end,
+                "no step after the result showed: {:?}",
+                rig.result_script.as_ref().and_then(|s| s.failure())
+            );
+            look(rig);
+        }
+        assert!(rig.take_menu().is_some(), "the step sent not queued");
+        assert_eq!(rig.take_menu(), None, "more than one step");
         rig.leave_result();
     });
 }

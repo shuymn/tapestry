@@ -1066,7 +1066,6 @@ fn rig<'a>(
         result_offset: None,
         result_leaving: false,
         result_entry: None,
-        result_view_shown: true,
         #[cfg(feature = "dev-tools")]
         views_shown: 0,
         result_outro: None,
@@ -1077,6 +1076,8 @@ fn rig<'a>(
         relooked: std::sync::Arc::default(),
         #[cfg(test)]
         result_started: std::sync::Arc::default(),
+        #[cfg(test)]
+        after_present: None,
         #[cfg(test)]
         park_probe: std::sync::Arc::default(),
         #[cfg(all(test, feature = "dev-tools"))]
