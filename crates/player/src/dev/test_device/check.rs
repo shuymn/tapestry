@@ -1803,6 +1803,24 @@ mod tests {
         let (ok, out) = check_set(&dir);
         assert!(!ok && out.contains("compare.a1-r75.band-17"), "{out}");
 
+        // A set with a role that has not run (its folder not made) is
+        // judged on the roles that ran, and does not match: each of the
+        // missing role's checks is named.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("set");
+        let set = set_folder(&dir, None);
+        private_verdicts(&dir, &set, &set_outcome);
+        std::fs::rename(dir.join("R75"), tmp.path().join("R75.kept")).unwrap();
+        std::fs::remove_file(dir.join("verdicts-judge.jsonl")).unwrap();
+        super::super::judge::judge("p1-compare", &dir).unwrap();
+        let judged = std::fs::read_to_string(dir.join("verdicts-judge.jsonl")).unwrap();
+        assert!(
+            judged.contains("\"A2/p1.volumes\"") && !judged.contains("\"R75/"),
+            "{judged}"
+        );
+        let (ok, out) = check_set(&dir);
+        assert!(!ok && out.contains("R75/ref.attached"), "{out}");
+
         // A1's folder in R1's place: the runs no longer bind to their roles.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("set");

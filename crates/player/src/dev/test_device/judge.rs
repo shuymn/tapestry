@@ -1995,7 +1995,8 @@ pub fn lines(row: &str, r: &Reading) -> Vec<Value> {
 /// The verdict lines of the set in `dir` for its row `e`: the set's
 /// provenance over every role's link (and each panel role's mode link), the
 /// reservation's build named in every `hello`, each panel role's driving
-/// connection in the panel mode; then each role's row checks on its run,
+/// connection in the panel mode; then each role's row checks on its run (a
+/// role whose folder is not there, which has not run, is left out),
 /// its own provenance left out, each id and input named by the role. The
 /// standing of every role's streams is read once, for the whole set; every
 /// line names the set's row and id.
@@ -2016,6 +2017,11 @@ pub fn set_lines(e: &contract::Expectation, dir: &Path) -> anyhow::Result<Vec<Va
             .iter()
             .find(|r| r.role == role.name)
             .ok_or_else(|| anyhow::anyhow!("the set reserves no role `{}`", role.name))?;
+        // A role that has not run (its folder not made) has no verdicts:
+        // `check` names each of its checks as missing.
+        if !test_device::contract::one_segment(&reserved.dir) || !dir.join(&reserved.dir).is_dir() {
+            continue;
+        }
         let r = read_role(role.row, &dir.join(&reserved.dir), role.name, &standing)?;
         links.push((role.name, LINK, r.files.link.clone()));
         if let Some(x) = &r.panel {
