@@ -420,8 +420,10 @@ pub fn ends_refused(e: &LaunchError) {
 
 /// Peeks at `due` in the frame ring `reader` reads and takes the frame
 /// due, if any, at the tight pitch (rows of the luma and chroma widths)
-/// into `out`, which it sizes to a frame's bytes: the frame taken, and
-/// whether slots were freed (a take always frees its frame's).
+/// into `out`, which it sizes to a frame's bytes: the frame taken,
+/// whether slots were freed (a take always frees its frame's), and whether
+/// the peek was its run's first, after which the game signals the worker,
+/// which may be waiting for its time to start.
 ///
 /// # Errors
 ///
@@ -431,10 +433,10 @@ pub fn read_tight(
     words: &[std::sync::atomic::AtomicU64],
     due: i64,
     out: &mut Vec<u8>,
-) -> Result<(Option<skin_model::media::Frame>, bool), skin_model::media::Fault> {
+) -> Result<(Option<skin_model::media::Frame>, bool, bool), skin_model::media::Fault> {
     let peek = reader.peek(words, due)?;
     let Some(d) = peek.due else {
-        return Ok((None, peek.freed));
+        return Ok((None, peek.freed, peek.first));
     };
     let g = reader.geometry();
     out.resize(g.frame_bytes(), 0);
@@ -445,5 +447,5 @@ pub fn read_tight(
             .is_some()
     };
     let f = reader.take(words, d, [w, w.div_ceil(2)], &mut sink)?;
-    Ok((Some(f), true))
+    Ok((Some(f), true, peek.first))
 }

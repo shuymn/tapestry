@@ -233,12 +233,12 @@ impl Ring {
     }
 
     /// Polls the ring at `due`, signalling the worker when slots were
-    /// freed: the frame taken, if any.
+    /// freed or the peek was its run's first: the frame taken, if any.
     fn poll(&mut self, due: i64) -> Option<Frame> {
         let words = Self::words(self.view, self.len);
-        let (taken, freed) = read_tight(&mut self.reader, words, due, &mut self.frame)
+        let (taken, freed, first) = read_tight(&mut self.reader, words, due, &mut self.frame)
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
-        if freed {
+        if freed || first {
             // SAFETY: the ring's event.
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }

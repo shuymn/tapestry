@@ -336,7 +336,10 @@ fn draw(movie: &Movie, drawn: &Drawn) {
         let origin = *origin.get_or_insert_with(Instant::now);
         let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
         match read_tight(r, live.ring.words(), due, &mut frame) {
-            Ok((taken, freed)) => {
+            Ok((taken, freed, first)) => {
+                if first {
+                    movie.wake();
+                }
                 if taken.is_some() {
                     drawn.staged.fetch_add(1, Ordering::AcqRel);
                     movie.staged_first();
