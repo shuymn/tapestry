@@ -127,6 +127,8 @@ pub(crate) enum Site {
     Trailing,
     /// Each mip level of each page.
     Mip,
+    /// Before each page's allocation.
+    Page,
     /// After a chart image's decode ([`crate::chart_image`]).
     Decoded,
     /// After a chart image's fit into its slot.

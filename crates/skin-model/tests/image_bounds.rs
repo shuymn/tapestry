@@ -853,10 +853,17 @@ fn growing_png(path: &std::path::Path) {
     f.set_len(1 << 20).unwrap();
 }
 
-/// A cancel that asks nothing to stop: on its first ask, the first piece
-/// of the first read, it grows the file at `path` to [`MAX_FILE_BYTES`].
-fn grow_once(path: &std::path::Path, grown: &std::cell::Cell<bool>) -> bool {
-    if !grown.replace(true) {
+/// The pages the growing file's tests build: the build asks its cancel
+/// once before each page's allocation, before any read.
+const GROW_PAGES: u32 = 4;
+
+/// A cancel that asks nothing to stop: on its first ask after the
+/// [`GROW_PAGES`] asks before the pages' allocation, the first piece of
+/// the first read, it grows the file at `path` to [`MAX_FILE_BYTES`].
+/// `asks` counts its asks.
+fn grow_once(path: &std::path::Path, asks: &std::cell::Cell<u32>) -> bool {
+    asks.set(asks.get() + 1);
+    if asks.get() == GROW_PAGES + 1 {
         let f = File::options().write(true).open(path).unwrap();
         f.set_len(MAX_FILE_BYTES).unwrap();
     }
@@ -888,8 +895,8 @@ fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
         .collect();
     let sheet = load(d.path(), vec![file("grow.png")], images).unwrap();
     assert_eq!(sheet.frame_count(), MAX_SKIN_FRAMES);
-    let grown = std::cell::Cell::new(false);
-    let grow = || grow_once(&path, &grown);
+    let asks = std::cell::Cell::new(0);
+    let grow = || grow_once(&path, &asks);
     // Eight layers and none reserved: a page holds at most 32 767 cells,
     // so the cells take three pages of 4 096.
     let limits = AtlasLimits {
@@ -898,7 +905,8 @@ fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
         reserved_layers: 0,
     };
     let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &grow).unwrap());
-    assert!(grown.get());
+    assert!(asks.get() > GROW_PAGES);
+    assert_eq!(atlas.pages().len(), GROW_PAGES as usize);
     let pages = page_bytes(atlas.pages().len(), atlas.side());
     let encoded = i64::try_from(MAX_FILE_BYTES).unwrap();
     let tables = i64::try_from(ATLAS_TABLE_BYTES).unwrap();
@@ -955,15 +963,16 @@ fn no_files_path_is_kept_while_another_is_read() {
     images.extend((1..4_096).map(whole));
     let sheet = load(&root, files, images).unwrap();
     assert_eq!(sheet.frame_count(), 65_535);
-    let grown = std::cell::Cell::new(false);
-    let grow = || grow_once(&grow_path, &grown);
+    let asks = std::cell::Cell::new(0);
+    let grow = || grow_once(&grow_path, &asks);
     let limits = AtlasLimits {
         max_side: 8_192,
         max_layers: 8,
         reserved_layers: 0,
     };
     let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &grow).unwrap());
-    assert!(grown.get());
+    assert!(asks.get() > GROW_PAGES);
+    assert_eq!(atlas.pages().len(), GROW_PAGES as usize);
     let pages = page_bytes(atlas.pages().len(), atlas.side());
     let tables = i64::try_from(ATLAS_TABLE_BYTES).unwrap();
     let bound = pages + tables + banded_bound(i64::try_from(MAX_FILE_BYTES).unwrap());

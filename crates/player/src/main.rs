@@ -1457,8 +1457,9 @@ fn start_skins(
 /// installations (design.md "beatoraja Lua Skins", the result skin's
 /// preload): the kept probe's rule decided from the reported charges and
 /// set at once, so the first attempt's decision is a second one, then the
-/// probe imported and handed to the result skin. `tapestry play` keeps
-/// its image stage at the attempt and runs none.
+/// probe imported and handed to the result skin, whose preload then
+/// pauses with the shelf. `tapestry play` keeps its image stage at the
+/// attempt and runs none.
 ///
 /// # Errors
 ///
@@ -1473,6 +1474,10 @@ fn preload_result(rig: &mut PlayerRig<'_>) -> Result<(), imports::StartupEnd> {
         rig.controls.quitting()
     })?;
     rig.result_skin.set_preload(outcome);
+    // Its pack pauses with the scan.
+    if let (Some(control), Some(sel)) = (rig.result_skin.preload_control(), &mut rig.selection) {
+        sel.shelf.set_preload(control);
+    }
     Ok(())
 }
 

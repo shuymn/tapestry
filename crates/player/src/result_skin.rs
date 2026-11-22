@@ -29,6 +29,11 @@ use crate::chart_images::{ChartImages, Sources};
 use crate::imports::{self, ImportTarget, Job, Ran};
 use crate::screens::{ScriptGen, ScriptPermit, ScriptSlot, Scripts};
 
+mod preload;
+
+pub use preload::PreloadControl;
+use preload::{Preload, Then};
+
 /// A result skin whose base import read a fact the base snapshot has
 /// pending: what each image stage and layout starts from, and the skin
 /// folder's resource cache, which every later import reads its image and
@@ -135,10 +140,6 @@ pub enum ProbeOutcome {
 /// only when a permit was taken and the kept import completed.
 #[derive(Debug)]
 pub struct StartupProbe {
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(dead_code, reason = "the preload's pack lays out from it")
-    )]
     imported: LuaImported,
     deps: FactDeps,
     kept: bool,
@@ -155,23 +156,6 @@ impl StartupProbe {
     pub const fn imported(&self) -> &LuaImported {
         &self.imported
     }
-}
-
-/// The result skin's preload (design.md "beatoraja Lua Skins", the result
-/// skin's preload), owned and changed on the game thread only.
-#[derive(Debug, Default)]
-enum Preload {
-    /// The startup probe, waiting for its pack.
-    Idle(
-        #[cfg_attr(
-            not(all(test, feature = "dev-tools")),
-            expect(dead_code, reason = "the preload's pack takes it")
-        )]
-        Box<StartupProbe>,
-    ),
-    /// No preload for this installation: none was imported, or it ended.
-    #[default]
-    Retired,
 }
 
 /// A prepared atlas and the sheet it was packed from: the cells a union
@@ -428,8 +412,17 @@ pub struct ResultSkin {
     /// its kept import ([`kept_probe_fits`]), else from a plain one; `None`
     /// until first decided, a plain one meanwhile.
     kept: Option<bool>,
-    /// The preload of a skin whose startup probe read the viewed result.
+    /// The preload of a skin whose startup probe read the viewed result
+    /// (design.md "beatoraja Lua Skins", the result skin's preload),
+    /// owned and changed on the game thread only.
     preload: Preload,
+    /// The preload's control, shared with the shelf's pause and its
+    /// packs' threads; none without a preload.
+    control: Option<Arc<PreloadControl>>,
+    /// The packs' thread mode in place of the system's (tests).
+    preload_mode: Option<Arc<dyn crate::priority::ThreadMode>>,
+    /// The packs begun, each one's job.
+    preload_jobs: u64,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -1182,6 +1175,9 @@ impl ResultSkin {
     /// either mode, and stays. The first decision drops nothing.
     pub fn set_kept_probe(&mut self, kept: bool) {
         if self.kept.replace(kept).is_some_and(|was| was != kept) {
+            // A running pack hands the image state back first; its pages
+            // are not kept.
+            self.settle_preload(Then::Retired);
             self.probe = None;
             self.image = None;
             self.cells = None;
@@ -1204,6 +1200,7 @@ impl ResultSkin {
                     if p.kept() { "kept" } else { "plain" },
                     p.deps.reads.len()
                 );
+                self.control = Some(Arc::default());
                 Preload::Idle(p)
             }
             ProbeOutcome::Stopped(fact) => {
@@ -1224,6 +1221,7 @@ impl ResultSkin {
     pub const fn preloaded(&self) -> Option<bool> {
         match &self.preload {
             Preload::Idle(p) => Some(p.kept),
+            Preload::Running(r) | Preload::Stopping { run: r, .. } => Some(r.kept()),
             Preload::Retired => None,
         }
     }
@@ -1492,6 +1490,12 @@ impl ResultSkin {
         chart: ResultChart,
         class: Option<JudgeClass>,
     ) -> ImageStage {
+        // The preload's pack, if one runs, hands the image state back
+        // (packed, it is reused below); the attempt's stage ends the
+        // preload either way (design.md "beatoraja Lua Skins", the result
+        // skin's preload).
+        self.settle_preload(Then::Idle);
+        self.preload = Preload::Retired;
         self.chart = Some(chart);
         self.class = Some(class);
         #[cfg(feature = "dev-tools")]
@@ -2213,11 +2217,12 @@ impl ResultSkin {
 
 impl Drop for ResultSkin {
     /// The run's end: a running job is cancelled and waited for at most
-    /// [`imports::STOP_WAIT`].
+    /// [`imports::STOP_WAIT`], and so is the preload's pack.
     fn drop(&mut self) {
         if self.has_job() {
             self.settle(|| true);
         }
+        self.end_preload(imports::STOP_WAIT);
     }
 }
 

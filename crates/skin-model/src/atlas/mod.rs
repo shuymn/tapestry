@@ -828,6 +828,9 @@ impl Sheet {
             .try_reserve_exact(usize::try_from(packing.pages).unwrap_or(usize::MAX))
             .map_err(|_| AtlasError::AtlasAlloc)?;
         for _ in 0..packing.pages {
+            // A stop is seen before each page's levels are allocated, so a
+            // stopped build allocates no further page.
+            decode::checkpoint(cancel, Site::Page).map_err(|_| AtlasError::Cancelled)?;
             let level = |k: u32| alloc_level(u64::from(side >> k) * u64::from(side >> k) * 4);
             pages.push(Page {
                 levels: [level(0)?, level(1)?, level(2)?, level(3)?],

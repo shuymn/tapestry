@@ -1077,6 +1077,24 @@ impl PlayerRig<'_> {
         self.result_skin.note_retained(&status.retained);
     }
 
+    /// The result skin's preload at a look of selection, the decision
+    /// screen or the practice page (design.md "beatoraja Lua Skins", the
+    /// result skin's preload): its pack collected when it ended, stopped
+    /// while the practice page's jobs want the room
+    /// ([`crate::page_jobs::PageJobs::preload_may_run`]), and begun when it
+    /// may, after a fresh report of the atlases the renderer references.
+    pub(crate) fn poll_preload(&mut self) {
+        let Some(sel) = &self.selection else {
+            return;
+        };
+        let may_run = sel.page.preload_may_run();
+        let coord = sel.coord.clone();
+        if self.result_skin.poll_preload(&coord, may_run) {
+            self.fresh_result_report();
+            self.result_skin.begin_preload(&coord);
+        }
+    }
+
     /// Whether the render thread disabled the result skin for the run (the
     /// S10-09i design's D7), as the presenter now knows too.
     fn result_run_disabled(&mut self) -> bool {

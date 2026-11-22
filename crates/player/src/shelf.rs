@@ -254,6 +254,9 @@ pub struct Shelf {
     /// The chart whose background measurement a wait promoted and still
     /// waits for ([`background_ready`](Self::background_ready)).
     awaiting: Option<std::path::PathBuf>,
+    /// The result skin's preload, which pauses with the scan (design.md
+    /// "Load Pipeline", Pauses); none without one.
+    preload: Option<Arc<crate::result_skin::PreloadControl>>,
     /// Passes completed (dev-tools and tests).
     #[cfg(any(test, feature = "dev-tools"))]
     passes: u64,
@@ -333,6 +336,7 @@ impl Shelf {
             loudness: Loudness::default(),
             background,
             awaiting: None,
+            preload: None,
             #[cfg(any(test, feature = "dev-tools"))]
             passes: 0,
             #[cfg(feature = "dev-tools")]
@@ -581,15 +585,26 @@ impl Shelf {
             if let Some(worker) = &self.background {
                 worker.request_pause(chosen);
             }
+            if let Some(preload) = &self.preload {
+                preload.set_paused(true);
+            }
         }
     }
 
+    /// The result skin's preload takes part in the pause from now on,
+    /// paused at once when a pause holds.
+    pub fn set_preload(&mut self, preload: Arc<crate::result_skin::PreloadControl>) {
+        preload.set_paused(self.paused);
+        self.preload = Some(preload);
+    }
+
     /// Before a READY state: requests the pause if none is, and waits for the
-    /// scan and the background measurement to acknowledge it, however long
-    /// that takes (design.md "Loading and Song Selection": READY
-    /// starts only after it); without a scan it waits for the background
-    /// measurement alone. Every `slice` it asks `cancelled` whether to give
-    /// up; once the wait has run `notice_after`, it calls `notice` once.
+    /// scan, the background measurement and the result skin's preload to
+    /// acknowledge it, however long that takes (design.md "Loading and
+    /// Song Selection": READY starts only after it); without a scan it
+    /// waits for the other two alone. Every `slice` it asks `cancelled`
+    /// whether to give up; once the wait has run `notice_after`, it calls
+    /// `notice` once.
     pub fn wait_paused(
         &mut self,
         slice: Duration,
@@ -611,6 +626,10 @@ impl Shelf {
                     .background
                     .as_ref()
                     .is_none_or(|w| w.wait_paused(slice))
+                && self
+                    .preload
+                    .as_ref()
+                    .is_none_or(|p| p.wait_acknowledged(slice))
             {
                 return paused;
             }
@@ -634,6 +653,9 @@ impl Shelf {
         }
         if let Some(worker) = &self.background {
             worker.release();
+        }
+        if let Some(preload) = &self.preload {
+            preload.set_paused(false);
         }
     }
 
@@ -929,12 +951,13 @@ impl Shelf {
 }
 
 impl Drop for Shelf {
-    /// Stops the running pass and the background measurement, waiting at
-    /// most [`STOP_TIMEOUT`] (or `--dev-stop-timeout`) for both together: a pass stuck on its file
+    /// Stops the running pass, the background measurement and the result
+    /// skin's preload, waiting at most [`STOP_TIMEOUT`] (or
+    /// `--dev-stop-timeout`) for all together: a pass stuck on its file
     /// system is left to end on its own, keeping the library's lock until
     /// it does or the process exits, and so is a stuck measurement, whose
-    /// result nobody takes. The measurements the background completed are
-    /// stored with the load's.
+    /// result nobody takes, or a stuck pack. The measurements the
+    /// background completed are stored with the load's.
     fn drop(&mut self) {
         let background = self.background.take();
         // Both stop at once, and share one deadline.
@@ -942,6 +965,9 @@ impl Drop for Shelf {
         let deadline = Instant::now() + bound;
         if let Some(worker) = &background {
             worker.stop();
+        }
+        if let Some(preload) = &self.preload {
+            preload.close();
         }
         let (quiet, stopped) = stop_together(
             deadline,
@@ -969,6 +995,18 @@ impl Drop for Shelf {
                 log::warn!("{line}");
             }
             self.keep(results);
+        }
+        // The result skin's preload, stopped with the others, within what
+        // is left of the same bound.
+        if let Some(preload) = &self.preload
+            && !preload.wait_ended(deadline.saturating_duration_since(Instant::now()))
+        {
+            let line = format!(
+                "skin: result: the preload did not stop within {} s; it ends with the process",
+                bound.as_secs()
+            );
+            eprintln!("{line}");
+            log::warn!("{line}");
         }
         // A measurement is stored only when no scan may still commit.
         self.loudness.close(&mut self.library, quiet);

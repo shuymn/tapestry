@@ -3009,6 +3009,9 @@ impl PlayerRig<'_> {
                 sc.captures.arm_select(k, lifetime, revision);
             }
         }
+        // The result skin's preload, after the choice's pause if this look
+        // chose (design.md "Load Pipeline", Pauses).
+        self.poll_preload();
         chosen
     }
 
@@ -4135,9 +4138,12 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), game::LiveError<ScreenError>> {
-        // The page's jobs go on through the decision screen.
-        if origin == game::Origin::Jobs {
-            self.poll_page()?;
+        // The page's jobs go on through the decision screen, and the
+        // result skin's preload with them.
+        match origin {
+            game::Origin::Jobs => self.poll_page()?,
+            game::Origin::Loading => {}
+            _ => self.poll_preload(),
         }
         Ok(())
     }
@@ -4455,7 +4461,9 @@ impl AppRig for PlayerRig<'_> {
         };
         sel.page
             .poll(&sel.coord, sel.spawner, &mut sel.shelf)
-            .map_err(game::LiveError::Load)
+            .map_err(game::LiveError::Load)?;
+        self.poll_preload();
+        Ok(())
     }
 
     /// A Start taken on the practice page, before anything of it begins

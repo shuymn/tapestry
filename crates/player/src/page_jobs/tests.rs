@@ -923,3 +923,57 @@ fn the_1x_bank_moves_to_speculation_at_page_entry() {
         until("every permit back", || held(&coord) == (0, 0));
     }
 }
+
+/// The result skin's preload waits for the page's jobs: not while the
+/// page's bank waits for its prerequisites, while its bank or its
+/// measurement runs, or while its gain is unknown with the measurement
+/// still due; with no page, and once the page is left, it may run.
+#[test]
+fn the_preload_waits_for_the_pages_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let chart = chart(dir.path(), 2, 0.2);
+    let coord = coordinator(4, 1);
+    let seam = Arc::new(Seam::default());
+    let page_chart = || super::PageChart {
+        path: "page.bms".into(),
+        chart: Arc::clone(&chart),
+        name: "page.bms".to_owned(),
+        rate: RATE,
+    };
+    let mut page = super::PageJobs::new(Arc::clone(&seam) as Arc<dyn ThreadMode>);
+    assert!(page.preload_may_run(), "no page");
+    // The bank waits for the measurement or the barrier's unload.
+    page.defer(page_chart(), false);
+    assert!(!page.preload_may_run(), "a bank pending");
+    let _ = page.leave(None, &mut || None);
+    assert!(page.preload_may_run(), "left");
+    // The bank runs.
+    let script = Script::new(&coord);
+    script.hold(PageAt::File(0), 1);
+    let (job, _mode) = bank(&coord, &chart, false, &seam, &script);
+    page.chart = Some(page_chart());
+    page.bank = Some(job);
+    assert!(!page.preload_may_run(), "the bank runs");
+    let _ = page.leave(None, &mut || None);
+    assert!(page.preload_may_run(), "left");
+    // The measurement runs.
+    let script = Script::new(&coord);
+    let (job, _mode) = measure(&coord, &chart, false, &seam, &script);
+    page.chart = Some(page_chart());
+    page.measure = Some(job);
+    assert!(!page.preload_may_run(), "the measurement runs");
+    let _ = page.leave(None, &mut || None);
+    assert!(page.preload_may_run(), "left");
+    // The bank is kept, its gain unknown: the measurement is due.
+    page.chart = Some(page_chart());
+    page.key = Some(crate::background::tests::key(std::path::Path::new(
+        "page.bms",
+    )));
+    assert!(!page.preload_may_run(), "a measurement due");
+    page.measure_tried = true;
+    assert!(page.preload_may_run(), "the page measures no more");
+    page.measure_tried = false;
+    let _ = page.leave(None, &mut || None);
+    assert!(page.preload_may_run(), "left");
+    until("every permit back", || held(&coord) == (0, 0));
+}
