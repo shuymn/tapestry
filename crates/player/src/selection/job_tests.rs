@@ -1643,6 +1643,97 @@ fn a_claimed_preload_leaves_the_decode_its_width() {
     );
 }
 
+/// Why no speculative preload pack can run.
+#[derive(Clone, Copy, Debug)]
+enum Alone {
+    /// The coordinator has no speculative permit.
+    SpeculationOff,
+    /// A pack's thread was refused background mode.
+    Refused,
+}
+
+/// A choice to play under `alone`, where the pack can run only as
+/// foreground work: the choice's look claims it but begins nothing, so
+/// the cold bank's decode is granted every foreground permit its pool
+/// runs a worker for; the pack begins in the foreground once the decode
+/// has ended, and packs (design.md "beatoraja Lua Skins", the result
+/// skin's preload: begun as foreground work after the decode).
+fn a_foreground_only_preload_leaves_a_cold_bank_its_width(alone: Alone) {
+    use crate::result_skin::preload_tests::{Opened, REACHED, Seam, gate, preloaded_with};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let coord = match alone {
+        Alone::SpeculationOff => Coordinator::new(game::coord::Caps {
+            foreground: game::coord::FOREGROUND_PERMITS,
+            speculative: 0,
+        }),
+        Alone::Refused => coordinator(),
+    };
+    let mut b = bench_on(coord, dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    seam.refuse
+        .store(matches!(alone, Alone::Refused), Ordering::SeqCst);
+    let builds = crate::result_skin::builds();
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.result_skin =
+                preloaded_with(skin.path(), &seam, Some(rig.render.scripts().clone()));
+            let control = rig.result_skin.preload_control().unwrap();
+            sel(rig).shelf.set_preload(Arc::clone(&control));
+            // A look before the choice: a refused pack ends at once.
+            until("no pack in flight", || {
+                rig.poll_preload();
+                rig.result_skin.preload_state().1.is_none()
+            });
+            gate(2);
+            // The choice's look: the claim, the pause, the poll.
+            rig.preload_claim = sel(rig).shelf.claim_preload();
+            sel(rig).shelf.choose(&path);
+            rig.poll_preload();
+            if rig.result_skin.preload_state().1.is_some() {
+                until("the pack's checkpoint", || REACHED.load(Ordering::SeqCst));
+            }
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready, "{alone:?}");
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)], "{alone:?}");
+            assert_eq!(
+                decoded(&b.decodes),
+                [(Speed::NORMAL, granted(0, 4), 0)],
+                "{alone:?}"
+            );
+            // After the decode it begins, in the foreground, and packs.
+            gate(0);
+            until("the pack's collection", || {
+                rig.poll_preload();
+                rig.result_skin.image().is_some()
+            });
+            assert!(
+                seam.left.lock().unwrap().is_empty(),
+                "{alone:?}: no mode change"
+            );
+            assert_eq!(crate::result_skin::builds(), builds + 1, "{alone:?}");
+            assert!(control.claimed());
+        },
+    );
+}
+
+#[test]
+fn with_speculation_off_a_preload_leaves_a_cold_bank_its_width() {
+    a_foreground_only_preload_leaves_a_cold_bank_its_width(Alone::SpeculationOff);
+}
+
+#[test]
+fn with_background_mode_refused_a_preload_leaves_a_cold_bank_its_width() {
+    a_foreground_only_preload_leaves_a_cold_bank_its_width(Alone::Refused);
+}
+
 /// The rig's result skin preloaded, its pack begun at a look and held at
 /// its checkpoint whatever it is told, on its speculative permit, the
 /// shelf's pause requested as a choice's would be. Its control, and the
