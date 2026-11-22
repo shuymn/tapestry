@@ -593,9 +593,86 @@ fn endings(seen: &BTreeMap<&str, Seen>, exits: &[Observed]) -> Endings {
     out
 }
 
-/// Compares the run, set or outer run in `dir` with `e`.
+/// What `check` reads before any verdict: the binding's id, every bound
+/// role's run, every writer's ending, and the standing of each role's run
+/// stream (finished as its writer's ending allows) and its other streams.
+struct Evidence {
+    id: String,
+    seen: BTreeMap<&'static str, Seen>,
+    endings: Endings,
+    runs: BTreeMap<&'static str, bool>,
+    usable: BTreeMap<&'static str, Streams>,
+}
+
+/// The standing of each bound role's streams as evidence, as `check`
+/// judges them before it reads any verdict: a producer judges only
+/// streams that stand, so it never judges a prefix the checker refuses.
+#[derive(Debug, Default)]
+pub struct Standing {
+    streams: BTreeMap<(String, String), Result<(), String>>,
+    /// What kept the folder's runs from being read at all.
+    problems: Vec<String>,
+}
+
+impl Standing {
+    /// Whether role `role`'s stream `stream` stands; why not.
+    ///
+    /// # Errors
+    ///
+    /// The stream is missing, unreadable, not the run's, unfinished for
+    /// its writer's ending, or unsealed; or the run was not read.
+    pub fn of(&self, role: &str, stream: &str) -> Result<(), String> {
+        match self.streams.get(&(role.to_owned(), stream.to_owned())) {
+            Some(r) => r.clone(),
+            None if self.problems.is_empty() => Err(format!("role `{role}` is not bound")),
+            None => Err(self.problems.join("; ")),
+        }
+    }
+}
+
+/// The standing of the streams of the run, set or outer run in `dir`
+/// against `e`, as [`check`] reads them.
 #[must_use]
-pub fn check(e: &Expectation, dir: &Path) -> Report {
+pub fn standing(e: &Expectation, dir: &Path, runner: &str) -> Standing {
+    let mut report = Report::default();
+    let Some(ev) = evidence(e, dir, runner, &mut report) else {
+        return Standing {
+            streams: BTreeMap::new(),
+            problems: report.mismatches,
+        };
+    };
+    let mut streams = BTreeMap::new();
+    for (role, finished) in &ev.runs {
+        let run = if *finished {
+            Ok(())
+        } else {
+            Err(format!("role `{role}`: {RUN} is unfinished"))
+        };
+        streams.insert(((*role).to_owned(), RUN.to_owned()), run);
+    }
+    for (role, (link, recorder)) in &ev.usable {
+        let of = |u: Result<(), String>, name: &str| {
+            u.map_err(|why| format!("role `{role}`: {name}: {why}"))
+        };
+        let link = of(link.stream().map(drop).ok_or_else(|| link.why()), LINK);
+        let recorder = of(
+            recorder.stream().map(drop).ok_or_else(|| recorder.why()),
+            RECORDER,
+        );
+        streams.insert(((*role).to_owned(), LINK.to_owned()), link);
+        streams.insert(((*role).to_owned(), RECORDER.to_owned()), recorder);
+    }
+    Standing {
+        streams,
+        problems: Vec::new(),
+    }
+}
+
+/// Compares the run, set or outer run in `dir` with `e`, the expectation
+/// compiled into the runner of commit `runner`: every role's run must name
+/// that commit as its runner's.
+#[must_use]
+pub fn check(e: &Expectation, dir: &Path, runner: &str) -> Report {
     let mut report = Report::default();
     for p in e.problems() {
         report.add(format!("the expectation: {p}"));
@@ -603,35 +680,49 @@ pub fn check(e: &Expectation, dir: &Path) -> Report {
     if !report.ok() {
         return report;
     }
-    let Some((bound, id, mut root)) = bind(e, dir, &mut report) else {
+    let Some(ev) = evidence(e, dir, runner, &mut report) else {
         return report;
     };
-    let mut seen: BTreeMap<&str, Seen> = BTreeMap::new();
+    let exits = observed(&ev.seen);
+    let view = View {
+        seen: &ev.seen,
+        usable: &ev.usable,
+    };
+    check_exits(e, &ev.seen, &exits, &ev.endings, &mut report);
+    check_records(e, &view, &mut report);
+    check_verdicts(e, dir, &ev.id, &view, &mut report);
+    report
+}
+
+/// Reads what `check` reads before any verdict, adding each mismatch.
+fn evidence(e: &Expectation, dir: &Path, runner: &str, report: &mut Report) -> Option<Evidence> {
+    let (bound, id, mut root) = bind(e, dir, report)?;
+    let mut seen: BTreeMap<&'static str, Seen> = BTreeMap::new();
     for b in &bound {
         let raw = if b.dir.is_empty() { root.take() } else { None };
-        if let Some(s) = read_role(b, dir, raw, &mut report) {
+        if let Some(s) = read_role(b, dir, raw, runner, report) {
             seen.insert(b.name, s);
         }
     }
-    check_runs(&seen, &mut report);
+    check_runs(&seen, report);
     let endings = endings(&seen, &observed(&seen));
-    seals(&mut seen, &endings, &mut report);
-    let exits = observed(&seen);
-    let mut usable: BTreeMap<&str, Streams> = BTreeMap::new();
+    seals(&mut seen, &endings, report);
+    let mut usable: BTreeMap<&'static str, Streams> = BTreeMap::new();
+    let mut runs: BTreeMap<&'static str, bool> = BTreeMap::new();
     for (role, s) in &seen {
         let end_of = |path: &str| match s.writer(path) {
             Ok(w) => ending_of(&endings, w),
             Err(why) => Ending::Ambiguous(format!("its writer is not known: the run {why}")),
         };
-        finished(role, RUN, &s.run, &end_of(RUN), &mut report);
+        runs.insert(role, finished(role, RUN, &s.run, &end_of(RUN), report));
         let link = s.link.as_ref().map_or(Usable::Missing, |raw| {
-            usable_of(role, LINK, raw, s, &end_of(LINK), &mut report)
+            usable_of(role, LINK, raw, s, &end_of(LINK), report)
         });
         if let Some(l) = link.stream() {
-            link_errors(role, l, &mut report);
+            link_errors(role, l, report);
         }
         let recorder = s.recorder.as_ref().map_or(Usable::Missing, |raw| {
-            usable_of(role, RECORDER, raw, s, &end_of(RECORDER), &mut report)
+            usable_of(role, RECORDER, raw, s, &end_of(RECORDER), report)
         });
         let dropped = [
             (RUN, s.run.dropped.as_deref()),
@@ -657,14 +748,13 @@ pub fn check(e: &Expectation, dir: &Path) -> Report {
         }
         usable.insert(role, (link, recorder));
     }
-    let view = View {
-        seen: &seen,
-        usable: &usable,
-    };
-    check_exits(e, &seen, &exits, &endings, &mut report);
-    check_records(e, &view, &mut report);
-    check_verdicts(e, dir, &id, &view, &mut report);
-    report
+    Some(Evidence {
+        id,
+        seen,
+        endings,
+        runs,
+        usable,
+    })
 }
 
 /// The checker's view of the evidence.
@@ -820,7 +910,13 @@ fn bind(e: &Expectation, dir: &Path, report: &mut Report) -> Option<Binds> {
 /// A role's `run.jsonl`, read strictly once (`raw` when [`bind`] read it),
 /// its `start` against its reservation, and its other streams read once
 /// (not yet judged).
-fn read_role(b: &Bound, dir: &Path, raw: Option<Raw<Run>>, report: &mut Report) -> Option<Seen> {
+fn read_role(
+    b: &Bound,
+    dir: &Path,
+    raw: Option<Raw<Run>>,
+    runner: &str,
+    report: &mut Report,
+) -> Option<Seen> {
     let folder = dir.join(&b.dir);
     let at = |name: &str| {
         if b.dir.is_empty() {
@@ -849,6 +945,7 @@ fn read_role(b: &Bound, dir: &Path, raw: Option<Raw<Run>>, report: &mut Report) 
         ("role", start.role.as_str(), b.name),
         ("row", start.row.as_str(), b.row),
         ("build", start.build.as_str(), b.build.as_str()),
+        ("runner commit", start.commit.as_str(), runner),
         (
             "set",
             start.set.as_deref().unwrap_or("none"),

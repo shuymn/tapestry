@@ -672,6 +672,21 @@ static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// outcome.
 static FAIL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Arms [`GATE`] (`true`), a layout's build waiting at it, or lets the
+/// one waiting go (`false`), for a test of another module.
+pub(crate) fn hold_builds(on: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if on {
+        REACHED.store(false, SeqCst);
+    }
+    GATE.store(on, SeqCst);
+}
+
+/// Whether a layout's build reached the armed [`GATE`].
+pub(crate) fn build_reached() -> bool {
+    REACHED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A layout's job starts: with [`FAIL`] at 3, taken, it panics before any
 /// plan.
 pub(super) fn layout_starts() {

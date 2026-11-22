@@ -1061,7 +1061,7 @@ fn run_with(
     let seen = Arc::new(Seen::default());
     let make: MakeScreen = {
         let seen = Arc::clone(&seen);
-        Box::new(move || {
+        Box::new(move |_| {
             let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,

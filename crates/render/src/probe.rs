@@ -365,3 +365,97 @@ pub(crate) fn array_key(b: &wgpu::Texture) -> u64 {
         h.finish().max(1)
     })
 }
+
+/// The uploader's steps submitted so far, every payload's (tests).
+pub(crate) static STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// The uploader's steps submitted so far, every payload's (tests).
+pub fn steps() -> u64 {
+    STEPS.load(Ordering::Relaxed)
+}
+
+/// The kinds of a render-thread pass a blocking GPU wait is counted in
+/// ([`count_gpu_waits`]): none of the others, a held pass (one that
+/// presents nothing while a first picture is held), a pass that presents a
+/// frame, and the pacing between two frames (the wait for the frame's
+/// deadline, which looks at the uploader's step in flight meanwhile).
+pub const PASS_OTHER: u8 = 0;
+pub const PASS_HELD: u8 = 1;
+pub const PASS_PRESENTING: u8 = 2;
+pub const PASS_BETWEEN: u8 = 3;
+
+/// The kind of the pass the render thread runs now.
+static PASS: AtomicU8 = AtomicU8::new(PASS_OTHER);
+/// The counter's scope: 0 off, 1 the uploader's and stagings' blocking
+/// waits, 2 those and the frame's own pacing (a control).
+static GPU_WAITS: AtomicU8 = AtomicU8::new(0);
+/// A blocking GPU wait counted ([`count_gpu_waits`]): its pass's kind,
+/// how long it took, and the bound it was asked with (`None` unbounded),
+/// both in µs. The two are kept apart: a wait past its bound is the
+/// scheduler's lateness or a stall, which a test judges, never clipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuWait {
+    pub pass: u8,
+    pub elapsed_us: u64,
+    pub bound_us: Option<u64>,
+}
+
+/// The waits counted.
+static GPU_WAIT_LOG: std::sync::Mutex<Vec<GpuWait>> = std::sync::Mutex::new(Vec::new());
+/// Room the log is given as counting starts; a wait past it is dropped.
+const GPU_WAIT_ROOM: usize = 65_536;
+
+/// Names the kind of the pass the render thread begins (tests).
+pub fn set_pass(kind: u8) {
+    PASS.store(kind, Ordering::Relaxed);
+}
+
+/// Counts each blocking GPU wait from now on with its pass's kind and
+/// length, the log emptied: the uploader's and stagings' waits (every
+/// wait for the GPU's submissions and the wait for the step in flight),
+/// and with `pacing` also the offscreen frame's wait for the frame before
+/// (a control); `None` stops counting (tests).
+pub fn count_gpu_waits(scope: Option<bool>) {
+    let mut log = GPU_WAIT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.clear();
+    log.reserve(GPU_WAIT_ROOM);
+    GPU_WAITS.store(
+        match scope {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The waits counted so far.
+pub fn gpu_waits() -> Vec<GpuWait> {
+    GPU_WAIT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Counts a blocking GPU wait of `took`, asked with `bound` (`None`
+/// unbounded), that began `pacing` (the frame's own) or not, while
+/// counting is on and its scope takes it.
+pub(crate) fn gpu_wait(took: Duration, bound: Option<Duration>, pacing: bool) {
+    let scope = GPU_WAITS.load(Ordering::Relaxed);
+    if scope == 0 || (pacing && scope < 2) {
+        return;
+    }
+    let mut log = GPU_WAIT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+    if log.len() < log.capacity() {
+        log.push(GpuWait {
+            pass: PASS.load(Ordering::Relaxed),
+            elapsed_us: us(took),
+            bound_us: bound.map(us),
+        });
+    }
+}

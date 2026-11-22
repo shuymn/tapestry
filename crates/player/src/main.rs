@@ -1080,6 +1080,8 @@ fn rig<'a>(
         #[cfg(test)]
         result_started: std::sync::Arc::default(),
         #[cfg(test)]
+        after_present: None,
+        #[cfg(test)]
         park_probe: std::sync::Arc::default(),
         #[cfg(all(test, feature = "dev-tools"))]
         audio_lost,
@@ -1346,7 +1348,7 @@ fn play(
     };
     let link = window_thread.link();
     let media = movie_screen::MediaHub::new(loaded.root().path());
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let target = Target::Window {
             window: surface.into(),
             width: surface.width,
@@ -1766,16 +1768,36 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
     let media = movie_screen::MediaHub::new(root.path());
+    // The window's own shots, asked for on a runner's pipe
+    // (`--dev-shot-pipe`): every window renderer made copies for the tap.
+    // The select skin's clock frozen for a test device's shots
+    // (`--dev-freeze-skin-clock`).
+    #[cfg(feature = "dev-tools")]
+    if s.dev.freeze_skin_clock {
+        dev::skin_clock::freeze();
+    }
+    #[cfg(feature = "dev-tools")]
+    let shot_tap = s.dev.shot_pipe.clone().map(|name| {
+        let tap = dev::present_shot::Tap::new();
+        dev::present_shot::start(name, Arc::clone(&tap));
+        tap
+    });
     let make: MakeScreen = match (surface, link) {
-        (Some(surface), Some(link)) => Box::new(move || {
+        (Some(surface), Some(link)) => Box::new(move |font| {
             let target = Target::Window {
                 window: surface.into(),
                 width: surface.width,
                 height: surface.height,
             };
-            let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
-            let fonts = render::text::Fonts::runtime()?;
-            let screen = MenuScreen::new(r, Some(fonts))
+            #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+            let mut r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            #[cfg(feature = "dev-tools")]
+            if let Some(tap) = &shot_tap
+                && let Err(e) = r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>)
+            {
+                eprintln!("dev: the window's shots: {e}");
+            }
+            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
                 .with_sink(Box::new(link.clone()))
                 .with_media(Arc::clone(&media));
             Ok(Box::new(screen) as Box<dyn Screen>)
@@ -1783,7 +1805,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         // Headless (dev-tools): offscreen on WARP, or on the hardware
         // adapter a scenario asks for, admitted at every build.
         #[cfg(feature = "dev-tools")]
-        _ => Box::new(move || {
+        _ => Box::new(move |font| {
             let target = Target::Offscreen {
                 width: size.0,
                 height: size.1,
@@ -1797,13 +1819,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             println!("{line}");
             log::info!("{line}");
             dev::scenario::admit(adapter, &got)?;
-            let fonts = render::text::Fonts::runtime()?;
-            let screen = MenuScreen::new(r, Some(fonts)).with_media(Arc::clone(&media));
+            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
+                .with_media(Arc::clone(&media));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // A production run always has its window.
         #[cfg(not(feature = "dev-tools"))]
-        _ => Box::new(|| Err(render::RenderError::SurfaceUnsupported)),
+        _ => Box::new(|_| Err(render::RenderError::SurfaceUnsupported)),
     };
     let measure = measure(
         clock,
@@ -1875,6 +1897,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         preset_steps: std::collections::VecDeque::new(),
         covers_turned: [false; 3],
         volumes_set: [None; 3],
+        #[cfg(feature = "dev-tools")]
+        act_origin: crate::dev::present_shot::VolumeOrigin::Other,
         cues: crate::select::SelectCues::default(),
         feed: selection_skin::SkinFeed::default(),
         ime,
@@ -2101,7 +2125,7 @@ fn headless(
         None => Box::new(NoFrames),
     };
     let media = movie_screen::MediaHub::new(loaded.root().path());
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let target = Target::Offscreen {
             width: size.0,
             height: size.1,
@@ -2919,7 +2943,7 @@ mod tests {
             let render = {
                 let (scripts, gone, seen) =
                     (Arc::clone(&scripts), Arc::clone(&gone), Arc::clone(&seen));
-                crate::render_side::tests::spawn_empty(Box::new(move || {
+                crate::render_side::tests::spawn_empty(Box::new(move |_| {
                     Ok(Box::new(RestFrames {
                         scripts: Arc::clone(&scripts),
                         gone: Arc::clone(&gone),
@@ -3047,7 +3071,7 @@ mod tests {
     #[cfg(feature = "dev-tools")]
     fn gauge_render(seen: &Gauges, loaded: &game::Loaded) -> crate::render_side::RenderLink {
         let noted = Arc::clone(seen);
-        let render = crate::render_side::tests::spawn_empty(Box::new(move || {
+        let render = crate::render_side::tests::spawn_empty(Box::new(move |_| {
             Ok(Box::new(GaugeFrames {
                 seen: Arc::clone(&noted),
             }) as Box<dyn crate::render_side::Screen>)

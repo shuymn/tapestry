@@ -27,7 +27,7 @@ use crate::result_skin::{ResultSkin, ResultStart, Upload};
 
 /// The colours of the stage files: chart A's, chart B's, and the one
 /// written again after a deletion.
-const RED: [u8; 3] = [200, 30, 30];
+pub(super) const RED: [u8; 3] = [200, 30, 30];
 const GREEN: [u8; 3] = [30, 200, 30];
 const BLUE: [u8; 3] = [30, 30, 200];
 /// The skins' own image, the 190 branch's mark.
@@ -120,7 +120,7 @@ fn on_warp_charged<R>(
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
 ) -> R {
     let seen = Seen::default();
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let mut r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,
@@ -199,7 +199,7 @@ fn png(dir: &Path, name: &str, rgb: [u8; 3]) {
 
 /// A chart naming the stage file `s.png`, written beside it in `rgb`
 /// when `Some`.
-fn chart(rgb: Option<[u8; 3]>) -> (tempfile::TempDir, game::Loaded) {
+pub(super) fn chart(rgb: Option<[u8; 3]>) -> (tempfile::TempDir, game::Loaded) {
     let (dir, l) = crate::imports::facts::tests::loaded_kept("#STAGEFILE s.png\n", "tapestry");
     if let Some(rgb) = rgb {
         png(dir.path(), "s.png", rgb);
@@ -235,8 +235,13 @@ fn lua_result(pre: &str, places: &str) -> tempfile::TempDir {
 }
 
 /// A fixed result skin drawing the stage file: it reads no fact.
-fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
-    let d = lua_result("", &format!("d[#d + 1] = {CHART_DST}"));
+pub(super) fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    fixed_skin_with("")
+}
+
+/// [`fixed_skin`] running `pre` (its timing, say) before its destinations.
+pub(super) fn fixed_skin_with(pre: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let d = lua_result(pre, &format!("d[#d + 1] = {CHART_DST}"));
     let choice = game::SkinChoice {
         root: d.path().to_owned(),
         entry: "s.luaskin".to_owned(),
@@ -290,7 +295,7 @@ fn payload_stage(rig: &PlayerRig<'_>, bundle: &Arc<render::SkinBundle>) -> Optio
 }
 
 /// The preparation of `loaded` polled to its end, ready, and committed.
-fn prepared(rig: &mut PlayerRig<'_>, loaded: &game::Loaded) {
+pub(super) fn prepared(rig: &mut PlayerRig<'_>, loaded: &game::Loaded) {
     let mut h = begin(rig, loaded);
     readied(rig, &mut h);
     rig.commit_attempt().unwrap();
@@ -910,27 +915,43 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         );
     }
     // Each upload's figures are marked once it was waited for, so no probe
-    // work overlaps the GPU's copy its wait times: the first of them comes
-    // after the wait began (for the waits long enough to tell).
-    let waits: Vec<(u64, i64)> = marks
-        .iter()
-        .filter(|m| m.1 == "up:selskin:gpu_wait_us")
-        .map(|m| (m.0, m.2))
-        .collect();
-    assert_eq!(waits.len(), begins.len(), "{waits:?}");
-    let long: Vec<_> = begins
-        .iter()
-        .zip(&waits)
-        .filter(|(_, (_, w))| *w >= 1_000)
-        .collect();
-    assert!(!long.is_empty(), "no upload waited 1 ms: {waits:?}");
-    for (&begin, &(at, wait)) in long {
-        let began = at.saturating_sub(u64::try_from(wait).unwrap_or(0));
-        assert!(
-            begin >= began,
-            "an upload's figures marked before its wait: {begin} < {began}"
-        );
+    // work overlaps the GPU's copy its wait times. The result uploads are
+    // written in the uploader's steps, which add no wait (design.md "Load
+    // Pipeline"): they record a wait of none and no wait marks. Only the
+    // play skin's (upload 0) waits for the GPU: in the marks' order (one
+    // thread's marks keep its order), its wait begins and ends, then its
+    // figures and its wait's time are marked, before the next upload's.
+    let order = |tag: &str| -> Vec<usize> {
+        marks
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.1 == tag)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let [starts, ends, figures, waited] = [
+        "up:selskin:wait_begin",
+        "up:selskin:wait_end",
+        "up:selskin:begin",
+        "up:selskin:gpu_wait_us",
+    ]
+    .map(order);
+    assert_eq!((starts.len(), ends.len()), (1, 1), "{starts:?} {ends:?}");
+    for o in [&figures, &waited] {
+        assert_eq!(o.len(), begins.len(), "{o:?}");
     }
+    let chain: Vec<usize> = starts
+        .iter()
+        .chain(&ends)
+        .copied()
+        .chain(figures.iter().zip(&waited).flat_map(|(&f, &w)| [f, w]))
+        .collect();
+    assert!(
+        chain.is_sorted(),
+        "an upload's figures outside its wait: {chain:?}"
+    );
+    let waits = values("up:selskin:gpu_wait_us");
+    assert_eq!(waits.get(1..), Some(&[0, 0][..]), "{waits:?}");
     // The first result's installation: none before (0); the second's: one
     // installed, another asked for (2).
     assert_eq!(values("res:installed"), [0, 2]);
@@ -992,9 +1013,14 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     assert!(between.len() >= 3, "{between:?}");
     // The result frames probed are presented.
     assert!(values("rf:presented").iter().all(|&v| v == 1));
-    // B's chart images, written for the result's view inside its staging.
+    // B's chart images, written for the result's view inside its staging,
+    // its stage file a band a step.
     let (install, chart) = (one("res:install_us", 1), one("res:chart_us", 1));
-    assert_eq!(within("ci:result:image", install, chart), [0]);
+    let images = within("ci:result:image", install, chart);
+    assert!(
+        !images.is_empty() && images.iter().all(|&i| i == 0),
+        "{images:?}"
+    );
     assert!(
         within("ci:result:bytes", install, chart)
             .iter()

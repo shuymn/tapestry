@@ -560,7 +560,7 @@ fn on_warp<R>(
     f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &Samples) -> R,
 ) -> R {
     let samples = Samples::default();
-    let make: crate::render_side::MakeScreen = Box::new(|| {
+    let make: crate::render_side::MakeScreen = Box::new(|_| {
         let r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,

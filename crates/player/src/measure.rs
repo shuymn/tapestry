@@ -901,6 +901,9 @@ pub enum ResultPath {
     BuiltIn,
     /// The built-in page, its skin refused in this frame.
     Refused,
+    /// The result's pending presentation (design.md "Rendering and
+    /// Skins", the result's hold): no view.
+    Pending,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -912,6 +915,7 @@ impl ResultPath {
             Self::Skin => "skin",
             Self::BuiltIn => "built-in",
             Self::Refused => "refused",
+            Self::Pending => "pending",
         }
     }
 }

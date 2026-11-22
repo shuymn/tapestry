@@ -526,6 +526,15 @@ pub trait Rig {
     fn result_timing(&self) -> Option<ResultTiming> {
         None
     }
+    /// Whether the result handed over has shown (design.md "State Model",
+    /// Result): a result its skin may present shows at the first look
+    /// that reads the acknowledgement of its first committed view's frame;
+    /// until then the flow drops preset steps. Read once per look. By
+    /// default, `true`: the result shows at the hand-over.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_view_shown(&self) -> bool {
+        true
+    }
     /// The result's origin (design.md "Rendering and Skins", Timers): the
     /// instant its screen's first view was committed, from which a skin's
     /// input and scene times count; `None` before it. Never set later than
@@ -1288,6 +1297,9 @@ fn run_from<R: Rig>(
             let now = rig.now();
             let timing = rig.result_timing();
             let start = start(rig);
+            // Until the result shows, its preset steps are dropped: it
+            // opens on the played preset.
+            let shown = rig.result_view_shown();
             let mut open = true;
             if outro.is_none() {
                 open = timing.is_none_or(|t| now.0 >= start.0.saturating_add(t.input.0));
@@ -1305,7 +1317,7 @@ fn run_from<R: Rig>(
                                 break;
                             }
                         }
-                        _ if !open => {}
+                        _ if !open || !shown => {}
                         // Each step stamps G5's start (dev-tools).
                         MenuCommand::NextPreset => {
                             #[cfg(feature = "dev-tools")]

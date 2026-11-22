@@ -42,6 +42,11 @@ pub enum MarkKind {
     /// The render thread held a loading lifetime's first frame (design.md
     /// "The pending presentation"), and why the hold ended.
     Hold(Option<HoldEnd>),
+    /// The result's hold kept the outgoing picture (design.md "Rendering
+    /// and Skins", the result's hold): from the preparation's start to the
+    /// end of its outgoing phase, and why that phase ended (`skin`: the
+    /// first view committed within it).
+    ResultHold(HoldEnd),
     /// The result was prepared: from the play's end to the render thread's
     /// taking its presentation (design.md "State Model", ResultPreparing).
     Preparing,
@@ -474,7 +479,9 @@ fn format_records(records: &[Record], instrumented: bool, lost: u64) -> Vec<Stri
             }
             Record::Mark(m) => {
                 let ended = match m.kind {
-                    MarkKind::Hold(Some(why)) => format!(" (ended by {})", why.name()),
+                    MarkKind::Hold(Some(why)) | MarkKind::ResultHold(why) => {
+                        format!(" (ended by {})", why.name())
+                    }
                     _ => String::new(),
                 };
                 format!(
@@ -567,6 +574,7 @@ fn span_line(s: &Span, tag: &str) -> String {
 const fn mark_name(k: MarkKind) -> &'static str {
     match k {
         MarkKind::Hold(_) => "hold",
+        MarkKind::ResultHold(_) => "result-hold",
         MarkKind::Preparing => "preparing",
         MarkKind::ReadBack => "read-back",
     }
@@ -669,6 +677,17 @@ impl Recorder {
             self.held = Some(h.lifetime);
             self.mark(Mark {
                 kind: MarkKind::Hold(h.ended_by),
+                from: h.from,
+                to: h.to,
+            });
+        }
+    }
+
+    /// The result's hold's outgoing phase, ended.
+    pub fn result_hold(&self, h: HoldStamp) {
+        if let Some(why) = h.ended_by {
+            self.mark(Mark {
+                kind: MarkKind::ResultHold(why),
                 from: h.from,
                 to: h.to,
             });

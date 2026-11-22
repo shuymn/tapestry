@@ -2096,3 +2096,126 @@ mod error_tests {
         assert!(InputError::StopFromWorker.source().is_none());
     }
 }
+
+/// The input thread's own `deliver` on keyboard Raw Input blocks: a key
+/// from a device with a handle reaches the panels' level, a block with a
+/// null handle (input injected by software) reaches nothing (design.md
+/// "Input", Raw Input reception and Menu input).
+#[cfg(test)]
+mod deliver_tests {
+    use bms_model::TimeUs;
+    use eval::ControlId;
+
+    use super::{Controllers, deliver};
+    use crate::capture::Capture;
+    use crate::{
+        AdjustmentBindings, DeviceId, DeviceKind, PanelLevel, SourceConfig, SourceSet, TapControl,
+        adjustment_queue, raw,
+    };
+
+    /// START's and SELECT's default keyboard keys, E and W, by scan code.
+    const E: u16 = 0x12;
+    const W: u16 = 0x11;
+    const HANDLE: u64 = 0xC0DE;
+    const BREAK: u16 = 1;
+
+    /// A keyboard Raw Input block, as `GetRawInputBuffer` hands it.
+    fn block(device: u64, make: u16, down: bool) -> Vec<u8> {
+        let vkey: u16 = if make == E { 0x45 } else { 0x57 };
+        let (flags, message): (u16, u32) = if down { (0, 0x100) } else { (BREAK, 0x101) };
+        let mut b = Vec::with_capacity(40);
+        b.extend_from_slice(&1u32.to_le_bytes()); // RIM_TYPEKEYBOARD
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&device.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // RIM_INPUT
+        b.extend_from_slice(&make.to_le_bytes());
+        b.extend_from_slice(&flags.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&vkey.to_le_bytes());
+        b.extend_from_slice(&message.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b
+    }
+
+    /// The keyboard as a source, START on E and SELECT on W at the
+    /// adjustment tap, as the select screen sets them.
+    fn rig() -> (SourceSet, PanelLevel) {
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 2,
+            max_sources: 2,
+            max_held: 8,
+            queue_capacity: 16,
+            max_arrivals: 2,
+        })
+        .unwrap();
+        set.begin_batch(TimeUs(0));
+        set.connect(DeviceId(HANDLE), DeviceKind::Keyboard);
+        set.end_batch(TimeUs(1));
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![
+                (TapControl::Key(ControlId(E.into())), 0),
+                (TapControl::Key(ControlId(W.into())), 1),
+            ],
+            latched: 0b11,
+            ..AdjustmentBindings::default()
+        })
+        .unwrap();
+        tap.set_panel_roles(0b01, 0b10);
+        let level = tap.panel_level();
+        set.set_adjustment(tap);
+        (set, level)
+    }
+
+    /// One batch of `blocks` through `deliver`, then the boundary's
+    /// publication.
+    fn batch(set: &mut SourceSet, at: i64, blocks: &[Vec<u8>]) {
+        let capture = Capture::new();
+        let mut controllers = Controllers::new();
+        set.begin_batch(TimeUs(at));
+        for b in blocks {
+            deliver(b, &capture, &mut controllers, set);
+        }
+        set.end_batch(TimeUs(at + 1));
+        set.adjustment_mut().unwrap().publish_panels(true, 0);
+    }
+
+    fn held(level: &PanelLevel) -> (bool, bool, Option<usize>) {
+        let p = level.read();
+        (p.start, p.select, p.open())
+    }
+
+    /// E and W from the keyboard's handle: between their makes and their
+    /// breaks the level reads START and SELECT held (panel 3), and neither
+    /// after the breaks.
+    #[test]
+    fn device_keys_open_panel_3_between_make_and_break() {
+        let (mut set, level) = rig();
+        batch(
+            &mut set,
+            10,
+            &[block(HANDLE, E, true), block(HANDLE, W, true)],
+        );
+        assert_eq!(held(&level), (true, true, Some(2)));
+        batch(
+            &mut set,
+            20,
+            &[block(HANDLE, E, false), block(HANDLE, W, false)],
+        );
+        assert_eq!(held(&level), (false, false, None));
+    }
+
+    /// The same blocks with a null handle decode to nothing, so no source
+    /// holds a key and the level never changes.
+    #[test]
+    fn injected_keys_open_no_panel() {
+        let (mut set, level) = rig();
+        let made = [block(0, E, true), block(0, W, true)];
+        for b in &made {
+            assert_eq!(raw::decode_keyboard(b), None, "a null handle decodes");
+        }
+        let before = level.read();
+        batch(&mut set, 10, &made);
+        assert_eq!(held(&level), (false, false, None));
+        assert_eq!(level.read().generation, before.generation);
+    }
+}

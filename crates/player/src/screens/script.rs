@@ -114,6 +114,12 @@ pub(in crate::screens) struct ScriptHost {
     pub(in crate::screens) presented: Option<(u64, u64)>,
     /// The current result lifetime, 0 between lifetimes.
     pub(in crate::screens) result_lifetime: u64,
+    /// The generation of a result lifetime's first payload and that
+    /// lifetime, from the payload's publication to the lifetime's first
+    /// commit (design.md "beatoraja Lua Skins", the result skin):
+    /// protected only while that lifetime is the current one
+    /// ([`ScriptHost::first_now`]).
+    pub(in crate::screens) first: Option<(u64, u64)>,
     /// The generation the result skin's publication of the current
     /// attempt runs, if any ([`Scripts::set_published`]).
     pub(in crate::screens) published: Option<u64>,
@@ -154,12 +160,23 @@ impl ScriptHost {
             .map(|(g, _)| g)
     }
 
+    /// The generation of the current result lifetime's first payload,
+    /// until its first commit: decided where it is used, as
+    /// [`presented_now`](Self::presented_now).
+    pub(in crate::screens) fn first_now(&self) -> Option<u64> {
+        self.first
+            .filter(|&(_, l)| l != 0 && l == self.result_lifetime)
+            .map(|(g, _)| g)
+    }
+
     /// Whether result generation `generation` is protected now: the fixed
-    /// skin's, presented in the current result lifetime, or published in
-    /// the current attempt. The one predicate the eviction, the reuse and
+    /// skin's, presented in the current result lifetime, its first
+    /// payload's until its first commit, or published in the current
+    /// attempt. The one predicate the eviction, the reuse and
     /// the commit point all ask, each time (s7-07-design §3.7.1 M6).
     pub(in crate::screens) fn protects(&self, generation: u64) -> bool {
         self.presented_now() == Some(generation)
+            || self.first_now() == Some(generation)
             || self.published == Some(generation)
             || self
                 .results
@@ -642,12 +659,14 @@ impl Scripts {
         {
             let mut host = self.0.host();
             let presented = host.presented_now();
+            let first = host.first_now();
             let published = host.published;
             let id = self.0.id;
             host.retire_results(|e| {
                 matches!(e.held, Held::Parked(_))
                     && !e.retained
                     && Some(e.generation) != presented
+                    && Some(e.generation) != first
                     && Some(e.generation) != published
                     && !keep
                         .iter()
@@ -674,6 +693,27 @@ impl Scripts {
     /// nothing from now on.
     pub(crate) fn enter_result(&self, lifetime: u64) {
         self.0.host().result_lifetime = lifetime;
+    }
+
+    /// Result lifetime `lifetime`'s first payload runs generation `g`
+    /// (none for one without a runtime): protected until the lifetime's
+    /// first commit, its end or the kind's disable. Set under the result
+    /// slot's lock, before the payload is offered.
+    pub(crate) fn set_first(&self, g: Option<ScriptGen>, lifetime: u64) {
+        self.0.host().first = g
+            .filter(|g| g.cell == self.0.id)
+            .map(|g| (g.generation, lifetime));
+    }
+
+    /// The generation the current result lifetime's first payload runs,
+    /// while it is protected (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub(crate) fn first(&self) -> Option<ScriptGen> {
+        self.0.host().first_now().map(|generation| ScriptGen {
+            cell: self.0.id,
+            generation,
+        })
     }
 
     /// The result skin published a layout running generation `g` (none
@@ -732,6 +772,7 @@ impl Scripts {
         let mut host = self.0.host();
         host.results_disabled = true;
         host.presented = None;
+        host.first = None;
         host.retire_results(|_| true);
     }
 
@@ -765,6 +806,10 @@ impl Scripts {
             return ViewCommit::Refused;
         }
         host.presented = next.map(|g| (g.generation, lifetime));
+        // The lifetime's first commit ends its first payload's protection.
+        if host.first.is_some_and(|(_, l)| l == lifetime) {
+            host.first = None;
+        }
         ViewCommit::Committed
     }
 

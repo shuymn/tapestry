@@ -167,6 +167,77 @@ fn the_topmost_target_takes_the_press() {
     }
 }
 
+/// The test device's panel-3 targets (docs/test-device.md "Verification",
+/// P1; `test_device::panel::TARGETS`), on a volume slider placed as the
+/// select skin used there draws them (travel 176 from x 212, 31 high) at
+/// 1920 wide: each client x lies a whole quarter along, so the hit's value
+/// is exact and the knob of that value sits at the pointer's x in both
+/// players.
+#[test]
+fn the_panel_runs_volume_targets_hit_exact_quarters() {
+    use test_device::panel::{CLIENT, TARGETS, TRAVEL, TRAVEL_FROM};
+    let bar = RatioBarDef {
+        image: 4,
+        form: RatioForm::Slider {
+            direction: SliderDirection::Right,
+            range: skin_model::Ratio {
+                numerator: TRAVEL.try_into().unwrap(),
+                denominator: 1,
+            },
+            changeable: true,
+        },
+        source: RatioSource::SystemVolume,
+    };
+    let mut fx = Fx::new(
+        load(
+            vec![element(Source::RatioBar(0), [TRAVEL_FROM, 0, 31, 31])],
+            WidgetDefs::default(),
+            SelectionDefs {
+                ratio_bars: vec![bar],
+                ..SelectionDefs::default()
+            },
+        )
+        .unwrap(),
+    );
+    // The slider is drawn, so it takes presses, once a volume is known.
+    let full = skin_model::VolumeReading::of_gain(1.0);
+    let settings = skin_model::SelectionSettings {
+        display_offset_ms: 0,
+        system_volume: full,
+        key_volume: full,
+        background_volume: full,
+        speed: skin_model::SpeedView::Classic,
+        order: skin_model::SelectionOrder::Title,
+        gauge: None,
+        covers_on: [false; 3],
+        play_to_end: false,
+        assignment: None,
+    };
+    fx.skin
+        .update_selection_settings(&mut fx.sel, &settings)
+        .unwrap();
+    fx.view(&numbered(vec![chart("a")]));
+    fx.frame(0);
+    assert_eq!(fx.target.map(|v| i32::try_from(v).unwrap()), CLIENT);
+    for t in TARGETS {
+        let along = t.x - TRAVEL_FROM;
+        // along / TRAVEL is k / 4: exact in f32 and f64.
+        assert_eq!(along * 4 % TRAVEL, 0, "{t:?}");
+        let steps = u64::try_from(along * 1_000_000 / TRAVEL).unwrap();
+        let want = SliderCommand {
+            source: RatioSource::SystemVolume,
+            value: skin_model::Ratio::new(steps, skin_model::SLIDER_STEPS).unwrap(),
+        };
+        let p = [f32::from(i16::try_from(t.x).unwrap()), 15.0];
+        assert_eq!(
+            hit(&fx, p, Button::Left),
+            Some(PointerHit::Slider(want)),
+            "{t:?}"
+        );
+        assert_eq!(fx.skin.drag_at(&fx.sel, p, fx.target), Some(want), "{t:?}");
+    }
+}
+
 /// Two slots drawn over one point: the list tries its clickable slots in
 /// their order, the first that holds the point taking it, with the button.
 #[test]

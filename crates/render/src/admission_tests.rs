@@ -807,3 +807,75 @@ fn a_removal_fills_its_standing_entry_with_the_list_full() {
             .contains(&Some(sel.atlas_id()))
     );
 }
+
+/// A result view's staging in steps destroys nothing in its call: with a
+/// live pool beside the smaller one a regrowth retired, a result candidate
+/// that fits only once the live pool is reduced needs the retired one
+/// destroyed first, so it has no room, and taken anyway it is refused with
+/// nothing destroyed; once a boundary has destroyed the retired pool it has
+/// room, and its staging retires the live pool, destroying nothing in its
+/// call either.
+// Revert: `install_stepped` letting a result staging destroy in its call
+// -> the staging taken without room destroys the retired pool inline:
+// "taken without room".
+#[test]
+fn a_result_view_staging_destroys_nothing_in_its_call() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let res = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Result, &res, 3);
+    settle(&mut r);
+    assert_eq!(r.pool().unwrap().layers, 4);
+    let sel = r.admission().charge(ScreenKind::Selection);
+    // A decision candidate reduces the pool to two layers, made once the
+    // retired one is destroyed.
+    r.state_charge(&p, SHARED_TEXELS - sel - 2 * TINY - LAYER);
+    let d = tiny(&r, BLUE);
+    commit(&mut r, ScreenKind::Decision, &d, 4);
+    settle(&mut r);
+    assert!(r.make_owed_pool());
+    assert_eq!(r.pool().unwrap().layers, 2);
+    // Room for the whole pool again: the regrowth's live pool of four
+    // layers beside the two-layer one it retired, left standing.
+    r.state_charge(&p, SHARED_TEXELS - sel - 2 * TINY - 3 * LAYER);
+    assert_eq!(r.regrow_pool().unwrap().layers, 4);
+    assert_eq!(r.admission().retired_pool, 2 * LAYER);
+    // A result candidate that fits once the live pool keeps three layers.
+    let b = tiny(&r, GREEN);
+    r.state_candidate_charge(&b, TINY + LAYER);
+    assert!(
+        !r.install_room(ScreenKind::Result, &b),
+        "room while the retired pool stands"
+    );
+    let from = r.destructions_recorded();
+    let e = r
+        .install_stepped(ScreenKind::Result, &b, 5)
+        .expect_err("taken without room");
+    assert!(matches!(e, RenderError::ListFull { .. }), "{e:?}");
+    assert_eq!(
+        recorded_since(&r, from),
+        Vec::new(),
+        "destroyed in its call"
+    );
+    assert_eq!(r.admission().retired_pool, 2 * LAYER);
+    assert_eq!(r.pool().unwrap().layers, 4);
+    // A boundary destroys the retired pool: room, and the staging retires
+    // the live pool with nothing destroyed in its call.
+    settle(&mut r);
+    assert!(r.install_room(ScreenKind::Result, &b));
+    let from = r.destructions_recorded();
+    let _ = r.install_stepped(ScreenKind::Result, &b, 6).unwrap();
+    assert_eq!(
+        recorded_since(&r, from),
+        Vec::new(),
+        "destroyed in its call"
+    );
+    assert_eq!(r.pool(), None, "the live pool retired");
+    assert!(r.pool_owed());
+    assert_eq!(r.admission().retired_pool, 4 * LAYER);
+    r.discard();
+}

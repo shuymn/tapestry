@@ -228,6 +228,8 @@ struct Fake {
     /// The result's sound waits for its first picture until this clock
     /// time.
     sound_due_until: i64,
+    /// The result handed over shows from this clock time on.
+    view_shown_from: i64,
     /// Menu commands, taken on the result at these clock times.
     menu: Vec<(i64, game::MenuCommand)>,
     /// Commands pressed by a record sink while the play is saved, taken
@@ -500,6 +502,7 @@ impl Fake {
             idle_to_deadline: false,
             idle_waits: Vec::new(),
             sound_due_until: 0,
+            view_shown_from: i64::MIN,
             menu: Vec::new(),
             pressed: std::sync::Arc::default(),
             steps: Vec::new(),
@@ -623,6 +626,10 @@ impl Rig for Fake {
 
     fn result_sound_due(&self) -> bool {
         self.clock.now().0 < self.sound_due_until
+    }
+
+    fn result_view_shown(&self) -> bool {
+        self.clock.now().0 >= self.view_shown_from
     }
 
     fn take(&mut self) -> Option<Command> {
@@ -7205,4 +7212,78 @@ fn a_retry_reads_the_best_and_its_pace_again() {
         "{two:?}"
     );
     assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// V19a's game flow (design.md "State Model", Result): until the result
+/// handed over shows, a preset step is dropped; once it shows, one is
+/// taken.
+#[test]
+fn a_step_before_the_result_shows_is_dropped() {
+    use game::MenuCommand::NextPreset;
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(None, s + 3_000_000);
+    rig.view_shown_from = s + 1_000_000;
+    press(
+        &mut rig,
+        &[(s + 500_000, NextPreset), (s + 1_500_000, NextPreset)],
+    );
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let played = viewed(shown(&rig, s));
+    assert_eq!(
+        viewed(shown(&rig, s + 1_400_000)),
+        played,
+        "a step taken before the result showed"
+    );
+    assert_ne!(
+        viewed(shown(&rig, s + 2_000_000)),
+        played,
+        "the step after the result showed dropped"
+    );
+}
+
+/// V19a's game flow: before the result shows a back is taken in the look
+/// that takes it.
+#[test]
+fn a_back_before_the_result_shows_is_taken_at_once() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(None, s + 3_000_000);
+    rig.view_shown_from = i64::MAX;
+    press(&mut rig, &[(s + 500_000, game::MenuCommand::Back)]);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(rig.served, [(game::MenuCommand::Back, s + 500_000)]);
+}
+
+/// V19a's game flow: before the result shows, a back that arrives during a
+/// recovery is taken at the next look, not dropped with what an input
+/// time drops.
+#[test]
+fn a_back_during_a_recovery_before_the_result_shows_is_taken_next() {
+    use game::MenuCommand::Back;
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(None, s + 6_000_000);
+    rig.view_shown_from = i64::MAX;
+    rig.screen_fails_at = s + 400_000;
+    rig.at.push((s + 400_000, Box::new(|| {})));
+    rig.prepare_cost = 2_000_000;
+    rig.menu.push((s + 500_000, Back));
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert!(
+        rig.screen_at.contains(&(s + 400_000)),
+        "{:?}",
+        rig.screen_at
+    );
+    assert_eq!(rig.accepted, [Back], "the back dropped after the recovery");
+    assert!(
+        rig.served.iter().all(|&(_, at)| at >= s + 2_400_000),
+        "{:?}",
+        rig.served
+    );
 }

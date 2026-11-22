@@ -52,7 +52,7 @@ pub(crate) fn movie_bundle_in(dir: &std::path::Path) -> Arc<render::SkinBundle> 
 /// `chart` loaded and the movie bundle chosen for play.
 fn on_menu(hub: &Arc<MediaHub>, chart: &Chart) -> super::super::RenderLink {
     let hub = Arc::clone(hub);
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,

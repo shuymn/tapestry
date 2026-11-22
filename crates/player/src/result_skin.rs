@@ -1285,6 +1285,12 @@ impl ResultSkin {
         self.generation += 1;
     }
 
+    /// Whether the attempt's image stage chose the built-in result: every
+    /// view of this attempt is published as it.
+    pub fn attempt_built_in(&self) -> bool {
+        matches!(self.attempt, Some(ForAttempt::BuiltIn))
+    }
+
     /// The attempt's result skin as its image stage left it, and whether a
     /// prepared atlas is live (dev-tools).
     #[cfg(feature = "dev-tools")]

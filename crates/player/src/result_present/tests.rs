@@ -96,13 +96,65 @@ fn the_slot_keeps_only_the_newest_of_its_lifetime() {
     slot.enter(1);
     assert!(slot.offer(clone(&first)), "the first signals");
     assert!(!slot.offer(clone(&second)), "one signal waits");
-    assert_eq!(slot.take().map(|p| p.revision), Some(2));
-    assert!(slot.take().is_none());
+    let [kept, newest] = slot.take();
+    assert_eq!(kept.map(|p| p.revision), Some(2));
+    assert!(newest.is_none());
+    assert!(slot.take().iter().all(Option::is_none));
     // A new lifetime drops what waited of the old one.
     assert!(slot.offer(clone(&first)));
     slot.enter(2);
-    assert!(slot.take().is_none());
+    assert!(slot.take().iter().all(Option::is_none));
     assert!(!slot.offer(clone(&first)), "of an ended lifetime");
+}
+
+/// V19 (l2)'s slot (design.md "beatoraja Lua Skins", the result skin):
+/// the lifetime's first presentation is kept apart, a newer overlay of its
+/// payload replacing it in place, while another payload's replace only the
+/// newest; the take gives the first, then the newest, and a new lifetime
+/// begins with no first offered.
+#[test]
+fn the_slot_keeps_a_lifetimes_first_presentation() {
+    let mut sent = Sent::default();
+    let mut p = Presenter::default();
+    p.begin(&mut sent);
+    p.want(snapshot("a"));
+    p.land(&mut sent, Some(&Published::BuiltIn), None);
+    p.lines(&mut sent, vec!["n".to_owned()]);
+    p.want(snapshot("b"));
+    p.land(&mut sent, Some(&Published::BuiltIn), None);
+    p.want(snapshot("c"));
+    p.land(&mut sent, Some(&Published::BuiltIn), None);
+    let [a, a2, b, c] = <[ResultPresentation; 4]>::try_from(sent.shown).unwrap();
+    assert!(Arc::ptr_eq(&a.payload, &a2.payload));
+    let mut slot = ResultSlot::default();
+    slot.enter(1);
+    assert!(slot.takes_first(&a));
+    assert!(slot.offer(clone(&a)));
+    assert!(!slot.takes_first(&b), "a second first");
+    assert!(!slot.offer(clone(&b)));
+    assert!(!slot.offer(clone(&a2)), "one signal waits");
+    assert!(!slot.offer(clone(&c)));
+    let [first, newest] = slot.take();
+    assert_eq!(
+        (
+            first.map(|p| (p.payload.key, p.revision)),
+            newest.map(|p| p.payload.key)
+        ),
+        (Some((a.payload.key, a2.revision)), Some(c.payload.key)),
+        "the first replaced by another payload, or the overlay lost"
+    );
+    // Once taken, the first payload's overlay goes to the newest.
+    assert!(slot.offer(clone(&a2)));
+    assert_eq!(
+        slot.take()[1].as_ref().map(|p| p.revision),
+        Some(a2.revision)
+    );
+    slot.enter(2);
+    let b2 = ResultPresentation {
+        lifetime: 2,
+        ..clone(&b)
+    };
+    assert!(slot.takes_first(&b2), "the new lifetime's first");
 }
 
 fn clone(p: &ResultPresentation) -> ResultPresentation {

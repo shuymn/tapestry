@@ -35,7 +35,9 @@ use crate::render_side::{FrameSink, Screen};
 pub mod checkpoints;
 mod decision_faults;
 pub mod loop_probe;
+pub mod present_shot;
 pub mod scenario;
+pub mod skin_clock;
 pub mod test_device;
 pub mod transitions;
 
@@ -829,6 +831,14 @@ pub struct SelectOptions {
     /// only while speculation is on: the select screen measured at caps 1
     /// and 2 (design.md "Load Pipeline", System friendliness).
     pub speculative_permits: Option<usize>,
+    /// The named pipe a test device's runner asks for the window's own
+    /// shots on (`--dev-shot-pipe <name>`, [`present_shot`]): each answered
+    /// with a frame the render thread copied as it presented it.
+    pub shot_pipe: Option<String>,
+    /// Whether the select skin's clock is frozen for the whole run
+    /// (`--dev-freeze-skin-clock`, [`skin_clock`]): a test device's shots
+    /// of the select screen are then the same frame in every run.
+    pub freeze_skin_clock: bool,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -863,6 +873,16 @@ impl SelectOptions {
                 })?;
                 self.stop_timeout = Some(std::time::Duration::from_secs(secs));
             }
+            "dev-shot-pipe" => {
+                let name = p.value()?.to_string_lossy().into_owned();
+                if !name.starts_with(r"\\.\pipe\") {
+                    return Err(UsageError::Usage(
+                        r"--dev-shot-pipe takes a pipe name, \\.\pipe\<name>".to_owned(),
+                    ));
+                }
+                self.shot_pipe = Some(name);
+            }
+            "dev-freeze-skin-clock" => self.freeze_skin_clock = true,
             "dev-speculative-permits" => {
                 let n = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-speculative-permits takes a count".to_owned())
@@ -884,6 +904,11 @@ impl SelectOptions {
         if self.headless && !(auto && self.script.is_some()) {
             return Err(UsageError::Usage(
                 "--dev-headless needs --auto and --dev-select".to_owned(),
+            ));
+        }
+        if self.shot_pipe.is_some() && self.window.is_none() {
+            return Err(UsageError::Usage(
+                "--dev-shot-pipe needs --dev-window".to_owned(),
             ));
         }
         if self.headless && self.window.is_some() {
@@ -2769,7 +2794,7 @@ impl FrameDump {
 /// An RGBA8 image as a PNG file, stored without compression (deflate's
 /// stored blocks): enough for a few development screenshots without an
 /// image library.
-fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+pub(crate) fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let row = width as usize * 4;
     let mut raw = Vec::with_capacity((row + 1) * height as usize);
     for line in rgba.chunks(row) {
@@ -3243,6 +3268,14 @@ pub fn read_result_faults() {
 static LOST_RESULT_FAULT: AtomicU64 = AtomicU64::new(0);
 static LOST_RESULT_SEEN: AtomicU64 = AtomicU64::new(0);
 
+/// Loses the `n`th result or end frame drawn from now on as a device
+/// loss; 0 none (tests).
+#[cfg(test)]
+pub fn lose_result_frame_at(n: u64) {
+    LOST_RESULT_SEEN.store(0, Ordering::SeqCst);
+    LOST_RESULT_FAULT.store(n, Ordering::SeqCst);
+}
+
 /// Whether this result or end frame, drawn, is lost as a device loss.
 pub fn lose_result_frame() -> bool {
     let n = LOST_RESULT_FAULT.load(Ordering::SeqCst);
@@ -3305,8 +3338,22 @@ pub fn hold_result_settle() {
     RESULT_SETTLE_WAITING.store(false, Ordering::SeqCst);
 }
 
+/// The next view's text preparation is refused (tests).
+#[cfg(test)]
+static REFUSE_NEXT_TEXT: AtomicBool = AtomicBool::new(false);
+
+/// Refuses the next view's text preparation (tests).
+#[cfg(test)]
+pub fn refuse_next_result_text() {
+    REFUSE_NEXT_TEXT.store(true, Ordering::SeqCst);
+}
+
 /// Whether this view's text preparation is refused.
 pub fn refuse_result_text() -> bool {
+    #[cfg(test)]
+    if REFUSE_NEXT_TEXT.swap(false, Ordering::SeqCst) {
+        return true;
+    }
     result_fault("text", RESULT_TEXTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1)
 }
 

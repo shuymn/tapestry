@@ -221,8 +221,44 @@ pub enum Run {
     /// A child the runner started: its name in the row and its process.
     Spawn(Child),
     /// The runner terminated a child it started, and every process in the
-    /// job it started that child in, with its cut code.
-    Kill(Child),
+    /// job it started that child in, with its cut code: written once the
+    /// termination call returned.
+    Kill(RunKill),
+    /// The runner's sink window, once it shows.
+    Sink(RunWindow),
+    /// The runner's recorder shows every press the row holds, from the
+    /// device's bound handles.
+    Held(RunQ),
+    /// The runner's recorder shows the device's buttons all up after
+    /// `held`: the counter of that report.
+    Released(RunReleased),
+    /// `stop_holds`: no hold-bearing command is admitted after it, and the
+    /// one `release` is requested; its cause.
+    Stop(RunNote),
+    /// A step of the recovery after the end found no release evidence.
+    Recovery(RunNote),
+    /// A `SendInput` call about to be made: its tag and what it sends.
+    Call(RunCall),
+    /// The release evidence the end took: the `hello` answer (as the link
+    /// recorded it) that read the run's token and `quiet 1`.
+    Quiet(RunLine),
+    /// The runner closed its sink window.
+    Close(RunWindow),
+    /// The player's main window, once it shows on the run's monitor: the
+    /// run's window from then on.
+    Window(RunWindow),
+    /// The player's executable the runner starts: its path, sha256, the
+    /// commit it reports and its last write.
+    Player(RunPlayer),
+    /// The device's `hello` after the run's mode step, as the mode link
+    /// recorded it: the mode the run's reports come in.
+    Mode(RunLine),
+    /// A shot of the player's window: its file in the run's folder, sealed
+    /// once written; the player's own copy of a frame it presented.
+    Shot(RunShot),
+    /// The kill barrier: the run waits here, holding, for its outer to end
+    /// it.
+    Barrier(RunQ),
     Exit(Exit),
     End(RunEnd),
 }
@@ -239,6 +275,11 @@ pub struct Start {
     /// The device's build the run expects.
     pub build: String,
     pub process: Process,
+    /// The runner's own commit: 12 hex digits, with `-dirty` for a build
+    /// of uncommitted changes (`nogit` when the build had no Git).
+    pub commit: String,
+    /// The 16-bit prefix of every injected input's 32-bit tag.
+    pub tag: u16,
     /// The exit code this runner gives every process it terminates:
     /// `0x40000000` plus 30 random bits, a code no process gives itself.
     pub cut: i32,
@@ -268,6 +309,140 @@ pub struct Child {
     pub q: i64,
     pub name: String,
     pub process: Process,
+}
+
+/// A termination the runner made: the child's name and process, the host
+/// counter read just before the termination call (`requested`) and the
+/// record's own, written once the call returned. Whatever the recorder saw
+/// before `requested` came before the termination; between the two, its
+/// order with the termination is unknown.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunKill {
+    pub q: i64,
+    pub name: String,
+    pub process: Process,
+    pub requested: i64,
+}
+
+/// A window of the runner's, by its handle's value.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunWindow {
+    pub q: i64,
+    pub window: u64,
+}
+
+/// A record with only its host counter.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunQ {
+    pub q: i64,
+}
+
+/// A `SendInput` call: its 32-bit tag, what it sends (`move`, `click`,
+/// `calibrate`) and the run's window's client point it aims at.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCall {
+    pub q: i64,
+    pub tag: u32,
+    pub what: String,
+    pub point: [i32; 2],
+}
+
+/// A shot: its file, the player's process that made it and the process
+/// id of the shot pipe's client that sent it (the system's), the frame's
+/// size, the host counter when the runner sent the request, the frame, and
+/// the player's witness of its pointer volume arm: each volume the arm
+/// reached before the player answered, as the slider's number (17 system,
+/// 18 key, 19 background), the whole percent, the host counter when the
+/// arm took it, and the pointer input that brought it (`press`, `drag` or
+/// `other`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunShot {
+    pub q: i64,
+    pub what: String,
+    pub process: Process,
+    pub client: u32,
+    pub size: [i32; 2],
+    pub requested: i64,
+    pub frame: RunFrame,
+    pub volumes: Vec<(u8, u32, i64, String)>,
+}
+
+/// A frame the player copied as it presented it: the swap chain's present
+/// count before and after its present (the player answers only a present
+/// that advanced it), and the host counter when the render thread took it
+/// for the copy and right after its present returned.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFrame {
+    pub previous: u32,
+    pub present: u32,
+    pub acquired: i64,
+    pub presented: i64,
+}
+
+/// The recorder's neutral report the runner saw: the record's own counter
+/// and the report's.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunReleased {
+    pub q: i64,
+    pub report: i64,
+}
+
+/// A line the runner observed, with its host counter.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunLine {
+    pub q: i64,
+    pub line: String,
+}
+
+/// A cause or a step, with its host counter.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunNote {
+    pub q: i64,
+    pub what: String,
+}
+
+/// A file of the player's private copy and its sha256.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopiedFile {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// The player's executable: the sha256 is the copy's, read through the
+/// handle that keeps it unchanged while the run lasts.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunPlayer {
+    pub q: i64,
+    /// The private copy the run starts.
+    pub path: String,
+    /// The executable it was copied from.
+    pub source: String,
+    /// Every file copied with it (the executable first, then its media
+    /// worker and DLLs), each with the sha256 of the copy.
+    pub files: Vec<CopiedFile>,
+    pub sha256: String,
+    /// The sha256 the row expected of it, recorded before the holds: the
+    /// runner's own executable's, or the declared one (P5's).
+    pub expected: String,
+    /// The sha256 the row declared for it (P5's mutated player).
+    pub declared: Option<String>,
+    /// The runner's own executable's sha256.
+    pub runner_sha256: String,
+    /// What `<exe> test-device commit` printed.
+    pub commit: String,
+    /// The file's last write, as the system's FILETIME.
+    pub modified: u64,
 }
 
 /// A process's end as the runner observed it, once the process had ended:
@@ -302,6 +477,19 @@ impl Kinds for Run {
             Self::Start(_) => "start",
             Self::Seal(_) => "seal",
             Self::Spawn(_) => "spawn",
+            Self::Sink(_) => "sink",
+            Self::Held(_) => "held",
+            Self::Released(_) => "released",
+            Self::Stop(_) => "stop",
+            Self::Recovery(_) => "recovery",
+            Self::Call(_) => "call",
+            Self::Quiet(_) => "quiet",
+            Self::Close(_) => "close",
+            Self::Window(_) => "window",
+            Self::Player(_) => "player",
+            Self::Mode(_) => "mode",
+            Self::Shot(_) => "shot",
+            Self::Barrier(_) => "barrier",
             Self::Kill(_) => "kill",
             Self::Exit(_) => "exit",
             Self::End(_) => "end",
@@ -310,7 +498,16 @@ impl Kinds for Run {
 
     fn q(&self) -> Option<i64> {
         match self {
-            Self::Spawn(c) | Self::Kill(c) => Some(c.q),
+            Self::Spawn(c) => Some(c.q),
+            Self::Kill(k) => Some(k.q),
+            Self::Sink(r) | Self::Close(r) | Self::Window(r) => Some(r.q),
+            Self::Call(r) => Some(r.q),
+            Self::Quiet(r) | Self::Mode(r) => Some(r.q),
+            Self::Held(r) | Self::Barrier(r) => Some(r.q),
+            Self::Stop(r) | Self::Recovery(r) => Some(r.q),
+            Self::Shot(r) => Some(r.q),
+            Self::Released(r) => Some(r.q),
+            Self::Player(p) => Some(p.q),
             Self::Exit(e) => Some(e.q),
             Self::Start(_) | Self::Seal(_) | Self::End(_) => None,
         }
@@ -325,8 +522,17 @@ pub enum Link {
     /// bound location, the COM port, the interface path it was opened by,
     /// and the counter's frequency.
     Open(LinkOpen),
-    /// A command written.
-    Cmd(LinkLine),
+    /// A command written: the host counter just before its write, and in
+    /// the runner's link also when it was queued and when its write ended.
+    Cmd(LinkCmd),
+    /// The guard's good check, at `q`, that the hold-bearing command
+    /// `line` written next is derived from.
+    Check(LinkLine),
+    /// A hold-bearing command not written: holds had stopped.
+    Dropped(LinkLine),
+    /// The fence: no hold-bearing write begun before holds stopped is in
+    /// progress.
+    Fence(LinkQ),
     /// An answer read; `sent` and `cmd` name the command it answers (none
     /// for the `hello` read while the link opens).
     Ans(LinkAnswer),
@@ -362,6 +568,21 @@ pub struct LinkOpen {
 pub struct LinkLine {
     pub q: i64,
     pub line: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkCmd {
+    pub q: i64,
+    pub line: String,
+    pub queued: Option<i64>,
+    pub done: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkQ {
+    pub q: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -411,6 +632,9 @@ impl Kinds for Link {
         match self {
             Self::Open(_) => "open",
             Self::Cmd(_) => "cmd",
+            Self::Check(_) => "check",
+            Self::Dropped(_) => "dropped",
+            Self::Fence(_) => "fence",
             Self::Ans(_) => "ans",
             Self::Ping(_) => "ping",
             Self::Rec(_) => "rec",
@@ -424,7 +648,9 @@ impl Kinds for Link {
     fn q(&self) -> Option<i64> {
         Some(match self {
             Self::Open(r) => r.q,
-            Self::Cmd(r) | Self::Rec(r) => r.q,
+            Self::Cmd(r) => r.q,
+            Self::Rec(r) | Self::Check(r) | Self::Dropped(r) => r.q,
+            Self::Fence(r) => r.q,
             Self::Ans(r) => r.q,
             Self::Ping(r) => r.recv,
             Self::Malformed(r) => r.q,
@@ -438,14 +664,31 @@ impl Kinds for Link {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Recorder {
-    /// The recorder's first record: the run its runner gave it and its own
-    /// process.
+    /// The recorder's first record: the run its runner gave it, its own
+    /// process, its window and the device's handles it bound.
     Ready(RecorderReady),
+    /// A pad report, from the bound pad (`ours`) or another handle.
+    Pad(RecorderPad),
+    /// A keyboard edge, from the bound keyboard (`ours`) or another handle.
+    Key(RecorderKey),
+    /// A mouse button edge: its handle and `ulExtraInformation`.
+    Mouse(RecorderMouse),
+    /// A device's arrival, removal, or presence at the start.
+    Dev(RecorderDev),
     /// A recorder error: what failed and the stretch of the stream it
     /// affects, from and to on the host's counter.
     Error(RecorderError),
+    /// The recorder's loop is running: written every 20 ms whatever it
+    /// reads, so its runner tells a stalled recorder from a quiet one.
+    Beat(RecorderBeat),
     /// The recorder's end, after draining its queue.
     End(RecorderEnd),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderBeat {
+    pub q: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -454,6 +697,81 @@ pub struct RecorderReady {
     pub q: i64,
     pub run: String,
     pub process: Process,
+    /// Its message-only window.
+    pub window: u64,
+    /// The device's location the handles are bound by.
+    pub location: String,
+    /// The device's keyboard and pad handles, as bound at the start.
+    pub keyboard: Option<u64>,
+    pub pad: Option<u64>,
+}
+
+/// The foreground window and its process when an input was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Foreground {
+    pub window: u64,
+    pub pid: u32,
+}
+
+/// A pad report.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderPad {
+    pub q: i64,
+    pub h: u64,
+    pub ours: bool,
+    /// The report's bytes as read, without a report id, in lowercase hex:
+    /// the bound pad's decode as `report::PadReport`; another
+    /// controller's are kept as they came.
+    pub bytes: String,
+    pub fg: Foreground,
+}
+
+/// A keyboard edge.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderKey {
+    pub q: i64,
+    pub h: u64,
+    pub ours: bool,
+    /// The scan code, with 0xE000 added for an E0 key.
+    pub code: u16,
+    pub down: bool,
+    pub fg: Foreground,
+}
+
+/// A mouse button edge.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderMouse {
+    pub q: i64,
+    pub h: u64,
+    /// `RAWMOUSE.usButtonFlags`, only its button edges.
+    pub buttons: u16,
+    /// `RAWMOUSE.ulExtraInformation`: an injected input's tag.
+    pub extra: u32,
+    pub fg: Foreground,
+}
+
+/// A device's change.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecorderDev {
+    pub q: i64,
+    pub h: u64,
+    pub change: Change,
+    /// Whether it is one of the device's interfaces at the bound location.
+    pub ours: bool,
+}
+
+/// What a [`RecorderDev`] saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Change {
+    Present,
+    Arrival,
+    Removal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -477,7 +795,12 @@ impl Kinds for Recorder {
     fn kind(&self) -> &'static str {
         match self {
             Self::Ready(_) => "ready",
+            Self::Pad(_) => "pad",
+            Self::Key(_) => "key",
+            Self::Mouse(_) => "mouse",
+            Self::Dev(_) => "dev",
             Self::Error(_) => "error",
+            Self::Beat(_) => "beat",
             Self::End(_) => "end",
         }
     }
@@ -485,7 +808,12 @@ impl Kinds for Recorder {
     fn q(&self) -> Option<i64> {
         Some(match self {
             Self::Ready(r) => r.q,
+            Self::Pad(r) => r.q,
+            Self::Key(r) => r.q,
+            Self::Mouse(r) => r.q,
+            Self::Dev(r) => r.q,
             Self::Error(r) => r.to,
+            Self::Beat(r) => r.q,
             Self::End(r) => r.q,
         })
     }

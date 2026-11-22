@@ -375,7 +375,7 @@ fn screen(
     let seen = Arc::new(Mutex::new(Vec::new()));
     let noted = Arc::clone(&seen);
     let made = Mutex::new(Some((model, uvs, dir)));
-    let make: MakeScreen = Box::new(move || {
+    let make: MakeScreen = Box::new(move |_| {
         let (model, uvs, _dir) = made.lock().unwrap().take().unwrap();
         Ok(Box::new(Skins {
             simple: SimpleSkin::new(),
