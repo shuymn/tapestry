@@ -5137,11 +5137,14 @@ fn a_second_payload_waits_for_the_first_picture(replaced: bool) {
     let pending = views.0.lock().unwrap().len();
     assert!(wait_until(|| views.0.lock().unwrap().len() > pending + 3));
     rig.link.pause_result_staging(false);
+    // The status is published before the frame reaches the sink: the
+    // second's frame is waited for there.
     assert!(
-        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        wait_until(|| views.0.lock().unwrap().iter().any(|(_, v)| *v == Some(2))),
         "the second never committed: {:?}",
         rig.link.result_status()
     );
+    assert_eq!(rig.link.result_status().shown, Some((2, true)));
     let seen = views.0.lock().unwrap().clone();
     let first = seen
         .iter()
