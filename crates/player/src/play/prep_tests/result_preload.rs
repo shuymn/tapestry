@@ -97,6 +97,109 @@ fn a_chosen_attempt_uploads_the_adopted_packs_pages() {
     });
 }
 
+/// The transition probe's marks in the order they were taken: each of
+/// `steps` is there once (with its value where one is given), in that
+/// order; none of `absent` is.
+fn marked_in_order(steps: &[(&str, Option<i64>)], absent: &[&str]) {
+    let marks = crate::dev::loop_probe::tests::marks();
+    let tags: Vec<_> = marks.iter().map(|m| (m.1, m.2)).collect();
+    let mut at = Vec::new();
+    for (tag, value) in steps {
+        let found: Vec<_> = (0..tags.len()).filter(|&i| tags[i].0 == *tag).collect();
+        assert_eq!(found.len(), 1, "{tag}: {tags:?}");
+        if let Some(v) = value {
+            assert_eq!(tags[found[0]].1, *v, "{tag}'s value: {tags:?}");
+        }
+        at.push(found[0]);
+    }
+    assert!(at.is_sorted(), "{steps:?} out of order: {tags:?}");
+    for tag in absent {
+        assert!(tags.iter().all(|t| t.0 != *tag), "{tag}: {tags:?}");
+    }
+}
+
+/// The transition probe's marks of an attempt that adopts the running
+/// pack: the pack's begin, the choice's claim of it and the adoption, its
+/// move to the foreground, its end and collection, then the stage decided
+/// resident, the attempt's preparation sent (`PrepareAttempt`) and only
+/// then its pages begun; no import job of the stage's own.
+#[test]
+fn the_probe_marks_an_adopted_attempts_steps_in_order() {
+    let _serial = imports::serial();
+    let _g = Opened;
+    crate::dev::loop_probe::tests::turn_on();
+    let (_dir, l) = chart(None);
+    on_warp(l.chart(), true, |rig, _| {
+        let seam = Arc::new(Seam::default());
+        let (_control, _skin) = held_on_rig(rig, &seam, 2);
+        let (_, Some(job)) = rig.result_skin.preload_state() else {
+            panic!("no pack runs");
+        };
+        let id = Some(i64::try_from(job).unwrap());
+        choose(rig, &l);
+        let mut h = begin(rig, &l);
+        at_adopted(rig, &mut h);
+        gate(0);
+        readied(rig, &mut h);
+        marked_in_order(
+            &[
+                ("pre:begin", id),
+                ("pre:claim", id),
+                ("img:adopted", id),
+                ("pre:class", id),
+                ("pre:end", id),
+                ("pre:collect", id),
+                ("img:resident", Some(1)),
+                ("att:send", None),
+                ("res:pages_begun", None),
+            ],
+            &["img:job", "pre:stop"],
+        );
+    });
+}
+
+/// The transition probe's marks of an attempt that finds the pack's atlas
+/// resident: the pack begun, ended and collected in selection, a claim of
+/// no running pack at the choice, then the stage decided resident, the
+/// attempt's preparation sent (`PrepareAttempt`) and only then its pages
+/// begun; no adoption and no import job of the stage's own.
+#[test]
+fn the_probe_marks_a_resident_attempts_steps_in_order() {
+    let _serial = imports::serial();
+    let _g = Opened;
+    crate::dev::loop_probe::tests::turn_on();
+    let (_dir, l) = chart(None);
+    on_warp(l.chart(), true, |rig, _| {
+        let seam = Arc::new(Seam::default());
+        let (_control, _skin) = held_on_rig(rig, &seam, 2);
+        let (_, Some(job)) = rig.result_skin.preload_state() else {
+            panic!("no pack runs");
+        };
+        let id = Some(i64::try_from(job).unwrap());
+        gate(0);
+        until("the pack's collection", || {
+            rig.poll_preload();
+            rig.result_skin.preload_state().1.is_none()
+        });
+        assert!(rig.result_skin.image().is_some(), "packed");
+        choose(rig, &l);
+        let mut h = begin(rig, &l);
+        readied(rig, &mut h);
+        marked_in_order(
+            &[
+                ("pre:begin", id),
+                ("pre:end", id),
+                ("pre:collect", id),
+                ("pre:claim", Some(0)),
+                ("img:resident", Some(1)),
+                ("att:send", None),
+                ("res:pages_begun", None),
+            ],
+            &["img:job", "img:adopted", "pre:class"],
+        );
+    });
+}
+
 /// The preparation's discard while its stage holds an adopted pack at a
 /// gate: it returns without waiting for the pack's thread, the claim
 /// ends, and the pack is the preload's again, so the choice's pause, still

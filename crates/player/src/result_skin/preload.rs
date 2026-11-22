@@ -181,6 +181,20 @@ impl PreloadControl {
     /// The shelf's pause is requested (`true`) or released.
     pub fn set_paused(&self, on: bool) {
         self.paused.store(on, Ordering::SeqCst);
+        #[cfg(feature = "dev-tools")]
+        if on && !self.claimed() {
+            self.mark_stop("pause");
+        }
+    }
+
+    /// Dev-tools: the running pack, if any, is asked to stop for `why`
+    /// (`pre:stop`).
+    #[cfg(feature = "dev-tools")]
+    fn mark_stop(&self, why: &str) {
+        let live = *self.live();
+        if let Some(id) = live.job.filter(|_| !live.left) {
+            mark_job("pre:stop", id, why);
+        }
     }
 
     /// Whether the pause holds with no claim exempting the pack.
@@ -199,6 +213,9 @@ impl PreloadControl {
     /// pause, so a pack never sees the choice's pause unclaimed.
     pub fn claim(self: &Arc<Self>) -> PreloadClaim {
         self.claims.fetch_add(1, Ordering::SeqCst);
+        // The job claimed: the running pack's, 0 when none runs.
+        #[cfg(feature = "dev-tools")]
+        mark_job("pre:claim", self.live().job.unwrap_or(0), "");
         PreloadClaim(Arc::clone(self))
     }
 
@@ -242,6 +259,8 @@ impl PreloadControl {
     /// The run ends: a running pack stops at its next checkpoint.
     pub fn close(&self) {
         self.closing.store(true, Ordering::SeqCst);
+        #[cfg(feature = "dev-tools")]
+        self.mark_stop("close");
     }
 
     /// Whether the run's end was signalled ([`close`](Self::close)).
@@ -286,6 +305,21 @@ impl PreloadControl {
             *live = Live::default();
             drop(live);
             self.changed.notify_all();
+        }
+    }
+}
+
+/// Dev-tools: the preload's mark `tag` of job `id` (the transition probe,
+/// [`crate::dev::loop_probe`]), and its `dev:` line with `what` when the
+/// probe is on.
+#[cfg(feature = "dev-tools")]
+fn mark_job(tag: &'static str, id: u64, what: &str) {
+    crate::dev::loop_probe::mark(tag, i64::try_from(id).unwrap_or(-1));
+    if crate::dev::loop_probe::on() {
+        if what.is_empty() {
+            println!("dev: {tag} {id}");
+        } else {
+            println!("dev: {tag} {id} {what}");
         }
     }
 }
@@ -387,6 +421,8 @@ impl PackJob {
         if mode.refused() {
             control.refused.store(true, Ordering::SeqCst);
             drop(runner);
+            #[cfg(feature = "dev-tools")]
+            mark_job("pre:end", id, "no-background");
             let _ = done.send(PackOut {
                 id,
                 kept,
@@ -401,12 +437,21 @@ impl PackJob {
                 || (control.refused.load(Ordering::SeqCst) && !control.claimed())
         };
         let mut laid: Option<Laid> = None;
-        let outcome = runner.run(&stops, &|class| mode.on_class(class), |ctx| {
+        let on_class = |class| {
+            #[cfg(feature = "dev-tools")]
+            if class == Class::Foreground {
+                mark_job("pre:class", id, "fg");
+            }
+            mode.on_class(class);
+        };
+        let outcome = runner.run(&stops, &on_class, |ctx| {
             let check = || {
                 #[cfg(all(test, feature = "dev-tools"))]
                 tests::pack_gate(&stops);
                 let stopped = ctx.checkpoint();
                 if stopped {
+                    #[cfg(feature = "dev-tools")]
+                    mark_job("pre:ack", id, "");
                     control.left(id);
                 }
                 stopped
@@ -438,6 +483,18 @@ impl PackJob {
             }
             ran => ran,
         };
+        #[cfg(feature = "dev-tools")]
+        mark_job(
+            "pre:end",
+            id,
+            match &ran {
+                PackRan::Built(..) => "built",
+                PackRan::Deferred(_) => "deferred",
+                PackRan::Cancelled(_) => "cancelled",
+                PackRan::Refused(..) => "refused",
+                PackRan::NoBackground => "no-background",
+            },
+        );
         // A receiver gone (the installation's end): the outcome, its pages
         // included, drops here.
         let _ = done.send(PackOut { id, kept, ran });
@@ -569,6 +626,8 @@ impl ResultSkin {
         {
             Ok(_) => {
                 log::info!("skin: result: preload {id} begins");
+                #[cfg(feature = "dev-tools")]
+                mark_job("pre:begin", id, if promoted { "fg" } else { "speculative" });
                 self.preload = Preload::Running(Running {
                     id,
                     input,
@@ -593,6 +652,15 @@ impl ResultSkin {
         self.preload = match std::mem::take(&mut self.preload) {
             Preload::Running(run) => {
                 run.stop.cancel();
+                #[cfg(feature = "dev-tools")]
+                mark_job(
+                    "pre:stop",
+                    run.id,
+                    match then {
+                        Then::Idle => "gate",
+                        Then::Retired => "retired",
+                    },
+                );
                 Preload::Stopping { run, then }
             }
             Preload::Stopping { run, then: was } => Preload::Stopping {
@@ -646,6 +714,8 @@ impl ResultSkin {
                 return;
             }
         };
+        #[cfg(feature = "dev-tools")]
+        mark_job("pre:collect", run.id, "");
         let Some(out) = out.filter(|o| o.id == run.id) else {
             log::info!("skin: result: preload {} ended without its outcome", run.id);
             self.restore(None, &run.slot);

@@ -1573,10 +1573,14 @@ impl ResultSkin {
         }
         if let Some(reused) = self.reuse_for_attempt(&facts) {
             #[cfg(feature = "dev-tools")]
-            crate::dev::loop_probe::mark(
-                "img:reused",
-                i64::from(matches!(&reused, ForAttempt::Every(..))),
-            );
+            {
+                crate::dev::loop_probe::mark(
+                    "img:reused",
+                    i64::from(matches!(&reused, ForAttempt::Every(..))),
+                );
+                // Decided at once from the resident probe and atlas.
+                crate::dev::loop_probe::mark("img:resident", i64::from(self.image.is_some()));
+            }
             self.attempt = Some(reused);
             return ImageStage::Ready(Staged::Ready);
         }
@@ -1589,6 +1593,10 @@ impl ResultSkin {
         let base = self.shown_entry();
         let others = self.counted("the image stage");
         let kept = self.kept == Some(true);
+        // The stage's own import and build (dev-tools: whether it keeps a
+        // runtime).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("img:job", i64::from(permit.is_some()));
         let spawned = imports::spawn_job(move |cancel: &Cancel| -> ImageOut {
             let slot = theirs;
             let o = if permit.is_some() {
