@@ -165,6 +165,57 @@ fn result_text_shows_the_plays_target_name_and_a_practice_round_none() {
     assert_eq!(fx.batch.quads().len(), 0);
 }
 
+/// A target's name shows its first 16 characters, in the outline requests
+/// and the bitmap lines, on selection and the result.
+#[test]
+fn target_names_show_at_most_their_cap() {
+    let cap = skin_model::MAX_TARGET_NAME_CHARS;
+    let long = "Aé".repeat(cap);
+    let want: String = long.chars().take(cap).collect();
+    let shown = SelectionLabels {
+        targets: TargetNames {
+            chosen: long.clone(),
+            ..names()
+        },
+        ..labels_of()
+    };
+    let mut fx = Fx::new(selection(vec![text(TargetName::Chosen)], None).unwrap());
+    fx.skin
+        .update_selection(&mut fx.sel, &view(Vec::new(), None), &shown)
+        .unwrap();
+    let req = fx
+        .skin
+        .selection_text_requests(&fx.sel, fx.target, &fx.layout);
+    let got: Vec<&str> = req.texts.iter().map(|r| r.text.as_str()).collect();
+    assert_eq!(got, [want.as_str()]);
+    // The bitmap sheet has A and B: one quad a character.
+    let shown = SelectionLabels {
+        targets: TargetNames {
+            chosen: "AB".repeat(cap),
+            ..names()
+        },
+        ..labels_of()
+    };
+    let (_dir, sheet) = selection_support::bitmap_sheet();
+    let mut fx = Fx::new(selection(vec![bitmap(TargetName::Chosen)], Some(sheet)).unwrap());
+    fx.skin
+        .update_selection(&mut fx.sel, &view(Vec::new(), None), &shown)
+        .unwrap();
+    fx.skin.attach_selection_bitmap_text(&mut fx.sel);
+    fx.frame(0);
+    assert_eq!(fx.batch.quads().len(), cap);
+    let named = ResultLabels {
+        target: long.clone(),
+        ..labels()
+    };
+    let view = ready(1, BestView::Unavailable, 1);
+    let mut fx = RFx::new(result(vec![text(TargetName::Chosen)], None).unwrap());
+    fx.skin.update_result(&mut fx.res, &view, &named).unwrap();
+    let req = fx.skin.result_text_requests(&fx.res, fx.target, &fx.layout);
+    let got: Vec<&str> = req.iter().map(|r| r.text.as_str()).collect();
+    assert_eq!(got, [want.as_str()]);
+}
+
 /// A neighbour beyond ten, or none, is refused at load; a result skin
 /// shows the chosen target alone, a play or decision skin none.
 #[test]

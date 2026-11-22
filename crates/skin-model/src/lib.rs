@@ -279,9 +279,9 @@ pub use widget::song_list::{
     RowStyle, RowTextDef, SongListDef, SongListError,
 };
 pub use widget::text::{
-    ChartText, FontRef, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM, MAX_TEXT_EM_PX, Overflow,
-    SelectionText, TARGET_NEIGHBOURS, TargetName, TargetNames, TextDef, TextError, TextField,
-    TextImage, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
+    ChartText, FontRef, MAX_TARGET_NAME_CHARS, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM,
+    MAX_TEXT_EM_PX, Overflow, SelectionText, TARGET_NEIGHBOURS, TargetName, TargetNames, TextDef,
+    TextError, TextField, TextImage, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
 };
 pub use widget::timing_graph::TimingGraphDef;
 pub use widget::timing_vis::{MAX_JUDGE_WIDTH, TimingVisualizerDef};

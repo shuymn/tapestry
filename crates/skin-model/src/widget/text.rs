@@ -65,6 +65,18 @@ pub enum SelectionText {
 /// name ([`TargetName`]).
 pub const TARGET_NEIGHBOURS: u8 = 10;
 
+/// The most characters of a target's name a text shows (design.md
+/// "Personal Bests", Target): the player's names fit, and a bitmap-font
+/// text showing one is charged this many quads.
+pub const MAX_TARGET_NAME_CHARS: usize = 16;
+
+/// `name` cut to its first [`MAX_TARGET_NAME_CHARS`] characters.
+pub(crate) fn target_name(name: &str) -> &str {
+    name.char_indices()
+        .nth(MAX_TARGET_NAME_CHARS)
+        .map_or(name, |(at, _)| name.get(..at).unwrap_or(name))
+}
+
 /// Which target's name a text shows (design.md "Personal Bests", Target):
 /// the chosen one, or the `n`th before or after it in the player's list of
 /// targets, `n` from 1 to [`TARGET_NEIGHBOURS`].
@@ -171,11 +183,11 @@ impl TextDef {
             }
             (
                 FontRef::Bitmap(_),
-                TextValue::Field(_)
-                | TextValue::FieldOr { .. }
-                | TextValue::Selection(_)
-                | TextValue::Target(_),
+                TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
             ) => u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX),
+            (FontRef::Bitmap(_), TextValue::Target(_)) => {
+                u32::try_from(MAX_TARGET_NAME_CHARS).unwrap_or(u32::MAX)
+            }
             (FontRef::Default | FontRef::File(_), _) => 1,
         }
     }
@@ -582,5 +594,28 @@ impl Text {
             let rect = [x + off + ix * h * sx, y + iy * h, iw * h * sx, ih * h];
             brush.push_about(out, rect, pivot, uv, Filter::Linear);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bitmap text is charged the most glyph quads its string can take:
+    /// a target's name its cap, a chart field its byte bound (design.md
+    /// "Personal Bests", Target).
+    #[test]
+    fn a_bitmap_target_name_is_charged_its_cap() {
+        let def = |value| TextDef {
+            value,
+            font: FontRef::Bitmap(0),
+            align: Align::Left,
+            overflow: Overflow::Spill,
+        };
+        assert_eq!(def(TextValue::Target(TargetName::Chosen)).quads(), 16);
+        assert_eq!(def(TextValue::Target(TargetName::After(10))).quads(), 16);
+        assert_eq!(def(TextValue::Field(TextField::Title)).quads(), 256);
+        assert_eq!(target_name(&"Aé".repeat(16)), "AéAéAéAéAéAéAéAé");
+        assert_eq!(target_name("MAX"), "MAX");
     }
 }

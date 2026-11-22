@@ -201,11 +201,9 @@ impl Cx<'_> {
             (FontRef::Bitmap(_), TextValue::Literal(s)) => s.chars().count(),
             (
                 FontRef::Bitmap(_),
-                TextValue::Field(_)
-                | TextValue::FieldOr { .. }
-                | TextValue::Selection(_)
-                | TextValue::Target(_),
+                TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
             ) => MAX_TEXT_BYTES,
+            (FontRef::Bitmap(_), TextValue::Target(_)) => skin_model::MAX_TARGET_NAME_CHARS,
             _ => 1,
         };
         self.budget

@@ -397,7 +397,8 @@ mod tests {
     }
 
     /// Each target is named in the source's wording, the twelve names
-    /// distinct (design.md "Personal Bests", Target).
+    /// distinct, each within the characters a skin shows of one (design.md
+    /// "Personal Bests", Target).
     // Source: SF-023
     #[test]
     fn targets_are_named_in_the_sources_wording() {
@@ -422,6 +423,12 @@ mod tests {
                 "NEXT RANK",
             ]
         );
+        for name in names {
+            assert!(
+                name.chars().count() <= skin_model::MAX_TARGET_NAME_CHARS,
+                "{name}"
+            );
+        }
     }
 
     /// Data is an argument, copied as it is, never looked up.

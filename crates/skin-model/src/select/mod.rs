@@ -542,14 +542,15 @@ impl Selection {
             _ => {}
         }
         push(&mut s.query, &view.query);
-        // On every row kind, as the setting is the screen's, not a row's.
+        // On every row kind, as the setting is the screen's, not a row's;
+        // each name cut to `MAX_TARGET_NAME_CHARS`.
         let t = &mut s.targets;
         for (to, from) in std::iter::once((&mut t.chosen, &labels.targets.chosen))
             .chain(t.before.iter_mut().zip(&labels.targets.before))
             .chain(t.after.iter_mut().zip(&labels.targets.after))
         {
             to.clear();
-            push(to, from);
+            push(to, crate::widget::text::target_name(from));
         }
         match &view.place {
             SelectionPlace::Top => {}

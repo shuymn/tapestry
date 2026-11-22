@@ -117,18 +117,22 @@ impl Strings {
         }
     }
 
-    /// Sets the strings to `labels`, each as [`kept`] keeps it.
+    /// Sets the strings to `labels`, each as [`kept`] keeps it, the
+    /// target's name cut to [`MAX_TARGET_NAME_CHARS`](crate::MAX_TARGET_NAME_CHARS).
     /// Allocates only to replace a string too small for its new text, with
     /// one of exactly that text's length, so each keeps at most twice
     /// [`MAX_TEXT_BYTES`] however often it grows.
     pub(crate) fn set(&mut self, labels: &ResultLabels) {
         for (to, from) in [
-            (&mut self.title, &labels.title),
+            (&mut self.title, labels.title.as_str()),
             (&mut self.subtitle, &labels.subtitle),
             (&mut self.artist, &labels.artist),
             (&mut self.subartist, &labels.subartist),
             (&mut self.genre, &labels.genre),
-            (&mut self.target, &labels.target),
+            (
+                &mut self.target,
+                crate::widget::text::target_name(&labels.target),
+            ),
         ] {
             let len = kept(from).map(char::len_utf8).sum();
             if to.capacity() < len {
