@@ -316,7 +316,7 @@ fn draw(movie: &Movie, drawn: &Drawn) {
     let mut frame = Vec::new();
     while !drawn.stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(4));
-        if drawn.hold.load(Ordering::Acquire) || movie.status() == Status::Lost {
+        if movie.status() == Status::Lost {
             continue;
         }
         let Some(live) = movie.live() else { continue };
@@ -324,6 +324,15 @@ fn draw(movie: &Movie, drawn: &Drawn) {
             reader = live.reader.lock().unwrap().take();
         }
         let Some(r) = reader.as_mut() else { continue };
+        if drawn.hold.load(Ordering::Acquire) {
+            // A game that holds its frames still looks once, with nothing
+            // due, as an admitted movie's first look does: the worker
+            // starts on it and fills the ring.
+            if origin.is_none() && r.peek(live.ring.words(), i64::MIN).is_ok_and(|p| p.first) {
+                movie.wake();
+            }
+            continue;
+        }
         let origin = *origin.get_or_insert_with(Instant::now);
         let due = i64::try_from(origin.elapsed().as_micros()).unwrap();
         match read_tight(r, live.ring.words(), due, &mut frame) {

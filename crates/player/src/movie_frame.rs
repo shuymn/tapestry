@@ -29,11 +29,11 @@
 //! at the screen's time and, when a frame is due, takes it straight into
 //! the renderer's upload buffer ([`Planes::write`]); a fault loses it in
 //! the same frame. It shows its newest frame once one was taken on the
-//! screen, and nothing before: a frame the ring's reader frees unread as
-//! late and published before the worker knew the game's time
-//! ([`skin_model::media::Peek::behind`]) is never taken, and a late frame
-//! the worker published knowing the time is, a stutter rather than a blank
-//! panel. A
+//! screen, and nothing before: a late frame is taken, the newest the ring
+//! holds at or before the time, a stutter rather than a blank panel, and
+//! the frame taken last stays shown until a newer one is due. The first
+//! peek of a run signals the worker, which waits for that time before it
+//! starts the run ([`skin_model::media::Peek::first`]). A
 //! first frame whose take ends past the preparation deadline loses its
 //! movie (L5): it is judged when the frame is accepted, not when the poll
 //! began. Anything else shows nothing.
@@ -125,6 +125,9 @@ pub trait Source {
     /// The reader freed `total` slots over the ring's life; a rise signals
     /// the worker.
     fn freed(&self, total: u64);
+    /// The reader's first peek of its run wrote the time the worker may be
+    /// waiting for: signals the worker.
+    fn wake(&self);
     /// The preparation deadline passed.
     fn expire(&self);
     /// Whether it reached a terminal outcome for readiness.
@@ -160,6 +163,10 @@ impl Source for Movie {
 
     fn freed(&self, total: u64) {
         Self::freed(self, total);
+    }
+
+    fn wake(&self) {
+        Self::wake(self);
     }
 
     fn expire(&self) {
@@ -431,6 +438,9 @@ impl<S: Source> Movies<S> {
         };
         if peek.freed {
             movie.freed(reader.freed());
+        }
+        if peek.first {
+            movie.wake();
         }
         if let Some(d) = peek.due {
             let mut took = None;

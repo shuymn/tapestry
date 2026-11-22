@@ -58,9 +58,8 @@ fn bga_images_seeds_read_or_fail_as_built() {
 
 /// The frame ring seeds stage a due frame, then the next a second later,
 /// wait for one not due, stage the newest of a full ring, free an earlier
-/// run's frame unread and a blind frame behind the clock, stage a late one
-/// published knowing the time, and fail the player for each broken slot they were
-/// built with.
+/// run's frame unread, stage a frame whatever its reserved words hold, and
+/// fail the player for each broken slot they were built with.
 #[test]
 fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
     use crate::{RingOutcome, ring_bytes};
@@ -83,9 +82,7 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
             "shared_seq",
             "stamp_order",
             "stamp_outside",
-            "behind",
-            "late_informed",
-            "until",
+            "reserved",
         ],
     );
     let outcome = |name: &str| {
@@ -129,21 +126,9 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
         })
     );
     assert_eq!(
-        outcome("behind"),
-        RingOutcome::Nothing,
-        "a frame whose successor is due freed unread"
-    );
-    assert_eq!(
-        outcome("late_informed"),
+        outcome("reserved"),
         staged(1, 1_000),
-        "a late frame published knowing the time staged"
-    );
-    assert_eq!(
-        outcome("until"),
-        fault(Fault::Until {
-            slot: 1,
-            value: 1_000_000
-        })
+        "the reserved words not read"
     );
 }
 

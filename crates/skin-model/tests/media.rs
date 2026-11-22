@@ -971,99 +971,55 @@ fn ring_take_refused_fails_the_player() {
     }
 }
 
-/// Publishes frame `seq` of run 1, stamped `at` and shown until `until`, in
-/// a slot it claims, knowing the game's time when `informed`.
-#[track_caller]
-fn publish_until(ring: &[AtomicU64], seq: u64, at: i64, until: i64, informed: bool) {
-    let w = Writer::attach(ring).unwrap();
-    let slot = w.claim(ring).expect("a free slot");
-    w.publish_until(
-        ring,
-        slot,
-        &frame(w.geometry(), seq),
-        seq,
-        1,
-        at,
-        until,
-        informed,
-    )
-    .unwrap();
-}
-
-/// A frame is shown until its successor is due (design.md "Rendering and
-/// Skins", video frames): with the ring holding a video's first four
-/// frames, published before the worker knew the game's time, and the time
-/// 780 ms in, the newest at or before it (its successor at 133 ms due) is
-/// behind the clock, so the peek takes
-/// nothing, frees all four unread and says so, and writes the time for
-/// the worker, for its run alone; the frame due then is taken, and a
-/// video's last frame (`UNTIL_END`) is never behind. A later run's time is
-/// not the earlier run's until its first peek.
-// Revert: the peek's behind check dropped -> "a frame behind the clock
-// taken"; a last frame counted behind at the latest time -> the last
-// read fails.
+/// The game writes the time it shows at each peek, for its run alone, and
+/// says which peek is its run's first (design.md "Rendering and Skins",
+/// video frames): a worker waiting to start a run reads that time as its
+/// target, and that peek signals it. A later run's time is not the
+/// earlier run's until its first peek.
+// Revert: every peek said to be a run's first -> "a second peek of the
+// run".
 #[test]
-fn ring_frees_a_frame_behind_the_clock_unread() {
-    use skin_model::media::{NOTHING_DUE, UNTIL_END, shown};
+fn ring_writes_its_time_and_says_a_runs_first_peek() {
+    use skin_model::media::{NOTHING_DUE, peeked, shown};
     let g = Geometry::new(16, 9).unwrap();
     let mem = section(g);
     let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
     assert_eq!(shown(&*mem, 1), None, "no peek yet");
     assert_eq!(shown(&*mem, 0), Some(NOTHING_DUE));
-    for seq in 1..=4 {
-        publish_until(&mem, seq, stamp(seq - 1), stamp(seq), false);
-    }
+    assert!(!peeked(&*mem));
     let peek = reader.peek(&*mem, 780_000).unwrap();
-    assert!(peek.due.is_none(), "a frame behind the clock taken");
-    assert!(peek.behind && peek.freed, "{peek:?}");
-    assert_eq!(reader.freed(), 4, "the four freed unread");
+    assert!(peek.first && peek.due.is_none(), "{peek:?}");
+    assert!(peeked(&*mem));
     assert_eq!(shown(&*mem, 1), Some(780_000), "the time written");
-    publish_until(&mem, 5, 766_667, 800_000, true);
-    let r = read(&mut reader, &*mem, 780_000).unwrap();
-    assert_whole(&r, g, 5);
-    publish_until(&mem, 6, 800_000, UNTIL_END, true);
-    let r = read(&mut reader, &*mem, i64::MAX).unwrap();
-    assert_whole(&r, g, 6);
+    let peek = reader.peek(&*mem, 790_000).unwrap();
+    assert!(!peek.first, "a second peek of the run");
     let run = reader.start_run(WINDOW);
     assert_eq!(shown(&*mem, run), None, "an earlier run's time");
-    reader.peek(&*mem, 2_000).unwrap();
+    let peek = reader.peek(&*mem, 2_000).unwrap();
+    assert!(peek.first, "the new run's first peek");
     assert_eq!(shown(&*mem, run), Some(2_000));
     assert_eq!(shown(&*mem, 1), None);
 }
 
-/// A frame shown until no later than its own stamp breaks the protocol:
-/// the peek fails the player.
+/// A late frame is dropped only for a newer one that is also due
+/// (design.md "Rendering and Skins", video frames): with the ring holding
+/// four frames and the time 780 ms in, the peek takes the newest, late,
+/// and frees the three before it unread; a frame not due yet stays.
+// Revert: a peek taking the oldest due frame -> "the newest late frame
+// taken".
 #[test]
-fn ring_rejects_an_until_not_after_the_stamp() {
+fn ring_takes_the_newest_late_frame() {
     let g = Geometry::new(16, 9).unwrap();
     let mem = section(g);
     let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
-    publish_until(&mem, 1, 1_000, 1_000, true);
-    assert_eq!(
-        reader.peek(&*mem, 2_000),
-        Err(Fault::Until {
-            slot: 0,
-            value: 1_000
-        })
-    );
-}
-
-/// A late frame is dropped only for a newer one (design.md "Rendering and
-/// Skins", video frames): with the ring holding four frames the worker
-/// published knowing the game's time and the time 780 ms in, the peek
-/// takes the newest, late, and frees the three before it unread.
-// Revert: a late informed frame freed as a blind one -> "the newest late
-// frame taken".
-#[test]
-fn ring_takes_the_newest_late_frame_published_knowing_the_time() {
-    let g = Geometry::new(16, 9).unwrap();
-    let mem = section(g);
-    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
-    for seq in 1..=4 {
-        publish_until(&mem, seq, stamp(seq - 1), stamp(seq), true);
+    for seq in 1..=3 {
+        publish(&mem, seq, 1, stamp(seq - 1));
     }
+    publish(&mem, 4, 1, 900_000);
     let r = read(&mut reader, &*mem, 780_000).unwrap();
-    assert!(r.taken.is_some(), "the newest late frame taken");
+    assert!(r.taken.is_some());
+    assert_whole(&r, g, 3);
+    assert_eq!(reader.freed(), 3, "the newest late frame taken");
+    let r = read(&mut reader, &*mem, 900_000).unwrap();
     assert_whole(&r, g, 4);
-    assert_eq!(reader.freed(), 4, "the three before it unread, then it");
 }
