@@ -82,6 +82,9 @@ pub enum Label {
     On,
     Off,
     PracticeHelp,
+    /// A target's name (design.md "Personal Bests", Target): the game's
+    /// vocabulary, the same in every language.
+    Target(game::ScoreTarget),
 }
 
 /// A line of the player's screens with typed arguments; string arguments
@@ -250,6 +253,29 @@ mod ja {
             Label::PracticeHelp => {
                 "↑↓ 選択  ←→ 変更  Enter 編集・開始  Esc 戻る  ウィンドウを閉じて終了"
             }
+            Label::Target(t) => target(t),
+        }
+    }
+
+    /// A target's name, the source's wording, which skins size their
+    /// boxes for (`play/TargetProperty.java:116-146`, `:308-310` at
+    /// `0.8.9`).
+    // Source: SF-023
+    const fn target(t: game::ScoreTarget) -> &'static str {
+        use game::ScoreTarget as T;
+        match t {
+            T::AMinus => "RANK A-",
+            T::A => "RANK A",
+            T::APlus => "RANK A+",
+            T::AaMinus => "RANK AA-",
+            T::Aa => "RANK AA",
+            T::AaPlus => "RANK AA+",
+            T::AaaMinus => "RANK AAA-",
+            T::Aaa => "RANK AAA",
+            T::AaaPlus => "RANK AAA+",
+            T::MaxMinus => "RANK MAX-",
+            T::Max => "MAX",
+            T::Next => "NEXT RANK",
         }
     }
 
@@ -368,6 +394,34 @@ mod tests {
             super::ja::write,
         );
         assert_eq!(out, "held スキンを使えません: x");
+    }
+
+    /// Each target is named in the source's wording, the twelve names
+    /// distinct (design.md "Personal Bests", Target).
+    // Source: SF-023
+    #[test]
+    fn targets_are_named_in_the_sources_wording() {
+        let names: Vec<_> = game::ScoreTarget::ALL
+            .iter()
+            .map(|&t| Label::Target(t).text_in(game::Language::Ja))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "RANK A-",
+                "RANK A",
+                "RANK A+",
+                "RANK AA-",
+                "RANK AA",
+                "RANK AA+",
+                "RANK AAA-",
+                "RANK AAA",
+                "RANK AAA+",
+                "RANK MAX-",
+                "MAX",
+                "NEXT RANK",
+            ]
+        );
     }
 
     /// Data is an argument, copied as it is, never looked up.

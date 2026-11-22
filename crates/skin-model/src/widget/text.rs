@@ -61,12 +61,62 @@ pub enum SelectionText {
     Place,
 }
 
+/// How many targets before and after the chosen one a selection skin may
+/// name ([`TargetName`]).
+pub const TARGET_NEIGHBOURS: u8 = 10;
+
+/// Which target's name a text shows (design.md "Personal Bests", Target):
+/// the chosen one, or the `n`th before or after it in the player's list of
+/// targets, `n` from 1 to [`TARGET_NEIGHBOURS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetName {
+    Chosen,
+    Before(u8),
+    After(u8),
+}
+
+impl TargetName {
+    /// Whether a neighbour's `n` is 1 to [`TARGET_NEIGHBOURS`].
+    pub(crate) const fn valid(self) -> bool {
+        match self {
+            Self::Chosen => true,
+            Self::Before(n) | Self::After(n) => n >= 1 && n <= TARGET_NEIGHBOURS,
+        }
+    }
+}
+
+/// The target names a skin shows, in the player's language: the chosen
+/// target's, and the ten before and after it, `before[0]` and `after[0]`
+/// the nearest. The player fills them; this crate never names a target.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TargetNames {
+    pub chosen: String,
+    pub before: [String; TARGET_NEIGHBOURS as usize],
+    pub after: [String; TARGET_NEIGHBOURS as usize],
+}
+
+/// The strings of a screen, besides the chart's, that a text element may
+/// show: selection's query and place, and the target names, a result's
+/// chosen one alone. Every slice may be shorter than its kind's, its
+/// missing names empty.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScreenText<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) place: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) before: &'a [String],
+    pub(crate) after: &'a [String],
+}
+
 /// What a text element shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextValue {
     Field(TextField),
     /// A selection screen's string; only a selection skin shows one.
     Selection(SelectionText),
+    /// A target's name: a selection skin shows any, a result skin the
+    /// chosen one alone, a play or decision skin none.
+    Target(TargetName),
     /// `field`, or `empty` where its string is empty: chosen when the text
     /// is prepared. `empty` is as a [`Literal`](Self::Literal).
     FieldOr {
@@ -121,7 +171,10 @@ impl TextDef {
             }
             (
                 FontRef::Bitmap(_),
-                TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
+                TextValue::Field(_)
+                | TextValue::FieldOr { .. }
+                | TextValue::Selection(_)
+                | TextValue::Target(_),
             ) => u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX),
             (FontRef::Default | FontRef::File(_), _) => 1,
         }
@@ -141,6 +194,8 @@ pub enum TextError {
     Literal,
     #[error("the text's font does not exist")]
     UnknownFont,
+    #[error("the text names a target more than {TARGET_NEIGHBOURS} away, or none")]
+    TargetOffset,
 }
 
 /// The chart's header strings a text element may show.
@@ -322,7 +377,7 @@ impl TextSlots {
     pub(crate) fn names(self, value: &TextValue) -> bool {
         let f = match value {
             TextValue::Literal(_) => return self.literals,
-            TextValue::Selection(_) => return false,
+            TextValue::Selection(_) | TextValue::Target(_) => return false,
             TextValue::Field(f) | TextValue::FieldOr { field: f, .. } => *f,
         };
         let parts = match f {
@@ -395,21 +450,28 @@ impl TextValue {
     /// emptiness is its string's as written, so one of control characters
     /// alone keeps the field and draws nothing.
     pub(crate) fn resolve<'a>(&'a self, chart: &ChartText<'a>) -> Cow<'a, str> {
-        self.resolve_with(chart, "", "")
+        self.resolve_with(chart, &ScreenText::default())
     }
 
-    /// The string it shows with `chart`'s header, the selection screen's
-    /// `query` and `place`.
+    /// The string it shows with `chart`'s header and `screen`'s strings.
     pub(crate) fn resolve_with<'a>(
         &'a self,
         chart: &ChartText<'a>,
-        query: &'a str,
-        place: &'a str,
+        screen: &ScreenText<'a>,
     ) -> Cow<'a, str> {
+        let near = |names: &'a [String], n: u8| {
+            usize::from(n)
+                .checked_sub(1)
+                .and_then(|i| names.get(i))
+                .map_or("", String::as_str)
+        };
         match self {
             Self::Literal(s) => Cow::Borrowed(s),
-            Self::Selection(SelectionText::Query) => Cow::Borrowed(query),
-            Self::Selection(SelectionText::Place) => Cow::Borrowed(place),
+            Self::Selection(SelectionText::Query) => Cow::Borrowed(screen.query),
+            Self::Selection(SelectionText::Place) => Cow::Borrowed(screen.place),
+            Self::Target(TargetName::Chosen) => Cow::Borrowed(screen.target),
+            Self::Target(TargetName::Before(n)) => Cow::Borrowed(near(screen.before, *n)),
+            Self::Target(TargetName::After(n)) => Cow::Borrowed(near(screen.after, *n)),
             Self::Field(f) => f.resolve(chart),
             Self::FieldOr { field, empty } => {
                 let s = field.resolve(chart);

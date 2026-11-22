@@ -26,7 +26,7 @@ fn update_of(lifetime: u64, revision: u64, view: SelectionView) -> SelectionUpda
         list_revision: 1,
         page: MenuPage::default(),
         view,
-        labels: crate::select::labels(),
+        labels: crate::select::labels(game::ScoreTarget::Max),
         strip: StripText::default(),
         events: SelectionEvents {
             entered,

@@ -378,6 +378,10 @@ pub struct ResultLabels {
     pub artist: String,
     pub subartist: String,
     pub genre: String,
+    /// The name of the target the play was paced against, in the
+    /// player's language; empty for a practice round, which has none, and
+    /// on the decision screen.
+    pub target: String,
 }
 
 #[cfg(test)]

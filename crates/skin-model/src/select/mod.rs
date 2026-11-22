@@ -31,7 +31,7 @@ use crate::widget::Starts;
 use crate::widget::bpm_graph::{BpmGraphDef, BpmInput, BpmRaster};
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::song_list::{LampKey, RowBind, RowStyle};
-use crate::widget::text::{ChartText, MAX_TEXT_BYTES, TextTable};
+use crate::widget::text::{ChartText, MAX_TEXT_BYTES, ScreenText, TargetNames, TextTable};
 use crate::{AppReadouts, BuildError, GaugeLook};
 
 /// The starts of the selection screen's built-in timers this frame, each
@@ -88,6 +88,8 @@ pub(crate) struct Strings {
     pub(crate) query: String,
     /// The place's names, each followed by `" > "`.
     pub(crate) place: String,
+    /// The target names, as the labels give them.
+    pub(crate) targets: TargetNames,
 }
 
 impl Strings {
@@ -99,6 +101,24 @@ impl Strings {
             subartist: &self.subartist,
             genre: &self.genre,
         }
+    }
+
+    /// The screen's strings besides the chart's.
+    pub(crate) fn screen(&self) -> ScreenText<'_> {
+        ScreenText {
+            query: &self.query,
+            place: &self.place,
+            target: &self.targets.chosen,
+            before: &self.targets.before,
+            after: &self.targets.after,
+        }
+    }
+
+    /// The target names' strings.
+    fn target_strings(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.targets.chosen)
+            .chain(&self.targets.before)
+            .chain(&self.targets.after)
     }
 }
 
@@ -262,6 +282,7 @@ impl Selection {
             &self.strings.place,
         ]
         .into_iter()
+        .chain(self.strings.target_strings())
         .chain(self.row_strings.iter())
         .map(String::capacity)
         .sum::<usize>();
@@ -521,6 +542,15 @@ impl Selection {
             _ => {}
         }
         push(&mut s.query, &view.query);
+        // On every row kind, as the setting is the screen's, not a row's.
+        let t = &mut s.targets;
+        for (to, from) in std::iter::once((&mut t.chosen, &labels.targets.chosen))
+            .chain(t.before.iter_mut().zip(&labels.targets.before))
+            .chain(t.after.iter_mut().zip(&labels.targets.after))
+        {
+            to.clear();
+            push(to, from);
+        }
         match &view.place {
             SelectionPlace::Top => {}
             SelectionPlace::Folder(names) => {

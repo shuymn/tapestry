@@ -2751,7 +2751,7 @@ impl Rig for PlayerRig<'_> {
         self.cutoff_asked = false;
         self.preps += 1;
         let attempt = loaded.attempt();
-        let labels = crate::result_present::labels_of(&attempt.labels);
+        let labels = crate::result_present::labels_of(&attempt.labels, attempt.score.setting);
         let images = (
             crate::chart_images::folder(loaded.path()),
             [

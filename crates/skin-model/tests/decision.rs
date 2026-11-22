@@ -523,6 +523,7 @@ fn decision_text_matches_plays_lines() {
         artist: "é".repeat(400),
         subartist: format!("\u{7}{}", "y".repeat(600)),
         genre: "\n\n".to_owned(),
+        target: String::new(),
     };
     assert_eq!(raw.title.len(), 513);
     fx.skin.update_decision(&mut fx.dec, &raw).unwrap();

@@ -30,7 +30,7 @@ use crate::select::value;
 use crate::widget::Starts;
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::text::MAX_TEXT_BYTES;
-use crate::widget::text::{ChartText, TextTable};
+use crate::widget::text::{ChartText, ScreenText, TextTable};
 
 /// The starts of the result screen's built-in timers this frame, each
 /// `None` while it is off.
@@ -87,7 +87,7 @@ pub enum ResultError {
 }
 
 /// The chart strings a result or decision skin's text shows, as of the
-/// last view or labels.
+/// last view or labels, and the name of the play's target.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Strings {
     title: String,
@@ -95,6 +95,7 @@ pub(crate) struct Strings {
     artist: String,
     subartist: String,
     genre: String,
+    target: String,
 }
 
 impl Strings {
@@ -105,6 +106,14 @@ impl Strings {
             artist: &self.artist,
             subartist: &self.subartist,
             genre: &self.genre,
+        }
+    }
+
+    /// The screen's strings besides the chart's: the target's name.
+    pub(crate) fn screen(&self) -> ScreenText<'_> {
+        ScreenText {
+            target: &self.target,
+            ..ScreenText::default()
         }
     }
 
@@ -119,6 +128,7 @@ impl Strings {
             (&mut self.artist, &labels.artist),
             (&mut self.subartist, &labels.subartist),
             (&mut self.genre, &labels.genre),
+            (&mut self.target, &labels.target),
         ] {
             let len = kept(from).map(char::len_utf8).sum();
             if to.capacity() < len {
@@ -137,6 +147,7 @@ impl Strings {
             &self.artist,
             &self.subartist,
             &self.genre,
+            &self.target,
         ]
         .into_iter()
         .map(String::capacity)

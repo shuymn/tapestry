@@ -806,6 +806,12 @@ impl SettingsFiles {
         self.written.player.on_failure
     }
 
+    /// The target setting `player.toml` holds, read at startup and written
+    /// back as read.
+    pub const fn target(&self) -> game::ScoreTarget {
+        self.written.player.target
+    }
+
     /// The play preset `player.toml` is to hold.
     pub fn preset(&self) -> &str {
         &self.preset
