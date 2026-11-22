@@ -60,8 +60,9 @@ pub trait Desk {
     fn virtual_screen(&mut self) -> [i32; 4];
     /// One `SendInput` call, every input tagged `tag`: the count inserted.
     fn send(&mut self, inputs: &[Input], tag: u32) -> u32;
-    /// Records that call `tag` is about to be made, before it is.
-    fn note(&mut self, tag: u32, what: &str);
+    /// Records that call `tag`, aimed at the run's window's client
+    /// `point`, is about to be made, before it is.
+    fn note(&mut self, tag: u32, what: &str, point: (i32, i32));
     /// Waits `ms` milliseconds.
     fn sleep(&mut self, ms: u64);
 }
@@ -281,7 +282,7 @@ pub fn click<D: Desk>(
     // The move alone.
     let t = tag(prefix, *call);
     *call = call.wrapping_add(1);
-    desk.note(t, "move");
+    desk.note(t, "move", point);
     let got = desk.send(&[to], t);
     if got != 1 {
         return Err(Refusal::Inserted { got, of: 1 });
@@ -290,7 +291,7 @@ pub fn click<D: Desk>(
     // file between them and the insertion.
     let t = tag(prefix, *call);
     *call = call.wrapping_add(1);
-    desk.note(t, "click");
+    desk.note(t, "click", point);
     let scene = Scene {
         monitor_then,
         monitor_now: desk.monitor(),
@@ -343,6 +344,48 @@ pub fn click<D: Desk>(
         let foreground = desk.foreground();
         if foreground != window {
             return Err(Refusal::Foreground { foreground });
+        }
+    }
+    Ok(())
+}
+
+/// The mapping calibration: one move-only call (no button) to each client
+/// `point` of `window`, each followed by a read of the pointer, which must
+/// be at that point's pixel. Only this read verifies the system's mapping
+/// of the absolute coordinate on the run's monitor; [`to_abs`]'s tests
+/// verify the runner's own inverse only.
+///
+/// # Errors
+///
+/// A call that did not insert its move, or a pointer elsewhere.
+pub fn calibrate<D: Desk>(
+    desk: &mut D,
+    window: Win,
+    points: &[(i32, i32)],
+    prefix: u16,
+    call: &mut u16,
+) -> Result<(), Refusal> {
+    let [vx, vy, vw, vh] = desk.virtual_screen();
+    for &point in points {
+        let client = desk.client(window).ok_or(Refusal::WindowGone)?;
+        let pixel = (client[0] + point.0, client[1] + point.1);
+        let to = Input::Move {
+            x: to_abs(pixel.0, vx, vw),
+            y: to_abs(pixel.1, vy, vh),
+        };
+        let t = tag(prefix, *call);
+        *call = call.wrapping_add(1);
+        desk.note(t, "calibrate", point);
+        let got = desk.send(&[to], t);
+        if got != 1 {
+            return Err(Refusal::Inserted { got, of: 1 });
+        }
+        let cursor = desk.cursor();
+        if cursor != Some(pixel) {
+            return Err(Refusal::CursorMoved {
+                cursor,
+                want: pixel,
+            });
         }
     }
     Ok(())
@@ -481,7 +524,7 @@ pub mod fake {
             }
             n
         }
-        fn note(&mut self, tag: u32, what: &str) {
+        fn note(&mut self, tag: u32, what: &str, _: (i32, i32)) {
             self.did.push(Did::Note(tag, what.to_owned()));
         }
         fn sleep(&mut self, ms: u64) {
@@ -599,8 +642,8 @@ mod tests {
             fn send(&mut self, inputs: &[Input], tag: u32) -> u32 {
                 self.0.send(inputs, tag)
             }
-            fn note(&mut self, tag: u32, what: &str) {
-                self.0.note(tag, what);
+            fn note(&mut self, tag: u32, what: &str, point: (i32, i32)) {
+                self.0.note(tag, what, point);
             }
             fn sleep(&mut self, ms: u64) {
                 self.0.sleep(ms);

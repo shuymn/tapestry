@@ -2010,6 +2010,45 @@ mod tests {
         }
     }
 
+    /// The test device's panel-3 targets (docs/test-device.md
+    /// "Verification", P1; `test_device::panel::TARGETS`) are a quarter, a
+    /// half and three quarters of a slider's travel: each sets that whole
+    /// percent and lies half a percent (5 000 steps) from both rounding
+    /// edges, so no float difference can move it, and the stored percent is
+    /// the source's continuous value.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_panel_runs_volume_targets_lie_half_a_percent_from_rounding() {
+        use test_device::panel::{TARGETS, TRAVEL, TRAVEL_FROM};
+        let set = |numerator| {
+            volume(SliderCommand {
+                source: RatioSource::SystemVolume,
+                value: Ratio {
+                    numerator,
+                    denominator: skin_model::SLIDER_STEPS,
+                },
+            })
+        };
+        let at = |percent| PointerAct::Volume(game::Channel::System, percent);
+        for t in TARGETS {
+            let steps = u64::try_from((t.x - TRAVEL_FROM) * 1_000_000 / TRAVEL).unwrap();
+            let percent = u32::from(t.percent);
+            assert_eq!(set(steps), at(percent), "{t:?}");
+            assert_eq!(
+                set(steps - 5_000),
+                at(percent),
+                "{t:?}: the lower edge, a tie up"
+            );
+            assert_eq!(set(steps - 5_001), at(percent - 1), "{t:?}: below it");
+            assert_eq!(
+                set(steps + 4_999),
+                at(percent),
+                "{t:?}: below the upper edge"
+            );
+            assert_eq!(set(steps + 5_000), at(percent + 1), "{t:?}: the upper edge");
+        }
+    }
+
     #[test]
     fn the_render_side_takes_one_move_a_frame_under_the_current_word() {
         let s = PointerShared::default();

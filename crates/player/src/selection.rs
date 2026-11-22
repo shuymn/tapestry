@@ -403,6 +403,10 @@ pub struct Selection {
     /// The volumes the skin's sliders set since the last look, by
     /// [`game::Channel::index`]: the newest percent of each.
     pub volumes_set: [Option<u32>; 3],
+    /// The pointer input whose act is being carried out (dev-tools): what
+    /// the volume arm's witness records as each volume's origin.
+    #[cfg(feature = "dev-tools")]
+    pub act_origin: crate::dev::present_shot::VolumeOrigin,
     /// The cue sounds the input asked for since the last look, and the
     /// visit's panel baseline: every input path adds to it, and the look
     /// starts them once, after the drain and the switches it turns
@@ -871,7 +875,15 @@ impl Selection {
             self.refresh_pending();
             let facts = self.pointer_facts();
             let act = crate::pointer::resolve_drag(&drag, &facts);
+            #[cfg(feature = "dev-tools")]
+            {
+                self.act_origin = crate::dev::present_shot::VolumeOrigin::Drag;
+            }
             let pick = self.pointer_act(act, level, now);
+            #[cfg(feature = "dev-tools")]
+            {
+                self.act_origin = crate::dev::present_shot::VolumeOrigin::Other;
+            }
             #[cfg(test)]
             self.dispatched(crate::pointer::Dispatched::Drag(act));
             return pick;
@@ -937,7 +949,22 @@ impl Selection {
             // As Tab in the box: the focus goes, and the IME with it.
             let _ = self.take_reading(MenuInput::Key(MenuKey::Tab), level, now);
         }
+        #[cfg(feature = "dev-tools")]
+        {
+            self.act_origin = match slot.request {
+                crate::pointer::PointerRequest::Press { .. } => {
+                    crate::dev::present_shot::VolumeOrigin::Press
+                }
+                crate::pointer::PointerRequest::Wheel { .. } => {
+                    crate::dev::present_shot::VolumeOrigin::Other
+                }
+            };
+        }
         let pick = self.pointer_act(resolved.act, level, now);
+        #[cfg(feature = "dev-tools")]
+        {
+            self.act_origin = crate::dev::present_shot::VolumeOrigin::Other;
+        }
         // A press that focused a search box names it: its bounds keep the
         // focus from here.
         if let (
@@ -982,6 +1009,10 @@ impl Selection {
                 return None;
             }
             crate::pointer::PointerAct::Volume(channel, percent) => {
+                // The arm's witness for a test device's shots (dev-tools),
+                // with the pointer input that brought it.
+                #[cfg(feature = "dev-tools")]
+                crate::dev::present_shot::volume_reached(channel, percent, self.act_origin);
                 // The newest of a channel's settings counts.
                 if let Some(set) = self.volumes_set.get_mut(channel.index()) {
                     *set = Some(percent);
@@ -4972,6 +5003,8 @@ pub(crate) mod tests {
             preset_steps: std::collections::VecDeque::new(),
             covers_turned: [false; 3],
             volumes_set: [None; 3],
+            #[cfg(feature = "dev-tools")]
+            act_origin: crate::dev::present_shot::VolumeOrigin::Other,
             cues: crate::select::SelectCues::default(),
             #[cfg(feature = "dev-tools")]
             script: None,
@@ -5329,6 +5362,33 @@ pub(crate) mod tests {
         });
         assert_eq!(taken, counted, "a take starts each counted cue once");
         taken
+    }
+
+    /// The pointer's volume arm leaves its witness for a test device's
+    /// shots (dev-tools): the slider's number and the percent it took.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_volume_arm_leaves_its_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["c1.bms"]]);
+        let from = crate::dev::present_shot::volumes_reached().unwrap().len();
+        sel.pointer_act(
+            crate::pointer::PointerAct::Volume(game::Channel::Background, 75),
+            None,
+            TimeUs(0),
+        );
+        let got = crate::dev::present_shot::volumes_reached().unwrap();
+        let got: Vec<(u8, u32, crate::dev::present_shot::VolumeOrigin)> = got
+            .get(from..)
+            .unwrap()
+            .iter()
+            .map(|v| (v.slider, v.percent, v.origin))
+            .collect();
+        // Called outside a pointer input's dispatch: neither press nor drag.
+        assert_eq!(
+            got,
+            [(19, 75, crate::dev::present_shot::VolumeOrigin::Other)]
+        );
     }
 
     /// C24-5, C24-6, C24-8 (design.md "State Model", system sounds,
@@ -7946,6 +8006,8 @@ pub(crate) mod tests {
             preset_steps: std::collections::VecDeque::new(),
             covers_turned: [false; 3],
             volumes_set: [None; 3],
+            #[cfg(feature = "dev-tools")]
+            act_origin: crate::dev::present_shot::VolumeOrigin::Other,
             cues: crate::select::SelectCues::default(),
             #[cfg(feature = "dev-tools")]
             script: None,

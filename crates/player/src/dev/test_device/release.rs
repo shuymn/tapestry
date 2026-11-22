@@ -83,6 +83,11 @@ pub struct State {
     pub log_error: Option<String>,
 }
 
+/// The freshness the link thread asks of a hold-bearing command as it
+/// submits it, given the guard's check the command came from (none for a
+/// step's held change): why it is stale, if it is.
+pub type Fresh = Box<dyn Fn(Option<i64>) -> Result<(), String> + Send + Sync>;
+
 /// The gate: why holds stopped, once they have.
 #[derive(Debug, Default)]
 struct Gate {
@@ -103,6 +108,8 @@ struct Shared {
     end: AtomicBool,
     log: Stream,
     run: Stream,
+    /// Asked of every hold-bearing command at its submission ([`Fresh`]).
+    fresh: std::sync::OnceLock<Fresh>,
     /// A test's point in a hold-bearing write at which holds stop.
     #[cfg(test)]
     probe: Mutex<Option<&'static str>>,
@@ -134,6 +141,7 @@ impl Writer {
             end: AtomicBool::new(false),
             log,
             run,
+            fresh: std::sync::OnceLock::new(),
             #[cfg(test)]
             probe: Mutex::new(None),
         });
@@ -167,6 +175,13 @@ impl Writer {
             check,
         });
         Ok(())
+    }
+
+    /// Sets the freshness every hold-bearing command must have as it is
+    /// submitted: one that is stale then is not written, and holds stop. A
+    /// second call changes nothing.
+    pub fn fresh(&self, f: Fresh) {
+        let _ = self.shared.fresh.set(f);
     }
 
     /// Stops holds, once: closes the gate, records the cause, and requests
@@ -375,8 +390,10 @@ impl Thread {
     }
 
     /// Writes one queued command: a hold-bearing one only when the gate is
-    /// open as its submission begins, its records written before; the
-    /// submission holds the submit lock, so a stop waits for it to end.
+    /// open as its submission begins and it is still fresh then (a renewal
+    /// queued in time and taken late is not written, and holds stop), its
+    /// records written before; the submission holds the submit lock, so a
+    /// stop waits for it to end.
     fn write(&mut self, item: Item) -> anyhow::Result<()> {
         if !item.cmd.holds_input() {
             return self.send(item.cmd, item.queued);
@@ -388,8 +405,23 @@ impl Thread {
         self.record(check);
         self.probe("recorded");
         let submit = lock(&self.shared.submit);
-        if lock(&self.shared.gate).stopped.is_some() {
+        let stale = if lock(&self.shared.gate).stopped.is_some() {
+            Some(None)
+        } else {
+            self.shared
+                .fresh
+                .get()
+                .and_then(|f| f(item.check).err())
+                .map(Some)
+        };
+        if let Some(why) = stale {
             drop(submit);
+            if let Some(why) = why {
+                stop_holds(
+                    &self.shared,
+                    &format!("`{}` was stale as it was submitted: {why}", item.cmd),
+                );
+            }
             self.record(Some(
                 json!({ "t": "dropped", "q": qpc(), "line": item.cmd.to_string() }),
             ));
@@ -874,6 +906,82 @@ mod tests {
         let renew = lines.iter().position(|l| l.starts_with("renew")).unwrap();
         let release = lines.iter().position(|l| l == "release").unwrap();
         assert!(renew < release, "{lines:?}");
+    }
+
+    /// A renewal queued while the step thread's heartbeat was fresh and
+    /// taken by the link thread only after it went stale is not written,
+    /// and holds stop: the link thread is held in an earlier renewal's
+    /// write while the second is queued, the heartbeat goes stale, and the
+    /// write is let go. The control: still fresh, both are written.
+    #[test]
+    fn a_hold_stale_at_its_submission_is_not_written() {
+        for stale in [true, false] {
+            let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            let g2 = Arc::clone(&gate);
+            let mut r = Run::with(Dev::new(HERE, "COM5", hello("abc", false)), move |d| {
+                Box::new(Blocking {
+                    inner: d,
+                    block: "renew",
+                    gate: Arc::clone(&g2),
+                })
+            });
+            let old = Arc::new(AtomicBool::new(false));
+            let o2 = Arc::clone(&old);
+            r.w.fresh(Box::new(move |_| {
+                if o2.load(Ordering::Acquire) {
+                    Err("the heartbeat is old".into())
+                } else {
+                    Ok(())
+                }
+            }));
+            grant(&r);
+            let id = r.w.state().grant.unwrap().id();
+            let renew = |n: u64| Command::Renew {
+                id,
+                deadline: 9_100_000_000 + n,
+            };
+            r.w.enqueue(renew(1), Some(qpc())).unwrap();
+            // The first renewal's write has begun and waits.
+            {
+                let (m, c) = &*gate;
+                let mut g = lock(m);
+                while !g.0 {
+                    g = c.wait(g).unwrap();
+                }
+            }
+            r.w.enqueue(renew(2), Some(qpc())).unwrap();
+            old.store(stale, Ordering::Release);
+            {
+                let (m, c) = &*gate;
+                lock(m).1 = true;
+                c.notify_all();
+            }
+            if stale {
+                wait_for(&r.w, |s| s.released);
+            } else {
+                wait_for(&r.w, |s| {
+                    s.answers
+                        .iter()
+                        .filter(|(c, _)| matches!(c, Command::Renew { .. }))
+                        .count()
+                        == 2
+                });
+            }
+            r.finish();
+            let renewals = r.lines().iter().filter(|l| l.starts_with("renew")).count();
+            let dropped = Run::records(&r.log)
+                .iter()
+                .filter(|v| v["t"] == "dropped")
+                .count();
+            if stale {
+                assert_eq!((renewals, dropped), (1, 1), "{:?}", r.lines());
+                let cause = r.w.stopped().unwrap();
+                assert!(cause.contains("the heartbeat is old"), "{cause}");
+            } else {
+                assert_eq!((renewals, dropped), (2, 0), "{:?}", r.lines());
+                assert!(r.w.stopped().is_none());
+            }
+        }
     }
 
     /// A port that, while it writes a hold-bearing line, has another

@@ -844,6 +844,43 @@ fn a_volume_slider_sets_its_own_volume() {
     }
 }
 
+/// The volume arm's witness for a test device's shots (dev-tools) names
+/// the pointer input that brought each volume: a click's press, then a
+/// held press's drag, each as it reached the arm.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_volume_witness_tells_a_press_from_a_drag() {
+    use crate::dev::present_shot::{VolumeOrigin, volumes_reached};
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 3);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        let from = volumes_reached().unwrap().len();
+        w.click(c, volume_at(200), Button::Left);
+        act(rig, screens);
+        w.down(c, volume_at(1_000), Button::Left);
+        act(rig, screens);
+        w.to(c, volume_at(0));
+        dragged(rig, screens);
+        w.up(c, Button::Left);
+        let got: Vec<(u8, u32, VolumeOrigin)> = volumes_reached()
+            .unwrap()
+            .get(from..)
+            .unwrap()
+            .iter()
+            .map(|v| (v.slider, v.percent, v.origin))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (17, 20, VolumeOrigin::Press),
+                (17, 100, VolumeOrigin::Press),
+                (17, 0, VolumeOrigin::Drag),
+            ]
+        );
+    });
+}
+
 /// K3: a volume slider's setting is written at the next settings write,
 /// not at once: `device.toml` then holds the system volume it set, the key
 /// and background volumes exactly as loaded and every other setting as
