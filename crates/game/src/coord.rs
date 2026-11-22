@@ -28,7 +28,11 @@
 //!   runs on a foreground permit, taken at its admission or moved at its
 //!   next checkpoint, and returns to its own class when demoted. Only its
 //!   own thread changes its permit, and the run's hook is called there at
-//!   each change of class (the player changes the thread's mode).
+//!   each change of class (the player changes the thread's mode). A task's
+//!   promotion can also be revoked ([`Promoter::revoke`]), a revocable
+//!   lease: the foreground permit its thread holds goes back to the pool at
+//!   once, before the thread yields it at its next checkpoint, so the
+//!   foreground work that comes next has the pool's full width.
 //! - **Outcomes** ([`Outcome`]) carry no policy: done, cancelled, or
 //!   panicked with the panic caught at the job's boundary, its admission
 //!   and hooks included. The caller decides what a panic means.
@@ -349,6 +353,13 @@ struct Job {
     owned: bool,
     /// A keyed job's `Arc<Slot<T>>`.
     slot: Option<Arc<dyn Any + Send + Sync>>,
+    /// The class of the permit its own thread holds, while it holds one.
+    holds: Option<Class>,
+    /// Its foreground permit was revoked ([`Promoter::revoke`]): given
+    /// back to the pool already, so the lease its thread still holds gives
+    /// nothing back as it drops, and is neither moved nor computed on past
+    /// the thread's next checkpoint.
+    revoked: bool,
 }
 
 impl Job {
@@ -684,6 +695,7 @@ impl Coordinator {
             .then(|| Lease {
                 shared: Arc::clone(&self.shared),
                 class,
+                job: None,
             })
     }
 
@@ -703,6 +715,7 @@ impl Coordinator {
                 return Some(Lease {
                     shared: Arc::clone(&self.shared),
                     class,
+                    job: None,
                 });
             }
             drop(
@@ -791,6 +804,8 @@ impl Coordinator {
                     responsible: false,
                     owned: false,
                     slot: Some(any_slot),
+                    holds: None,
+                    revoked: false,
                 },
             );
             state.keys.insert(key, id);
@@ -835,6 +850,8 @@ impl Coordinator {
                     responsible: false,
                     owned: false,
                     slot: None,
+                    holds: None,
+                    revoked: false,
                 },
             );
             id
@@ -879,6 +896,9 @@ pub enum Taken<T> {
 pub struct Lease {
     shared: Arc<Shared>,
     class: Class,
+    /// The job whose own thread holds it, which a revocation can take it
+    /// from ([`Promoter::revoke`]); none for a lease taken directly.
+    job: Option<u64>,
 }
 
 impl std::fmt::Debug for Lease {
@@ -896,17 +916,26 @@ impl Lease {
         self.class
     }
 
-    /// Moves it to `class` if a permit of `class` is free; whether it is
-    /// of `class` now.
+    /// Moves it to `class` if a permit of `class` is free and it was not
+    /// revoked; whether it is of `class` now.
     pub fn move_to(&mut self, class: Class) -> bool {
         if self.class == class {
             return true;
         }
-        let from = self.class;
+        let (from, job) = (self.class, self.job);
         let moved = self.shared.update(|state| {
+            if job
+                .and_then(|id| state.jobs.get(&id))
+                .is_some_and(|j| j.revoked)
+            {
+                return false;
+            }
             let moved = state.take_permit(self.shared.caps, class);
             if moved {
                 state.give_permit(from);
+                if let Some(j) = job.and_then(|id| state.jobs.get_mut(&id)) {
+                    j.holds = Some(class);
+                }
             }
             moved
         });
@@ -918,9 +947,18 @@ impl Lease {
 }
 
 impl Drop for Lease {
+    /// Its permit goes back, unless a revocation gave it back already.
     fn drop(&mut self) {
-        let class = self.class;
-        self.shared.update(|state| state.give_permit(class));
+        let (class, job) = (self.class, self.job);
+        self.shared.update(|state| {
+            if let Some(j) = job.and_then(|id| state.jobs.get_mut(&id)) {
+                j.holds = None;
+                if std::mem::take(&mut j.revoked) {
+                    return;
+                }
+            }
+            state.give_permit(class);
+        });
     }
 }
 
@@ -1004,6 +1042,31 @@ impl Promoter {
         self.shared
             .update(|state| state.set_promoted(self.job, false));
     }
+
+    /// The interest ends, and the foreground permit its thread holds, if
+    /// any, is revoked: given back to the pool now rather than at the
+    /// thread's next checkpoint (a revocable lease, as a file lease or an
+    /// opportunistic lock is broken for the next opener). The thread
+    /// computes on without a permit until that checkpoint, which lets the
+    /// revoked lease go and waits for a permit of the class wanted then,
+    /// as the checkpoint's own move does when no permit is free
+    /// ([`Ctx::checkpoint`]). Foreground work that comes next, a bank's
+    /// decode workers, so never finds a demoted task's permit taken.
+    pub fn revoke(&self) {
+        self.shared.update(|state| {
+            let Some(job) = state.jobs.get_mut(&self.job) else {
+                return;
+            };
+            job.promoted = false;
+            let revoke = job.holds == Some(Class::Foreground)
+                && job.base != Class::Foreground
+                && !job.revoked;
+            if revoke {
+                job.revoked = true;
+                state.give_permit(Class::Foreground);
+            }
+        });
+    }
 }
 
 /// A job to run on the caller's thread ([`Runner::run`]). Dropped without
@@ -1016,7 +1079,8 @@ pub struct Runner<T> {
     /// or a joinable job, whose caller set the thread up (the background
     /// worker enters background mode before its jobs; a scoped job's base
     /// is the foreground); the normal mode, the foreground's, for an owned
-    /// job's new thread.
+    /// job's new thread and for a task run on a new thread
+    /// ([`Runner::on_new_thread`]).
     mode: Class,
     slot: Option<Arc<Slot<T>>>,
     done: bool,
@@ -1032,6 +1096,17 @@ impl<T> std::fmt::Debug for Runner<T> {
 }
 
 impl<T> Runner<T> {
+    /// It runs on a thread of its own that begins in the normal mode, the
+    /// foreground's, as an owned job's does: the hook is called at its
+    /// first admission in another class, so the thread's mode is set for
+    /// the class of its first actual permit before its work, whatever
+    /// class was wanted when the task was made.
+    #[must_use]
+    pub const fn on_new_thread(mut self) -> Self {
+        self.mode = Class::Foreground;
+        self
+    }
+
     /// Its promoter.
     #[must_use]
     pub fn promoter(&self) -> Promoter {
@@ -1309,18 +1384,24 @@ impl Ctx<'_> {
     }
 
     /// Moves the permit to the class wanted now; `false` when the wait for
-    /// one was stopped.
+    /// one was stopped. A revoked permit is let go, giving nothing back,
+    /// and a permit of the class wanted is waited for.
     fn retarget(&self) -> bool {
-        let want = self.want();
+        let (want, revoked) = self
+            .shared
+            .lock()
+            .jobs
+            .get(&self.id)
+            .map_or((self.base, false), |j| (j.want(), j.revoked));
         let mut lease = self.lease();
         let Some(held) = lease.as_mut() else {
             drop(lease);
             return self.admit();
         };
-        if held.class() == want {
+        if !revoked && held.class() == want {
             return true;
         }
-        if held.move_to(want) {
+        if !revoked && held.move_to(want) {
             drop(lease);
             self.apply(want);
             return true;
@@ -1365,10 +1446,14 @@ impl Ctx<'_> {
                 return false;
             }
             if state.take_permit(self.shared.caps, want) {
+                if let Some(job) = state.jobs.get_mut(&self.id) {
+                    job.holds = Some(want);
+                }
                 drop(state);
                 *self.lease() = Some(Lease {
                     shared: Arc::clone(self.shared),
                     class: want,
+                    job: Some(self.id),
                 });
                 self.apply(want);
                 return true;

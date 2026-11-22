@@ -210,6 +210,8 @@ impl Coordinator {
                 responsible: false,
                 owned: true,
                 slot: Some(any_slot),
+                holds: None,
+                revoked: false,
             },
         );
         state.keys.insert(key, id);
