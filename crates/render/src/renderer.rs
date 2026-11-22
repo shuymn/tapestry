@@ -589,6 +589,15 @@ pub enum LoadingOn {
     Staged(PreparedToken),
 }
 
+/// Development builds: whether a frame drawn `on` is the selection screen's,
+/// the only frames a present tap may copy ([`crate::PresentTap::wanted`]):
+/// its committed slot, `slot` saying the slot is there (a missing slot
+/// draws play's resources).
+#[cfg(feature = "dev-tools")]
+fn selection_frame(on: Draw, slot: bool) -> bool {
+    matches!(on, Draw::Slot(i) if slot && Renderer::screen(ScreenKind::Selection) == Some(i))
+}
+
 /// Which resources a frame is drawn from ([`Renderer::draw_on`]).
 #[derive(Clone, Copy, Debug)]
 enum Draw {
@@ -1552,6 +1561,10 @@ struct Window {
     waitable: Option<usize>,
     /// The swap chain itself, for its present count and frame statistics.
     chain: Option<IDXGISwapChain3>,
+    /// Development builds: whether the surface's images can be copied from,
+    /// for a present tap ([`Renderer::set_present_tap`]).
+    #[cfg(feature = "dev-tools")]
+    copy_src: bool,
 }
 
 impl Window {
@@ -1681,6 +1694,10 @@ pub struct Renderer {
     /// long after its submission ([`delay_steps`](Self::delay_steps)).
     #[cfg(feature = "dev-tools")]
     step_delay: Option<Duration>,
+    /// Development builds: the tap that copies window frames as they are
+    /// presented ([`set_present_tap`](Self::set_present_tap)).
+    #[cfg(feature = "dev-tools")]
+    present_tap: Option<Arc<dyn crate::present_tap::PresentTap>>,
     /// Development builds: the time a staging step's writes have taken on
     /// the boundary's slice clock, read instead of the real clock
     /// ([`set_write_slice_clock`](Self::set_write_slice_clock)).
@@ -2013,6 +2030,8 @@ impl Renderer {
                     config,
                     waitable: None,
                     chain: None,
+                    #[cfg(feature = "dev-tools")]
+                    copy_src: caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
                 };
                 w.configure(device);
                 (Output::Window(w), format)
@@ -2062,6 +2081,8 @@ impl Renderer {
             stage_failed: None,
             #[cfg(feature = "dev-tools")]
             step_delay: None,
+            #[cfg(feature = "dev-tools")]
+            present_tap: None,
             #[cfg(feature = "dev-tools")]
             write_slice_clock: None,
             #[cfg(feature = "dev-tools")]
@@ -10005,6 +10026,32 @@ impl Renderer {
             });
             text.render(&mut pass).map_err(RenderError::Text)?;
         }
+        // A frame the present tap wants: its swap chain image copied after
+        // every pass drew into it, in its own command buffer, before its
+        // present. Only a selection frame is copied (the copy allocates);
+        // the tap is told every frame's kind, so it refuses a request that
+        // another frame meets.
+        #[cfg(feature = "dev-tools")]
+        let selection = selection_frame(
+            on,
+            Self::screen(ScreenKind::Selection)
+                .and_then(|i| self.screens.get(i))
+                .is_some_and(Option::is_some),
+        );
+        #[cfg(feature = "dev-tools")]
+        let tapped = match (&frame, &self.present_tap) {
+            (Some(t), Some(tap)) if tap.wanted(selection) && selection => Some((
+                Arc::clone(tap),
+                self.chain().cloned(),
+                crate::present_tap::record(
+                    self.gpu.device(),
+                    &mut encoder,
+                    &t.texture,
+                    self.format,
+                ),
+            )),
+            _ => None,
+        };
         #[cfg(feature = "dev-tools")]
         let p_s = crate::probe::Span::start();
         let (number, submitted) = self.gpu.submit([encoder.finish()]);
@@ -10029,11 +10076,32 @@ impl Renderer {
         let mut out = timing(cpu, FrameOutcome::Shown);
         match frame {
             Some(t) => {
+                // A tapped frame's present is read on the chain it goes to,
+                // before and after: a count that does not advance is a
+                // present that did not happen.
+                #[cfg(feature = "dev-tools")]
+                let before = tapped.as_ref().and_then(|(_, chain, _)| {
+                    // SAFETY: a plain query of the live swap chain.
+                    chain
+                        .as_ref()
+                        .and_then(|c| unsafe { c.GetLastPresentCount() }.ok())
+                });
                 self.gpu.queue().present(t);
                 out.present_count = self.chain().and_then(|c| {
                     // SAFETY: a plain query of the live swap chain.
                     unsafe { c.GetLastPresentCount() }.ok()
                 });
+                #[cfg(feature = "dev-tools")]
+                if let Some((tap, chain, copy)) = tapped {
+                    // SAFETY: a plain query of the live swap chain.
+                    let after = chain.and_then(|c| unsafe { c.GetLastPresentCount() }.ok());
+                    tap.presented(before, after);
+                    tap.deliver(
+                        copy.and_then(|c| {
+                            crate::present_tap::read(self.gpu.device(), &c, submitted)
+                        }),
+                    );
+                }
             }
             None => {
                 // Offscreen: this frame is the one left pending, so a later
@@ -10071,6 +10139,30 @@ impl Renderer {
                 _ => self.atlas.mark(number),
             },
         }
+    }
+
+    /// Development builds: copies window frames for `tap` as they are
+    /// presented, from now on ([`crate::present_tap`]): the surface is
+    /// configured again so its images can be copied from.
+    ///
+    /// # Errors
+    ///
+    /// An offscreen target, or a surface whose images cannot be copied.
+    #[cfg(feature = "dev-tools")]
+    pub fn set_present_tap(
+        &mut self,
+        tap: Arc<dyn crate::present_tap::PresentTap>,
+    ) -> Result<(), String> {
+        let Output::Window(w) = &mut self.output else {
+            return Err("an offscreen target presents no frame".into());
+        };
+        if !w.copy_src {
+            return Err("the surface's images cannot be copied from".into());
+        }
+        w.config.usage |= wgpu::TextureUsages::COPY_SRC;
+        w.configure(self.gpu.device());
+        self.present_tap = Some(tap);
+        Ok(())
     }
 
     fn chain(&self) -> Option<&IDXGISwapChain3> {
@@ -10779,6 +10871,23 @@ mod tests {
         Acquisition, AtlasPages, ChartOutcome, ChartTarget, ClipTable, FrameOutcome, RenderError,
         Renderer, Target, acquisition, letterbox, offscreen_skip,
     };
+
+    /// A present tap may copy only the selection screen's frames: its own
+    /// slot while the slot is there, never play's, a pending play
+    /// staging's, another screen's slot, or a selection slot that is gone
+    /// (whose frame draws play's resources).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn only_a_selection_frame_is_a_tap_s() {
+        use super::{Draw, selection_frame};
+        let sel = Renderer::screen(skin_model::ScreenKind::Selection).unwrap();
+        let other = Renderer::screen(skin_model::ScreenKind::Result).unwrap();
+        assert!(selection_frame(Draw::Slot(sel), true));
+        assert!(!selection_frame(Draw::Slot(sel), false));
+        assert!(!selection_frame(Draw::Slot(other), true));
+        assert!(!selection_frame(Draw::Play, true));
+        assert!(!selection_frame(Draw::Pending, true));
+    }
     use crate::pace::Pacer;
     use crate::text::MenuText;
     use crate::{AdapterChoice, Blend, SkinError, Sprite, UploadError, solid_uv};

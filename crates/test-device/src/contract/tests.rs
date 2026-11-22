@@ -148,7 +148,7 @@ fn exit(name: &str, (pid, created): (u32, u64), code: i32) -> Value {
 }
 
 fn kill(name: &str, (pid, created): (u32, u64)) -> Value {
-    json!({"t": "kill", "q": 90, "name": name, "process": {"pid": pid, "created": created}})
+    json!({"t": "kill", "q": 90, "name": name, "process": {"pid": pid, "created": created}, "requested": 89})
 }
 
 fn spawn(name: &str, (pid, created): (u32, u64)) -> Value {

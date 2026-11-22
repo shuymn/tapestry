@@ -36,6 +36,7 @@ pub mod lease;
 #[cfg(feature = "std")]
 pub mod matcher;
 pub mod mode;
+pub mod panel;
 pub mod protocol;
 #[cfg(feature = "std")]
 pub mod provenance;

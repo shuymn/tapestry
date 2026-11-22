@@ -163,6 +163,8 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         preset_steps: std::collections::VecDeque::new(),
         covers_turned: [false; 3],
         volumes_set: [None; 3],
+        #[cfg(feature = "dev-tools")]
+        act_origin: crate::dev::present_shot::VolumeOrigin::Other,
         cues: crate::select::SelectCues::default(),
         script: None,
         coord: coord.clone(),

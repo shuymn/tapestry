@@ -28,6 +28,8 @@ bms-parser.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+# The test device's panel-3 targets, which a test pins.
+test-device.workspace = true
 
 [lints]
 workspace = true

@@ -61,6 +61,8 @@ pub mod measure;
 mod outline;
 mod overlay;
 mod pace;
+#[cfg(feature = "dev-tools")]
+pub mod present_tap;
 pub mod presentation;
 #[cfg(feature = "dev-tools")]
 pub mod probe;
@@ -95,6 +97,8 @@ pub use outline::{
     TextNote, TextResidency,
 };
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
+#[cfg(feature = "dev-tools")]
+pub use present_tap::{PresentFrame, PresentTap};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::UploadTiming;

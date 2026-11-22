@@ -4,14 +4,16 @@
 //! front, its client area unchanged and inside the run's monitor (the
 //! monitor read again at least every [`MONITOR_EVERY`]), the recorder's
 //! process running, and the step thread's heartbeat no older than a third
-//! of the slice. Each grant names
+//! of the slice, with no longer gap between two beats since the guard
+//! started ([`Beat`] latches each gap as the step thread closes it, so a
+//! gap no look saw still counts). Each grant names
 //! the connection's token and each grant and renewal carries the deadline
 //! that check bounds ([`clock::deadline`]); with no round trip on the
 //! connection, nothing is granted. A bad check, or a command the link's
 //! queue refuses, stops holds for good.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -32,6 +34,80 @@ pub const POLL: Duration = Duration::from_millis(5);
 /// How often the run's monitor is enumerated again.
 pub const MONITOR_EVERY: Duration = Duration::from_millis(50);
 
+/// The step thread's heartbeat: when it last beat, and the longest gap
+/// between two beats since [`Beat::arm`], latched by the beat that closes
+/// it. A look that reads the heartbeat only after the step thread beat
+/// again still sees the gap.
+#[derive(Debug)]
+pub struct Beat {
+    last: AtomicI64,
+    worst: AtomicI64,
+}
+
+impl Beat {
+    /// A heartbeat that beat at `now` (host counter ticks).
+    pub const fn new(now: i64) -> Self {
+        Self {
+            last: AtomicI64::new(now),
+            worst: AtomicI64::new(0),
+        }
+    }
+
+    /// A beat at `now`: the gap it closes is latched before the new
+    /// timestamp is published, so a reader that sees the new timestamp
+    /// sees that gap too ([`Self::age`] reads the timestamp first).
+    pub fn beat(&self, now: i64) {
+        self.beat_with(now, || {});
+    }
+
+    /// [`Self::beat`], running `between` after the gap is published and
+    /// before the timestamp is: the point a reader may meet.
+    fn beat_with(&self, now: i64, between: impl FnOnce()) {
+        let mut before = self.last.load(Ordering::Acquire);
+        let mut between = Some(between);
+        loop {
+            self.worst
+                .fetch_max(now.saturating_sub(before), Ordering::AcqRel);
+            if let Some(f) = between.take() {
+                f();
+            }
+            match self
+                .last
+                .compare_exchange(before, now, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                // Another beat came between: its gap is latched by it, and
+                // this one closes the gap from it.
+                Err(seen) => before = seen,
+            }
+        }
+    }
+
+    /// Beats at `now` and forgets the gaps before: the guard's start, so a
+    /// step that blocked before any lease (a rediscovery, the player's
+    /// start) does not count.
+    pub fn arm(&self, now: i64) {
+        self.last.store(now, Ordering::Release);
+        self.worst.store(0, Ordering::Release);
+    }
+
+    /// The heartbeat's age (ticks): the gap still open at `now()`, read
+    /// after the last beat is, or the longest one closed since the guard
+    /// armed it, whichever is longer.
+    pub fn age(&self, now: impl FnOnce() -> i64) -> i64 {
+        self.age_at(now).0
+    }
+
+    /// [`Self::age`] and the counter `now()` read for it, after the
+    /// timestamp: a submission's freshness is judged at that counter.
+    pub fn age_at(&self, now: impl FnOnce() -> i64) -> (i64, i64) {
+        let last = self.last.load(Ordering::Acquire);
+        let at = now();
+        let open = at.saturating_sub(last);
+        (open.max(self.worst.load(Ordering::Acquire)), at)
+    }
+}
+
 /// One look at the run, read fresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Look {
@@ -42,8 +118,9 @@ pub struct Look {
     /// The window's client area is the one it had, inside the run's
     /// monitor, which has the area it had.
     pub placed: bool,
-    /// When the step thread last beat (host counter ticks).
-    pub beat: i64,
+    /// The step thread's heartbeat's age (ticks, [`Beat::age`]), read
+    /// after the look's other reads.
+    pub beat_age: i64,
     /// The recorder's process runs: with it gone, nothing would show a
     /// held input reaching another window.
     pub recording: bool,
@@ -61,7 +138,7 @@ impl Look {
         if !self.recording {
             return Some("the recorder is not running".into());
         }
-        let age = ticks_to_us(self.at.saturating_sub(self.beat), freq);
+        let age = ticks_to_us(self.beat_age, freq);
         if age > BEAT_MAX_US {
             return Some(format!("the step thread's heartbeat is {age} µs old"));
         }
@@ -112,6 +189,10 @@ pub struct Guard {
     /// The check the last grant or renewal queued came from.
     last: Option<i64>,
     lost: bool,
+    /// The oldest heartbeat a judged look read (µs), and how many looks
+    /// were judged: the measured margin under [`BEAT_MAX_US`].
+    beat_max_us: i64,
+    judged: u64,
 }
 
 impl Guard {
@@ -121,7 +202,15 @@ impl Guard {
             until: None,
             last: None,
             lost: false,
+            beat_max_us: 0,
+            judged: 0,
         }
+    }
+
+    /// The oldest heartbeat a judged look read (µs) and the number of
+    /// looks judged.
+    pub const fn heartbeat(&self) -> (i64, u64) {
+        (self.beat_max_us, self.judged)
     }
 
     /// The row asks for a lease lasting until `until` (host counter ticks).
@@ -145,6 +234,8 @@ impl Guard {
         let Some(until) = self.until else {
             return Act::Idle;
         };
+        self.judged += 1;
+        self.beat_max_us = self.beat_max_us.max(ticks_to_us(look.beat_age, self.freq));
         if let Some(why) = look.bad(self.freq) {
             self.lost = true;
             return Act::Stop(why);
@@ -241,6 +332,11 @@ impl Handle {
         self.end.store(true, Ordering::Release);
     }
 
+    /// [`Guard::heartbeat`].
+    pub fn heartbeat(&self) -> (i64, u64) {
+        self.lock().heartbeat()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Guard> {
         self.guard
             .lock()
@@ -263,6 +359,20 @@ pub fn step(guard: &mut Guard, watch: &mut dyn Watch, sink: &dyn Sink) {
         },
         Act::Stop(why) => sink.stop_holds(&format!("a lost check: {why}")),
     }
+}
+
+/// Ends the guard's thread, waits for it up to `wait`, and only then reads
+/// its heartbeat statistics ([`Guard::heartbeat`]): a thread blocked in a
+/// look holds the guard's lock, so a read before the join could outlast
+/// the wait.
+///
+/// # Errors
+///
+/// The thread did not end within `wait`: no statistics are read.
+pub fn stop(h: &Handle, thread: JoinHandle<()>, wait: Duration) -> Result<(i64, u64), String> {
+    h.end();
+    super::owner::join_within(thread, "the guard's thread", wait)?;
+    Ok(h.heartbeat())
 }
 
 /// Starts the guard thread.
@@ -328,7 +438,7 @@ mod tests {
             at,
             front: true,
             placed: true,
-            beat: at,
+            beat_age: 0,
             recording: true,
         }
     }
@@ -369,7 +479,7 @@ mod tests {
                             at: 2_000_000,
                             front,
                             placed,
-                            beat: 2_000_000 - age,
+                            beat_age: age,
                             recording,
                         };
                         let ok = front && placed && recording && age <= BEAT_MAX_US;
@@ -468,7 +578,7 @@ mod tests {
         loop {
             at += 5_000;
             let look = Look {
-                beat: at.min(500_000),
+                beat_age: at - at.min(500_000),
                 ..good(at)
             };
             match g.decide(&look, &view(true)) {
@@ -486,6 +596,12 @@ mod tests {
             500_000 + BEAT_MAX_US + 5_000 - (BEAT_MAX_US + 5_000) % 5_000
         );
         assert!(renewals >= 5, "the beating stretch renewed: {renewals}");
+        // The guard kept the oldest heartbeat it judged: the stopping
+        // look's, and one look per 5 ms until then.
+        assert_eq!(
+            g.heartbeat(),
+            (at - 500_000, 1 + u64::try_from(at / 5_000).unwrap())
+        );
     }
 
     struct Full {
@@ -511,6 +627,148 @@ mod tests {
             self.0 += 5_000;
             good(self.0)
         }
+    }
+
+    /// A gap the step thread closed before the guard looked still stops
+    /// holds: the step thread stalls past the bound while the guard is
+    /// descheduled, beats again, and only then does the guard look, its
+    /// counter sampled first. The two threads meet at each point of that
+    /// order. The control: a gap within the bound sends the renewal.
+    #[test]
+    fn a_gap_closed_before_the_look_still_stops_holds() {
+        use std::sync::Barrier;
+        for gap in [BEAT_MAX_US + 1, BEAT_MAX_US] {
+            let beat = Arc::new(Beat::new(0));
+            let meet = Arc::new(Barrier::new(2));
+            let (b2, m2) = (Arc::clone(&beat), Arc::clone(&meet));
+            let step = std::thread::spawn(move || {
+                // The stall ends with this beat, after the guard sampled
+                // its counter.
+                m2.wait();
+                b2.beat(gap);
+                m2.wait();
+            });
+            let mut g = wanting();
+            // The look: the counter first, then (after the beat) the
+            // heartbeat.
+            let at = gap - 1;
+            meet.wait();
+            meet.wait();
+            let look = Look {
+                beat_age: beat.age(|| at),
+                ..good(at)
+            };
+            step.join().unwrap();
+            match g.decide(&look, &view(true)) {
+                Act::Stop(why) => {
+                    assert!(gap > BEAT_MAX_US, "{why}");
+                    assert!(why.contains("heartbeat"), "{why}");
+                }
+                Act::Send { .. } => assert!(gap <= BEAT_MAX_US, "{look:?}"),
+                Act::Idle => panic!("{look:?}"),
+            }
+        }
+        // Arming forgets a gap before the guard's start.
+        let beat = Beat::new(0);
+        beat.beat(1_000_000);
+        beat.arm(1_000_000);
+        assert_eq!(beat.age(|| 1_000_010), 10);
+    }
+
+    /// A reader that meets a beat between its two publications reads the
+    /// gap that beat closes: the gap is published before the timestamp, so
+    /// the new timestamp never comes with the old gap. The beat closes a
+    /// gap past the bound and the reader reads at the meeting point; the
+    /// control, a gap within the bound, reads fresh.
+    #[test]
+    fn a_reader_between_a_beat_s_publications_sees_its_gap() {
+        use std::sync::Barrier;
+        let freq = 1_000_000;
+        for gap in [BEAT_MAX_US + 1, BEAT_MAX_US] {
+            let beat = Arc::new(Beat::new(0));
+            let meet = Arc::new(Barrier::new(2));
+            let (b2, m2) = (Arc::clone(&beat), Arc::clone(&meet));
+            let step = std::thread::spawn(move || {
+                b2.beat_with(gap, || {
+                    m2.wait();
+                    m2.wait();
+                });
+            });
+            meet.wait();
+            // The reader, between the beat's publications, at the beat's
+            // own time.
+            let age = beat.age(|| gap);
+            meet.wait();
+            step.join().unwrap();
+            let stale = ticks_to_us(age, freq) > BEAT_MAX_US;
+            assert_eq!(stale, gap > BEAT_MAX_US, "gap {gap}: age {age}");
+            // Once both are published the gap stays latched.
+            assert_eq!(beat.age(|| gap), gap);
+        }
+    }
+
+    #[test]
+    fn arming_forgets_a_gap_before_the_guard_s_start() {
+        let beat = Beat::new(0);
+        beat.beat(1_000_000);
+        beat.arm(1_000_000);
+        assert_eq!(beat.age(|| 1_000_010), 10);
+    }
+
+    /// A guard thread blocked in a look holds the guard's lock: ending it
+    /// returns within its wait, with no statistics, instead of waiting on
+    /// that lock. The look and the stop meet at a point the test holds.
+    #[test]
+    fn stopping_a_blocked_guard_returns_within_its_wait() {
+        use std::sync::mpsc;
+        struct Stuck {
+            entered: mpsc::Sender<()>,
+            release: Arc<std::sync::Barrier>,
+            n: i64,
+        }
+        impl Watch for Stuck {
+            fn look(&mut self) -> Look {
+                self.n += 5_000;
+                if self.n == 10_000 {
+                    let _ = self.entered.send(());
+                    self.release.wait();
+                }
+                good(self.n)
+            }
+        }
+        let (entered, looked) = mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (h, thread) = start(
+            FREQ,
+            Box::new(Stuck {
+                entered,
+                release: Arc::clone(&release),
+                n: 0,
+            }),
+            Arc::new(Full {
+                stops: Mutex::new(Vec::new()),
+            }),
+        );
+        looked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done, stopped) = mpsc::channel();
+        let h2 = h.clone();
+        let stopper = std::thread::spawn(move || {
+            let _ = done.send(stop(&h2, thread, Duration::from_millis(100)));
+        });
+        let r = stopped.recv_timeout(Duration::from_secs(2));
+        release.wait();
+        stopper.join().unwrap();
+        let r = r.expect("the stop waited on the guard's lock past its wait");
+        assert!(r.is_err(), "{r:?}");
+        // The control: a guard not blocked stops with its statistics.
+        let (h, thread) = start(
+            FREQ,
+            Box::new(Steady(0)),
+            Arc::new(Full {
+                stops: Mutex::new(Vec::new()),
+            }),
+        );
+        assert!(stop(&h, thread, Duration::from_secs(2)).is_ok());
     }
 
     #[test]
