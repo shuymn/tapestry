@@ -88,8 +88,15 @@ impl Play {
     }
 
     /// A play frame at chart time `now` (µs) and speed `k / 20`, on a
-    /// frame clock far from chart time.
+    /// frame clock far from chart time, presented drawing what it shows.
     fn at_k(&mut self, now: i64, k: u32) -> MovieShows {
+        self.shown_at(now, k, true)
+    }
+
+    /// A play frame at chart time `now` (µs) and speed `k / 20`, presented
+    /// drawing slot 2 only when `slot` (a picture on its channel draws
+    /// none of it).
+    fn shown_at(&mut self, now: i64, k: u32, slot: bool) -> MovieShows {
         self.m.admit(&mut self.planes, self.start);
         let shows = self.m.play_frame(
             &mut self.planes,
@@ -97,7 +104,11 @@ impl Play {
             ChartAt { now, k },
             self.start,
         );
-        self.m.presented(true, drawn(shows));
+        let mut quads = drawn(shows);
+        if let Some(q) = quads.get_mut(2) {
+            *q &= slot;
+        }
+        self.m.presented(true, quads);
         shows
     }
 
@@ -229,20 +240,16 @@ fn of_starts_crossed_between_frames_the_latest_wins() {
 // Source: SF-028
 #[test]
 fn a_video_started_then_replaced_by_a_picture_keeps_running() {
-    let drawn = |slot: bool| [false, false, slot, false];
     // The video starts at 1 s; a picture replaces it on the base at 2 s,
-    // which is no start of the video's.
+    // which is no start of the video's, and its quad is drawn no more.
     let mut p = Play::new(&[1_000_000], i64::MIN);
     assert!(frame(p.at(1_000_000)));
-    p.m.presented(true, drawn(true));
     p.publish(1, FIRST + 1_000_000, 2);
     p.publish(1, FIRST + 1_500_000, 3);
     p.publish(1, FIRST + 2_000_000, 4);
-    p.at(2_100_000);
-    p.m.presented(true, drawn(false));
+    p.shown_at(2_100_000, 20, false);
     assert_eq!(p.stamp(), Some(FIRST + 1_000_000));
-    p.at(2_500_000);
-    p.m.presented(true, drawn(false));
+    p.shown_at(2_500_000, 20, false);
     assert_eq!(p.stamp(), Some(FIRST + 1_500_000), "taken while not drawn");
     p.at(3_000_000);
     assert_eq!(p.stamp(), Some(FIRST + 2_000_000), "due at 3 s");
