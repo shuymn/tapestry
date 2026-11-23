@@ -208,6 +208,17 @@ pub(in crate::result_skin) fn after_adopt_release() {
     }
 }
 
+/// Run inside a job mark's output (`mark_job`), with the mark's tag
+/// (E25: the output is no stretch's work).
+pub(super) static IN_MARK_OUTPUT: Mutex<Option<fn(&'static str)>> = Mutex::new(None);
+
+pub(super) fn in_mark_output(tag: &'static str) {
+    let hook = *IN_MARK_OUTPUT.lock().unwrap();
+    if let Some(hook) = hook {
+        hook(tag);
+    }
+}
+
 /// The cycle counts a test's source answers in turn (E24), in place of
 /// the thread's.
 pub(crate) static CYCLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());

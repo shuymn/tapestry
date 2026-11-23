@@ -484,6 +484,8 @@ impl Drop for Hooks {
     fn drop(&mut self) {
         *super::AFTER_HOLD_STORE.lock().unwrap() = None;
         *super::AFTER_ADOPT_RELEASE.lock().unwrap() = None;
+        *super::IN_MARK_OUTPUT.lock().unwrap() = None;
+        *AFTER_SEEN.lock().unwrap() = None;
         LOOKED.store(true, SeqCst);
         gaps::release();
     }
@@ -612,4 +614,74 @@ fn a_release_before_a_hold_engages_does_not_end_it() {
     gaps::release();
     collected(&mut rs, &coord);
     assert_eq!(marks(from, "pre:hold_released").len(), 1);
+}
+
+/// A job's end, its output held 80 ms on the test's clock (E25).
+fn slow_end_output(tag: &'static str) {
+    if tag == "pre:end" {
+        advance(80_000);
+    }
+}
+
+/// A mark's output is no stretch's work: 80 ms in the `pre:end` line,
+/// after the job's last checkpoint, leaves its longest stretch at 0 and
+/// no gap over the bound (E25).
+#[test]
+fn a_marks_output_is_no_stretchs_work() {
+    let _s = crate::imports::tests::serial();
+    let _g = Opened;
+    let _h = Hooks;
+    let from = start();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    *super::IN_MARK_OUTPUT.lock().unwrap() = Some(slow_end_output);
+    look(&mut rs, &coord, true);
+    collected(&mut rs, &coord);
+    let id = begun(from);
+    assert_eq!(marks(from, "pre:end").len(), 1, "the job ended");
+    assert_eq!(
+        marks(from, "pre:gap"),
+        [(marks(from, "pre:gap")[0].0, id, 0)]
+    );
+    assert!(
+        marks(from, "pre:gap_over").is_empty(),
+        "no gap over the bound"
+    );
+}
+
+/// After a stop, a mark's output is no disposal: 100 ms of disposal and
+/// 80 ms in the `pre:end` line give a disposal of 100 ms (E25).
+#[test]
+fn a_marks_output_is_no_disposal() {
+    let _s = crate::imports::tests::serial();
+    let _g = Opened;
+    let _h = Hooks;
+    let from = start();
+    let d = runtime_drawn_skin();
+    let data = tempfile::tempdir().unwrap();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let mut shelf = shelf(data.path());
+    let control = rs.preload_control().unwrap();
+    shelf.set_preload(Arc::clone(&control));
+    let coord = coordinator(1);
+    fn dispose() {
+        advance(100_000);
+    }
+    *AFTER_SEEN.lock().unwrap() = Some(dispose);
+    *super::IN_MARK_OUTPUT.lock().unwrap() = Some(slow_end_output);
+    gate(1);
+    look(&mut rs, &coord, true);
+    until("the pack's checkpoint", || REACHED.load(SeqCst));
+    shelf.pause();
+    assert!(control.wait_ended(long()));
+    let id = begun(from);
+    assert_eq!(marks(from, "pre:end").len(), 1, "the job ended");
+    assert_eq!(
+        marks(from, "pre:dispose"),
+        [(marks(from, "pre:dispose")[0].0, id, 100_000)]
+    );
+    collected(&mut rs, &coord);
 }

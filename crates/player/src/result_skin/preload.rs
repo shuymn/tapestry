@@ -514,17 +514,22 @@ impl PreloadControl {
 
 /// Dev-tools: the preload's mark `tag` of job `id` (the transition probe,
 /// [`crate::dev::loop_probe`]), and its `dev:` line with `what` when the
-/// probe is on.
+/// probe is on. The line is measurement output, which a write can block:
+/// on the job's thread it is left out of its stretch and its disposal.
 #[cfg(feature = "dev-tools")]
 fn mark_job(tag: &'static str, id: u64, what: &str) {
     crate::dev::loop_probe::mark(tag, i64::try_from(id).unwrap_or(-1));
-    if crate::dev::loop_probe::on() {
-        if what.is_empty() {
-            println!("dev: {tag} {id}");
-        } else {
-            println!("dev: {tag} {id} {what}");
+    gaps::dev_only(|| {
+        #[cfg(test)]
+        tests::in_mark_output(tag);
+        if crate::dev::loop_probe::on() {
+            if what.is_empty() {
+                println!("dev: {tag} {id}");
+            } else {
+                println!("dev: {tag} {id} {what}");
+            }
         }
-    }
+    });
 }
 
 /// Dev-tools: `pre:stop` of a stop's `request` ([`PreloadControl::stop_request`]),

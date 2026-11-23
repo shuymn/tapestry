@@ -129,6 +129,8 @@ struct Tracker {
     dev_total: i64,
     /// When its stop was seen.
     seen: Option<i64>,
+    /// Dev-only µs since its stop was seen, out of its disposal.
+    dev_seen: i64,
 }
 
 fn now() -> Option<i64> {
@@ -183,6 +185,7 @@ pub fn admit(id: u64) {
             longest: 0,
             dev_total: 0,
             seen: None,
+            dev_seen: 0,
         });
     });
 }
@@ -262,7 +265,8 @@ pub fn stopped_at(site: u8) {
 }
 
 /// Runs dev-only `f` (measurement work no production build does), its
-/// time left out of the stretch it falls in.
+/// time left out of the stretch it falls in, or of the disposal after
+/// the job's stop.
 pub fn dev_only<R>(f: impl FnOnce() -> R) -> R {
     let Some(began) = now() else {
         return f();
@@ -273,6 +277,9 @@ pub fn dev_only<R>(f: impl FnOnce() -> R) -> R {
     };
     let len = ended - began;
     with(|t| {
+        if t.seen.is_some() {
+            t.dev_seen += len;
+        }
         if t.start.is_none() {
             return;
         }
@@ -309,7 +316,7 @@ pub fn finish() {
         pair(id, i64::try_from(t.visits).unwrap_or(-1)),
     );
     if let Some(seen) = t.seen {
-        loop_probe::mark("pre:dispose", pair(id, at - seen));
+        loop_probe::mark("pre:dispose", pair(id, at - seen - t.dev_seen));
     }
 }
 
