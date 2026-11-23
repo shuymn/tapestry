@@ -275,29 +275,29 @@ fn chart_due(first: i64, start: i64, at: ChartAt) -> i64 {
 /// Whether run `run`, its end reported, had ended by media time `due`, as a
 /// frame drawn at that time would have judged it: the ring holds no frame
 /// of the run newer than the one due then, and that frame, or `held` when
-/// none is due, lasts no further than `due`; a run with no frame ended at
-/// once. A peek that fails leaves the run playing: the next peek returns
-/// the fault. `freed` is set when the peek freed slots. Allocates nothing.
+/// none is due, lasts no further than `due`; a run with no frame ended
+/// once its seek is acknowledged empty (`empty`). A peek that fails returns
+/// its fault. `freed` is set when the peek freed slots. Allocates nothing.
 fn ended_by<W: skin_model::media::Words + ?Sized>(
     reader: &mut Reader,
     ring: &W,
     held: Option<Held>,
-    run: u64,
+    (run, empty): (u64, u64),
     due: i64,
     freed: &mut bool,
-) -> bool {
-    let Ok(peek) = reader.peek(ring, due) else {
-        return false;
-    };
+) -> Result<bool, skin_model::media::Fault> {
+    let peek = reader.peek(ring, due)?;
     *freed |= peek.freed;
     if peek.left {
-        return false;
+        return Ok(false);
     }
     let last = peek
         .due
         .map(|d| (d.stamp(), d.duration()))
         .or_else(|| held.filter(|h| h.run == run).map(|h| (h.stamp, h.duration)));
-    last.is_none_or(|(stamp, duration)| due >= stamp.saturating_add(duration))
+    Ok(last.map_or(empty == run, |(stamp, duration)| {
+        due >= stamp.saturating_add(duration)
+    }))
 }
 
 /// Where a movie's clock stands (design.md "Skin movies").
@@ -846,7 +846,7 @@ impl<S: Source> Movies<S> {
         let empty = movie.empty();
         let first = slot.first.unwrap_or(0);
         let mut freed = false;
-        let (due, peeked) = {
+        let (due, peeked) = 'read: {
             #[cfg(feature = "dev-tools")]
             let _region = crate::alloc_count::AppRegion::enter();
             let mut wanted = None;
@@ -872,25 +872,33 @@ impl<S: Source> Movies<S> {
                         before @ (Chart::Playing { .. }
                         | Chart::Restarting { .. }
                         | Chart::Ended) => {
-                            let hold = match before {
-                                // Held only while the run before still
-                                // plays at the new start: its end judged by
-                                // the start's time, not this frame's.
+                            // What the run before shows: its own frame
+                            // while playing, the frame held from the run
+                            // before it while restarting.
+                            let (run, start, shows) = match before {
                                 Chart::Playing { run, start } => {
-                                    slot.held.is_some_and(|h| h.run == run)
-                                        && !(ended == run
-                                            && ended_by(
-                                                reader,
-                                                live.words,
-                                                slot.held,
-                                                run,
-                                                chart_due(first, start, ChartAt { now: e, ..at }),
-                                                &mut freed,
-                                            ))
+                                    (run, start, slot.held.is_some_and(|h| h.run == run))
                                 }
-                                Chart::Restarting { hold, .. } => hold,
-                                _ => false,
+                                Chart::Restarting { run, start, hold } => (run, start, hold),
+                                _ => (0, 0, false),
                             };
+                            // Held only while the run before still plays at
+                            // the new start: its end judged by the start's
+                            // time, not this frame's. A fault its peek finds
+                            // loses the movie before the run changes.
+                            let hold = shows
+                                && !(ended == run
+                                    && match ended_by(
+                                        reader,
+                                        live.words,
+                                        slot.held,
+                                        (run, empty),
+                                        chart_due(first, start, ChartAt { now: e, ..at }),
+                                        &mut freed,
+                                    ) {
+                                        Ok(ended) => ended,
+                                        Err(fault) => break 'read (None, Err(fault)),
+                                    });
                             let run = reader.start_run(RUN_WINDOW);
                             wanted = Some(run);
                             Chart::Restarting {

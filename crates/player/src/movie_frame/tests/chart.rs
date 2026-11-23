@@ -479,3 +479,87 @@ fn late_restart_does_not_hold_expired_run() {
     assert!(frame(p.at(1_000_000)), "still playing at the start: held");
     assert!(holds(&p.planes, 2, 1));
 }
+
+/// Runs 1 and 2 of a video starting at 0, 1 s and 2 s: run 1's first
+/// frame drawn at 0, run 2 started at 1 s while run 1 still plays (its
+/// frame held), then run 2's end reported, with `run2` done to its ring
+/// meanwhile and no frame drawn until 2 s.
+fn second_start(run2: impl FnOnce(&mut Play)) -> Play {
+    let mut p = Play::new(&[0, 1_000_000, 2_000_000], i64::MIN);
+    assert!(frame(p.at(0)));
+    assert!(frame(p.at(1_000_000)), "run 1 plays at 1 s: held");
+    assert_eq!(p.a.want.load(Ordering::SeqCst), 2);
+    run2(&mut p);
+    p.a.ended.store(2, Ordering::SeqCst);
+    p
+}
+
+/// The second start then shows nothing until run 3 has a frame, and then
+/// that frame.
+fn holds_nothing_at_the_second_start(mut p: Play) {
+    assert!(!frame(p.at(2_000_000)), "run 2 ended by 2 s, nothing held");
+    assert_eq!(p.a.want.load(Ordering::SeqCst), 3, "restarted");
+    p.publish(3, FIRST, 30);
+    assert!(frame(p.at(2_010_000)));
+    assert!(holds(&p.planes, 2, 30), "run 3's frame");
+}
+
+/// A second start drawn after the run restarted at the first had ended,
+/// its one frame's end passed by the second start's time with no frame
+/// drawn in between, holds nothing: the frame held from run 1 goes. A run
+/// with a frame due after the second start's time was playing then, so
+/// the frame held stays.
+#[test]
+fn a_second_restart_does_not_hold_an_expired_frame() {
+    holds_nothing_at_the_second_start(second_start(|p| p.publish(2, FIRST, 20)));
+    // The control: run 2's ring holds a frame due after 2 s.
+    let mut p = second_start(|p| {
+        p.publish(2, FIRST, 20);
+        p.publish(2, FIRST + 1_500_000, 21);
+    });
+    assert!(frame(p.at(2_000_000)), "run 2 plays at 2 s: held");
+    assert!(holds(&p.planes, 2, 1));
+}
+
+/// A second start drawn after the run restarted at the first was
+/// acknowledged empty (its seek found no frame), with no frame drawn in
+/// between, holds nothing either. A run with no frame and no
+/// acknowledgment may still bring one, so the frame held stays.
+#[test]
+fn a_second_restart_after_an_empty_run_holds_nothing() {
+    holds_nothing_at_the_second_start(second_start(|p| {
+        p.a.empty.store(2, Ordering::SeqCst);
+    }));
+    let mut p = second_start(|_| {});
+    assert!(frame(p.at(2_000_000)), "run 2 not acknowledged: held");
+    assert!(holds(&p.planes, 2, 1));
+}
+
+/// A ring fault the end check at a start finds (a frame of the run whose
+/// stamp does not rise past the one taken) loses the movie and its peer
+/// in that frame (T02), before the run changes: no new run is wanted.
+#[test]
+fn a_fault_found_at_a_start_loses_the_panel() {
+    let peer = Fake::new(16, 8);
+    peer.set(Status::Live);
+    peer.publish(1, FIRST, 4);
+    let mut p = Play::with(
+        videos(&[0, 1_000_000], &[0], 3),
+        i64::MIN,
+        Some(&peer),
+        None,
+    );
+    assert!(frame(p.at(0)));
+    assert_eq!(p.stamp(), Some(FIRST));
+    p.publish(1, FIRST, 2);
+    p.a.ended.store(1, Ordering::SeqCst);
+    let shows = p.at(1_000_000);
+    assert_eq!((shows[2], shows[3]), (MovieShow::Lost, MovieShow::Lost));
+    assert_eq!(p.a.loss(), Some(Loss::Fault));
+    assert_eq!(peer.loss(), Some(Loss::Peer));
+    assert_eq!(
+        (p.m.wakes(), p.a.want.load(Ordering::SeqCst)),
+        (0, 0),
+        "no run wanted"
+    );
+}
