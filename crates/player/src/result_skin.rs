@@ -623,11 +623,19 @@ impl RoomLine {
 
 /// The one release decision, once a replacement plan fits (D13): an
 /// image entry that is not `base` (the shown one) is dropped, its cells
-/// kept; the unshown cached specialization goes too. Returns what is left
-/// and whether the atlases live besides it (`others`, with the entry when
-/// kept) leave room for one more (the S10-09i design's Q3); in
-/// development builds, a build with no room says so.
-fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Others) -> (Images, bool) {
+/// kept; the unshown cached specialization goes too. `merged` is the kept
+/// cells' union with the dropped entry's sheet when the caller computed
+/// it before the take ([`dropped_union`]); otherwise it is made here.
+/// Returns what is left and whether the atlases live besides it
+/// (`others`, with the entry when kept) leave room for one more (the
+/// S10-09i design's Q3); in development builds, a build with no room says
+/// so.
+fn release(
+    images: Images,
+    base: Option<&Arc<ImageEntry>>,
+    others: Others,
+    merged: Option<Sheet>,
+) -> (Images, bool) {
     let Images {
         entry,
         cells,
@@ -641,7 +649,7 @@ fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Others) -> (I
     let cells = match (cells, dropped) {
         (c, None) => c,
         (None, Some(d)) => Some(d.packed.clone()),
-        (Some(c), Some(d)) => c.union(&d.packed).or(Some(c)),
+        (Some(c), Some(d)) => merged.or_else(|| c.union(&d.packed)).or(Some(c)),
     };
     let mut live = others.ids;
     live.extend(entry.as_ref().map(|e| e.pages().id()));
@@ -1019,15 +1027,34 @@ fn ask(check: &dyn Fn() -> bool, site: StepSite) -> bool {
     }
 }
 
+/// The union [`release`] makes of the kept cells `kept` with the sheet of
+/// the slot's entry `entry` when it drops it (it is not `base`), asking
+/// `check`; `None` when there is none to make.
+fn dropped_union(
+    kept: Option<&Sheet>,
+    entry: Option<&Arc<ImageEntry>>,
+    base: Option<&Arc<ImageEntry>>,
+    check: &dyn Fn() -> bool,
+) -> Result<Option<Sheet>, skin_model::AtlasError> {
+    match (kept, entry) {
+        (Some(c), Some(d)) if !base.is_some_and(|b| Arc::ptr_eq(d, b)) => {
+            c.union_checked(&d.packed, check)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The atlas step of `skin` for [`lay_out`] and [`pack`]: the slot's
 /// image entry rebound when it holds the layout's cells, else the plan
 /// packed (D13, "The atlas step").
 ///
 /// The step asks `check` at its start, before each union of an earlier
-/// holding and after the last, through the planning (skin-model asks it
-/// at each phase and batch of work) and once more before it takes the
-/// holdings; a stop at any of these ends it with the slot untouched, the
-/// partial tables dropped here.
+/// holding, inside it and after the last, through the planning
+/// (skin-model asks it at each phase and batch of work), inside the
+/// release's union of the kept cells with the entry it drops, made from
+/// the snapshot, and once more before it takes the holdings; a stop at
+/// any of these ends it with the slot untouched, the partial tables
+/// dropped here.
 ///
 /// The slot's single owner: from [`ResultSkin::slot_for_job`] until the
 /// outcome is collected, only this job's thread locks the slot (the game
@@ -1114,13 +1141,21 @@ fn atlas_step(
                 if ask(check, StepSite::Union) {
                     return Err(stopped());
                 }
-                union = union.and_then(|u| u.union(&b.packed));
+                union = match union.map(|u| u.union_checked(&b.packed, check)) {
+                    Some(Err(_)) => return Err(stopped()),
+                    Some(Ok(u)) => u,
+                    None => None,
+                };
             }
             if let Some(c) = &kept_cells {
                 if ask(check, StepSite::Union) {
                     return Err(stopped());
                 }
-                union = union.and_then(|u| u.union(c));
+                union = match union.map(|u| u.union_checked(c, check)) {
+                    Some(Err(_)) => return Err(stopped()),
+                    Some(Ok(u)) => u,
+                    None => None,
+                };
             }
             if earlier && ask(check, StepSite::UnionEnd) {
                 return Err(stopped());
@@ -1173,6 +1208,16 @@ fn atlas_step(
                     }
                 },
             };
+            // The release's union of the kept cells with the entry it
+            // drops, made here from the snapshot so it asks too.
+            let Ok(merged) = dropped_union(
+                kept_cells.as_ref(),
+                earlier_entry.as_ref(),
+                base.as_ref(),
+                check,
+            ) else {
+                return Err(stopped());
+            };
             // The snapshot goes before the release, so the release's drop
             // of the earlier entry frees its pages before the build.
             drop((earlier_entry, kept_cells));
@@ -1182,7 +1227,7 @@ fn atlas_step(
             // The plan fits: the holdings are taken, and what is not shown
             // goes before the build.
             let images = lock(slot).take().unwrap_or_default();
-            let (images, room) = release(images, base.as_ref(), others);
+            let (images, room) = release(images, base.as_ref(), others, merged);
             #[cfg(all(test, feature = "dev-tools"))]
             tests::released();
             if !room {
@@ -1853,7 +1898,7 @@ impl ResultSkin {
                         );
                     }
                     let images = lock(&slot).take().unwrap_or_default();
-                    let (images, room) = release(images, base.as_ref(), others);
+                    let (images, room) = release(images, base.as_ref(), others, None);
                     if !room {
                         return (None, deps, Some(images), None, ScriptSlot::default());
                     }

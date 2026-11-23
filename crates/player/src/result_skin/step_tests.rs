@@ -1,8 +1,9 @@
 //! The atlas step's checkpoints, run on the test's thread through the
 //! pack with a check the test answers: a stop in the union branch (E18),
 //! the slot unlocked while it plans (E19), one packing per build (E17),
-//! the snapshot gone before the release (E23), and the gap tracker's
-//! dev-only time, scored interval and cycles (E20, E24).
+//! the snapshot gone before the release (E23), the release's union made
+//! and asked before the take (the phase bench's split), and the gap
+//! tracker's dev-only time, scored interval and cycles (E20, E24).
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -124,6 +125,7 @@ impl StopAt {
     }
 }
 
+const UNION_WORK: u8 = 15;
 const UNION: u8 = 17;
 const UNION_END: u8 = 18;
 const TAKE: u8 = 19;
@@ -158,6 +160,8 @@ fn a_stop_in_the_union_branch_keeps_the_earlier_entry() {
     let sites = control.sites.borrow().clone();
     let unions = sites.iter().filter(|&&s| s == UNION).count();
     assert!(unions >= 1, "the union branch ran: {sites:?}");
+    let union_work = sites.iter().filter(|&&s| s == UNION_WORK).count();
+    assert!(union_work >= 2, "the union asked in batches: {sites:?}");
     assert!(
         sites.iter().filter(|&&s| s == PLAN_PLACE_WORK).count() >= 4,
         "placements asked in batches"
@@ -170,6 +174,12 @@ fn a_stop_in_the_union_branch_keeps_the_earlier_entry() {
             "the union",
             UNION,
             u32::try_from(unions).unwrap(),
+            Some(UNION_WORK),
+        ),
+        (
+            "the union's last batch",
+            UNION_WORK,
+            u32::try_from(union_work).unwrap(),
             Some(UNION_END),
         ),
         ("the final checkpoint", PLAN_END, 1, Some(TAKE)),
@@ -212,7 +222,7 @@ fn the_slot_is_unlocked_while_the_union_is_planned() {
     *slot_seen.borrow_mut() = Some(Arc::clone(&slot));
     let check = || {
         let s = gaps::site_now();
-        if matches!(s, 7..=14 | UNION | UNION_END | TAKE) {
+        if matches!(s, 7..=14 | UNION_WORK | UNION | UNION_END | TAKE) {
             let free = slot_seen
                 .borrow()
                 .as_ref()
@@ -228,6 +238,7 @@ fn the_slot_is_unlocked_while_the_union_is_planned() {
         PLAN_RECTS,
         PLAN_PLACE_WORK,
         PLAN_END,
+        UNION_WORK,
         UNION,
         UNION_END,
         TAKE,
@@ -293,6 +304,69 @@ fn the_snapshot_is_gone_before_the_release() {
         "the earlier entry dropped by the release's return"
     );
     drop(witness);
+}
+
+/// The phase bench's split of the release's union: with kept cells and an
+/// earlier entry the release drops, their union is made from the snapshot
+/// between the plan's end and the take, asking in batches there and none
+/// after the take; a stop at its last batch builds nothing and leaves
+/// the entry and the kept cells as they were.
+#[test]
+fn the_releases_union_asks_before_the_take() {
+    let _s = serial();
+    let between = |sites: &[u8]| {
+        let end = sites.iter().rposition(|&s| s == PLAN_END).unwrap();
+        let take = sites.iter().rposition(|&s| s == TAKE).unwrap();
+        let before = sites[end..take]
+            .iter()
+            .filter(|&&s| s == UNION_WORK)
+            .count();
+        let after = sites[take..].iter().filter(|&&s| s == UNION_WORK).count();
+        (before, after)
+    };
+    // The control: no kept cells, no release union.
+    let (_d, p, mut rs) = earlier();
+    let control = StopAt::never();
+    let (out, _slot) = pack_with(&mut rs, &p, view(2), &|| control.ask());
+    assert!(out.is_ok());
+    assert_eq!(between(&control.sites.borrow()), (0, 0), "control");
+    drop(out);
+
+    // Kept cells of 900 cells and the probe's entry dropped.
+    // Of the same folder as the pack's.
+    let kept = |p: &PendingResult| import(p, view(3)).imported.skin.sheet().clone();
+    let (_d, p, mut rs) = earlier();
+    rs.cells = Some(kept(&p));
+    let seen = StopAt::never();
+    let b0 = builds();
+    let (out, slot) = pack_with(&mut rs, &p, view(2), &|| seen.ask());
+    assert!(out.is_ok());
+    assert_eq!(builds(), b0 + 1);
+    let sites = seen.sites.borrow().clone();
+    let (before, after) = between(&sites);
+    assert!(
+        before >= 3,
+        "the release's union asked before the take: {sites:?}"
+    );
+    assert_eq!(after, 0, "no union after the take: {sites:?}");
+    give_back(&mut rs, out, &slot);
+
+    // A stop at its last batch.
+    let (_d, p, mut rs) = earlier();
+    rs.cells = Some(kept(&p));
+    let before_entry = rs.image().map(Arc::clone).unwrap();
+    let cells = format!("{:?}", rs.cells);
+    let last = sites.iter().filter(|&&s| s == UNION_WORK).count();
+    let stop = StopAt::new(UNION_WORK, u32::try_from(last).unwrap(), false);
+    let b0 = builds();
+    let (out, slot) = pack_with(&mut rs, &p, view(2), &|| stop.ask());
+    assert_eq!(stop.stopped.get(), Some(UNION_WORK));
+    assert!(out.is_err(), "stopped");
+    assert_eq!(builds(), b0, "no build");
+    give_back(&mut rs, out, &slot);
+    let after_entry = rs.image().map(Arc::clone).unwrap();
+    assert!(Arc::ptr_eq(&before_entry, &after_entry), "the same entry");
+    assert_eq!(format!("{:?}", rs.cells), cells, "the kept cells");
 }
 
 /// The marks of `tag` since index `from`: (time, job, value).

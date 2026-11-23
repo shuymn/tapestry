@@ -34,7 +34,7 @@ pub const ADMIT: u8 = 20;
 pub const END: u8 = 21;
 
 /// The site names of the marks and of `hold-preload`, by code.
-pub const SITES: [(&str, u8); 22] = [
+pub const SITES: [(&str, u8); 23] = [
     ("Read", 0),
     ("Band", 1),
     ("Trailing", 2),
@@ -50,6 +50,7 @@ pub const SITES: [(&str, u8); 22] = [
     ("PlanRectWork", 12),
     ("PlanPlaceWork", 13),
     ("PlanEnd", 14),
+    ("UnionWork", 15),
     ("StepStart", 16),
     ("Union", 17),
     ("UnionEnd", 18),
