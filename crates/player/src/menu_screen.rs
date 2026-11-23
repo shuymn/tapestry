@@ -408,13 +408,12 @@ pub struct MenuScreen {
     /// one no movie is opened.
     media: Option<Arc<MediaHub>>,
     /// The movies of the screen instance shown or being prepared, with
-    /// their holder and the renderer's part of them.
+    /// their holder and the renderer's part of them, and the newest video
+    /// manifest the BGA job sent, with its BGA generation, which a play
+    /// preparation's set of that generation takes.
     movies: ScreenMovies,
     /// The play preparation whose movies' readiness is awaited, staged.
     movie_wait: Option<u64>,
-    /// The newest video manifest the BGA job sent, with its BGA
-    /// generation: a play preparation's set of that generation takes it.
-    manifest: Option<(u64, crate::bga::Manifest)>,
     /// The BGA generation current when a play preparation was last polled.
     bga_now: u64,
     /// A swap chain's grants in place of the target's (tests: an
@@ -750,7 +749,6 @@ impl MenuScreen {
             media: None,
             movies: ScreenMovies::new(),
             movie_wait: None,
-            manifest: None,
             bga_now: 0,
             #[cfg(all(test, feature = "dev-tools"))]
             grants: None,
@@ -770,6 +768,8 @@ impl MenuScreen {
     /// included): the chart's videos from the manifest of the current BGA
     /// generation, once it is there, and then the movies of `skin` staged,
     /// else of the play skin in use; a start before `boundary` not counted.
+    /// The attempt draws no chart video until its set takes the manifest
+    /// ([`offer_manifest`](Self::offer_manifest)).
     fn open_play_movies(
         &mut self,
         skin: Option<&Arc<SkinBundle>>,
@@ -782,6 +782,8 @@ impl MenuScreen {
             .cloned()
             .or_else(|| self.renderer.installed(ScreenKind::Play).cloned());
         let bga = self.bga_now;
+        self.renderer
+            .set_chart_videos(skin_model::bga::ChartVideos::default());
         self.movies
             .open(Holder::Preparing(request), &mut self.renderer, || {
                 let mut set = MovieSet::play(
@@ -816,12 +818,13 @@ impl MenuScreen {
         chart && settled
     }
 
-    /// The play preparation's set waiting for the manifest held takes it.
+    /// The play preparation's set waiting for the manifest held takes it,
+    /// and the attempt's play, in the skin in use and the one staged, draws
+    /// its chart videos from the slots it names (design.md "Rendering and
+    /// Skins", BGA).
     fn offer_manifest(&mut self) {
-        if let (Some((Holder::Preparing(_), set)), Some((generation, manifest))) =
-            (self.movies.get_mut(), &self.manifest)
-        {
-            set.chart(*generation, Some(manifest));
+        if let Some(videos) = self.movies.offer() {
+            self.renderer.set_chart_videos((*videos).clone());
         }
     }
 
@@ -1558,8 +1561,11 @@ impl Screen for MenuScreen {
         self.renderer.published_bga(key)
     }
 
+    /// The chart is left: its array goes, and the manifest kept with it,
+    /// its files closed.
     fn drop_bga(&mut self) {
         self.renderer.drop_bga();
+        self.movies.forget_manifest();
     }
 
     fn write_result_chart(
@@ -2287,7 +2293,7 @@ impl Screen for MenuScreen {
     }
 
     fn chart_manifest(&mut self, generation: u64, manifest: crate::bga::Manifest) {
-        self.manifest = Some((generation, manifest));
+        self.movies.keep_manifest(generation, manifest);
         self.offer_manifest();
     }
 

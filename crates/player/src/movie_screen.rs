@@ -38,9 +38,13 @@
 //! declaration order, and the pixel total's, takes the chart's first
 //! (design.md "Rendering and Skins", skin movies and BGA). The manifest
 //! belongs to the BGA generation the preparation began in: one of another
-//! generation is not taken. Past the set's preparation deadline with no
-//! manifest, the skin's movies are opened alone and the chart's videos are
-//! absent.
+//! generation is not taken. A manifest that has not come within
+//! [`MANIFEST_WAIT`] of the preparation's start is not waited for: the
+//! skin's movies are opened alone, with the rest of the preparation's
+//! deadline to stage their first frames, and the chart's videos are
+//! absent. The screen keeps the latest manifest for a set of its
+//! generation opened later, until a committed set of that generation is
+//! retired ([`ScreenMovies::retire`]) or a newer manifest replaces it.
 //!
 //! None of this waits on the session: entering stores a word and an open
 //! only queues a request.
@@ -59,6 +63,13 @@ use skin_model::movie::{CHART_SLOTS, MAX_MOVIES};
 use crate::media_host::launch::Setup;
 use crate::media_host::session::{Deadlines, Launching, Loss, Movie, Session};
 use crate::movie_frame::Movies;
+
+/// How long a play's set waits for the attempt's video manifest from its
+/// preparation's start: half the preparation deadline
+/// ([`PREPARATION`](crate::media_host::session::PREPARATION)), so the skin's
+/// movies, opened alone past it, still have the other half to stage their
+/// first frames (design.md "Load Pipeline", movies at READY).
+pub const MANIFEST_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 /// The run's media session, made when a screen first needs it.
 pub struct MediaHub {
@@ -203,6 +214,8 @@ pub struct MovieSet {
     /// a frame of another (a later Start's) shows none of them.
     pub loading: Option<u64>,
     pub movies: Movies,
+    /// A play's: the BGA generation its preparation began in.
+    bga: Option<u64>,
     /// A play's, until its manifest is taken: what it waits for.
     awaiting: Option<Awaiting>,
 }
@@ -217,6 +230,8 @@ struct Awaiting {
     /// The attempt's boundary: a start before it is not counted
     /// ([`Movies::set_chart`]).
     boundary: i64,
+    /// Until when the manifest is waited for ([`MANIFEST_WAIT`]).
+    by: Instant,
 }
 
 impl MovieSet {
@@ -255,10 +270,12 @@ impl MovieSet {
         start: Instant,
     ) -> Self {
         let mut set = Self::entered(hub, ScreenKind::Play, start);
+        set.bga = Some(bga);
         set.awaiting = Some(Awaiting {
             bga,
             bundle,
             boundary,
+            by: start + MANIFEST_WAIT,
         });
         set
     }
@@ -279,6 +296,7 @@ impl MovieSet {
             generation,
             loading: None,
             movies,
+            bga: None,
             awaiting: None,
         }
     }
@@ -325,32 +343,36 @@ impl MovieSet {
     }
 
     /// The BGA generation whose manifest a play's set waits for, if it
-    /// waits.
+    /// waits (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn awaits(&self) -> Option<u64> {
         self.awaiting.as_ref().map(|a| a.bga)
     }
 
-    /// Takes `manifest`, BGA generation `bga`'s (`None`: none came by the
-    /// set's preparation deadline), unless the set waits for another
-    /// generation's or none: its chart videos are opened in the chart's
-    /// slots, not looping, each from a duplicate of the manifest's handle,
-    /// and then the skin's movies, so the session declares the chart's
-    /// first. A file whose handle cannot be duplicated is absent.
-    pub fn chart(&mut self, bga: u64, manifest: Option<&crate::bga::Manifest>) {
-        let Some(awaiting) = self.awaiting.take_if(|a| a.bga == bga) else {
-            return;
-        };
-        let Some(hub) = self.hub.upgrade() else {
-            return;
-        };
-        if let Some(manifest) = manifest {
+    /// Takes `manifest`, BGA generation `bga`'s (`None`: none came within
+    /// [`MANIFEST_WAIT`]), unless the set waits for another generation's or
+    /// none: its chart videos are opened in the chart's slots, not
+    /// looping, each from a duplicate of the manifest's handle, and then
+    /// the skin's movies, so the session declares the chart's first. A file
+    /// whose handle cannot be duplicated is absent. The chart's videos it
+    /// took, which the attempt's play draws.
+    pub fn chart(
+        &mut self,
+        bga: u64,
+        manifest: Option<&crate::bga::Manifest>,
+    ) -> Option<Arc<skin_model::bga::ChartVideos>> {
+        let awaiting = self.awaiting.take_if(|a| a.bga == bga)?;
+        let hub = self.hub.upgrade()?;
+        let taken = manifest.map(|manifest| {
             self.movies
                 .set_chart(Arc::clone(&manifest.videos), awaiting.boundary);
             self.open_chart(&hub, manifest);
-        }
+            Arc::clone(&manifest.videos)
+        });
         if let Some(bundle) = &awaiting.bundle {
             self.open_skin(&hub, bundle);
         }
+        taken
     }
 
     /// Opens `manifest`'s chart videos in the chart's slots.
@@ -380,15 +402,25 @@ impl MovieSet {
         }
     }
 
-    /// Past its preparation deadline at `now` with no manifest taken, a
-    /// play's set opens its skin's movies alone: the chart's videos are
-    /// absent. Whether its manifest is settled.
+    /// Past [`MANIFEST_WAIT`] at `now` with no manifest taken, a play's set
+    /// opens its skin's movies alone, with the rest of the preparation's
+    /// deadline to stage them: the chart's videos are absent. Whether its
+    /// manifest is settled.
     pub fn settle_chart(&mut self, now: Instant) -> bool {
-        if let Some(bga) = self.awaits()
-            && now >= self.movies.deadline()
+        if let Some(a) = &self.awaiting
+            && now >= a.by
         {
-            log::warn!("chart videos: no manifest by the preparation deadline; they are absent");
-            self.chart(bga, None);
+            let bga = a.bga;
+            log::warn!(
+                "chart videos: no manifest within {} ms of the preparation's start; they are absent and the skin's movies open alone",
+                MANIFEST_WAIT.as_millis()
+            );
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark(
+                "movies:manifest_missed_ms",
+                i64::try_from(MANIFEST_WAIT.as_millis()).unwrap_or(i64::MAX),
+            );
+            let _ = self.chart(bga, None);
         }
         self.awaiting.is_none()
     }
@@ -409,6 +441,7 @@ impl MovieSet {
             generation: hub.next_generation(),
             loading: None,
             movies: Movies::skin(movies, start),
+            bga: None,
             awaiting: None,
         }
     }
@@ -488,15 +521,49 @@ impl Holder {
 }
 
 /// The movies of the screen instance shown or being prepared, with their
-/// holder; the renderer's part of them goes with them.
+/// holder; the renderer's part of them goes with them. It also keeps the
+/// latest video manifest, by its BGA generation, for a play's set of that
+/// generation, whichever comes first.
 pub struct ScreenMovies {
     held: Option<(Holder, MovieSet)>,
+    manifest: Option<(u64, crate::bga::Manifest)>,
 }
 
 impl ScreenMovies {
     /// None held.
     pub const fn new() -> Self {
-        Self { held: None }
+        Self {
+            held: None,
+            manifest: None,
+        }
+    }
+
+    /// Keeps `manifest`, BGA generation `generation`'s, in place of the one
+    /// kept before (its files closed), for [`offer`](Self::offer).
+    pub fn keep_manifest(&mut self, generation: u64, manifest: crate::bga::Manifest) {
+        self.manifest = Some((generation, manifest));
+    }
+
+    /// The play preparation's set held, waiting for the manifest kept,
+    /// takes it ([`MovieSet::chart`]): the chart's videos it took.
+    pub fn offer(&mut self) -> Option<Arc<skin_model::bga::ChartVideos>> {
+        let (Some((Holder::Preparing(_), set)), Some((generation, manifest))) =
+            (&mut self.held, &self.manifest)
+        else {
+            return None;
+        };
+        set.chart(*generation, Some(manifest))
+    }
+
+    /// The chart is left: the manifest kept goes, its files closed.
+    pub fn forget_manifest(&mut self) {
+        self.manifest = None;
+    }
+
+    /// Whether a manifest is kept (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn keeps_manifest(&self) -> bool {
+        self.manifest.is_some()
     }
 
     /// The set held and its holder.
@@ -512,11 +579,23 @@ impl ScreenMovies {
     /// Its screen instance ends: the set is dropped (its generation left,
     /// its players closed), and `renderer` releases every slot's planes
     /// and shows no movie in its loading frames or play builds. The one
-    /// place a set is let go while its renderer lives.
+    /// place a set is let go while its renderer lives. A committed play's
+    /// set takes the manifest kept for its BGA generation with it, its
+    /// files closed: the next attempt is a new generation, with a manifest
+    /// of its own. A preparation's, cancelled before its commit, leaves it
+    /// for the next preparation of the same generation, which reads
+    /// nothing again.
     pub fn retire(&mut self, renderer: &mut Renderer) {
-        if self.held.take().is_some() {
-            renderer.retire_movies();
+        let Some((holder, set)) = self.held.take() else {
+            return;
+        };
+        if !matches!(holder, Holder::Preparing(_))
+            && let Some(bga) = set.bga
+        {
+            self.manifest.take_if(|(g, _)| *g == bga);
         }
+        drop(set);
+        renderer.retire_movies();
     }
 
     /// The set held retired, then `open`'s held for `holder`, opened once
