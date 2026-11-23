@@ -2705,7 +2705,8 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 
 /// The play snapshot of a `skin_lua` input's first two bytes: autoplay
 /// unavailable, off, on or pending by `a` modulo 4, on a result scene
-/// showing [`result_view`] for 255; the play level unavailable, pending,
+/// showing [`result_view`] for 255, its attempt inputs known, or pending
+/// as in the startup probe when `r`'s bit 4 is set; the play level unavailable, pending,
 /// or `a / 16` (twice) by `a / 4` modulo 4; the chart's judgment class
 /// unavailable, pending, or known by `r`'s low two bits, the rest choosing
 /// one of the five classes or none; the chart's gauge total and note
@@ -2744,11 +2745,20 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
         _ => Fact::Known(i32::from(a >> 4)),
     };
     // On a result scene, a ready view whose best has no BP: every result
-    // read answers, the hidden ones as `i32::MIN`.
-    let result = if scene == ScreenKind::Result {
-        Fact::Known(skin_model::ResultFields::of(&result_view(true)))
+    // read answers, the hidden ones as `i32::MIN`. Its attempt inputs are
+    // known, or pending as in the startup probe.
+    let (result, result_inputs) = if scene == ScreenKind::Result {
+        let inputs = if r & 0x10 == 0 {
+            Fact::Known(())
+        } else {
+            Fact::Pending
+        };
+        (
+            Fact::Known(skin_model::ResultFields::of(&result_view(true))),
+            inputs,
+        )
     } else {
-        Fact::Unavailable
+        (Fact::Unavailable, Fact::Unavailable)
     };
     let notes = i32::from(r & 0x1f) * 41;
     let (total, chart_notes) = match r >> 5 {
@@ -2763,6 +2773,7 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
         judge_class,
         play_level,
         result,
+        result_inputs,
         total,
         chart_notes,
     }
