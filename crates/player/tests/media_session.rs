@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use media_support::media_host::EXIT_HUNG;
 use media_support::media_host::launch::Launches;
 use media_support::media_host::session::{
-    Deadlines, Event, Launching, Loss, Movie, PREPARATION, Session, Status, Waker,
+    Deadlines, Event, Held, Launching, Loss, Movie, PREPARATION, Session, Status, Waker,
 };
 use media_support::{Made, Stage, Step, WORKER, read_tight, recipe};
 use skin_model::media::{self, Frame, Reader, State, Window};
@@ -78,6 +78,13 @@ impl Rig {
 
     /// A session whose worker is passed `args`.
     fn with_args(args: &[&str]) -> Self {
+        Self::starting(args, |launching| {
+            Session::start(launching, Deadlines::GAME).unwrap()
+        })
+    }
+
+    /// A session whose worker is passed `args`, started by `start`.
+    fn starting(args: &[&str], start: impl FnOnce(Launching) -> Session) -> Self {
         let stage = Stage::new();
         let clips = tempfile::Builder::new()
             .prefix("media-session-")
@@ -100,7 +107,7 @@ impl Rig {
             data: stage.data().to_owned(),
             setup: recipe().in_profile(stage.profile()).args_of(args),
         };
-        let session = Session::start(launching, Deadlines::GAME).unwrap();
+        let session = start(launching);
         Self {
             session,
             clip,
@@ -1407,6 +1414,103 @@ fn a_peer_closed_when_its_worker_is_terminated_is_not_struck() {
 
     // The control: the worker crashes while the peer's close is unread.
     peer_struck_when_its_worker_ends_with(1);
+}
+
+/// What lets a session held at a held point go: a held turn waits on it
+/// without parking its thread, whose wake a channel's wait would take.
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Gate {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    /// Waits up to 10 s for the gate to open, and closes it again.
+    fn pass(&self) {
+        let open = self.open.lock().unwrap();
+        let (mut open, _) = self
+            .opened
+            .wait_timeout_while(open, Duration::from_secs(10), |o| !*o)
+            .unwrap();
+        *open = false;
+    }
+}
+
+/// A peer the game loses after the session has judged its players and
+/// before it ends their marked worker is closed before the termination,
+/// and so not struck. As in the test above, player 1's seek is never
+/// answered and player 1 is lost for it, the worker marked; the session is
+/// then held at its next judgement, its peer still live, while the game
+/// loses the peer, so that the same look finds nothing live and ends the
+/// worker. Twice over, the frozen player's file is struck and its peer's
+/// is not: the third attempt refuses the first and plays the second.
+// Covers: T02
+#[test]
+fn a_peer_lost_as_its_worker_is_ended_is_not_struck() {
+    let armed = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Gate::default());
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let rig = {
+        let (armed, gate) = (Arc::clone(&armed), Arc::clone(&gate));
+        Rig::starting(&["--dev-serve", "freeze=1:waiting", "deaf=5"], move |l| {
+            Session::start_held(l, Deadlines::GAME, move |at| {
+                if at == Held::Judged && armed.swap(false, Ordering::AcqRel) {
+                    let _ = held_tx.send(());
+                    gate.pass();
+                }
+            })
+            .unwrap()
+        })
+    };
+    let waker = rig.session.waker();
+    let reaped = || rig.count(|e| matches!(e, Event::Reaped { .. }));
+    for generation in 1..=2 {
+        rig.session.enter(generation);
+        let (frozen, peer) = (Movie::new(generation), Movie::new(generation));
+        rig.open_as(&frozen, "a.mpg", true);
+        rig.open_as(&peer, "b.mpg", true);
+        for m in [&frozen, &peer] {
+            until(LAUNCH, || m.status() == Status::Live)
+                .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+        }
+        let words = frozen.live().unwrap().ring.words();
+        until(Duration::from_secs(5), || {
+            media::supervision(words).is_some_and(|(_, s)| s == Some(State::Waiting))
+                && media::watermark(words) == Some(u64::try_from(media::SLOTS).unwrap())
+        })
+        .expect("player 1 never filled its ring");
+        frozen.want(2);
+        waker.wake();
+        lost(&frozen, Duration::from_secs(5)).expect("no loss within 5 s");
+        assert_eq!(frozen.loss(), Some(Loss::Answer));
+        // Held at the next judgement, the peer live through it.
+        armed.store(true, Ordering::Release);
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the session never judged");
+        assert_eq!(peer.status(), Status::Live);
+        peer.lose(Loss::Peer);
+        gate.open();
+        let n = usize::try_from(generation).unwrap();
+        until(Duration::from_secs(5), || reaped() >= n)
+            .unwrap_or_else(|| panic!("not reaped: {:?}", rig.session.events()));
+    }
+    rig.session.enter(3);
+    let again = [Movie::new(3), Movie::new(3)];
+    rig.open_as(&again[0], "a.mpg", true);
+    rig.open_as(&again[1], "b.mpg", true);
+    assert!(lost(&again[0], LAUNCH).is_some(), "{:?}", again[0].status());
+    assert_eq!(again[0].loss(), Some(Loss::Struck));
+    until(LAUNCH, || again[1].status() != Status::Pending).expect("never settled");
+    assert_eq!(
+        (again[1].status(), again[1].loss()),
+        (Status::Live, None),
+        "struck?"
+    );
 }
 
 /// A peer closed while its worker ends on its own, with the very code the

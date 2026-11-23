@@ -19,7 +19,8 @@
 //!   within [`Deadlines::answer`] of its own command's write, a close within
 //!   [`Deadlines::close`], loses that player's video; an answer that
 //!   arrives later, by the reader's stamp, counts as none. The worker,
-//!   marked, is terminated once no player of it is live. A result moves a
+//!   marked, is terminated once no player of it is live, each player not
+//!   closing yet closed first. A result moves a
 //!   player only when it echoes the command the player waits on
 //!   ([`super::movie::answer`]), and a player goes when the worker's
 //!   tracker frees its id.
@@ -465,6 +466,30 @@ impl Session {
     ///
     /// When its thread does not start.
     pub fn start(launching: Launching, deadlines: Deadlines) -> std::io::Result<Self> {
+        Self::spawn(launching, deadlines, |_| {})
+    }
+
+    /// Starts the session as [`Self::start`] does, `turn` run at each of
+    /// its turns' held points (tests).
+    ///
+    /// # Errors
+    ///
+    /// When its thread does not start.
+    #[cfg(test)]
+    pub fn start_held(
+        launching: Launching,
+        deadlines: Deadlines,
+        turn: impl FnMut(Held) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::spawn(launching, deadlines, move |s| s.turn = Some(Box::new(turn)))
+    }
+
+    /// Starts the session's thread, its supervisor first given to `set`.
+    fn spawn(
+        launching: Launching,
+        deadlines: Deadlines,
+        set: impl FnOnce(&mut Supervisor) + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(REQUESTS);
         let shared = Arc::new(Shared {
             generation: AtomicU64::new(0),
@@ -484,7 +509,11 @@ impl Session {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("media session".to_owned())
-                .spawn(move || Supervisor::new(launching, deadlines, shared).run(&rx))?
+                .spawn(move || {
+                    let mut supervisor = Supervisor::new(launching, deadlines, shared);
+                    set(&mut supervisor);
+                    supervisor.run(&rx);
+                })?
                 .thread()
                 .clone()
         };
@@ -776,9 +805,12 @@ struct Supervisor {
 /// Where a test holds the session's turn.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Held {
+pub enum Held {
     /// The requests are taken; the session has not read its end.
     Taken,
+    /// The look has judged the players' deadlines and not yet ended a
+    /// marked worker with nothing live.
+    Judged,
     /// The session has looked and not slept yet.
     Looked,
 }
@@ -947,7 +979,23 @@ impl Supervisor {
             return;
         }
         self.judge(generation, now, settled);
+        #[cfg(test)]
+        if let Some(turn) = &mut self.turn {
+            turn(Held::Judged);
+        }
         if self.marked && !self.players.iter().any(Player::live) {
+            // A player lost since the judgement (a peer the game lost
+            // meanwhile) is closed before the termination, so its file is
+            // spared as any closed for its peer's loss.
+            for i in 0..self.players.len() {
+                let open = self.players.get(i).is_some_and(|p| {
+                    !matches!(p.stage, Stage::Closing(_) | Stage::Idle | Stage::Queued)
+                });
+                if open && let Err(why) = self.close(i) {
+                    self.fail_worker(why);
+                    return;
+                }
+            }
             self.fail_worker(Loss::Answer);
         }
     }
