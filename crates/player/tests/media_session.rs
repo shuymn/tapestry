@@ -1233,11 +1233,15 @@ fn seeks_through_the_real_worker() {
     // Past the end: no landing, then the end.
     movie.seek_from(10_000_000);
     let past = runs.start(&waker);
+    // Its end recorded: the session takes the ended run, then records it,
+    // so the events are compared once the last of them is there.
     assert!(
-        until(Duration::from_secs(3), || movie.ended() == past).is_some(),
+        rig.event(Duration::from_secs(3), |e| *e == Event::Ended { run: past })
+            .is_some(),
         "{:?}",
         rig.session.events()
     );
+    assert_eq!(movie.ended(), past);
     // Every seek answered, and each run's end taken only after its answer.
     let answers: Vec<_> = rig
         .session

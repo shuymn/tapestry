@@ -25,10 +25,10 @@
 //!   tracker frees its id.
 //! - **Seeks**: the render side writes the newest run it wants sought into
 //!   its video's want word ([`Movie::want`]) and wakes the session
-//!   ([`Waker`]), so a seek starts without waiting for the tick. A wake is
-//!   one token: it puts a request in the session's queue only when none is
-//!   pending, so wakes hold at most one of the queue's places and never
-//!   crowd out an open or the session's end. A live player has at most one
+//!   ([`Waker`]), so a seek starts without waiting for the tick. A wake
+//!   unparks the session's thread, apart from its request queue, which
+//!   holds opens alone: a wake never crowds out an open, and one that comes
+//!   while the session looks ends its next sleep at once. A live player has at most one
 //!   seek in flight, for the newest run wanted, from the clip's start;
 //!   wants made meanwhile are coalesced and the newest sought once it is
 //!   answered. An end the worker reports for the newest run whose seek was
@@ -54,6 +54,9 @@
 //! (another launch staging its copies) holds neither the game nor the
 //! session.
 //!
+//! The session's end, the game's handle dropped, loses every video it holds
+//! and every open its queue still holds, none of them launched.
+//!
 //! Each video's [`Movie`] is shared with the game: the session moves it
 //! from pending to absent (refused at its probe), live (its ring set up)
 //! or lost; lost is for good, whatever comes later. The screen that asked
@@ -67,8 +70,9 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 use skin_model::media::control::{Command, Matrix, Range, Reply};
@@ -119,7 +123,7 @@ pub const PREPARATION: Duration = Duration::from_secs(3);
 /// The most players the session holds in a worker at once: the worker's.
 const PLAYERS: u8 = 8;
 
-/// The requests the session's queue holds.
+/// The requests the session's queue holds: opens alone.
 const REQUESTS: usize = 32;
 
 use super::movie::{Cell, Outcome, Stage, Then};
@@ -359,10 +363,6 @@ enum Request {
         file: std::fs::File,
         looping: bool,
     },
-    /// Look now: a video wants a seek.
-    Wake,
-    /// End the session.
-    Quit,
     /// Fill the worker's command pipe with `len` bytes written apart from
     /// the writer, so the writer's next command waits (a test's).
     #[cfg(test)]
@@ -416,11 +416,8 @@ struct Shared {
     pid: AtomicU32,
     /// Videos the game's hand-offs lost (L1), for the session to log.
     queue_lost: AtomicU32,
-    /// A wake is pending: its request is in the queue, or a full queue
-    /// holds requests the session takes before it looks.
-    wake: AtomicBool,
     /// The game's handle has gone: the session ends at its next turn,
-    /// whatever the queue holds and whoever holds a [`Waker`].
+    /// whoever holds a [`Waker`].
     quit: AtomicBool,
     /// The worker's writer's account of its writes (tests).
     #[cfg(test)]
@@ -456,6 +453,8 @@ macro_rules! event {
 pub struct Session {
     tx: SyncSender<Request>,
     shared: Arc<Shared>,
+    /// The session's thread, unparked by each request and wake.
+    thread: Thread,
 }
 
 impl Session {
@@ -471,7 +470,6 @@ impl Session {
             generation: AtomicU64::new(0),
             pid: AtomicU32::new(0),
             queue_lost: AtomicU32::new(0),
-            wake: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             #[cfg(test)]
             transport: Mutex::new(None),
@@ -482,13 +480,15 @@ impl Session {
             #[cfg(test)]
             beats: Mutex::new(Vec::new()),
         });
-        {
+        let thread = {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("media session".to_owned())
-                .spawn(move || Supervisor::new(launching, deadlines, shared).run(&rx))?;
-        }
-        Ok(Self { tx, shared })
+                .spawn(move || Supervisor::new(launching, deadlines, shared).run(&rx))?
+                .thread()
+                .clone()
+        };
+        Ok(Self { tx, shared, thread })
     }
 
     /// Shows the screen of `generation`: the videos of other generations
@@ -507,11 +507,13 @@ impl Session {
             file,
             looping,
         };
-        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-            self.tx.try_send(request)
-            && movie.lose(Loss::Queue)
-        {
-            self.shared.queue_lost.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(request) {
+            Ok(()) => self.thread.unpark(),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                if movie.lose(Loss::Queue) {
+                    self.shared.queue_lost.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -524,8 +526,7 @@ impl Session {
     /// a seek.
     pub fn waker(&self) -> Waker {
         Waker {
-            tx: self.tx.clone(),
-            shared: Arc::clone(&self.shared),
+            session: self.thread.clone(),
         }
     }
 
@@ -559,7 +560,9 @@ impl Session {
     /// while the worker reads nothing.
     #[cfg(test)]
     pub fn stuff(&self, len: usize) {
-        let _ = self.tx.try_send(Request::Stuff(len));
+        if self.tx.try_send(Request::Stuff(len)).is_ok() {
+            self.thread.unpark();
+        }
     }
 
     /// What the session did so far.
@@ -575,34 +578,28 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // The flag ends the session even when the queue has no room for
-        // the request, which only has it end sooner.
+        // The flag ends the session at its next turn, which the unpark
+        // starts at once.
         self.shared.quit.store(true, Ordering::Release);
-        let _ = self.tx.try_send(Request::Quit);
+        self.thread.unpark();
     }
 }
 
-/// Wakes the session: a sender of its request queue and its wake token.
+/// Wakes the session: its thread, unparked apart from the request queue.
 /// Holding one keeps no session alive: dropping the game's handle ends it.
 #[derive(Clone)]
 pub struct Waker {
-    tx: SyncSender<Request>,
-    shared: Arc<Shared>,
+    session: Thread,
 }
 
 impl Waker {
-    /// Asks the session to look now, never waiting and allocating nothing
-    /// (the queue's places are allocated with it). Only the first wake
-    /// since the session took the last one sends a request, so wakes hold
-    /// at most one place of the queue; when the queue is full, its
-    /// requests have the session look anyway, and the token is given back.
+    /// Asks the session to look now, never waiting and allocating nothing:
+    /// it unparks the session's thread, so wakes take no place of the
+    /// request queue. Wakes coalesce into the thread's one token: a wake
+    /// while the session looks ends its next sleep at once, so a want
+    /// stored before the wake is read by a look after it.
     pub fn wake(&self) {
-        if self.shared.wake.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if self.tx.try_send(Request::Wake).is_err() {
-            self.shared.wake.store(false, Ordering::Release);
-        }
+        self.session.unpark();
     }
 }
 
@@ -771,6 +768,19 @@ struct Supervisor {
     /// The commands sent with no worker (tests).
     #[cfg(test)]
     sent: Vec<Command>,
+    /// Runs at each turn's held points (a test's).
+    #[cfg(test)]
+    turn: Option<Box<dyn FnMut(Held) + Send>>,
+}
+
+/// Where a test holds the session's turn.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// The requests are taken; the session has not read its end.
+    Taken,
+    /// The session has looked and not slept yet.
+    Looked,
 }
 
 impl Supervisor {
@@ -795,52 +805,58 @@ impl Supervisor {
             ring_fails: false,
             #[cfg(test)]
             sent: Vec::new(),
+            #[cfg(test)]
+            turn: None,
         }
     }
 
     fn run(mut self, rx: &Receiver<Request>) {
         loop {
-            let first = match rx.recv_timeout(self.deadlines.tick) {
-                Ok(request) => Some(request),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
             // The requests waiting before the look, at most a queue's
             // worth, so no sender keeps the session from looking.
-            let waiting = std::iter::from_fn(|| rx.try_recv().ok()).take(REQUESTS);
-            let mut quit = false;
-            for request in first.into_iter().chain(waiting) {
-                quit |= self.request(request);
+            let mut gone = false;
+            for _ in 0..REQUESTS {
+                match rx.try_recv() {
+                    Ok(request) => self.request(request),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        gone = true;
+                        break;
+                    }
+                }
             }
-            if quit || self.shared.quit.load(Ordering::Acquire) {
+            #[cfg(test)]
+            if let Some(turn) = &mut self.turn {
+                turn(Held::Taken);
+            }
+            if gone || self.shared.quit.load(Ordering::Acquire) {
                 break;
             }
             self.look();
             self.note_losses();
+            #[cfg(test)]
+            if let Some(turn) = &mut self.turn {
+                turn(Held::Looked);
+            }
+            // Until a request, a wake or the end unparks the thread, or the
+            // tick: one that came since the last sleep ends this one at
+            // once, so none is lost.
+            std::thread::park_timeout(self.deadlines.tick);
         }
-        self.quit();
+        self.quit(rx);
     }
 
-    /// Takes `request`: whether it ends the session.
-    fn request(&mut self, request: Request) -> bool {
+    /// Takes `request`.
+    fn request(&mut self, request: Request) {
         match request {
             Request::Open {
                 movie,
                 file,
                 looping,
             } => self.queue(movie, file, looping),
-            // The token is taken back before the look reads the wants (a
-            // read-modify-write, so it sees every want stored before a
-            // wake that found the token taken): a want stored after that
-            // read wakes the session again.
-            Request::Wake => {
-                self.shared.wake.swap(false, Ordering::AcqRel);
-            }
             #[cfg(test)]
             Request::Stuff(len) => self.stuff(len),
-            Request::Quit => return true,
         }
-        false
     }
 
     /// Writes `len` bytes on the worker's command pipe from a thread of its
@@ -1626,11 +1642,22 @@ impl Supervisor {
         }
     }
 
-    /// Ends the session: every video lost, the workers dropped (their jobs
-    /// end after a grace, without waiting).
-    fn quit(&mut self) {
+    /// Ends the session: every video lost, those of the opens `rx` still
+    /// holds included, none launched; the workers dropped (their jobs end
+    /// after a grace, without waiting). The game's handle is gone, so no
+    /// open comes after the ones `rx` holds.
+    fn quit(&mut self, rx: &Receiver<Request>) {
         for p in &self.players {
             p.movie.lose(Loss::Ended);
+        }
+        while let Ok(request) = rx.try_recv() {
+            match request {
+                Request::Open { movie, .. } => {
+                    movie.lose(Loss::Ended);
+                }
+                #[cfg(test)]
+                Request::Stuff(_) => {}
+            }
         }
         self.players.clear();
         self.worker = None;
@@ -1705,7 +1732,6 @@ pub fn preparation_deadline(start: Instant) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::TryRecvError;
 
     const LIMIT: Duration = Deadlines::GAME.progress;
 
@@ -1730,7 +1756,6 @@ mod tests {
             generation: AtomicU64::new(generation),
             pid: AtomicU32::new(0),
             queue_lost: AtomicU32::new(0),
-            wake: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             transport: Mutex::new(None),
             events: Mutex::new(Vec::new()),
@@ -2049,67 +2074,193 @@ mod tests {
         }
     }
 
-    /// Wakes take one place of the request queue at most, however many
-    /// come before the session takes one: an open and the session's end
-    /// still find room, and nothing is lost at the hand-off.
+    /// A file to hand the session.
+    fn file() -> std::fs::File {
+        std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap()
+    }
+
+    /// The session `s` on a thread of its own, which starts its turns once
+    /// `before` has used the game's handle: the handle, and the thread.
+    fn started(
+        s: Supervisor,
+        before: impl FnOnce(&Session),
+    ) -> (Session, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel(REQUESTS);
+        let (go, gone) = mpsc::channel::<()>();
+        let shared = Arc::clone(&s.shared);
+        let thread = std::thread::spawn(move || {
+            if gone.recv().is_ok() {
+                s.run(&rx);
+            }
+        });
+        let session = Session {
+            tx,
+            shared,
+            thread: thread.thread().clone(),
+        };
+        before(&session);
+        go.send(()).unwrap();
+        (session, thread)
+    }
+
+    /// What lets a held turn go. A turn waits on it without parking its
+    /// thread: a channel's wait parks it, and would take the wake a test
+    /// makes meanwhile.
+    #[derive(Default)]
+    struct Gate {
+        /// The turns let go and not taken yet, `u32::MAX` for all.
+        passes: Mutex<u32>,
+        opened: std::sync::Condvar,
+    }
+
+    impl Gate {
+        /// Lets the next held turn go.
+        fn open(&self) {
+            let mut passes = self.passes.lock().unwrap();
+            *passes = passes.saturating_add(1);
+            self.opened.notify_all();
+        }
+
+        /// Lets every held turn go from now on.
+        fn open_all(&self) {
+            *self.passes.lock().unwrap() = u32::MAX;
+            self.opened.notify_all();
+        }
+
+        /// Waits until a held turn may go, up to 10 s, and takes its pass.
+        fn pass(&self) {
+            let passes = self.passes.lock().unwrap();
+            let (mut passes, _) = self
+                .opened
+                .wait_timeout_while(passes, Duration::from_secs(10), |n| *n == 0)
+                .unwrap();
+            if *passes != u32::MAX {
+                *passes = passes.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Has `s` report each of its turns' held points `at` to the receiver
+    /// returned and wait there until the gate returned lets it go. At
+    /// [`Held::Looked`] it first takes any wake left from before, so the
+    /// next turn comes only from a wake made while it is held.
+    fn hold_at(s: &mut Supervisor, at: Held) -> (Receiver<()>, Arc<Gate>) {
+        let (turned, turns) = mpsc::channel();
+        let gate = Arc::new(Gate::default());
+        let held_by = Arc::clone(&gate);
+        s.turn = Some(Box::new(move |held| {
+            if held != at {
+                return;
+            }
+            if held == Held::Looked {
+                std::thread::park_timeout(Duration::ZERO);
+            }
+            let _ = turned.send(());
+            held_by.pass();
+        }));
+        (turns, gate)
+    }
+
+    /// Wakes take no place of the request queue: however many come, a
+    /// queue's worth of opens all find room and nothing is lost at the
+    /// hand-off.
     // Covers: T02
     #[test]
-    fn wakes_leave_room_for_open_and_shutdown() {
+    fn wakes_never_crowd_out_an_open() {
         let (tx, rx) = mpsc::sync_channel(REQUESTS);
         let session = Session {
             tx,
             shared: supervisor(1).shared,
+            thread: std::thread::current(),
         };
         let waker = session.waker();
         for _ in 0..REQUESTS {
             waker.wake();
         }
-        let movie = Movie::new(1);
-        let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
-        session.open(&movie, file, false);
+        let movies: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                let movie = Movie::new(1);
+                session.open(&movie, file(), false);
+                movie
+            })
+            .collect();
+        let lost = movies.iter().filter(|m| m.loss().is_some()).count();
+        let opens = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|r| matches!(r, Request::Open { .. }))
+            .count();
+        assert_eq!((lost, opens), (0, REQUESTS));
+    }
+
+    /// A wake is never lost: one made after the session has looked (read
+    /// the wants) and before it sleeps, held there, ends its sleep at once.
+    /// The session takes another turn long before its tick (60 s here),
+    /// three times over.
+    // Covers: T02
+    #[test]
+    fn a_wake_before_the_sleep_is_not_lost() {
+        let mut s = supervisor(1);
+        s.deadlines.tick = Duration::from_secs(60);
+        let (turns, gate) = hold_at(&mut s, Held::Looked);
+        let (session, ended) = started(s, |_| {});
+        let waker = session.waker();
+        let mut turned = Vec::new();
+        for _ in 0..3 {
+            turned.push(turns.recv_timeout(Duration::from_secs(10)).is_ok());
+            waker.wake();
+            gate.open();
+        }
+        turned.push(turns.recv_timeout(Duration::from_secs(10)).is_ok());
         drop(session);
-        let mut wakes = 0;
-        let quit = loop {
-            match rx.try_recv() {
-                Ok(Request::Quit) | Err(TryRecvError::Disconnected) => break true,
-                Ok(Request::Wake) => wakes += 1,
-                Ok(_) => {}
-                Err(TryRecvError::Empty) => break false,
-            }
-        };
-        drop(waker);
-        assert_eq!((movie.loss(), quit, wakes), (None, true, 1));
+        gate.open_all();
+        ended.join().unwrap();
+        assert_eq!(turned, [true; 4], "a wake waited for the tick");
     }
 
     /// A waker held after the game's handle is dropped keeps no session
-    /// alive, even when the queue had no room for the end's request: the
-    /// session ends at its next turn.
+    /// alive, and the drop ends it at once, not at its tick (60 s here).
     // Covers: T02
     #[test]
     fn a_retained_waker_keeps_no_session_alive() {
-        let (tx, rx) = mpsc::sync_channel(REQUESTS);
-        let s = supervisor(1);
-        let session = Session {
-            tx,
-            shared: Arc::clone(&s.shared),
-        };
+        let mut s = supervisor(1);
+        s.deadlines.tick = Duration::from_secs(60);
+        let (turns, gate) = hold_at(&mut s, Held::Looked);
+        let (session, ended) = started(s, |_| {});
         let waker = session.waker();
-        // The queue full of opens (of a screen not shown, so nothing is
-        // launched): the end's request finds no room.
-        for _ in 0..REQUESTS {
-            let file =
-                std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
-            session.open(&Movie::new(2), file, false);
-        }
-        drop(session);
-        let (done, ended) = mpsc::channel();
+        // The session asleep after its first look.
+        turns.recv_timeout(Duration::from_secs(10)).unwrap();
+        gate.open_all();
+        let (done, finished) = mpsc::channel();
         std::thread::spawn(move || {
-            s.run(&rx);
+            let _ = ended.join();
             let _ = done.send(());
         });
-        let ended = ended.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(session);
+        let finished = finished.recv_timeout(Duration::from_secs(2)).is_ok();
         drop(waker);
-        assert!(ended, "the session outlived the game's handle");
+        assert!(finished, "the session outlived the game's handle");
+    }
+
+    /// An open the session's queue took before the game's handle went is
+    /// lost with the session's end, never left pending: the session is held once it has taken its requests (the first open
+    /// among them), one more open is accepted and the handle dropped, then
+    /// the session goes on.
+    // Covers: T02
+    #[test]
+    fn an_open_accepted_before_the_end_is_lost_with_it() {
+        let mut s = supervisor(1);
+        let (held, gate) = hold_at(&mut s, Held::Taken);
+        let first = Movie::new(1);
+        let (session, ended) = started(s, |session| session.open(&first, file(), false));
+        held.recv_timeout(Duration::from_secs(10)).unwrap();
+        let late = Movie::new(1);
+        session.open(&late, file(), false);
+        drop(session);
+        gate.open();
+        ended.join().unwrap();
+        assert_eq!(
+            (first.loss(), late.loss()),
+            (Some(Loss::Ended), Some(Loss::Ended))
+        );
     }
 
     /// A probe of `width` × `height`.
