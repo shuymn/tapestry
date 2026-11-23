@@ -1281,6 +1281,54 @@ fn seeks_through_the_real_worker() {
     assert_eq!(rig.count(|e| matches!(e, Event::Lost { .. })), 0);
 }
 
+/// A play's videos through the real worker, as its preparation opens them:
+/// two chart videos, not looping, declared before the skin's looping
+/// movie, all live. The first chart video plays to its end and is started
+/// again from its first frame; the second, sought past its end, records
+/// the run as empty and then ended, which ends that run with no frame of
+/// it. Then the first is lost for its own reason: the session loses the
+/// second with it as its peer, while the skin's movie keeps playing, and
+/// no worker is ended.
+// Covers: T02
+#[test]
+fn a_play_s_chart_videos_run_through_the_real_worker() {
+    let rig = Rig::serving(&[]);
+    rig.session.enter(1);
+    let (base, layer, skin) = (Movie::chart(1), Movie::chart(1), Movie::new(1));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    rig.open_as(&skin, "s.mpg", true);
+    let waker = rig.session.waker();
+    let mut a = Runs::of(&base);
+    let mut b = Runs::of(&layer);
+    let render = Render::start(&skin, false);
+    playing(&skin, &render);
+    // The base: run 1 to its end, then a restart from its first frame.
+    let first = a.first();
+    assert!(a.take_to_end() > 0);
+    assert_eq!((base.ended(), base.empty()), (1, 0));
+    let restart = a.start(&waker);
+    assert_eq!(a.first().stamp, first.stamp, "run {restart}");
+    assert!(a.take_to_end() > 0);
+    assert_eq!((base.ended(), base.empty()), (restart, 0));
+    // The layer: a seek past its end finds no frame, then ends.
+    b.first();
+    layer.seek_from(10_000_000);
+    let past = b.start(&waker);
+    until(Duration::from_secs(3), || layer.ended() == past)
+        .unwrap_or_else(|| panic!("run {past} never ended: {:?}", rig.session.events()));
+    assert_eq!(layer.empty(), past, "the seek found no frame");
+    assert_eq!((layer.status(), layer.loss()), (Status::Live, None));
+    // The base lost: the layer goes with it, the skin's movie plays on.
+    base.lose(Loss::Fault);
+    lost(&layer, Duration::from_secs(1))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+    assert!(render.advances_over(Duration::from_millis(300)));
+    assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    assert_eq!(rig.count(|e| matches!(e, Event::Terminated { .. })), 0);
+}
+
 /// A video lost with its peer is closed, not struck: the chart's videos
 /// are one panel, and when one is lost (here its ring at fault, as the
 /// render side finds it) the other is lost with it, which ends no worker.
