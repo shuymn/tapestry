@@ -4915,7 +4915,7 @@ fn write_rect_png(path: &Path, [w, h]: [u32; 2], rect: [u32; 4], rgba: [u8; 4]) 
 
 /// A play skin whose only element is the chart's BGA filling the canvas,
 /// each picture stretched to it whole (stretch 0): a 4:3 video of 320 × 240
-/// at a 640 × 360 capture is scaled 2 across and 1.5 down.
+/// at a 320 × 180 capture is kept across and scaled 0.75 down.
 fn install_video_skin(fx: &Fixture) {
     let skin = fx.base.join("skin");
     fs::create_dir_all(&skin).unwrap();
@@ -4938,8 +4938,8 @@ fn install_video_skin(fx: &Fixture) {
     .unwrap();
 }
 
-/// The captures of a video scenario: 640 × 360, the BGA filling them.
-const VIDEO_SIZE: [usize; 2] = [640, 360];
+/// The captures of a video scenario: 320 × 180 (small, so each PNG encodes quickly), the BGA filling them.
+const VIDEO_SIZE: [usize; 2] = [320, 180];
 
 /// The RGB pixels of the PNG at `path`, `VIDEO_SIZE`.
 fn rgb(path: &Path) -> Vec<[u8; 3]> {
@@ -4962,13 +4962,13 @@ fn rgb(path: &Path) -> Vec<[u8; 3]> {
 }
 
 /// The index a 320 × 240 coded clip's frame shows in a capture's pixels
-/// `px`, its blocks scaled 2 across and 1.5 down: bit `b` in the green of
-/// block `b`'s centre (32 b + 16, 12), for `bits` bits; `None` when a block
+/// `px`, its blocks kept across and scaled 0.75 down: bit `b` in the green of
+/// block `b`'s centre (16 b + 8, 6), for `bits` bits; `None` when a block
 /// is neither dark nor bright (no frame of the clip there).
 fn coded_index(px: &[[u8; 3]], bits: usize) -> Option<u32> {
     let mut index = 0;
     for b in 0..bits {
-        let [_, g, _] = px[12 * VIDEO_SIZE[0] + 32 * b + 16];
+        let [_, g, _] = px[6 * VIDEO_SIZE[0] + 16 * b + 8];
         match g {
             0..64 => {}
             192.. => index |= 1 << b,
@@ -5221,7 +5221,7 @@ fn video_scenario(ats: &[i64], steps: &[&str]) -> String {
         .collect();
     scenario(&all).replacen(
         "output = \"out\"\n",
-        "output = \"out\"\nsize = [640, 360]\n",
+        "output = \"out\"\nsize = [320, 180]\n",
         1,
     )
 }
@@ -5313,7 +5313,7 @@ fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
             got.is_some_and(|g| is_due(g, due)),
             "{name} at {t}: {got:?}, due {due:?}"
         );
-        let [r, g, b] = px[285 * VIDEO_SIZE[0] + 500];
+        let [r, g, b] = px[142 * VIDEO_SIZE[0] + 250];
         assert!(
             g > 128 && r < 64 && b < 64,
             "{name}: the layer's green over the video"
