@@ -657,6 +657,8 @@ impl Shelf {
     /// Selection was entered, or a result shown: the scan goes on, and
     /// passes start again when due.
     pub fn release(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("sh:release", 0);
         self.paused = false;
         if let Some(scan) = &self.scan {
             scan.release();

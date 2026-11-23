@@ -1308,6 +1308,13 @@ impl<T> Runner<T> {
         self
     }
 
+    /// Its job's id, the task a permit observer names (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn task_id(&self) -> u64 {
+        self.id
+    }
+
     /// Its promoter.
     #[must_use]
     pub fn promoter(&self) -> Promoter {

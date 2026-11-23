@@ -55,6 +55,8 @@ use std::time::{Duration, Instant};
 use game::coord::{Class, Coordinator, Outcome, Promoter, Runner};
 use skin_beatoraja::{Cancel, Imported, LuaImported};
 
+#[cfg(feature = "dev-tools")]
+use super::gaps;
 use super::{
     ImageEntry, Images, NotPacked, Others, Packed, PendingResult, ResultSkin, Slot, StartupProbe,
     Unbuilt, lock, pack,
@@ -300,21 +302,26 @@ impl PreloadControl {
 
     /// The shelf's pause is requested (`true`) or released.
     pub fn set_paused(&self, on: bool) {
-        self.paused.store(on, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
-        if on && !self.claimed() {
-            self.mark_stop("pause");
+        let request = (on && !self.claimed()).then(|| self.stop_request());
+        self.paused.store(on, Ordering::SeqCst);
+        #[cfg(all(test, feature = "dev-tools"))]
+        tests::after_stop_store();
+        #[cfg(feature = "dev-tools")]
+        if let Some(request) = request {
+            mark_stop(request, "pause");
         }
     }
 
-    /// Dev-tools: the running pack, if any, is asked to stop for `why`
-    /// (`pre:stop`).
+    /// Dev-tools: a stop's request, read before its flag is stored: the
+    /// probe's time and the running pack's job, if one runs, so no
+    /// observation of the stop can precede its mark and a job that leaves
+    /// meanwhile still gets it ([`mark_stop`]).
     #[cfg(feature = "dev-tools")]
-    fn mark_stop(&self, why: &str) {
+    fn stop_request(&self) -> Option<(bms_model::TimeUs, u64)> {
+        let at = crate::dev::loop_probe::stamp()?;
         let live = *self.live();
-        if let Some(id) = live.job.filter(|_| !live.left) {
-            mark_job("pre:stop", id, why);
-        }
+        live.job.filter(|_| !live.left).map(|id| (at, id))
     }
 
     /// Whether the pause holds with no claim exempting the pack.
@@ -435,9 +442,11 @@ impl PreloadControl {
     /// run's stop deadline is `deadline` unless an earlier end set it.
     /// The deadline every wait of the run's end shares.
     pub fn close_by(&self, deadline: Instant) -> Instant {
+        #[cfg(feature = "dev-tools")]
+        let request = self.stop_request();
         self.closing.store(true, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
-        self.mark_stop("close");
+        mark_stop(request, "close");
         let mut set = self.deadline.lock().unwrap_or_else(PoisonError::into_inner);
         *set.get_or_insert(deadline)
     }
@@ -481,11 +490,8 @@ impl PreloadControl {
             live.left = true;
             drop(live);
             #[cfg(feature = "dev-tools")]
-            {
-                if stopped {
-                    mark_job("pre:ack", id, "");
-                }
-                mark_job("pre:left", id, if stopped { "stopped" } else { "ended" });
+            if stopped {
+                mark_job("pre:ack", id, "");
             }
             #[cfg(not(feature = "dev-tools"))]
             let _ = stopped;
@@ -493,12 +499,14 @@ impl PreloadControl {
         }
     }
 
-    /// Job `id`'s thread ends.
+    /// Job `id`'s thread ends (dev-tools: `pre:left`).
     fn ended(&self, id: u64) {
         let mut live = self.live();
         if live.job == Some(id) {
             *live = Live::default();
             drop(live);
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark("pre:left", i64::try_from(id).unwrap_or(-1));
             self.changed.notify_all();
         }
     }
@@ -516,6 +524,19 @@ fn mark_job(tag: &'static str, id: u64, what: &str) {
         } else {
             println!("dev: {tag} {id} {what}");
         }
+    }
+}
+
+/// Dev-tools: `pre:stop` of a stop's `request` ([`PreloadControl::stop_request`]),
+/// kept at the request's time after its flag was stored.
+#[cfg(feature = "dev-tools")]
+fn mark_stop(request: Option<(bms_model::TimeUs, u64)>, why: &str) {
+    let Some((at, id)) = request else {
+        return;
+    };
+    crate::dev::loop_probe::mark_at("pre:stop", at, i64::try_from(id).unwrap_or(-1));
+    if crate::dev::loop_probe::on() {
+        println!("dev: pre:stop {id} {why}");
     }
 }
 
@@ -613,7 +634,13 @@ impl PackJob {
         } = self;
         let _ended = Ended(&control, id);
         #[cfg(feature = "dev-tools")]
-        super::IMPORT_PERMIT.set(kept);
+        {
+            super::IMPORT_PERMIT.set(kept);
+            // The trace's join key: the pack thread's OS id.
+            // SAFETY: no arguments; it reads the calling thread's id.
+            let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            crate::dev::loop_probe::mark("pre:tid", gaps::pair(id, i64::from(tid)));
+        }
         let mode = JobMode::new(mode, "skin: result: preload");
         let checked = |class| {
             mode.on_class(class);
@@ -635,30 +662,78 @@ impl PackJob {
         let progressed = AtomicBool::new(false);
         let mut packed = None;
         let mut no_background = false;
+        let mut admitted = false;
         let outcome = runner.run(&stops, &on_class, |ctx| {
+            admitted = true;
+            // Admitted: the job's thread holds its permit, before its work.
+            #[cfg(feature = "dev-tools")]
+            {
+                let class = match ctx.class() {
+                    Some(Class::Foreground) => 1,
+                    Some(Class::Speculative) => 2,
+                    Some(Class::Maintenance) => 0,
+                    None => 3,
+                };
+                crate::dev::loop_probe::mark("pre:admit", gaps::pair(id, class));
+                gaps::admit(id);
+            }
             // Admitted: its thread's mode is set for its permit's class.
             if mode.refused() {
                 no_background = true;
                 return;
             }
+            // Each checkpoint is one bracket (dev-tools): the gate, a hold,
+            // the coordinator's checkpoint and the marks lie outside every
+            // stretch of the job's work.
             let check = || {
+                #[cfg(feature = "dev-tools")]
+                let site = gaps::site_now();
+                #[cfg(feature = "dev-tools")]
+                gaps::bracket_in(site);
                 #[cfg(all(test, feature = "dev-tools"))]
                 tests::pack_gate(&stops);
+                #[cfg(feature = "dev-tools")]
+                gaps::engage(id, site, false);
                 let stopped = ctx.checkpoint();
                 if stopped {
+                    #[cfg(feature = "dev-tools")]
+                    gaps::stopped_at(site);
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    tests::after_seen();
                     control.left(id, true);
+                    return true;
                 }
-                // Its first progress (dev-tools): the latency from a
-                // release or a begin to its work.
                 #[cfg(feature = "dev-tools")]
-                if !stopped && !progressed.swap(true, Ordering::SeqCst) {
-                    mark_job("pre:progress", id, "");
+                {
+                    gaps::engage(id, site, true);
+                    // Its first progress: the latency from a release or a
+                    // begin to its work.
+                    if !progressed.swap(true, Ordering::SeqCst) {
+                        mark_job("pre:progress", id, "");
+                    }
+                    gaps::bracket_out(site);
                 }
-                stopped
+                false
             };
             packed = Some(pack(&pending, imported, &slot, base, others, &stop, &check));
         });
         let cancelled = matches!(outcome, Outcome::Cancelled);
+        // A waiter stopped in its admission saw its stop there.
+        #[cfg(feature = "dev-tools")]
+        if cancelled
+            && !admitted
+            && let Some(at) = crate::dev::loop_probe::stamp()
+        {
+            {
+                crate::dev::loop_probe::mark_at(
+                    "pre:seen",
+                    at,
+                    gaps::pair(id, i64::from(gaps::ADMIT)),
+                );
+            }
+        }
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = admitted;
         control.left(id, cancelled || no_background);
         // Pages it built that nobody takes drop here, on its own thread.
         let lent_of = |p: Option<Result<Packed, NotPacked>>| match p {
@@ -713,6 +788,11 @@ impl PackJob {
                 },
             },
         );
+        #[cfg(feature = "dev-tools")]
+        {
+            gaps::finish();
+            crate::dev::loop_probe::mark("pre:sent", i64::try_from(id).unwrap_or(-1));
+        }
         // A receiver gone (the installation's end): the outcome, its pages
         // included, drops here.
         let _ = done.send(PackOut { id, kept, ran });
@@ -935,6 +1015,8 @@ impl ResultSkin {
         // foreground begins it promoted. Its new thread is in the normal
         // mode, as the runner records, until its first permit.
         let runner = coord.task::<()>(Class::Speculative).on_new_thread();
+        #[cfg(feature = "dev-tools")]
+        let task = runner.task_id();
         let promoted = control.set_promoter(runner.promoter());
         #[cfg(not(feature = "dev-tools"))]
         let _ = promoted;
@@ -964,6 +1046,10 @@ impl ResultSkin {
                 #[cfg(feature = "dev-tools")]
                 {
                     mark_job("pre:begin", id, if promoted { "fg" } else { "speculative" });
+                    crate::dev::loop_probe::mark(
+                        "pre:task",
+                        gaps::pair(id, i64::try_from(task).unwrap_or(-1)),
+                    );
                     // A claim that came before it attaches to it now.
                     if control.claimed() {
                         mark_job("pre:claim", id, "");
@@ -994,11 +1080,12 @@ impl ResultSkin {
     fn stop_preload(&mut self, then: Then) {
         self.preload = match std::mem::take(&mut self.preload) {
             Preload::Running(run) => {
+                #[cfg(feature = "dev-tools")]
+                let request = self.control.as_ref().and_then(|c| c.stop_request());
                 run.stop.cancel();
                 #[cfg(feature = "dev-tools")]
-                mark_job(
-                    "pre:stop",
-                    run.id,
+                mark_stop(
+                    request,
                     match then {
                         Then::Idle => "gate",
                         Then::Retired => "retired",
@@ -1151,6 +1238,8 @@ impl ResultSkin {
             return None;
         }
         claim.promote();
+        #[cfg(feature = "dev-tools")]
+        gaps::adopted(run.id);
         log::info!("skin: result: the attempt adopts preload {}", run.id);
         Some(Adopted {
             id: run.id,
@@ -1215,6 +1304,15 @@ impl ResultSkin {
     /// set `bound` from now unless the run's end set it already.
     pub(super) fn end_preload(&mut self, bound: Duration) {
         self.preload_on(Event::End(bound));
+    }
+
+    /// The holdings lent to the pack in flight (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(super) fn pack_slot(&self) -> Option<Slot> {
+        match &self.preload {
+            Preload::Running(r) | Preload::Stopping { run: r, .. } => Some(Arc::clone(&r.slot)),
+            Preload::Idle(_) | Preload::Retired => None,
+        }
     }
 
     /// The preload's pack thread mode in place of the system's (tests).

@@ -29,6 +29,8 @@ use crate::chart_images::{ChartImages, Sources};
 use crate::imports::{self, ImportTarget, Job, Ran};
 use crate::screens::{ScriptGen, ScriptPermit, ScriptSlot, Scripts};
 
+#[cfg(feature = "dev-tools")]
+pub(crate) mod gaps;
 mod preload;
 
 #[cfg(all(test, feature = "dev-tools"))]
@@ -851,6 +853,8 @@ fn layout(
 /// file's version as well.
 #[cfg(feature = "dev-tools")]
 fn probe_miss(e: &ImageEntry, sheet: &Sheet, variant: Variant, kept: skin_model::KeptLayers) {
+    #[cfg(all(test, feature = "dev-tools"))]
+    tests::in_probe_miss();
     let pages = e.atlas.shared_pages();
     let refusal = match pages.not_held_why(sheet, variant, kept) {
         None => "none".to_owned(),
@@ -990,10 +994,51 @@ fn pack(
     }
 }
 
+/// The atlas step's own checkpoint sites, after skin-model's (dev-tools:
+/// the codes a gap names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepSite {
+    /// The step's start, before any planning.
+    StepStart = 16,
+    /// Before each union of an earlier holding with the layout's sheet.
+    Union = 17,
+    /// After the last union.
+    UnionEnd = 18,
+    /// After the planning, before the holdings are taken.
+    Take = 19,
+}
+
+/// Asks `check` at the atlas step's `site`: whether to stop.
+fn ask(check: &dyn Fn() -> bool, site: StepSite) -> bool {
+    #[cfg(feature = "dev-tools")]
+    return gaps::ask(check, site);
+    #[cfg(not(feature = "dev-tools"))]
+    {
+        let _ = site;
+        check()
+    }
+}
+
 /// The atlas step of `skin` for [`lay_out`] and [`pack`]: the slot's
 /// image entry rebound when it holds the layout's cells, else the plan
 /// packed (D13, "The atlas step").
+///
+/// The step asks `check` at its start, before each union of an earlier
+/// holding and after the last, through the planning (skin-model asks it
+/// at each phase and batch of work) and once more before it takes the
+/// holdings; a stop at any of these ends it with the slot untouched, the
+/// partial tables dropped here.
+///
+/// The slot's single owner: from [`ResultSkin::slot_for_job`] until the
+/// outcome is collected, only this job's thread locks the slot (the game
+/// thread locks it once the outcome is in, and no other job is given it),
+/// so the snapshot taken under the lock before the unions and planning is
+/// still the slot's at the take. A change that lets another thread lock a
+/// running job's slot must check the snapshot again at the take. Nothing
+/// that can wait for a permit (a checkpoint's move, an admission) runs
+/// under the lock.
 #[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
+#[expect(clippy::too_many_lines, reason = "one step, its stops in order")]
 fn atlas_step(
     pending: &PendingResult,
     skin: &mut skin_model::Skin,
@@ -1005,6 +1050,16 @@ fn atlas_step(
 ) -> Result<Bound, Box<NotBound>> {
     #[cfg(not(all(test, feature = "dev-tools")))]
     let _ = cancel;
+    let stopped = || {
+        Box::new(NotBound {
+            why: "the atlas cannot be built: cancelled".to_owned().into(),
+            lent: None,
+            built: None,
+        })
+    };
+    if ask(check, StepSite::StepStart) {
+        return Err(stopped());
+    }
     let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
     let (kept, _) = imports::plan_layers(skin, variant, pending.target.limits);
     let entry = lock(slot).as_ref().and_then(|i| i.entry.clone());
@@ -1019,25 +1074,7 @@ fn atlas_step(
             && held.is_none()
             && let Some(e) = &entry
         {
-            probe_miss(e, skin.sheet(), variant, kept);
-        }
-        if crate::dev::loop_probe::on() {
-            // The layout's own cells, as one atlas (no file read).
-            match skin
-                .sheet()
-                .plan_shape(variant, pending.target.limits, kept)
-            {
-                Ok(sh) => {
-                    crate::dev::loop_probe::mark("rl:own_plan_pages", i64::from(sh.pages));
-                    crate::dev::loop_probe::mark("rl:own_plan_side", i64::from(sh.side));
-                    crate::dev::loop_probe::mark("rl:own_plan_layers", i64::from(sh.layers));
-                    crate::dev::loop_probe::mark(
-                        "rl:own_plan_texels",
-                        i64::try_from(sh.texels).unwrap_or(-1),
-                    );
-                }
-                Err(_) => crate::dev::loop_probe::mark("rl:own_plan_pages", -1),
-            }
+            gaps::dev_only(|| probe_miss(e, skin.sheet(), variant, kept));
         }
     }
     let (atlas, entry, taken) = match held {
@@ -1060,50 +1097,94 @@ fn atlas_step(
         None => {
             drop(entry);
             let limits = pending.target.limits;
-            let mut guard = lock(slot);
-            let packed = {
-                let (e, c) = guard
-                    .as_ref()
-                    .map_or((None, None), |i| (i.entry.as_ref(), i.cells.as_ref()));
-                // The union's base: the shown atlas's cells, the image
-                // entry's and the kept ones, which the build keeps as cells
-                // only.
-                let earlier = base.is_some() || e.is_some() || c.is_some();
-                let mut union = Some(skin.sheet().clone());
-                for b in [base.as_ref(), e].into_iter().flatten() {
-                    union = union.and_then(|u| u.union(&b.packed));
+            // Under the lock, only snapshots: the earlier entry's `Arc`
+            // and the kept cells.
+            let (earlier_entry, kept_cells) = lock(slot)
+                .as_ref()
+                .map_or((None, None), |i| (i.entry.clone(), i.cells.clone()));
+            // The union's base: the shown atlas's cells, the image entry's
+            // and the kept ones, which the build keeps as cells only.
+            let earlier = base.is_some() || earlier_entry.is_some() || kept_cells.is_some();
+            let own = skin.sheet().clone();
+            let mut union = earlier.then(|| own.clone());
+            for b in [base.as_ref(), earlier_entry.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if ask(check, StepSite::Union) {
+                    return Err(stopped());
                 }
-                if let Some(c) = c {
-                    union = union.and_then(|u| u.union(c));
+                union = union.and_then(|u| u.union(&b.packed));
+            }
+            if let Some(c) = &kept_cells {
+                if ask(check, StepSite::Union) {
+                    return Err(stopped());
                 }
-                match union
-                    .filter(|_| earlier)
-                    .filter(|u| u.plan_keeping(variant, limits, kept).is_ok())
-                {
-                    Some(u) => {
+                union = union.and_then(|u| u.union(c));
+            }
+            if earlier && ask(check, StepSite::UnionEnd) {
+                return Err(stopped());
+            }
+            let cancelled =
+                |e: &skin_model::AtlasError| matches!(e, skin_model::AtlasError::Cancelled);
+            let union_plan = match union
+                .as_ref()
+                .map(|u| u.plan_atlas(variant, limits, kept, check))
+            {
+                Some(Ok(p)) => Some(p),
+                Some(Err(e)) if cancelled(&e) => return Err(stopped()),
+                Some(Err(_)) | None => None,
+            };
+            let from_union = union_plan.is_some();
+            let plan = match union_plan {
+                Some(p) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("rl:branch_union", 1);
+                    p
+                }
+                None => match own.plan_atlas(variant, limits, kept, check) {
+                    Ok(p) => {
                         #[cfg(feature = "dev-tools")]
-                        crate::dev::loop_probe::mark("rl:branch_union", 1);
-                        u
+                        {
+                            crate::dev::loop_probe::mark("rl:branch_own", i64::from(earlier));
+                            // The production plan's shape: no packing of its
+                            // own.
+                            let sh = p.shape();
+                            crate::dev::loop_probe::mark("rl:own_plan_pages", i64::from(sh.pages));
+                            crate::dev::loop_probe::mark("rl:own_plan_side", i64::from(sh.side));
+                            crate::dev::loop_probe::mark(
+                                "rl:own_plan_layers",
+                                i64::from(sh.layers),
+                            );
+                            crate::dev::loop_probe::mark(
+                                "rl:own_plan_texels",
+                                i64::try_from(sh.texels).unwrap_or(-1),
+                            );
+                        }
+                        p
                     }
-                    None if skin.sheet().plan_keeping(variant, limits, kept).is_ok() => {
-                        #[cfg(feature = "dev-tools")]
-                        crate::dev::loop_probe::mark("rl:branch_own", i64::from(earlier));
-                        skin.sheet().clone()
-                    }
-                    None => {
+                    Err(e) if cancelled(&e) => return Err(stopped()),
+                    Err(_) => {
                         #[cfg(feature = "dev-tools")]
                         crate::dev::loop_probe::mark("rl:branch_refused", 1);
                         return Err(Box::new(NotBound::refused(
                             "the layout's images do not fit one atlas".to_owned(),
                         )));
                     }
-                }
+                },
             };
+            // The snapshot goes before the release, so the release's drop
+            // of the earlier entry frees its pages before the build.
+            drop((earlier_entry, kept_cells));
+            if ask(check, StepSite::Take) {
+                return Err(stopped());
+            }
             // The plan fits: the holdings are taken, and what is not shown
             // goes before the build.
-            let images = guard.take().unwrap_or_default();
-            drop(guard);
+            let images = lock(slot).take().unwrap_or_default();
             let (images, room) = release(images, base.as_ref(), others);
+            #[cfg(all(test, feature = "dev-tools"))]
+            tests::released();
             if !room {
                 return Err(Box::new(NotBound {
                     why: Unbuilt::Deferred,
@@ -1118,8 +1199,10 @@ fn atlas_step(
             #[cfg(any(test, feature = "dev-tools"))]
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "dev-tools")]
+            gaps::build();
+            #[cfg(feature = "dev-tools")]
             let p_t = render::probe::Span::start();
-            let built = match packed.atlas_keeping(variant, limits, kept, check) {
+            let built = match plan.build(check) {
                 Ok(a) => {
                     #[cfg(feature = "dev-tools")]
                     {
@@ -1150,6 +1233,12 @@ fn atlas_step(
                         built: None,
                     }));
                 }
+            };
+            // The plan's borrow ended with the build: the sheet it packed
+            // is the entry's.
+            let packed = match union {
+                Some(u) if from_union => u,
+                _ => own,
             };
             let new = Arc::new(ImageEntry {
                 atlas: built,
@@ -2472,5 +2561,7 @@ pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts 
 
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) mod chart_tests;
+#[cfg(all(test, feature = "dev-tools"))]
+mod step_tests;
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) mod tests;

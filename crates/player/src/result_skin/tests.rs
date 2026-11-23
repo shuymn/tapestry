@@ -114,7 +114,7 @@ pub(crate) fn view(nr: u32) -> ViewFacts {
 }
 
 /// [`view`] of a chart at play level `level`.
-fn view_at(level: i32, nr: u32) -> ViewFacts {
+pub(crate) fn view_at(level: i32, nr: u32) -> ViewFacts {
     let mut v = probe_view(ResultChart {
         level: Some(level),
         ..chart()
@@ -892,6 +892,31 @@ struct Bomb;
 impl Drop for Bomb {
     fn drop(&mut self) {
         panic!("the payload's drop");
+    }
+}
+
+/// Run inside the probe-miss diagnostic, when set (E20's dev-only time).
+pub(crate) static IN_PROBE_MISS: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+pub(super) fn in_probe_miss() {
+    let hook = *IN_PROBE_MISS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run at the atlas step's release's return, when set (E23).
+pub(crate) static AT_RELEASE: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+/// The atlas step's release returned: [`AT_RELEASE`] runs.
+pub(super) fn released() {
+    let hook = *AT_RELEASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -1689,7 +1714,7 @@ fn a_full_report_retries_nothing() {
 /// B (100×100) fit together, C (200×200) with neither. At level 7 it shows
 /// C; otherwise A for the probe (154 = 1), A and B for 154 = 2, B for 3
 /// and C for 4.
-fn cells_skin() -> (tempfile::TempDir, Arc<super::PendingResult>) {
+pub(crate) fn cells_skin() -> (tempfile::TempDir, Arc<super::PendingResult>) {
     let d = skin_reading(
         "local lv = ms.number(96)\nlocal nr = ms.number(154)",
         "local A = { id = \"a\", src = \"h\", x = 0, y = 0, w = 100, h = 100 }\n\

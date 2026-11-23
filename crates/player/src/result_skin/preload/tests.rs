@@ -20,6 +20,8 @@ use crate::result_skin::{ImageStage, ResultSkin, ResultStart, Staged, builds};
 use crate::screens::Scripts;
 use crate::shelf::{PAUSE_SLICE, Paused, Shelf};
 
+mod marks;
+
 /// The gate a pack's checkpoint waits at: 0 open, 1 held until the pack
 /// should stop, 2 held whatever it is told.
 static GATE: AtomicU8 = AtomicU8::new(0);
@@ -162,6 +164,42 @@ impl Drop for AdmissionOpened {
     }
 }
 
+/// Run on the game thread right after a pause's flag is stored, before
+/// its `pre:stop` is marked (E20's cut).
+pub(super) static AFTER_STOP_STORE: Mutex<Option<fn()>> = Mutex::new(None);
+
+pub(super) fn after_stop_store() {
+    let hook = *AFTER_STOP_STORE.lock().unwrap();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run on the pack's thread right after its checkpoint saw its stop,
+/// before its pages drop (E20's disposal).
+pub(super) static AFTER_SEEN: Mutex<Option<fn()>> = Mutex::new(None);
+
+pub(super) fn after_seen() {
+    let hook = *AFTER_SEEN.lock().unwrap();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// The cycle counts a test's source answers in turn (E24), in place of
+/// the thread's.
+pub(crate) static CYCLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Whether [`CYCLES`] answers.
+pub(crate) static CYCLES_ON: AtomicBool = AtomicBool::new(false);
+
+pub(in crate::result_skin) fn cycle_source() -> Option<u64> {
+    if !CYCLES_ON.load(SeqCst) {
+        return None;
+    }
+    let mut c = CYCLES.lock().unwrap();
+    Some(if c.is_empty() { 0 } else { c.remove(0) })
+}
+
 /// Whether drops are witnessed ([`DropWitness`]).
 static WITNESSING: AtomicBool = AtomicBool::new(false);
 /// The threads image entries dropped on while witnessed, by name.
@@ -183,13 +221,18 @@ impl Drop for DropWitness {
 
 /// Witnesses image entries' drops from now until it drops, which stops
 /// it and clears what was recorded.
-struct Witness;
+pub(crate) struct Witness;
 
 impl Witness {
-    fn on() -> Self {
+    pub(crate) fn on() -> Self {
         DROPPED_ON.lock().unwrap().clear();
         WITNESSING.store(true, SeqCst);
         Self
+    }
+
+    /// The witnessed drops so far.
+    pub(crate) fn count() -> usize {
+        DROPPED_ON.lock().unwrap().len()
     }
 
     /// The threads witnessed drops ran on, once `n` came.
@@ -207,6 +250,32 @@ impl Drop for Witness {
         DROPPED_ON.lock().unwrap().clear();
         hold_built(false);
     }
+}
+
+/// The process's probe, on, timed on a clock the test holds: it reads
+/// only what the test sets ([`advance`]). For a test run in a process of
+/// its own (nextest).
+pub(crate) fn held_clock() -> &'static input::QpcClock {
+    static CLOCK: std::sync::OnceLock<input::QpcClock> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(|| {
+        let c = input::QpcClock::holdable();
+        crate::dev::loop_probe::tests::turn_on_on(c);
+        c.hold();
+        c
+    })
+}
+
+/// Moves the held clock on by `us`.
+pub(crate) fn advance(us: i64) {
+    use bms_model::TimeSource;
+    let c = held_clock();
+    c.set(bms_model::TimeUs(c.now().0 + us));
+}
+
+/// The held clock's time.
+pub(crate) fn clock_now() -> i64 {
+    use bms_model::TimeSource;
+    held_clock().now().0
 }
 
 pub(crate) fn long() -> Duration {
@@ -385,7 +454,7 @@ fn a_pause_is_acknowledged_by_the_pack_and_a_release_packs_again() {
     assert_eq!(rs.preload_state(), (Some(true), None));
     look(&mut rs, &coord, true);
     assert_eq!(rs.preload_state(), (Some(true), None));
-    assert_eq!(builds(), before + 1);
+    assert_eq!(builds(), before, "stopped at its step's start: no build");
     // The release: a new job, from the start.
     shelf.release();
     gate(0);
@@ -397,7 +466,7 @@ fn a_pause_is_acknowledged_by_the_pack_and_a_release_packs_again() {
     collected(&mut rs, &coord);
     assert_eq!(rs.preload_state(), (None, None));
     assert!(rs.image().is_some());
-    assert_eq!(builds(), before + 2);
+    assert_eq!(builds(), before + 1);
 }
 
 /// A pack's outcome published before its retirement (the mode dropped,
@@ -584,12 +653,12 @@ fn the_practice_page_keeps_the_pack_stopped() {
     assert_eq!(rs.preload_state(), (Some(true), None));
     look(&mut rs, &coord, false);
     assert_eq!(rs.preload_state(), (Some(true), None));
-    assert_eq!(builds(), before + 1);
+    assert_eq!(builds(), before, "stopped at its step's start: no build");
     gate(0);
     look(&mut rs, &coord, true);
     collected(&mut rs, &coord);
     assert_eq!(rs.preload_state(), (None, None));
-    assert_eq!(builds(), before + 2);
+    assert_eq!(builds(), before + 1);
 }
 
 /// The installation's end stops a pack held mid-build and waits for its
@@ -704,7 +773,7 @@ fn a_claim_after_the_stop_was_observed_begins_a_new_job() {
     assert_ne!(first, second, "a terminal job is not revived");
     collected(&mut rs, &coord);
     assert_eq!(rs.preload_state(), (None, None));
-    assert_eq!(builds(), before + 2);
+    assert_eq!(builds(), before + 1, "only the second job built");
     drop(claim);
 }
 

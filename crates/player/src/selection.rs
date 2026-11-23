@@ -1553,6 +1553,23 @@ impl Selection {
                 Some(SelectStep::SlowChartLoad(ms)) => crate::dev::slow_chart_load(ms),
                 Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
+                Some(SelectStep::HoldPreload(at)) => crate::result_skin::gaps::hold(at),
+                Some(SelectStep::ReleasePreload { on_adopt }) => {
+                    if on_adopt {
+                        crate::result_skin::gaps::release_on_adopt();
+                    } else {
+                        crate::result_skin::gaps::release();
+                    }
+                }
+                Some(SelectStep::PreloadHeld) => {
+                    if crate::result_skin::gaps::held().is_none() {
+                        if script.watchdog_expired() {
+                            script.fail("the preload pack never held".to_owned());
+                            controls.close();
+                        }
+                        return false;
+                    }
+                }
                 Some(SelectStep::Background(running)) => {
                     let done = if running {
                         crate::dev::background_held()

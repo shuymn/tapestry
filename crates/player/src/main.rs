@@ -1661,6 +1661,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         _ => caps,
     };
     let coord = game::coord::Coordinator::new(caps);
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::observe_permits(&coord);
     #[cfg_attr(
         not(feature = "dev-tools"),
         expect(unused_mut, reason = "`--dev-stop-timeout` sets its bound")
