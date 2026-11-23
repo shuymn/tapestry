@@ -238,8 +238,9 @@ const RUN_WINDOW: Window = Window {
 };
 
 /// What the hooks did over the process's life (dev-tools): each slot's
-/// frames taken into its planes, and the chart videos' restarts. A play's
-/// measure reports them from its start ([`crate::measure`]).
+/// frames taken into its planes, the chart videos' restarts, and the
+/// frames a chart slot took from a run it restarted. A play's measure
+/// reports them from its start ([`crate::measure`]).
 #[cfg(feature = "dev-tools")]
 pub mod counts {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -248,6 +249,7 @@ pub mod counts {
 
     static TAKES: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
     static RESTARTS: AtomicU64 = AtomicU64::new(0);
+    static RESTARTED_TAKES: AtomicU64 = AtomicU64::new(0);
 
     /// A frame taken into slot `i`'s planes.
     pub(super) fn took(i: usize) {
@@ -261,11 +263,18 @@ pub mod counts {
         RESTARTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Each slot's takes and the restarts so far.
-    pub fn now() -> ([u64; SLOTS], u64) {
+    /// A chart slot took a frame of a run it restarted (after its first).
+    pub(super) fn took_restarted() {
+        RESTARTED_TAKES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each slot's takes, the restarts and the restarted runs' takes so
+    /// far.
+    pub fn now() -> ([u64; SLOTS], u64, u64) {
         (
             TAKES.each_ref().map(|t| t.load(Ordering::Relaxed)),
             RESTARTS.load(Ordering::Relaxed),
+            RESTARTED_TAKES.load(Ordering::Relaxed),
         )
     }
 }
@@ -434,6 +443,14 @@ pub struct Movies<S = Movie> {
     lost_marked: bool,
 }
 
+/// The chart time of the play frame that first drew the chart's panel
+/// lost, of the play whose chart videos were set last ([`Movies::set_chart`];
+/// dev-tools: a scenario's `chart_lost` capture); `i64::MIN` until one
+/// does.
+#[cfg(feature = "dev-tools")]
+pub static CHART_LOST_AT: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
 impl<S: Source> Movies<S> {
     /// The movies of a screen whose preparation started at `start`, by
     /// slot (`None` for an absent one).
@@ -470,6 +487,8 @@ impl<S: Source> Movies<S> {
     pub fn set_chart(&mut self, videos: Arc<ChartVideos>, boundary: i64) {
         self.videos = Some(videos);
         self.boundary = boundary;
+        #[cfg(feature = "dev-tools")]
+        CHART_LOST_AT.store(i64::MIN, std::sync::atomic::Ordering::Release);
     }
 
     /// Wakes the media session through `waker` when a chart video wants a
@@ -683,6 +702,7 @@ impl<S: Source> Movies<S> {
         {
             self.lost_marked = true;
             crate::dev::loop_probe::mark("movies:chart_lost", now);
+            CHART_LOST_AT.store(now, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -1041,6 +1061,11 @@ impl<S: Source> Movies<S> {
                         #[cfg(feature = "dev-tools")]
                         counts::took(i);
                         let run = reader.run();
+                        // The first run is 1; a restart starts the next.
+                        #[cfg(feature = "dev-tools")]
+                        if run > 1 {
+                            counts::took_restarted();
+                        }
                         slot.held = Some(Held {
                             run,
                             stamp,

@@ -123,6 +123,8 @@ pub struct ListedQuad {
     pub clip_rect: Option<[f32; 4]>,
     /// How the atlas is sampled.
     pub filter: Filter,
+    /// The texture array's layer it samples: a movie quad's movie slot.
+    pub layer: u16,
     /// Its texels.
     pub source: QuadSource,
 }
@@ -181,6 +183,7 @@ impl Skin {
                     clip_geometry: run.key.clip.and_then(clips),
                     clip_rect: run.clip_rect.map(crate::ClipRect::rect),
                     filter: q.filter,
+                    layer: q.layer,
                     // A BGA quad samples the BGA array, not the atlas.
                     source: if matches!(q.filter, crate::Filter::Bga | crate::Filter::BgaLayer) {
                         QuadSource::Other

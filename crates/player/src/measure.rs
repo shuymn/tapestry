@@ -233,9 +233,10 @@ pub struct Figures {
     #[cfg(feature = "dev-tools")]
     pub decision: Option<DecisionRecord>,
     /// The movie hooks' work during the play (dev-tools): each slot's
-    /// frames taken into its planes, and the chart videos' restarts.
+    /// frames taken into its planes, the chart videos' restarts, and the
+    /// frames taken from a restarted run.
     #[cfg(feature = "dev-tools")]
-    pub movies: Option<([u64; skin_model::movie::SLOTS], u64)>,
+    pub movies: Option<([u64; skin_model::movie::SLOTS], u64, u64)>,
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
@@ -1033,7 +1034,7 @@ pub struct Measure {
     decision: Option<DecisionRecord>,
     /// The movie hooks' counts when the play started (dev-tools).
     #[cfg(feature = "dev-tools")]
-    movies_base: ([u64; skin_model::movie::SLOTS], u64),
+    movies_base: ([u64; skin_model::movie::SLOTS], u64, u64),
 }
 
 impl Measure {
@@ -1091,7 +1092,7 @@ impl Measure {
             #[cfg(feature = "dev-tools")]
             decision: None,
             #[cfg(feature = "dev-tools")]
-            movies_base: ([0; skin_model::movie::SLOTS], 0),
+            movies_base: ([0; skin_model::movie::SLOTS], 0, 0),
         }
     }
 
@@ -1243,13 +1244,17 @@ impl Measure {
             decision: self.decision,
             #[cfg(feature = "dev-tools")]
             movies: {
-                let ((takes, restarts), (base, base_restarts)) =
+                let ((takes, restarts, again), (base, base_restarts, base_again)) =
                     (crate::movie_frame::counts::now(), self.movies_base);
                 let mut since = takes;
                 for (t, b) in since.iter_mut().zip(base) {
                     *t = t.saturating_sub(b);
                 }
-                Some((since, restarts.saturating_sub(base_restarts)))
+                Some((
+                    since,
+                    restarts.saturating_sub(base_restarts),
+                    again.saturating_sub(base_again),
+                ))
             },
             steps_dropped: 0,
             ready_state: self.play.as_ref().map(|p| ReadyState {
@@ -1592,11 +1597,11 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
         }
     }
     #[cfg(feature = "dev-tools")]
-    if let Some((takes, restarts)) = &fig.movies {
+    if let Some((takes, restarts, again)) = &fig.movies {
         let takes: Vec<String> = takes.iter().map(u64::to_string).collect();
         let _ = writeln!(
             out,
-            "\n[movies]\ntakes = [{}]\nrestarts = {restarts}",
+            "\n[movies]\ntakes = [{}]\nrestarts = {restarts}\nrestarted_takes = {again}",
             takes.join(", ")
         );
     }
