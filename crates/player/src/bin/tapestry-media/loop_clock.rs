@@ -39,10 +39,6 @@ pub struct LoopClock {
     offset: i64,
     /// A frame's interval at the stream's average frame rate, if known.
     interval: Option<i64>,
-    /// That interval rounded down, the least an own duration is taken
-    /// for: a constant-rate clip's own durations, whole ticks around the
-    /// exact period, stay their own.
-    least: Option<i64>,
     /// The last frame of the pass: its ticks and its own duration, if
     /// known.
     last: Option<(i64, Option<i64>)>,
@@ -59,18 +55,9 @@ impl LoopClock {
             first: None,
             offset: 0,
             interval,
-            least: interval,
             last: None,
             delta: None,
         }
-    }
-
-    /// The clock with the stream's average interval rounded down to
-    /// `least` ticks: no own duration is taken below it.
-    #[must_use]
-    pub const fn least(mut self, least: Option<i64>) -> Self {
-        self.least = least;
-        self
     }
 
     /// The ticks, since the play began, of a frame at `pts` lasting
@@ -85,16 +72,14 @@ impl LoopClock {
     }
 
     /// The ticks a frame lasting `duration` (0 or less when unknown) lasts:
-    /// its own duration, but never below the stream's average frame
-    /// interval when it states one, else below the interval between the
-    /// last two frames (a container may state less than a frame's period:
-    /// motion JPEG in Matroska at 25 fps states 1 ms); without its own, the
-    /// average interval, else the last interval, else one tick.
+    /// its own duration, else the stream's average frame interval, else the
+    /// interval between the last two frames, else one tick.
     pub fn length(&self, duration: i64) -> i64 {
-        match Some(duration).filter(|d| *d > 0) {
-            Some(own) => self.least.or(self.delta).map_or(own, |f| own.max(f)),
-            None => self.interval.or(self.delta).unwrap_or(1),
-        }
+        Some(duration)
+            .filter(|d| *d > 0)
+            .or(self.interval)
+            .or(self.delta)
+            .unwrap_or(1)
     }
 
     /// How long a frame at `ticks` lasting `duration` ([`Self::length`])
@@ -233,16 +218,6 @@ mod tests {
         clock.ticks(0, None);
         clock.ticks(2700, None);
         assert_eq!(us(&clock, -1), 30_000);
-        // An own duration below the average period: the period; above it,
-        // its own (a still held longer).
-        let clock = LoopClock::new(0, Some(1800));
-        assert_eq!(us(&clock, 90), 20_000);
-        assert_eq!(us(&clock, 5400), 60_000);
-        // Below the last interval, with no average period: that interval.
-        let mut clock = LoopClock::new(0, None);
-        clock.ticks(0, None);
-        clock.ticks(2700, None);
-        assert_eq!(us(&clock, 90), 30_000);
         // Nothing: one tick, 11.1 µs.
         let clock = LoopClock::new(0, None);
         assert_eq!(us(&clock, 0), 11);

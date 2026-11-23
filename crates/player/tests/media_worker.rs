@@ -4040,16 +4040,16 @@ fn each_frame_is_published_with_its_duration() {
     worker.close(1);
 }
 
-/// A frame's own duration is taken only down to the stream's average
+/// A frame that states no duration of its own lasts the stream's average
 /// period (design.md "Rendering and Skins", video frames): motion JPEG in
-/// Matroska at 25 fps states 1 ms a frame, and each frame, the last one
-/// included, is published lasting its 40 ms period, so a clip's end comes
-/// at its last frame's real end; at 24 fps the container states 42 ms,
-/// above the period, which is kept.
+/// Matroska states none, so each frame, the last one included, is
+/// published lasting its period in the container's 1 ms ticks, 40 ms at
+/// 25 fps and 42 ms at 24 fps, and a chart video's end comes after its
+/// last frame has shown for a period.
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
-fn a_container_s_short_frame_duration_is_taken_as_its_period() {
+fn a_frame_with_no_duration_of_its_own_lasts_the_average_period() {
     let dir = tempfile::tempdir().unwrap();
     for (name, spec, rate) in [
         ("j25.mkv", "mjpeg matroska 176x96 25 30 1", 25),
@@ -4064,9 +4064,8 @@ fn a_container_s_short_frame_duration_is_taken_as_its_period() {
         let taken = take_all(&worker, &mut ring, 1, 0, 1_000_000 / rate);
         assert_eq!(taken.len(), 30, "{name}: every frame");
         let durations: Vec<i64> = taken.iter().map(|t| t.duration).collect();
-        // At 25 fps the container states 1 ms: the period. At 24 fps it
-        // states 42 ms, above the 41.7 ms period: its own, kept (the
-        // stamps alone choose frames).
+        // The 41.7 ms period at 24 fps rounds to 42 of the container's
+        // ticks (the stamps alone choose frames).
         let want = if rate == 25 { 40_000 } else { 42_000 };
         assert_eq!(durations, [want; 30], "{name}: {}", worker.log());
         worker.close(1);

@@ -1375,9 +1375,7 @@ impl Input {
             };
             self.width = width;
             self.height = height;
-            let rate = (*st).avg_frame_rate;
-            self.clock = LoopClock::new(self.start, interval(self.time_base, rate))
-                .least(least_interval(self.time_base, rate));
+            self.clock = LoopClock::new(self.start, interval(self.time_base, (*st).avg_frame_rate));
             self.colour = Colour::of_stream(
                 width,
                 height,
@@ -1883,17 +1881,6 @@ fn interval(time_base: ff::AVRational, rate: ff::AVRational) -> Option<i64> {
         return None;
     }
     i64::try_from((num + den / 2) / den).ok().filter(|i| *i > 0)
-}
-
-/// A frame's interval at `rate` in ticks of `time_base`, rounded down:
-/// the least a frame's own duration is taken for ([`LoopClock::least`]).
-fn least_interval(time_base: ff::AVRational, rate: ff::AVRational) -> Option<i64> {
-    let den = i128::from(time_base.num) * i128::from(rate.num);
-    let num = i128::from(time_base.den) * i128::from(rate.den);
-    if den <= 0 || num <= 0 {
-        return None;
-    }
-    i64::try_from(num / den).ok().filter(|i| *i > 0)
 }
 
 /// Copies an I420 frame of `width` × `height` into `out`, its planes one
