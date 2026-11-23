@@ -58,6 +58,7 @@ fn want(dir: &Path, names: &[&str]) -> Want {
     Want {
         dir: dir.to_path_buf(),
         names: names.iter().map(|&n| n.to_owned()).collect(),
+        bga: None,
     }
 }
 
@@ -378,11 +379,14 @@ fn absent_answer(bound: Duration) -> (BgaWorker, Arc<Answer>) {
     w.renew();
     w.attempt(want(Path::new("."), &[]));
     w.step(None, &|| false);
-    let Ok(RenderMsg::Bga {
-        msg: BgaMsg::Publish { reply, .. },
-        ..
-    }) = rx.try_recv()
-    else {
+    // The empty video manifest comes first.
+    let Some(reply) = rx.try_iter().find_map(|m| match m {
+        RenderMsg::Bga {
+            msg: BgaMsg::Publish { reply, .. },
+            ..
+        } => Some(reply),
+        _ => None,
+    }) else {
         panic!("the empty table is sent at the step");
     };
     (w, reply)
@@ -600,4 +604,146 @@ fn the_job_holds_each_picture_to_the_whole_decode_term() {
     w.renew();
     w.attempt(want(d.path(), &["base.jpg", "prog.jpg", "long.jpg"]));
     assert_eq!(entries(&ready(&w, &coord)), [None, None, None]);
+}
+
+/// The job's messages on a link, answered as the render thread answers:
+/// each message's name in order, and the manifests it sent.
+fn answered_run(
+    want: &Want,
+    prior: Option<&super::Kept>,
+) -> (Vec<&'static str>, Vec<super::Manifest>, super::JobOut) {
+    use skin_model::bga::BgaKey;
+    let (link, rx) = BgaPublisher::channel(Duration::from_secs(5));
+    let answering = std::thread::spawn(move || {
+        let mut names = Vec::new();
+        let mut manifests = Vec::new();
+        for m in rx {
+            let RenderMsg::Bga { msg, .. } = m else {
+                continue;
+            };
+            match msg {
+                BgaMsg::Videos(m) => {
+                    names.push("videos");
+                    manifests.push(m);
+                }
+                BgaMsg::Begin { reply, .. } => {
+                    names.push("begin");
+                    let _ = reply.send(Ok(BgaKey {
+                        renderer: 1,
+                        array: 1,
+                    }));
+                }
+                BgaMsg::Cells { reply, .. } => {
+                    names.push("cells");
+                    let _ = reply.send(Ok(()));
+                }
+                BgaMsg::Publish {
+                    entries,
+                    key,
+                    reply,
+                } => {
+                    names.push("publish");
+                    let table = BgaTable::new(entries);
+                    let table = match key {
+                        Some(k) => table.keyed(k),
+                        None => table,
+                    };
+                    reply.give(|| Ok(Arc::new(table)));
+                }
+                BgaMsg::Reuse { reply, .. } => {
+                    names.push("reuse");
+                    let _ = reply.send(Some(Arc::new(BgaTable::new(Vec::new()))));
+                }
+                BgaMsg::Drop => names.push("drop"),
+            }
+        }
+        (names, manifests)
+    });
+    let out = super::run(want, 1, prior, &link, &|| false);
+    drop(link);
+    let (names, manifests) = answering.join().unwrap();
+    (names, manifests, out)
+}
+
+/// A folder with a picture and the video files `v1` to `v4`, and the want
+/// of a chart whose ids 0 (`a.png`), 1 and 2 (`v1`, aliases), 3 (`v2`), 4
+/// (`v3`) and 5 (`v4`) start as: v1 on the base at 1 s and again at 3 s
+/// through its alias, v2 on the layer at 1 s (a tie the base wins), v3 on
+/// the layer at 1.5 s (a third file), v4 named only by a poor sequence.
+fn video_chart() -> (tempfile::TempDir, Want) {
+    use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga, PoorSequence, TimeUs};
+    let dir = tempfile::tempdir().unwrap();
+    png(dir.path(), "a.png", [32, 32], [0, 0, 200]);
+    for v in ["v1", "v2", "v3", "v4"] {
+        std::fs::write(dir.path().join(format!("{v}.mp4")), b"x").unwrap();
+    }
+    let names = ["a.png", "v1.mp4", "v1.mp4", "v2.mp4", "v3.mp4", "v4.mp4"];
+    let ev = |t: i64, id: u16| BgaEvent {
+        time: TimeUs(t),
+        image: Some(BgaImageId(id)),
+    };
+    let bga = ChartBga::new(
+        (1..=6)
+            .map(|id| BgaImage {
+                id,
+                name: names[usize::from(id) - 1].to_owned(),
+            })
+            .collect(),
+        vec![ev(0, 0), ev(1_000_000, 1), ev(3_000_000, 2)],
+        vec![ev(1_000_000, 3), ev(1_500_000, 4)],
+        vec![PoorSequence {
+            time: TimeUs(2_000_000),
+            frames: vec![Some(BgaImageId(5))].into_boxed_slice(),
+        }],
+    )
+    .unwrap();
+    let mut w = want(dir.path(), &names);
+    w.bga = Some(bga);
+    (dir, w)
+}
+
+/// The job hands over the video manifest first, before any picture is
+/// read: two files at most, ranked by their first start (a tie broken by
+/// channel), aliases sharing a slot and its starts; a third file and a
+/// file only the poor sequences name are absent and opened by no one; each
+/// file opened is the canonical one. A reservation the ledger refuses
+/// leaves the pictures absent and the videos as they are.
+#[test]
+fn a_third_file_and_a_poor_only_file_are_absent() {
+    use bms_model::{BgaImageId, TimeUs};
+    let (dir, w) = video_chart();
+    let (names, manifests, _) = answered_run(&w, None);
+    assert_eq!(names.first(), Some(&"videos"), "{names:?}");
+    assert_eq!(manifests.len(), 1);
+    let m = &manifests[0];
+    let at = |k: usize| crate::movie_screen::final_path(m.files[k].as_ref().unwrap()).unwrap();
+    let canonical = |v: &str| dir.path().join(v).canonicalize().unwrap();
+    assert_eq!((at(0), at(1)), (canonical("v1.mp4"), canonical("v2.mp4")));
+    let slot = |id| m.videos.slot(BgaImageId(id));
+    assert_eq!(
+        (0..6).map(slot).collect::<Vec<_>>(),
+        [None, Some(2), Some(2), Some(3), None, None]
+    );
+    assert_eq!(m.videos.starts(2), [TimeUs(1_000_000), TimeUs(3_000_000)]);
+    assert_eq!(m.videos.starts(3), [TimeUs(1_000_000)]);
+    // The ledger refusing the job's transient: the videos stay.
+    super::REFUSE.store(true, Ordering::SeqCst);
+    let (names, manifests, _) = answered_run(&w, None);
+    super::REFUSE.store(false, Ordering::SeqCst);
+    assert_eq!(names, ["videos", "publish"]);
+    assert_eq!(manifests[0].files.iter().flatten().count(), 2);
+}
+
+/// A retry whose pictures are unchanged reuses the array, and its videos
+/// are handed over again, before the reuse: the next attempt opens its
+/// chart's videos anew.
+#[test]
+fn a_reused_picture_table_still_opens_the_videos() {
+    let (_dir, w) = video_chart();
+    let (_, _, first) = answered_run(&w, None);
+    let kept = first.kept.clone().expect("published into an array");
+    let (names, manifests, out) = answered_run(&w, Some(&kept));
+    assert!(matches!(out.end, super::End::Reused(_)), "{:?}", out.end);
+    assert_eq!(names, ["videos", "reuse"]);
+    assert_eq!(manifests[0].files.iter().flatten().count(), 2);
 }

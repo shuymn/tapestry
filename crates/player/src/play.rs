@@ -2867,6 +2867,24 @@ impl Rig for PlayerRig<'_> {
                     Some(staged) => prep.stage = self.after_image(&mut prep, skin, staged),
                 },
                 PrepStage::Screen(mut pending) => {
+                    // With no coordinator (the direct launch) the BGA job
+                    // runs here, on the game thread, so its video manifest
+                    // reaches the render thread while it prepares the
+                    // attempt, whose movies wait for it (design.md "Load
+                    // Pipeline"); with one, it runs beside since the
+                    // preparation began. A play that does not show the BGA
+                    // sent its empty manifest as the preparation began.
+                    if self.selection.is_none() && self.bga_session.shown() {
+                        let stops = || {
+                            preparation_stops(
+                                self.quitting(),
+                                self.controls.leaving(),
+                                self.input_failure(),
+                                self.audio_failure(),
+                            )
+                        };
+                        self.bga.clone().step(None, &stops);
+                    }
                     match self.poll_screen(&prep, &mut pending, deadline) {
                         None => {
                             prep.stage = PrepStage::Screen(pending);

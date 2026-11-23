@@ -526,3 +526,62 @@ source = [
 ]
 sites = ["crates/skin-model/src/play/bga.rs"]
 tests = ["crates/render/tests/bga.rs::a_layer_video_is_opaque_over_the_base"]
+
+[[entry]]
+id = "SF-025"
+summary = "Every base or layer event naming a video restarts it"
+class = "rule"
+reason = """
+A player sees a chart video start again from its first frame at each base or layer event that names it, a start inside the clip included (design.md "Rendering and Skins", BGA): the start is judged by the event's chart time, not by when a draw first asks for the video."""
+source = [
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:300-316 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/video/FFmpegProcessor.java:331-349 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/movie_frame.rs"]
+tests = [
+    "crates/player/src/movie_frame/tests/chart.rs::a_restart_holds_the_last_frame_until_the_new_run",
+    "crates/player/src/movie_frame/tests/chart.rs::of_starts_crossed_between_frames_the_latest_wins",
+]
+
+[[entry]]
+id = "SF-026"
+summary = "Ids naming one video file share one playhead"
+class = "rule"
+reason = """
+A player sees the base and the layer show the same frame when their ids name one video file, and a start on either restart it for both: one player plays a file however many ids name it (design.md "Rendering and Skins", BGA)."""
+source = [
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:199-210 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:279-283 @beatoraja-0.8.9",
+]
+sites = ["crates/skin-model/src/bga.rs"]
+tests = [
+    "crates/player/src/movie_frame/tests/chart.rs::aliases_on_both_channels_share_one_playhead",
+    "crates/skin-model/tests/bga.rs::chart_files_are_ranked_by_their_first_start_and_capped_at_two",
+]
+
+[[entry]]
+id = "SF-027"
+summary = "A video's channel shows nothing after the clip ends"
+class = "rule"
+reason = """
+A player sees the base's placeholder and nothing on the layer once a chart video's last frame has ended, until its next start (design.md "Rendering and Skins", BGA); here the last frame shows for its duration first."""
+source = [
+    "src/bms/player/beatoraja/video/FFmpegProcessor.java:178-182 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/video/FFmpegProcessor.java:198-200 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:357-369 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/movie_frame.rs"]
+tests = ["crates/player/src/movie_frame/tests/chart.rs::the_end_comes_at_the_last_frame_s_end"]
+
+[[entry]]
+id = "SF-028"
+summary = "A poor frame shows a running video and starts nothing"
+class = "rule"
+reason = """
+A player sees a poor frame naming a chart video show that video's current frame while a run of it has started and not ended, and nothing otherwise: the poor sequence never starts a video (design.md "Rendering and Skins", BGA)."""
+source = [
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:347 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/bga/BGAProcessor.java:349 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/movie_frame.rs"]
+tests = ["crates/player/src/movie_frame/tests/chart.rs::a_video_started_then_replaced_by_a_picture_keeps_running"]

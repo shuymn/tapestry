@@ -180,3 +180,40 @@ fn a_session_not_showing_the_bga_reads_nothing_and_is_ready_unwaited() {
         assert!(matches!(table.entries(), [BgaEntry::Picture(c)] if c.native == [640, 480]));
     });
 }
+
+/// With no coordinator (the direct launch), the BGA job runs while the
+/// render thread prepares the attempt, so its video manifest reaches the
+/// render thread before that preparation answers (design.md "Load
+/// Pipeline"): a screen that answers only once a manifest has come, as a
+/// play's movie set does, is ready well inside its own deadline, with the
+/// chart's video file in the manifest.
+#[test]
+fn direct_play_waits_for_the_manifest() {
+    let _serial = imports::serial();
+    let (dir, l) = crate::imports::facts::tests::loaded_kept(
+        "#BMP01 a.png\n#BMP02 v.mp4\n#00104:0102\n",
+        "tapestry",
+    );
+    crate::bga::tests::png(dir.path(), "a.png", [64, 64], [200, 0, 0]);
+    std::fs::write(dir.path().join("v.mp4"), b"x").unwrap();
+    let screens = Installers::default();
+    screens.wait_manifest.store(true, Ordering::Release);
+    on_rig(l.chart(), &screens, false, |rig| {
+        rig.render
+            .set_timeouts(Duration::from_secs(2), Duration::from_secs(5));
+        let began = Instant::now();
+        let mut h = begin(rig, &l);
+        let ready = polled(rig, &mut h).unwrap();
+        assert_eq!(ready, Preparation::Ready);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(*screens.manifests.lock().unwrap(), [1], "the video's file");
+        let log = screens.log();
+        let manifest = log.iter().position(|l| l.ends_with(" manifest"));
+        let prepared = log.iter().position(|l| l.contains(" prepare "));
+        assert!(manifest.is_some() && prepared.is_some(), "{log:?}");
+    });
+}

@@ -806,6 +806,7 @@ impl ChartVideos {
     /// with no start (only the poor sequences name it) none. Returns each
     /// id's slot and each slot's file.
     #[must_use]
+    // Source: SF-026
     pub fn choose(
         bga: &ChartBga,
         file_of: &[Option<usize>],

@@ -412,6 +412,11 @@ pub struct MenuScreen {
     movies: ScreenMovies,
     /// The play preparation whose movies' readiness is awaited, staged.
     movie_wait: Option<u64>,
+    /// The newest video manifest the BGA job sent, with its BGA
+    /// generation: a play preparation's set of that generation takes it.
+    manifest: Option<(u64, crate::bga::Manifest)>,
+    /// The BGA generation current when a play preparation was last polled.
+    bga_now: u64,
     /// A swap chain's grants in place of the target's (tests: an
     /// offscreen target paced as a window's).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -745,6 +750,8 @@ impl MenuScreen {
             media: None,
             movies: ScreenMovies::new(),
             movie_wait: None,
+            manifest: None,
+            bga_now: 0,
             #[cfg(all(test, feature = "dev-tools"))]
             grants: None,
         }
@@ -757,33 +764,65 @@ impl MenuScreen {
         self
     }
 
-    /// Opens the movies of the play skin an attempt is prepared with for
+    /// Opens the movie set of the play an attempt is prepared with for
     /// preparation `request`, published in loading lifetime `lifetime`,
     /// its own whatever was held before (a practice round and a retry
-    /// included): `skin` staged, else the play skin in use.
+    /// included): the chart's videos from the manifest of the current BGA
+    /// generation, once it is there, and then the movies of `skin` staged,
+    /// else of the play skin in use; a start before `boundary` not counted.
     fn open_play_movies(
         &mut self,
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
         lifetime: Option<u64>,
+        boundary: i64,
     ) {
         let hub = self.media.clone();
         let bundle = skin
             .cloned()
             .or_else(|| self.renderer.installed(ScreenKind::Play).cloned());
+        let bga = self.bga_now;
         self.movies
             .open(Holder::Preparing(request), &mut self.renderer, || {
-                MovieSet::open(
+                let mut set = MovieSet::play(
                     hub.as_ref()?,
-                    ScreenKind::Play,
-                    &bundle?,
+                    bundle,
+                    bga,
+                    boundary,
                     std::time::Instant::now(),
-                )
-                .map(|mut set| {
-                    set.loading = lifetime;
-                    set
-                })
+                );
+                set.loading = lifetime;
+                Some(set)
             });
+        self.offer_manifest();
+    }
+
+    /// Whether the movies of play preparation `request` are settled at
+    /// `now`: its set's manifest taken (or its deadline passed without
+    /// one) and each movie's first frame staged, absent or lost; their
+    /// shows published for the loading frames. True with no set of it.
+    fn play_movies_settled(&mut self, request: u64, now: std::time::Instant) -> bool {
+        let Some((Holder::Preparing(r), m)) = self.movies.get_mut() else {
+            return true;
+        };
+        if r != request {
+            return true;
+        }
+        let chart = m.settle_chart(now);
+        let (settled, shows) = m.movies.prepare(&mut self.renderer, now);
+        // The loading frames draw them too, whichever installation draws
+        // those.
+        self.renderer.set_loading_movies(shows);
+        chart && settled
+    }
+
+    /// The play preparation's set waiting for the manifest held takes it.
+    fn offer_manifest(&mut self) {
+        if let (Some((Holder::Preparing(_), set)), Some((generation, manifest))) =
+            (self.movies.get_mut(), &self.manifest)
+        {
+            set.chart(*generation, Some(manifest));
+        }
     }
 
     /// A frame of selection's entry `lifetime` with the skin `bundle`: a set
@@ -853,11 +892,15 @@ impl MenuScreen {
     /// The play frame's movie hook at `at` on the frame clock
     /// ([`crate::movie_frame`]): what the play screen's movies show.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn play_movies(&mut self, at: i64) -> skin_model::movie::MovieShows {
+    fn play_movies(
+        &mut self,
+        at: i64,
+        chart: crate::movie_frame::ChartAt,
+    ) -> skin_model::movie::MovieShows {
         match self.movies.get_mut() {
             Some((Holder::Playing, m)) => {
                 m.movies
-                    .frame(&mut self.renderer, at, std::time::Instant::now())
+                    .play_frame(&mut self.renderer, at, chart, std::time::Instant::now())
             }
             _ => skin_model::movie::MovieShows::default(),
         }
@@ -1353,24 +1396,18 @@ impl Screen for MenuScreen {
                 }
                 Err(e) => return Some(Err(e)),
             }
-            self.open_play_movies(skin, request, lifetime);
+            // A practice round counts no video start before its lead-in.
+            let boundary = a.section().map_or(i64::MIN, |s| s.start.0 - s.lead_in.0);
+            self.open_play_movies(skin, request, lifetime, boundary);
             self.movie_wait = Some(request);
         }
-        // The movies' readiness (design.md "Threat Model" T02, L5): their
-        // first frames are taken as the polls come, and the answer waits
-        // for each to settle, never past the preparation's deadline.
-        if let Some((Holder::Preparing(r), m)) = self.movies.get_mut()
-            && r == request
-        {
-            let (settled, shows) = m
-                .movies
-                .prepare(&mut self.renderer, std::time::Instant::now());
-            // The loading frames draw them too, whichever installation
-            // draws those.
-            self.renderer.set_loading_movies(shows);
-            if !settled {
-                return None;
-            }
+        // The movies' readiness (design.md "Threat Model" T02, L5; "Load
+        // Pipeline"): the video manifest taken, the chart's videos and then
+        // the skin's opened, their first frames taken as the polls come,
+        // and the answer waits for each to settle, never past the
+        // preparation's deadline.
+        if !self.play_movies_settled(request, std::time::Instant::now()) {
+            return None;
         }
         self.movie_wait = None;
         Some(Ok(Preparation::Ready))
@@ -2244,9 +2281,18 @@ impl Screen for MenuScreen {
     /// ([`crate::movie_frame`]): the play skin's movies' shows for the
     /// build that follows.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn movie_frame(&mut self, at: i64) {
-        let shows = self.play_movies(at);
+    fn movie_frame(&mut self, at: i64, chart: crate::movie_frame::ChartAt) {
+        let shows = self.play_movies(at, chart);
         self.renderer.set_play_movies(shows);
+    }
+
+    fn chart_manifest(&mut self, generation: u64, manifest: crate::bga::Manifest) {
+        self.manifest = Some((generation, manifest));
+        self.offer_manifest();
+    }
+
+    fn bga_generation(&mut self, generation: u64) {
+        self.bga_now = generation;
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

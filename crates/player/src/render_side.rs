@@ -957,8 +957,20 @@ pub trait Screen: Send {
     /// before its [`build`](Self::build) ([`crate::movie_frame`]): it may
     /// upload a movie's frame through wgpu, so it runs outside the frame's
     /// app region and enters its own around the reads. Nothing by default.
-    fn movie_frame(&mut self, at: i64) {
-        let _ = at;
+    fn movie_frame(&mut self, at: i64, chart: crate::movie_frame::ChartAt) {
+        let _ = (at, chart);
+    }
+    /// The attempt's video manifest of BGA generation `generation`, which
+    /// the play preparation's movie set takes
+    /// ([`crate::movie_screen::MovieSet::chart`]). Dropped by default, its
+    /// files closed.
+    fn chart_manifest(&mut self, generation: u64, manifest: crate::bga::Manifest) {
+        let _ = (generation, manifest);
+    }
+    /// The BGA generation current as a play preparation is polled: the
+    /// one whose manifest its movie set takes. Nothing by default.
+    fn bga_generation(&mut self, generation: u64) {
+        let _ = generation;
     }
     /// The skin movies' admission boundary, in each pass that finds no
     /// frame due (no grant held or found, no clock deadline passed),
@@ -9005,7 +9017,17 @@ impl Run {
                     // enters its own around its reads.
                     #[cfg(feature = "dev-tools")]
                     drop(region);
-                    screen.movie_frame(frame_at.0);
+                    screen.movie_frame(
+                        frame_at.0,
+                        crate::movie_frame::ChartAt {
+                            now: now.0,
+                            k: self
+                                .current
+                                .as_ref()
+                                .map_or(bms_model::Speed::NORMAL, |(t, _)| t.speed())
+                                .twentieths(),
+                        },
+                    );
                     #[cfg(feature = "dev-tools")]
                     let region = crate::alloc_count::AppRegion::enter();
                     // The adjustments change anytime and move the notes
@@ -11431,6 +11453,7 @@ impl Run {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
+        screen.bga_generation(self.shared.bga_generation.load(Ordering::SeqCst));
         let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request, p.lifetime);
         // Play's admission released the result's installation: recorded
         // with the staging's request and published before its answer
@@ -11810,6 +11833,17 @@ impl Run {
     fn bga(&mut self, generation: u64, msg: crate::bga::BgaMsg) {
         use crate::bga::BgaMsg;
         let current = self.shared.bga_generation.load(Ordering::SeqCst) == generation;
+        // The attempt's video manifest goes to the screen, whose play set
+        // takes it; one of another generation is dropped, its files closed.
+        let msg = match msg {
+            BgaMsg::Videos(manifest) => {
+                if current && let Some(s) = self.screen.as_mut() {
+                    s.chart_manifest(generation, manifest);
+                }
+                return;
+            }
+            msg => msg,
+        };
         let in_use = current && self.screen.as_ref().is_some_and(|s| s.bga_in_use());
         let stale = render::BgaFault::Stale;
         let msg = match msg {
@@ -11869,6 +11903,7 @@ impl Run {
                     s.drop_bga();
                 }
             }
+            BgaMsg::Videos(_) => {}
         }
     }
 
@@ -20263,6 +20298,11 @@ pub(crate) mod tests {
     }
 
     impl Screen for Installer {
+        fn chart_manifest(&mut self, _generation: u64, manifest: crate::bga::Manifest) {
+            self.note("manifest");
+            let files = manifest.files.iter().flatten().count();
+            self.shared.manifests.lock().unwrap().push(files);
+        }
         fn pool(&self) -> Option<render::PoolLayout> {
             *self.shared.pool.lock().unwrap()
         }
@@ -20332,6 +20372,11 @@ pub(crate) mod tests {
             _lifetime: Option<u64>,
         ) -> Option<Result<Preparation, RenderError>> {
             if self.shared.hold.load(Ordering::Acquire) {
+                return None;
+            }
+            if self.shared.wait_manifest.load(Ordering::Acquire)
+                && self.shared.manifests.lock().unwrap().is_empty()
+            {
                 return None;
             }
             assert!(
@@ -20838,6 +20883,11 @@ pub(crate) mod tests {
     /// their devices numbered from 1.
     #[derive(Clone, Default)]
     pub(crate) struct Installers {
+        /// While set, a play preparation is answered only once a video
+        /// manifest has come, as a play's movie set waits for one.
+        pub(crate) wait_manifest: Arc<AtomicBool>,
+        /// The video manifests that came, each its files' count.
+        pub(crate) manifests: Arc<std::sync::Mutex<Vec<usize>>>,
         /// The screens built so far.
         pub(crate) builds: Arc<AtomicU32>,
         /// What becomes of each end-screen frame, in order, then

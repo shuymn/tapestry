@@ -540,6 +540,7 @@ fn a_lost_panel_draws_one_black_quad_per_element() {
 /// layer start, a tie broken by channel then by the lowest id: aliases of
 /// one file share its slot and its starts, each start once; a third file
 /// and one only the poor sequences name take no slot.
+// Source: SF-026
 #[test]
 fn chart_files_are_ranked_by_their_first_start_and_capped_at_two() {
     // Ids 0 and 1 name file 0, id 2 file 1, id 3 file 2, id 4 file 3 (poor
