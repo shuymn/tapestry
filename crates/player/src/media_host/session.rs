@@ -448,6 +448,8 @@ pub enum Event {
     Closed,
     /// A beat reached the reply queue.
     QueuedBeat,
+    /// Load stage `name` stamped, of load `load`.
+    Stage { name: &'static str, load: u64 },
 }
 
 /// What the session shares with the game's handle.
@@ -491,54 +493,103 @@ macro_rules! event {
 }
 
 /// What the session tells the game's development tools as it goes
-/// (dev-tools): each video it loses, as it sees the loss, and the steps of
-/// the worker's launch and of a chart video's probe, the load's stages.
+/// (dev-tools): each video it loses for its worker, its answers, its
+/// progress, its probe's total or its peer, at the time read just before
+/// the loss was published (a file struck or not handed in is not told),
+/// and the steps of the worker's launch and of a chart video's probe, the
+/// load's stages.
 #[cfg(feature = "dev-tools")]
 pub struct Observer {
-    /// A video lost for `why`, a chart video's when `chart`.
-    pub lost: fn(Loss, bool),
-    /// A load stage reached (`media_launch_start`, …).
-    pub stage: fn(&'static str),
+    /// The development tools' time now, read before a loss is published,
+    /// so the loss's time is never later than a reader's sight of it.
+    pub now: fn() -> Option<i64>,
+    /// A video lost for `why`, a chart video's when `chart`, seen at the
+    /// time `now` read.
+    pub lost: fn(Loss, bool, Option<i64>),
+    /// A load stage reached (`media_launch_start`, …), of the load whose
+    /// stages began as `load` (the value `load` read when the step began).
+    pub stage: fn(&'static str, u64),
+    /// The load whose stages are being stamped now.
+    pub load: fn() -> u64,
 }
 
 /// The development tools' observer, set once by the game (dev-tools).
 #[cfg(feature = "dev-tools")]
 pub static OBSERVER: OnceLock<Observer> = OnceLock::new();
 
-/// Tells the observer, if any, of a video lost for `why`.
+/// The observer's time now, if any.
 #[cfg(feature = "dev-tools")]
-fn observe_lost(why: Loss, chart: bool) {
+fn observe_now() -> Option<i64> {
+    OBSERVER.get().and_then(|o| (o.now)())
+}
+
+/// Tells the observer, if any, of a video lost for `why`, seen at `at`.
+#[cfg(feature = "dev-tools")]
+fn observe_lost(why: Loss, chart: bool, at: Option<i64>) {
     if let Some(o) = OBSERVER.get() {
-        (o.lost)(why, chart);
+        (o.lost)(why, chart, at);
     }
 }
 
-/// Tells the observer, if any, of load stage `name`.
+/// Tells the observer, if any, of load stage `name` of load `load`.
 #[cfg(feature = "dev-tools")]
-fn observe_stage(name: &'static str) {
+fn observe_stage(name: &'static str, load: u64) {
     if let Some(o) = OBSERVER.get() {
-        (o.stage)(name);
+        (o.stage)(name, load);
     }
 }
 
-/// Records a video's loss for `why` (`movie` the video's): a test's event,
-/// and the development tools' observation.
+/// The load the observer stamps now (0 without one): a step's stages are
+/// stamped into the load shown when it began.
+#[cfg(feature = "dev-tools")]
+fn current_load() -> u64 {
+    OBSERVER.get().map_or(0, |o| (o.load)())
+}
+
+/// The load stamped now in a test without the development tools: none.
+#[cfg(all(test, not(feature = "dev-tools")))]
+const fn current_load() -> u64 {
+    0
+}
+
+/// Records a video's loss for `why` (`movie` the video's), published after
+/// the observer's time `$seen` was read: a test's event, and the
+/// development tools' observation.
 macro_rules! lost {
-    ($shared:expr, $movie:expr, $why:expr) => {{
+    ($shared:expr, $movie:expr, $why:expr, $seen:ident) => {{
         #[cfg(any(test, feature = "dev-tools"))]
         let why: Loss = $why;
         event!($shared, Event::Lost { why });
         #[cfg(feature = "dev-tools")]
-        observe_lost(why, $movie.chart);
+        observe_lost(why, $movie.chart, $seen);
     }};
 }
 
-/// Stamps load stage `name` for the development tools.
-macro_rules! stage {
-    ($name:expr) => {
+/// Loses `movie` for `why` by its atomic step and, when that step lost it,
+/// records the loss as [`lost!`] does, the observer's time read before the
+/// step.
+macro_rules! lose {
+    ($shared:expr, $movie:expr, $why:expr) => {{
         #[cfg(feature = "dev-tools")]
-        observe_stage($name);
-    };
+        let seen = observe_now();
+        let why: Loss = $why;
+        if $movie.lose(why) {
+            lost!($shared, $movie, why, seen);
+        }
+    }};
+}
+
+/// Stamps load stage `name` of load `load` (read when the step began,
+/// [`current_load`]): a test's event, and the development tools' stamp,
+/// which a later load's stages do not take.
+macro_rules! stage {
+    ($shared:expr, $name:expr, $load:expr) => {{
+        #[cfg(any(test, feature = "dev-tools"))]
+        let (name, load): (&'static str, u64) = ($name, $load);
+        event!($shared, Event::Stage { name, load });
+        #[cfg(feature = "dev-tools")]
+        observe_stage(name, load);
+    }};
 }
 
 /// The game's handle on the session. Dropping it ends the session without
@@ -728,6 +779,9 @@ struct Player {
     /// The newest run answered sought or played: run 1, played, until a
     /// seek's answer.
     sought: u64,
+    /// The load its open was handed to the worker in (load stages).
+    #[cfg(any(test, feature = "dev-tools"))]
+    load: u64,
 }
 
 /// What a probe said of a video, as its ring is made from it.
@@ -863,6 +917,10 @@ struct Supervisor {
     /// The screen (its generation) whose rings were made last, and the luma
     /// pixels of every ring made for it: the pixel total's charge.
     charged: (u64, u64),
+    /// The load the launch under way was handed to its thread in (load
+    /// stages).
+    #[cfg(any(test, feature = "dev-tools"))]
+    launch_load: u64,
     /// Every ring's creation fails (tests).
     #[cfg(test)]
     ring_fails: bool,
@@ -898,6 +956,8 @@ impl Supervisor {
             inner_rx,
             worker: None,
             launching_now: false,
+            #[cfg(any(test, feature = "dev-tools"))]
+            launch_load: 0,
             marked: false,
             players: Vec::new(),
             dying: Vec::new(),
@@ -994,6 +1054,8 @@ impl Supervisor {
             noted: false,
             held: None,
             sought: 1,
+            #[cfg(any(test, feature = "dev-tools"))]
+            load: 0,
         });
     }
 
@@ -1097,6 +1159,11 @@ impl Supervisor {
 
     /// Starts the launch on a thread of its own.
     fn launch(&mut self) {
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            self.launch_load = current_load();
+        }
+        stage!(self.shared, "media_launch_start", self.launch_load);
         let launching = self.launching.clone();
         let tx = self.inner_tx.clone();
         let spawned = std::thread::Builder::new()
@@ -1107,10 +1174,7 @@ impl Supervisor {
                 let _ = tx.send(Inner::Launched(launched));
             });
         match spawned {
-            Ok(_) => {
-                stage!("media_launch_start");
-                self.launching_now = true;
-            }
+            Ok(_) => self.launching_now = true,
             Err(e) => {
                 self.lose_queued(Loss::Launch);
                 self.notes
@@ -1125,9 +1189,9 @@ impl Supervisor {
             return;
         };
         self.launching_now = false;
+        stage!(self.shared, "media_launch_end", self.launch_load);
         match launched {
             Ok(worker) => {
-                stage!("media_launch_end");
                 self.shared.pid.store(worker.pid(), Ordering::Release);
                 event!(self.shared, Event::Launched { pid: worker.pid() });
                 #[cfg(test)]
@@ -1149,8 +1213,8 @@ impl Supervisor {
     /// Loses every queued player, then drops them, logged.
     fn lose_queued(&mut self, why: Loss) {
         for p in &self.players {
-            if p.stage == Stage::Queued && p.movie.lose(why) {
-                lost!(self.shared, p.movie, why);
+            if p.stage == Stage::Queued {
+                lose!(self.shared, p.movie, why);
             }
         }
         self.note_losses();
@@ -1185,8 +1249,8 @@ impl Supervisor {
     /// logged after.
     fn fail_worker(&mut self, why: Loss) {
         for p in &self.players {
-            if p.stage != Stage::Queued && p.movie.lose(why) {
-                lost!(self.shared, p.movie, why);
+            if p.stage != Stage::Queued {
+                lose!(self.shared, p.movie, why);
             }
         }
         let pid = self.worker.as_ref().map(Worker::pid);
@@ -1245,8 +1309,12 @@ impl Supervisor {
                     p.id = id;
                     p.wait_on(Stage::Opening(open));
                     event!(self.shared, Event::Opened);
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    {
+                        p.load = current_load();
+                    }
                     if p.movie.chart {
-                        stage!("video_probes_start");
+                        stage!(self.shared, "video_probes_start", p.load);
                     }
                 }
                 Err(OpenError::Struck) => {
@@ -1365,6 +1433,19 @@ impl Supervisor {
         };
         #[cfg(any(test, feature = "dev-tools"))]
         let before = p.movie.status();
+        // The open's terminal answer, whatever it says, ends a chart
+        // video's probe.
+        #[cfg(any(test, feature = "dev-tools"))]
+        let probe_answered = p.movie.chart
+            && matches!(
+                (p.stage, outcome),
+                (
+                    Stage::Opening(open),
+                    Outcome::Probed(id) | Outcome::Refused(id) | Outcome::Rejected(id)
+                ) if open == id
+            );
+        #[cfg(feature = "dev-tools")]
+        let seen = observe_now();
         let (stage, then) =
             super::movie::answer(p.stage, &p.movie.cell, generation, outcome, late, p.sought);
         // The screen shown, read again after the answer's step.
@@ -1388,7 +1469,11 @@ impl Supervisor {
         if before != Status::Lost
             && let Some(why) = p.movie.loss()
         {
-            lost!(self.shared, p.movie, why);
+            lost!(self.shared, p.movie, why, seen);
+        }
+        #[cfg(any(test, feature = "dev-tools"))]
+        if probe_answered {
+            stage!(self.shared, "video_probes_end", p.load);
         }
         match then {
             Then::Nothing => Ok(()),
@@ -1416,21 +1501,16 @@ impl Supervisor {
                     matrix,
                     range,
                     ..
-                } => {
-                    if self.players.get(i).is_some_and(|p| p.movie.chart) {
-                        stage!("video_probes_end");
-                    }
-                    self.admit_probe(
-                        i,
-                        Probe {
-                            width,
-                            height,
-                            duration,
-                            matrix,
-                            range,
-                        },
-                    )
-                }
+                } => self.admit_probe(
+                    i,
+                    Probe {
+                        width,
+                        height,
+                        duration,
+                        matrix,
+                        range,
+                    },
+                ),
                 _ => Ok(()),
             },
         }
@@ -1459,10 +1539,8 @@ impl Supervisor {
         };
         if self.late(i, at) {
             self.marked = true;
-            if let Some(p) = self.players.get(i)
-                && p.movie.lose(Loss::Answer)
-            {
-                lost!(self.shared, p.movie, Loss::Answer);
+            if let Some(p) = self.players.get(i) {
+                lose!(self.shared, p.movie, Loss::Answer);
             }
         }
     }
@@ -1484,11 +1562,8 @@ impl Supervisor {
             if matches!(p.stage, Stage::Closing(_)) {
                 event!(self.shared, Event::Closed);
             }
-            if p.movie.generation() == generation
-                && p.movie.status() != Status::Absent
-                && p.movie.lose(Loss::Failed)
-            {
-                lost!(self.shared, p.movie, Loss::Failed);
+            if p.movie.generation() == generation && p.movie.status() != Status::Absent {
+                lose!(self.shared, p.movie, Loss::Failed);
             }
             p.stage = Stage::Idle;
             p.id = 0;
@@ -1529,10 +1604,8 @@ impl Supervisor {
                 Ok(())
             }
             Verdict::Refuse => {
-                if let Some(p) = self.players.get(i)
-                    && p.movie.lose(Loss::OverTotal)
-                {
-                    lost!(self.shared, p.movie, Loss::OverTotal);
+                if let Some(p) = self.players.get(i) {
+                    lose!(self.shared, p.movie, Loss::OverTotal);
                 }
                 self.close(i)
             }
@@ -1695,9 +1768,8 @@ impl Supervisor {
                 if q.movie.chart
                     && q.movie.generation() == generation
                     && matches!(q.movie.status(), Status::Pending | Status::Live)
-                    && q.movie.lose(Loss::Peer)
                 {
-                    lost!(self.shared, q.movie, Loss::Peer);
+                    lose!(self.shared, q.movie, Loss::Peer);
                 }
             }
         }
@@ -1781,9 +1853,7 @@ impl Supervisor {
             let Some(p) = self.players.get(i) else {
                 continue;
             };
-            if p.movie.lose(why) {
-                lost!(self.shared, p.movie, why);
-            }
+            lose!(self.shared, p.movie, why);
             if why == Loss::Answer {
                 // A missed answer on a working transport: the worker is
                 // ended once nothing of it is live.
@@ -1946,6 +2016,7 @@ mod tests {
             noted: false,
             held: None,
             sought: 1,
+            load: 0,
         }
     }
 
@@ -2159,6 +2230,60 @@ mod tests {
             super::super::movie::unwanted(s.players[1].stage, &b.cell, 1),
             "the judgement closes the peer"
         );
+    }
+
+    /// A chart video's probe ends at its open's terminal answer, whatever
+    /// it says: with two chart videos opening, one probed and the other
+    /// refused after it, the probes' end is stamped at each, so the load's
+    /// last end is the refusal's; a skin movie's probe stamps none.
+    #[test]
+    fn the_probes_end_at_a_late_refusal() {
+        let ends = |s: &Supervisor| {
+            s.shared
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e,
+                        Event::Stage {
+                            name: "video_probes_end",
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        let probed = |player: u8| Reply::Probed {
+            id: u32::from(player),
+            player,
+            width: 64,
+            height: 48,
+            duration: 1_000_000,
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
+            codec: String::new(),
+            container: String::new(),
+        };
+        let mut s = supervisor(1);
+        let (a, b, skin) = (Movie::chart(1), Movie::chart(1), Movie::new(1));
+        s.players = vec![opening(&a, 1), opening(&b, 2), opening(&skin, 3)];
+        s.take(Instant::now(), &probed(1)).unwrap();
+        assert_eq!(ends(&s), 1);
+        s.take(Instant::now(), &probed(3)).unwrap();
+        assert_eq!(ends(&s), 1, "a skin movie's probe is not a chart video's");
+        s.take(
+            Instant::now(),
+            &Reply::Refused {
+                id: 2,
+                player: 2,
+                why: skin_model::media::control::Refusal::Codec,
+                code: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(ends(&s), 2, "the late refusal ends the probes");
     }
 
     /// The pixel total takes the chart's videos first, as a play's set

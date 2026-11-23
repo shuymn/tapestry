@@ -261,6 +261,14 @@ pub fn mark(tag: &'static str, v: i64) {
     }
 }
 
+/// Keeps a mark at `at`, a time read earlier on the probe's clock
+/// ([`stamp`]), as the probe's own work ([`mark`]).
+pub fn mark_at(tag: &'static str, at: TimeUs, v: i64) {
+    if REC.on() {
+        render::probe::own(|| REC.mark_at(tag, at, v));
+    }
+}
+
 /// The probe's clock now, the game's, for a mark kept later at this time
 /// ([`opened`]); none with the probe off.
 pub fn stamp() -> Option<TimeUs> {
@@ -354,6 +362,18 @@ pub fn dump() {
     let (marks, unfilled) = REC.marks();
     for (t, tag, v) in marks {
         println!("dev: probe {t} {tag} {v}");
+    }
+    // The probe's clock against QPC, read together: a test puts a QPC time
+    // it read (a fault's injection) on the marks' clock.
+    if let Some(t) = REC.now() {
+        let (mut qpc, mut frequency) = (0, 0);
+        // SAFETY: each writes the local it is given.
+        unsafe {
+            let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut qpc);
+            let _ =
+                windows::Win32::System::Performance::QueryPerformanceFrequency(&raw mut frequency);
+        }
+        println!("dev: probe-clock {qpc} {frequency} {t}");
     }
     let past = REC.dropped();
     println!(

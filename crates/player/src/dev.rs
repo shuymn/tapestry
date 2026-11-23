@@ -3087,12 +3087,17 @@ static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
 /// BGA job's time busy reading and decoding in all (`*_busy`, durations
 /// in µs), which its spans cannot tell apart where the pictures' reads
 /// and decodes alternate. The media session stamps the media worker's
-/// launch, when the load launches one, and its chart videos' probes, from
-/// the first open handed to the worker to the last probe answered.
+/// launch, when the load launches one, from its hand-off to its thread to
+/// the launch's result, and its chart videos' probes, from the first open
+/// handed to the worker to the last open's answer (probed, refused or
+/// rejected); a step stamps only into the load it began in, so one a
+/// later choice left behind stamps nothing into the next.
 #[derive(Debug, Default)]
 struct LoadStages {
     /// The game's clock and the choice's time on it, from the choice on.
     since: Option<(QpcClock, TimeUs)>,
+    /// The choices so far: the load the stamps belong to.
+    load: u64,
     stamps: Vec<(&'static str, i64)>,
     /// READY was stamped: nothing more until the next choice.
     done: bool,
@@ -3100,6 +3105,7 @@ struct LoadStages {
 
 static LOAD_STAGES: Mutex<LoadStages> = Mutex::new(LoadStages {
     since: None,
+    load: 0,
     stamps: Vec::new(),
     done: false,
 });
@@ -3141,6 +3147,7 @@ fn load_stages() -> std::sync::MutexGuard<'static, LoadStages> {
 pub fn stages_begin(clock: QpcClock, chosen: TimeUs) {
     let mut s = load_stages();
     s.since = Some((clock, chosen));
+    s.load = s.load.wrapping_add(1);
     s.stamps.clear();
     s.done = false;
 }
@@ -3148,6 +3155,21 @@ pub fn stages_begin(clock: QpcClock, chosen: TimeUs) {
 /// Stamps stage `name` now.
 pub fn stage(name: &'static str) {
     stage_at(name, None);
+}
+
+/// The load whose stages are stamped now: a step that begins now stamps
+/// into it ([`stage_of`]).
+pub fn current_load() -> u64 {
+    load_stages().load
+}
+
+/// Stamps stage `name` now into load `load`, the one a step began in
+/// ([`current_load`]): nothing when a later choice has begun another, so
+/// a step of a load left behind stamps nothing into the next.
+pub fn stage_of(name: &'static str, load: u64) {
+    if load_stages().load == load {
+        stage_at(name, None);
+    }
 }
 
 /// Stamps stage `name` at `at` (now when `None`): a start keeps its first
@@ -3192,10 +3214,16 @@ pub fn stage_busy(name: &'static str, took: Duration) {
 pub fn observe_media() {
     use crate::media_host::session::{OBSERVER, Observer};
     let _ = OBSERVER.set(Observer {
-        lost: |why, chart| {
-            loop_probe::mark("media:lost", why as i64 + if chart { 256 } else { 0 });
+        now: || loop_probe::stamp().map(|t| t.0),
+        lost: |why, chart, at| {
+            let v = why as i64 + if chart { 256 } else { 0 };
+            match at {
+                Some(at) => loop_probe::mark_at("media:lost", TimeUs(at), v),
+                None => loop_probe::mark("media:lost", v),
+            }
         },
-        stage,
+        stage: stage_of,
+        load: current_load,
     });
 }
 
@@ -3389,6 +3417,30 @@ pub fn refuse_result_staging() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{adler32, crc32, png, read_bounded, read_limited};
+
+    /// A stage stamped for a load a later choice has left behind is not
+    /// kept: a launch handed off for one choice and ended after the next
+    /// stamps nothing into the next's stages, whose own stamps are kept.
+    #[test]
+    fn a_stage_of_an_abandoned_load_is_dropped() {
+        use super::{QpcClock, TimeSource as _, current_load, stage_of, stages_begin};
+        let clock = QpcClock::start();
+        stages_begin(clock, clock.now());
+        let abandoned = current_load();
+        stage_of("media_launch_start", abandoned);
+        stages_begin(clock, clock.now());
+        let load = current_load();
+        assert_ne!(load, abandoned);
+        stage_of("media_launch_end", abandoned);
+        stage_of("video_probes_start", load);
+        stage_of("ready", load);
+        let names: Vec<&str> = super::take_load_stages()
+            .unwrap()
+            .iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, ["video_probes_start", "ready"]);
+    }
 
     /// A frame's spans count each part once: the preparation before the
     /// wait and the window up to the build less the runtime, the runtime,
