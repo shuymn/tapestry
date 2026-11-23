@@ -926,6 +926,13 @@ impl PlayerRig<'_> {
         let mut adjust = self.adjust.take();
         let rig = &*self;
         let answered = pending.wait_until(Some(until), || {
+            // With a coordinator, the BGA job begins as soon as the job of
+            // the choice before ends, so its video manifest reaches the
+            // render thread while the attempt's movies still wait for it
+            // (design.md "Load Pipeline"); the direct launch ran it above.
+            if let Some(s) = &rig.selection {
+                rig.bga.step(Some((&s.coord, s.spawner)), &|| false);
+            }
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
@@ -2872,8 +2879,10 @@ impl Rig for PlayerRig<'_> {
                     // reaches the render thread while it prepares the
                     // attempt, whose movies wait for it (design.md "Load
                     // Pipeline"); with one, it runs beside since the
-                    // preparation began. A play that does not show the BGA
-                    // sent its empty manifest as the preparation began.
+                    // preparation began, or begins while this stage waits
+                    // once the job of the choice before ends. A play that
+                    // does not show the BGA sent its empty manifest as the
+                    // preparation began.
                     if self.selection.is_none() && self.bga_session.shown() {
                         let stops = || {
                             preparation_stops(
