@@ -545,13 +545,19 @@ impl ScreenMovies {
     }
 
     /// The play preparation's set held, waiting for the manifest kept,
-    /// takes it ([`MovieSet::chart`]): the chart's videos it took.
-    pub fn offer(&mut self) -> Option<Arc<skin_model::bga::ChartVideos>> {
+    /// takes it at `now` ([`MovieSet::chart`]) unless [`MANIFEST_WAIT`] has
+    /// passed by then, on the clock [`MovieSet::settle_chart`] reads: its
+    /// skin's movies then open alone, as at the first poll past the wait.
+    /// The chart's videos it took.
+    pub fn offer(&mut self, now: Instant) -> Option<Arc<skin_model::bga::ChartVideos>> {
         let (Some((Holder::Preparing(_), set)), Some((generation, manifest))) =
             (&mut self.held, &self.manifest)
         else {
             return None;
         };
+        if set.settle_chart(now) {
+            return None;
+        }
         set.chart(*generation, Some(manifest))
     }
 

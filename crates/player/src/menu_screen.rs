@@ -784,19 +784,14 @@ impl MenuScreen {
         let bga = self.bga_now;
         self.renderer
             .set_chart_videos(skin_model::bga::ChartVideos::default());
+        let start = std::time::Instant::now();
         self.movies
             .open(Holder::Preparing(request), &mut self.renderer, || {
-                let mut set = MovieSet::play(
-                    hub.as_ref()?,
-                    bundle,
-                    bga,
-                    boundary,
-                    std::time::Instant::now(),
-                );
+                let mut set = MovieSet::play(hub.as_ref()?, bundle, bga, boundary, start);
                 set.loading = lifetime;
                 Some(set)
             });
-        self.offer_manifest();
+        self.offer_manifest(start);
     }
 
     /// Whether the movies of play preparation `request` are settled at
@@ -818,12 +813,25 @@ impl MenuScreen {
         chart && settled
     }
 
-    /// The play preparation's set waiting for the manifest held takes it,
-    /// and the attempt's play, in the skin in use and the one staged, draws
-    /// its chart videos from the slots it names (design.md "Rendering and
+    /// The attempt's video manifest of BGA generation `generation` comes
+    /// at `now`: kept, and offered to the play preparation's set.
+    fn chart_manifest_at(
+        &mut self,
+        generation: u64,
+        manifest: crate::bga::Manifest,
+        now: std::time::Instant,
+    ) {
+        self.movies.keep_manifest(generation, manifest);
+        self.offer_manifest(now);
+    }
+
+    /// The play preparation's set waiting for the manifest held takes it
+    /// at `now`, within its wait ([`ScreenMovies::offer`]), and the
+    /// attempt's play, in the skin in use and the one staged, draws its
+    /// chart videos from the slots it names (design.md "Rendering and
     /// Skins", BGA).
-    fn offer_manifest(&mut self) {
-        if let Some(videos) = self.movies.offer() {
+    fn offer_manifest(&mut self, now: std::time::Instant) {
+        if let Some(videos) = self.movies.offer(now) {
             self.renderer.set_chart_videos((*videos).clone());
         }
     }
@@ -2293,8 +2301,7 @@ impl Screen for MenuScreen {
     }
 
     fn chart_manifest(&mut self, generation: u64, manifest: crate::bga::Manifest) {
-        self.movies.keep_manifest(generation, manifest);
-        self.offer_manifest();
+        self.chart_manifest_at(generation, manifest, std::time::Instant::now());
     }
 
     fn bga_generation(&mut self, generation: u64) {

@@ -1032,6 +1032,33 @@ fn the_manifest_is_waited_for_half_the_deadline() {
     assert_eq!(hub.asked().len(), asked);
 }
 
+/// A manifest that comes past the 1.5 s wait, before the poll that would
+/// find the wait over (design.md "Load Pipeline", movies at READY), opens
+/// no chart video: the skin's movie opens alone, as at that poll, and the
+/// set no longer waits.
+#[test]
+fn a_manifest_past_the_wait_before_its_poll_opens_no_chart_video() {
+    use std::time::{Duration, Instant};
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    let before = Instant::now();
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    let after = Instant::now();
+    assert!(!s.play_movies_settled(1, before + Duration::from_millis(1_490)));
+    assert!(hub.asked().is_empty(), "nothing opened while it waits");
+    s.chart_manifest_at(
+        0,
+        manifest_with(dir.path(), 1, &[0]),
+        after + Duration::from_millis(1_510),
+    );
+    let g = held_generation(&s);
+    assert_eq!(hub.asked(), [(g, false, true)], "the skin's movie alone");
+    assert_eq!(s.movies.get().unwrap().1.awaits(), None, "no longer waits");
+}
+
 /// The manifest a screen keeps goes with its play (its files closed):
 /// a preparation cancelled before its commit leaves it for the next
 /// preparation of the same BGA generation, which reads nothing again and
