@@ -1238,8 +1238,13 @@ impl ResultSkin {
             return None;
         }
         claim.promote();
+        // The adoption's mark before the hold it releases: the held pack's
+        // `pre:hold_released` cannot come first (dev-tools).
         #[cfg(feature = "dev-tools")]
-        gaps::adopted(run.id);
+        {
+            crate::dev::loop_probe::mark("img:adopted", i64::try_from(run.id).unwrap_or(-1));
+            gaps::adopted(run.id);
+        }
         log::info!("skin: result: the attempt adopts preload {}", run.id);
         Some(Adopted {
             id: run.id,

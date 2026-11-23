@@ -32,6 +32,9 @@ pub const BOUND_US: i64 = 50_000;
 pub const ADMIT: u8 = 20;
 /// The job's end: its last stretch's end.
 pub const END: u8 = 21;
+/// A checkpoint asked at no known site: the last code of `pre:visits`'
+/// site bits, below [`KIND_SHIFT`], so its visit sets no kind's bit.
+pub const NONE: u8 = 27;
 
 /// The site names of the marks and of `hold-preload`, by code.
 pub const SITES: [(&str, u8); 23] = [
@@ -57,7 +60,7 @@ pub const SITES: [(&str, u8); 23] = [
     ("Take", 19),
     ("Admit", 20),
     ("End", 21),
-    ("None", 31),
+    ("None", NONE),
 ];
 
 /// The code of site `name`.
@@ -103,7 +106,7 @@ pub fn ask(check: &dyn Fn() -> bool, site: super::StepSite) -> bool {
 pub fn site_now() -> u8 {
     STEP.with(Cell::get)
         .or_else(skin_model::dev::last_site)
-        .unwrap_or(31)
+        .unwrap_or(NONE)
 }
 
 /// One stretch's state.
@@ -389,6 +392,8 @@ pub fn release_on_adopt() {
 pub fn adopted(id: u64) {
     if ON_ADOPT.load(Ordering::SeqCst) && HELD.load(Ordering::SeqCst) == id {
         RELEASED.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        super::preload::tests::after_adopt_release();
     }
 }
 
@@ -417,11 +422,15 @@ pub fn engage(id: u64, site: u8, after: bool) {
     if !due {
         return;
     }
-    HELD.store(id, Ordering::SeqCst);
+    // Marked before it is published: whoever sees the hold ([`held`])
+    // finds its `pre:hold` already there.
     loop_probe::mark("pre:hold", pair(id, i64::from(site)));
     if loop_probe::on() {
         println!("dev: pre:hold {id} {site}");
     }
+    HELD.store(id, Ordering::SeqCst);
+    #[cfg(test)]
+    super::preload::tests::after_hold_store();
     let began = Instant::now();
     while !RELEASED.load(Ordering::SeqCst) {
         if began.elapsed() > HOLD_BOUND {

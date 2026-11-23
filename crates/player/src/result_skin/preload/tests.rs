@@ -186,6 +186,28 @@ pub(super) fn after_seen() {
     }
 }
 
+/// Run on the pack's thread right after a hold is published, before it
+/// waits (E25).
+pub(super) static AFTER_HOLD_STORE: Mutex<Option<fn()>> = Mutex::new(None);
+
+pub(in crate::result_skin) fn after_hold_store() {
+    let hook = *AFTER_HOLD_STORE.lock().unwrap();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run on the game thread right after an adoption lets its hold go
+/// (E25).
+pub(super) static AFTER_ADOPT_RELEASE: Mutex<Option<fn()>> = Mutex::new(None);
+
+pub(in crate::result_skin) fn after_adopt_release() {
+    let hook = *AFTER_ADOPT_RELEASE.lock().unwrap();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// The cycle counts a test's source answers in turn (E24), in place of
 /// the thread's.
 pub(crate) static CYCLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());

@@ -1765,8 +1765,6 @@ impl ResultSkin {
         // A pack that ended is collected first: packed, it is reused below.
         self.collect_preload(std::time::Duration::ZERO);
         if let Some(adopted) = self.adopt_preload(claim) {
-            #[cfg(feature = "dev-tools")]
-            crate::dev::loop_probe::mark("img:adopted", i64::try_from(adopted.id()).unwrap_or(-1));
             return ImageStage::Adopted(Box::new(ImageJob(InFlight::Adopted(adopted))));
         }
         self.attempt_stage()

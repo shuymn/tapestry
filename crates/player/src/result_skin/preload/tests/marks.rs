@@ -471,3 +471,107 @@ fn a_pack_held_at_its_first_asks_stops_with_no_build() {
         collected(&mut rs, &coord);
     }
 }
+
+/// Whether the test thread has looked at a published hold (E25).
+static LOOKED: AtomicBool = AtomicBool::new(false);
+/// The marks' index at an adoption test's start (E25).
+static ADOPT_FROM: Mutex<usize> = Mutex::new(0);
+
+/// Clears E25's hooks, also when an assertion fails.
+struct Hooks;
+
+impl Drop for Hooks {
+    fn drop(&mut self) {
+        *super::AFTER_HOLD_STORE.lock().unwrap() = None;
+        *super::AFTER_ADOPT_RELEASE.lock().unwrap() = None;
+        LOOKED.store(true, SeqCst);
+        gaps::release();
+    }
+}
+
+/// A hold is marked before it is published: whoever finds the pack held
+/// finds its `pre:hold` already marked (E25). The pack waits right after
+/// the publication until the test has looked.
+#[test]
+fn a_hold_is_marked_before_it_is_published() {
+    let _s = crate::imports::tests::serial();
+    let _h = Hooks;
+    let from = start();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    fn looked() {
+        until("the test's look at the hold", || LOOKED.load(SeqCst));
+    }
+    LOOKED.store(false, SeqCst);
+    *super::AFTER_HOLD_STORE.lock().unwrap() = Some(looked);
+    gaps::hold(HoldAt::parse("PlanRects:1:after").unwrap());
+    look(&mut rs, &coord, true);
+    until("the hold", || gaps::held().is_some());
+    let marked = marks(from, "pre:hold").len();
+    LOOKED.store(true, SeqCst);
+    gaps::release();
+    collected(&mut rs, &coord);
+    assert_eq!(marked, 1, "pre:hold not marked when the hold was seen");
+}
+
+/// An adoption is marked before the hold it lets go: the held pack's
+/// `pre:hold_released` follows `img:adopted` (E25). The game thread waits
+/// right after the release until the pack has marked its end.
+#[test]
+fn an_adoption_is_marked_before_its_hold_is_let_go() {
+    let _s = crate::imports::tests::serial();
+    let _h = Hooks;
+    let from = start();
+    *ADOPT_FROM.lock().unwrap() = from;
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    gaps::hold(HoldAt::parse("PlanEnd:1:after").unwrap());
+    gaps::release_on_adopt();
+    look(&mut rs, &coord, true);
+    until("the hold", || gaps::held().is_some());
+    let claim = rs.preload_control().unwrap().claim();
+    fn released() {
+        let from = *ADOPT_FROM.lock().unwrap();
+        until("the hold's end", || {
+            !marks(from, "pre:hold_released").is_empty()
+        });
+    }
+    *super::AFTER_ADOPT_RELEASE.lock().unwrap() = Some(released);
+    let crate::result_skin::ImageStage::Adopted(mut job) = rs.begin_image_stage(
+        crate::result_skin::tests::chart(),
+        Some(skin_beatoraja::JudgeClass::Normal),
+        Some(claim),
+    ) else {
+        panic!("not adopted");
+    };
+    *super::AFTER_ADOPT_RELEASE.lock().unwrap() = None;
+    let staged = rs.poll_image_stage(&mut job, None, || false, || false);
+    assert_eq!(staged, Some(crate::result_skin::Staged::Ready));
+    let order: Vec<&str> = all(from)
+        .iter()
+        .map(|m| m.1)
+        .filter(|t| matches!(*t, "img:adopted" | "pre:hold_released"))
+        .collect();
+    assert_eq!(order, ["img:adopted", "pre:hold_released"]);
+}
+
+/// A checkpoint at no known site is a site's visit in `pre:visits`, never
+/// an unchecked kind's (E25).
+#[test]
+fn a_visit_at_no_known_site_sets_no_kind() {
+    let _s = crate::imports::tests::serial();
+    let from = start();
+    gaps::admit(9);
+    gaps::bracket_in(gaps::NONE);
+    gaps::bracket_out(gaps::NONE);
+    gaps::finish();
+    let v = marks(from, "pre:visits");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert_eq!(v[0].1, 9);
+    assert_eq!(v[0].2 >> gaps::KIND_SHIFT, 0, "a kind's bit: {:b}", v[0].2);
+    assert_ne!(v[0].2 & 1 << gaps::NONE, 0, "the visit: {:b}", v[0].2);
+}
