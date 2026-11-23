@@ -99,6 +99,14 @@ fn an_admitted_pack_marks_its_admission_and_its_work() {
         .map(|m| co(m.1 << 40 | m.2))
         .collect();
     assert!(takes.contains(&(task, 2)), "{takes:?} for task {task}");
+    // After the admission: the job's own take comes first.
+    let seen = all(from);
+    let job_take = seen
+        .iter()
+        .position(|m| m.1 == "co:take" && co(m.2).0 == task)
+        .unwrap();
+    let admit_at = seen.iter().position(|m| m.1 == "pre:admit").unwrap();
+    assert!(job_take < admit_at, "pre:admit before its take");
     assert_eq!(marks(from, "pre:build").len(), 1, "one build");
     let visits = marks(from, "pre:visits");
     assert_eq!(visits.len(), 1);
