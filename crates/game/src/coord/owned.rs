@@ -212,6 +212,10 @@ impl Coordinator {
                 slot: Some(any_slot),
                 holds: None,
                 revoked: false,
+                #[cfg(any(test, feature = "dev-tools"))]
+                wait: None,
+                #[cfg(any(test, feature = "dev-tools"))]
+                retry: false,
             },
         );
         state.keys.insert(key, id);
