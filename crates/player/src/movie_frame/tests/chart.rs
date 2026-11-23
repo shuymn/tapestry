@@ -434,3 +434,48 @@ fn an_absent_chart_file_starts_no_peer_loss() {
     assert!(matches!(shows[3], MovieShow::Frame { .. }));
     assert_eq!(peer.loss(), None);
 }
+
+/// A take of the run's last frame the planes refuse leaves that frame in
+/// the ring: the run, its end reported, plays on with the frame before
+/// held, and the next frame takes the last one, which then shows.
+#[test]
+fn retries_refused_final_upload() {
+    let mut p = Play::new(&[0], i64::MIN);
+    assert!(frame(p.at(0)));
+    p.publish(1, FIRST + P, 2);
+    p.a.ended.store(1, Ordering::SeqCst);
+    p.planes.refuse = true;
+    assert!(
+        frame(p.at(P)),
+        "the frame before held, the last one untaken"
+    );
+    assert!(holds(&p.planes, 2, 1));
+    p.planes.refuse = false;
+    assert!(frame(p.at(P + 1)), "the last frame taken");
+    assert!(holds(&p.planes, 2, 2));
+    assert!(!frame(p.at(2 * P)), "its end");
+}
+
+/// A start drawn after the run before had ended (its end reported and its
+/// last frame's end passed by the start's time, with no frame drawn in
+/// between) holds nothing: the panel shows the new run's frames only. A run
+/// whose ring still holds a frame due after the start's time was playing
+/// then, so its frame is held.
+#[test]
+fn late_restart_does_not_hold_expired_run() {
+    let mut p = Play::new(&[0, 1_000_000], i64::MIN);
+    p.a.ended.store(1, Ordering::SeqCst);
+    assert!(frame(p.at(0)));
+    assert!(!frame(p.at(1_000_000)), "ended at 40 ms, nothing held");
+    assert_eq!(p.a.want.load(Ordering::SeqCst), 2, "restarted");
+    p.publish(2, FIRST, 20);
+    assert!(frame(p.at(1_010_000)));
+    assert!(holds(&p.planes, 2, 20), "the new run's first frame");
+    // The control: a frame of run 1 due after the start's time.
+    let mut p = Play::new(&[0, 1_000_000], i64::MIN);
+    p.publish(1, FIRST + 2_000_000, 3);
+    p.a.ended.store(1, Ordering::SeqCst);
+    assert!(frame(p.at(0)));
+    assert!(frame(p.at(1_000_000)), "still playing at the start: held");
+    assert!(holds(&p.planes, 2, 1));
+}

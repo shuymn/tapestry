@@ -272,6 +272,34 @@ fn chart_due(first: i64, start: i64, at: ChartAt) -> i64 {
     i64::try_from(due).unwrap_or(if due < 0 { i64::MIN } else { i64::MAX })
 }
 
+/// Whether run `run`, its end reported, had ended by media time `due`, as a
+/// frame drawn at that time would have judged it: the ring holds no frame
+/// of the run newer than the one due then, and that frame, or `held` when
+/// none is due, lasts no further than `due`; a run with no frame ended at
+/// once. A peek that fails leaves the run playing: the next peek returns
+/// the fault. `freed` is set when the peek freed slots. Allocates nothing.
+fn ended_by<W: skin_model::media::Words + ?Sized>(
+    reader: &mut Reader,
+    ring: &W,
+    held: Option<Held>,
+    run: u64,
+    due: i64,
+    freed: &mut bool,
+) -> bool {
+    let Ok(peek) = reader.peek(ring, due) else {
+        return false;
+    };
+    *freed |= peek.freed;
+    if peek.left {
+        return false;
+    }
+    let last = peek
+        .due
+        .map(|d| (d.stamp(), d.duration()))
+        .or_else(|| held.filter(|h| h.run == run).map(|h| (h.stamp, h.duration)));
+    last.is_none_or(|(stamp, duration)| due >= stamp.saturating_add(duration))
+}
+
 /// Where a movie's clock stands (design.md "Skin movies").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Clock {
@@ -395,11 +423,6 @@ impl<S: Source> Movies<S> {
         {
             *slot = Slot::new(Some(movie));
         }
-    }
-
-    /// The screen's preparation deadline.
-    pub const fn deadline(&self) -> Instant {
-        self.deadline
     }
 
     /// The chart's videos' starts (`videos`, by slot) and the attempt's
@@ -821,6 +844,8 @@ impl<S: Source> Movies<S> {
         // run's end: read first, so the peek below sees them all.
         let ended = movie.ended();
         let empty = movie.empty();
+        let first = slot.first.unwrap_or(0);
+        let mut freed = false;
         let (due, peeked) = {
             #[cfg(feature = "dev-tools")]
             let _region = crate::alloc_count::AppRegion::enter();
@@ -848,8 +873,20 @@ impl<S: Source> Movies<S> {
                         | Chart::Restarting { .. }
                         | Chart::Ended) => {
                             let hold = match before {
-                                Chart::Playing { run, .. } => {
+                                // Held only while the run before still
+                                // plays at the new start: its end judged by
+                                // the start's time, not this frame's.
+                                Chart::Playing { run, start } => {
                                     slot.held.is_some_and(|h| h.run == run)
+                                        && !(ended == run
+                                            && ended_by(
+                                                reader,
+                                                live.words,
+                                                slot.held,
+                                                run,
+                                                chart_due(first, start, ChartAt { now: e, ..at }),
+                                                &mut freed,
+                                            ))
                                 }
                                 Chart::Restarting { hold, .. } => hold,
                                 _ => false,
@@ -885,7 +922,6 @@ impl<S: Source> Movies<S> {
                     *wakes += 1;
                 }
             }
-            let first = slot.first.unwrap_or(0);
             let (pick, due) = match (slot.chart, at) {
                 (Chart::Unstaged | Chart::Waiting { staged: false, .. }, _) => (None, None),
                 (Chart::Playing { start, .. } | Chart::Restarting { start, .. }, Some(at)) => {
@@ -905,10 +941,14 @@ impl<S: Source> Movies<S> {
             movie.lose(Loss::Fault);
             return MovieShow::Lost;
         };
-        if peek.freed {
+        if peek.freed || freed {
             movie.freed(reader.freed());
         }
+        // Whether a frame of the run stays in the ring: one newer than the
+        // frame due, or the frame due itself while its take is refused.
+        let mut left = peek.left;
         if let Some(d) = peek.due {
+            left = true;
             let mut took = None;
             let words = live.words;
             let written = planes.write(layer, width, height, &mut |sink, pitch| {
@@ -925,6 +965,7 @@ impl<S: Source> Movies<S> {
                     return MovieShow::Lost;
                 }
                 Some(Some((stamp, duration))) => {
+                    left = peek.left;
                     movie.freed(reader.freed());
                     if written {
                         slot.shown = true;
@@ -971,7 +1012,7 @@ impl<S: Source> Movies<S> {
         if let (Chart::Playing { run, .. } | Chart::Restarting { run, .. }, Some(due)) =
             (slot.chart, due)
             && ended == run
-            && !peek.left
+            && !left
         {
             let done = match slot.held {
                 Some(h) if h.run == run => due >= h.stamp.saturating_add(h.duration),
