@@ -42,7 +42,7 @@ pub mod verdict;
 pub mod watch;
 pub mod writer;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -172,7 +172,9 @@ pub struct Hello {
     pub configuration: String,
 }
 
-pub use verdict::EXIT_HUNG;
+/// The exit code of a worker the game ended for a hang: a missed deadline,
+/// a stuck command write, a stalled decoder or no heartbeat.
+pub const EXIT_HUNG: u32 = 0xC0DE_0004;
 
 /// How long a dropped worker has to end on its own before its job closes.
 const QUIT_GRACE_MS: u32 = 500;
@@ -201,6 +203,9 @@ pub struct Worker {
     watch: Option<Watch>,
     /// Where each player id stands, from the replies the game took.
     players: RefCell<Players<FileId>>,
+    /// The game's termination for a hang ([`Self::terminate_hung`]) was
+    /// accepted, the worker's process not ended when the game looked.
+    hung: Cell<bool>,
     /// The id of the next command: never 0, which no command has.
     next_id: u32,
     /// The window station and desktop the worker runs on, kept while it
@@ -273,25 +278,20 @@ impl Worker {
         self.commands.as_ref().map(writer::Writer::transport)
     }
 
-    /// Ends the worker's job for a hang ([`EXIT_HUNG`]), without waiting,
-    /// through its watcher ([`Watch::hang`]), which records the end as the
-    /// game's ([`End::Hung`]) only when its termination was accepted and the
-    /// worker ended with its code; [`Worker::reap`] strikes its files either
-    /// way. A watcher that cannot be asked leaves the job to be ended here,
-    /// an end then recorded as the worker's own.
+    /// Terminates the worker's job for a hang ([`EXIT_HUNG`]), without
+    /// waiting and without its watcher, unless its process has ended
+    /// already; a termination the system accepts is recorded here, for
+    /// [`Worker::reap`]. A process that has ended is the worker's own end,
+    /// whatever its code: nothing is terminated or recorded.
     pub fn terminate_hung(&self) {
-        let asked = match self.watch.as_ref().map(Watch::hang) {
-            Some(Ok(())) => true,
-            Some(Err(e)) => {
-                log::warn!("media worker: its watcher could not be asked to end it ({e})");
-                false
-            }
-            None => false,
-        };
-        if !asked && let Some(job) = &self.job {
+        if self.exited() {
+            return;
+        }
+        if let Some(job) = &self.job {
             // SAFETY: the worker's job, which this value holds.
-            if let Err(e) = unsafe { TerminateJobObject(job.0, EXIT_HUNG) } {
-                log::warn!("media worker: its job could not be ended for a hang ({e})");
+            match unsafe { TerminateJobObject(job.0, EXIT_HUNG) } {
+                Ok(()) => self.hung.set(true),
+                Err(e) => log::warn!("media worker: its job could not be ended for a hang ({e})"),
             }
         }
     }
@@ -462,9 +462,10 @@ impl Worker {
     }
 
     /// Player `player`, whose close is sent, was closed for a reason that
-    /// is not its file's (its peer's loss): if the game terminates the
-    /// worker ([`Self::terminate_hung`]) before the close is answered, its
-    /// file gets no strike; if the worker ends on its own, it does.
+    /// is not its file's (its peer's loss): if the game's termination
+    /// ([`Self::terminate_hung`]) ends the worker before the close is
+    /// answered, its file gets no strike; if the worker ends on its own, it
+    /// does.
     pub fn spare(&mut self, player: u8) {
         self.players.get_mut().spare(player);
     }
@@ -474,8 +475,12 @@ impl Worker {
     /// are taken here, then each player of the worker fails, passed to
     /// `failed`, and each file open in it gets one strike, however many of
     /// its players had it open, but a spared player's ([`Self::spare`])
-    /// when the game's termination for a hang ended it ([`End::Hung`]):
-    /// its exit code alone proves nothing. `None` until then.
+    /// when the game's termination ended it: the game's termination for a
+    /// hang was accepted ([`Self::terminate_hung`]) and the worker ended
+    /// with its code ([`EXIT_HUNG`]). That code alone proves nothing, and a
+    /// worker that ends by itself with it after the game looked and before
+    /// its termination was accepted is taken for the game's termination.
+    /// `None` until then.
     pub fn reap(&mut self, strikes: &mut Strikes, failed: impl FnMut(u8)) -> Option<End> {
         let end = self.end()?;
         loop {
@@ -485,7 +490,7 @@ impl Worker {
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        let terminated = end == End::Hung;
+        let terminated = self.hung.get() && end == End::Exited(EXIT_HUNG);
         let (files, players) = self.players.get_mut().clear(terminated);
         for file in files {
             strikes.strike(file);

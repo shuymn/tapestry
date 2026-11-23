@@ -2,8 +2,8 @@
 //! ended (design.md "Threat Model" T02), checked over every ordering within
 //! a bound: the host's player states (`media_host::players`) against a
 //! model of the worker, and the watcher's verdict
-//! (`media_host::verdict`) against every order of its message, reads, the
-//! game's hang, terminations and the worker's end.
+//! (`media_host::verdict`) against every order of its message, reads,
+//! terminations and the worker's end.
 //!
 //! The worker's model follows `tapestry-media`'s control loop and player
 //! threads: the control loop reads the commands in order, rejects an open
@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use players::Players;
 use skin_model::media::control::{Failure, Refusal, Reply};
-use verdict::{Cause, ENDED_AT_LINE, ENDED_BY_MESSAGE, EXIT_HUNG, End, Verdict};
+use verdict::{Cause, ENDED_AT_LINE, ENDED_BY_MESSAGE, End, Verdict};
 
 /// A file, by a number of the test's.
 type File = u8;
@@ -409,19 +409,18 @@ const CRASH: u32 = 0xc000_0005;
 const LINE: usize = 448;
 
 /// Every ordering, up to `depth` more events, of the job's message, a read
-/// below or at the line, the game's hang, a read while a termination is
-/// pending (asking again) and each termination's acceptance or refusal,
-/// then the worker's end, each checked: how many ends. `accepted` is the cause of the first
+/// below or at the line, a read while a termination is pending (asking
+/// again) and each termination's acceptance or refusal, then the worker's
+/// end, each checked: how many ends. `accepted` is the cause of the first
 /// termination the system accepted, as the test itself counts it.
 fn verdicts(v: Verdict, accepted: Option<Cause>, depth: usize, trace: &mut Vec<String>) -> usize {
     let mut ends = 0;
     // The worker ends: by the watcher's accepted termination, or by
-    // itself with a crash's code or any of the watcher's.
+    // itself with a crash's code or either of the watcher's.
     let mut truths = vec![
         Truth::Own(CRASH),
         Truth::Own(ENDED_BY_MESSAGE),
         Truth::Own(ENDED_AT_LINE),
-        Truth::Own(EXIT_HUNG),
     ];
     if let Some(cause) = accepted {
         truths.push(Truth::Ours(cause));
@@ -435,12 +434,10 @@ fn verdicts(v: Verdict, accepted: Option<Cause>, depth: usize, trace: &mut Vec<S
         let proven = match end {
             End::Message => accepted == Some(Cause::Message) && code == ENDED_BY_MESSAGE,
             End::Line => accepted == Some(Cause::Line) && code == ENDED_AT_LINE,
-            End::Hung => accepted == Some(Cause::Hang) && code == EXIT_HUNG,
             End::Exited(c) => {
                 c == code
                     && !matches!(truth, Truth::Ours(_))
-                    && ambiguous
-                        == (code == ENDED_BY_MESSAGE || code == ENDED_AT_LINE || code == EXIT_HUNG)
+                    && ambiguous == (code == ENDED_BY_MESSAGE || code == ENDED_AT_LINE)
             }
         };
         assert!(
@@ -478,16 +475,6 @@ fn verdicts(v: Verdict, accepted: Option<Cause>, depth: usize, trace: &mut Vec<S
             trace.pop();
         }
     }
-    // The game's hang, the worker's process not ended yet.
-    let mut next = v;
-    match next.hang() {
-        Some(cause) => ends += attempt(next, cause, "hang", trace),
-        None => {
-            trace.push("hang, a cause asked already".to_owned());
-            ends += verdicts(next, accepted, depth - 1, trace);
-            trace.pop();
-        }
-    }
     match v.requested() {
         // The watcher waits on the process, and asks again at each read.
         Some(cause) => ends += attempt(v, cause, "read, asking again", trace),
@@ -510,11 +497,11 @@ fn verdicts(v: Verdict, accepted: Option<Cause>, depth: usize, trace: &mut Vec<S
 
 // Covers: T02
 #[test]
-fn a_watcher_end_is_recorded_only_when_proven_in_every_ordering() {
+fn a_memory_end_is_recorded_only_when_proven_in_every_ordering() {
     // The bound: six events before the end, each of the job's message, a
     // read below or at the line (or, once a termination is asked for, a
-    // read that asks again), the game's hang and each termination accepted
-    // or refused, and every way the worker can end after each.
+    // read that asks again) and each termination accepted or refused, and
+    // every way the worker can end after each.
     let ends = verdicts(Verdict::default(), None, 6, &mut Vec::new());
     eprintln!("{ends} ends checked");
     assert!(ends > 1_000, "{ends}");

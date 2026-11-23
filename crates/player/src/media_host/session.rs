@@ -45,12 +45,12 @@
 //!   whole worker.
 //!
 //! A failure of the whole worker loses every one of its players first, each
-//! by one atomic step that writes nothing else, then has its job ended for
-//! a hang ([`Worker::terminate_hung`]) and reaps it: the files it had open
-//! get their strikes, but for a file the session was closing because its
-//! peer was lost ([`Loss::Peer`]): a worker the game's termination ended,
-//! by the watcher's proof, does not strike it; one that ended on its own
-//! does, whatever its exit code. The next video a screen
+//! by one atomic step that writes nothing else, then has its job
+//! terminated for a hang ([`Worker::terminate_hung`]), directly, and reaps
+//! it: the files it had open get their strikes, but for a file the session
+//! was closing because its peer was lost ([`Loss::Peer`]): a worker the
+//! game's accepted termination ended, with its code, does not strike it;
+//! one that ended on its own does, whatever its exit code. The next video a screen
 //! needs launches a new worker. The launch runs on a thread of its own, so a launch held up
 //! (another launch staging its copies) holds neither the game nor the
 //! session.
@@ -391,7 +391,9 @@ pub enum Event {
     Launched { pid: u32 },
     /// A video lost, for `why`.
     Lost { why: Loss },
-    /// A worker's job terminated for a hang (`why`).
+    /// The session's call that terminates a worker's job for a hang
+    /// (`why`), made: the worker's end is its process's, or
+    /// [`Event::Reaped`].
     Terminated { pid: u32, why: Loss },
     /// A worker reaped.
     Reaped { pid: u32 },
