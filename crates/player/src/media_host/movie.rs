@@ -11,7 +11,7 @@
 //! the stage that follows and what the session does next. A player has at
 //! most one seek in flight ([`seek_for`]): every seek is answered, and an
 //! answer that is not the in-flight seek's, or an end for a run newer than
-//! the newest sought, loses the player. The screen shown
+//! the newest answered, loses the player. The screen shown
 //! is a shared word the game changes when it leaves a screen, the
 //! cancellation of that screen's videos: [`confirm`] reads it again after
 //! the answer's step, and withdraws a step that a screen change raced, so
@@ -297,10 +297,10 @@ pub fn seek_for(stage: Stage, sought: u64, want: u64) -> Option<u64> {
 /// follows and what the session does next. A result that does not answer
 /// the stage's command changes nothing, but a seek's answer other than the
 /// in-flight seek's (with one in flight, it cannot be stale) and an end for
-/// a run newer than the newest sought, or in flight, lose the player; an
-/// end for an older run (one that ended before its seek arrived) changes
-/// nothing. The video moves only by its cell's own steps, and only for the
-/// screen shown.
+/// a run newer than the newest answered (the run in flight included, its
+/// answer not taken yet) lose the player; an end for an older run (one
+/// that ended before its seek arrived) changes nothing. The video moves
+/// only by its cell's own steps, and only for the screen shown.
 pub fn answer(
     stage: Stage,
     movie: &Cell,
@@ -310,10 +310,6 @@ pub fn answer(
     sought: u64,
 ) -> (Stage, Then) {
     let shown = movie.generation() == current;
-    let newest = match stage {
-        Stage::Seeking { run, .. } => run,
-        _ => sought,
-    };
     match (stage, result) {
         // The deadline first, whatever the answer says.
         (Stage::Opening(open), Outcome::Probed(id) | Outcome::Refused(id))
@@ -371,11 +367,11 @@ pub fn answer(
             movie.lose(Loss::Answer);
             (stage, Then::Close)
         }
-        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run > newest => {
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run > sought => {
             movie.lose(Loss::Answer);
             (stage, Then::Close)
         }
-        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run == newest => {
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run == sought => {
             (stage, Then::End(run))
         }
         (

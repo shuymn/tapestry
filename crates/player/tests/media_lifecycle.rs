@@ -325,7 +325,7 @@ impl World {
         for said in &self.sent[self.taken..] {
             host.take(&said.reply());
         }
-        let (struck, failed) = host.clear();
+        let (struck, failed) = host.clear(false);
         let held = self.held();
         let unreported = self.unreported();
         assert!(

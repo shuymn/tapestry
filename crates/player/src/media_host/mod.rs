@@ -452,11 +452,20 @@ impl Worker {
         Ok(close)
     }
 
+    /// Player `player`, whose close is sent, was closed for a reason that
+    /// is not its file's (its peer's loss): if the game terminates the
+    /// worker ([`Self::terminate_hung`]) before the close is answered, its
+    /// file gets no strike; if the worker ends on its own, it does.
+    pub fn spare(&mut self, player: u8) {
+        self.players.get_mut().spare(player);
+    }
+
     /// How the worker ended, once its watcher has seen it end and the game
     /// has every reply the worker sent: the replies the game left unread
     /// are taken here, then each player of the worker fails, passed to
     /// `failed`, and each file open in it gets one strike, however many of
-    /// its players had it open. `None` until then.
+    /// its players had it open, but a spared player's ([`Self::spare`])
+    /// when the game terminated it ([`EXIT_HUNG`]). `None` until then.
     pub fn reap(&mut self, strikes: &mut Strikes, failed: impl FnMut(u8)) -> Option<End> {
         let end = self.end()?;
         loop {
@@ -466,7 +475,8 @@ impl Worker {
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        let (files, players) = self.players.get_mut().clear();
+        let terminated = end == End::Exited(EXIT_HUNG);
+        let (files, players) = self.players.get_mut().clear(terminated);
         for file in files {
             strikes.strike(file);
         }

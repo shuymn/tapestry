@@ -1143,8 +1143,9 @@ impl Runs {
 }
 
 /// A want reaches the worker as a seek at once: the session looks when
-/// woken, not at its next tick. Each of five wants, one at a time, is sent
-/// within 20 ms; at the 100 ms tick alone a want waits 50 ms on average.
+/// woken, not at its next tick. Each of five wants, one at a time, has its
+/// seek written whole by the worker's writer, on a healthy pipe, within
+/// 20 ms; at the 100 ms tick alone a want waits 50 ms on average.
 // Covers: T02
 #[test]
 fn a_want_is_sought_without_waiting_for_the_tick() {
@@ -1160,10 +1161,23 @@ fn a_want_is_sought_without_waiting_for_the_tick() {
     for _ in 0..5 {
         let wanted = rig.session.now();
         let run = runs.start(&waker);
-        let sent = rig
-            .event(Duration::from_secs(1), |e| *e == Event::Seek { run })
+        let seek = |e: &Event| matches!(*e, Event::Seek { run: r, .. } if r == run);
+        rig.event(Duration::from_secs(1), seek)
             .unwrap_or_else(|| panic!("run {run} never sought: {:?}", rig.session.events()));
-        took.push(sent.saturating_sub(wanted));
+        let id = rig
+            .session
+            .events()
+            .into_iter()
+            .find_map(|(_, e)| match e {
+                Event::Seek { run: r, id } if r == run => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        // When the writer wrote the seek whole, not when it was queued.
+        let written = until(Duration::from_secs(1), || rig.session.written(id).is_some())
+            .and_then(|_| rig.session.written(id))
+            .unwrap_or_else(|| panic!("run {run}'s seek {id} never written"));
+        took.push(written.saturating_sub(wanted));
         assert!(
             rig.event(
                 Duration::from_secs(2),
@@ -1219,19 +1233,33 @@ fn seeks_through_the_real_worker() {
         "{:?}",
         rig.session.events()
     );
+    // Every seek answered, and each run's end taken only after its answer.
     let answers: Vec<_> = rig
         .session
         .events()
         .into_iter()
-        .filter_map(|(_, e)| match e {
-            Event::Sought { run, landed } => Some((run, landed.is_some())),
-            _ => None,
-        })
+        .filter(|(_, e)| matches!(e, Event::Sought { .. } | Event::Ended { .. }))
+        .map(|(_, e)| e)
         .collect();
     assert_eq!(
         answers,
-        [(cue, true), (restart, true), (past, false)],
-        "every seek answered"
+        [
+            Event::Ended { run: 1 },
+            Event::Sought {
+                run: cue,
+                landed: Some(first.stamp)
+            },
+            Event::Sought {
+                run: restart,
+                landed: Some(first.stamp)
+            },
+            Event::Ended { run: restart },
+            Event::Sought {
+                run: past,
+                landed: None
+            },
+            Event::Ended { run: past },
+        ],
     );
     assert_eq!((movie.status(), movie.loss()), (Status::Live, None));
     assert_eq!(rig.count(|e| matches!(e, Event::Lost { .. })), 0);
@@ -1293,6 +1321,109 @@ fn a_peer_loss_strikes_nothing() {
     rig.session.enter(6);
     let struck = Movie::new(6);
     rig.open_as(&struck, "c.mpg", true);
+    assert!(lost(&struck, LAUNCH).is_some(), "{:?}", struck.status());
+    assert_eq!(struck.loss(), Some(Loss::Struck));
+}
+
+/// A peer closed while the game terminates its worker for another
+/// player's missed answer is not struck. Player 1 holds every slot full
+/// and freezes there, so its seek is never answered; the worker reads its
+/// first five commands only (two opens, two plays and the seek), so no
+/// close is answered. Once player 1 is lost for the answer, its peer is
+/// lost with it, and the worker, marked and with nothing live, is
+/// terminated while both files are open in it. Twice over, the frozen
+/// player's file is struck and its peer's is not: the third attempt
+/// refuses the first and plays the second. The control: a peer closed
+/// while its worker crashes on its own (the worker reads the two opens and
+/// two plays only, so the close is not answered) is struck, and refused
+/// after two crashes.
+// Covers: T02
+#[test]
+fn a_peer_closed_when_its_worker_is_terminated_is_not_struck() {
+    let rig = Rig::serving(&["freeze=1:waiting", "deaf=5"]);
+    let waker = rig.session.waker();
+    let terminated = || {
+        rig.count(|e| {
+            matches!(
+                e,
+                Event::Terminated {
+                    why: Loss::Answer,
+                    ..
+                }
+            )
+        })
+    };
+    let reaped = || rig.count(|e| matches!(e, Event::Reaped { .. }));
+    for generation in 1..=2 {
+        rig.session.enter(generation);
+        let (frozen, peer) = (Movie::new(generation), Movie::new(generation));
+        rig.open_as(&frozen, "a.mpg", true);
+        rig.open_as(&peer, "b.mpg", true);
+        for m in [&frozen, &peer] {
+            until(LAUNCH, || m.status() == Status::Live)
+                .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+        }
+        // Player 1 has filled its ring and frozen, saying it waits.
+        let words = frozen.live().unwrap().ring.words();
+        until(Duration::from_secs(5), || {
+            media::supervision(words).is_some_and(|(_, s)| s == Some(State::Waiting))
+                && media::watermark(words) == Some(u64::try_from(media::SLOTS).unwrap())
+        })
+        .expect("player 1 never filled its ring");
+        frozen.want(2);
+        waker.wake();
+        lost(&frozen, Duration::from_secs(5)).expect("no loss within 5 s");
+        assert_eq!(frozen.loss(), Some(Loss::Answer));
+        assert_eq!(peer.status(), Status::Live);
+        peer.lose(Loss::Peer);
+        let n = usize::try_from(generation).unwrap();
+        until(Duration::from_secs(5), || {
+            terminated() >= n && reaped() >= n
+        })
+        .unwrap_or_else(|| panic!("not terminated and reaped: {:?}", rig.session.events()));
+        assert_eq!(rig.count(|e| *e == Event::Closed), 0, "a close answered");
+    }
+    rig.session.enter(3);
+    let again = [Movie::new(3), Movie::new(3)];
+    rig.open_as(&again[0], "a.mpg", true);
+    rig.open_as(&again[1], "b.mpg", true);
+    assert!(lost(&again[0], LAUNCH).is_some(), "{:?}", again[0].status());
+    assert_eq!(again[0].loss(), Some(Loss::Struck));
+    until(LAUNCH, || again[1].status() != Status::Pending).expect("never settled");
+    assert_eq!(
+        (again[1].status(), again[1].loss()),
+        (Status::Live, None),
+        "struck?"
+    );
+
+    // The control: the worker crashes while the peer's close is unread.
+    let rig = Rig::serving(&["deaf=4"]);
+    let reaped = || rig.count(|e| matches!(e, Event::Reaped { .. }));
+    for generation in 1..=2 {
+        rig.session.enter(generation);
+        let (live, peer) = (Movie::new(generation), Movie::new(generation));
+        rig.open_as(&live, "c.mpg", true);
+        rig.open_as(&peer, "d.mpg", true);
+        for m in [&live, &peer] {
+            until(LAUNCH, || m.status() == Status::Live)
+                .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+        }
+        let worker = rig.worker(Duration::ZERO);
+        peer.lose(Loss::Peer);
+        let n = usize::try_from(generation).unwrap();
+        // Its close written: the worker's fifth command, after the two
+        // opens and the two plays it read.
+        until(Duration::from_secs(1), || rig.session.written(5).is_some())
+            .expect("the peer's close never written");
+        let before = reaped();
+        worker.terminate();
+        until(LAUNCH, || reaped() > before).expect("the crashed worker never reaped");
+        assert_eq!(live.status(), Status::Lost);
+        assert_eq!(reaped(), n);
+    }
+    rig.session.enter(3);
+    let struck = Movie::new(3);
+    rig.open_as(&struck, "d.mpg", true);
     assert!(lost(&struck, LAUNCH).is_some(), "{:?}", struck.status());
     assert_eq!(struck.loss(), Some(Loss::Struck));
 }

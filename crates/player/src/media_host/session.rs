@@ -24,15 +24,19 @@
 //!   ([`super::movie::answer`]), and a player goes when the worker's
 //!   tracker frees its id.
 //! - **Seeks**: the render side writes the newest run it wants sought into
-//!   its video's want word ([`Movie::want`]) and wakes the session through
-//!   its request queue ([`Waker`]), so a seek starts without waiting for
-//!   the tick. A live player has at most one seek in flight, for the newest
-//!   run wanted, from the clip's start; wants made meanwhile are coalesced
-//!   and the newest sought once it is answered. An end the worker reports
-//!   for the newest run becomes the video's ended run ([`Movie::ended`]).
+//!   its video's want word ([`Movie::want`]) and wakes the session
+//!   ([`Waker`]), so a seek starts without waiting for the tick. A wake is
+//!   one token: it puts a request in the session's queue only when none is
+//!   pending, so wakes hold at most one of the queue's places and never
+//!   crowd out an open or the session's end. A live player has at most one
+//!   seek in flight, for the newest run wanted, from the clip's start;
+//!   wants made meanwhile are coalesced and the newest sought once it is
+//!   answered. An end the worker reports for the newest run whose seek was
+//!   answered becomes the video's ended run ([`Movie::ended`]).
 //! - **Progress** (L3): a decoding player whose progress word has not risen
-//!   for [`Deadlines::progress`] is lost. Waiting for a free slot excuses it
-//!   only while every slot holds a frame the game has not freed, by the
+//!   for [`Deadlines::progress`] is lost, a seek in flight or answered
+//!   included: a seek keeps the window it found. Waiting for a free slot
+//!   excuses it only while every slot holds a frame the game has not freed, by the
 //!   game's own count of the slots it freed; from the first look that finds
 //!   a slot free the window runs again. An end excuses it only as an end
 //!   for good: a looping play never ends.
@@ -41,8 +45,10 @@
 //!
 //! A failure of the whole worker loses every one of its players first, each
 //! by one atomic step that writes nothing else, then terminates its job ([`super::EXIT_HUNG`]) and reaps it: the files it had
-//! open get their strikes. The next video a screen needs launches a new
-//! worker. The launch runs on a thread of its own, so a launch held up
+//! open get their strikes, but for a file the session was closing because
+//! its peer was lost ([`Loss::Peer`]): a worker the game terminated does
+//! not strike it, one that ended on its own does. The next video a screen
+//! needs launches a new worker. The launch runs on a thread of its own, so a launch held up
 //! (another launch staging its copies) holds neither the game nor the
 //! session.
 //!
@@ -58,8 +64,8 @@ use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -386,10 +392,12 @@ pub enum Event {
     Terminated { pid: u32, why: Loss },
     /// A worker reaped.
     Reaped { pid: u32 },
-    /// A seek for `run` sent.
-    Seek { run: u64 },
+    /// A seek for `run` sent, as command `id`.
+    Seek { run: u64, id: u32 },
     /// A seek for `run` answered, `landed` or not.
     Sought { run: u64, landed: Option<i64> },
+    /// Run `run`'s end taken as the video's ended run.
+    Ended { run: u64 },
     /// An open handed to the worker.
     Opened,
     /// A player's close answered.
@@ -406,6 +414,15 @@ struct Shared {
     pid: AtomicU32,
     /// Videos the game's hand-offs lost (L1), for the session to log.
     queue_lost: AtomicU32,
+    /// A wake is pending: its request is in the queue, or a full queue
+    /// holds requests the session takes before it looks.
+    wake: AtomicBool,
+    /// The game's handle has gone: the session ends at its next turn,
+    /// whatever the queue holds and whoever holds a [`Waker`].
+    quit: AtomicBool,
+    /// The worker's writer's account of its writes (tests).
+    #[cfg(test)]
+    transport: Mutex<Option<Arc<super::writer::Transport>>>,
     #[cfg(test)]
     events: Mutex<Vec<(Duration, Event)>>,
     #[cfg(test)]
@@ -452,6 +469,10 @@ impl Session {
             generation: AtomicU64::new(0),
             pid: AtomicU32::new(0),
             queue_lost: AtomicU32::new(0),
+            wake: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
+            #[cfg(test)]
+            transport: Mutex::new(None),
             #[cfg(test)]
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -500,7 +521,19 @@ impl Session {
     /// The render side's handle for waking the session when a video wants
     /// a seek.
     pub fn waker(&self) -> Waker {
-        Waker(self.tx.clone())
+        Waker {
+            tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// When command `id` was written whole, on the clock of
+    /// [`Self::events`], once the worker's writer has written it (tests).
+    #[cfg(test)]
+    pub fn written(&self, id: u32) -> Option<Duration> {
+        let transport = self.shared.transport.lock().ok()?.clone()?;
+        let at = transport.written(id).ok()??;
+        Some(at.saturating_duration_since(self.shared.origin))
     }
 
     /// The time on the clock of [`Self::events`] (tests).
@@ -540,20 +573,34 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // The flag ends the session even when the queue has no room for
+        // the request, which only has it end sooner.
+        self.shared.quit.store(true, Ordering::Release);
         let _ = self.tx.try_send(Request::Quit);
     }
 }
 
-/// Wakes the session: a clone of its request queue's sender.
+/// Wakes the session: a sender of its request queue and its wake token.
+/// Holding one keeps no session alive: dropping the game's handle ends it.
 #[derive(Clone)]
-pub struct Waker(SyncSender<Request>);
+pub struct Waker {
+    tx: SyncSender<Request>,
+    shared: Arc<Shared>,
+}
 
 impl Waker {
-    /// Asks the session to look now, never waiting: the queue's slots are
-    /// allocated with it, so this allocates nothing, and a full queue
-    /// already holds a request that wakes it.
+    /// Asks the session to look now, never waiting and allocating nothing
+    /// (the queue's places are allocated with it). Only the first wake
+    /// since the session took the last one sends a request, so wakes hold
+    /// at most one place of the queue; when the queue is full, its
+    /// requests have the session look anyway, and the token is given back.
     pub fn wake(&self) {
-        let _ = self.0.try_send(Request::Wake);
+        if self.shared.wake.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.tx.try_send(Request::Wake).is_err() {
+            self.shared.wake.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -751,36 +798,47 @@ impl Supervisor {
 
     fn run(mut self, rx: &Receiver<Request>) {
         loop {
-            match rx.recv_timeout(self.deadlines.tick) {
-                Ok(Request::Open {
-                    movie,
-                    file,
-                    looping,
-                }) => self.queue(movie, file, looping),
-                Ok(Request::Wake) | Err(RecvTimeoutError::Timeout) => {}
-                #[cfg(test)]
-                Ok(Request::Stuff(len)) => self.stuff(len),
-                Ok(Request::Quit) | Err(RecvTimeoutError::Disconnected) => break,
+            let first = match rx.recv_timeout(self.deadlines.tick) {
+                Ok(request) => Some(request),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            // The requests waiting before the look, at most a queue's
+            // worth, so no sender keeps the session from looking.
+            let waiting = std::iter::from_fn(|| rx.try_recv().ok()).take(REQUESTS);
+            let mut quit = false;
+            for request in first.into_iter().chain(waiting) {
+                quit |= self.request(request);
             }
-            // Every request waiting, before the look.
-            loop {
-                match rx.try_recv() {
-                    Ok(Request::Open {
-                        movie,
-                        file,
-                        looping,
-                    }) => self.queue(movie, file, looping),
-                    Ok(Request::Wake) => {}
-                    #[cfg(test)]
-                    Ok(Request::Stuff(len)) => self.stuff(len),
-                    Ok(Request::Quit) | Err(TryRecvError::Disconnected) => return self.quit(),
-                    Err(TryRecvError::Empty) => break,
-                }
+            if quit || self.shared.quit.load(Ordering::Acquire) {
+                break;
             }
             self.look();
             self.note_losses();
         }
         self.quit();
+    }
+
+    /// Takes `request`: whether it ends the session.
+    fn request(&mut self, request: Request) -> bool {
+        match request {
+            Request::Open {
+                movie,
+                file,
+                looping,
+            } => self.queue(movie, file, looping),
+            // The token is taken back before the look reads the wants (a
+            // read-modify-write, so it sees every want stored before a
+            // wake that found the token taken): a want stored after that
+            // read wakes the session again.
+            Request::Wake => {
+                self.shared.wake.swap(false, Ordering::AcqRel);
+            }
+            #[cfg(test)]
+            Request::Stuff(len) => self.stuff(len),
+            Request::Quit => return true,
+        }
+        false
     }
 
     /// Writes `len` bytes on the worker's command pipe from a thread of its
@@ -929,6 +987,10 @@ impl Supervisor {
             Ok(worker) => {
                 self.shared.pid.store(worker.pid(), Ordering::Release);
                 event!(self.shared, Event::Launched { pid: worker.pid() });
+                #[cfg(test)]
+                if let Ok(mut transport) = self.shared.transport.lock() {
+                    *transport = worker.transport().cloned();
+                }
                 self.notes.note(format!("worker {} launched", worker.pid()));
                 self.worker = Some(worker);
                 self.marked = false;
@@ -1162,9 +1224,9 @@ impl Supervisor {
         // The screen shown, read again after the answer's step.
         let generation = self.shared.generation.load(Ordering::SeqCst);
         let (stage, then) = super::movie::confirm(stage, &p.movie.cell, generation, then);
-        if stage == Stage::Live && p.stage != Stage::Live {
-            // The progress window starts when playback does, and again
-            // when a seek's run does.
+        if stage == Stage::Live && matches!(p.stage, Stage::Playing(_)) {
+            // The progress window starts when playback does; a seek keeps
+            // the window it found, its last count and time.
             p.progress = (0, Instant::now());
         }
         if let (Stage::Seeking { run, .. }, Stage::Live) = (p.stage, stage) {
@@ -1181,6 +1243,7 @@ impl Supervisor {
             Then::Nothing => Ok(()),
             Then::End(run) => {
                 p.movie.ended.store(run, Ordering::Release);
+                event!(self.shared, Event::Ended { run });
                 Ok(())
             }
             Then::Close => self.close(i),
@@ -1456,7 +1519,7 @@ impl Supervisor {
             if let Some(p) = self.players.get_mut(i) {
                 p.wait_on(Stage::Seeking { id, run });
             }
-            event!(self.shared, Event::Seek { run });
+            event!(self.shared, Event::Seek { run, id });
         }
         Ok(())
     }
@@ -1476,7 +1539,9 @@ impl Supervisor {
             .map_err(|_| Loss::Transport)
     }
 
-    /// Sends player `i` its close.
+    /// Sends player `i` its close. A player closed because its peer was
+    /// lost has its file spared by a worker the game terminates
+    /// ([`Worker::spare`]).
     fn close(&mut self, i: usize) -> Result<(), Loss> {
         let (Some(p), Some(worker)) = (self.players.get_mut(i), self.worker.as_mut()) else {
             return Ok(());
@@ -1486,6 +1551,9 @@ impl Supervisor {
         }
         match worker.close(p.id) {
             Ok(close) => {
+                if p.movie.loss() == Some(Loss::Peer) {
+                    worker.spare(p.id);
+                }
                 p.wait_on(Stage::Closing(close));
                 Ok(())
             }
@@ -1518,7 +1586,7 @@ impl Supervisor {
             if lost.iter().any(|(l, _)| *l == i) {
                 continue;
             }
-            if p.stage == Stage::Live
+            if matches!(p.stage, Stage::Live | Stage::Seeking { .. })
                 && p.movie.generation() == generation
                 && p.movie.status() != Status::Lost
                 && let Some(why) = progress(p, now, self.deadlines.progress)
@@ -1635,6 +1703,7 @@ pub fn preparation_deadline(start: Instant) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::TryRecvError;
 
     const LIMIT: Duration = Deadlines::GAME.progress;
 
@@ -1659,6 +1728,9 @@ mod tests {
             generation: AtomicU64::new(generation),
             pid: AtomicU32::new(0),
             queue_lost: AtomicU32::new(0),
+            wake: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
+            transport: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             origin: Instant::now(),
             beats: Mutex::new(Vec::new()),
@@ -1888,6 +1960,154 @@ mod tests {
             assert_eq!(movie.loss(), lost, "{since:?}");
             assert_eq!(s.marked, lost.is_some());
         }
+    }
+
+    /// An end for the run in flight, its seek not answered yet, loses the
+    /// player: the worker answers a seek before any end of its run. The
+    /// ended run stays the last answered run's.
+    // Covers: T02
+    #[test]
+    fn an_end_before_its_seek_is_answered_fails_the_player() {
+        let (mut s, movie) = sought_to(4);
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!(movie.ended(), 4);
+        movie.want(5);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.players[0].stage, Stage::Seeking { id: 2, run: 5 });
+        s.take(Instant::now(), &ended(5)).unwrap();
+        assert_eq!(movie.ended(), 4, "run 5's end before its answer");
+        assert_eq!(movie.loss(), Some(Loss::Answer));
+        // An end of the run answered last, run 4, while 5 is in flight is
+        // that run's end, not a loss.
+        let (mut s, movie) = sought_to(4);
+        movie.want(5);
+        s.seek_wanted(1).unwrap();
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!((movie.ended(), movie.loss()), (4, None));
+        assert_eq!(s.players[0].stage, Stage::Seeking { id: 2, run: 5 });
+    }
+
+    /// The worker's rejection of the seek in flight fails the player; a
+    /// rejection of another command does not.
+    // Covers: T02
+    #[test]
+    fn a_rejected_seek_fails_the_player() {
+        for (id, lost) in [(2, None), (1, Some(Loss::Failed))] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(3);
+            s.seek_wanted(1).unwrap();
+            let rejected = Reply::Rejected {
+                id,
+                player: 1,
+                code: 87,
+            };
+            s.take(Instant::now(), &rejected).unwrap();
+            assert_eq!(movie.loss(), lost, "a rejection of command {id}");
+            let stage = if lost.is_some() {
+                Stage::Idle
+            } else {
+                Stage::Seeking { id: 1, run: 3 }
+            };
+            assert_eq!(s.players[0].stage, stage);
+            assert!(!s.marked);
+        }
+    }
+
+    /// A seek keeps the progress window it found: a decoder whose word has
+    /// not risen since 2.001 s ago is lost for its progress, with its seek
+    /// in flight (sent 0.5 s ago) or answered meanwhile.
+    // Covers: T02
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_seek_keeps_the_progress_window() {
+        for answered in [false, true] {
+            let mut s = supervisor(1);
+            let movie = Movie::live_here(1, 64, 48);
+            let words = movie.live().unwrap().ring.words();
+            words[media::PROGRESS_WORD].store(7, Ordering::Release);
+            words[media::STATE_WORD].store(State::Decoding.word(), Ordering::Release);
+            let now = Instant::now();
+            let since = now.checked_sub(MS(2_001)).unwrap();
+            s.players = vec![Player {
+                stage: Stage::Live,
+                progress: (7, since),
+                ..opening(&movie, 1)
+            }];
+            movie.want(2);
+            s.seek_wanted(1).unwrap();
+            s.players[0].written = Some(now.checked_sub(MS(500)).unwrap());
+            if answered {
+                s.take(Instant::now(), &sought(1, 2, Some(40_000))).unwrap();
+                assert_eq!(s.players[0].stage, Stage::Live);
+            }
+            s.judge(1, now, true);
+            assert_eq!(movie.loss(), Some(Loss::Progress), "answered: {answered}");
+        }
+    }
+
+    /// Wakes take one place of the request queue at most, however many
+    /// come before the session takes one: an open and the session's end
+    /// still find room, and nothing is lost at the hand-off.
+    // Covers: T02
+    #[test]
+    fn wakes_leave_room_for_open_and_shutdown() {
+        let (tx, rx) = mpsc::sync_channel(REQUESTS);
+        let session = Session {
+            tx,
+            shared: supervisor(1).shared,
+        };
+        let waker = session.waker();
+        for _ in 0..REQUESTS {
+            waker.wake();
+        }
+        let movie = Movie::new(1);
+        let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        session.open(&movie, file, false);
+        drop(session);
+        let mut wakes = 0;
+        let quit = loop {
+            match rx.try_recv() {
+                Ok(Request::Quit) | Err(TryRecvError::Disconnected) => break true,
+                Ok(Request::Wake) => wakes += 1,
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break false,
+            }
+        };
+        drop(waker);
+        assert_eq!((movie.loss(), quit, wakes), (None, true, 1));
+    }
+
+    /// A waker held after the game's handle is dropped keeps no session
+    /// alive, even when the queue had no room for the end's request: the
+    /// session ends at its next turn.
+    // Covers: T02
+    #[test]
+    fn a_retained_waker_keeps_no_session_alive() {
+        let (tx, rx) = mpsc::sync_channel(REQUESTS);
+        let s = supervisor(1);
+        let session = Session {
+            tx,
+            shared: Arc::clone(&s.shared),
+        };
+        let waker = session.waker();
+        // The queue full of opens (of a screen not shown, so nothing is
+        // launched): the end's request finds no room.
+        for _ in 0..REQUESTS {
+            let file =
+                std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+            session.open(&Movie::new(2), file, false);
+        }
+        drop(session);
+        let (done, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            s.run(&rx);
+            let _ = done.send(());
+        });
+        let ended = ended.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(waker);
+        assert!(ended, "the session outlived the game's handle");
     }
 
     /// A probe of `width` × `height`.
