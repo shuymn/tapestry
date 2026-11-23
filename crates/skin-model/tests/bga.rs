@@ -535,3 +535,47 @@ fn a_lost_panel_draws_one_black_quad_per_element() {
         assert_eq!(h.batch.movies(), [false; 4]);
     }
 }
+
+/// A play opens at most two video files, ranked by their first base or
+/// layer start, a tie broken by channel then by the lowest id: aliases of
+/// one file share its slot and its starts, each start once; a third file
+/// and one only the poor sequences name take no slot.
+#[test]
+fn chart_files_are_ranked_by_their_first_start_and_capped_at_two() {
+    // Ids 0 and 1 name file 0, id 2 file 1, id 3 file 2, id 4 file 3 (poor
+    // only), id 5 a picture.
+    let file_of = [Some(0), Some(0), Some(1), Some(2), Some(3), None];
+    let bga = ChartBga::new(
+        (1..=6).map(image).collect(),
+        vec![event(1_000, Some(2)), event(2_000, Some(0))],
+        // File 2 ties file 1 at 1 000 ms on the layer: the base wins.
+        vec![
+            event(500, Some(1)),
+            event(1_000, Some(3)),
+            event(2_000, Some(1)),
+        ],
+        vec![PoorSequence {
+            time: TimeUs(3_000 * MS),
+            frames: vec![Some(BgaImageId(4)), Some(BgaImageId(3))].into_boxed_slice(),
+        }],
+    )
+    .unwrap();
+    let (slots, files) = ChartVideos::choose(&bga, &file_of);
+    assert_eq!(slots, [Some(2), Some(2), Some(3), None, None, None]);
+    assert_eq!(files, [Some(0), Some(1)]);
+    let videos = ChartVideos::of(&bga, &slots);
+    let us = |ms: &[i64]| ms.iter().map(|m| TimeUs(m * MS)).collect::<Vec<_>>();
+    assert_eq!(videos.starts(2), us(&[500, 2_000]), "aliases' starts, once");
+    assert_eq!(videos.starts(3), us(&[1_000]));
+    assert_eq!(videos.starts(0), us(&[]), "a skin slot has none");
+    // The same file named first by the lowest id breaks a full tie.
+    let tie = ChartBga::new(
+        (1..=2).map(image).collect(),
+        vec![event(0, Some(1)), event(0, Some(0))],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let (slots, files) = ChartVideos::choose(&tie, &[Some(7), Some(8)]);
+    assert_eq!((slots, files), (vec![Some(2), Some(3)], [Some(7), Some(8)]));
+}

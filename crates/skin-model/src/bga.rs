@@ -36,7 +36,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bms_model::BgaImageId;
+use bms_model::{BgaImageId, ChartBga, TimeUs};
 
 use crate::atlas::pack::{self, MAX_CELLS_PER_PAGE};
 use crate::atlas::premultiply;
@@ -750,22 +750,113 @@ pub(crate) fn absent_table() -> Arc<BgaTable> {
 
 /// An attempt's chart videos (design.md "Rendering and Skins", BGA): the
 /// chart movie slot ([`crate::movie::CHART_SLOTS`]) each `#BMPxx` id of a
-/// video plays in, by the id's index. An id with none, or a play with no
-/// chart videos set, draws as a picture that cannot be prepared. Made
-/// before the attempt's READY; a frame only reads it.
+/// video plays in, by the id's index, and each slot's starts: the chart
+/// times of the base and layer events naming one of its ids, sorted, each
+/// once. An id with none, or a play with no chart videos set, draws as a
+/// picture that cannot be prepared. Made before the attempt's READY; a
+/// frame only reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChartVideos {
     slots: Box<[Option<u8>]>,
+    starts: [Box<[TimeUs]>; 2],
 }
+
+/// The video files a play opens at most: one per chart movie slot.
+pub const MAX_CHART_FILES: usize = crate::movie::CHART_SLOTS.len();
 
 impl ChartVideos {
     /// The videos whose ids, by index, play in `slots` (each one of
-    /// [`crate::movie::CHART_SLOTS`]; any other slot is none).
+    /// [`crate::movie::CHART_SLOTS`]; any other slot is none), with no
+    /// starts.
     #[must_use]
     pub fn new(slots: &[Option<u8>]) -> Self {
         let chart = |s: &u8| crate::movie::CHART_SLOTS.contains(&usize::from(*s));
         let slots = slots.iter().map(|s| s.filter(chart)).collect();
-        Self { slots }
+        Self {
+            slots,
+            starts: Default::default(),
+        }
+    }
+
+    /// The videos of `bga` whose ids, by index, play in `slots`, each
+    /// slot's starts taken from its base and layer events.
+    #[must_use]
+    pub fn of(bga: &ChartBga, slots: &[Option<u8>]) -> Self {
+        let mut videos = Self::new(slots);
+        let events = || bga.base().iter().chain(bga.layer());
+        for (k, &slot) in crate::movie::CHART_SLOTS.iter().enumerate() {
+            let mut starts: Vec<TimeUs> = events()
+                .filter(|e| e.image.and_then(|id| videos.slot(id)) == Some(slot))
+                .map(|e| e.time)
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            if let Some(s) = videos.starts.get_mut(k) {
+                *s = starts.into_boxed_slice();
+            }
+        }
+        videos
+    }
+
+    /// The files a play opens (design.md "Rendering and Skins", BGA): each
+    /// id's file by its index (`file_of`, `None` for an id that is no
+    /// video), ranked by its first base or layer start, ties broken by
+    /// channel (the base first) and then by the lowest id; the first
+    /// [`MAX_CHART_FILES`] take the chart slots in that order, and a file
+    /// with no start (only the poor sequences name it) none. Returns each
+    /// id's slot and each slot's file.
+    #[must_use]
+    pub fn choose(
+        bga: &ChartBga,
+        file_of: &[Option<usize>],
+    ) -> (Vec<Option<u8>>, [Option<usize>; MAX_CHART_FILES]) {
+        // Each file's first start: (time, channel, id).
+        let mut first: Vec<(usize, (TimeUs, u8, u16))> = Vec::new();
+        for (channel, events) in [(0_u8, bga.base()), (1, bga.layer())] {
+            for e in events {
+                let Some(id) = e.image else { continue };
+                let Some(&Some(file)) = file_of.get(usize::from(id.0)) else {
+                    continue;
+                };
+                let key = (e.time, channel, id.0);
+                match first.iter_mut().find(|(f, _)| *f == file) {
+                    Some((_, k)) => *k = (*k).min(key),
+                    None => first.push((file, key)),
+                }
+            }
+        }
+        first.sort_unstable_by_key(|(_, k)| *k);
+        let mut files = [None; MAX_CHART_FILES];
+        for (out, (file, _)) in files.iter_mut().zip(&first) {
+            *out = Some(*file);
+        }
+        let slot_of = |file: usize| {
+            files
+                .iter()
+                .zip(crate::movie::CHART_SLOTS)
+                .find(|(f, _)| **f == Some(file))
+                .and_then(|(_, s)| u8::try_from(s).ok())
+        };
+        let slots = file_of.iter().map(|f| f.and_then(slot_of)).collect();
+        (slots, files)
+    }
+
+    /// The starts of chart movie slot `slot`, sorted, each once; none for
+    /// a slot that is not a chart's.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn starts(&self, slot: usize) -> &[TimeUs] {
+        crate::movie::CHART_SLOTS
+            .iter()
+            .position(|s| *s == slot)
+            .and_then(|k| self.starts.get(k))
+            .map_or(&[], |s| s)
+    }
+
+    /// Whether any id plays in a chart slot.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.slots.iter().any(Option::is_some)
     }
 
     /// The chart movie slot id `id`'s video plays in, if any.
