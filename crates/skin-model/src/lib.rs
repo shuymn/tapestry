@@ -104,6 +104,8 @@ pub mod bga;
 mod canvas;
 pub mod chart_image;
 mod decision;
+#[cfg(any(test, feature = "dev-tools"))]
+pub mod dev;
 mod expr;
 mod image;
 mod layout;
@@ -129,7 +131,7 @@ mod widget;
 
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
-    ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasId, AtlasLimits, CELL_TABLE_BYTES,
+    ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasId, AtlasLimits, AtlasPlan, CELL_TABLE_BYTES,
     FILE_TABLE_BYTES, GUTTER, KeptLayers, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES,
     MIN_PAGE_SIDE, MIN_TEXT_SIDE, MIP_LEVELS, PAGE_SIDE_STEP, PackedPages, Page, Variant,
     cell_fits_page, downsample_rgba,

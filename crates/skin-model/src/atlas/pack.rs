@@ -6,6 +6,91 @@
 use etagere::{AllocatorOptions, AtlasAllocator, size2};
 
 use super::{ALIGN, GUTTER, MIN_PAGE_SIDE, PAGE_SIDE_STEP};
+use crate::image::decode::{self, Site};
+
+/// The most units of planning work between two asks of the cancel
+/// ([`Work`]): a provisional cadence, checked by the development
+/// measurement of the preload's pause latency against its 50 ms target
+/// (design.md "Scaling quality").
+pub(crate) const PLAN_BATCH: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// The rectangles pass's units, counted in its loop.
+    pub(crate) static RECT_UNITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The candidate sides begun, counted in the side loop.
+    pub(crate) static SIDE_STARTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The placement units [`Work`] counted.
+    pub(crate) static PLACE_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Every call of the allocator's `allocate`, counted beside it.
+    pub(crate) static ALLOC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The allocations that took their cell.
+    pub(crate) static PLACED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The packings this thread began.
+    pub(crate) static PACKINGS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn bump(counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>) {
+    counter.with(|c| c.set(c.get() + 1));
+}
+
+/// A planning's cooperative cancellation: it asks `cancel` at each phase
+/// boundary and after every [`PLAN_BATCH`] units of attempted work (a
+/// cell's rectangle, a page tried by a placement, whether it took the
+/// cell or not), each ask resetting the count, so at most [`PLAN_BATCH`]
+/// units run between two asks whatever phases they span.
+pub(crate) struct Work<'a> {
+    cancel: Option<&'a dyn Fn() -> bool>,
+    count: usize,
+}
+
+impl<'a> Work<'a> {
+    /// Work that asks `cancel`.
+    pub(crate) fn new(cancel: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            cancel: Some(cancel),
+            count: 0,
+        }
+    }
+
+    /// Work that counts and asks nothing.
+    pub(crate) const fn never() -> Self {
+        Self {
+            cancel: None,
+            count: 0,
+        }
+    }
+
+    /// One unit ran; asks at `site` once [`PLAN_BATCH`] ran since the last
+    /// ask.
+    pub(crate) fn unit(&mut self, site: Site) -> Result<(), PackError> {
+        if self.cancel.is_none() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if site == Site::PlanPlaceWork {
+            bump(&PLACE_ATTEMPTS);
+        }
+        #[cfg(any(test, feature = "dev-tools"))]
+        crate::dev::work_unit();
+        self.count += 1;
+        if self.count >= PLAN_BATCH {
+            self.phase(site)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Asks at `site`, a phase boundary, and resets the count.
+    pub(crate) fn phase(&mut self, site: Site) -> Result<(), PackError> {
+        let Some(cancel) = self.cancel else {
+            return Ok(());
+        };
+        self.count = 0;
+        decode::checkpoint(cancel, site).map_err(|_| PackError::Cancelled)
+    }
+}
 
 /// The most cells one page's allocator takes.
 ///
@@ -40,6 +125,8 @@ pub(crate) enum PackError {
     TooManyPages,
     /// The allocator returned a place off the alignment.
     Misaligned,
+    /// The planning's cancel said stop ([`Work`]).
+    Cancelled,
 }
 
 fn round_up(n: u32, to: u32) -> Option<u32> {
@@ -97,6 +184,7 @@ fn allocator(side: i32, align: u32) -> AtlasAllocator {
 /// Packs cells of `padded` sizes in `order` at `side` into at most
 /// `max_pages` pages, each taking at most `per_page` cells: each cell goes
 /// to the first page with room. `None` when they do not fit.
+#[cfg(test)]
 pub(crate) fn pack_side(
     padded: &[[u32; 2]],
     order: &[usize],
@@ -104,10 +192,20 @@ pub(crate) fn pack_side(
     max_pages: u32,
     per_page: usize,
 ) -> Result<Option<Packing>, PackError> {
-    pack_side_aligned(padded, order, side, max_pages, per_page, ALIGN)
+    pack_side_aligned(
+        padded,
+        order,
+        side,
+        max_pages,
+        per_page,
+        ALIGN,
+        &mut Work::never(),
+    )
 }
 
-/// [`pack_side`] with every place a multiple of `align` (at least 1).
+/// [`pack_side`] with every place a multiple of `align` (at least 1),
+/// asking `work` after its table setup ([`Site::PlanPlace`]) and counting
+/// each page a placement tries ([`Site::PlanPlaceWork`]).
 pub(crate) fn pack_side_aligned(
     padded: &[[u32; 2]],
     order: &[usize],
@@ -115,6 +213,7 @@ pub(crate) fn pack_side_aligned(
     max_pages: u32,
     per_page: usize,
     align: u32,
+    work: &mut Work<'_>,
 ) -> Result<Option<Packing>, PackError> {
     let align = align.max(1);
     let Ok(side_i) = i32::try_from(side) else {
@@ -128,6 +227,7 @@ pub(crate) fn pack_side_aligned(
         };
         padded.len()
     ];
+    work.phase(Site::PlanPlace)?;
     for &i in order {
         let Some(&[w, h]) = padded.get(i) else {
             continue;
@@ -136,16 +236,24 @@ pub(crate) fn pack_side_aligned(
             return Ok(None);
         };
         let size = size2(w, h);
-        let existing = (0_u32..)
-            .zip(pages.iter_mut())
-            .find_map(|(page, (alloc, count))| {
-                if *count >= per_page {
-                    return None;
-                }
-                let a = alloc.allocate(size)?;
+        // Each page tried is a unit, whether it takes the cell or not.
+        let mut existing = None;
+        for (page, (alloc, count)) in (0_u32..).zip(pages.iter_mut()) {
+            if *count >= per_page {
+                continue;
+            }
+            #[cfg(test)]
+            bump(&ALLOC_CALLS);
+            let a = alloc.allocate(size);
+            work.unit(Site::PlanPlaceWork)?;
+            if let Some(a) = a {
+                #[cfg(test)]
+                bump(&PLACED);
                 *count += 1;
-                Some((page, a.rectangle))
-            });
+                existing = Some((page, a.rectangle));
+                break;
+            }
+        }
         let (page, r) = if let Some(place) = existing {
             place
         } else {
@@ -154,9 +262,15 @@ pub(crate) fn pack_side_aligned(
                 return Ok(None);
             }
             let mut alloc = allocator(side_i, align);
-            let Some(a) = alloc.allocate(size) else {
+            #[cfg(test)]
+            bump(&ALLOC_CALLS);
+            let a = alloc.allocate(size);
+            work.unit(Site::PlanPlaceWork)?;
+            let Some(a) = a else {
                 return Ok(None);
             };
+            #[cfg(test)]
+            bump(&PLACED);
             pages.push((alloc, 1));
             (page, a.rectangle)
         };
@@ -207,14 +321,21 @@ fn least_cost(reserved: u32, area: u64, side: u32) -> u64 {
 /// ([`least_cost`]) is past the best found, every larger side's is too,
 /// and the search ends; a side is packed only into the pages that would
 /// not cost more than the best found, so a costlier packing stops early.
+///
+/// `work` is asked before the order's sort ([`Site::PlanSort`]), before
+/// the scans ([`Site::PlanScan`]) and before each side begun
+/// ([`Site::PlanSide`]), and counts the placements' page tries.
 pub(crate) fn pack(
     padded: &[[u32; 2]],
     cap: u32,
     max_pages: u32,
     reserved: u32,
     min_side: u32,
+    work: &mut Work<'_>,
 ) -> Result<Packing, PackError> {
+    work.phase(Site::PlanSort)?;
     if padded.is_empty() {
+        work.phase(Site::PlanScan)?;
         let Some(side) = candidates(padded, cap, min_side).next() else {
             return Err(PackError::TooManyPages);
         };
@@ -225,6 +346,7 @@ pub(crate) fn pack(
         });
     }
     let order = order(padded);
+    work.phase(Site::PlanScan)?;
     let area = padded
         .iter()
         .map(|&[w, h]| u64::from(w) * u64::from(h))
@@ -244,9 +366,14 @@ pub(crate) fn pack(
             }
             None => max_pages,
         };
+        #[cfg(test)]
+        bump(&SIDE_STARTS);
+        work.phase(Site::PlanSide)?;
         // Within that budget a packing costs no more than the best, and on
         // this larger side the same cost takes fewer pages: it is better.
-        if let Some(p) = pack_side(padded, &order, side, pages, MAX_CELLS_PER_PAGE)? {
+        if let Some(p) =
+            pack_side_aligned(padded, &order, side, pages, MAX_CELLS_PER_PAGE, ALIGN, work)?
+        {
             best = Some(p);
         }
     }
@@ -257,7 +384,9 @@ pub(crate) fn pack(
 mod tests {
     use proptest::prelude::*;
 
-    use super::{MAX_CELLS_PER_PAGE, candidates, cost, order, pack, pack_side, padded, side_cap};
+    use super::{
+        MAX_CELLS_PER_PAGE, Work, candidates, cost, order, pack, pack_side, padded, side_cap,
+    };
 
     /// Whether two rectangles (left, top, width, height) overlap.
     fn overlap(a: [u32; 4], b: [u32; 4]) -> bool {
@@ -320,7 +449,7 @@ mod tests {
         let mut sizes = vec![[2_064, 2_064]];
         sizes.extend([[2_048, 2_048]; 30]);
         sizes.extend([[1_936, 1_096]; 6]);
-        let p = pack(&sizes, 8_192, 64, 1, 0).unwrap();
+        let p = pack(&sizes, 8_192, 64, 1, 0, &mut Work::never()).unwrap();
         assert_eq!((p.side, p.pages), (4_224, 9));
         let chosen = cost(1, p.pages, p.side);
         assert_eq!(chosen, 10 * 4_224 * 4_224);
@@ -332,7 +461,10 @@ mod tests {
             assert!(cost(1, q.pages, side) > chosen, "{side}: {}", q.pages);
         }
         // Deterministic.
-        assert_eq!(pack(&sizes, 8_192, 64, 1, 0).unwrap(), p);
+        assert_eq!(
+            pack(&sizes, 8_192, 64, 1, 0, &mut Work::never()).unwrap(),
+            p
+        );
     }
 
     /// Cells from raw values: sizes 1 to 600.
@@ -355,7 +487,7 @@ mod tests {
             let sizes: Vec<[u32; 2]> = contents.iter().map(|&c| padded(c).unwrap()).collect();
             let largest = sizes.iter().flatten().copied().max().unwrap();
             prop_assume!(largest <= cap);
-            let Ok(p) = pack(&sizes, cap, layers, reserved, 0) else {
+            let Ok(p) = pack(&sizes, cap, layers, reserved, 0, &mut Work::never()) else {
                 // No candidate fits: every candidate fails the page cap.
                 let order = order(&sizes);
                 for side in candidates(&sizes, cap, 0) {
@@ -389,7 +521,7 @@ mod tests {
                 }
             }
             // Deterministic.
-            prop_assert_eq!(pack(&sizes, cap, layers, reserved, 0).unwrap(), p);
+            prop_assert_eq!(pack(&sizes, cap, layers, reserved, 0, &mut Work::never()).unwrap(), p);
         }
     }
 }

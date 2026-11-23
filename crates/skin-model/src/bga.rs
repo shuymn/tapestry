@@ -300,9 +300,15 @@ pub fn pack(stored: &[Option<[u32; 2]>], budget: u32) -> Packing {
             .map(|c| c.map(|v| v + 2 * CELL_GUTTER))
             .collect();
         let order = pack::order(&padded);
-        let Ok(Some(p)) =
-            pack::pack_side_aligned(&padded, &order, PAGE_SIDE, budget, MAX_CELLS_PER_PAGE, 1)
-        else {
+        let Ok(Some(p)) = pack::pack_side_aligned(
+            &padded,
+            &order,
+            PAGE_SIDE,
+            budget,
+            MAX_CELLS_PER_PAGE,
+            1,
+            &mut pack::Work::never(),
+        ) else {
             continue;
         };
         let mut cells = vec![None; stored.len()];

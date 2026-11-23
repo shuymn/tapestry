@@ -676,7 +676,11 @@ impl FileSource {
         self.count(|c| c.decodes += 1);
         match mode {
             Mode::Full(header) => decode::check_whole(&bytes, dims, header)
-                .and_then(|()| decode::decode(bytes, dims))
+                .and_then(|()| {
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    crate::dev::whole_decode();
+                    decode::decode(bytes, dims)
+                })
                 .map(Some)
                 .map_err(|e| Stop::Image(ImageError::decode(at, e))),
             Mode::Banded(header) => decode::banded(bytes, dims, header, cancel, bands)
