@@ -926,22 +926,26 @@ impl PlayerRig<'_> {
         let mut adjust = self.adjust.take();
         let rig = &*self;
         let answered = pending.wait_until(Some(until), || {
-            // With a coordinator, the BGA job begins as soon as the job of
-            // the choice before ends, so its video manifest reaches the
-            // render thread while the attempt's movies still wait for it
-            // (design.md "Load Pipeline"); the direct launch ran it above.
-            if let Some(s) = &rig.selection {
-                rig.bga.step(Some((&s.coord, s.spawner)), &|| false);
-            }
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
-            preparation_stops(
+            if preparation_stops(
                 rig.quitting(),
                 rig.controls.leaving(),
                 rig.input_failure(),
                 rig.audio_failure(),
-            )
+            ) {
+                return true;
+            }
+            // With a coordinator, the BGA job begins as soon as the job of
+            // the choice before ends, so its video manifest reaches the
+            // render thread while the attempt's movies still wait for it
+            // (design.md "Load Pipeline"); the direct launch ran it above.
+            // A wait that stops begins none.
+            if let Some(s) = &rig.selection {
+                rig.bga.step(Some((&s.coord, s.spawner)), &|| false);
+            }
+            false
         });
         self.adjust = adjust;
         let answered = answered?;

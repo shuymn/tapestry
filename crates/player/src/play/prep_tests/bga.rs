@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use game::Preparation;
+use game::Rig as _;
 use skin_model::bga::BgaEntry;
 
 use super::{begin, imports, on_rig, polled, stage};
@@ -279,5 +280,59 @@ fn a_menu_preparation_starts_its_bga_job_while_its_screen_waits() {
         let took = began.elapsed();
         assert!(took < Duration::from_secs(2), "{took:?}");
         assert_eq!(*screens.manifests.lock().unwrap(), [1], "B's video file");
+    });
+}
+
+/// A quit pending as the screen's wait looks at the BGA job begins no job:
+/// with the job of the chart before ended while the chosen chart's screen
+/// waits, the wait stops on the quit and the chosen chart's job is not
+/// begun.
+#[test]
+fn a_stopped_screen_wait_begins_no_bga_job() {
+    let _serial = imports::serial();
+    let (_dir_a, a) = chart_with_bga();
+    let (dir_b, b) = crate::imports::facts::tests::loaded_kept(
+        "#BMP01 a.png\n#BMP02 v.mp4\n#00104:0102\n",
+        "tapestry",
+    );
+    crate::bga::tests::png(dir_b.path(), "a.png", [64, 64], [200, 0, 0]);
+    std::fs::write(dir_b.path().join("v.mp4"), b"x").unwrap();
+    let list = tempfile::tempdir().unwrap();
+    let screens = Installers::default();
+    screens.wait_manifest.store(true, Ordering::Release);
+    on_rig(a.chart(), &screens, false, |rig| {
+        let _let_go = LetGo;
+        let (sel, _) = crate::selection::tests::tree(list.path(), &[&["b.bms"]]);
+        rig.selection = Some(sel);
+        rig.render
+            .set_timeouts(Duration::from_secs(5), Duration::from_secs(10));
+        // Chart A's job let go into a read that takes 2 s; chart B chosen
+        // and prepared up to its screen meanwhile.
+        HOLD.store(true, Ordering::Release);
+        let delay = ReadDelay::set(2_000);
+        rig.chart_images_at_choice(&a);
+        super::until("A's job held", || crate::bga::HELD.load(Ordering::Acquire));
+        HOLD.store(false, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(delay);
+        rig.bga.renew();
+        let mut h = begin(rig, &b);
+        let began = Instant::now();
+        while stage(rig) != "screen" {
+            assert!(
+                began.elapsed() < super::watchdog(),
+                "never reached its screen"
+            );
+            let until = Instant::now() + Duration::from_millis(10);
+            let polled = rig.poll_preparation(&mut h, until);
+            assert!(matches!(polled, Ok(game::PrepPoll::Pending)), "{polled:?}");
+        }
+        assert!(!rig.bga.obsolete_ended(), "A's job still reads");
+        // The quit pending, and A's job ended, its end not yet taken.
+        rig.controls.command(game::Command::Quit);
+        super::until("A's job ended", || rig.bga.obsolete_ended());
+        let (begun, _) = rig.bga.counts();
+        assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Cancelled);
+        assert_eq!(rig.bga.counts().0, begun, "no job begun");
     });
 }

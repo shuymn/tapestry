@@ -1141,6 +1141,15 @@ impl BgaWorker {
         c.job.is_none() && c.obsolete.is_empty()
     }
 
+    /// Whether a job made obsolete is held and every such job's thread
+    /// ended, their ends not yet taken (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn obsolete_ended(&self) -> bool {
+        let c = self.core();
+        !c.obsolete.is_empty() && c.obsolete.iter().all(OwnedJob::finished)
+    }
+
     /// The current generation (tests).
     #[cfg(test)]
     #[must_use]
