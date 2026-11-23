@@ -115,6 +115,27 @@ pub const FAIL_PANIC: u8 = 2;
 #[cfg(test)]
 pub static READ_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// While set, each whole file read waits, its job cancelled or not, for
+/// at most 30 s (tests).
+#[cfg(test)]
+pub static READ_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a read waits at [`READ_GATE`] (tests).
+#[cfg(test)]
+pub static READ_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A read's wait at [`READ_DELAY_MS`] and then at [`READ_GATE`] (tests).
+#[cfg(test)]
+fn read_waits() {
+    std::thread::sleep(Duration::from_millis(READ_DELAY_MS.load(Ordering::SeqCst)));
+    let end = Instant::now() + Duration::from_secs(30);
+    while READ_GATE.load(Ordering::Acquire) && Instant::now() < end {
+        READ_WAITING.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    READ_WAITING.store(false, Ordering::Release);
+}
+
 /// Whether the job's spawn is refused (tests: [`FAIL`]).
 fn spawn_refused() -> bool {
     #[cfg(test)]
@@ -844,7 +865,7 @@ fn read_and_publish(
         #[cfg(feature = "dev-tools")]
         let reading = Instant::now();
         #[cfg(test)]
-        std::thread::sleep(Duration::from_millis(READ_DELAY_MS.load(Ordering::SeqCst)));
+        read_waits();
         let read = bga::read_picture(path, file, native, cancel, identity, limit());
         #[cfg(feature = "dev-tools")]
         {

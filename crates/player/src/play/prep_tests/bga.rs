@@ -283,6 +283,22 @@ fn a_menu_preparation_starts_its_bga_job_while_its_screen_waits() {
     });
 }
 
+/// Holds each BGA read at its gate, and lets it go when dropped.
+struct ReadGate;
+
+impl ReadGate {
+    fn set() -> Self {
+        crate::bga::READ_GATE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ReadGate {
+    fn drop(&mut self) {
+        crate::bga::READ_GATE.store(false, Ordering::Release);
+    }
+}
+
 /// A quit pending as the screen's wait looks at the BGA job begins no job:
 /// with the job of the chart before ended while the chosen chart's screen
 /// waits, the wait stops on the quit and the chosen chart's job is not
@@ -306,30 +322,38 @@ fn a_stopped_screen_wait_begins_no_bga_job() {
         rig.selection = Some(sel);
         rig.render
             .set_timeouts(Duration::from_secs(5), Duration::from_secs(10));
-        // Chart A's job let go into a read that takes 2 s; chart B chosen
-        // and prepared up to its screen meanwhile.
-        HOLD.store(true, Ordering::Release);
-        let delay = ReadDelay::set(2_000);
+        // Chart A's job held inside a read, whatever happens meanwhile;
+        // chart B chosen and prepared up to its screen.
+        let gate = ReadGate::set();
         rig.chart_images_at_choice(&a);
-        super::until("A's job held", || crate::bga::HELD.load(Ordering::Acquire));
-        HOLD.store(false, Ordering::Release);
-        std::thread::sleep(Duration::from_millis(100));
-        drop(delay);
+        super::until("A's read held", || {
+            crate::bga::READ_WAITING.load(Ordering::Acquire)
+        });
+        // A's manifest, sent before its reads, is not B's.
+        super::until("A's manifest", || {
+            !screens.manifests.lock().unwrap().is_empty()
+        });
+        screens.manifests.lock().unwrap().clear();
         rig.bga.renew();
         let mut h = begin(rig, &b);
         let began = Instant::now();
-        while stage(rig) != "screen" {
+        // Its screen's wait looks at the job at least once while A reads.
+        let mut waited = false;
+        while !waited {
             assert!(
                 began.elapsed() < super::watchdog(),
                 "never reached its screen"
             );
-            let until = Instant::now() + Duration::from_millis(10);
+            waited = stage(rig) == "screen";
+            let until = Instant::now() + Duration::from_millis(100);
             let polled = rig.poll_preparation(&mut h, until);
             assert!(matches!(polled, Ok(game::PrepPoll::Pending)), "{polled:?}");
         }
+        assert_eq!(stage(rig), "screen");
         assert!(!rig.bga.obsolete_ended(), "A's job still reads");
         // The quit pending, and A's job ended, its end not yet taken.
         rig.controls.command(game::Command::Quit);
+        drop(gate);
         super::until("A's job ended", || rig.bga.obsolete_ended());
         let (begun, _) = rig.bga.counts();
         assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Cancelled);
