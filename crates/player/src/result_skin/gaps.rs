@@ -437,7 +437,7 @@ pub fn engage(id: u64, site: u8, after: bool) {
 #[cfg(test)]
 mod tests {
     use super::{HoldAt, pair};
-    use crate::dev::SelectScript;
+    use crate::dev::{SelectScript, SelectStep};
 
     /// The measurement's select steps parse, and a malformed hold is
     /// refused with its reason.
@@ -476,12 +476,36 @@ mod tests {
         ] {
             assert!(HoldAt::parse(bad).is_err(), "{bad}");
         }
-        for ok in [
-            "hold-preload=PlanEnd:1:after,release-preload=adopted,pick=a.bme,enter",
-            "hold-preload=PlanPlaceWork:1:after,preload-held,practice,release-preload",
-        ] {
-            assert!(SelectScript::parse(ok).is_ok(), "{ok}");
+        // Each step parses to itself: the hold's site, count and timing,
+        // the release's form, the practice key and Back.
+        let mut s = SelectScript::parse(
+            "hold-preload=PlanEnd:1:after,release-preload=adopted,hold-preload=Take:2:before,\
+             hold-preload=PlanPlaceWork:3,preload-held,practice,release-preload,practice-back",
+        )
+        .unwrap();
+        let mut steps = Vec::new();
+        while let Some(step) = s.front() {
+            steps.push(format!("{step:?}"));
+            s.done();
         }
+        let hold =
+            |site, n, after| format!("{:?}", SelectStep::HoldPreload(HoldAt { site, n, after }));
+        assert_eq!(
+            steps,
+            [
+                hold(14, 1, true),
+                format!("{:?}", SelectStep::ReleasePreload { on_adopt: true }),
+                hold(19, 2, false),
+                hold(13, 3, false),
+                format!("{:?}", SelectStep::PreloadHeld),
+                format!(
+                    "{:?}",
+                    SelectStep::PracticeKey(crate::dev::scenario::InputRef::Auto)
+                ),
+                format!("{:?}", SelectStep::ReleasePreload { on_adopt: false }),
+                format!("{:?}", SelectStep::PracticeBack),
+            ]
+        );
         assert!(SelectScript::parse("hold-preload=Nowhere:1").is_err());
         assert!(SelectScript::parse("release-preload=later").is_err());
         // A paired mark keeps its job and its value apart.

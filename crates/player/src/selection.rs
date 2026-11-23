@@ -2100,6 +2100,53 @@ enum Driven {
     Wait,
     /// The script failed: the run ends.
     Failed,
+    /// The script closes the window (`close`): the run ends.
+    Close,
+}
+
+/// The `--dev-select` steps due on the practice page (dev-tools; a run
+/// with no scenario): `sleep`, the preload's hold steps and `close` run
+/// as on the select screen, `practice-back` leaves the page, and any
+/// other step waits for the select screen.
+#[cfg(feature = "dev-tools")]
+fn drive_practice_select(script: &mut crate::dev::SelectScript) -> Driven {
+    use crate::dev::SelectStep;
+    loop {
+        match script.front().cloned() {
+            Some(SelectStep::Sleep(ms)) => {
+                if !script.slept(ms) {
+                    return Driven::Wait;
+                }
+            }
+            Some(SelectStep::HoldPreload(at)) => crate::result_skin::gaps::hold(at),
+            Some(SelectStep::ReleasePreload { on_adopt }) => {
+                if on_adopt {
+                    crate::result_skin::gaps::release_on_adopt();
+                } else {
+                    crate::result_skin::gaps::release();
+                }
+            }
+            Some(SelectStep::PreloadHeld) => {
+                if crate::result_skin::gaps::held().is_none() {
+                    if script.watchdog_expired() {
+                        script.fail("the preload pack never held".to_owned());
+                        return Driven::Failed;
+                    }
+                    return Driven::Wait;
+                }
+            }
+            Some(SelectStep::PracticeBack) => {
+                script.done();
+                return Driven::Key(MenuKey::Escape);
+            }
+            Some(SelectStep::Close) => {
+                script.done();
+                return Driven::Close;
+            }
+            _ => return Driven::Wait,
+        }
+        script.done();
+    }
 }
 
 /// The scripted step due on the practice page (a scenario's `practice`):
@@ -3311,6 +3358,22 @@ impl PlayerRig<'_> {
     /// fails the run.
     #[cfg(feature = "dev-tools")]
     fn script_practice(&mut self) -> bool {
+        if self.scenario.is_none() {
+            let Some(script) = self.selection.as_mut().and_then(|s| s.script.as_mut()) else {
+                return false;
+            };
+            return match drive_practice_select(script) {
+                Driven::Key(key) => {
+                    self.result_input.menu.push(MenuInput::Key(key));
+                    true
+                }
+                Driven::Wait => false,
+                Driven::Failed | Driven::Close => {
+                    self.controls.close();
+                    false
+                }
+            };
+        }
         let (Some(sc), Some(script)) = (
             &mut self.scenario,
             self.selection.as_mut().and_then(|s| s.script.as_mut()),
@@ -3323,7 +3386,7 @@ impl PlayerRig<'_> {
                 true
             }
             Driven::Wait => false,
-            Driven::Failed => {
+            Driven::Failed | Driven::Close => {
                 self.controls.close();
                 false
             }
@@ -6955,6 +7018,44 @@ pub(crate) mod tests {
             }
         }
         (keys, super::Driven::Wait)
+    }
+
+    /// A `--dev-select` run on the practice page: its waits run, Back
+    /// leaves the page, `close` ends the run, and a step of the select
+    /// screen waits there.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_dev_select_run_steps_on_the_practice_page() {
+        let mut script =
+            crate::dev::SelectScript::parse("sleep=0,practice-back,sleep=0,close").unwrap();
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Key(MenuKey::Escape)
+        ));
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Close
+        ));
+        assert!(script.front().is_none());
+        // A select screen's step waits for it; a long sleep holds Back.
+        let mut script = crate::dev::SelectScript::parse("pick=a.bme,practice-back").unwrap();
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Wait
+        ));
+        assert!(matches!(
+            script.front(),
+            Some(crate::dev::SelectStep::Pick(_))
+        ));
+        let mut script = crate::dev::SelectScript::parse("sleep=60000,practice-back").unwrap();
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Wait
+        ));
+        assert!(matches!(
+            script.front(),
+            Some(crate::dev::SelectStep::Sleep(60_000))
+        ));
     }
 
     /// Setting a page far from where it opens takes a key per showing of

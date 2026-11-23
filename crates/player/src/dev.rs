@@ -1093,7 +1093,10 @@ pub struct SlowLoad {
 /// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading`,
 /// `slow-measuring=<ms>`, `hold-background`, `background=<running|idle>`,
 /// `hold-preload=<site>:<n>[:before|:after]`, `preload-held`,
-/// `release-preload[=adopted]`, `practice` and `close`.
+/// `release-preload[=adopted]`, `practice`, `practice-back` and `close`.
+/// After `practice` the page shows: there `sleep`, the preload's hold
+/// steps and `close` run as on the select screen, `practice-back` leaves
+/// the page (Escape), and any other step waits for the select screen.
 /// Selection steps run on the select screen (`prev-preset` and
 /// `next-preset` press F11 and F12; `close-measuring` and
 /// `quit-measuring` close the window or press the quit key once the next
@@ -1195,7 +1198,7 @@ impl SelectScript {
                 Some(("row", f)) => Ok(SelectStep::Row(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, hold-preload=, preload-held, release-preload[=adopted], practice, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, hold-preload=, preload-held, release-preload[=adopted], practice, practice-back, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -1265,9 +1268,10 @@ impl SelectScript {
                 None if s == "practice" => {
                     Ok(SelectStep::PracticeKey(scenario::InputRef::Auto))
                 }
+                None if s == "practice-back" => Ok(SelectStep::PracticeBack),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, hold-preload=, preload-held, release-preload[=adopted], practice, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, hold-preload=, preload-held, release-preload[=adopted], practice, practice-back, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
