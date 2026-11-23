@@ -4871,3 +4871,676 @@ fn a_run_past_the_record_s_cap_exits_1() {
         }
     }
 }
+
+/// The media worker built beside the game, which makes the coded clips.
+const WORKER: &str = env!("CARGO_BIN_EXE_tapestry-media");
+
+/// A clip of `spec` (`--dev-gen-clip`'s codec, container, size, rate,
+/// frames and group) at `path`: frame `i` shows `i` in the top row of its
+/// 16 × 16 blocks, bit `b` in block `b`.
+fn gen_clip(path: &Path, spec: &str) {
+    let out = Command::new(WORKER)
+        .arg("--dev-gen-clip")
+        .arg(path)
+        .args(spec.split(' '))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--dev-gen-clip {spec}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `w` × `h` PNG at `path`, `rgba` inside `rect` (x, y, w, h) and
+/// opaque black elsewhere.
+fn write_rect_png(path: &Path, [w, h]: [u32; 2], rect: [u32; 4], rgba: [u8; 4]) {
+    let file = fs::File::create(path).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let [rx, ry, rw, rh] = rect;
+    let texels: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .flat_map(|(x, y)| {
+            if (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y) {
+                rgba
+            } else {
+                [0, 0, 0, 255]
+            }
+        })
+        .collect();
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+}
+
+/// A play skin whose only element is the chart's BGA filling the canvas,
+/// each picture stretched to it whole (stretch 0): a 4:3 video of 320 × 240
+/// at a 640 × 360 capture is scaled 2 across and 1.5 down.
+fn install_video_skin(fx: &Fixture) {
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "bga": {"id": "g"},
+            "destination": [{"id": "g", "stretch": 0,
+                "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]}]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The captures of a video scenario: 640 × 360, the BGA filling them.
+const VIDEO_SIZE: [usize; 2] = [640, 360];
+
+/// The RGB pixels of the PNG at `path`, `VIDEO_SIZE`.
+fn rgb(path: &Path) -> Vec<[u8; 3]> {
+    let mut reader = png::Decoder::new(BufReader::new(fs::File::open(path).unwrap()))
+        .read_info()
+        .unwrap();
+    let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut rgba).unwrap();
+    assert_eq!(
+        [info.width as usize, info.height as usize],
+        VIDEO_SIZE,
+        "{}",
+        path.display()
+    );
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[r, g, b, _]| [r, g, b])
+        .collect()
+}
+
+/// The index a 320 × 240 coded clip's frame shows in a capture's pixels
+/// `px`, its blocks scaled 2 across and 1.5 down: bit `b` in the green of
+/// block `b`'s centre (32 b + 16, 12), for `bits` bits; `None` when a block
+/// is neither dark nor bright (no frame of the clip there).
+fn coded_index(px: &[[u8; 3]], bits: usize) -> Option<u32> {
+    let mut index = 0;
+    for b in 0..bits {
+        let [_, g, _] = px[12 * VIDEO_SIZE[0] + 32 * b + 16];
+        match g {
+            0..64 => {}
+            192.. => index |= 1 << b,
+            _ => return None,
+        }
+    }
+    Some(index)
+}
+
+/// Whether every pixel of `px` is black within 8 of 0.
+fn all_black(px: &[[u8; 3]]) -> bool {
+    px.iter().all(|p| p.iter().all(|&c| c <= 8))
+}
+
+/// The newest frame of a clip at `rate` frames a second whose stamp,
+/// counted from its first, is at or before `media` µs: `None` before the
+/// first. The stamps are rounded to µs as the worker rescales them, from
+/// a start the clip's container may offset, so a time within 1 µs of a
+/// frame's stamp may take either frame (`Err` with both).
+fn due_frame(media: i64, rate: i64) -> Option<Result<u32, (u32, u32)>> {
+    if media < 0 {
+        return None;
+    }
+    let stamp = |i: i64| (i * 1_000_000 + rate / 2) / rate;
+    let mut i = media * rate / 1_000_000;
+    while stamp(i + 1) <= media {
+        i += 1;
+    }
+    while stamp(i) > media {
+        i -= 1;
+    }
+    let near_own = media - stamp(i) <= 1 && i > 0;
+    let near_next = stamp(i + 1) - media <= 1;
+    let i = u32::try_from(i).unwrap();
+    Some(if near_own {
+        Err((i - 1, i))
+    } else if near_next {
+        Err((i, i + 1))
+    } else {
+        Ok(i)
+    })
+}
+
+/// Whether `got` is the frame `due` names.
+fn is_due(got: u32, due: Result<u32, (u32, u32)>) -> bool {
+    match due {
+        Ok(i) => got == i,
+        Err((a, b)) => got == a || got == b,
+    }
+}
+
+/// The capture `name`'s chart time, from its JSON beside it.
+fn chart_us(dir: &Path, name: &str) -> i64 {
+    side_num(
+        &fs::read_to_string(dir.join(format!("{name}.json"))).unwrap(),
+        "chart_us",
+    )
+}
+
+/// The transition probe's marks `tag` in `stdout`: each one's time on
+/// the game's clock and value.
+fn probe_marks(stdout: &str, tag: &str) -> Vec<(i64, i64)> {
+    lines(stdout, "dev: probe ")
+        .iter()
+        .filter_map(|l| {
+            let mut w = l.split(' ').skip(2);
+            let (t, g, v) = (w.next()?, w.next()?, w.next()?);
+            (g == tag).then(|| (t.parse().unwrap(), v.parse().unwrap()))
+        })
+        .collect()
+}
+
+/// The id of the media worker the game process `parent` launched, waiting
+/// up to `limit` for it: a child process of it named `tapestry-media.exe`.
+fn worker_of(parent: u32, limit: std::time::Duration) -> u32 {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let begun = std::time::Instant::now();
+    loop {
+        // SAFETY: a snapshot of the system's processes, closed below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.unwrap();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap(),
+            ..Default::default()
+        };
+        let mut found = None;
+        // SAFETY: the snapshot and an entry of its size.
+        let mut more = unsafe { Process32FirstW(snapshot, &raw mut entry) }.is_ok();
+        while more {
+            let name = String::from_utf16_lossy(&entry.szExeFile);
+            if entry.th32ParentProcessID == parent
+                && name.trim_end_matches('\0') == "tapestry-media.exe"
+            {
+                found = Some(entry.th32ProcessID);
+            }
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snapshot, &raw mut entry) }.is_ok();
+        }
+        // SAFETY: the snapshot, unused after this.
+        let _ = unsafe { CloseHandle(snapshot) };
+        if let Some(pid) = found {
+            return pid;
+        }
+        assert!(begun.elapsed() < limit, "no media worker of {parent}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Ends process `pid`, as a crash does: nobody asked it to.
+fn crash(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: a process id; the handle is closed below.
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }.unwrap();
+    // SAFETY: the process just opened to terminate.
+    unsafe { TerminateProcess(process, 1) }.unwrap();
+    // SAFETY: the handle, unused after this.
+    let _ = unsafe { CloseHandle(process) };
+}
+
+/// Waits up to `limit` for the capture `name` in `dir` to be written whole
+/// (its JSON, written after its PNG, ending its line); when it is, the
+/// time it was seen.
+fn written(dir: &Path, name: &str, limit: std::time::Duration) -> std::time::Instant {
+    let begun = std::time::Instant::now();
+    loop {
+        if fs::read_to_string(dir.join(format!("{name}.json"))).is_ok_and(|s| s.ends_with('\n')) {
+            return std::time::Instant::now();
+        }
+        assert!(begun.elapsed() < limit, "{name} not written");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+impl Fixture {
+    /// `command` run to its end within `limit` as [`run_drained`] runs it,
+    /// `during` given its process id while it runs; a failure of `during`
+    /// ends the run and fails the test with what it printed.
+    ///
+    /// [`run_drained`]: Self::run_drained
+    fn run_during(
+        &self,
+        command: &mut Command,
+        limit: std::time::Duration,
+        during: impl FnOnce(u32),
+    ) -> (Output, String, String) {
+        use std::io::Read as _;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let drain = |mut r: Box<dyn std::io::Read + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = r.read_to_end(&mut bytes);
+                let _ = tx.send(bytes);
+            });
+            rx
+        };
+        let out = drain(Box::new(child.stdout.take().unwrap()));
+        let err = drain(Box::new(child.stderr.take().unwrap()));
+        let begun = std::time::Instant::now();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| during(child.id())));
+        let status = loop {
+            if ran.is_err() {
+                break None;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if begun.elapsed() >= limit {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        if status.is_none() {
+            // Its worker, in a job the game closes with it, ends with it.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let read = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+            let bytes = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let (stdout, stderr) = (read(out), read(err));
+        if let Err(e) = ran {
+            eprintln!("{stdout}\n{stderr}");
+            std::panic::resume_unwind(e);
+        }
+        let Some(status) = status else {
+            panic!("the run did not end within {limit:?}\n{stdout}\n{stderr}");
+        };
+        let output = Output {
+            status,
+            stdout: stdout.clone().into_bytes(),
+            stderr: stderr.clone().into_bytes(),
+        };
+        (output, stdout, stderr)
+    }
+}
+
+/// How long the session takes at most to see a crashed worker: it looks
+/// at least every 100 ms (its tick), and the allowance covers a loaded
+/// machine's scheduling of the session and the render thread.
+const CRASH_SEEN: i64 = 100_000 + 1_000_000;
+
+/// A chart with a coded base video and a layer picture, `v/v.bms`: the
+/// 10 s clip `clip.avi` (MJPEG, 320 × 240, 10 fps, frame `i` showing `i`) on the
+/// base from 0 s, a layer picture over it, black but for a green block at
+/// (200, 150) 100 × 80, from 0 s, and notes at 2.0 to 3.5 s and 6.0 to
+/// 7.5 s (120 BPM) with an invisible key-6 note.
+fn write_video_chart(library: &Path) -> bms_model::Chart {
+    let dir = library.join("v");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    gen_clip(&dir.join("clip.avi"), "mjpeg avi 320x240 10 100 1");
+    write_rect_png(
+        &dir.join("layer.png"),
+        [320, 240],
+        [200, 150, 100, 80],
+        [0, 200, 0, 255],
+    );
+    let text = "#PLAYER 1\n#TITLE video\n#BPM 120\n#WAV01 key.wav\n\
+                #BMP01 clip.avi\n#BMP02 layer.png\n\
+                #00138:01\n#00004:01\n#00007:02\n#00111:01010101\n#00311:01010101\n";
+    fs::write(dir.join("v.bms"), text).unwrap();
+    bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart
+}
+
+/// The scenario of `steps` after a capture at each of `ats` (chart ms,
+/// `c<ms>.png`), at the video captures' size.
+fn video_scenario(ats: &[i64], steps: &[&str]) -> String {
+    let captures: Vec<String> = ats
+        .iter()
+        .map(|at| format!("capture = {{ at = {at}, file = \"c{at}.png\" }}"))
+        .collect();
+    let all: Vec<&str> = captures
+        .iter()
+        .map(String::as_str)
+        .chain(steps.iter().copied())
+        .collect();
+    scenario(&all).replacen(
+        "output = \"out\"\n",
+        "output = \"out\"\nsize = [640, 360]\n",
+        1,
+    )
+}
+
+/// A chart's coded base video plays on chart time through the media worker
+/// (design.md "Rendering and Skins", BGA): each capture shows the frame
+/// due at its chart time, the green block of the layer picture over it.
+/// The worker is then crashed after a capture read back so (design.md
+/// "Threat Model" T02): the session sees it within its tick and an
+/// allowance, and from the first frame built after, the whole BGA panel,
+/// the layer picture too, reads back black; the frames before it still
+/// show the video. Play goes on to its end and its record is saved.
+// Covers: T02
+#[test]
+fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
+    // The capture after which the worker is crashed.
+    const KILL_AFTER: i64 = 12 * 237;
+    let fx = Fixture::new();
+    let chart = write_video_chart(&fx.library());
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("v.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    // Every 237 ms, out of step with the clip's 100 ms frames, to 7.8 s.
+    let ats: Vec<i64> = (1..=33).map(|k| k * 237).collect();
+    let text = video_scenario(
+        &ats,
+        &[
+            "select = { path = \"library/v/v.bms\" }",
+            "play = { input = \"logs/v.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ],
+    );
+    let dir = fx.base.join("out");
+    let mut killed = None;
+    let (out, stdout, stderr) = fx.run_during(
+        fx.command(&text).env("TAPESTRY_LOOP_PROBE", "1"),
+        RUN_LIMIT,
+        |game| {
+            let name = format!("c{KILL_AFTER}");
+            let seen = written(&dir, &name, RUN_LIMIT);
+            let px = rgb(&dir.join(format!("{name}.png")));
+            let due = due_frame(chart_us(&dir, &name), 10).unwrap();
+            let got = coded_index(&px, 7);
+            assert!(
+                got.is_some_and(|g| is_due(g, due)),
+                "{name}: {got:?}, due {due:?}"
+            );
+            let worker = worker_of(game, std::time::Duration::from_secs(10));
+            crash(worker);
+            killed = Some(seen.elapsed());
+        },
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let since_seen = i64::try_from(killed.unwrap().as_micros()).unwrap();
+    // The session saw the chart video lost as its worker ended (`Ended`,
+    // a chart video's), and the render side then drew the panel lost.
+    let ended = 8 + 256;
+    let session = probe_marks(&stdout, "media:lost");
+    assert_eq!(
+        session.iter().map(|m| m.1).collect::<Vec<_>>(),
+        [ended],
+        "{stdout}"
+    );
+    let [(drawn_at, lost_chart_us)] = probe_marks(&stdout, "movies:chart_lost")[..] else {
+        panic!("one panel loss drawn: {stdout}");
+    };
+    assert!(session[0].0 <= drawn_at, "{session:?} {drawn_at}");
+    // The crash came at least `since_seen` after the capture's frame.
+    let crashed_by = chart_us(&dir, &format!("c{KILL_AFTER}")) + since_seen;
+    assert!(
+        lost_chart_us - crashed_by <= CRASH_SEEN,
+        "lost at {lost_chart_us}, crashed by {crashed_by}"
+    );
+    for at in &ats {
+        let name = format!("c{at}");
+        let px = rgb(&dir.join(format!("{name}.png")));
+        let t = chart_us(&dir, &name);
+        if t >= lost_chart_us {
+            assert!(all_black(&px), "{name} at {t}: black from {lost_chart_us}");
+            continue;
+        }
+        let due = due_frame(t, 10).unwrap();
+        let got = coded_index(&px, 7);
+        assert!(
+            got.is_some_and(|g| is_due(g, due)),
+            "{name} at {t}: {got:?}, due {due:?}"
+        );
+        let [r, g, b] = px[285 * VIDEO_SIZE[0] + 500];
+        assert!(
+            g > 128 && r < 64 && b < 64,
+            "{name}: the layer's green over the video"
+        );
+    }
+    assert!(
+        ats.iter()
+            .any(|at| chart_us(&dir, &format!("c{at}")) >= lost_chart_us),
+        "a capture after the loss"
+    );
+    let (records, _) = fx.played_records();
+    let [record] = &records[..] else {
+        panic!("one played record: {records:?}");
+    };
+    let rec = replay::decode(&fs::read(record).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
+}
+
+/// The `[load_stages]` of the measure file beside `record`, in their order.
+fn record_load_stages(record: &Path) -> Vec<(String, i64)> {
+    let text = fs::read_to_string(record.with_extension("measure.toml")).unwrap();
+    let section = text
+        .split("[load_stages]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no load stages: {text}"));
+    section
+        .lines()
+        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+        .map(|l| {
+            let (k, v) = l.split_once(" = ").unwrap();
+            (k.to_owned(), v.parse().unwrap())
+        })
+        .collect()
+}
+
+/// A 20 s coded clip started on the base at 1 s plays on chart time
+/// through the media worker (design.md "Rendering and Skins", BGA): every
+/// capture shows the newest frame whose stamp, from the clip's first, is at
+/// or before its chart time less 1 s, the placeholder before the start and
+/// after the clip's last frame has ended (its stamp plus its duration). The
+/// load that led to the play stamps the worker's launch and the video's
+/// probe in its stages, in order, before READY.
+#[test]
+fn chart_video_frames_follow_chart_time_in_a_scenario() {
+    let fx = Fixture::new();
+    let dir = fx.library().join("t");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    gen_clip(&dir.join("clip.avi"), "mjpeg avi 320x240 10 200 1");
+    let text = "#PLAYER 1\n#TITLE timing\n#BPM 120\n#WAV01 key.wav\n#BMP01 clip.avi\n\
+                #00138:01\n#00004:0001\n#00111:01010101\n#01011:01010101\n";
+    fs::write(dir.join("t.bms"), text).unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("t.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    // Every 237 ms, out of step with the clip's 100 ms frames, to 21.6 s:
+    // the clip's last frame ends at 21 s.
+    let ats: Vec<i64> = (1..=91).map(|k| k * 237).collect();
+    let (out, stdout, stderr) = fx.run_drained(
+        &mut fx.command(&video_scenario(
+            &ats,
+            &[
+                "select = { path = \"library/t/t.bms\" }",
+                "play = { input = \"logs/t.tprl\", until = \"end\" }",
+                "result = \"back\"",
+                "quit = {}",
+            ],
+        )),
+        RUN_LIMIT,
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out_dir = fx.base.join("out");
+    let (mut shown, mut placeholder) = (0, 0);
+    for at in &ats {
+        let name = format!("c{at}");
+        let px = rgb(&out_dir.join(format!("{name}.png")));
+        let t = chart_us(&out_dir, &name);
+        // The start at 1 s; the clip's 200 frames end at 20 s of media.
+        let media = t - 1_000_000;
+        if !(0..20_000_000).contains(&media) {
+            assert!(all_black(&px), "{name} at {t}: the placeholder");
+            placeholder += 1;
+            continue;
+        }
+        let due = due_frame(media, 10).unwrap();
+        let got = coded_index(&px, 8);
+        assert!(
+            got.is_some_and(|g| is_due(g, due)),
+            "{name} at {t}: {got:?}, due {due:?}"
+        );
+        shown += 1;
+    }
+    assert!(shown >= 80 && placeholder >= 5, "{shown} {placeholder}");
+    let (records, _) = fx.played_records();
+    let [record] = &records[..] else {
+        panic!("one played record: {records:?}");
+    };
+    let stages = record_load_stages(record);
+    let at = |k: &str| {
+        stages
+            .iter()
+            .find(|(n, _)| n == k)
+            .unwrap_or_else(|| panic!("no {k}: {stages:?}"))
+            .1
+    };
+    let order = [
+        "media_launch_start",
+        "media_launch_end",
+        "video_probes_start",
+        "video_probes_end",
+        "ready",
+    ];
+    for pair in order.windows(2) {
+        assert!(at(pair[0]) <= at(pair[1]), "{pair:?}: {stages:?}");
+    }
+    assert!(at("media_launch_start") >= 0, "{stages:?}");
+}
+
+/// The render thread's app region allocates nothing in any frame of a play
+/// whose movie hook runs all four movie slots (design.md "Scope of No
+/// Allocation"): a chart video on the base, started again inside its clip,
+/// another on the layer, the base's video in the poor window of every
+/// missed note, and two skin movies, each through the media worker. The
+/// play's measure counts frames taken into each of the four slots and the
+/// restart, and the capture in the poor window draws the base's video
+/// alone. Its positive control: the BGA's draw made to allocate
+/// (dev-tools) is counted.
+#[test]
+fn render_app_zero_with_video_bga() {
+    let fx = Fixture::new();
+    let dir = fx.library().join("w");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    for name in ["a.mpg", "b.mpg"] {
+        gen_clip(&dir.join(name), "mpeg1video mpeg 320x240 30 300 15");
+    }
+    // Base a.mpg at 0 s and again at 3 s, layer b.mpg at 0 s, the poor
+    // window naming a.mpg; four notes from 2 s, every one missed.
+    let text = "#PLAYER 1\n#TITLE all\n#BPM 120\n#WAV01 key.wav\n\
+                #BMP01 a.mpg\n#BMP02 b.mpg\n\
+                #00138:01\n#00004:01\n#00104:0001\n#00007:02\n#00006:01\n#00111:01010101\n";
+    fs::write(dir.join("w.bms"), text).unwrap();
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    for name in ["c.mpg", "d.mpg"] {
+        gen_clip(&skin.join(name), "mpeg1video mpeg 160x120 30 300 15");
+    }
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "source": [{"id": "c", "path": "c.mpg"}, {"id": "d", "path": "d.mpg"}],
+            "image": [{"id": "mc", "src": "c"}, {"id": "md", "src": "d"}],
+            "bga": {"id": "g"},
+            "destination": [
+                {"id": "g", "stretch": 0, "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]},
+                {"id": "mc", "dst": [{"x": 0, "y": 840, "w": 320, "h": 240}]},
+                {"id": "md", "dst": [{"x": 1600, "y": 840, "w": 320, "h": 240}]}]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let plays = |output: &str| {
+        video_scenario(
+            &[1_000, 2_400],
+            &[
+                "select = { path = \"library/w/w.bms\" }",
+                "play = { input = { miss = \"all\" }, until = \"end\" }",
+                "result = \"back\"",
+                "quit = {}",
+            ],
+        )
+        .replacen("output = \"out\"", &format!("output = \"{output}\""), 1)
+    };
+    let measured = |fx: &Fixture| -> toml::Table {
+        let (records, _) = fx.played_records();
+        let last = records.last().expect("a played record");
+        fs::read_to_string(last.with_extension("measure.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let (out, stdout, stderr) = fx.run_drained(&mut fx.command(&plays("all")), RUN_LIMIT);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let m = measured(&fx);
+    assert!(int(&m, "render_cpu_us", "count").unwrap() > 0, "{m:?}");
+    assert_eq!(int(&m, "allocations", "render_app"), Some(0), "{m:?}");
+    let takes: Vec<i64> = m["movies"]["takes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_integer().unwrap())
+        .collect();
+    assert_eq!(takes.len(), 4, "{m:?}");
+    assert!(takes.iter().all(|&t| t > 0), "each slot taken: {m:?}");
+    assert!(int(&m, "movies", "restarts").unwrap() >= 1, "{m:?}");
+    // Before any miss the BGA draws two movie quads, the base's and the
+    // layer's, beside the skin's two; in the poor window, one: the base's
+    // video in the poor picture's place.
+    let movie_quads = |name: &str| {
+        fs::read_to_string(fx.base.join("all").join(format!("{name}.jsonl")))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"filter\":\"Movie {"))
+            .count()
+    };
+    assert_eq!((movie_quads("c1000"), movie_quads("c2400")), (4, 3));
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&plays("control"))
+            .env("TAPESTRY_DEV_BGA_ALLOCATE", "1"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let m = measured(&fx);
+    assert!(
+        int(&m, "allocations", "render_app").unwrap() > 0,
+        "the positive control is counted: {m:?}"
+    );
+}
