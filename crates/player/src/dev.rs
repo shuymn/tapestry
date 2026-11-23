@@ -3086,7 +3086,9 @@ static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
 /// last end of each, and the points, until READY ends the record; and the
 /// BGA job's time busy reading and decoding in all (`*_busy`, durations
 /// in µs), which its spans cannot tell apart where the pictures' reads
-/// and decodes alternate.
+/// and decodes alternate. The media session stamps the media worker's
+/// launch, when the load launches one, and its chart videos' probes, from
+/// the first open handed to the worker to the last probe answered.
 #[derive(Debug, Default)]
 struct LoadStages {
     /// The game's clock and the choice's time on it, from the choice on.
@@ -3103,7 +3105,7 @@ static LOAD_STAGES: Mutex<LoadStages> = Mutex::new(LoadStages {
 });
 
 /// The order `[load_stages]` lists its keys in.
-pub const LOAD_STAGE_KEYS: [&str; 21] = [
+pub const LOAD_STAGE_KEYS: [&str; 25] = [
     "chart_start",
     "chart_end",
     "sounds_start",
@@ -3122,6 +3124,10 @@ pub const LOAD_STAGE_KEYS: [&str; 21] = [
     "bga_decodes_busy",
     "bga_upload_start",
     "bga_upload_end",
+    "media_launch_start",
+    "media_launch_end",
+    "video_probes_start",
+    "video_probes_end",
     "decision_end",
     "minimum_end",
     "ready",
@@ -3176,6 +3182,21 @@ pub fn stage_busy(name: &'static str, took: Duration) {
         Some((_, v)) => *v = v.saturating_add(us),
         None => s.stamps.push((name, us)),
     }
+}
+
+/// The media session's observer ([`crate::media_host::session::OBSERVER`]):
+/// each video it loses is a transition probe mark `media:lost` whose value
+/// is the loss's reason ([`crate::media_host::session::Loss`] as a number),
+/// plus 256 for a chart video's, on the game's clock when the session saw
+/// it; the worker's launch and the chart videos' probes are load stages.
+pub fn observe_media() {
+    use crate::media_host::session::{OBSERVER, Observer};
+    let _ = OBSERVER.set(Observer {
+        lost: |why, chart| {
+            loop_probe::mark("media:lost", why as i64 + if chart { 256 } else { 0 });
+        },
+        stage,
+    });
 }
 
 /// The coordinator's jobs' stages ([`game::coord::observe_jobs`]).

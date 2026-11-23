@@ -490,6 +490,57 @@ macro_rules! event {
     };
 }
 
+/// What the session tells the game's development tools as it goes
+/// (dev-tools): each video it loses, as it sees the loss, and the steps of
+/// the worker's launch and of a chart video's probe, the load's stages.
+#[cfg(feature = "dev-tools")]
+pub struct Observer {
+    /// A video lost for `why`, a chart video's when `chart`.
+    pub lost: fn(Loss, bool),
+    /// A load stage reached (`media_launch_start`, …).
+    pub stage: fn(&'static str),
+}
+
+/// The development tools' observer, set once by the game (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub static OBSERVER: OnceLock<Observer> = OnceLock::new();
+
+/// Tells the observer, if any, of a video lost for `why`.
+#[cfg(feature = "dev-tools")]
+fn observe_lost(why: Loss, chart: bool) {
+    if let Some(o) = OBSERVER.get() {
+        (o.lost)(why, chart);
+    }
+}
+
+/// Tells the observer, if any, of load stage `name`.
+#[cfg(feature = "dev-tools")]
+fn observe_stage(name: &'static str) {
+    if let Some(o) = OBSERVER.get() {
+        (o.stage)(name);
+    }
+}
+
+/// Records a video's loss for `why` (`movie` the video's): a test's event,
+/// and the development tools' observation.
+macro_rules! lost {
+    ($shared:expr, $movie:expr, $why:expr) => {{
+        #[cfg(any(test, feature = "dev-tools"))]
+        let why: Loss = $why;
+        event!($shared, Event::Lost { why });
+        #[cfg(feature = "dev-tools")]
+        observe_lost(why, $movie.chart);
+    }};
+}
+
+/// Stamps load stage `name` for the development tools.
+macro_rules! stage {
+    ($name:expr) => {
+        #[cfg(feature = "dev-tools")]
+        observe_stage($name);
+    };
+}
+
 /// The game's handle on the session. Dropping it ends the session without
 /// waiting: its thread ends its worker as it goes.
 pub struct Session {
@@ -1056,7 +1107,10 @@ impl Supervisor {
                 let _ = tx.send(Inner::Launched(launched));
             });
         match spawned {
-            Ok(_) => self.launching_now = true,
+            Ok(_) => {
+                stage!("media_launch_start");
+                self.launching_now = true;
+            }
             Err(e) => {
                 self.lose_queued(Loss::Launch);
                 self.notes
@@ -1073,6 +1127,7 @@ impl Supervisor {
         self.launching_now = false;
         match launched {
             Ok(worker) => {
+                stage!("media_launch_end");
                 self.shared.pid.store(worker.pid(), Ordering::Release);
                 event!(self.shared, Event::Launched { pid: worker.pid() });
                 #[cfg(test)]
@@ -1095,7 +1150,7 @@ impl Supervisor {
     fn lose_queued(&mut self, why: Loss) {
         for p in &self.players {
             if p.stage == Stage::Queued && p.movie.lose(why) {
-                event!(self.shared, Event::Lost { why });
+                lost!(self.shared, p.movie, why);
             }
         }
         self.note_losses();
@@ -1131,7 +1186,7 @@ impl Supervisor {
     fn fail_worker(&mut self, why: Loss) {
         for p in &self.players {
             if p.stage != Stage::Queued && p.movie.lose(why) {
-                event!(self.shared, Event::Lost { why });
+                lost!(self.shared, p.movie, why);
             }
         }
         let pid = self.worker.as_ref().map(Worker::pid);
@@ -1190,6 +1245,9 @@ impl Supervisor {
                     p.id = id;
                     p.wait_on(Stage::Opening(open));
                     event!(self.shared, Event::Opened);
+                    if p.movie.chart {
+                        stage!("video_probes_start");
+                    }
                 }
                 Err(OpenError::Struck) => {
                     p.movie.lose(Loss::Struck);
@@ -1305,7 +1363,7 @@ impl Supervisor {
         let Some(p) = self.players.get_mut(i) else {
             return Ok(());
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "dev-tools"))]
         let before = p.movie.status();
         let (stage, then) =
             super::movie::answer(p.stage, &p.movie.cell, generation, outcome, late, p.sought);
@@ -1326,11 +1384,11 @@ impl Supervisor {
             }
         }
         p.stage = stage;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "dev-tools"))]
         if before != Status::Lost
             && let Some(why) = p.movie.loss()
         {
-            self.shared.event(Event::Lost { why });
+            lost!(self.shared, p.movie, why);
         }
         match then {
             Then::Nothing => Ok(()),
@@ -1358,16 +1416,21 @@ impl Supervisor {
                     matrix,
                     range,
                     ..
-                } => self.admit_probe(
-                    i,
-                    Probe {
-                        width,
-                        height,
-                        duration,
-                        matrix,
-                        range,
-                    },
-                ),
+                } => {
+                    if self.players.get(i).is_some_and(|p| p.movie.chart) {
+                        stage!("video_probes_end");
+                    }
+                    self.admit_probe(
+                        i,
+                        Probe {
+                            width,
+                            height,
+                            duration,
+                            matrix,
+                            range,
+                        },
+                    )
+                }
                 _ => Ok(()),
             },
         }
@@ -1399,7 +1462,7 @@ impl Supervisor {
             if let Some(p) = self.players.get(i)
                 && p.movie.lose(Loss::Answer)
             {
-                event!(self.shared, Event::Lost { why: Loss::Answer });
+                lost!(self.shared, p.movie, Loss::Answer);
             }
         }
     }
@@ -1425,7 +1488,7 @@ impl Supervisor {
                 && p.movie.status() != Status::Absent
                 && p.movie.lose(Loss::Failed)
             {
-                event!(self.shared, Event::Lost { why: Loss::Failed });
+                lost!(self.shared, p.movie, Loss::Failed);
             }
             p.stage = Stage::Idle;
             p.id = 0;
@@ -1469,12 +1532,7 @@ impl Supervisor {
                 if let Some(p) = self.players.get(i)
                     && p.movie.lose(Loss::OverTotal)
                 {
-                    event!(
-                        self.shared,
-                        Event::Lost {
-                            why: Loss::OverTotal
-                        }
-                    );
+                    lost!(self.shared, p.movie, Loss::OverTotal);
                 }
                 self.close(i)
             }
@@ -1639,7 +1697,7 @@ impl Supervisor {
                     && matches!(q.movie.status(), Status::Pending | Status::Live)
                     && q.movie.lose(Loss::Peer)
                 {
-                    event!(self.shared, Event::Lost { why: Loss::Peer });
+                    lost!(self.shared, q.movie, Loss::Peer);
                 }
             }
         }
@@ -1724,7 +1782,7 @@ impl Supervisor {
                 continue;
             };
             if p.movie.lose(why) {
-                event!(self.shared, Event::Lost { why });
+                lost!(self.shared, p.movie, why);
             }
             if why == Loss::Answer {
                 // A missed answer on a working transport: the worker is

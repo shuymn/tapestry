@@ -237,6 +237,39 @@ const RUN_WINDOW: Window = Window {
     last: i64::MAX,
 };
 
+/// What the hooks did over the process's life (dev-tools): each slot's
+/// frames taken into its planes, and the chart videos' restarts. A play's
+/// measure reports them from its start ([`crate::measure`]).
+#[cfg(feature = "dev-tools")]
+pub mod counts {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use skin_model::movie::SLOTS;
+
+    static TAKES: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static RESTARTS: AtomicU64 = AtomicU64::new(0);
+
+    /// A frame taken into slot `i`'s planes.
+    pub(super) fn took(i: usize) {
+        if let Some(t) = TAKES.get(i) {
+            t.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A chart video restarted.
+    pub(super) fn restarted() {
+        RESTARTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each slot's takes and the restarts so far.
+    pub fn now() -> ([u64; SLOTS], u64) {
+        (
+            TAKES.each_ref().map(|t| t.load(Ordering::Relaxed)),
+            RESTARTS.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Where a chart video stands (design.md "Rendering and Skins", BGA).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chart {
@@ -396,6 +429,9 @@ pub struct Movies<S = Movie> {
     /// The wakes made (tests).
     #[cfg(test)]
     wakes: u32,
+    /// A play frame has shown the chart's panel lost (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    lost_marked: bool,
 }
 
 impl<S: Source> Movies<S> {
@@ -412,6 +448,8 @@ impl<S: Source> Movies<S> {
             waker: None,
             #[cfg(test)]
             wakes: 0,
+            #[cfg(feature = "dev-tools")]
+            lost_marked: false,
         }
     }
 
@@ -626,7 +664,26 @@ impl<S: Source> Movies<S> {
             }
         }
         self.lose_peers(&mut shows);
+        #[cfg(feature = "dev-tools")]
+        if let Some(c) = chart {
+            self.mark_lost(&shows, c.now);
+        }
         shows
+    }
+
+    /// The first play frame that shows the chart's panel lost marks its
+    /// chart time `now` (µs) as the transition probe's `movies:chart_lost`
+    /// (dev-tools): the frame from which the panel draws black.
+    #[cfg(feature = "dev-tools")]
+    fn mark_lost(&mut self, shows: &MovieShows, now: i64) {
+        if !self.lost_marked
+            && CHART_SLOTS
+                .iter()
+                .any(|&i| matches!(shows.get(i), Some(MovieShow::Lost)))
+        {
+            self.lost_marked = true;
+            crate::dev::loop_probe::mark("movies:chart_lost", now);
+        }
     }
 
     /// A chart video lost for its own reason (not its peer's, not the
@@ -761,6 +818,8 @@ impl<S: Source> Movies<S> {
                         movie.freed(reader.freed());
                         if written {
                             slot.shown = true;
+                            #[cfg(feature = "dev-tools")]
+                            counts::took(i);
                             #[cfg(all(test, feature = "dev-tools"))]
                             {
                                 slot.stamp = Some(stamp);
@@ -901,6 +960,8 @@ impl<S: Source> Movies<S> {
                                     });
                             let run = reader.start_run(RUN_WINDOW);
                             wanted = Some(run);
+                            #[cfg(feature = "dev-tools")]
+                            counts::restarted();
                             Chart::Restarting {
                                 run,
                                 start: e,
@@ -977,6 +1038,8 @@ impl<S: Source> Movies<S> {
                     movie.freed(reader.freed());
                     if written {
                         slot.shown = true;
+                        #[cfg(feature = "dev-tools")]
+                        counts::took(i);
                         let run = reader.run();
                         slot.held = Some(Held {
                             run,

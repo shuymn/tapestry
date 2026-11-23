@@ -153,6 +153,10 @@ fn main() -> ExitCode {
     // The transition probe (`TAPESTRY_LOOP_PROBE`), on from here if set.
     #[cfg(feature = "dev-tools")]
     crate::dev::loop_probe::init(clock);
+    // The media session's losses as marks of that probe, and its launch
+    // and probes as load stages.
+    #[cfg(feature = "dev-tools")]
+    crate::dev::observe_media();
     // A usage error is found before anything is opened, and exits 2.
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
