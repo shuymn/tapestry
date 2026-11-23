@@ -151,6 +151,10 @@ pub(crate) enum Site {
     PlanPlaceWork,
     /// After the side search, before the plan's texel check.
     PlanEnd,
+    /// Every [`PLAN_BATCH`](crate::atlas::pack::PLAN_BATCH) units inside
+    /// a sheet union ([`super::Sheet::union_checked`]): a cell inserted
+    /// or a file compared.
+    UnionWork,
 }
 
 impl Site {
@@ -173,6 +177,7 @@ impl Site {
             Self::PlanRectWork => 12,
             Self::PlanPlaceWork => 13,
             Self::PlanEnd => 14,
+            Self::UnionWork => 15,
         }
     }
 }

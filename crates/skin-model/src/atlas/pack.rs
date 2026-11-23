@@ -28,6 +28,9 @@ thread_local! {
     pub(crate) static PLACED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The packings this thread began.
     pub(crate) static PACKINGS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A union's units: each cell inserted and each file compared,
+    /// counted in its loops.
+    pub(crate) static UNION_UNITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

@@ -43,6 +43,8 @@ pub mod site {
     pub const PLAN_PLACE_WORK: u8 = 13;
     /// After the side search.
     pub const PLAN_END: u8 = 14;
+    /// A batch ask inside a sheet union.
+    pub const UNION_WORK: u8 = 15;
     /// The first code a caller's own sites take.
     pub const CALLER: u8 = 16;
 }
