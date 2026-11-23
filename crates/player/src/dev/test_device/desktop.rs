@@ -5,7 +5,9 @@
 use anyhow::{Context as _, bail};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
+    GetDIBits, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
@@ -255,6 +257,67 @@ fn mouse(input: Input, tag: u32) -> INPUT {
     }
 }
 
+/// Copies the screen rectangle `rect` ([x, y, w, h]) from the screen's DC
+/// (`BitBlt`): its pixels, 32-bit BGRA, top row first.
+///
+/// # Errors
+///
+/// An empty rectangle, or a copy or read that failed.
+pub fn capture(rect: [i32; 4]) -> Result<Vec<u8>, String> {
+    let [x, y, w, h] = rect;
+    if w <= 0 || h <= 0 {
+        return Err(format!("an empty rectangle {rect:?}"));
+    }
+    // SAFETY: the screen's DC, released below.
+    let screen = unsafe { GetDC(None) };
+    // SAFETY: a valid DC.
+    let mem = unsafe { CreateCompatibleDC(Some(screen)) };
+    // SAFETY: as above.
+    let bitmap = unsafe { CreateCompatibleBitmap(screen, w, h) };
+    // SAFETY: both handles were just made.
+    let old = unsafe { SelectObject(mem, bitmap.into()) };
+    // SAFETY: both DCs are valid; the bitmap is `w`×`h`.
+    let blit = unsafe { BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY) };
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(0),
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
+    };
+    let mut pixels = vec![0_u8; usize::try_from(w * h * 4).unwrap_or(0)];
+    // SAFETY: the bitmap is deselected first; the buffer holds `h` rows of
+    // `w` 32-bit pixels.
+    let rows = unsafe {
+        SelectObject(mem, old);
+        GetDIBits(
+            mem,
+            bitmap,
+            0,
+            u32::try_from(h).unwrap_or(0),
+            Some(pixels.as_mut_ptr().cast::<std::ffi::c_void>()),
+            &raw mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    // SAFETY: each handle was made above and is released once.
+    unsafe {
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+    }
+    blit.map_err(|e| format!("BitBlt: {e}"))?;
+    if rows != h {
+        return Err(format!("GetDIBits read {rows} of {h} rows"));
+    }
+    Ok(pixels)
+}
+
 /// Records a call (its tag, what it sends and the client point it aims
 /// at) before it is made.
 pub type Note<'a> = dyn FnMut(u32, &str, (i32, i32)) + 'a;
@@ -313,12 +376,15 @@ impl Desk for Real<'_> {
             // Unreadable: refuse as if a menu were up.
             return Gui {
                 foreign_capture: false,
+                capture_process: 0,
                 menu: true,
             };
         }
         let capture = win(info.hwndCapture);
+        let capture_process = if capture == 0 { 0 } else { process_of(capture) };
         Gui {
-            foreign_capture: capture != 0 && process_of(capture) != std::process::id(),
+            foreign_capture: capture != 0 && capture_process != std::process::id(),
+            capture_process,
             menu: info.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0 | GUI_SYSTEMMENUMODE.0)
                 != 0,
         }
@@ -348,6 +414,24 @@ impl Desk for Real<'_> {
 
     fn sleep(&mut self, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+impl super::capture::Screen for Real<'_> {
+    fn monitor(&mut self) -> Option<[i32; 4]> {
+        Desk::monitor(self)
+    }
+    fn client(&mut self, w: Win) -> Option<[i32; 4]> {
+        Desk::client(self, w)
+    }
+    fn root_at(&mut self, x: i32, y: i32) -> Win {
+        Desk::root_at(self, x, y)
+    }
+    fn foreground(&mut self) -> Win {
+        foreground()
+    }
+    fn grab(&mut self, rect: [i32; 4]) -> Result<Vec<u8>, String> {
+        capture(rect)
     }
 }
 

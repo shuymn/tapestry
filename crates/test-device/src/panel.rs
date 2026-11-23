@@ -47,6 +47,20 @@ pub const TARGETS: [Target; 3] = [
     },
 ];
 
+/// The reference player's control run (`p1-ref-75`): slider 17 at 75 %,
+/// sliders 18 and 19 as [`TARGETS`]. Compared with tapestry's shot at
+/// [`TARGETS`], it must differ at slider 17 alone.
+pub const REF_75: [Target; 3] = [
+    Target {
+        slider: 17,
+        x: 344,
+        y: 606,
+        percent: 75,
+    },
+    TARGETS[1],
+    TARGETS[2],
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,11 +69,27 @@ mod tests {
     /// quarter is its percent.
     #[test]
     fn every_target_is_a_quarter_of_its_travel() {
-        for t in TARGETS {
+        for t in TARGETS.into_iter().chain(REF_75) {
             let along = t.x - TRAVEL_FROM;
             assert_eq!(along * 4 % TRAVEL, 0, "{t:?}");
             assert_eq!(along * 100 / TRAVEL, i32::from(t.percent), "{t:?}");
             assert!((0..CLIENT[0]).contains(&t.x) && (0..CLIENT[1]).contains(&t.y));
         }
+    }
+
+    /// The control table differs from the targets at slider 17 alone, set
+    /// to another whole quarter on the same row.
+    #[test]
+    fn ref_75_moves_slider_17_alone() {
+        let moved: Vec<_> = TARGETS
+            .iter()
+            .zip(&REF_75)
+            .filter(|(t, r)| t != r)
+            .collect();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let (t, r) = moved[0];
+        assert_eq!((t.slider, r.slider), (17, 17));
+        assert_eq!((r.y, r.percent), (t.y, 75));
+        assert_ne!(r.x, t.x);
     }
 }

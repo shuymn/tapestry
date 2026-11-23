@@ -28,6 +28,10 @@ pub struct Player {
     /// The select skin's root folder, and its entry file within it.
     pub skin: PathBuf,
     pub skin_entry: String,
+    /// The skin's options set by name (`--skin-option <name>=<value>`),
+    /// each to the name of the item chosen: the repository names no skin's
+    /// options, so the run's caller passes them.
+    pub skin_options: Vec<(String, String)>,
 }
 
 /// The window's client size the panel rows run at: the reference's.
@@ -100,12 +104,24 @@ pub fn device_table(monitor: &str, library: &Path) -> toml::Table {
     ])
 }
 
-/// `player.toml` for a panel row: the select skin used for testing.
-pub fn player_table(skin: &Path, entry: &str) -> toml::Table {
-    let selection = toml::Table::from_iter([
+/// `player.toml` for a panel row: the select skin used for testing, with
+/// `options` set by name.
+pub fn player_table(skin: &Path, entry: &str, options: &[(String, String)]) -> toml::Table {
+    let mut selection = toml::Table::from_iter([
         ("root".to_owned(), toml::Value::String(slashed(skin))),
         ("entry".to_owned(), toml::Value::String(entry.to_owned())),
     ]);
+    if !options.is_empty() {
+        selection.insert(
+            "options".to_owned(),
+            toml::Value::Table(
+                options
+                    .iter()
+                    .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+    }
     toml::Table::from_iter([(
         "skins".to_owned(),
         toml::Value::Table(toml::Table::from_iter([(
@@ -188,7 +204,7 @@ impl Player {
             &files[0].0,
         )?;
         write_settings::<game::PlayerSettings>(
-            &player_table(&self.skin, &self.skin_entry),
+            &player_table(&self.skin, &self.skin_entry, &self.skin_options),
             &scratch,
             &files[1].0,
         )?;
@@ -484,6 +500,7 @@ mod tests {
             library: PathBuf::from("C:/lib"),
             skin: PathBuf::from("C:/skins/select"),
             skin_entry: "select/select.luaskin".into(),
+            skin_options: Vec::new(),
         }
     }
 
@@ -515,7 +532,11 @@ mod tests {
         );
         let p = tmp.path().join("player.toml");
         write_settings::<game::PlayerSettings>(
-            &player_table(Path::new("C:/skins/select"), "select/select.luaskin"),
+            &player_table(
+                Path::new("C:/skins/select"),
+                "select/select.luaskin",
+                &[("Movies".to_owned(), "OFF".to_owned())],
+            ),
             &scratch,
             &p,
         )
@@ -524,6 +545,10 @@ mod tests {
         let s = back.skins.selection.unwrap();
         assert_eq!(s.root, PathBuf::from("C:/skins/select"));
         assert_eq!(s.entry, "select/select.luaskin");
+        assert_eq!(
+            s.options.into_iter().collect::<Vec<_>>(),
+            [("Movies".to_owned(), "OFF".to_owned())]
+        );
         // What the player refuses is refused, and nothing is written.
         let other = tmp.path().join("other.toml");
         let mut old = table.clone();
@@ -534,7 +559,7 @@ mod tests {
             assert!(write_settings::<game::DeviceSettings>(&bad, &scratch, &other).is_err());
             assert!(!other.exists(), "{bad}");
         }
-        let mut skin = player_table(Path::new("C:/s"), "e");
+        let mut skin = player_table(Path::new("C:/s"), "e", &[]);
         skin["skins"]["selection"]
             .as_table_mut()
             .unwrap()

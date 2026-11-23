@@ -244,6 +244,33 @@ pub fn open(p: Process) -> anyhow::Result<Child> {
     Ok(Child { handle, process: p })
 }
 
+/// Opens process `pid`, which the runner did not start, to read its
+/// creation time and whether it still runs, never to end it.
+///
+/// # Errors
+///
+/// It cannot be opened or its times read.
+pub fn observe(pid: u32) -> anyhow::Result<Child> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: no pointers.
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    }
+    .with_context(|| format!("opening process {pid}"))?;
+    let handle = Owned(h);
+    let created = created(handle.0)?;
+    Ok(Child {
+        handle,
+        process: Process { pid, created },
+    })
+}
+
 /// A process's creation time (the system's FILETIME), which with its id
 /// names it: an id the system reuses names another process.
 ///
