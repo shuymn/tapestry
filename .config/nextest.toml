@@ -6,3 +6,10 @@
 [[profile.default.overrides]]
 filter = 'package(player) & binary(media_session) & (test(=cold_entry_meets_the_preparation_deadline) | test(=held_launch_expires_preparation_and_the_screen_commits) | test(=departure_during_a_held_launch_opens_nothing) | test(=a_decoder_with_no_first_frame_is_lost_from_its_play))'
 threads-required = "num-test-threads"
+
+# The scenarios that read a chart video's exact frame back from the real
+# worker run alone: the worker runs below normal priority, so other tests'
+# load can starve it behind the frame due (design.md "Testing Strategy").
+[[profile.default.overrides]]
+filter = 'package(player) & binary(scenario) & (test(=a_chart_video_plays_and_a_crash_blacks_its_panel) | test(=chart_video_frames_follow_chart_time_in_a_scenario))'
+threads-required = "num-test-threads"
