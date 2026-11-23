@@ -575,3 +575,41 @@ fn a_visit_at_no_known_site_sets_no_kind() {
     assert_eq!(v[0].2 >> gaps::KIND_SHIFT, 0, "a kind's bit: {:b}", v[0].2);
     assert_ne!(v[0].2 & 1 << gaps::NONE, 0, "the visit: {:b}", v[0].2);
 }
+
+/// Whether a release was pending when the hold engaged (E25).
+static STALE: AtomicBool = AtomicBool::new(true);
+
+/// A release given before a hold engages is spent: the next hold to
+/// engage waits for a release of its own (E25), so a script can arm a
+/// hold for the next pack before it lets the held one go.
+#[test]
+fn a_release_before_a_hold_engages_does_not_end_it() {
+    let _s = crate::imports::tests::serial();
+    let _h = Hooks;
+    let from = start();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    fn engaged() {
+        STALE.store(gaps::released(), SeqCst);
+        until("the test's look at the hold", || LOOKED.load(SeqCst));
+    }
+    STALE.store(true, SeqCst);
+    LOOKED.store(false, SeqCst);
+    *super::AFTER_HOLD_STORE.lock().unwrap() = Some(engaged);
+    gaps::hold(HoldAt::parse("PlanRects:1:after").unwrap());
+    // The release a script gives the hold before this one.
+    gaps::release();
+    look(&mut rs, &coord, true);
+    until("the hold", || gaps::held().is_some());
+    LOOKED.store(true, SeqCst);
+    assert!(
+        !STALE.load(SeqCst),
+        "the earlier release still pending at the engagement"
+    );
+    assert!(marks(from, "pre:hold_released").is_empty());
+    gaps::release();
+    collected(&mut rs, &coord);
+    assert_eq!(marks(from, "pre:hold_released").len(), 1);
+}

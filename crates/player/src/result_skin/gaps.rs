@@ -382,6 +382,12 @@ pub fn release() {
     RELEASED.store(true, Ordering::SeqCst);
 }
 
+/// Whether a release is pending for the hold engaged now (E25).
+#[cfg(test)]
+pub fn released() -> bool {
+    RELEASED.load(Ordering::SeqCst)
+}
+
 /// Lets the hold go once the held job is adopted
 /// (`release-preload=adopted`).
 pub fn release_on_adopt() {
@@ -422,6 +428,9 @@ pub fn engage(id: u64, site: u8, after: bool) {
     if !due {
         return;
     }
+    // A release lets go only the hold it finds: one given before this hold
+    // engaged (for an earlier hold, or with none held) is spent.
+    RELEASED.store(false, Ordering::SeqCst);
     // Marked before it is published: whoever sees the hold ([`held`])
     // finds its `pre:hold` already there.
     loop_probe::mark("pre:hold", pair(id, i64::from(site)));
