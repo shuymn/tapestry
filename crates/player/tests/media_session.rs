@@ -27,14 +27,14 @@ use std::time::{Duration, Instant};
 use media_support::media_host::EXIT_HUNG;
 use media_support::media_host::launch::Launches;
 use media_support::media_host::session::{
-    Deadlines, Event, Launching, Loss, Movie, PREPARATION, Session, Status,
+    Deadlines, Event, Launching, Loss, Movie, PREPARATION, Session, Status, Waker,
 };
 use media_support::{Made, Stage, Step, WORKER, read_tight, recipe};
-use skin_model::media::{self, Reader, State};
+use skin_model::media::{self, Frame, Reader, State, Window};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
-    PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 #[link(name = "ntdll")]
@@ -209,7 +209,10 @@ impl Process {
         // SAFETY: a process id; the handle is closed on drop.
         let handle = unsafe {
             OpenProcess(
-                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SUSPEND_RESUME,
+                PROCESS_SYNCHRONIZE
+                    | PROCESS_QUERY_LIMITED_INFORMATION
+                    | PROCESS_SUSPEND_RESUME
+                    | PROCESS_TERMINATE,
                 false,
                 pid,
             )
@@ -235,6 +238,12 @@ impl Process {
     fn suspend(&self) {
         // SAFETY: the process this value holds, opened to suspend.
         assert_eq!(unsafe { NtSuspendProcess(self.handle) }, 0);
+    }
+
+    /// Ends it, as a crash does: the game did not ask.
+    fn terminate(&self) {
+        // SAFETY: the process this value holds, opened to terminate.
+        unsafe { TerminateProcess(self.handle, 1) }.unwrap();
     }
 }
 
@@ -395,17 +404,17 @@ fn handed_off(what: &str, took: Duration) {
 // Covers: T02
 #[test]
 fn hello_with_another_protocol_is_refused_before_any_handle() {
-    let rig = Rig::serving(&["protocol=3"]);
+    let rig = Rig::serving(&["protocol=2"]);
     // The launch itself refuses it at the handshake, and the process ends.
     let Err(e) = rig
         .stage
-        .launch(&recipe().args_of(&["--dev-serve", "protocol=3"]))
+        .launch(&recipe().args_of(&["--dev-serve", "protocol=2"]))
     else {
         panic!("a worker of another protocol launched");
     };
     // ERROR_REVISION_MISMATCH.
     assert_eq!((e.step, e.code), (Step::Handshake, 1306), "{e}");
-    assert!(e.what.contains("protocol 3"), "{e}");
+    assert!(e.what.contains("protocol 2"), "{e}");
     // The process ends with the refusal's code, on the handle the launch
     // kept when it stopped watching first.
     media_support::ends_refused(&e);
@@ -1026,4 +1035,264 @@ fn quitting_the_game_reaps_the_worker() {
     assert!(worker.exit(Duration::from_secs(10)).is_some());
     assert!(lost(&movie, Duration::from_secs(1)).is_some());
     drop(render);
+}
+
+/// The render side's stand-in for a video's runs: a reader of its ring the
+/// test drives on its own thread, taking frames as they come, starting runs
+/// and wanting them sought as the render side does.
+struct Runs {
+    movie: Arc<Movie>,
+    reader: Reader,
+    frame: Vec<u8>,
+}
+
+impl Runs {
+    /// Reads `movie` once it is live.
+    fn of(movie: &Arc<Movie>) -> Self {
+        until(LAUNCH, || movie.live().is_some())
+            .unwrap_or_else(|| panic!("never live: {:?}", movie.loss()));
+        let reader = movie.live().unwrap().reader.lock().unwrap().take().unwrap();
+        Self {
+            movie: Arc::clone(movie),
+            reader,
+            frame: Vec::new(),
+        }
+    }
+
+    /// Looks at the ring once: the run's oldest frame when `first`, its
+    /// newest otherwise, taken if there is one, and whether a frame of the
+    /// run stays in the ring untaken.
+    fn look(&mut self, first: bool) -> (Option<Frame>, bool) {
+        let words = self.movie.live().unwrap().ring.words();
+        let peek = if first {
+            self.reader.peek_first(words)
+        } else {
+            self.reader.peek(words, i64::MAX)
+        }
+        .unwrap();
+        let taken = peek.due.map(|due| {
+            let g = self.reader.geometry();
+            self.frame.resize(g.frame_bytes(), 0);
+            let w = g.width() as usize;
+            let frame = &mut self.frame;
+            let mut sink = |at: usize, bytes: &[u8]| {
+                frame
+                    .get_mut(at..at + bytes.len())
+                    .map(|d| d.copy_from_slice(bytes))
+                    .is_some()
+            };
+            self.reader
+                .take(words, due, [w, w.div_ceil(2)], &mut sink)
+                .unwrap()
+        });
+        self.movie.freed(self.reader.freed());
+        (taken, peek.left)
+    }
+
+    /// The current run's first frame, waiting for it.
+    fn first(&mut self) -> Frame {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let (Some(f), _) = self.look(true) {
+                return f;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no frame of run {}: {:?}",
+                self.reader.run(),
+                self.movie.loss()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Takes the current run's frames until the worker has reported its
+    /// end and none is left: how many it took.
+    fn take_to_end(&mut self) -> usize {
+        let run = self.reader.run();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut taken = 0;
+        loop {
+            // The end first, then the ring: every frame of the run is
+            // published before its end is reported.
+            let ended = self.movie.ended() == run;
+            let (frame, left) = self.look(false);
+            taken += usize::from(frame.is_some());
+            if ended && frame.is_none() && !left {
+                return taken;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run {run} never ended: {:?}",
+                self.movie.loss()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Starts the next run and wants it sought, waking the session: the run.
+    fn start(&mut self, waker: &Waker) -> u64 {
+        let run = self.reader.start_run(Window {
+            first: 0,
+            last: i64::MAX,
+        });
+        self.movie.want(run);
+        waker.wake();
+        run
+    }
+}
+
+/// A want reaches the worker as a seek at once: the session looks when
+/// woken, not at its next tick. Each of five wants, one at a time, is sent
+/// within 20 ms; at the 100 ms tick alone a want waits 50 ms on average.
+// Covers: T02
+#[test]
+fn a_want_is_sought_without_waiting_for_the_tick() {
+    let rig = Rig::serving(&[]);
+    assert_eq!(Deadlines::GAME.tick, Duration::from_millis(100));
+    rig.session.enter(1);
+    let movie = Movie::new(1);
+    rig.open(&movie, false);
+    let waker = rig.session.waker();
+    let mut runs = Runs::of(&movie);
+    runs.first();
+    let mut took = Vec::new();
+    for _ in 0..5 {
+        let wanted = rig.session.now();
+        let run = runs.start(&waker);
+        let sent = rig
+            .event(Duration::from_secs(1), |e| *e == Event::Seek { run })
+            .unwrap_or_else(|| panic!("run {run} never sought: {:?}", rig.session.events()));
+        took.push(sent.saturating_sub(wanted));
+        assert!(
+            rig.event(
+                Duration::from_secs(2),
+                |e| matches!(e, Event::Sought { run: r, .. } if *r == run)
+            )
+            .is_some(),
+            "run {run} never answered"
+        );
+    }
+    println!("from each want to its seek: {took:?}");
+    assert!(
+        took.iter().all(|t| *t < Duration::from_millis(20)),
+        "{took:?}"
+    );
+    assert_eq!(movie.loss(), None);
+}
+
+/// Seeks through the real worker: a 2 s clip that is not looping plays to
+/// its end, is sought from its start (a cue after the end) and sought
+/// again mid-run, each run's first frame the clip's first and each run
+/// ending; a seek past the clip's end is answered with no landing and
+/// ended. No player fails.
+// Covers: T02
+#[test]
+fn seeks_through_the_real_worker() {
+    let rig = Rig::serving(&[]);
+    rig.session.enter(1);
+    let movie = Movie::new(1);
+    rig.open(&movie, false);
+    let waker = rig.session.waker();
+    let mut runs = Runs::of(&movie);
+    let first = runs.first();
+    // Run 1, played to its end.
+    assert!(runs.take_to_end() > 0);
+    assert_eq!(movie.ended(), 1);
+    // The cue: sought from the start after its end.
+    let cue = runs.start(&waker);
+    assert_eq!(runs.first().stamp, first.stamp, "run {cue}");
+    for _ in 0..5 {
+        runs.look(false);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A restart mid-run.
+    let restart = runs.start(&waker);
+    assert_eq!(runs.first().stamp, first.stamp, "run {restart}");
+    assert!(runs.take_to_end() > 0);
+    assert_eq!(movie.ended(), restart);
+    // Past the end: no landing, then the end.
+    movie.seek_from(10_000_000);
+    let past = runs.start(&waker);
+    assert!(
+        until(Duration::from_secs(3), || movie.ended() == past).is_some(),
+        "{:?}",
+        rig.session.events()
+    );
+    let answers: Vec<_> = rig
+        .session
+        .events()
+        .into_iter()
+        .filter_map(|(_, e)| match e {
+            Event::Sought { run, landed } => Some((run, landed.is_some())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        [(cue, true), (restart, true), (past, false)],
+        "every seek answered"
+    );
+    assert_eq!((movie.status(), movie.loss()), (Status::Live, None));
+    assert_eq!(rig.count(|e| matches!(e, Event::Lost { .. })), 0);
+}
+
+/// A video lost with its peer is closed, not struck: the chart's videos
+/// are one panel, and when one is lost (here its ring at fault, as the
+/// render side finds it) the other is lost with it, which ends no worker.
+/// After two such attempts both files still open. The control: a file
+/// open in a worker that crashes twice is struck out.
+// Covers: T02
+#[test]
+fn a_peer_loss_strikes_nothing() {
+    let rig = Rig::serving(&[]);
+    let reaped = || rig.count(|e| matches!(e, Event::Reaped { .. }));
+    for generation in 1..=2 {
+        rig.session.enter(generation);
+        let (lost_first, peer) = (Movie::new(generation), Movie::new(generation));
+        rig.open_as(&lost_first, "a.mpg", true);
+        rig.open_as(&peer, "b.mpg", true);
+        for m in [&lost_first, &peer] {
+            until(LAUNCH, || m.status() == Status::Live)
+                .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+        }
+        lost_first.lose(Loss::Fault);
+        peer.lose(Loss::Peer);
+        // Both players go: closed, or their worker ended and reaped.
+        let n = usize::try_from(generation).unwrap();
+        let gone = until(Duration::from_secs(5), || {
+            rig.count(|e| *e == Event::Closed) >= 2 * n || reaped() >= n
+        });
+        assert!(gone.is_some(), "{:?}", rig.session.events());
+    }
+    // Any worker ended has been reaped, its strikes given.
+    until(LAUNCH, || {
+        rig.count(|e| matches!(e, Event::Terminated { .. })) == reaped()
+    })
+    .expect("a worker not reaped");
+    rig.session.enter(3);
+    let again = [Movie::new(3), Movie::new(3)];
+    rig.open_as(&again[0], "a.mpg", true);
+    rig.open_as(&again[1], "b.mpg", true);
+    for m in &again {
+        assert!(until(LAUNCH, || m.status() != Status::Pending).is_some());
+        assert_eq!((m.status(), m.loss()), (Status::Live, None), "struck?");
+    }
+    assert_eq!(rig.count(|e| matches!(e, Event::Terminated { .. })), 0);
+
+    // The control: a file open in a worker that crashes, twice.
+    for generation in 4..=5 {
+        rig.session.enter(generation);
+        let movie = Movie::new(generation);
+        rig.open_as(&movie, "c.mpg", true);
+        until(LAUNCH, || movie.status() == Status::Live).expect("never live");
+        let before = reaped();
+        rig.worker(LAUNCH).terminate();
+        until(LAUNCH, || reaped() > before).expect("the crashed worker never reaped");
+    }
+    rig.session.enter(6);
+    let struck = Movie::new(6);
+    rig.open_as(&struck, "c.mpg", true);
+    assert!(lost(&struck, LAUNCH).is_some(), "{:?}", struck.status());
+    assert_eq!(struck.loss(), Some(Loss::Struck));
 }

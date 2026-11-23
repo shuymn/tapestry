@@ -32,6 +32,9 @@ const OPEN: u32 = 1;
 const PLAY: u32 = 2;
 const CLOSE: u32 = 3;
 
+/// The run the player plays: no seek is sent in these orders.
+const RUN: u64 = 1;
+
 /// The screen that asked for the video.
 const SCREEN: u64 = 1;
 
@@ -39,11 +42,15 @@ const SCREEN: u64 = 1;
 const LOOKS: u8 = 2;
 const FRAMES: u8 = 2;
 
+/// `movie::answer`: a result, in time or late, against the stage, the video,
+/// the screen shown and the newest run sought.
+type Answer = fn(Stage, &Cell, u64, Outcome, bool, u64) -> (Stage, Then);
+
 /// The session's rules for a result: `movie::answer` and `movie::confirm`,
 /// or broken ones for the controls.
 #[derive(Clone, Copy)]
 struct Rules {
-    answer: fn(Stage, &Cell, u64, Outcome, bool) -> (Stage, Then),
+    answer: Answer,
     confirm: fn(Stage, &Cell, u64, Then) -> (Stage, Then),
 }
 
@@ -137,7 +144,7 @@ fn closes(stage: Stage, cell: &Cell, shown: u64) -> bool {
     match stage {
         Stage::Queued | Stage::Closing(_) => false,
         Stage::Opening(_) | Stage::Playing(_) => left,
-        Stage::Live | Stage::Idle => left || lost,
+        Stage::Live | Stage::Seeking { .. } | Stage::Idle => left || lost,
     }
 }
 
@@ -231,7 +238,7 @@ impl World {
     /// The session acts on its rule's `then`.
     fn then(&mut self, then: Then) {
         match then {
-            Then::Nothing | Then::Mark => {}
+            Then::Nothing | Then::Mark | Then::End(_) => {}
             Then::Play => {
                 self.ring = true;
                 self.stage = Some(Stage::Playing(PLAY));
@@ -296,6 +303,7 @@ impl World {
                     taking.read,
                     outcome,
                     taking.result.late(),
+                    RUN,
                 ));
             }
             Step::Confirm => {
@@ -549,9 +557,10 @@ fn rejection_before_the_deadline(
     current: u64,
     result: Outcome,
     late: bool,
+    sought: u64,
 ) -> (Stage, Then) {
     let late = late && !matches!(result, Outcome::Rejected(_));
-    movie::answer(stage, movie, current, result, late)
+    movie::answer(stage, movie, current, result, late, sought)
 }
 
 /// The control: the exploration finds a late rejection taken as in time.

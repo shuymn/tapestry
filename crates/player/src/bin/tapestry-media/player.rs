@@ -17,7 +17,8 @@
 //! game drops one behind its clock only for a newer frame that is also
 //! due. A frame is published before the next one is converted, so a
 //! blocked conversion leaves the frame due in the ring. It answers the end
-//! of the video, a seek and a failure; a failed or refused player only
+//! of the video, every seek (one that finds no frame with no landing, then
+//! the run's end) and a failure; a failed or refused player only
 //! waits to be closed. A looping play starts again at the video's start at
 //! each end, in the same run, its stamps rising on, and never ends. It
 //! counts every frame its decoder returns in the ring's progress word and
@@ -276,7 +277,8 @@ impl Playing {
     }
 
     /// Positions the video at `at` µs for run `run` and answers seek `id`
-    /// with where it landed, or that nothing is at or after it.
+    /// with where it landed, or, when nothing is at or after it, with no
+    /// landing and then the run's end: every seek is answered.
     fn seek(&mut self, id: u32, run: u64, at: i64, out: &Out) -> Result<(), (Failure, i32)> {
         self.run = run;
         self.floor = at;
@@ -294,11 +296,18 @@ impl Playing {
                     id,
                     player: self.player,
                     run,
-                    landed: landed.stamp,
+                    landed: Some(landed.stamp),
                     attempts: landed.attempts,
                 });
             }
             None => {
+                out.send(&Reply::Sought {
+                    id,
+                    player: self.player,
+                    run,
+                    landed: None,
+                    attempts: 0,
+                });
                 self.ended = true;
                 self.writer.state(self.view.words(), State::Ended);
                 out.send(&Reply::Ended {

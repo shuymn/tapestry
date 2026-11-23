@@ -493,7 +493,10 @@ fn worker_operations_succeed_under_the_recipe() {
         at: 2_000_000,
     });
     let landed = match worker.reply() {
-        Reply::Sought { landed, .. } => landed,
+        Reply::Sought {
+            landed: Some(landed),
+            ..
+        } => landed,
         other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
     };
     assert!(take_one(&worker, &mut ring, landed).stamp >= 2_000_000);
@@ -661,7 +664,7 @@ fn worker_seek_lands_on_target_after_back_off() {
             id: worker.last,
             player: 3,
             run,
-            landed: 1_500_000,
+            landed: Some(1_500_000),
             attempts: 2,
         },
         "the worker's log:\n{}",
@@ -979,7 +982,10 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     let run = ring.start_run(at);
     worker.send(&Order::Seek { player: 1, run, at });
     let landed = match worker.reply() {
-        Reply::Sought { landed, .. } => landed,
+        Reply::Sought {
+            landed: Some(landed),
+            ..
+        } => landed,
         other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
     };
     assert_eq!(landed, at);
@@ -988,6 +994,70 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     std::thread::sleep(Duration::from_millis(200));
     let taken = take_seq(&worker, &mut ring, landed);
     assert_eq!((taken.1, taken.2), (at, 24));
+    worker.close(1);
+}
+
+/// Every seek is answered (design.md "Rendering and Skins", video frames):
+/// one that finds no frame at or after its time by an answer with no
+/// landing, then its run's end; one that finds a frame by its landing,
+/// though the run before had ended.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn every_seek_is_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two seconds at 24 fps.
+    let path = gen_clip(dir.path(), "e.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let empty = |worker: &mut Worker, ring: &mut Ring| {
+        let run = ring.start_run(10_000_000);
+        worker.send(&Order::Seek {
+            player: 1,
+            run,
+            at: 10_000_000,
+        });
+        let sought = Reply::Sought {
+            id: worker.last,
+            player: 1,
+            run,
+            landed: None,
+            attempts: 0,
+        };
+        for want in [sought, Reply::Ended { player: 1, run }] {
+            assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+        }
+    };
+    // Past the clip's end, while run 1 decodes.
+    empty(&mut worker, &mut ring);
+    // Inside the clip, after that run ended: a landing.
+    let at = stamp_of(24, 24);
+    let run = ring.start_run(at);
+    worker.send(&Order::Seek { player: 1, run, at });
+    assert!(
+        matches!(
+            worker.reply(),
+            Reply::Sought { id, player: 1, run: r, landed: Some(l), .. }
+                if id == worker.last && r == run && l == at
+        ),
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    assert_eq!(take_seq(&worker, &mut ring, at).1, at);
+    // Past the end again.
+    empty(&mut worker, &mut ring);
     worker.close(1);
 }
 
@@ -1481,12 +1551,25 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
             run,
             at: 10_000_000,
         });
-        let want = if seam {
-            refused(2)
+        if seam {
+            assert_eq!(
+                worker.reply(),
+                refused(2),
+                "the worker's log:\n{}",
+                worker.log()
+            );
         } else {
-            Reply::Ended { player: 2, run }
-        };
-        assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+            let sought = Reply::Sought {
+                id: worker.last,
+                player: 2,
+                run,
+                landed: None,
+                attempts: 0,
+            };
+            for want in [sought, Reply::Ended { player: 2, run }] {
+                assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+            }
+        }
         for player in [1, 2] {
             worker.close(player);
         }
@@ -1946,7 +2029,10 @@ fn worker_decodes_zlib_compressed_containers() {
             at: 2_000_000,
         });
         let landed = match worker.reply() {
-            Reply::Sought { landed, .. } => landed,
+            Reply::Sought {
+                landed: Some(landed),
+                ..
+            } => landed,
             other => panic!("{name}: {other:?}; the worker's log:\n{}", worker.log()),
         };
         let at = take_one(&worker, &mut ring, landed);
@@ -3799,7 +3885,7 @@ fn a_seek_landing_carries_its_own_duration() {
         matches!(
             worker.reply(),
             Reply::Sought {
-                landed: 1_000_000,
+                landed: Some(1_000_000),
                 ..
             }
         ),

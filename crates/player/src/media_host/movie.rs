@@ -8,7 +8,10 @@
 //! The session's part is pure: [`answer`] takes a player's stage, its
 //! video and the screen being shown, and a result the worker sent (matched
 //! by its command's id, judged late or in time on its arrival), and gives
-//! the stage that follows and what the session does next. The screen shown
+//! the stage that follows and what the session does next. A player has at
+//! most one seek in flight ([`seek_for`]): every seek is answered, and an
+//! answer that is not the in-flight seek's, or an end for a run newer than
+//! the newest sought, loses the player. The screen shown
 //! is a shared word the game changes when it leaves a screen, the
 //! cancellation of that screen's videos: [`confirm`] reads it again after
 //! the answer's step, and withdraws a step that a screen change raced, so
@@ -70,6 +73,10 @@ pub enum Loss {
     /// pixel total ([`skin_model::movie::MAX_MOVIE_PIXELS`]). It draws
     /// nothing.
     OverTotal,
+    /// Lost with its peer: the chart's videos are one panel, and the other
+    /// one's loss loses this one too. It is closed as any lost video is and
+    /// ends no worker, so it strikes nothing.
+    Peer,
 }
 
 impl Loss {
@@ -82,11 +89,12 @@ impl Loss {
                 "a video is refused: over cap (the screen's movies pass their 2048×2048 luma pixels)"
                     .to_owned()
             }
+            Self::Peer => "a video is lost with its peer (Peer)".to_owned(),
             why => format!("a video is lost ({why:?})"),
         }
     }
 
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Queue,
         Self::Launch,
         Self::Struck,
@@ -100,6 +108,7 @@ impl Loss {
         Self::Preparation,
         Self::Fault,
         Self::OverTotal,
+        Self::Peer,
     ];
 }
 
@@ -226,6 +235,9 @@ pub enum Stage {
     Playing(u32),
     /// Playing into its ring.
     Live,
+    /// Playing into its ring, its seek `id` for run `run` sent and not
+    /// answered.
+    Seeking { id: u32, run: u64 },
     /// Its close sent.
     Closing(u32),
     /// Refused or failed in the worker, which waits to close it.
@@ -243,6 +255,10 @@ pub enum Outcome {
     Playing(u32),
     /// A command of its rejected.
     Rejected(u32),
+    /// A seek's answer (the seek's id, its run), with or without a landing.
+    Sought { id: u32, run: u64 },
+    /// The end of a run's video.
+    Ended(u64),
     /// The player failed.
     Failed,
 }
@@ -262,25 +278,47 @@ pub enum Then {
     /// The answer came past its deadline and left nothing to close: the
     /// worker is marked.
     Mark,
+    /// Run `run`'s video ended: the video's ended run.
+    End(u64),
+}
+
+/// The run to seek for a player at `stage` whose newest run sought or
+/// played is `sought`, while the render side wants run `want` sought: the
+/// wanted run, when it is newer and no seek is in flight. Wants made while
+/// a seek is in flight wait for its answer, and then only the newest is
+/// sought.
+pub fn seek_for(stage: Stage, sought: u64, want: u64) -> Option<u64> {
+    (stage == Stage::Live && want > sought).then_some(want)
 }
 
 /// What `result`, which arrived `late` or in time, does to a player at
-/// `stage` whose video is `movie` while the screen of `current` is shown:
-/// the stage that follows and what the session does next. A result that
-/// does not answer the stage's command changes nothing; the video moves
-/// only by its cell's own steps, and only for the screen shown.
+/// `stage` whose video is `movie` while the screen of `current` is shown,
+/// its newest run answered sought or played being `sought`: the stage that
+/// follows and what the session does next. A result that does not answer
+/// the stage's command changes nothing, but a seek's answer other than the
+/// in-flight seek's (with one in flight, it cannot be stale) and an end for
+/// a run newer than the newest sought, or in flight, lose the player; an
+/// end for an older run (one that ended before its seek arrived) changes
+/// nothing. The video moves only by its cell's own steps, and only for the
+/// screen shown.
 pub fn answer(
     stage: Stage,
     movie: &Cell,
     current: u64,
     result: Outcome,
     late: bool,
+    sought: u64,
 ) -> (Stage, Then) {
     let shown = movie.generation() == current;
+    let newest = match stage {
+        Stage::Seeking { run, .. } => run,
+        _ => sought,
+    };
     match (stage, result) {
         // The deadline first, whatever the answer says.
         (Stage::Opening(open), Outcome::Probed(id) | Outcome::Refused(id))
         | (Stage::Playing(open), Outcome::Playing(id) | Outcome::Rejected(id))
+        | (Stage::Seeking { id: open, .. }, Outcome::Sought { id, .. } | Outcome::Rejected(id))
             if open == id && late =>
         {
             movie.lose(Loss::Answer);
@@ -320,7 +358,30 @@ pub fn answer(
             movie.lose(Loss::Failed);
             (Stage::Idle, Then::Close)
         }
-        (Stage::Playing(_) | Stage::Live | Stage::Idle, Outcome::Failed) => {
+        (Stage::Seeking { id: seek, run }, Outcome::Sought { id, run: r })
+            if seek == id && run == r =>
+        {
+            (Stage::Live, Then::Nothing)
+        }
+        (Stage::Seeking { id: seek, .. }, Outcome::Rejected(id)) if seek == id => {
+            movie.lose(Loss::Failed);
+            (Stage::Idle, Then::Close)
+        }
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Sought { .. }) => {
+            movie.lose(Loss::Answer);
+            (stage, Then::Close)
+        }
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run > newest => {
+            movie.lose(Loss::Answer);
+            (stage, Then::Close)
+        }
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run == newest => {
+            (stage, Then::End(run))
+        }
+        (
+            Stage::Playing(_) | Stage::Live | Stage::Seeking { .. } | Stage::Idle,
+            Outcome::Failed,
+        ) => {
             movie.lose(Loss::Failed);
             (Stage::Idle, Then::Close)
         }
@@ -351,7 +412,7 @@ pub fn confirm(stage: Stage, movie: &Cell, current: u64, then: Then) -> (Stage, 
 pub fn unwanted(stage: Stage, movie: &Cell, current: u64) -> bool {
     let gone = movie.generation() != current || movie.status() == Status::Lost;
     match stage {
-        Stage::Live | Stage::Idle => gone,
+        Stage::Live | Stage::Seeking { .. } | Stage::Idle => gone,
         Stage::Opening(_) | Stage::Playing(_) => movie.generation() != current,
         Stage::Queued | Stage::Closing(_) => false,
     }

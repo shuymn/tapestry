@@ -8,10 +8,12 @@
 //! which the game chooses, never 0, and each reply that answers a command
 //! echoes: the open's probe or refusal ([`Reply::Probed`],
 //! [`Reply::Refused`]) and its rejection ([`Reply::Rejected`]), the play's
-//! start, the seek's landing, the close's [`Reply::Closed`] and any
+//! start, the seek's answer, the close's [`Reply::Closed`] and any
 //! command's rejection, so the game follows each player through the replies
-//! to its own commands. A player's failure ([`Reply::Failed`]) and the end
-//! of its video answer no command. Decoding reads exactly one message's
+//! to its own commands. Every seek is answered ([`Reply::Sought`]), with its
+//! landing or with none, the run's end following an answer with none. A
+//! player's failure ([`Reply::Failed`]) and the end of its video answer no
+//! command. Decoding reads exactly one message's
 //! bytes and refuses anything else ([`Malformed`]): an unknown tag, a field
 //! cut short, bytes left over, a string that is not UTF-8 or is longer than
 //! [`MAX_TEXT`], a reason the protocol does not have. The game reads the
@@ -26,7 +28,7 @@
 
 /// The protocol's version, the first field of [`Reply::Hello`]: the game
 /// refuses a worker that names another before it hands it anything.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// The most bytes a frame holds after its length.
 pub const MAX_FRAME: usize = 8_192;
@@ -121,13 +123,16 @@ pub enum Reply {
     Rejected { id: u32, player: u8, code: i32 },
     /// `player` decodes into its frame ring: the answer to play `id`.
     Playing { id: u32, player: u8 },
-    /// Run `run` of `player` starts at the frame stamped `landed`, found
-    /// after `attempts` seeks: the answer to seek `id`.
+    /// The answer to seek `id`, which every seek gets: run `run` of
+    /// `player` starts at the frame stamped `landed`, found after
+    /// `attempts` seeks; or, `landed` being `None` (and `attempts` 0), no
+    /// frame lies at or after the seek's time, and [`Reply::Ended`] for the
+    /// run follows.
     Sought {
         id: u32,
         player: u8,
         run: u64,
-        landed: i64,
+        landed: Option<i64>,
         attempts: u8,
     },
     /// `player` published the last frame of run `run`.
@@ -396,7 +401,7 @@ impl Reply {
                 .u32(*id)
                 .u8(*player)
                 .u64(*run)
-                .i64(*landed)
+                .landing(*landed)
                 .u8(*attempts),
             Self::Ended { player, run } => b.u8(ENDED).u8(*player).u64(*run),
             Self::Failed {
@@ -454,7 +459,7 @@ impl Reply {
                 id: r.u32()?,
                 player: r.u8()?,
                 run: r.u64()?,
-                landed: r.i64()?,
+                landed: r.landing()?,
                 attempts: r.u8()?,
             },
             ENDED => Self::Ended {
@@ -536,6 +541,15 @@ impl Bytes {
         self
     }
 
+    /// Writes a seek's landing: a flag byte, then the stamp when there is
+    /// one.
+    fn landing(&mut self, v: Option<i64>) -> &mut Self {
+        match v {
+            Some(stamp) => self.u8(1).i64(stamp),
+            None => self.u8(0),
+        }
+    }
+
     /// Writes `strings`, the message's last fields, each cut to fit the
     /// frame: to at most [`MAX_TEXT`] bytes, and to the room the frame has
     /// left after its own length and those of the strings after it.
@@ -614,6 +628,15 @@ impl<'a> Fields<'a> {
             0 => Ok(false),
             1 => Ok(true),
             v => Err(Malformed::Reason(v)),
+        }
+    }
+
+    /// A seek's landing, as [`Bytes::landing`] writes it.
+    fn landing(&mut self) -> Result<Option<i64>, Malformed> {
+        if self.flag()? {
+            self.i64().map(Some)
+        } else {
+            Ok(None)
         }
     }
 
