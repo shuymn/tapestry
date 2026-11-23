@@ -21,8 +21,9 @@
 //!   dropped before the picture whose cell would overflow it is decoded, so
 //!   a decode and one batch are all the job holds.
 //! - **Absence.** A refused reservation or allocation, or a refused array
-//!   or write, publishes every picture absent; a picture that cannot be
-//!   read is absent alone. Play starts in every case.
+//!   or write, publishes every picture absent, the videos' entries kept; a
+//!   picture that cannot be read is absent alone. Play starts in every
+//!   case.
 //! - **Videos.** Right after it resolves the names, before it reuses or
 //!   reads any picture, the job hands the render thread the attempt's video
 //!   manifest ([`BgaMsg::Videos`]): at most two video files, chosen by
@@ -707,6 +708,17 @@ fn read_and_publish(
     // The videos first: neither a reuse nor a refused reservation erases
     // them.
     let _ = link.send(generation, BgaMsg::Videos(Manifest::of(want, &bindings)));
+    // A fallback leaves every picture absent and every video its entry, so
+    // the videos handed over still draw from their slots.
+    let absent = || {
+        bindings
+            .iter()
+            .map(|b| match b {
+                BgaBinding::Resolved { video: true, .. } => BgaEntry::Video,
+                _ => BgaEntry::Absent,
+            })
+            .collect::<Vec<_>>()
+    };
     if !reserve(TERMS) {
         log::warn!("bga: its memory was not granted; the pictures are absent");
         out.end = publish(None, absent());

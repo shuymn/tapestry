@@ -707,7 +707,9 @@ fn video_chart() -> (tempfile::TempDir, Want) {
 /// channel), aliases sharing a slot and its starts; a third file and a
 /// file only the poor sequences name are absent and opened by no one; each
 /// file opened is the canonical one. A reservation the ledger refuses
-/// leaves the pictures absent and the videos as they are.
+/// leaves the pictures absent and the videos as they are: the table it
+/// publishes keeps every video's entry, so the base's video still reads
+/// back its frame where the picture before it reads back the placeholder.
 #[test]
 fn a_third_file_and_a_poor_only_file_are_absent() {
     use bms_model::{BgaImageId, TimeUs};
@@ -728,10 +730,34 @@ fn a_third_file_and_a_poor_only_file_are_absent() {
     assert_eq!(m.videos.starts(3), [TimeUs(1_000_000)]);
     // The ledger refusing the job's transient: the videos stay.
     super::REFUSE.store(true, Ordering::SeqCst);
-    let (names, manifests, _) = answered_run(&w, None);
+    let (names, manifests, out) = answered_run(&w, None);
     super::REFUSE.store(false, Ordering::SeqCst);
     assert_eq!(names, ["videos", "publish"]);
     assert_eq!(manifests[0].files.iter().flatten().count(), 2);
+    let super::End::Published(table) = out.end else {
+        panic!("{:?}", out.end);
+    };
+    assert_eq!(table.key(), None, "no array");
+    let video = BgaEntry::Video;
+    assert_eq!(
+        table.entries(),
+        [BgaEntry::Absent, video, video, video, video, video],
+        "the picture absent, the videos kept"
+    );
+    #[cfg(feature = "dev-tools")]
+    {
+        use crate::menu_screen::movie_tests::{CLIP_LUMA, bga_pixels, grey, near};
+        let _turn = crate::warp_turn::take();
+        let got = bga_pixels(
+            w.bga.clone().unwrap(),
+            table.entries().to_vec(),
+            manifests.into_iter().next().unwrap(),
+            false,
+            &[500_000, 1_100_000],
+        );
+        assert_eq!(got[0], [0; 3], "the absent picture's placeholder");
+        near(got[1], grey(CLIP_LUMA[0]), "the video's first frame");
+    }
 }
 
 /// A retry whose pictures are unchanged reuses the array, and its videos
