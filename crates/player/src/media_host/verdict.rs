@@ -4,9 +4,11 @@
 //! terminations and the worker's end.
 //!
 //! The watcher asks for the job to be ended for one cause, the job's memory
-//! message or a read at the line, whichever comes first, and asks again at
-//! each read while the worker lives. A memory end is recorded only when a
-//! termination it asked for was accepted and the process then ended with
+//! message, a read at the line or the game's hang, whichever comes first,
+//! and asks again at each read while the worker lives; the game's hang is
+//! asked for only while the worker's process has not ended. An end of the
+//! watcher's (a memory end, or the game's for a hang) is recorded only when
+//! a termination it asked for was accepted and the process then ended with
 //! that termination's exit code; any other end is the worker's own, its
 //! exit code recorded. A worker that ends with one of the watcher's codes
 //! though no termination with that code was accepted ended by itself, and
@@ -18,6 +20,10 @@ pub const ENDED_BY_MESSAGE: u32 = 0xc0de_0002;
 /// The exit code of a worker the watcher ended at the line.
 pub const ENDED_AT_LINE: u32 = 0xc0de_0003;
 
+/// The exit code of a worker the game ended for a hang: a missed deadline,
+/// a stuck command write, a stalled decoder or no heartbeat.
+pub const EXIT_HUNG: u32 = 0xc0de_0004;
+
 /// How a worker ended, as its watcher saw it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -25,6 +31,8 @@ pub enum End {
     Message,
     /// The watcher ended it when its peak commit reached the line.
     Line,
+    /// The watcher ended it for the game, for a hang.
+    Hung,
     /// It ended by itself, with its exit code: a crash, or an exit the
     /// game did not ask for.
     Exited(u32),
@@ -36,6 +44,7 @@ impl End {
             Self::Message => 1 << 32,
             Self::Line => 2 << 32,
             Self::Exited(code) => (3 << 32) | code as u64,
+            Self::Hung => 4 << 32,
         }
     }
 
@@ -44,6 +53,7 @@ impl End {
             1 => Some(Self::Message),
             2 => Some(Self::Line),
             3 => Some(Self::Exited(u32::try_from(v & 0xffff_ffff).ok()?)),
+            4 => Some(Self::Hung),
             _ => None,
         }
     }
@@ -56,6 +66,8 @@ pub enum Cause {
     Message,
     /// A read at the line.
     Line,
+    /// The game's hang.
+    Hang,
 }
 
 impl Cause {
@@ -64,6 +76,7 @@ impl Cause {
         match self {
             Self::Message => ENDED_BY_MESSAGE,
             Self::Line => ENDED_AT_LINE,
+            Self::Hang => EXIT_HUNG,
         }
     }
 
@@ -71,6 +84,7 @@ impl Cause {
         match self {
             Self::Message => End::Message,
             Self::Line => End::Line,
+            Self::Hang => End::Hung,
         }
     }
 }
@@ -103,6 +117,13 @@ impl Verdict {
         self.ask(Cause::Line)
     }
 
+    /// The game asks for the worker's job to be ended for a hang, its
+    /// process not ended yet: the cause to end it for, unless one was
+    /// asked for before.
+    pub fn hang(&mut self) -> Option<Cause> {
+        self.ask(Cause::Hang)
+    }
+
     fn ask(&mut self, cause: Cause) -> Option<Cause> {
         if self.requested.is_some() {
             return None;
@@ -127,7 +148,7 @@ impl Verdict {
             Some(cause) if code == cause.code() => (cause.end(), false),
             _ => (
                 End::Exited(code),
-                code == ENDED_BY_MESSAGE || code == ENDED_AT_LINE,
+                code == ENDED_BY_MESSAGE || code == ENDED_AT_LINE || code == EXIT_HUNG,
             ),
         }
     }

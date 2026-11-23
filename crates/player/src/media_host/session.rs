@@ -44,10 +44,12 @@
 //!   whole worker.
 //!
 //! A failure of the whole worker loses every one of its players first, each
-//! by one atomic step that writes nothing else, then terminates its job ([`super::EXIT_HUNG`]) and reaps it: the files it had
-//! open get their strikes, but for a file the session was closing because
-//! its peer was lost ([`Loss::Peer`]): a worker the game terminated does
-//! not strike it, one that ended on its own does. The next video a screen
+//! by one atomic step that writes nothing else, then has its job ended for
+//! a hang ([`Worker::terminate_hung`]) and reaps it: the files it had open
+//! get their strikes, but for a file the session was closing because its
+//! peer was lost ([`Loss::Peer`]): a worker the game's termination ended,
+//! by the watcher's proof, does not strike it; one that ended on its own
+//! does, whatever its exit code. The next video a screen
 //! needs launches a new worker. The launch runs on a thread of its own, so a launch held up
 //! (another launch staging its copies) holds neither the game nor the
 //! session.

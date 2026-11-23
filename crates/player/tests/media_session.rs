@@ -242,8 +242,13 @@ impl Process {
 
     /// Ends it, as a crash does: the game did not ask.
     fn terminate(&self) {
+        self.terminate_with(1);
+    }
+
+    /// Ends it with exit `code`, as an exit of its own does.
+    fn terminate_with(&self, code: u32) {
         // SAFETY: the process this value holds, opened to terminate.
-        unsafe { TerminateProcess(self.handle, 1) }.unwrap();
+        unsafe { TerminateProcess(self.handle, code) }.unwrap();
     }
 }
 
@@ -1397,6 +1402,24 @@ fn a_peer_closed_when_its_worker_is_terminated_is_not_struck() {
     );
 
     // The control: the worker crashes while the peer's close is unread.
+    peer_struck_when_its_worker_ends_with(1);
+}
+
+/// A peer closed while its worker ends on its own, with the very code the
+/// game ends a hung worker with, is struck: only a termination of the
+/// game's that the system accepted, and that the worker's end matches,
+/// spares it. The worker ends, and has ended, before the session takes
+/// its end and terminates it.
+// Covers: T02
+#[test]
+fn a_worker_ending_itself_with_the_hang_code_strikes_its_peer() {
+    peer_struck_when_its_worker_ends_with(EXIT_HUNG);
+}
+
+/// A peer's close unanswered (the worker reads the two opens and two plays
+/// only) while its worker ends on its own with exit `code`, twice: the
+/// peer's file is then refused.
+fn peer_struck_when_its_worker_ends_with(code: u32) {
     let rig = Rig::serving(&["deaf=4"]);
     let reaped = || rig.count(|e| matches!(e, Event::Reaped { .. }));
     for generation in 1..=2 {
@@ -1416,8 +1439,9 @@ fn a_peer_closed_when_its_worker_is_terminated_is_not_struck() {
         until(Duration::from_secs(1), || rig.session.written(5).is_some())
             .expect("the peer's close never written");
         let before = reaped();
-        worker.terminate();
-        until(LAUNCH, || reaped() > before).expect("the crashed worker never reaped");
+        worker.terminate_with(code);
+        assert_eq!(worker.exit(Duration::from_secs(5)), Some(code));
+        until(LAUNCH, || reaped() > before).expect("the ended worker never reaped");
         assert_eq!(live.status(), Status::Lost);
         assert_eq!(reaped(), n);
     }

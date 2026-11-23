@@ -19,7 +19,11 @@
 //! accepted and the process ended with that termination's code
 //! ([`super::verdict`]): a worker that ended by itself first, or whose job
 //! could not be ended, is recorded as its own end, and the watcher asks
-//! again at each read while the worker lives. The game never waits on the watcher: it
+//! again at each read while the worker lives. The game's own termination of
+//! a hung worker goes through the watcher too ([`Watch::hang`]): the watcher
+//! ends the job with the game's code unless the worker's process has ended
+//! already, and records the game's end on the same proof, so a worker that
+//! ends by itself with that code is recorded as its own end. The game never waits on the watcher: it
 //! reads the end the watcher recorded ([`Watch::end`]), and dropping the
 //! watch stops it, by a flag the watcher reads at every timed wake and a
 //! packet that wakes it at once.
@@ -60,6 +64,10 @@ const JOB_KEY: usize = 1;
 
 /// The completion key of the packet that stops the watcher.
 const STOP_KEY: usize = 2;
+
+/// The completion key of the game's packet that asks for the worker's job
+/// to be ended for a hang.
+const HANG_KEY: usize = 4;
 
 /// The completion key of a test's packet that makes the watcher read the
 /// job's accounting at once.
@@ -336,6 +344,20 @@ impl Watch {
         End::decode(self.end.load(Ordering::Acquire))
     }
 
+    /// Asks the watcher to end the worker's job for a hang, without waiting:
+    /// unless the worker has ended already, or a termination was asked for
+    /// before, the watcher ends it with the game's code, and records the
+    /// game's end only once the worker has ended with that code after a
+    /// termination the system accepted.
+    ///
+    /// # Errors
+    ///
+    /// When the packet that asks it cannot be posted.
+    pub fn hang(&self) -> windows::core::Result<()> {
+        // SAFETY: the watcher's port, which this value keeps open.
+        unsafe { PostQueuedCompletionStatus(self.port.0, 0, HANG_KEY, None) }
+    }
+
     /// Asks the watcher to stop, without waiting for it: the flag first,
     /// which it reads at its next timed wake, a period at most away, then
     /// the packet that wakes it at once, which may fail to post.
@@ -493,6 +515,7 @@ impl Watched<'_> {
         let (end, ambiguous) = verdict.end(code);
         match end {
             End::Message | End::Line => log::warn!("media worker: ended for its memory ({end:?})"),
+            End::Hung => log::warn!("media worker: ended for a hang"),
             End::Exited(code) if ambiguous => log::warn!(
                 "media worker: ended with {code:#x}, the watcher's code, though no termination of the watcher's with it was accepted: recorded as its own end"
             ),
@@ -639,6 +662,17 @@ fn watch(w: &Watched, start: Instant) {
         };
         match got {
             Ok(()) if key == STOP_KEY => return,
+            // The game's hang: a worker whose process has ended already
+            // ended by itself, whatever its code.
+            Ok(()) if key == HANG_KEY => {
+                if let Some(code) = w.exited(0) {
+                    w.ended_with(&verdict, code, start);
+                    return;
+                }
+                if let Some(cause) = verdict.hang() {
+                    w.terminate(&mut verdict, cause);
+                }
+            }
             // The job's message carries the process's id where an I/O
             // packet carries its OVERLAPPED.
             Ok(())

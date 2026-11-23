@@ -172,9 +172,7 @@ pub struct Hello {
     pub configuration: String,
 }
 
-/// The exit code of a worker the game ended for a hang: a missed deadline,
-/// a stuck command write, a stalled decoder or no heartbeat.
-pub const EXIT_HUNG: u32 = 0xC0DE_0004;
+pub use verdict::EXIT_HUNG;
 
 /// How long a dropped worker has to end on its own before its job closes.
 const QUIT_GRACE_MS: u32 = 500;
@@ -275,11 +273,22 @@ impl Worker {
         self.commands.as_ref().map(writer::Writer::transport)
     }
 
-    /// Terminates the worker's job for a hang ([`EXIT_HUNG`]), without
-    /// waiting: its watcher then records the end as the worker's own, and
-    /// [`Worker::reap`] strikes its files.
+    /// Ends the worker's job for a hang ([`EXIT_HUNG`]), without waiting,
+    /// through its watcher ([`Watch::hang`]), which records the end as the
+    /// game's ([`End::Hung`]) only when its termination was accepted and the
+    /// worker ended with its code; [`Worker::reap`] strikes its files either
+    /// way. A watcher that cannot be asked leaves the job to be ended here,
+    /// an end then recorded as the worker's own.
     pub fn terminate_hung(&self) {
-        if let Some(job) = &self.job {
+        let asked = match self.watch.as_ref().map(Watch::hang) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                log::warn!("media worker: its watcher could not be asked to end it ({e})");
+                false
+            }
+            None => false,
+        };
+        if !asked && let Some(job) = &self.job {
             // SAFETY: the worker's job, which this value holds.
             if let Err(e) = unsafe { TerminateJobObject(job.0, EXIT_HUNG) } {
                 log::warn!("media worker: its job could not be ended for a hang ({e})");
@@ -465,7 +474,8 @@ impl Worker {
     /// are taken here, then each player of the worker fails, passed to
     /// `failed`, and each file open in it gets one strike, however many of
     /// its players had it open, but a spared player's ([`Self::spare`])
-    /// when the game terminated it ([`EXIT_HUNG`]). `None` until then.
+    /// when the game's termination for a hang ended it ([`End::Hung`]):
+    /// its exit code alone proves nothing. `None` until then.
     pub fn reap(&mut self, strikes: &mut Strikes, failed: impl FnMut(u8)) -> Option<End> {
         let end = self.end()?;
         loop {
@@ -475,7 +485,7 @@ impl Worker {
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        let terminated = end == End::Exited(EXIT_HUNG);
+        let terminated = end == End::Hung;
         let (files, players) = self.players.get_mut().clear(terminated);
         for file in files {
             strikes.strike(file);

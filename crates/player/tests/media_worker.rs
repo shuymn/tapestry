@@ -3107,6 +3107,7 @@ fn job_memory_cap_refuses_and_the_parent_terminates() {
             assert_eq!(code, Some(verdict::ENDED_AT_LINE));
             assert!(!message && over, "{events:?}");
         }
+        End::Hung => panic!("the worker ended for a hang: {events:?}"),
         End::Exited(c) => panic!("the worker ended by itself ({c:#x}): {events:?}"),
     }
     eprintln!("ended on {end:?} at a peak of {peak}; the watcher saw {events:?}");
@@ -3815,6 +3816,37 @@ fn a_worker_ending_with_the_watchers_code_is_its_own_end() {
     // SAFETY: the worker's process handle, which has every access.
     unsafe { TerminateProcess(worker.process(), verdict::ENDED_BY_MESSAGE) }.unwrap();
     assert_eq!(ended(&worker), End::Exited(verdict::ENDED_BY_MESSAGE));
+}
+
+/// The game's termination for a hang goes through the watcher. A worker
+/// that has ended on its own, with the very code the game ends a hung one
+/// with, before the game asks, is recorded as its own end: the watcher,
+/// asked, finds its process ended and terminates nothing. The watcher
+/// reads nothing meanwhile (its period an hour), so only the game's request
+/// records the end. The control: a live worker the game ends for a hang
+/// ends with that code, recorded as the game's.
+// Covers: T02
+#[test]
+fn a_worker_ended_before_its_hang_termination_is_its_own_end() {
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    let stage = Stage::new();
+    let quiet = watch::Variation {
+        period: Some(Duration::from_secs(3600)),
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(quiet)).unwrap();
+    worker.terminate_hung();
+    assert_eq!(ended(&worker), End::Hung);
+    assert_eq!(worker.wait_exit(REPLY), Some(media_host::EXIT_HUNG));
+
+    let worker = stage.launch(&recipe().watching_as(quiet)).unwrap();
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), media_host::EXIT_HUNG) }.unwrap();
+    assert_eq!(worker.wait_exit(REPLY), Some(media_host::EXIT_HUNG));
+    assert_eq!(worker.end(), None, "{:?}", worker.watch_events());
+    worker.terminate_hung();
+    assert_eq!(ended(&worker), End::Exited(media_host::EXIT_HUNG));
 }
 
 /// Each frame goes out with its duration (design.md "Rendering and
