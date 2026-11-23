@@ -1164,7 +1164,7 @@ impl BgaWorker {
 
     /// Whether a job made obsolete is held and every such job's thread
     /// ended, their ends not yet taken (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     #[must_use]
     pub fn obsolete_ended(&self) -> bool {
         let c = self.core();
