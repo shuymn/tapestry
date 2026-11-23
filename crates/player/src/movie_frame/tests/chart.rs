@@ -223,20 +223,27 @@ fn of_starts_crossed_between_frames_the_latest_wins() {
 }
 
 /// A video started on the base keeps running on chart time after the base
-/// changes to a picture (no start of its own), and a later frame shows the
-/// frame due then, with no restart.
+/// changes to a picture (no start of its own), its frames taken while no
+/// presented frame draws it, and a later frame shows the frame due then,
+/// with no restart.
 // Source: SF-028
 #[test]
 fn a_video_started_then_replaced_by_a_picture_keeps_running() {
+    let drawn = |slot: bool| [false, false, slot, false];
     // The video starts at 1 s; a picture replaces it on the base at 2 s,
     // which is no start of the video's.
     let mut p = Play::new(&[1_000_000], i64::MIN);
     assert!(frame(p.at(1_000_000)));
+    p.m.presented(true, drawn(true));
     p.publish(1, FIRST + 1_000_000, 2);
     p.publish(1, FIRST + 1_500_000, 3);
     p.publish(1, FIRST + 2_000_000, 4);
     p.at(2_100_000);
-    assert_eq!(p.stamp(), Some(FIRST + 1_000_000), "taken while not drawn");
+    p.m.presented(true, drawn(false));
+    assert_eq!(p.stamp(), Some(FIRST + 1_000_000));
+    p.at(2_500_000);
+    p.m.presented(true, drawn(false));
+    assert_eq!(p.stamp(), Some(FIRST + 1_500_000), "taken while not drawn");
     p.at(3_000_000);
     assert_eq!(p.stamp(), Some(FIRST + 2_000_000), "due at 3 s");
     assert_eq!(p.m.wakes(), 0, "no restart");

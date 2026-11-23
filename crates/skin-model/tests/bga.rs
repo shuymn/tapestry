@@ -548,11 +548,12 @@ fn chart_files_are_ranked_by_their_first_start_and_capped_at_two() {
     let file_of = [Some(0), Some(0), Some(1), Some(2), Some(3), None];
     let bga = ChartBga::new(
         (1..=6).map(image).collect(),
-        vec![event(1_000, Some(2)), event(2_000, Some(0))],
-        // File 2 ties file 1 at 1 000 ms on the layer: the base wins.
+        vec![event(1_000, Some(3)), event(2_000, Some(0))],
+        // File 1 ties file 2 at 1 000 ms on the layer, by a lower id: the
+        // base wins.
         vec![
             event(500, Some(1)),
-            event(1_000, Some(3)),
+            event(1_000, Some(2)),
             event(2_000, Some(1)),
         ],
         vec![PoorSequence {
@@ -562,8 +563,8 @@ fn chart_files_are_ranked_by_their_first_start_and_capped_at_two() {
     )
     .unwrap();
     let (slots, files) = ChartVideos::choose(&bga, &file_of);
-    assert_eq!(slots, [Some(2), Some(2), Some(3), None, None, None]);
-    assert_eq!(files, [Some(0), Some(1)]);
+    assert_eq!(slots, [Some(2), Some(2), None, Some(3), None, None]);
+    assert_eq!(files, [Some(0), Some(2)]);
     let videos = ChartVideos::of(&bga, &slots);
     let us = |ms: &[i64]| ms.iter().map(|m| TimeUs(m * MS)).collect::<Vec<_>>();
     assert_eq!(videos.starts(2), us(&[500, 2_000]), "aliases' starts, once");
