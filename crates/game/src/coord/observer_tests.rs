@@ -216,10 +216,13 @@ fn a_wait_is_opened_reclassed_and_closed() {
         let running = s.spawn(|| d.run(&never, &|_| {}, |_| {}));
         assert!(gate.reached(WAIT), "D never retried");
         promoter.promote();
-        // Told by the promotion, before D's thread tries again.
-        assert_eq!(rec.of(d_id), [(Wait, Spec), (Rewait, Fg)]);
+        // Told by the promotion, before D's thread tries again; read
+        // before the gate opens and asserted after D's thread is joined,
+        // so a failure ends the test rather than leaving D held.
+        let told = rec.of(d_id);
         gate.open();
         running.join().unwrap();
+        assert_eq!(told, [(Wait, Spec), (Rewait, Fg)]);
     });
     assert_eq!(
         rec.of(d_id),
