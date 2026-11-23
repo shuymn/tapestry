@@ -19,6 +19,9 @@ use crate::media_host::session::{Loss, Movie};
 use crate::movie_screen::{Holder, MediaHub};
 use crate::render_side::Screen as _;
 
+/// A play frame at chart time 0, 1×: no chart video set here.
+const CHART0: crate::movie_frame::ChartAt = crate::movie_frame::ChartAt { now: 0, k: 20 };
+
 /// A WARP screen playing movies through `hub`.
 fn screen(hub: &Arc<MediaHub>) -> super::MenuScreen {
     let r = render::Renderer::new(
@@ -96,7 +99,8 @@ fn play_screen(
     movies: [Option<Arc<Movie>>; 2],
 ) {
     hub.supply(movies);
-    s.open_play_movies(Some(bundle), request, Some(request));
+    s.open_play_movies(Some(bundle), request, Some(request), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.commit(token(s, request)).unwrap();
     s.begin_play();
@@ -141,7 +145,8 @@ fn a_screen_s_movies_never_outlive_it() {
     let lost = Movie::new(1);
     let _ = lost.lose(Loss::Failed);
     hub.supply([Some(clip(&[0])), Some(lost)]);
-    s.open_play_movies(Some(&play), 1, Some(1));
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     assert!(matches!(
@@ -194,7 +199,8 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     let lost = Movie::new(1);
     let _ = lost.lose(Loss::Failed);
     hub.supply([Some(clip(&[0])), Some(lost)]);
-    s.open_play_movies(Some(&play), 1, Some(1));
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     assert!(matches!(
@@ -213,7 +219,8 @@ fn a_later_start_s_loading_shows_nothing_of_a_committed_one() {
     assert_eq!(origin(&s), None, "no clock started by the second lifetime");
     // The second Start's preparation: its own movies show.
     hub.supply([Some(clip(&[0])), None]);
-    s.open_play_movies(Some(&play), 2, Some(2));
+    s.open_play_movies(Some(&play), 2, Some(2), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.loading_movies(&loading_frame(2, 3_000_000));
     assert!(matches!(
@@ -239,7 +246,8 @@ fn an_abandoned_committed_start_retires_its_movies() {
     let hub = MediaHub::with(None);
     let mut s = screen(&hub);
     hub.supply([Some(clip(&[0])), None]);
-    s.open_play_movies(Some(&play), 1, Some(1));
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     // Not committed: a local retry keeps its preparation's movies.
@@ -348,7 +356,8 @@ fn the_built_in_selection_page_retires_a_committed_play_and_a_skinned_entry() {
             let (_fixture, mut s) = selection_screen(&hub, installed);
             hub.supply([Some(clip(&[0])), None]);
             if held == "committed play" {
-                s.open_play_movies(Some(&play), 1, Some(1));
+                s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+                s.chart_manifest(0, crate::bga::Manifest::empty());
                 s.movie_boundary();
                 s.commit(token(&s, 1)).unwrap();
             } else {
@@ -429,9 +438,9 @@ fn each_play_screen_opens_its_own_movies() {
         let hub = MediaHub::with(None);
         let mut s = screen(&hub);
         play_screen(&mut s, &hub, &play, 1, [Some(clip(&[0, 20_000_000])), None]);
-        let _ = s.play_movies(1_000);
+        let _ = s.play_movies(1_000, CHART0);
         present(&mut s);
-        let _ = s.play_movies(20_001_000);
+        let _ = s.play_movies(20_001_000, CHART0);
         assert_eq!(shown(&s), Some(20_000_000), "{between}: the old frame");
         let first = s.movies.get().unwrap().1.generation();
         match between {
@@ -444,14 +453,14 @@ fn each_play_screen_opens_its_own_movies() {
             _ => {}
         }
         play_screen(&mut s, &hub, &play, 2, [Some(clip(&[0, 1_000_000])), None]);
-        let _ = s.play_movies(30_000_000);
+        let _ = s.play_movies(30_000_000, CHART0);
         present(&mut s);
         assert_eq!(
             shown(&s),
             Some(0),
             "{between}: its own first frame, not the old 20 s one"
         );
-        let _ = s.play_movies(31_000_000);
+        let _ = s.play_movies(31_000_000, CHART0);
         assert_eq!(shown(&s), Some(1_000_000), "{between}: a second on");
         assert_ne!(s.movies.get().unwrap().1.generation(), first, "{between}");
         assert_eq!(hub.open_sets(), 1, "{between}: the old set left");
@@ -472,21 +481,23 @@ fn a_cancelled_start_leaves_one_clock_for_the_next_loading_and_ready() {
     let hub = MediaHub::with(None);
     let mut s = screen(&hub);
     hub.supply([Some(clip(&[0])), None]);
-    s.open_play_movies(Some(&play), 1, Some(1));
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.loading_movies(&loading_frame(1, 0));
     present(&mut s);
     s.discard_token(token(&s, 1));
     assert_eq!(hub.open_sets(), 0, "the cancelled Start's movies");
     hub.supply([Some(clip(&[0, 1_000_000, 3_000_000, 6_000_000])), None]);
-    s.open_play_movies(Some(&play), 2, Some(2));
+    s.open_play_movies(Some(&play), 2, Some(2), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     s.loading_movies(&loading_frame(2, 5_000_000));
     present(&mut s);
     assert_eq!(origin(&s), Some(5_000_000), "its own clock");
     s.commit(token(&s, 2)).unwrap();
     s.begin_play();
-    let _ = s.play_movies(6_000_000);
+    let _ = s.play_movies(6_000_000, CHART0);
     assert_eq!(
         shown(&s),
         Some(1_000_000),
@@ -505,7 +516,8 @@ fn a_device_loss_drops_the_set_before_and_after_commit() {
     for committed in [false, true] {
         let hub = MediaHub::with(None);
         let mut s = screen(&hub);
-        s.open_play_movies(Some(&play), 5, Some(5));
+        s.open_play_movies(Some(&play), 5, Some(5), i64::MIN);
+        s.chart_manifest(0, crate::bga::Manifest::empty());
         assert_eq!(hub.open_sets(), 1);
         if committed {
             s.commit(token(&s, 5)).unwrap();
@@ -533,7 +545,8 @@ fn loading_with_a_pending_peer_keeps_the_ready_clip_moving() {
     let a = clip(&[0, 1_000_000, 1_500_000, 2_000_000]);
     let pending = Movie::new(1);
     hub.supply([Some(Arc::clone(&a)), Some(Arc::clone(&pending))]);
-    s.open_play_movies(Some(&play), 1, Some(1));
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    s.chart_manifest(0, crate::bga::Manifest::empty());
     s.movie_boundary();
     // The first loading frame draws it: the fixture skin has no quad of
     // it, so a frame presented with its quad stands in for that one.
@@ -607,4 +620,478 @@ fn selection_movie_admission_alloc() {
         drop(std::hint::black_box(vec![0_u8; 16]));
     }
     assert!(app_allocations() > after);
+}
+
+/// A manifest of `files` chart video files made in `dir`, ids 0 and 1 in
+/// slots 2 and 3, each starting at `starts` (µs) on the base and the layer.
+fn manifest_with(dir: &std::path::Path, files: usize, starts: &[i64]) -> crate::bga::Manifest {
+    use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga};
+    let ev = |t: &i64, id| BgaEvent {
+        time: TimeUs(*t),
+        image: Some(BgaImageId(id)),
+    };
+    let bga = ChartBga::new(
+        (1..=2)
+            .map(|id| BgaImage {
+                id,
+                name: format!("v{id}.mp4"),
+            })
+            .collect(),
+        starts.iter().map(|t| ev(t, 0)).collect(),
+        starts.iter().map(|t| ev(t, 1)).collect(),
+        vec![],
+    )
+    .unwrap();
+    let slots = [Some(2), Some(3)];
+    let open = |k: usize| {
+        (k < files).then(|| {
+            let path = dir.join(format!("v{k}.mp4"));
+            std::fs::write(&path, b"x").unwrap();
+            std::fs::File::open(path).unwrap()
+        })
+    };
+    crate::bga::Manifest::of_files(
+        [open(0), open(1)],
+        skin_model::bga::ChartVideos::of(&bga, &slots[..files.max(1)]),
+    )
+}
+
+/// The generation of the set held.
+fn held_generation(s: &super::MenuScreen) -> u64 {
+    s.movies.get().unwrap().1.generation()
+}
+
+/// A play's set declares the chart's videos first, in its slots and not
+/// looping, then the skin's movie, and only once the manifest is there;
+/// with the BGA off, the empty manifest opens the skin's movie alone.
+#[test]
+fn chart_videos_open_before_the_skin_s_movies() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    assert!(hub.asked().is_empty(), "nothing opened before the manifest");
+    s.chart_manifest(0, manifest_with(dir.path(), 2, &[0]));
+    let g = held_generation(&s);
+    assert_eq!(
+        hub.asked(),
+        [(g, true, false), (g, true, false), (g, false, true)]
+    );
+    // The BGA off, a new BGA generation: an empty manifest, the skin's
+    // movie alone.
+    s.bga_generation(1);
+    s.open_play_movies(Some(&play), 2, Some(2), i64::MIN);
+    assert_eq!(hub.asked().len(), 3, "waits for its own generation's");
+    s.chart_manifest(1, crate::bga::Manifest::empty());
+    let g2 = held_generation(&s);
+    assert_eq!(hub.asked()[3..], [(g2, false, true)]);
+}
+
+/// The manifest and the preparation's set meet in either order, with the
+/// same set; a manifest of another BGA generation (a preparation left) is
+/// not taken, and the next replaces it, its files closed.
+#[test]
+fn the_manifest_and_the_holder_meet_in_either_order() {
+    use std::sync::atomic::Ordering;
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    // The manifest first.
+    s.chart_manifest(0, manifest_with(dir.path(), 2, &[0]));
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    let g = held_generation(&s);
+    assert_eq!(
+        hub.asked(),
+        [(g, true, false), (g, true, false), (g, false, true)]
+    );
+    // The set first, in BGA generation 5: generation 4's manifest is not
+    // taken; 5's is.
+    s.bga_generation(5);
+    s.open_play_movies(Some(&play), 2, Some(2), i64::MIN);
+    let alive = crate::bga::MANIFESTS.load(Ordering::SeqCst);
+    s.chart_manifest(4, manifest_with(dir.path(), 2, &[0]));
+    assert_eq!(hub.asked().len(), 3, "another generation's is not taken");
+    assert_eq!(
+        crate::bga::MANIFESTS.load(Ordering::SeqCst),
+        alive,
+        "the one before closed"
+    );
+    s.chart_manifest(5, manifest_with(dir.path(), 2, &[0]));
+    let g2 = held_generation(&s);
+    assert_eq!(
+        hub.asked()[3..],
+        [(g2, true, false), (g2, true, false), (g2, false, true)]
+    );
+    assert_eq!(
+        crate::bga::MANIFESTS.load(Ordering::SeqCst),
+        alive,
+        "generation 4's closed"
+    );
+}
+
+/// A play whose skin has no movie still waits for its chart video: not
+/// ready before the manifest, nor before its first frame is staged; ready
+/// once it is; and past the preparation deadline ready with the video lost.
+#[test]
+fn ready_waits_for_the_chart_videos_with_no_skin_movie() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    let video = Movie::live_here(1, 64, 32);
+    hub.supply_chart([Some(Arc::clone(&video)), None]);
+    s.open_play_movies(None, 1, Some(1), i64::MIN);
+    let now = std::time::Instant::now();
+    assert!(!s.play_movies_settled(1, now), "no manifest");
+    s.chart_manifest(0, manifest_with(dir.path(), 1, &[0]));
+    s.movie_boundary();
+    assert!(!s.play_movies_settled(1, now), "its first frame not staged");
+    publish(&video, 1, 40_000, 7);
+    assert!(s.play_movies_settled(1, now));
+    // Another preparation whose video never stages: past the deadline,
+    // ready with it lost.
+    let stalled = Movie::live_here(1, 64, 32);
+    hub.supply_chart([Some(Arc::clone(&stalled)), None]);
+    s.open_play_movies(None, 2, Some(2), i64::MIN);
+    s.chart_manifest(0, manifest_with(dir.path(), 1, &[0]));
+    s.movie_boundary();
+    let late = std::time::Instant::now()
+        + crate::media_host::session::PREPARATION
+        + std::time::Duration::from_millis(1);
+    assert!(s.play_movies_settled(2, late));
+    assert_eq!(stalled.loss(), Some(Loss::Preparation));
+}
+
+/// A retry and then a practice round each open a set of their own, whose
+/// chart video shows its first frame at its first start.
+#[test]
+fn a_retry_and_a_round_open_their_own_chart_videos() {
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    let mut generations = Vec::new();
+    // The attempt, its retry, and a round whose lead-in starts at 1 s.
+    for (request, boundary) in [(1, i64::MIN), (2, i64::MIN), (3, 1_000_000)] {
+        let video = Movie::live_here(1, 64, 32);
+        publish(&video, 1, 40_000, u8::try_from(request).unwrap());
+        hub.supply_chart([Some(Arc::clone(&video)), None]);
+        s.open_play_movies(None, request, Some(request), boundary);
+        s.chart_manifest(0, manifest_with(dir.path(), 1, &[2_000_000]));
+        s.movie_boundary();
+        assert!(s.play_movies_settled(request, std::time::Instant::now()));
+        s.commit(token(&s, request)).unwrap();
+        s.begin_play();
+        generations.push(held_generation(&s));
+        let chart = |now| crate::movie_frame::ChartAt { now, k: 20 };
+        let before = s.play_movies(9_000_000, chart(1_500_000));
+        assert_eq!(
+            before[2],
+            MovieShow::Nothing,
+            "attempt {request}: before its start"
+        );
+        let at = s.play_movies(9_500_000, chart(2_000_000));
+        assert!(
+            matches!(at[2], MovieShow::Frame { .. }),
+            "attempt {request}"
+        );
+        assert_eq!(s.movies.get().unwrap().1.movies.stamps()[2], Some(40_000));
+    }
+    generations.dedup();
+    assert_eq!(generations.len(), 3, "a set of its own each");
+}
+
+/// The clip's first frame's stamp in [`bga_pixels`]' video.
+const CLIP_FIRST: i64 = 40_000;
+/// Its two frames' luma, the chroma neutral: two greys a read-back tells
+/// apart, neither black.
+pub(crate) const CLIP_LUMA: [u8; 2] = [60, 180];
+
+/// Publishes a frame of run 1 stamped `stamp` µs, its luma `luma` and its
+/// chroma neutral, into live `movie`'s ring.
+fn publish_grey(movie: &Movie, seq: u64, stamp: i64, luma: u8) {
+    let live = movie.live().unwrap();
+    let words = live.ring.words();
+    let geometry = Geometry::new(live.width, live.height).unwrap();
+    let writer = Writer::attach(words).unwrap();
+    let slot = writer.claim(words).unwrap();
+    let y = usize::try_from(live.width * live.height).unwrap();
+    let mut frame = vec![128_u8; geometry.frame_bytes()];
+    frame[..y].fill(luma);
+    let stamp = skin_model::media::Stamp {
+        at: stamp,
+        duration: 500_000,
+    };
+    writer.publish(words, slot, &frame, seq, 1, stamp).unwrap();
+}
+
+/// The colour a read-back of `luma` with neutral chroma gives, limited
+/// range.
+pub(crate) fn grey(luma: u8) -> [u8; 3] {
+    let v = ((u32::from(luma) - 16) * 255 + 109) / 219;
+    [u8::try_from(v).unwrap(); 3]
+}
+
+/// Asserts `got` is within 3 levels of `want` in each channel.
+#[track_caller]
+pub(crate) fn near(got: [u8; 3], want: [u8; 3], what: &str) {
+    let off = got.iter().zip(want).map(|(g, w)| g.abs_diff(w)).max();
+    assert!(
+        off.is_some_and(|o| o <= 3),
+        "{what}: {got:?} against {want:?}"
+    );
+}
+
+/// What a play's `bga` destination reads back at each of `times` (chart
+/// µs), entering through the play's preparation on a WARP screen: the
+/// chart `bga` loaded, `entries` published as its BGA table with no array
+/// and `manifest` sent by the BGA job, the attempt prepared with the skin in
+/// use, or with a skin staged for it when `staged`, its movies settled,
+/// committed and begun. The manifest's slot 2 plays a 64 × 32 clip of two
+/// frames, stamped [`CLIP_FIRST`] and 500 ms later, of [`CLIP_LUMA`].
+pub(crate) fn bga_pixels(
+    bga: bms_model::ChartBga,
+    entries: Vec<skin_model::bga::BgaEntry>,
+    manifest: crate::bga::Manifest,
+    staged: bool,
+    times: &[i64],
+) -> Vec<[u8; 3]> {
+    use crate::render_decl::{BGA_RECT, Look, bundle};
+    let dir = tempfile::tempdir().unwrap();
+    let hub = MediaHub::with(None);
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let mut s = super::MenuScreen::new(r, None).with_media(Arc::clone(&hub));
+    let look = Look {
+        bga: true,
+        ..Look::left([255, 255, 255, 255])
+    };
+    let (installed, _) = bundle(&s.renderer, dir.path(), &look);
+    assert_eq!(
+        s.install(ScreenKind::Play, &installed, 1).unwrap(),
+        game::Preparation::Ready
+    );
+    s.commit(token(&s, 1)).unwrap();
+    let staging = staged.then(|| bundle(&s.renderer, dir.path(), &look).0);
+    let mut chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+    chart.bga = Some(bga);
+    s.load(&chart, None).unwrap();
+    let video = Movie::live_here(1, 64, 32);
+    publish_grey(&video, 1, CLIP_FIRST, CLIP_LUMA[0]);
+    publish_grey(&video, 2, CLIP_FIRST + 500_000, CLIP_LUMA[1]);
+    hub.supply_chart([Some(Arc::clone(&video)), None]);
+    // The BGA job's messages: its manifest, then its table.
+    s.bga_generation(0);
+    s.chart_manifest(0, manifest);
+    s.publish_bga(None, entries).unwrap();
+    let ctx = crate::render_common::context(&crate::render_common::GAUGES, false);
+    let a = crate::render_common::attempt(&s.renderer, &chart, &ctx);
+    let request = 2;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let ready = loop {
+        if let Some(answer) = s.prepare_attempt(&a, staging.as_ref(), request, Some(request)) {
+            break answer.unwrap();
+        }
+        assert!(std::time::Instant::now() < end, "never ready");
+        // A frame boundary: the staging's upload steps, then the movies'
+        // admission.
+        let _ = s.upload_boundary(&mut || false);
+        s.wait_step(std::time::Duration::from_millis(10)).unwrap();
+        s.movie_boundary();
+    };
+    assert_eq!(ready, game::Preparation::Ready);
+    s.commit(token(&s, request)).unwrap();
+    s.begin_play();
+    let v = crate::render_common::view(0, 0);
+    let [x, y, w, h] = BGA_RECT.map(|c| u32::try_from(c).unwrap());
+    times
+        .iter()
+        .map(|&now| {
+            s.movie_boundary();
+            s.movie_frame(now + 9_000_000, crate::movie_frame::ChartAt { now, k: 20 });
+            let f = render::FrameInput {
+                target: s.target(),
+                ..crate::render_common::input(&v, TimeUs(now), TimeUs(0), &[])
+            };
+            s.build(&f).unwrap();
+            s.draw().unwrap();
+            let pixels = crate::render_common::read_back(&s.renderer);
+            crate::render_common::rgb_at(&pixels, 1_920, (x + w / 2, y + h / 2))
+        })
+        .collect()
+}
+
+/// A chart whose base names id 0, a video, at 1 s, and the manifest the
+/// BGA job sends for it: id 0 in slot 2.
+fn video_chart(dir: &std::path::Path) -> (bms_model::ChartBga, crate::bga::Manifest) {
+    use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga};
+    let bga = ChartBga::new(
+        vec![BgaImage {
+            id: 1,
+            name: "v.mp4".to_owned(),
+        }],
+        vec![BgaEvent {
+            time: TimeUs(1_000_000),
+            image: Some(BgaImageId(0)),
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let path = dir.join("v.mp4");
+    std::fs::write(&path, b"x").unwrap();
+    let manifest = crate::bga::Manifest::of_files(
+        [Some(std::fs::File::open(path).unwrap()), None],
+        skin_model::bga::ChartVideos::of(&bga, &[Some(2)]),
+    );
+    (bga, manifest)
+}
+
+/// The chart's video reaches the pixels of the play's `bga` destination
+/// on the production path (design.md "Rendering and Skins", BGA): entered
+/// through the play's preparation, with the skin in use and with one
+/// staged for the attempt, the destination reads back the base's black
+/// placeholder before the video's start, the clip's first frame 100 ms
+/// after it and its second frame 600 ms after it, each frame's grey.
+#[test]
+fn a_chart_video_s_frames_reach_the_bga_destination() {
+    let _turn = crate::warp_turn::take();
+    for staged in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (bga, manifest) = video_chart(dir.path());
+        let got = bga_pixels(
+            bga,
+            vec![skin_model::bga::BgaEntry::Video],
+            manifest,
+            staged,
+            &[500_000, 1_100_000, 1_600_000],
+        );
+        assert_eq!(
+            got[0], [0; 3],
+            "staged {staged}: the placeholder before the start"
+        );
+        near(
+            got[1],
+            grey(CLIP_LUMA[0]),
+            &format!("staged {staged}: the first frame"),
+        );
+        near(
+            got[2],
+            grey(CLIP_LUMA[1]),
+            &format!("staged {staged}: the second frame"),
+        );
+    }
+}
+
+/// A play's set waits for its manifest 1.5 s from its preparation's start
+/// (design.md "Load Pipeline", movies at READY): a manifest that comes at
+/// 1.4 s opens the chart's videos and then the skin's movie; past 1.5 s
+/// with none, the skin's movie opens alone, stages its first frame and
+/// plays, not lost, and a manifest that comes later opens nothing.
+#[test]
+fn the_manifest_is_waited_for_half_the_deadline() {
+    use std::time::{Duration, Instant};
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    // At 1.4 s: still waiting, and the manifest then taken.
+    let before = Instant::now();
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    assert!(!s.play_movies_settled(1, before + Duration::from_millis(1_400)));
+    assert!(hub.asked().is_empty(), "nothing opened while it waits");
+    s.chart_manifest(0, manifest_with(dir.path(), 1, &[0]));
+    let g = held_generation(&s);
+    assert_eq!(hub.asked(), [(g, true, false), (g, false, true)]);
+    // At 1.6 s with no manifest: the skin's movie alone, which plays.
+    s.bga_generation(1);
+    let skin = Movie::live_here(1, 64, 32);
+    hub.supply([Some(Arc::clone(&skin)), None]);
+    s.open_play_movies(Some(&play), 2, Some(2), i64::MIN);
+    let past = Instant::now() + Duration::from_millis(1_600);
+    assert!(
+        !s.play_movies_settled(2, past),
+        "its first frame not staged"
+    );
+    assert_eq!(s.movies.get().unwrap().1.awaits(), None, "no longer waits");
+    publish(&skin, 1, 40_000, 7);
+    s.movie_boundary();
+    assert!(s.play_movies_settled(2, past), "staged within the deadline");
+    assert_eq!(skin.loss(), None, "not lost");
+    s.commit(token(&s, 2)).unwrap();
+    s.begin_play();
+    let shows = s.play_movies(9_000_000, CHART0);
+    assert!(matches!(shows[0], MovieShow::Frame { .. }), "{shows:?}");
+    // A manifest after the wait opens nothing.
+    let asked = hub.asked().len();
+    s.chart_manifest(1, manifest_with(dir.path(), 1, &[0]));
+    assert_eq!(hub.asked().len(), asked);
+}
+
+/// A manifest that comes past the 1.5 s wait, before the poll that would
+/// find the wait over (design.md "Load Pipeline", movies at READY), opens
+/// no chart video: the skin's movie opens alone, as at that poll, and the
+/// set no longer waits.
+#[test]
+fn a_manifest_past_the_wait_before_its_poll_opens_no_chart_video() {
+    use std::time::{Duration, Instant};
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let play = bundle(&dir);
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    let before = Instant::now();
+    s.open_play_movies(Some(&play), 1, Some(1), i64::MIN);
+    let after = Instant::now();
+    assert!(!s.play_movies_settled(1, before + Duration::from_millis(1_490)));
+    assert!(hub.asked().is_empty(), "nothing opened while it waits");
+    s.chart_manifest_at(
+        0,
+        manifest_with(dir.path(), 1, &[0]),
+        after + Duration::from_millis(1_510),
+    );
+    let g = held_generation(&s);
+    assert_eq!(hub.asked(), [(g, false, true)], "the skin's movie alone");
+    assert_eq!(s.movies.get().unwrap().1.awaits(), None, "no longer waits");
+}
+
+/// The manifest a screen keeps goes with its play (its files closed):
+/// a preparation cancelled before its commit leaves it for the next
+/// preparation of the same BGA generation, which reads nothing again and
+/// takes it; that play's set retired, by a frame of another screen, closes
+/// it; and leaving the chart closes a manifest kept with no set.
+#[test]
+fn a_retired_play_closes_its_manifest() {
+    use std::sync::atomic::Ordering;
+    let _turn = crate::warp_turn::take();
+    let dir = tempfile::tempdir().unwrap();
+    let hub = MediaHub::with(None);
+    let mut s = screen(&hub);
+    let alive = || crate::bga::MANIFESTS.load(Ordering::SeqCst);
+    let before = alive();
+    s.chart_manifest(0, manifest_with(dir.path(), 2, &[0]));
+    s.open_play_movies(None, 1, Some(1), i64::MIN);
+    assert_eq!(hub.asked().len(), 2, "taken");
+    s.discard();
+    assert!(s.movies.get().is_none());
+    assert_eq!(alive(), before + 1, "kept for the next preparation");
+    s.open_play_movies(None, 2, Some(2), i64::MIN);
+    let g = held_generation(&s);
+    assert_eq!(hub.asked()[2..], [(g, true, false), (g, true, false)]);
+    s.commit(token(&s, 2)).unwrap();
+    s.begin_play();
+    assert_eq!(alive(), before + 1, "kept while its play holds it");
+    s.loading_movies(&loading_frame(9, 0));
+    assert!(s.movies.get().is_none(), "retired");
+    assert_eq!(alive(), before, "closed with its play");
+    assert!(!s.movies.keeps_manifest());
+    // The chart left: a manifest kept with no set is closed.
+    s.chart_manifest(0, manifest_with(dir.path(), 2, &[0]));
+    assert_eq!(alive(), before + 1);
+    s.drop_bga();
+    assert_eq!(alive(), before, "closed when the chart is left");
 }

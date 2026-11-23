@@ -23,7 +23,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::thread::Thread;
 
 /// Where a video stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +222,78 @@ impl Cell {
     /// made it (live, ready or absent) is withdrawn, pending again.
     fn withdraw(&self) -> bool {
         self.change(|s| matches!(s, LIVE | READY | ABSENT).then_some(PENDING))
+    }
+}
+
+/// A video's runs as the render side and the session share them, one
+/// word each: the newest run the render side wants sought, the newest run
+/// whose end the worker reported, and the newest run whose seek the worker
+/// answered with no frame (an empty run); 0 for none.
+#[derive(Debug, Default)]
+pub struct Runs {
+    want: AtomicU64,
+    ended: AtomicU64,
+    empty: AtomicU64,
+}
+
+impl Runs {
+    /// The render side wants run `run`, which its reader started, sought:
+    /// the session seeks the newest run wanted once no seek of the video
+    /// is in flight. One word written; the caller then wakes the session
+    /// ([`Waker::wake`]).
+    pub fn want(&self, run: u64) {
+        self.want.store(run, Ordering::Release);
+    }
+
+    /// The newest run wanted sought.
+    pub fn wanted(&self) -> u64 {
+        self.want.load(Ordering::Acquire)
+    }
+
+    /// The newest run whose end the worker reported: the worker published
+    /// every frame of that run before reporting it.
+    pub fn ended(&self) -> u64 {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Run `run`'s end, as the session took it.
+    pub fn end(&self, run: u64) {
+        self.ended.store(run, Ordering::Release);
+    }
+
+    /// The newest run whose seek found no frame: that run's end, once
+    /// reported, needs no frame of it.
+    pub fn empty(&self) -> u64 {
+        self.empty.load(Ordering::Acquire)
+    }
+
+    /// Run `run`'s seek was answered with no frame.
+    pub fn found_empty(&self, run: u64) {
+        self.empty.store(run, Ordering::Release);
+    }
+}
+
+/// Wakes the media session: its thread, unparked apart from the request
+/// queue. Holding one keeps no session alive: dropping the game's handle
+/// ends it.
+#[derive(Clone, Debug)]
+pub struct Waker {
+    session: Thread,
+}
+
+impl Waker {
+    /// A waker that unparks `session`, the session's thread.
+    pub const fn new(session: Thread) -> Self {
+        Self { session }
+    }
+
+    /// Asks the session to look now, never waiting and allocating nothing:
+    /// it unparks the session's thread, so wakes take no place of the
+    /// request queue. Wakes coalesce into the thread's one token: a wake
+    /// while the session looks ends its next sleep at once, so a want
+    /// stored before the wake is read by a look after it.
+    pub fn wake(&self) {
+        self.session.unpark();
     }
 }
 

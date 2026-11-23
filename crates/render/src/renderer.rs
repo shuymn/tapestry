@@ -6931,9 +6931,17 @@ impl Renderer {
         self.skin.set_movies(movies);
     }
 
-    /// The movie slots the committed attempt's chart videos play in
-    /// ([`skin_model::Play::set_chart_videos`]), from the next frame on.
+    /// The movie slots the prepared attempt's chart videos play in
+    /// ([`skin_model::Play::set_chart_videos`]), in the play skin in use and
+    /// in a staged one, from the next frame on. Set once the attempt is
+    /// prepared or staged and before its READY, never during it.
     pub fn set_chart_videos(&mut self, videos: skin_model::bga::ChartVideos) {
+        if let Some(Pending {
+            skin: Some(skin), ..
+        }) = &mut self.pending
+        {
+            skin.set_chart_videos(videos.clone());
+        }
         self.skin.set_chart_videos(videos);
     }
 

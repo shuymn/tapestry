@@ -128,7 +128,7 @@ const PLAYERS: u8 = 8;
 const REQUESTS: usize = 32;
 
 use super::movie::{Cell, Outcome, Stage, Then};
-pub use super::movie::{Loss, Status};
+pub use super::movie::{Loss, Runs, Status, Waker};
 
 /// A video a screen asked for, shared between the game, the render side
 /// and the session. Its state is a [`Cell`]: each thread changes it by one
@@ -139,10 +139,12 @@ pub struct Movie {
     live: OnceLock<Live>,
     /// Slots the render side freed.
     freed: AtomicU64,
-    /// The newest run the render side wants sought, 0 for none.
-    want: AtomicU64,
-    /// The newest run whose end the worker reported, 0 for none.
-    ended: AtomicU64,
+    /// Its runs as the render side and the session share them: the run
+    /// wanted sought, the run ended and the run found empty.
+    pub runs: Runs,
+    /// One of the chart's videos: a loss of one loses the other
+    /// ([`Loss::Peer`]).
+    chart: bool,
     /// The media time the session's seeks start from (tests; the game's
     /// are 0, the clip's start).
     #[cfg(test)]
@@ -152,15 +154,52 @@ pub struct Movie {
 impl Movie {
     /// A pending video of the screen of `generation`.
     pub fn new(generation: u64) -> Arc<Self> {
+        Self::made(generation, false)
+    }
+
+    /// A pending chart video of the screen of `generation`: a loss of one
+    /// of the screen's chart videos loses the others with it.
+    pub fn chart(generation: u64) -> Arc<Self> {
+        Self::made(generation, true)
+    }
+
+    fn made(generation: u64, chart: bool) -> Arc<Self> {
         Arc::new(Self {
             cell: Cell::new(generation),
             live: OnceLock::new(),
             freed: AtomicU64::new(0),
-            want: AtomicU64::new(0),
-            ended: AtomicU64::new(0),
+            runs: Runs::default(),
+            chart,
             #[cfg(test)]
             seek_at: AtomicI64::new(0),
         })
+    }
+
+    /// Whether it is one of the chart's videos.
+    pub const fn is_chart(&self) -> bool {
+        self.chart
+    }
+
+    /// The newest run the render side wants sought, 0 for none (tests).
+    #[cfg(test)]
+    pub fn wanted(&self) -> u64 {
+        self.runs.wanted()
+    }
+
+    /// The newest run whose seek the worker answered with no frame, 0 for
+    /// none: that run's end, once reported, needs no frame of it.
+    pub fn empty(&self) -> u64 {
+        self.runs.empty()
+    }
+
+    /// Run `run` ended, `empty` when its seek found no frame, as the
+    /// session records the worker's answers (tests).
+    #[cfg(test)]
+    pub fn end_run(&self, run: u64, empty: bool) {
+        if empty {
+            self.runs.found_empty(run);
+        }
+        self.runs.end(run);
     }
 
     /// The render side wants run `run`, which its reader started, sought:
@@ -168,13 +207,13 @@ impl Movie {
     /// in flight. It writes one word and allocates nothing; the caller then
     /// wakes the session ([`Waker::wake`]).
     pub fn want(&self, run: u64) {
-        self.want.store(run, Ordering::Release);
+        self.runs.want(run);
     }
 
     /// The newest run whose end the worker reported, 0 for none: the
     /// worker published every frame of that run before reporting it.
     pub fn ended(&self) -> u64 {
-        self.ended.load(Ordering::Acquire)
+        self.runs.ended()
     }
 
     /// Has the session's seeks start at `at` µs instead of the clip's
@@ -556,9 +595,7 @@ impl Session {
     /// The render side's handle for waking the session when a video wants
     /// a seek.
     pub fn waker(&self) -> Waker {
-        Waker {
-            session: self.thread.clone(),
-        }
+        Waker::new(self.thread.clone())
     }
 
     /// When command `id` was written whole, on the clock of
@@ -613,24 +650,6 @@ impl Drop for Session {
         // starts at once.
         self.shared.quit.store(true, Ordering::Release);
         self.thread.unpark();
-    }
-}
-
-/// Wakes the session: its thread, unparked apart from the request queue.
-/// Holding one keeps no session alive: dropping the game's handle ends it.
-#[derive(Clone)]
-pub struct Waker {
-    session: Thread,
-}
-
-impl Waker {
-    /// Asks the session to look now, never waiting and allocating nothing:
-    /// it unparks the session's thread, so wakes take no place of the
-    /// request queue. Wakes coalesce into the thread's one token: a wake
-    /// while the session looks ends its next sleep at once, so a want
-    /// stored before the wake is read by a look after it.
-    pub fn wake(&self) {
-        self.session.unpark();
     }
 }
 
@@ -980,6 +999,7 @@ impl Supervisor {
             self.fail_worker(why);
             return;
         }
+        self.lose_peers();
         self.judge(generation, now, settled);
         #[cfg(test)]
         if let Some(turn) = &mut self.turn {
@@ -1299,6 +1319,11 @@ impl Supervisor {
         }
         if let (Stage::Seeking { run, .. }, Stage::Live) = (p.stage, stage) {
             p.sought = run;
+            // An answer with no frame: the run is empty, and its end, which
+            // follows, needs no frame of it.
+            if let Reply::Sought { landed: None, .. } = reply {
+                p.movie.runs.found_empty(run);
+            }
         }
         p.stage = stage;
         #[cfg(test)]
@@ -1310,7 +1335,7 @@ impl Supervisor {
         match then {
             Then::Nothing => Ok(()),
             Then::End(run) => {
-                p.movie.ended.store(run, Ordering::Release);
+                p.movie.runs.end(run);
                 event!(self.shared, Event::Ended { run });
                 Ok(())
             }
@@ -1571,7 +1596,7 @@ impl Supervisor {
     fn seek_wanted(&mut self, generation: u64) -> Result<(), Loss> {
         for i in 0..self.players.len() {
             let Some(p) = self.players.get(i) else { break };
-            let want = p.movie.want.load(Ordering::Acquire);
+            let want = p.movie.runs.wanted();
             let Some(run) = super::movie::seek_for(p.stage, p.sought, want) else {
                 continue;
             };
@@ -1590,6 +1615,34 @@ impl Supervisor {
             event!(self.shared, Event::Seek { run, id });
         }
         Ok(())
+    }
+
+    /// Loses with [`Loss::Peer`] every chart video pending or live whose
+    /// screen has a chart video lost for another reason than its peer's or
+    /// the pixel total: the chart's videos are one panel. The judgement
+    /// then closes them, sparing their files ([`Self::close`]).
+    fn lose_peers(&mut self) {
+        for i in 0..self.players.len() {
+            let Some(p) = self.players.get(i) else { break };
+            if !p.movie.chart
+                || !p
+                    .movie
+                    .loss()
+                    .is_some_and(|why| !matches!(why, Loss::Peer | Loss::OverTotal))
+            {
+                continue;
+            }
+            let generation = p.movie.generation();
+            for q in &self.players {
+                if q.movie.chart
+                    && q.movie.generation() == generation
+                    && matches!(q.movie.status(), Status::Pending | Status::Live)
+                    && q.movie.lose(Loss::Peer)
+                {
+                    event!(self.shared, Event::Lost { why: Loss::Peer });
+                }
+            }
+        }
     }
 
     /// Queues `command` for the worker: its id. With no worker, a test's
@@ -2011,7 +2064,92 @@ mod tests {
         assert_eq!(s.players[0].stage, Stage::Live);
         assert_eq!(s.players[0].sought, 4);
         assert_eq!(movie.ended(), 4);
+        assert_eq!(movie.empty(), 4, "run 4 recorded empty");
         assert_eq!((movie.status(), movie.loss()), (Status::Live, None));
+        // A seek that lands records nothing empty.
+        let (_, landed) = sought_to(5);
+        assert_eq!(landed.empty(), 0);
+    }
+
+    /// A chart video lost for its own reason loses the screen's other
+    /// chart video with its peer's reason, which the judgement then closes;
+    /// a skin movie, a chart video of another screen and one refused at
+    /// the pixel total are left as they are, and a refusal at the total
+    /// starts no peer loss.
+    // Covers: T02
+    #[test]
+    fn a_chart_loss_loses_its_peer_in_the_session() {
+        let mut s = supervisor(1);
+        let (a, b, skin, other) = (
+            Movie::chart(1),
+            Movie::chart(1),
+            Movie::new(1),
+            Movie::chart(2),
+        );
+        s.players = vec![live(&a, 1), live(&b, 2), live(&skin, 3), live(&other, 4)];
+        assert!(a.lose(Loss::OverTotal));
+        s.lose_peers();
+        assert_eq!(b.loss(), None, "a refusal at the total starts no peer loss");
+        let c = Movie::chart(1);
+        s.players.push(live(&c, 5));
+        assert!(c.lose(Loss::Progress));
+        s.lose_peers();
+        assert_eq!(b.loss(), Some(Loss::Peer));
+        assert_eq!((skin.loss(), other.loss()), (None, None));
+        assert_eq!(a.loss(), Some(Loss::OverTotal), "the refused one stays so");
+        assert!(
+            super::super::movie::unwanted(s.players[1].stage, &b.cell, 1),
+            "the judgement closes the peer"
+        );
+    }
+
+    /// The pixel total takes the chart's videos first, as a play's set
+    /// declares them first: a 2048×1536 chart video gets its ring and a
+    /// 1280×1024 skin movie after it is refused with none; four movies of
+    /// 1024×1024, exactly the total together, are all admitted.
+    // Covers: T02
+    #[test]
+    fn the_pixel_total_takes_the_chart_first() {
+        let probe = |width, height| Probe {
+            width,
+            height,
+            duration: 1_000_000,
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
+        };
+        // Admits each player's probe in turn, its video live once its ring
+        // is made, as the worker's play answer makes it.
+        let admit = |movies: &[Arc<Movie>], sizes: &[(u32, u32)]| {
+            let mut s = supervisor(1);
+            s.players = movies
+                .iter()
+                .enumerate()
+                .map(|(i, m)| opening(m, u8::try_from(i + 1).unwrap()))
+                .collect();
+            for (i, (m, (w, h))) in movies.iter().zip(sizes).enumerate() {
+                s.admit_probe(i, probe(*w, *h)).unwrap();
+                if m.loss().is_none() {
+                    assert!(m.cell.go_live());
+                }
+            }
+            s.charged.1
+        };
+        let (chart, skin) = (Movie::chart(1), Movie::new(1));
+        let charged = admit(
+            &[Arc::clone(&chart), Arc::clone(&skin)],
+            &[(2048, 1536), (1280, 1024)],
+        );
+        assert_eq!((chart.loss(), skin.loss()), (None, Some(Loss::OverTotal)));
+        assert_eq!(charged, 2048 * 1536, "no ring for the refused");
+        let four = [
+            Movie::chart(1),
+            Movie::chart(1),
+            Movie::new(1),
+            Movie::new(1),
+        ];
+        let charged = admit(&four, &[(1024, 1024); 4]);
+        assert!(four.iter().all(|m| m.loss().is_none()));
+        assert_eq!(charged, skin_model::movie::MAX_MOVIE_PIXELS);
     }
 
     /// A seek not answered within the answer deadline of its write loses

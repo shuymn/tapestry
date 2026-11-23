@@ -4040,6 +4040,38 @@ fn each_frame_is_published_with_its_duration() {
     worker.close(1);
 }
 
+/// A frame that states no duration of its own lasts the stream's average
+/// period (design.md "Rendering and Skins", video frames): motion JPEG in
+/// Matroska states none, so each frame, the last one included, is
+/// published lasting its period in the container's 1 ms ticks, 40 ms at
+/// 25 fps and 42 ms at 24 fps, and a chart video's end comes after its
+/// last frame has shown for a period.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_frame_with_no_duration_of_its_own_lasts_the_average_period() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, spec, rate) in [
+        ("j25.mkv", "mjpeg matroska 176x96 25 30 1", 25),
+        ("j24.mkv", "mjpeg matroska 176x96 24 30 1", 24),
+    ] {
+        let path = gen_clip(dir.path(), name, spec);
+        let mut worker = Worker::start(&[]);
+        let probe = worker.open(1, &path);
+        assert!(matches!(probe, Reply::Probed { .. }), "{name}: {probe:?}");
+        let mut ring = Ring::new(176, 96);
+        assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
+        let taken = take_all(&worker, &mut ring, 1, 0, 1_000_000 / rate);
+        assert_eq!(taken.len(), 30, "{name}: every frame");
+        let durations: Vec<i64> = taken.iter().map(|t| t.duration).collect();
+        // The 41.7 ms period at 24 fps rounds to 42 of the container's
+        // ticks (the stamps alone choose frames).
+        let want = if rate == 25 { 40_000 } else { 42_000 };
+        assert_eq!(durations, [want; 30], "{name}: {}", worker.log());
+        worker.close(1);
+    }
+}
+
 /// A seek's landing goes out with its own duration: frame 24 of a 24 fps
 /// clip, sought at 1 s, lasts until frame 25's stamp.
 // Covers: T02
