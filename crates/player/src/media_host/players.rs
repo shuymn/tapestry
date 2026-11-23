@@ -24,7 +24,10 @@
 //!
 //! So a file is open in the worker, as far as the game can know, from its
 //! open until the reply that tells it was closed; a worker that ends while
-//! a reply is in flight still strikes it.
+//! a reply is in flight still strikes it. A player the game closes for a
+//! reason that is not its file's (its peer's loss) is spared: a worker the
+//! game itself terminates does not strike its file, one that ends on its
+//! own (a crash, its memory cap) does.
 //!
 //! A failure carries no command's id: a player's thread sends one only after
 //! its probe and nothing after its close's answer, and the replies come in
@@ -77,13 +80,13 @@ impl<F: Copy> State<F> {
     }
 }
 
-/// The players of one worker, by id.
+/// The players of one worker, by id, and those spared.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Players<F>(BTreeMap<u8, State<F>>);
+pub struct Players<F>(BTreeMap<u8, State<F>>, BTreeSet<u8>);
 
 impl<F> Default for Players<F> {
     fn default() -> Self {
-        Self(BTreeMap::new())
+        Self(BTreeMap::new(), BTreeSet::new())
     }
 }
 
@@ -103,6 +106,14 @@ impl<F: Copy + Ord> Players<F> {
         self.0
             .entry(player)
             .or_insert(State::Opening { open, file });
+    }
+
+    /// `player`, closing, was closed for a reason that is not its file's:
+    /// a worker the game terminates does not strike its file.
+    pub fn spare(&mut self, player: u8) {
+        if matches!(self.0.get(&player), Some(State::Closing { .. })) {
+            self.1.insert(player);
+        }
     }
 
     /// Close `close` of `player` is sent. A player already closing stays
@@ -166,15 +177,74 @@ impl<F: Copy + Ord> Players<F> {
             }
             None => {
                 self.0.remove(&player);
+                self.1.remove(&player);
             }
         }
     }
 
-    /// The worker has ended: every player is gone. The files it held, each
-    /// once, and the players it had.
-    pub fn clear(&mut self) -> (BTreeSet<F>, Vec<u8>) {
+    /// The worker has ended, `terminated` by the game or on its own: every
+    /// player is gone. The files to strike, each once (those it held, but a
+    /// spared player's when the game terminated it), and the players it
+    /// had.
+    pub fn clear(&mut self, terminated: bool) -> (BTreeSet<F>, Vec<u8>) {
         let all = std::mem::take(&mut self.0);
-        let files = all.values().filter_map(State::file).collect();
+        let spared = std::mem::take(&mut self.1);
+        let files = all
+            .iter()
+            .filter(|(player, _)| !(terminated && spared.contains(player)))
+            .filter_map(|(_, state)| state.file())
+            .collect();
         (files, all.into_keys().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn probed(id: u32, player: u8) -> Reply {
+        Reply::Probed {
+            id,
+            player,
+            width: 64,
+            height: 48,
+            duration: 0,
+            matrix: skin_model::media::control::Matrix::Bt601,
+            range: skin_model::media::control::Range::Limited,
+            codec: String::new(),
+            container: String::new(),
+        }
+    }
+
+    /// A spared player's file is struck by a worker that ends on its own
+    /// and not by one the game terminates, unless another player that is
+    /// not spared holds it too; an id spared and closed, then opened again,
+    /// is no longer spared.
+    // Covers: T02
+    #[test]
+    fn a_spared_file_is_struck_only_by_an_end_of_its_own() {
+        const A: u8 = 10;
+        const B: u8 = 20;
+        const C: u8 = 30;
+        let mut players = Players::default();
+        players.opened(1, 1, A);
+        players.opened(2, 2, B);
+        players.take(&probed(1, 1));
+        players.take(&probed(2, 2));
+        // Spared only once closing.
+        players.spare(2);
+        assert_eq!(players.clone().clear(true).0, BTreeSet::from([A, B]));
+        players.closing(2, 3);
+        players.spare(2);
+        assert_eq!(players.clone().clear(true).0, BTreeSet::from([A]));
+        assert_eq!(players.clone().clear(false).0, BTreeSet::from([A, B]));
+        // Another player not spared holds B too.
+        let mut shared = players.clone();
+        shared.opened(3, 4, B);
+        assert_eq!(shared.clear(true).0, BTreeSet::from([A, B]));
+        // Player 2 closed, its id opened again on C.
+        players.take(&Reply::Closed { id: 3, player: 2 });
+        players.opened(2, 5, C);
+        assert_eq!(players.clear(true).0, BTreeSet::from([A, C]));
     }
 }

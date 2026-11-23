@@ -754,6 +754,7 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
         job,
         watch,
         players: std::cell::RefCell::new(super::players::Players::default()),
+        hung: std::cell::Cell::new(false),
         next_id: 1,
         _desktop: desktop,
         #[cfg(test)]

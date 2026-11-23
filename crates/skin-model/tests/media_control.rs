@@ -76,8 +76,16 @@ fn replies() -> Vec<Reply> {
             id: u32::MAX,
             player: 6,
             run: 4,
-            landed: 1_500_000,
+            landed: Some(1_500_000),
             attempts: 2,
+        },
+        // An empty seek's answer: no landing.
+        Reply::Sought {
+            id: 10,
+            player: 6,
+            run: 5,
+            landed: None,
+            attempts: 0,
         },
         Reply::Ended { player: 7, run: 12 },
         Reply::Closed { id: 8, player: 8 },
@@ -302,6 +310,19 @@ fn control_refuses_malformed_messages() {
     let last = play.len() - 1;
     play[last] = 2;
     assert_eq!(Command::decode(&play), Err(Malformed::Reason(2)));
+    // A seek's landing flag the protocol does not have: after the tag, id,
+    // player and run.
+    let mut sought = Reply::Sought {
+        id: 1,
+        player: 1,
+        run: 2,
+        landed: None,
+        attempts: 0,
+    }
+    .encode();
+    assert_eq!(sought[14], 0);
+    sought[14] = 2;
+    assert_eq!(Reply::decode(&sought), Err(Malformed::Reason(2)));
     // A string that is not UTF-8, and one longer than the cap though it
     // fits in a frame.
     let mut hello = Reply::Hello {
