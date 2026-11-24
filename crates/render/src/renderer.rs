@@ -1693,8 +1693,8 @@ impl Window {
     /// # Errors
     ///
     /// [`RenderError::SurfaceConfigure`]: the surface refused it.
-    fn configure(&mut self, device: &wgpu::Device) -> Result<(), RenderError> {
-        crate::configure::configure(&self.surface, device, &self.config)?;
+    fn configure(&mut self, gpu: &crate::Gpu) -> Result<(), RenderError> {
+        crate::configure::configure(&self.surface, gpu, &self.config)?;
         // SAFETY: the handle is only read here; it belongs to the swap chain
         // just configured, which lives as long as the surface.
         let hal = unsafe { self.surface.as_hal::<wgpu_hal::api::Dx12>() };
@@ -2171,7 +2171,7 @@ impl Renderer {
                 };
                 #[cfg(feature = "dev-tools")]
                 crate::configure::before_first_configure();
-                w.configure(device)?;
+                w.configure(&gpu)?;
                 (Output::Window(w), format)
             }
             None => {
@@ -2404,7 +2404,7 @@ impl Renderer {
                 let old = (w.config.width, w.config.height);
                 w.config.width = size.0;
                 w.config.height = size.1;
-                if let Err(e) = w.configure(device) {
+                if let Err(e) = w.configure(&self.gpu) {
                     w.config.width = old.0;
                     w.config.height = old.1;
                     self.surface_refused = Some(e);
@@ -10095,7 +10095,7 @@ impl Renderer {
                         crate::probe::mark("rf:skipped", 1);
                     }
                     if reconfigure {
-                        w.configure(self.gpu.device())?;
+                        w.configure(&self.gpu)?;
                     }
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
                     #[cfg(feature = "dev-tools")]
@@ -10419,8 +10419,7 @@ impl Renderer {
             ));
         }
         w.config.usage |= wgpu::TextureUsages::COPY_SRC;
-        w.configure(self.gpu.device())
-            .map_err(TapError::Configure)?;
+        w.configure(&self.gpu).map_err(TapError::Configure)?;
         self.present_tap = Some(tap);
         Ok(())
     }

@@ -128,17 +128,50 @@ fn a_refused_configure_is_an_error() {
     on_own_desktop(|| {
         let popup = Popup::new(320, 180);
         let mut r = Renderer::new(popup.target(320, 180), AdapterChoice::Warp).unwrap();
-        let device = r.gpu.device().clone();
+        let gpu = r.gpu.clone();
         let Output::Window(w) = &mut r.output else {
             panic!("a window renderer has a window");
         };
         w.config.view_formats = vec![wgpu::TextureFormat::Rgba16Float];
-        let e = w.configure(&device).unwrap_err();
+        let e = w.configure(&gpu).unwrap_err();
         assert!(
             matches!(
                 e,
                 RenderError::SurfaceConfigure {
                     retryable: false,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        drop(r);
+    });
+}
+
+/// W5.6: a configure on a device that was lost is a retryable refusal,
+/// returned: wgpu reports the device's loss through its lost callback
+/// alone, past the error scopes, and leaves the surface unconfigured, so
+/// without a look at the loss the configure would say it succeeded.
+#[test]
+fn a_configure_on_a_lost_device_is_an_error() {
+    on_own_desktop(|| {
+        let popup = Popup::new(320, 180);
+        let mut r = Renderer::new(popup.target(320, 180), AdapterChoice::Warp).unwrap();
+        let gpu = r.gpu.clone();
+        // A destroyed device is lost at its next maintenance, which calls
+        // its lost callback, as a device the system removed is at once.
+        gpu.device().destroy();
+        let _ = gpu.device().poll(wgpu::PollType::Poll);
+        assert!(gpu.lost(), "the device's loss was not reported");
+        let Output::Window(w) = &mut r.output else {
+            panic!("a window renderer has a window");
+        };
+        let e = w.configure(&gpu).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                RenderError::SurfaceConfigure {
+                    retryable: true,
                     ..
                 }
             ),

@@ -6,26 +6,62 @@
 //! may pass (DXGI refused the swap chain, or the wait for the GPU timed
 //! out) is retryable; one the configuration itself causes is not.
 
+use std::cell::Cell;
 #[cfg(any(test, feature = "dev-tools"))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use wgpu::wgc::present::ConfigureSurfaceError as Refusal;
 
 use crate::RenderError;
+use crate::gpu::Gpu;
 
-/// Configures `surface` with `config` on `device` inside a validation and
-/// an out-of-memory scope (the scopes [`crate::skin_atlas::scoped`] pushes),
-/// after the checks wgpu panics on instead of reporting: a zero side, or
-/// one past the device's largest texture.
+thread_local! {
+    /// Whether this thread is inside a window surface's configure
+    /// ([`while_configuring`]).
+    static CONFIGURING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is inside a window surface's configure now: wgpu's
+/// own records made then are about that configure (the startup takes its
+/// error records into the log, design.md "Log File").
+#[must_use]
+pub fn configuring() -> bool {
+    CONFIGURING.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Runs `f` as inside a window surface's configure on this thread
+/// ([`configuring`]); [`configure`] runs its call through it, and tests a
+/// record made there.
+pub fn while_configuring<R>(f: impl FnOnce() -> R) -> R {
+    /// Leaves the configure however `f` ends.
+    struct Leave(bool);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            let _ = CONFIGURING.try_with(|c| c.set(self.0));
+        }
+    }
+    let _leave = Leave(configuring());
+    let _ = CONFIGURING.try_with(|c| c.set(true));
+    f()
+}
+
+/// Configures `surface` with `config` on `gpu`'s device inside a
+/// validation and an out-of-memory scope (the scopes
+/// [`crate::skin_atlas::scoped`] pushes), after the checks wgpu panics on
+/// instead of reporting: a zero side, or one past the device's largest
+/// texture. A device lost before or during it is a refusal too: wgpu
+/// reports that loss through the device's lost callback alone, past both
+/// scopes, and leaves the surface unconfigured.
 ///
 /// # Errors
 ///
 /// [`RenderError::SurfaceConfigure`] with what refused it.
 pub(crate) fn configure(
     surface: &wgpu::Surface<'_>,
-    device: &wgpu::Device,
+    gpu: &Gpu,
     config: &wgpu::SurfaceConfiguration,
 ) -> Result<(), RenderError> {
+    let device = gpu.device();
     let max = device.limits().max_texture_dimension_2d;
     if config.width == 0 || config.height == 0 {
         return Err(RenderError::surface_configure(refusal(Refusal::ZeroArea)));
@@ -43,9 +79,14 @@ pub(crate) fn configure(
             Refusal::InvalidSurface,
         )));
     }
-    let ((), refused) = crate::skin_atlas::scoped(device, || surface.configure(device, config));
+    let ((), refused) = while_configuring(|| {
+        crate::skin_atlas::scoped(device, || surface.configure(device, config))
+    });
     match refused {
         Some(e) => Err(RenderError::surface_configure(e)),
+        None if gpu.lost() => Err(RenderError::surface_configure(refusal(Refusal::Device(
+            wgpu::wgc::device::DeviceError::Lost,
+        )))),
         None => Ok(()),
     }
 }

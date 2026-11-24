@@ -87,6 +87,7 @@ pub use chart_pool::{POOL_MAX_SLOTS, POOL_MAX_TEXELS, PoolLayout, PoolWriteError
 pub use configure::on_first_configure;
 #[cfg(any(test, feature = "dev-tools"))]
 pub use configure::refuse_configures;
+pub use configure::{configuring, while_configuring};
 pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
     LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,
