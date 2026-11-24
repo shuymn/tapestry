@@ -5312,28 +5312,35 @@ fn write_video_chart(library: &Path) -> bms_model::Chart {
         .chart
 }
 
-/// The scenario of `steps` after a capture at each of `ats` (chart ms,
-/// `c<ms>.png`), at the video captures' size.
-fn video_scenario(ats: &[i64], steps: &[&str]) -> String {
+/// The scenario of a chart played twice in one run, at the video captures'
+/// size, written to `output`: the first play (`select` and `play`, then the
+/// result left) launches the media worker, which the session keeps for the
+/// run, so the second, captured at each of `ats` (chart ms, `c<ms>.png`)
+/// and by the capture steps `more`, waits for no launch. A launch slowed
+/// past the preparation deadline on a loaded machine would otherwise play
+/// the captured chart without its videos, as designed.
+fn warmed_scenario(output: &str, ats: &[i64], more: &[&str], select: &str, play: &str) -> String {
     let captures: Vec<String> = ats
         .iter()
         .map(|at| format!("capture = {{ at = {at}, file = \"c{at}.png\" }}"))
         .collect();
-    let all: Vec<&str> = captures
-        .iter()
-        .map(String::as_str)
-        .chain(steps.iter().copied())
-        .collect();
-    scenario(&all).replacen(
+    let once = [select, play, "result = \"back\""];
+    let mut steps: Vec<&str> = once.to_vec();
+    steps.extend(captures.iter().map(String::as_str));
+    steps.extend(more);
+    steps.extend(once);
+    steps.push("quit = {}");
+    scenario(&steps).replacen(
         "output = \"out\"\n",
-        "output = \"out\"\nsize = [320, 180]\n",
+        &format!("output = \"{output}\"\nsize = [320, 180]\n"),
         1,
     )
 }
 
 /// A chart's coded base video plays on chart time through the media worker
-/// (design.md "Rendering and Skins", BGA): each capture shows the frame
-/// due at its chart time, the green block of the layer picture over it.
+/// (design.md "Rendering and Skins", BGA), on the chart's second play, the
+/// first having launched the worker: each capture shows the frame due at
+/// its chart time, the green block of the layer picture over it.
 /// The worker is then crashed after a capture read back so (design.md
 /// "Threat Model" T02): the session sees it, from the call that ended it,
 /// within its tick and an allowance, before the render side draws it; the
@@ -5347,6 +5354,7 @@ fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
     // The capture after which the worker is crashed.
     const KILL_AFTER: i64 = 12 * 237;
     let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "a_chart_video_plays_and_a_crash_blacks_its_panel");
     let chart = write_video_chart(&fx.library());
     install_video_skin(&fx);
     write_log(
@@ -5354,17 +5362,15 @@ fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
         &hits(&chart, |_| true),
         1,
     );
-    // Every 237 ms, out of step with the clip's 100 ms frames, to 7.8 s.
+    // Every 237 ms, out of step with the clip's 100 ms frames, to 7.8 s, on
+    // the chart's second play; the first launches the worker.
     let ats: Vec<i64> = (1..=33).map(|k| k * 237).collect();
-    let text = video_scenario(
+    let text = warmed_scenario(
+        "out",
         &ats,
-        &[
-            "capture = { chart_lost = true, file = \"lost.png\" }",
-            "select = { path = \"library/v/v.bms\" }",
-            "play = { input = \"logs/v.tprl\", until = \"end\" }",
-            "result = \"back\"",
-            "quit = {}",
-        ],
+        &["capture = { chart_lost = true, file = \"lost.png\" }"],
+        "select = { path = \"library/v/v.bms\" }",
+        "play = { input = \"logs/v.tprl\", until = \"end\" }",
     );
     let dir = fx.base.join("out");
     let mut killed = None;
@@ -5385,6 +5391,7 @@ fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
             killed = Some(crash(worker));
         },
     );
+    fs::write(fx.base.join("run.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let crashed = game_time_of(&stdout, killed.unwrap());
     // The session saw the chart video lost as its worker ended (`Ended`,
@@ -5439,8 +5446,8 @@ fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
         "a capture after the loss"
     );
     let (records, _) = fx.played_records();
-    let [record] = &records[..] else {
-        panic!("one played record: {records:?}");
+    let [_, record] = &records[..] else {
+        panic!("two played records: {records:?}");
     };
     let rec = replay::decode(&fs::read(record).unwrap(), &DecodeLimits::default()).unwrap();
     assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
@@ -5470,12 +5477,13 @@ fn record_load_stages(record: &Path) -> Vec<(String, i64)> {
 /// before the start and after the clip's last frame has ended (its stamp
 /// plus its duration). Captures land inside the first frame's interval
 /// (frame 0, told from the black placeholder) and inside the last frame's
-/// (shown until its end, not its stamp). The load that led to the play
-/// stamps the worker's launch and the video's probe in its stages, in
-/// order, before READY.
+/// (shown until its end, not its stamp). The chart is played twice: the
+/// first play's load stamps the worker's launch, the second's, the one
+/// captured, its video's probe and no launch, each in order before READY.
 #[test]
 fn chart_video_frames_follow_chart_time_in_a_scenario() {
     let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "chart_video_frames_follow_chart_time_in_a_scenario");
     let dir = fx.library().join("t");
     fs::create_dir_all(&dir).unwrap();
     write_wav(&dir.join("key.wav"));
@@ -5500,17 +5508,16 @@ fn chart_video_frames_follow_chart_time_in_a_scenario() {
     ats.extend((0..5).map(|k| 20_820 + 40 * k));
     ats.sort_unstable();
     let (out, stdout, stderr) = fx.run_drained(
-        &mut fx.command(&video_scenario(
+        &mut fx.command(&warmed_scenario(
+            "out",
             &ats,
-            &[
-                "select = { path = \"library/t/t.bms\" }",
-                "play = { input = \"logs/t.tprl\", until = \"end\" }",
-                "result = \"back\"",
-                "quit = {}",
-            ],
+            &[],
+            "select = { path = \"library/t/t.bms\" }",
+            "play = { input = \"logs/t.tprl\", until = \"end\" }",
         )),
         RUN_LIMIT,
     );
+    fs::write(fx.base.join("run.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let out_dir = fx.base.join("out");
     let (mut shown, mut placeholder, mut first, mut last) = (0, 0, 0, 0);
@@ -5544,38 +5551,66 @@ fn chart_video_frames_follow_chart_time_in_a_scenario() {
         "captures inside the first frame's interval ({first}) and the last's ({last})"
     );
     let (records, _) = fx.played_records();
-    let [record] = &records[..] else {
-        panic!("one played record: {records:?}");
+    let [warm, record] = &records[..] else {
+        panic!("two played records: {records:?}");
     };
-    let stages = record_load_stages(record);
-    let at = |k: &str| {
-        stages
-            .iter()
-            .find(|(n, _)| n == k)
-            .unwrap_or_else(|| panic!("no {k}: {stages:?}"))
-            .1
+    let in_order = |stages: &[(String, i64)], order: &[&str]| {
+        let at = |k: &str| {
+            stages
+                .iter()
+                .find(|(n, _)| n == k)
+                .unwrap_or_else(|| panic!("no {k}: {stages:?}"))
+                .1
+        };
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) <= at(pair[1]), "{pair:?}: {stages:?}");
+        }
+        assert!(at(order[0]) >= 0, "{stages:?}");
     };
-    let order = [
-        "media_launch_start",
-        "media_launch_end",
-        "video_probes_start",
-        "video_probes_end",
-        "ready",
-    ];
-    for pair in order.windows(2) {
-        assert!(at(pair[0]) <= at(pair[1]), "{pair:?}: {stages:?}");
+    // The first play's load stamps the worker's launch. Its end is there
+    // when the launch ended by READY; a launch past the preparation
+    // deadline ends after it, unstamped, and that play took no frame of
+    // its video.
+    let stages = record_load_stages(warm);
+    if stages.iter().any(|(n, _)| n == "media_launch_end") {
+        in_order(
+            &stages,
+            &["media_launch_start", "media_launch_end", "ready"],
+        );
+    } else {
+        in_order(&stages, &["media_launch_start", "ready"]);
+        let measure: toml::Table = fs::read_to_string(warm.with_extension("measure.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            measure["movies"]["takes"][2].as_integer(),
+            Some(0),
+            "a launch unstamped by READY, yet its video played: {measure:?}"
+        );
     }
-    assert!(at("media_launch_start") >= 0, "{stages:?}");
+    // The second's stamps its video's probe, and no launch: the worker was
+    // kept.
+    let stages = record_load_stages(record);
+    in_order(
+        &stages,
+        &["video_probes_start", "video_probes_end", "ready"],
+    );
+    assert!(
+        !stages.iter().any(|(n, _)| n.starts_with("media_launch")),
+        "{stages:?}"
+    );
 }
 
 /// The render thread's app region allocates nothing in any frame of a play
 /// whose movie hook runs all four movie slots (design.md "Scope of No
 /// Allocation"): a chart video on the base, started again inside its clip,
 /// another on the layer, the base's video in the poor window of every
-/// missed note, and two skin movies, each through the media worker. The
-/// play's measure counts frames taken into each of the four slots and the
-/// restart, and the capture in the poor window draws the base's video
-/// alone. It prints how late each chart slot's picture was, the largest
+/// missed note, and two skin movies, each through the media worker, which a
+/// first play of the chart has launched. The second play's measure counts
+/// frames taken into each of the four slots and the restart, and its
+/// capture in the poor window draws the base's video alone, the frame the
+/// base's slot held. It prints how late each chart slot's picture was, the largest
 /// over the play and on each capture, and keeps its folder when it fails.
 /// Its positive control: the BGA's draw made to allocate (dev-tools) is
 /// counted.
@@ -5623,17 +5658,15 @@ fn render_app_zero_with_video_bga() {
         ),
     )
     .unwrap();
+    // The second play of the chart is the one measured and captured.
     let plays = |output: &str| {
-        video_scenario(
+        warmed_scenario(
+            output,
             &[1_000, 2_400],
-            &[
-                "select = { path = \"library/w/w.bms\" }",
-                "play = { input = { miss = \"all\" }, until = \"end\" }",
-                "result = \"back\"",
-                "quit = {}",
-            ],
+            &[],
+            "select = { path = \"library/w/w.bms\" }",
+            "play = { input = { miss = \"all\" }, until = \"end\" }",
         )
-        .replacen("output = \"out\"", &format!("output = \"{output}\""), 1)
     };
     let measured = |fx: &Fixture| -> toml::Table {
         let (records, _) = fx.played_records();
@@ -5699,12 +5732,17 @@ fn render_app_zero_with_video_bga() {
     };
     let lags = [("c1000", lag_at("c1000")), ("c2400", lag_at("c2400"))];
     println!("chart lag: largest {largest}, at the captures {lags:?}");
-    // The poor window's pixels are the base's clip's: its index due then.
+    // The poor window's pixels are the base's clip's: the frame its slot
+    // held on that frame, whose stamp is the chart time less the slot's lag
+    // (the base started at 0 s). How late that frame was is the ring's and
+    // the render rate's, not this check's: a frame due by chart time is
+    // the timing scenario's.
     let t = chart_us(&all, "c2400");
+    let (_, base_lag) = lags[1].1[0].expect("the base's lag on c2400");
+    let held = u32::try_from(((t - base_lag) * 30 + 500_000) / 1_000_000).ok();
     let got = coded_index(&rgb(&all.join("c2400.png")), 8);
     assert_eq!(
-        got,
-        due_frame(t, 30),
+        got, held,
         "c2400 at {t}: the base's clip; lag at the captures {lags:?}, largest {largest}"
     );
     let (out, stdout, stderr) = fx.run_drained(
