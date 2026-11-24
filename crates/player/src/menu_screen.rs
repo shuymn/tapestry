@@ -641,12 +641,14 @@ fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut
                 true
             }
             Ok(Err(e)) => {
-                eprintln!("render: the menu font could not be read: {e}");
+                crate::render_report::report(format_args!(
+                    "render: the menu font could not be read: {e}"
+                ));
                 *failed = true;
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                eprintln!("render: the menu font's read panicked");
+                crate::render_report::report(format_args!("render: the menu font's read panicked"));
                 *failed = true;
                 false
             }
@@ -656,7 +658,9 @@ fn font_now(fonts: &mut Option<Fonts>, ahead: &mut Option<FontJob>, failed: &mut
             }
         },
         None => {
-            eprintln!("render: the menu font's thread could not be started");
+            crate::render_report::report(format_args!(
+                "render: the menu font's thread could not be started"
+            ));
             *failed = true;
             false
         }
@@ -1128,7 +1132,9 @@ impl MenuScreen {
                 self.chosen.refused = None;
             }
             Err(render::TextFault::Install(e @ LoadingTextError::Table(_))) => {
-                eprintln!("render: the chosen chart's text was not installed: {e}");
+                crate::render_report::report(format_args!(
+                    "render: the chosen chart's text was not installed: {e}"
+                ));
                 self.chosen.installed = None;
                 self.chosen.refused = Some(hand);
             }
@@ -1136,10 +1142,10 @@ impl MenuScreen {
             // pass asks again.
             Err(render::TextFault::Install(_)) => {}
             Err(render::TextFault::Prepare(e)) if e.is_refusal() => {
-                eprintln!(
+                crate::render_report::report(format_args!(
                     "render: the chosen chart's text was not prepared: {}",
                     game::Chain(e)
-                );
+                ));
                 self.chosen.installed = None;
                 self.chosen.refused = Some(hand);
             }
@@ -1184,7 +1190,7 @@ impl MenuScreen {
         match &timing {
             Ok(Ok(t)) => {
                 self.movies_presented(t);
-                self.shown(t.presented());
+                self.shown(t);
             }
             Ok(Err(_)) | Err(_) => self.movies_unhooked(),
         }
@@ -1252,7 +1258,7 @@ impl MenuScreen {
         logic: &mut SelectionLogic,
         stop: crate::screens::ScriptStop,
     ) -> Result<(), RenderError> {
-        eprintln!("render: selection skin: {}", stop.notice());
+        crate::render_report::report(format_args!("render: selection skin: {}", stop.notice()));
         logic.script_stop = Some(stop);
         self.prepare_strip(&u.strip, Some(stop.notice()))
     }
@@ -1332,14 +1338,28 @@ impl MenuScreen {
         self.strip_staged
     }
 
-    /// Tells the window a frame was `presented`, with nothing allocated (a
-    /// play's frame calls it); passes it on.
+    /// Tells the window a frame `t` was presented, confirmed by the swap
+    /// chain ([`FrameTiming::confirmed`]), with nothing allocated (a
+    /// play's frame calls it); passes on whether it was presented.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) fn shown(&self, presented: bool) -> bool {
-        if presented && let Some(flag) = &self.presented {
-            flag.store(true, Ordering::Release);
+    pub(crate) fn shown(&self, t: &FrameTiming) -> bool {
+        if t.confirmed()
+            && let Some(flag) = &self.presented
+        {
+            let first = !flag.swap(true, Ordering::AcqRel);
+            // The first confirmed present's count (dev-tools, the
+            // startup's order against the window's show).
+            #[cfg(feature = "dev-tools")]
+            if first {
+                println!(
+                    "dev: first present confirmed, present count {}",
+                    t.present_count.unwrap_or(0)
+                );
+            }
+            #[cfg(not(feature = "dev-tools"))]
+            let _ = first;
         }
-        presented
+        t.presented()
     }
 }
 
@@ -1940,7 +1960,9 @@ impl Screen for MenuScreen {
         match spawned {
             Ok(_) => self.font_ahead = Some(job),
             Err(e) => {
-                eprintln!("render: the menu font's thread could not be started: {e}");
+                crate::render_report::report(format_args!(
+                    "render: the menu font's thread could not be started: {e}"
+                ));
                 self.font_failed = true;
             }
         }
@@ -2131,7 +2153,7 @@ impl Screen for MenuScreen {
             Some(t) if lines > 0 => self.renderer.submit_result(&[t]),
             _ => self.renderer.submit_result(&[]),
         }?;
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(timing)
     }
 
@@ -2187,7 +2209,7 @@ impl Screen for MenuScreen {
     fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
         self.movies.drawn(Drawn::Other, &mut self.renderer);
         let timing = self.renderer.submit_decision(&[])?;
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(timing)
     }
 
@@ -2316,7 +2338,7 @@ impl Screen for MenuScreen {
             return timing;
         };
         self.movies_presented(&timing);
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(timing)
     }
 
@@ -2337,18 +2359,17 @@ impl Screen for MenuScreen {
     fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
         self.movies.drawn(Drawn::Other, &mut self.renderer);
         let timing = self.renderer.text_frame(lines)?;
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(timing)
     }
 
     fn end(&mut self, page: &crate::render_side::EndPage) -> Result<FrameOutcome, RenderError> {
         self.movies.drawn(Drawn::Other, &mut self.renderer);
-        let outcome = self
+        let timing = self
             .renderer
-            .result_frame(&page.lines, page.graphs.as_deref())?
-            .outcome;
-        self.shown(outcome == FrameOutcome::Shown);
-        Ok(outcome)
+            .result_frame(&page.lines, page.graphs.as_deref())?;
+        self.shown(&timing);
+        Ok(timing.outcome)
     }
 
     fn splash(&mut self, elapsed: Duration) -> Option<Result<FrameOutcome, RenderError>> {
@@ -2360,7 +2381,7 @@ impl Screen for MenuScreen {
         } else {
             // A screen for plays only: black, so the window shows.
             self.renderer.text_frame(&[]).map(|t| {
-                self.shown(t.presented());
+                self.shown(&t);
                 t.outcome
             })
         })
@@ -2423,14 +2444,14 @@ impl Screen for MenuScreen {
             return Err(RenderError::OtherRenderersText);
         };
         let timing = self.renderer.menu_frame(|_| {}, text)?;
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(timing)
     }
 
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         self.movies.drawn(Drawn::Other, &mut self.renderer);
         let timing = self.menu_frame(page, changed)?;
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(timing)
     }
 
@@ -2503,7 +2524,7 @@ impl Screen for MenuScreen {
             self.send(self.page_caret);
             let timing = self.menu_frame(&u.page, false)?;
             self.movies_presented(&timing);
-            self.shown(timing.presented());
+            self.shown(&timing);
             return Ok(SelectionDrawn {
                 timing,
                 refused,
@@ -2520,7 +2541,7 @@ impl Screen for MenuScreen {
             None => self.renderer.submit_selection(&[]),
         }?;
         self.movies_presented(&timing);
-        self.shown(timing.presented());
+        self.shown(&timing);
         Ok(SelectionDrawn {
             timing,
             refused: None,
@@ -2639,9 +2660,9 @@ impl MenuScreen {
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        let outcome = self.renderer.menu_frame(|_| {}, text)?.outcome;
-        self.shown(outcome == FrameOutcome::Shown);
-        Ok(outcome)
+        let timing = self.renderer.menu_frame(|_| {}, text)?;
+        self.shown(&timing);
+        Ok(timing.outcome)
     }
 
     /// Draws `page`, laid out again when `changed`.

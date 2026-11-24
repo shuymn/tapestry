@@ -197,7 +197,7 @@ impl KeyScreen for Screen<'_> {
         let lines = lines(flow);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         match self.renderer.text_frame(&refs) {
-            Ok(t) if t.presented() => self.presented.store(true, Ordering::Release),
+            Ok(t) if t.confirmed() => self.presented.store(true, Ordering::Release),
             Ok(_) => {}
             Err(e) => {
                 // The screen is lost: nothing more can be shown, so the
@@ -289,6 +289,9 @@ pub fn run(
         Ok(r) => r,
         Err(e) => {
             drop(input);
+            window_thread
+                .shown()
+                .fail(crate::window::StartFailure::Render(e.to_string()));
             window_thread.close();
             return Err(e.into());
         }
@@ -306,7 +309,13 @@ pub fn run(
     #[cfg(feature = "dev-tools")]
     drop(script);
     drop(input);
+    // A window never shown (no frame by the startup's deadline, which
+    // closed the controls) fails the key config, not a close.
+    let readiness = window_thread.shown().readiness();
     window_thread.close();
+    if let crate::window::Readiness::Failed(why) = readiness {
+        anyhow::bail!("the window was not shown: {why}");
+    }
     match end {
         KeyConfigEnd::Done(keys, widened, menu_reversed, adjust_reversed) => {
             apply(&mut device, keys, widened, menu_reversed, adjust_reversed);

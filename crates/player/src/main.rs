@@ -65,6 +65,7 @@ mod preview_graphs;
 mod priority;
 #[cfg(feature = "dev-tools")]
 mod recording;
+mod render_report;
 mod render_side;
 mod result_input;
 mod result_present;
@@ -124,7 +125,7 @@ use input::{
     AutoplayInput, Capture, ClockedThread, InputThread, Phase, QpcClock, SourceConfig, SourceSet,
     Waker,
 };
-use render::{AdapterChoice, Renderer, Target};
+use render::{AdapterChoice, RenderError, Renderer, Target};
 use replay::{BuildProvenance, ReceiveMethod};
 
 use crate::args::Command;
@@ -134,7 +135,7 @@ use crate::input_side::Mode;
 use crate::measure::{AudioInfo, Measure, SOUND_QUEUE, STEP_QUEUE, StepSample};
 use crate::menu_screen::MenuScreen;
 use crate::play::PlayerRig;
-use crate::render_side::{MakeScreen, NoFrames, RenderEnd, Screen, View};
+use crate::render_side::{Extent, MakeScreen, NoFrames, RenderEnd, Screen, ScreenError, View};
 use crate::select::MenuQueue;
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
@@ -168,6 +169,9 @@ fn main() -> ExitCode {
     {
         log_file::start(&root.path().join("logs"), name);
     }
+    // Render-side lines made on a thread with no reporter (the game
+    // thread's) go to the log directly.
+    render_report::set_direct(log_file::warn_line);
     let code = match command {
         Command::Version => {
             println!("tapestry {}", env!("CARGO_PKG_VERSION"));
@@ -256,6 +260,10 @@ fn launch<T>(
     let scripted = options.headless || matches!(input, PlayInput::Script(..));
     let frames = options.frames.take();
     let size = options.size.unwrap_or(dev::DEFAULT_SIZE);
+    // The window's startup bound (`--dev-render-timeout`).
+    if let Some(bound) = options.render_timeout {
+        window::set_startup_bound(bound);
+    }
     let tune: Tune = Box::new(move |rig| options.tune(rig));
     if scripted {
         headless(chart, input, start, frames, size, clock, tune)
@@ -450,6 +458,8 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
 /// it, and exits 1. The log's exit line is written here, the one exit of
 /// every command that logs.
 fn report(result: anyhow::Result<()>) -> ExitCode {
+    // From here no record waits on a writer blocked in another thread.
+    log_file::finishing();
     let code = match result {
         Ok(()) => 0,
         Err(e) => {
@@ -1346,21 +1356,22 @@ fn play(
             return Err(e);
         }
     };
+    // The startup cause probe, when asked for (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    dev::configure_probe(surface.hwnd());
     let link = window_thread.link();
     let media = movie_screen::MediaHub::new(loaded.root().path());
-    let make: MakeScreen = Box::new(move |_| {
-        let target = Target::Window {
-            window: surface.into(),
-            width: surface.width,
-            height: surface.height,
-        };
-        Renderer::new(target, AdapterChoice::HighPerformance).map(|r| {
+    let make = window_make(
+        surface,
+        window_thread.extent(),
+        |target| Renderer::new(target, AdapterChoice::HighPerformance),
+        move |r, _| {
             let screen = MenuScreen::new(r, None)
                 .with_sink(Box::new(link.clone()))
                 .with_media(Arc::clone(&media));
-            Box::new(screen) as Box<dyn Screen>
-        })
-    });
+            Ok(Box::new(screen) as Box<dyn Screen>)
+        },
+    );
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut measure = measure(
         clock,
@@ -1375,7 +1386,8 @@ fn play(
         let lead_in = loaded.config().lead_in;
         measure.keep_presents(presents_of(loaded.chart(), lead_in, surface.refresh_mhz));
     }
-    let render = render_side::spawn(
+    let shown = window_thread.shown();
+    let render = render_side::spawn_until(
         make,
         Some(Arc::new(loaded.chart().clone())),
         loaded.section().cloned(),
@@ -1383,16 +1395,24 @@ fn play(
         view(),
         measure,
         Box::new(NoFrames),
+        shown.deadline(),
+        &|| controls.quitting(),
     );
     let render = match render {
         Ok(r) => r,
         Err(e) => {
             audio.exit();
-            window_thread.close();
-            return Err(e.into());
+            return render_not_started(window_thread, e);
         }
     };
     render.follow(&window_thread.extent());
+    if let Err(end) = wait_ready(&shown, &controls, &render) {
+        audio.exit();
+        let rendered = render.exit();
+        report_render_end(&rendered);
+        window_thread.close_after(rendered.released());
+        return startup_end(end);
+    }
     let threads = Threads {
         input,
         audio,
@@ -1422,7 +1442,8 @@ fn play(
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
     let ended = rig.shut_down();
-    window_thread.close_after(ended.rendered != RenderEnd::Stuck);
+    report_render_end(&ended.rendered);
+    window_thread.close_after(ended.rendered.released());
     // Not joined: an input thread that stopped answering must not hold up
     // the exit or the report of why the run ended. Its wake report is not
     // used here.
@@ -1438,7 +1459,133 @@ fn play(
     if let Some(why) = script_failed {
         anyhow::bail!("dev: the result script failed: {why}");
     }
-    Ok(())
+    panicked(&ended.rendered)
+}
+
+/// The factory of a window's screen, for `play` and song selection: each
+/// build makes its renderer through `renderer` on the window's newest
+/// client size (`extent`, else the size it was made at), so a startup
+/// build made again after a refused configure takes the size the window
+/// has then; with no client area it refuses with
+/// [`RenderError::NoArea`], which the startup builds again once more
+/// (design.md "Showing the window"). `screen` makes the screen on the
+/// renderer, with the page font it is handed.
+fn window_make(
+    surface: window::Surface,
+    extent: Arc<Extent>,
+    mut renderer: impl FnMut(Target) -> Result<Renderer, RenderError> + Send + 'static,
+    mut screen: impl FnMut(
+        Renderer,
+        &mut Option<menu_screen::PageFont>,
+    ) -> Result<Box<dyn Screen>, RenderError>
+    + Send
+    + 'static,
+) -> MakeScreen {
+    Box::new(move |font| {
+        let (width, height) = extent.latest().unwrap_or((surface.width, surface.height));
+        if width == 0 || height == 0 {
+            return Err(RenderError::NoArea);
+        }
+        // The size each build is given (dev-tools, the startup's cause).
+        #[cfg(feature = "dev-tools")]
+        render_report::report(format_args!("dev: window build at {width}x{height}"));
+        let r = renderer(Target::Window {
+            window: surface.into(),
+            width,
+            height,
+        })?;
+        screen(r, font)
+    })
+}
+
+/// Whether the window must stay open after the render thread did not
+/// start with `e`: a thread left detached past the deadline or at a close
+/// may still make its surface on it, so the window lives to the process's
+/// exit.
+fn keeps_window(e: &ScreenError) -> bool {
+    matches!(e, ScreenError::NoStart | ScreenError::Cancelled)
+}
+
+/// Ends a startup whose render thread did not start with `e`: the window
+/// is never shown, and closes unless [`keeps_window`]. A close is the
+/// run's end, no failure; anything else fails the run.
+fn render_not_started(window: window::WindowThread, e: ScreenError) -> anyhow::Result<()> {
+    window
+        .shown()
+        .fail(window::StartFailure::Render(e.to_string()));
+    window.close_after(!keeps_window(&e));
+    match e {
+        ScreenError::Cancelled => Ok(()),
+        e => Err(e.into()),
+    }
+}
+
+/// Waits for the startup's outcome ([`window::WindowShown::wait_ready`]),
+/// the render thread's failure waking the wait as a close does.
+fn wait_ready(
+    shown: &window::WindowShown,
+    controls: &Arc<Controls>,
+    render: &render_side::RenderLink,
+) -> Result<(), window::StartEnd> {
+    let c = Arc::clone(controls);
+    render.set_game_wake(Arc::new(move || c.wake_game()));
+    shown.wait_ready(&|| controls.quitting(), &|| {
+        render
+            .failed()
+            .then(|| "the render thread failed before its first frame".to_owned())
+    })
+}
+
+/// The run's end for a startup that ended without its first present: a
+/// failure fails it, a close ends it.
+fn startup_end(end: window::StartEnd) -> anyhow::Result<()> {
+    match end {
+        window::StartEnd::Failed(why) => Err(anyhow::anyhow!("the window was not shown: {why}")),
+        window::StartEnd::Closed => Ok(()),
+    }
+}
+
+/// The line that reports how the render thread ended, when not cleanly:
+/// its panic with the message, or that it did not end.
+fn render_end_line(end: &RenderEnd) -> Option<String> {
+    match end {
+        RenderEnd::Joined => None,
+        RenderEnd::Panicked(m) => Some(format!("render: the render thread panicked: {m}")),
+        RenderEnd::Stuck => Some("render: the render thread did not end".to_owned()),
+    }
+}
+
+/// Prints and logs [`render_end_line`], if any.
+fn report_render_end(end: &RenderEnd) {
+    if let Some(line) = render_end_line(end) {
+        eprintln!("{line}");
+        log::error!("{line}");
+    }
+}
+
+/// A run that ended with the render thread's panic fails, even when
+/// nothing else noticed it.
+fn panicked(end: &RenderEnd) -> anyhow::Result<()> {
+    match end {
+        RenderEnd::Panicked(_) => Err(anyhow::anyhow!("the render thread panicked")),
+        RenderEnd::Joined | RenderEnd::Stuck => Ok(()),
+    }
+}
+
+/// The dev-tools present tap set on `r`: a surface that refused its
+/// configuration with copies allowed fails the build, as any refused
+/// configure does; one whose images cannot be copied is noted, and the
+/// build goes on without shots.
+#[cfg(feature = "dev-tools")]
+fn tap_outcome(set: Result<(), render::TapError>) -> Result<(), RenderError> {
+    match set {
+        Ok(()) => Ok(()),
+        Err(render::TapError::Configure(e)) => Err(e),
+        Err(e @ render::TapError::Unsupported(_)) => {
+            eprintln!("dev: the window's shots: {e}");
+            Ok(())
+        }
+    }
 }
 
 /// Startup's skins of `launch` for `rig` ([`imports::startup`]), from
@@ -1612,6 +1759,11 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(size) = s.dev.window {
         window::set_dev_window(size);
     }
+    // The window's startup bound (`--dev-render-timeout`).
+    #[cfg(feature = "dev-tools")]
+    if let Some(bound) = s.dev.render_timeout {
+        window::set_startup_bound(bound);
+    }
     let (caps, note) = priority::run_caps(&settings.device, &priority::System);
     if let Some(note) = note {
         eprintln!("{note}");
@@ -1764,8 +1916,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             return Err(e);
         }
     };
+    // The startup cause probe, when asked for (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    if let Some(surface) = &surface {
+        dev::configure_probe(surface.hwnd());
+    }
     let ime = window_thread.as_ref().map(window::WindowThread::ime);
-    let link = window_thread.as_ref().map(window::WindowThread::link);
+    let link = window_thread.as_ref().map(|w| (w.link(), w.extent()));
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
     let media = movie_screen::MediaHub::new(root.path());
     // The window's own shots, asked for on a runner's pipe
@@ -1783,25 +1940,23 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         tap
     });
     let make: MakeScreen = match (surface, link) {
-        (Some(surface), Some(link)) => Box::new(move |font| {
-            let target = Target::Window {
-                window: surface.into(),
-                width: surface.width,
-                height: surface.height,
-            };
-            #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
-            let mut r = Renderer::new(target, AdapterChoice::HighPerformance)?;
-            #[cfg(feature = "dev-tools")]
-            if let Some(tap) = &shot_tap
-                && let Err(e) = r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>)
-            {
-                eprintln!("dev: the window's shots: {e}");
-            }
-            let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
-                .with_sink(Box::new(link.clone()))
-                .with_media(Arc::clone(&media));
-            Ok(Box::new(screen) as Box<dyn Screen>)
-        }),
+        (Some(surface), Some((link, extent))) => window_make(
+            surface,
+            extent,
+            |target| Renderer::new(target, AdapterChoice::HighPerformance),
+            move |r, font| {
+                #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+                let mut r = r;
+                #[cfg(feature = "dev-tools")]
+                if let Some(tap) = &shot_tap {
+                    tap_outcome(r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>))?;
+                }
+                let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
+                    .with_sink(Box::new(link.clone()))
+                    .with_media(Arc::clone(&media));
+                Ok(Box::new(screen) as Box<dyn Screen>)
+            },
+        ),
         // Headless (dev-tools): offscreen on WARP, or on the hardware
         // adapter a scenario asks for, admitted at every build.
         #[cfg(feature = "dev-tools")]
@@ -1848,15 +2003,40 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "dev-tools"))]
     let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
+    let shown = window_thread.as_ref().map(window::WindowThread::shown);
+    // Headless: no window, so the render thread's own startup bound.
+    let deadline = shown.as_ref().map_or_else(
+        || std::time::Instant::now() + render_side::STARTUP_TIMEOUT,
+        window::WindowShown::deadline,
+    );
+    #[cfg(feature = "dev-tools")]
+    let deadline = match (&shown, s.dev.render_timeout) {
+        (None, Some(bound)) => std::time::Instant::now() + bound,
+        _ => deadline,
+    };
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
-    let mut render = match render_side::spawn(make, None, None, clock, view(), measure, frames) {
+    let mut render = match render_side::spawn_until(
+        make,
+        None,
+        None,
+        clock,
+        view(),
+        measure,
+        frames,
+        deadline,
+        &|| controls.quitting(),
+    ) {
         Ok(r) => r,
         Err(e) => {
             audio.exit();
-            if let Some(w) = window_thread {
-                w.close();
-            }
-            return Err(e.into());
+            return match window_thread {
+                Some(w) => render_not_started(w, e),
+                None if keeps_window(&e) => match e {
+                    ScreenError::Cancelled => Ok(()),
+                    e => Err(e.into()),
+                },
+                None => Err(e.into()),
+            };
         }
     };
     #[cfg(feature = "dev-tools")]
@@ -1865,6 +2045,17 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     }
     if let Some(w) = &window_thread {
         render.follow(&w.extent());
+    }
+    if let Some(shown) = &shown
+        && let Err(end) = wait_ready(shown, &controls, &render)
+    {
+        audio.exit();
+        let rendered = render.exit();
+        report_render_end(&rendered);
+        if let Some(w) = window_thread {
+            w.close_after(rendered.released());
+        }
+        return startup_end(end);
     }
     let threads = Threads {
         input,
@@ -2025,8 +2216,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     });
     let ended = rig.shut_down();
     let rendered = ended.rendered;
+    report_render_end(&rendered);
     if let Some(w) = window_thread {
-        w.close_after(rendered != RenderEnd::Stuck);
+        w.close_after(rendered.released());
     }
     // A practice page job's panic found as the run ended ends it with it.
     let ran = ran.and(ended.page.map_err(game::LiveError::Load));
@@ -2067,7 +2259,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(why) = script_failed {
         anyhow::bail!("dev: the select script failed: {why}");
     }
-    Ok(())
+    panicked(&rendered)
 }
 
 /// A headless run (dev-tools): an input log replayed as a script, or
@@ -2179,6 +2371,7 @@ fn headless(
     let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
     let ended = rig.shut_down();
+    report_render_end(&ended.rendered);
     // As in `play`: not joined.
     input_thread.detach();
     ran?;
@@ -2186,7 +2379,7 @@ fn headless(
     if let Some(why) = script_failed {
         anyhow::bail!("dev: the result script failed: {why}");
     }
-    Ok(())
+    panicked(&ended.rendered)
 }
 
 #[cfg(test)]
@@ -3459,5 +3652,163 @@ mod tests {
             moved
         });
         assert_eq!(moved, [("selection", true), ("loading", true)]);
+    }
+
+    /// W4.2: the window factory `play` and song selection use builds each
+    /// time on the window's newest client size: the size it was made at
+    /// until one is published, none while it has no client area (the build
+    /// refused as no area, nothing configured), then exactly the size
+    /// restored. Each build is held at a gate while the test changes the
+    /// size, on a real render thread's startup.
+    #[test]
+    fn each_build_takes_the_newest_extent() {
+        use std::sync::Mutex;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        use render::{RenderError, Target};
+
+        use crate::render_side::{Extent, MakeScreen, NoFrames, ScreenError, View, spawn_until};
+
+        let extent = Arc::new(Extent::default());
+        let configured = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&configured);
+        let mut inner = super::window_make(
+            crate::window::Surface::unused(1_920, 1_080),
+            Arc::clone(&extent),
+            move |target| {
+                let Target::Window { width, height, .. } = target else {
+                    panic!("a window's target");
+                };
+                let mut seen = seen.lock().unwrap();
+                seen.push((width, height));
+                // The first refused as DXGI may, the last failing at once.
+                Err(if seen.len() == 1 {
+                    RenderError::SurfaceConfigure {
+                        retryable: true,
+                        source: wgpu::Error::Validation {
+                            source: Box::new(std::io::Error::other("refused (a test)")),
+                            description: "refused (a test)".into(),
+                        },
+                    }
+                } else {
+                    RenderError::SurfaceLost
+                })
+            },
+            |_, _| unreachable!("no renderer is made"),
+        );
+        let (at_gate, gate) = mpsc::channel::<u32>();
+        let (open, opened) = mpsc::channel::<()>();
+        let opened = Mutex::new(opened);
+        let mut builds = 0;
+        let make: MakeScreen = Box::new(move |font| {
+            builds += 1;
+            at_gate.send(builds).unwrap();
+            opened.lock().unwrap().recv().unwrap();
+            inner(font)
+        });
+        let clock = QpcClock::start();
+        let (_steps, steps) = rtrb::RingBuffer::new(1);
+        let (_sounds, sounds) = rtrb::RingBuffer::new(1);
+        let overlay = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let measure = crate::measure::Measure::new(clock, None, None, steps, sounds, overlay);
+        let started = std::thread::spawn(move || {
+            spawn_until(
+                make,
+                None,
+                None,
+                clock,
+                View { effects: 16 },
+                measure,
+                Box::new(NoFrames),
+                Instant::now() + Duration::from_secs(3_600),
+                &|| false,
+            )
+            .err()
+        });
+        let wait = Duration::from_secs(60);
+        assert_eq!(gate.recv_timeout(wait), Ok(1));
+        open.send(()).unwrap();
+        assert_eq!(gate.recv_timeout(wait), Ok(2));
+        extent.publish(1_280, 720);
+        extent.publish(0, 0);
+        open.send(()).unwrap();
+        assert_eq!(gate.recv_timeout(wait), Ok(3));
+        extent.publish(1_600, 900);
+        open.send(()).unwrap();
+        let e = started.join().unwrap();
+        assert!(
+            matches!(e, Some(ScreenError::Render(RenderError::SurfaceLost))),
+            "{e:?}"
+        );
+        assert_eq!(*configured.lock().unwrap(), [(1_920, 1_080), (1_600, 900)]);
+    }
+
+    /// W3.5: a render thread left detached (past the startup's deadline,
+    /// or at a close) may still make its surface on the window, which
+    /// then stays open; one that ended lets it close.
+    #[test]
+    fn a_detached_renderer_keeps_the_window() {
+        use crate::render_side::ScreenError;
+        assert!(super::keeps_window(&ScreenError::NoStart));
+        assert!(super::keeps_window(&ScreenError::Cancelled));
+        assert!(!super::keeps_window(&ScreenError::EndedWhileStarting));
+        assert!(!super::keeps_window(&ScreenError::PanickedWhileStarting(
+            "x".to_owned()
+        )));
+        assert!(!super::keeps_window(&ScreenError::Render(
+            render::RenderError::SurfaceLost
+        )));
+    }
+
+    /// W3.5: a startup that failed is the run's failure, with why; a close
+    /// before the first present ends the run as a close does.
+    #[test]
+    fn a_failed_startup_is_the_runs_failure() {
+        use std::time::Duration;
+
+        use crate::window::{StartEnd, StartFailure};
+        let e = super::startup_end(StartEnd::Failed(StartFailure::NoFrame(
+            Duration::from_secs(30),
+        )))
+        .unwrap_err();
+        assert!(
+            e.to_string().starts_with("the window was not shown: "),
+            "{e}"
+        );
+        assert!(super::startup_end(StartEnd::Closed).is_ok());
+    }
+
+    /// W2.1: the render thread's panic is reported with its message and
+    /// fails the run; a thread that did not end is reported and does not.
+    #[test]
+    fn a_render_panic_is_reported_and_fails_the_run() {
+        use crate::render_side::RenderEnd;
+        let panic = RenderEnd::Panicked("a frame fails (a test)".to_owned());
+        assert_eq!(
+            super::render_end_line(&panic).as_deref(),
+            Some("render: the render thread panicked: a frame fails (a test)")
+        );
+        assert!(super::panicked(&panic).is_err());
+        assert_eq!(
+            super::render_end_line(&RenderEnd::Stuck).as_deref(),
+            Some("render: the render thread did not end")
+        );
+        assert!(super::panicked(&RenderEnd::Stuck).is_ok());
+        assert_eq!(super::render_end_line(&RenderEnd::Joined), None);
+        assert!(super::panicked(&RenderEnd::Joined).is_ok());
+    }
+
+    /// W4.2: a present tap whose reconfigure the surface refused fails the
+    /// factory's build, which the startup builds again; a surface that
+    /// cannot be copied from is a note, and the build goes on.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_refused_tap_reconfigure_fails_the_factory() {
+        use render::{RenderError, TapError};
+        let e = super::tap_outcome(Err(TapError::Configure(RenderError::NoArea))).unwrap_err();
+        assert!(e.is_retryable_configure(), "{e:?}");
+        assert!(super::tap_outcome(Err(TapError::Unsupported("no copies (a test)"))).is_ok());
+        assert!(super::tap_outcome(Ok(())).is_ok());
     }
 }

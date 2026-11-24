@@ -54,6 +54,7 @@ mod upload_tests;
 mod atlas;
 mod bga;
 mod chart_pool;
+mod configure;
 mod decision_labels;
 mod decl;
 mod gpu;
@@ -82,6 +83,10 @@ mod video;
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use bga::{BgaFault, BgaStep};
 pub use chart_pool::{POOL_MAX_SLOTS, POOL_MAX_TEXELS, PoolLayout, PoolWriteError};
+#[cfg(feature = "dev-tools")]
+pub use configure::on_first_configure;
+#[cfg(any(test, feature = "dev-tools"))]
+pub use configure::refuse_configures;
 pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
     LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,
@@ -99,7 +104,7 @@ pub use outline::{
 };
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 #[cfg(feature = "dev-tools")]
-pub use present_tap::{PresentFrame, PresentTap};
+pub use present_tap::{PresentFrame, PresentTap, TapError};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::UploadTiming;

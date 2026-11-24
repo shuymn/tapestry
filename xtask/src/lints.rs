@@ -596,6 +596,9 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The render thread's report lines: a frame's refusal or failure
+    // formatted into the reporter's ring.
+    Site::File("crates/player/src/render_report.rs"),
     // The retirement worker's handoff table: the release reads and the
     // sends at each pass outside READY's cutoff, and the table's ids the
     // result's report reads.

@@ -1349,7 +1349,7 @@ impl Extent {
     /// The newest size published, if any. Reading it takes no wake, so a
     /// wake still on its way stays the only one. Allocates nothing: the
     /// render thread calls it between play frames.
-    fn latest(&self) -> Option<(u32, u32)> {
+    pub(crate) fn latest(&self) -> Option<(u32, u32)> {
         let packed = self.size.load(Ordering::Acquire);
         // The halves of a packed size.
         #[expect(
@@ -1386,6 +1386,22 @@ pub enum ScreenError {
     /// The render thread ended before its screen was built.
     #[error("the render thread ended while starting")]
     EndedWhileStarting,
+    /// The render thread panicked while it built its first screen, with
+    /// the panic's message.
+    #[error("the render thread panicked while starting: {0}")]
+    PanickedWhileStarting(String),
+    /// The render thread did not build its first screen by the startup's
+    /// deadline ([`spawn_until`]); it is left to the process's exit.
+    #[error("the render thread did not build its first screen in time")]
+    NoStart,
+    /// The window closed while the render thread built its first screen;
+    /// the thread is left to the process's exit.
+    #[error("the window closed while the render thread was starting")]
+    Cancelled,
+    /// The window was not shown at its first frame (design.md "Showing
+    /// the window"): no play opens.
+    #[error("the window was not shown: {0}")]
+    NotShown(String),
     /// The render thread did not answer a chart's load in time.
     #[error("the render thread did not answer")]
     NoAnswer,
@@ -1780,6 +1796,20 @@ const ACQUIRE_WAIT: Duration = Duration::from_millis(1);
 /// How long the end of the render thread is waited for: past it, the thread
 /// is left to the process's exit.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The startup's bound (design.md "Showing the window"): from the window's
+/// making, the render thread's first screen and its first presented frame
+/// come within it, or the startup fails. A ceiling for failure only: a
+/// normal start presents in seconds.
+pub const STARTUP_TIMEOUT: Duration = LOAD_TIMEOUT;
+
+/// The most builds the startup makes of its first screen while the window's
+/// surface refuses its configuration in a way a build made again may pass
+/// (provisional).
+pub(crate) const STARTUP_BUILDS: u32 = 3;
+
+/// The pause between two of the startup's builds (provisional).
+pub(crate) const STARTUP_RETRY: Duration = Duration::from_millis(250);
 
 /// How long the game thread waits for a play's figures. The render thread
 /// answers between frames, so this bounds only a stalled render thread: a
@@ -3116,14 +3146,23 @@ impl LoadingSink {
 }
 
 /// How the render thread ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderEnd {
     /// It ended and was joined.
     Joined,
-    /// It ended by a panic.
-    Panicked,
+    /// It ended by a panic, with the panic's message.
+    Panicked(String),
     /// It did not end in time and was left to the process's exit.
     Stuck,
+}
+
+impl RenderEnd {
+    /// Whether the window it drew into may close: every end but
+    /// [`RenderEnd::Stuck`], whose thread may still draw into it.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        !matches!(self, Self::Stuck)
+    }
 }
 
 /// How long a test hook waits on its other side: `TAPESTRY_TEST_WATCHDOG`
@@ -3239,6 +3278,9 @@ pub struct RenderLink {
     result_lifetimes: AtomicU64,
     /// The result's holds begun.
     result_holds: AtomicU64,
+    /// The thread that copies the render thread's report lines to the log,
+    /// if it started.
+    reporter: Option<crate::render_report::Reporter>,
 }
 
 impl RenderLink {
@@ -3929,7 +3971,9 @@ impl RenderLink {
         match rx.recv_timeout(self.answer_timeout) {
             Ok(Ok(declared)) => Ok(declared),
             Ok(Err(e)) => {
-                eprintln!("render: the attempt was not installed: {e}");
+                crate::render_report::report(format_args!(
+                    "render: the attempt was not installed: {e}"
+                ));
                 Err(ScreenError::Lost)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -4916,17 +4960,22 @@ impl RenderLink {
     pub fn exit(self) -> RenderEnd {
         self.send(RenderMsg::Exit);
         let end = match self.ended.recv_timeout(self.exit_timeout) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Detached: a thread stuck in the screen's work must not
-                // hold up the exit. The caller keeps the window open.
-                eprintln!("render: the render thread did not end");
-                RenderEnd::Stuck
-            }
+            // Detached: a thread stuck in the screen's work must not hold
+            // up the exit. The caller keeps the window open and reports
+            // it; its reporter goes on while it does.
+            Err(mpsc::RecvTimeoutError::Timeout) => RenderEnd::Stuck,
             _ => match self.handle.join() {
                 Ok(()) => RenderEnd::Joined,
-                Err(_) => RenderEnd::Panicked,
+                Err(payload) => RenderEnd::Panicked(game::coord::JobPanic::of(&*payload).0),
             },
         };
+        // The thread's lines are all in the ring once it ended: the
+        // reporter writes them and ends, within the same bound.
+        if end.released()
+            && let Some(reporter) = self.reporter
+        {
+            let _ = reporter.join(self.exit_timeout);
+        }
         // No play runs any more: the parked runtimes are destroyed here,
         // unless an interval was left open, when they are leaked.
         if let Some(token) = self.scripts.inactive() {
@@ -5375,7 +5424,9 @@ impl SkinState {
         match answer {
             Ok(Preparation::Ready) => Self::Ready,
             Ok(Preparation::Refused(why)) => {
-                eprintln!("render: the play skin was refused: {why}");
+                crate::render_report::report(format_args!(
+                    "render: the play skin was refused: {why}"
+                ));
                 Self::Refused(
                     Message::SkinUnusable {
                         why: &why.to_string(),
@@ -5385,7 +5436,10 @@ impl SkinState {
             }
             Ok(Preparation::Cancelled) => Self::Refused(Label::SkinCancelled.text().to_owned()),
             Err(e) => {
-                eprintln!("render: the play skin cannot be installed: {}", Chain(&e));
+                crate::render_report::report(format_args!(
+                    "render: the play skin cannot be installed: {}",
+                    Chain(&e)
+                ));
                 Self::Refused(
                     Message::SkinCannotPrepare {
                         why: &Chain(&e).to_string(),
@@ -5397,16 +5451,16 @@ impl SkinState {
     }
 }
 
-/// Starts the render thread; `make` builds the screen on it, and the chart,
-/// when there is one yet, is prepared before this returns, so every upload
-/// is done before the first READY state (design.md "Display Latency and
-/// Stutter"); a chart loaded later is prepared before its READY state too.
+/// Starts the render thread as [`spawn_until`] does, its first screen
+/// waited for at most the startup's bound from now, with nothing that
+/// cancels the wait.
 ///
 /// # Errors
 ///
-/// Why the screen could not be built or could not draw the chart.
+/// As [`spawn_until`].
+#[cfg(any(test, feature = "dev-tools"))]
 pub fn spawn(
-    mut make: MakeScreen,
+    make: MakeScreen,
     chart: Option<Arc<Chart>>,
     section: Option<Section>,
     clock: QpcClock,
@@ -5414,6 +5468,70 @@ pub fn spawn(
     measure: Measure,
     frames: Box<dyn FrameSink>,
 ) -> Result<RenderLink, ScreenError> {
+    spawn_until(
+        make,
+        chart,
+        section,
+        clock,
+        view,
+        measure,
+        frames,
+        Instant::now() + startup_bound(),
+        &|| false,
+    )
+}
+
+/// How long [`spawn`] waits for the first screen: the startup's bound
+/// (`--dev-render-timeout` sets it), and in tests the watchdog's, which
+/// only catches a thread that never builds.
+#[cfg(any(test, feature = "dev-tools"))]
+fn startup_bound() -> Duration {
+    #[cfg(test)]
+    return hook_bound();
+    #[cfg(not(test))]
+    crate::window::startup_bound()
+}
+
+/// Starts the render thread; `make` builds the screen on it, and the chart,
+/// when there is one yet, is prepared before this returns, so every upload
+/// is done before the first READY state (design.md "Display Latency and
+/// Stutter"); a chart loaded later is prepared before its READY state too.
+/// The first screen is waited for until `deadline`, in slices that end at
+/// once when `cancelled` (the window closed); a build the window's surface
+/// refused in a way a build made again may pass is made again
+/// ([`startup_build`]). The render thread's report lines go to the log
+/// through a reporter of its own ([`crate::render_report`]).
+///
+/// # Errors
+///
+/// Why the screen could not be built or could not draw the chart; the
+/// thread's panic while building, with its message; no screen by
+/// `deadline` ([`ScreenError::NoStart`]) or a close before it
+/// ([`ScreenError::Cancelled`]), the thread then left detached.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "spawn's inputs, beside the startup's deadline and its cancel"
+)]
+pub fn spawn_until(
+    mut make: MakeScreen,
+    chart: Option<Arc<Chart>>,
+    section: Option<Section>,
+    clock: QpcClock,
+    view: View,
+    measure: Measure,
+    frames: Box<dyn FrameSink>,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<RenderLink, ScreenError> {
+    let (producer, reporter) = match crate::render_report::start(crate::log_file::warn_sink()) {
+        Ok((p, r)) => (Some(p), Some(r)),
+        Err(e) => {
+            crate::render_report::report(format_args!(
+                "render: the report thread cannot start, render lines go to stderr only: {e}"
+            ));
+            (None, None)
+        }
+    };
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let shared = Arc::new(Shared::new());
@@ -5426,6 +5544,10 @@ pub fn spawn(
         .spawn(move || {
             // Dropped when the thread ends, however it ends.
             let _ended = ended_tx;
+            match producer {
+                Some(p) => crate::render_report::install(p),
+                None => crate::render_report::stderr_only(),
+            }
             let _orphan = thread_scripts.orphan_guard();
             // A panic is the screen's failure, which the game sees: this
             // guard covers the startup build, `Run`'s own field the rest.
@@ -5437,27 +5559,21 @@ pub fn spawn(
             #[cfg(feature = "dev-tools")]
             crate::dev::read_bga_faults();
             #[cfg(feature = "dev-tools")]
+            crate::dev::read_render_faults();
+            #[cfg(feature = "dev-tools")]
             crate::dev::read_script_switches();
-            let screen = match build(
-                &mut make,
-                &mut None,
-                &mut Committed::default(),
-                chart.as_deref(),
-                section.as_ref(),
-                false,
-                &mut None,
-                &mut None,
-            ) {
-                Ok(screen) => {
-                    thread_shared.built(screen.as_ref());
-                    let _ = ready_tx.send(Ok(()));
-                    screen
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
+            let screen =
+                match startup_build(&mut make, chart.as_deref(), section.as_ref(), deadline) {
+                    Ok(screen) => {
+                        thread_shared.built(screen.as_ref());
+                        let _ = ready_tx.send(Ok(()));
+                        screen
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
             // The startup build is no rebuild: the allowance starts free.
             let heavy_seen = screen.heavy_ops().count;
             let handoffs = crate::retire_worker::Handoffs::start(
@@ -5582,8 +5698,40 @@ pub fn spawn(
             r.flush_screen_frames();
         })
         .map_err(ScreenError::Spawn)?;
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(RenderLink {
+    let answer = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break Err(ScreenError::NoStart);
+        }
+        match ready_rx.recv_timeout(left.min(CANCEL_POLL)) {
+            Ok(answer) => break Ok(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) if cancelled() => {
+                break Err(ScreenError::Cancelled);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(ScreenError::EndedWhileStarting);
+            }
+        }
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        // Ended without an answer: a panic, whose message the join gives.
+        Err(ScreenError::EndedWhileStarting) => {
+            return Err(match handle.join() {
+                Err(payload) => {
+                    ScreenError::PanickedWhileStarting(game::coord::JobPanic::of(&*payload).0)
+                }
+                Ok(()) => ScreenError::EndedWhileStarting,
+            });
+        }
+        // Past the deadline or cancelled, the thread and its reporter are
+        // left detached: the build may still finish, and the window it
+        // may draw into stays open (the caller's).
+        Err(e) => return Err(e),
+    };
+    match answer {
+        Ok(()) => Ok(RenderLink {
             tx,
             shared,
             handle,
@@ -5598,12 +5746,70 @@ pub fn spawn(
             scripts,
             result_lifetimes: AtomicU64::new(0),
             result_holds: AtomicU64::new(0),
+            reporter,
         }),
-        Ok(Err(e)) => {
+        Err(e) => {
             let _ = handle.join();
+            if let Some(r) = reporter {
+                let _ = r.join(EXIT_TIMEOUT);
+            }
             Err(e.into())
         }
-        Err(_) => Err(ScreenError::EndedWhileStarting),
+    }
+}
+
+/// Builds the render thread's first screen through `make`: a build the
+/// window's surface refused in a way one made again may pass
+/// ([`RenderError::is_retryable_configure`]) is made again, the failed
+/// one's surface and device dropped first, [`STARTUP_RETRY`] later, at most
+/// [`STARTUP_BUILDS`] builds and none that would start past `deadline`;
+/// each refusal is reported. While a build runs, wgpu's own error records
+/// on this thread are copied to the report lines (design.md "Log File"),
+/// so a refused swap chain's system error is on record.
+///
+/// # Errors
+///
+/// The last build's error.
+fn startup_build(
+    make: &mut MakeScreen,
+    chart: Option<&Chart>,
+    section: Option<&Section>,
+    deadline: Instant,
+) -> Result<Box<dyn Screen>, RenderError> {
+    let mut builds = 1;
+    loop {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::startup_faults();
+        crate::log_file::capture_gpu_errors(true);
+        let built = build(
+            make,
+            &mut None,
+            &mut Committed::default(),
+            chart,
+            section,
+            false,
+            &mut None,
+            &mut None,
+        );
+        crate::log_file::capture_gpu_errors(false);
+        let e = match built {
+            Ok(screen) => return Ok(screen),
+            Err(e) => e,
+        };
+        if !e.is_retryable_configure() {
+            return Err(e);
+        }
+        let again = builds < STARTUP_BUILDS && Instant::now() + STARTUP_RETRY < deadline;
+        crate::render_report::report(format_args!(
+            "render: the window's surface refused its configuration (build {builds} of at most {STARTUP_BUILDS}{}): {}",
+            if again { ", built again" } else { "" },
+            Chain(&e)
+        ));
+        if !again {
+            return Err(e);
+        }
+        builds += 1;
+        std::thread::sleep(STARTUP_RETRY);
     }
 }
 
@@ -6377,10 +6583,10 @@ fn fill(
             match s.restore_pages(kind, &pages) {
                 Ok(()) => {}
                 Err(e) if e.is_refusal() => {
-                    eprintln!(
+                    crate::render_report::report(format_args!(
                         "render: the {kind} skin's atlas was not restored, its screen draws its built-in presentation: {}",
                         Chain(&e)
-                    );
+                    ));
                     committed.clear(kind);
                     if kind == ScreenKind::Result {
                         *result_refused = Some(format!(
@@ -6410,17 +6616,17 @@ fn fill(
         match restored {
             Ok(()) => {}
             Err(e) if committed.pending(kind) && e.is_refusal() => {
-                eprintln!(
+                crate::render_report::report(format_args!(
                     "render: the {kind} skin's specialization was not restored, the next attempt stages one again: {}",
                     Chain(&e)
-                );
+                ));
                 committed.pend(kind, None);
             }
             Err(e) if kind != ScreenKind::Play && e.is_refusal() => {
-                eprintln!(
+                crate::render_report::report(format_args!(
                     "render: the {kind} skin was not restored, its screen draws its built-in presentation: {}",
                     Chain(&e)
-                );
+                ));
                 committed.clear(kind);
                 if kind == ScreenKind::Result {
                     *result_refused = Some(format!(
@@ -8475,7 +8681,10 @@ impl Run {
                         }
                     }
                     self.first_frame = Some(first);
-                    eprintln!("render: {}", Chain(&RenderError::DeviceLost));
+                    crate::render_report::report(format_args!(
+                        "render: {}",
+                        Chain(&RenderError::DeviceLost)
+                    ));
                     self.drop_screen();
                     self.shared.failed.store(true, Ordering::Release);
                     mode = Mode::Idle;
@@ -9067,7 +9276,7 @@ impl Run {
                         // failure, but the screen, its device and its
                         // resources stay, for the next preparation.
                         self.measure.failed(&effects);
-                        eprintln!("render: {}", Chain(&e));
+                        crate::render_report::report(format_args!("render: {}", Chain(&e)));
                         self.shared.failed.store(true, Ordering::Release);
                         mode = Mode::Idle;
                         continue;
@@ -9164,7 +9373,10 @@ impl Run {
                                 // granted waits for what comes next.
                                 self.loading_refused = Some((lifetime, e));
                                 self.shared.refused_loading(lifetime, e);
-                                eprintln!("render: the loading frame was refused: {}", Chain(&e));
+                                crate::render_report::report(format_args!(
+                                    "render: the loading frame was refused: {}",
+                                    Chain(&e)
+                                ));
                                 mode = Mode::Idle;
                                 continue;
                             }
@@ -9308,9 +9520,9 @@ impl Run {
                         // screen and from what a screen built again
                         // restores, and the game thread's next look shows
                         // why; this frame drew the page.
-                        eprintln!(
+                        crate::render_report::report(format_args!(
                             "render: the selection skin was refused, the built-in page draws from now on: {why}"
-                        );
+                        ));
                         // Its pool goes with it, ending its generation.
                         screen.remove(ScreenKind::Selection);
                         self.committed.clear(ScreenKind::Selection);
@@ -9807,6 +10019,12 @@ impl Run {
                 }
                 other => other,
             };
+            // The render thread's panic at its nth frame drawn (dev-tools:
+            // a panic's report and the run's exit).
+            #[cfg(feature = "dev-tools")]
+            if drawn.is_ok() {
+                crate::dev::frame_fault();
+            }
             // The entry's first result picture, once shown or deliberately
             // not shown: the game thread starts the result's sound at its
             // next look (design.md "State Model", system sounds, Result).
@@ -10156,7 +10374,7 @@ impl Run {
                     if matches!(mode, Mode::Play { .. }) {
                         self.measure.failed(&effects);
                     }
-                    eprintln!("render: {}", Chain(&e));
+                    crate::render_report::report(format_args!("render: {}", Chain(&e)));
                     self.drop_screen();
                     self.shared.failed.store(true, Ordering::Release);
                     mode = Mode::Idle;
@@ -10677,7 +10895,7 @@ impl Run {
         if let Some(s) = &mut self.screen
             && let Err(e) = s.wait_step(bound)
         {
-            eprintln!("render: {}", Chain(&e));
+            crate::render_report::report(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
             self.shared.failed.store(true, Ordering::Release);
@@ -10938,7 +11156,7 @@ impl Run {
             if let Some(s) = &mut self.screen
                 && let Err(e) = s.poll_completion()
             {
-                eprintln!("render: {}", Chain(&e));
+                crate::render_report::report(format_args!("render: {}", Chain(&e)));
                 self.drop_screen();
                 self.granted = false;
                 self.shared.failed.store(true, Ordering::Release);
@@ -11460,10 +11678,10 @@ impl Run {
         // (design.md "Memory Budget", R5).
         let released = screen.take_result_release();
         if let Some([need, result, limit]) = released {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: play's admission released the result's installation for request {}: play needs {need} texels with the result's {result}, of {limit}",
                 p.request
-            );
+            ));
             self.released = Some(p.request);
         }
         let Some(answer) = answer else {
@@ -12806,7 +13024,10 @@ impl Run {
                 self.disable_decision(format!("{}", Chain(&e)));
             }
             crate::decision_side::Boundary::Failed(e) => {
-                eprintln!("render: the decision labels' device failed: {}", Chain(&e));
+                crate::render_report::report(format_args!(
+                    "render: the decision labels' device failed: {}",
+                    Chain(&e)
+                ));
                 self.drop_screen();
                 self.granted = false;
                 self.shared.failed.store(true, Ordering::Release);
@@ -12857,12 +13078,16 @@ impl Run {
             // lifetime under: never once it ended.
             let book = render::lock(&self.shared.labels);
             if book.active() != Some(lifetime) {
-                eprintln!("render: a takeover of an ended decision lifetime was dropped: {why}");
+                crate::render_report::report(format_args!(
+                    "render: a takeover of an ended decision lifetime was dropped: {why}"
+                ));
                 return;
             }
             #[cfg(test)]
             self.shared.takeover_gate.pass();
-            eprintln!("render: the built-in decision presentation takes over: {why}");
+            crate::render_report::report(format_args!(
+                "render: the built-in decision presentation takes over: {why}"
+            ));
             *self
                 .shared
                 .decision_takeover
@@ -12895,7 +13120,9 @@ impl Run {
     /// the skin still draws, once neither holds (its end and the render
     /// leaving the screen), so the pinned presentation keeps drawing.
     fn disable_decision(&mut self, why: String) {
-        eprintln!("render: the decision skin is disabled for the run: {why}");
+        crate::render_report::report(format_args!(
+            "render: the decision skin is disabled for the run: {why}"
+        ));
         if self.decision_disabled.is_none() {
             self.decision_disabled = Some(why.clone());
             #[cfg(test)]
@@ -13102,10 +13329,10 @@ fn stage_result_chart(
         Ok(table) => Ok(table),
         Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
         Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: the result's chart images are not shown: {}",
                 Chain(&e)
-            );
+            ));
             Ok(ChartTable::ABSENT)
         }
         Err(e) => Err(e),
@@ -13127,10 +13354,10 @@ pub(crate) fn chart_absent(
         Ok(table) => Ok(table),
         Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
         Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: the result's chart images are not shown: {}",
                 Chain(&e)
-            );
+            ));
             Ok(ChartTable::ABSENT)
         }
         Err(e) => Err(e),
@@ -13862,9 +14089,9 @@ impl Run {
     /// design's D7): the screen and every screen built again refuse it,
     /// and nothing of it is kept to restore.
     fn disable_result(&mut self, why: &str) {
-        eprintln!(
+        crate::render_report::report(format_args!(
             "render: the result skin was refused, the built-in result draws from now on: {why}"
-        );
+        ));
         if self.result_disabled.is_none() {
             self.result_disabled = Some(why.to_owned());
         }
@@ -13979,7 +14206,9 @@ impl Run {
             && let Some(v) = &mut side.prepared
         {
             const WHY: &str = "the view's runtime could not be committed";
-            eprintln!("render: the result's first view was refused at its commit");
+            crate::render_report::report(format_args!(
+                "render: the result's first view was refused at its commit"
+            ));
             v.held.state = None;
             v.held.page = Some(crate::result_present::compose_page(
                 &v.held.payload.page,
@@ -14280,7 +14509,9 @@ impl Run {
                 StagingEnd::Refused(why) => {
                     // The view's staging was refused: the presenter shows
                     // the built-in result for it (scope view).
-                    eprintln!("render: the result view's staging was refused: {why}");
+                    crate::render_report::report(format_args!(
+                        "render: the result view's staging was refused: {why}"
+                    ));
                     // The view draws the built-in page with its own rows at
                     // once (scope view, the S10-09i design's D7); the
                     // presenter's built-in payload for it follows.
@@ -14370,7 +14601,7 @@ impl Run {
             }
         }
         if let Some(e) = failed {
-            eprintln!("render: {}", Chain(&e));
+            crate::render_report::report(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
             self.shared.failed.store(true, Ordering::Release);
@@ -26035,6 +26266,9 @@ pub(crate) mod tests {
     mod admission_gate;
     #[cfg(feature = "dev-tools")]
     mod chart_fixture;
+    // The render thread's startup: its first screen's builds and the wait
+    // for it, and its report lines reaching the log.
+    mod startup;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,
