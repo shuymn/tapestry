@@ -570,7 +570,8 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::Fns(
         "crates/render/src/upload.rs",
-        &["write_buffer_with_unpaced"],
+        // The slice clock's fallback, read at every frame boundary.
+        &["write_buffer_with_unpaced", "MonoClock::now", "micros"],
     ),
     Site::Fns(
         "crates/render/src/atlas.rs",

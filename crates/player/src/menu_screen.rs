@@ -2002,7 +2002,7 @@ impl Screen for MenuScreen {
 
     #[cfg(all(test, feature = "dev-tools"))]
     fn set_slice_clock(&mut self, clock: Option<std::sync::Arc<dyn bms_model::TimeSource>>) {
-        self.renderer.set_slice_clock(clock);
+        self.renderer.override_slice_clock(clock);
     }
 
     #[cfg(all(test, feature = "dev-tools"))]

@@ -1356,7 +1356,9 @@ fn play(
             width: surface.width,
             height: surface.height,
         };
-        Renderer::new(target, AdapterChoice::HighPerformance).map(|r| {
+        Renderer::new(target, AdapterChoice::HighPerformance).map(|mut r| {
+            // The uploader's slice on the render thread's clock.
+            r.set_slice_clock(Arc::new(clock));
             let screen = MenuScreen::new(r, None)
                 .with_sink(Box::new(link.clone()))
                 .with_media(Arc::clone(&media));
@@ -1827,8 +1829,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 width: surface.width,
                 height: surface.height,
             };
-            #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
             let mut r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            // The uploader's slice on the render thread's clock.
+            r.set_slice_clock(Arc::new(clock));
             #[cfg(feature = "dev-tools")]
             if let Some(tap) = &shot_tap
                 && let Err(e) = r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>)

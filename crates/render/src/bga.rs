@@ -516,6 +516,26 @@ mod tests {
         assert_eq!(r.step_submits.get(), 3, "three steps in the slice");
     }
 
+    /// M2: the slice is read on the clock the renderer is given: on a
+    /// clock that does not move, a 1 µs slice takes all eight steps in one
+    /// boundary, where the renderer's own clock would have spent it at the
+    /// first.
+    #[test]
+    fn the_given_slice_clock_is_read() {
+        let (mut r, key) = renderer();
+        r.step_cost.set(None);
+        r.step_seen.set(Some(true));
+        r.set_slice_clock(std::sync::Arc::new(bms_model::VirtualClock::new(
+            bms_model::TimeUs(0),
+        )));
+        r.stage_bga_cells(key, quarters(8)).unwrap();
+        assert_eq!(
+            r.bga_boundary_within(Duration::from_micros(1)),
+            BgaStep::Done(Ok(()))
+        );
+        assert_eq!(r.step_submits.get(), 8, "every step in one boundary");
+    }
+
     /// C5: a boundary's first step runs whatever the slice: a slice spent
     /// before any step still takes one.
     #[test]

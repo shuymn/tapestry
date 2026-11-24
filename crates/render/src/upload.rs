@@ -59,6 +59,7 @@ impl MonoClock {
 }
 
 impl TimeSource for MonoClock {
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn now(&self) -> TimeUs {
         micros(self.origin.elapsed())
     }

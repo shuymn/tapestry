@@ -94,6 +94,35 @@ fn colours(r: &mut Renderer) -> ([u8; 3], [u8; 3]) {
     (rgb_at(&pixels, W, TOP), rgb_at(&pixels, W, BOTTOM))
 }
 
+/// M3: a staging's atlas steps stop at the boundary's slice: each step's
+/// completion seen at once and each step moving the slice clock 500 µs, a
+/// 501 µs slice takes two of the fixture's three steps (the second begun
+/// at 500 µs, none at 1 000 µs), and the next boundary the third.
+#[test]
+fn a_staging_s_steps_stop_at_the_slice() {
+    let mut r = offscreen(W, H);
+    let b = big(&r);
+    let chart = chart();
+    let ctx = context(&GAUGES, false);
+    assert_eq!(
+        r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).unwrap(),
+        None
+    );
+    assert_eq!(steps_of(&write_sizes(&b)).len(), 3);
+    r.step_cost.set(Some(Duration::from_micros(500)));
+    r.step_seen.set(Some(true));
+    let up = r.upload_boundary_within(Duration::from_micros(501), &mut || false, None);
+    assert_eq!(up.staged, None, "not every step in one boundary");
+    assert_eq!(r.step_submits.get(), 2, "two steps in the slice");
+    let up = r.upload_boundary_within(Duration::from_micros(501), &mut || false, None);
+    assert_eq!(r.step_submits.get(), 3);
+    assert!(
+        matches!(up.staged, Some(crate::StagingEnd::Ready(_))),
+        "{:?}",
+        up.staged
+    );
+}
+
 /// A staging asked again answers `None` until the boundary that sees its
 /// last step's completion, and ready from then on; nothing of it commits
 /// or draws before (V2).

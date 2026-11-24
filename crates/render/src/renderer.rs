@@ -1771,10 +1771,14 @@ pub struct Renderer {
     #[cfg(feature = "dev-tools")]
     present_tap: Option<Arc<dyn crate::present_tap::PresentTap>>,
     /// The clock the uploader's time slice is read on at each frame
-    /// boundary (design.md "Memory Budget", the uploader): the renderer's
-    /// own monotonic clock, or one a development build sets
-    /// ([`set_slice_clock`](Self::set_slice_clock)).
+    /// boundary (design.md "Memory Budget", the uploader): the render
+    /// thread's clock its owner gives ([`set_slice_clock`](Self::set_slice_clock)),
+    /// or, for a renderer given none, a monotonic clock of its own.
     slice_clock: Arc<dyn TimeSource>,
+    /// Development builds: a test's clock read in its place
+    /// ([`override_slice_clock`](Self::override_slice_clock)).
+    #[cfg(feature = "dev-tools")]
+    slice_override: Option<Arc<dyn TimeSource>>,
     /// Development builds: the chart-image bands written
     /// ([`chart_bands`](Self::chart_bands)).
     #[cfg(feature = "dev-tools")]
@@ -2167,6 +2171,8 @@ impl Renderer {
             #[cfg(feature = "dev-tools")]
             present_tap: None,
             slice_clock: Arc::new(crate::upload::MonoClock::new()),
+            #[cfg(feature = "dev-tools")]
+            slice_override: None,
             #[cfg(feature = "dev-tools")]
             chart_bands: 0,
             #[cfg(feature = "dev-tools")]
@@ -6846,14 +6852,20 @@ impl Renderer {
         self.step_delay = delay;
     }
 
+    /// Reads the uploader's time slice on `clock`, the clock of the thread
+    /// that owns the renderer (the render thread's), in place of the
+    /// renderer's own monotonic clock.
+    pub fn set_slice_clock(&mut self, clock: Arc<dyn TimeSource>) {
+        self.slice_clock = clock;
+    }
+
     /// Development builds: the uploader's time slice read on `clock`
-    /// (`None`: the renderer's own monotonic clock), so a test decides
-    /// where the slice closes a boundary's steps, and a step's writes,
-    /// whatever the machine's load: a clock that does not move never
-    /// spends the slice.
+    /// (`None`: the slice clock again), so a test decides where the slice
+    /// closes a boundary's steps, and a step's writes, whatever the
+    /// machine's load: a clock that does not move never spends the slice.
     #[cfg(feature = "dev-tools")]
-    pub fn set_slice_clock(&mut self, clock: Option<Arc<dyn TimeSource>>) {
-        self.slice_clock = clock.unwrap_or_else(|| Arc::new(crate::upload::MonoClock::new()));
+    pub fn override_slice_clock(&mut self, clock: Option<Arc<dyn TimeSource>>) {
+        self.slice_override = clock;
     }
 
     /// Development builds: the writes of the staging's first
@@ -6881,6 +6893,10 @@ impl Renderer {
         #[cfg(test)]
         if self.step_cost.get().is_some() {
             return Arc::clone(&self.step_clock) as Arc<dyn TimeSource>;
+        }
+        #[cfg(feature = "dev-tools")]
+        if let Some(clock) = &self.slice_override {
+            return Arc::clone(clock);
         }
         Arc::clone(&self.slice_clock)
     }
