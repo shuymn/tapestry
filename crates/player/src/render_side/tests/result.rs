@@ -2601,8 +2601,8 @@ fn fade_alpha(drawn: &Mutex<Vec<Drawn>>) -> Option<f32> {
 }
 
 /// A windowed run's record marks the result outro's end, its start plus
-/// the skin's fade-out, with its start, when the outro begins
-/// (development builds).
+/// the skin's fade-out, named by the attempt whose result it leaves, when
+/// the outro begins (development builds).
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_outro_s_end_is_marked() {
@@ -2610,6 +2610,7 @@ fn the_outro_s_end_is_marked() {
     use game::Rig as _;
     on_shown_result("skin.fadeout = 500\n", TIMER2_DOT, |p, _, _, _, _| {
         start_game_marks(QpcClock::start());
+        p.attempt = Some(TimeUs(3_000));
         let outro = p.result_timing().expect("the skin's timing").outro;
         assert_eq!(outro, TimeUs(500_000));
         let at = p.now();
@@ -2620,7 +2621,7 @@ fn the_outro_s_end_is_marked() {
         let marks: Vec<_> = kept_game_marks().iter().map(|m| (m.0, m.1, m.2)).collect();
         assert_eq!(
             marks,
-            [(u64::try_from(at.0 + outro.0).unwrap(), "outro-end", at.0)]
+            [(u64::try_from(at.0 + outro.0).unwrap(), "outro-end", 3_000)]
         );
         p.accept_leaving(game::MenuCommand::Back);
     });

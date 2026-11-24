@@ -1014,6 +1014,8 @@ fn rig<'a>(
         times: LoadTimes::default(),
         ready_state_at: None,
         origin: None,
+        #[cfg(feature = "dev-tools")]
+        attempt: None,
         declared: crate::render_side::Declared::default(),
         committed: None,
         steps,
@@ -3075,6 +3077,9 @@ mod tests {
                 let origin = bms_model::TimeSource::now(&rig.clock);
                 let (_sink, sounds) = game::audio_link_at(8, origin);
                 rig.start(origin, sounds, side);
+                // The attempt a windowed run's record names: its play's
+                // origin, the one the render thread is handed.
+                assert_eq!(rig.attempt, Some(origin));
                 assert!(crate::render_side::tests::wait_until(|| seen
                     .lock()
                     .unwrap()

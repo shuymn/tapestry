@@ -2368,6 +2368,10 @@ impl FrameSink for ScenarioFrames {
         self.captures.leave_decision(record.lifetime);
     }
 
+    fn play_began(&mut self, origin: TimeUs) {
+        self.recorder.play_began(origin);
+    }
+
     fn play_ended(&mut self, at: TimeUs) {
         self.recorder.play_ended(at);
     }

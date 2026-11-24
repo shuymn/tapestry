@@ -73,9 +73,9 @@ fn a_kept_specialization_is_reused_only_after_success() {
     });
 }
 
-/// A windowed run's record marks the play's fade-out end at its end, with
-/// its start, and a discarded attempt as a withdrawal (development
-/// builds).
+/// A windowed run's record marks the play's fade-out end at its end, named
+/// by its attempt's origin, and a discarded attempt as a withdrawal
+/// (development builds).
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_play_s_fade_and_a_discard_are_marked() {
@@ -85,10 +85,11 @@ fn the_play_s_fade_and_a_discard_are_marked() {
     on_rig(l.chart(), &Installers::default(), true, |rig| {
         start_game_marks(input::QpcClock::start());
         assert!(kept_game_marks().is_empty());
+        rig.attempt = Some(bms_model::TimeUs(4_000));
         rig.fade_began(bms_model::TimeUs(7_000), bms_model::TimeUs(9_500));
         rig.discard_attempt();
         let marks: Vec<_> = kept_game_marks().iter().map(|m| (m.1, m.2)).collect();
-        assert_eq!(marks, [("play-fade-end", 7_000), ("withdrawal", 0)]);
+        assert_eq!(marks, [("play-fade-end", 4_000), ("withdrawal", 0)]);
         assert_eq!(kept_game_marks().first().map(|m| m.0), Some(9_500));
     });
 }

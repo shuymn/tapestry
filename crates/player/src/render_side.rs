@@ -1836,6 +1836,14 @@ pub trait FrameSink: Send {
         let _ = record;
     }
 
+    /// The render thread took a play whose chart time 0 lies at `origin`,
+    /// before any frame of it (dev-tools: a windowed run's record names
+    /// each attempt by it).
+    #[cfg(feature = "dev-tools")]
+    fn play_began(&mut self, origin: TimeUs) {
+        let _ = origin;
+    }
+
     /// The play's in-play interval ended at `at`, on the clock: its result
     /// is prepared from now (dev-tools, design.md "State Model",
     /// ResultPreparing).
@@ -8253,6 +8261,8 @@ impl Run {
                     state_origin,
                 }) => {
                     let origin = measure.origin;
+                    #[cfg(feature = "dev-tools")]
+                    self.frames.play_began(origin);
                     let screen_origin = self.resolve_screen_origin(&measure);
                     // The play's movies: held by this screen alone.
                     if let Some(s) = self.screen.as_mut() {
@@ -18372,6 +18382,22 @@ pub(crate) mod tests {
         QpcClock,
         super::RenderLink,
     ) {
+        rearmed_play_into(chart, rule, device, Box::new(NoFrames))
+    }
+
+    /// [`rearmed_play`], its frames also handed to `sink`.
+    fn rearmed_play_into<'a>(
+        chart: &'a Chart,
+        rule: &'a rules::RulePreset,
+        device: &'a DeviceProfile,
+        sink: Box<dyn super::FrameSink>,
+    ) -> (
+        Logic<'a, SourceReader>,
+        game::RenderSide,
+        Noted,
+        QpcClock,
+        super::RenderLink,
+    ) {
         let (logic, side) = Logic::<SourceReader>::new(
             chart,
             rule,
@@ -18402,7 +18428,7 @@ pub(crate) mod tests {
             clock,
             view(),
             measure(clock),
-            Box::new(NoFrames),
+            sink,
         )
         .unwrap();
         let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
@@ -18438,6 +18464,49 @@ pub(crate) mod tests {
             let expected = u32::from(now.0 < -9_000_000);
             assert_eq!(rearms, expected, "a frame at {now:?}");
         }
+    }
+
+    /// The render thread tells its frame sink the play it takes, with the
+    /// play's origin, before any frame of it, and a rearm tells it nothing
+    /// more (dev-tools: a windowed run's record names each attempt by it).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_play_s_origin_reaches_the_frame_sink_before_its_frames() {
+        struct Began(Arc<std::sync::Mutex<Vec<Option<TimeUs>>>>);
+        impl super::FrameSink for Began {
+            fn frame(&mut self, _screen: &dyn Screen, _drawn: &super::Drawn<'_>) {
+                self.0.lock().unwrap().push(None);
+            }
+            fn play_began(&mut self, origin: TimeUs) {
+                self.0.lock().unwrap().push(Some(origin));
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) =
+            rearmed_play_into(&chart, &rule, &device, Box::new(Began(Arc::clone(&seen))));
+        let origin = TimeUs(clock.now().0 + 5_000_000);
+        link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
+            side,
+            gauge: 0,
+            measure: play_measure(origin),
+        });
+        assert!(wait_until(|| frames.lock().unwrap().len() >= 2));
+        logic.rearm(&InputStart::default(), TimeUs(clock.now().0 + 10_000_000));
+        assert!(wait_until(|| frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, now, ..)| now.0 < -9_000_000)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let seen = seen.lock().unwrap();
+        let began: Vec<_> = seen.iter().flatten().collect();
+        assert_eq!(began, [&origin], "one play, named once, through the rearm");
+        let at = seen.iter().position(Option::is_some).unwrap();
+        let play_frames = frames.lock().unwrap().len();
+        assert!(seen.len() - at > play_frames, "every play frame after it");
     }
 
     /// Each play frame's state clock runs from the play state's origin,

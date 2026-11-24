@@ -188,6 +188,9 @@ enum Raw {
     /// The render thread took a result's presentation or the built-in
     /// result's page.
     ResultTaken(TimeUs),
+    /// The render thread took a play: its origin on the clock names the
+    /// attempt, every frame after it its own until the next.
+    Attempt(TimeUs),
 }
 
 /// The raw records of a run, kept in place.
@@ -324,6 +327,7 @@ fn marks_of(raw: &[Raw]) -> Vec<(usize, Mark)> {
     for (i, r) in raw.iter().enumerate() {
         match *r {
             Raw::Mark(m) => marks.push((i, m)),
+            Raw::Attempt(_) => {}
             Raw::PlayEnded(at) => preparing = Some(at),
             Raw::Present { stage, .. } => {
                 let other_attempt = last.is_some_and(|l| l.lifetime != stage.lifetime);
@@ -728,6 +732,12 @@ impl Recorder {
         self.book.push(Raw::Mark(m));
     }
 
+    /// The render thread took a play whose chart time 0 lies at `origin`:
+    /// the attempt every later frame belongs to, until the next.
+    pub fn play_began(&self, origin: TimeUs) {
+        self.book.push(Raw::Attempt(origin));
+    }
+
     /// The play's in-play interval ended at `at`.
     pub fn play_ended(&self, at: TimeUs) {
         self.book.push(Raw::PlayEnded(at));
@@ -851,6 +861,10 @@ impl Transitions {
 }
 
 /// The lines of a windowed run's raw record ([`Transitions::run_lines`]).
+/// The windowed record's format, on its first line: 2 names each play's
+/// attempt (`attempt <origin>`) and the play's and outro's marks by it.
+const RECORD_VERSION: u32 = 2;
+
 fn run_record_lines(
     header: RunHeader,
     raw: &[Raw],
@@ -861,7 +875,7 @@ fn run_record_lines(
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(raw.len() + marks.len() + 5);
     lines.push(format!(
-        "run qpc-frequency {} qpc-origin {} pid {}",
+        "run version {RECORD_VERSION} qpc-frequency {} qpc-origin {} pid {}",
         header.qpc_frequency, header.qpc_origin, header.pid
     ));
     for r in raw {
@@ -893,6 +907,7 @@ fn run_record_lines(
             }
             Raw::PlayEnded(at) => format!("play-ended {}", at.0),
             Raw::ResultTaken(at) => format!("result-taken {}", at.0),
+            Raw::Attempt(origin) => format!("attempt {}", origin.0),
         });
     }
     for &(at, tag, v) in marks {
@@ -1035,6 +1050,10 @@ impl crate::render_side::FrameSink for RunFrames {
             drawn.hold,
             screen.present_stamps(),
         );
+    }
+
+    fn play_began(&mut self, origin: TimeUs) {
+        self.recorder.play_began(origin);
     }
 
     fn play_ended(&mut self, at: TimeUs) {
@@ -1425,6 +1444,7 @@ mod tests {
                 from: TimeUs(4_000),
                 to: TimeUs(5_000),
             }),
+            Raw::Attempt(TimeUs(5_800)),
             Raw::PlayEnded(TimeUs(6_000)),
             Raw::ResultTaken(TimeUs(6_500)),
         ];
@@ -1448,10 +1468,11 @@ mod tests {
                 end(RunStatus::Ok)
             ),
             [
-                "run qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "run version 2 qpc-frequency 10000000 qpc-origin 40000 pid 77",
                 "present 50000 50120 0xabc0 1000 decision 3 skin 0",
                 "present - - - 5166 loading 9 pending 2",
                 "mark hold 4000 5000 skin",
+                "attempt 5800",
                 "play-ended 6000",
                 "result-taken 6500",
                 "game 900 decision-end 3",
@@ -1464,7 +1485,7 @@ mod tests {
         assert_eq!(
             run_record_lines(header, &[], &[], None, (2, 0), end(RunStatus::Failed)),
             [
-                "run qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "run version 2 qpc-frequency 10000000 qpc-origin 40000 pid 77",
                 "close none",
                 "lost render 2 game 0",
                 "end 70000 failed",
@@ -1506,7 +1527,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
-        assert_eq!(lines[0], "run qpc-frequency 10000000 qpc-origin 0 pid 1");
+        assert_eq!(
+            lines[0],
+            "run version 2 qpc-frequency 10000000 qpc-origin 0 pid 1"
+        );
         assert!(
             lines[1].starts_with("end ") && lines[1].ends_with(" failed"),
             "{text}"
@@ -1569,6 +1593,41 @@ mod tests {
         };
         assert_eq!(presents(&book), 1);
         assert_eq!(presents(&run_record_book(None)), 0);
+    }
+
+    /// A windowed run's sink names each play it is told of, in its place
+    /// among the frames: the frames after it are that attempt's.
+    #[test]
+    fn a_play_s_attempt_is_named_in_its_place() {
+        use super::{RunEnd, RunFrames, RunHeader, RunStatus};
+        use crate::render_side::FrameSink as _;
+        let book = Transitions::with_capacity(4);
+        let mut sink = RunFrames::new(book.clone());
+        sink.recorder
+            .frame_stamped(stage(State::Loading, 1, Drew::Skin), TimeUs(3), None, None);
+        sink.play_began(TimeUs(77));
+        sink.recorder
+            .frame_stamped(stage(State::Ready, 70, Drew::Plain), TimeUs(5), None, None);
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let end = RunEnd {
+            qpc: 9,
+            status: RunStatus::Ok,
+        };
+        let lines = book.run_lines(header, end).unwrap();
+        let body: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("present") || l.starts_with("attempt"))
+            .map(|l| {
+                l.split(' ')
+                    .nth(if l.starts_with("present") { 5 } else { 1 })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(body, ["loading", "77", "ready"]);
     }
 
     /// The record written to its file ends with the run's end, read after
