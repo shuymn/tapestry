@@ -546,6 +546,30 @@ pub enum RenderError {
     /// must be built again.
     #[error("surface lost")]
     SurfaceLost,
+    /// The window has no client area (minimized) as its renderer is made:
+    /// nothing was made, and a build made once it has one may pass.
+    #[error("surface: the window has no client area")]
+    NoArea,
+    /// The window's surface refused its configuration (design.md "Showing
+    /// the window"): DXGI would not make or resize the swap chain, or the
+    /// configuration is one the surface cannot take. The renderer must be
+    /// built again; `retryable` when one built again may pass.
+    #[error("surface: configure refused")]
+    SurfaceConfigure {
+        /// Whether a surface and device made again may take it
+        /// ([`crate::configure`]'s classification).
+        retryable: bool,
+        /// wgpu's refusal.
+        #[source]
+        source: wgpu::Error,
+    },
+    /// The device was lost before or during a configure of the window's
+    /// surface, which is left unconfigured; a renderer built again on a new
+    /// device may pass. A variant of its own, with nothing to format until
+    /// it is reported, so a frame's reconfigure returns it with nothing
+    /// allocated.
+    #[error("surface: configure refused: the device was lost")]
+    ConfigureDeviceLost,
     /// A menu's text could not be drawn as prepared.
     #[error("text")]
     Text(#[source] glyphon::RenderError),
@@ -612,6 +636,30 @@ pub enum RenderError {
 }
 
 impl RenderError {
+    /// The configure refusal `source`, classified.
+    #[must_use]
+    pub fn surface_configure(source: wgpu::Error) -> Self {
+        Self::SurfaceConfigure {
+            retryable: crate::configure::retryable(&source),
+            source,
+        }
+    }
+
+    /// Whether this is a refusal of the window's surface a renderer built
+    /// again may pass: a retryable configure refusal, a device lost at the
+    /// configure, or no client area.
+    #[must_use]
+    pub const fn is_retryable_configure(&self) -> bool {
+        matches!(
+            self,
+            Self::SurfaceConfigure {
+                retryable: true,
+                ..
+            } | Self::ConfigureDeviceLost
+                | Self::NoArea
+        )
+    }
+
     /// Whether this is a refusal of what was asked while the device stays
     /// healthy (design.md "Play Lifecycle", preparing each attempt): the
     /// skin cannot draw the attempt, its atlas is past the checks or was
@@ -1545,6 +1593,16 @@ impl FrameTiming {
     pub const fn presented(&self) -> bool {
         matches!(self.outcome, FrameOutcome::Shown)
     }
+
+    /// Whether the frame reached the target and the swap chain counted
+    /// its present (DXGI's present count, read after it, past 0):
+    /// `Queue::present` itself reports nothing, so a window's first frame
+    /// is taken as presented only on this (design.md "Showing the
+    /// window"). Never for an offscreen frame, which has no count.
+    #[must_use]
+    pub fn confirmed(&self) -> bool {
+        self.presented() && self.present_count.is_some_and(|n| n > 0)
+    }
 }
 
 /// What became of a frame (design.md "State Model", system sounds,
@@ -1638,8 +1696,14 @@ struct Window {
 }
 
 impl Window {
-    fn configure(&mut self, device: &wgpu::Device) {
-        self.surface.configure(device, &self.config);
+    /// Configures the surface ([`crate::configure::configure`]), then
+    /// takes the new swap chain's waitable object and the chain itself.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::SurfaceConfigure`]: the surface refused it.
+    fn configure(&mut self, gpu: &crate::Gpu) -> Result<(), RenderError> {
+        crate::configure::configure(&self.surface, gpu, &self.config)?;
         // SAFETY: the handle is only read here; it belongs to the swap chain
         // just configured, which lives as long as the surface.
         let hal = unsafe { self.surface.as_hal::<wgpu_hal::api::Dx12>() };
@@ -1649,6 +1713,7 @@ impl Window {
             .and_then(|s| unsafe { s.waitable_handle() })
             .map(|h| h.0 as usize);
         self.chain = hal.and_then(|s| s.swap_chain());
+        Ok(())
     }
 }
 
@@ -1738,6 +1803,9 @@ pub struct Renderer {
     /// The window is minimized (the last size applied was zero): nothing
     /// is configured or presented until a nonzero size comes.
     minimized: bool,
+    /// A configuration the surface refused at a resize, returned by the
+    /// next frame ([`Renderer::resize`]).
+    surface_refused: Option<RenderError>,
     format: wgpu::TextureFormat,
     alpha: wgpu::RenderPipeline,
     additive: wgpu::RenderPipeline,
@@ -2119,7 +2187,9 @@ impl Renderer {
                     #[cfg(feature = "dev-tools")]
                     copy_src: caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
                 };
-                w.configure(device);
+                #[cfg(feature = "dev-tools")]
+                crate::configure::before_first_configure();
+                w.configure(&gpu)?;
                 (Output::Window(w), format)
             }
             None => {
@@ -2153,6 +2223,7 @@ impl Renderer {
             output,
             size,
             minimized: false,
+            surface_refused: None,
             format,
             alpha,
             additive,
@@ -2334,7 +2405,9 @@ impl Renderer {
     /// skin's canvas and clips projected again; the skin's play state is
     /// kept. A zero side minimizes: nothing is configured, and frames are
     /// skipped, unpresented, until a nonzero size is applied. A side past
-    /// the device's largest texture is clamped to it.
+    /// the device's largest texture is clamped to it. A configuration the
+    /// surface refuses keeps the old size, and the next frame returns the
+    /// refusal, so the screen is built again as after a lost surface.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             self.minimized = true;
@@ -2346,18 +2419,24 @@ impl Renderer {
         if size == self.size {
             return;
         }
-        self.size = size;
         let device = self.gpu.device();
         match &mut self.output {
             Output::Window(w) => {
+                let old = (w.config.width, w.config.height);
                 w.config.width = size.0;
                 w.config.height = size.1;
-                w.configure(device);
+                if let Err(e) = w.configure(&self.gpu) {
+                    w.config.width = old.0;
+                    w.config.height = old.1;
+                    self.surface_refused = Some(e);
+                    return;
+                }
             }
             Output::Offscreen { texture, view } => {
                 (*texture, *view) = offscreen(device, size, self.format);
             }
         }
+        self.size = size;
         self.project();
         let target = self.target();
         for slot in self.screens.iter_mut().flatten() {
@@ -10009,6 +10088,9 @@ impl Renderer {
             present_count: None,
             movies: staging.batch().movies(),
         };
+        if let Some(e) = self.surface_refused.take() {
+            return Err(e);
+        }
         if self.minimized {
             let cpu = start.elapsed();
             #[cfg(feature = "dev-tools")]
@@ -10038,7 +10120,7 @@ impl Renderer {
                         crate::probe::mark("rf:skipped", 1);
                     }
                     if reconfigure {
-                        w.configure(self.gpu.device());
+                        w.configure(&self.gpu)?;
                     }
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
                     #[cfg(feature = "dev-tools")]
@@ -10341,20 +10423,28 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// An offscreen target, or a surface whose images cannot be copied.
+    /// [`TapError::Unsupported`]: an offscreen target, or a surface whose
+    /// images cannot be copied; the renderer is unchanged.
+    /// [`TapError::Configure`]: the surface refused the configuration; the
+    /// renderer's swap chain is not usable, and it must be built again.
     #[cfg(feature = "dev-tools")]
     pub fn set_present_tap(
         &mut self,
         tap: Arc<dyn crate::present_tap::PresentTap>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::present_tap::TapError> {
+        use crate::present_tap::TapError;
         let Output::Window(w) = &mut self.output else {
-            return Err("an offscreen target presents no frame".into());
+            return Err(TapError::Unsupported(
+                "an offscreen target presents no frame",
+            ));
         };
         if !w.copy_src {
-            return Err("the surface's images cannot be copied from".into());
+            return Err(TapError::Unsupported(
+                "the surface's images cannot be copied from",
+            ));
         }
         w.config.usage |= wgpu::TextureUsages::COPY_SRC;
-        w.configure(self.gpu.device());
+        w.configure(&self.gpu).map_err(TapError::Configure)?;
         self.present_tap = Some(tap);
         Ok(())
     }
@@ -11068,6 +11158,10 @@ pub(crate) mod pool_tests;
 #[cfg(test)]
 #[path = "decision_label_tests.rs"]
 mod decision_label_tests;
+
+#[cfg(test)]
+#[path = "configure_tests.rs"]
+mod configure_tests;
 
 #[cfg(test)]
 #[path = "chart_upload_tests.rs"]

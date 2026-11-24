@@ -104,6 +104,27 @@ pub fn this_thread() -> u64 {
     MINE.with(Cell::get)
 }
 
+/// Leaves room in libtest's output capture for the lines a counted section
+/// prints (tests): `cargo test`, as CI's release allocation step runs, puts
+/// every print of a test's threads into one buffer, which allocates when it
+/// grows; a process's own stdout and stderr do not. A line of 64 KiB (a
+/// format width's most) grows it past that, then spaces are printed until
+/// it grows once more: it doubles, so at least 64 KiB are left free, and a
+/// buffer never shrinks. Without a capture (nextest) nothing grows, and the
+/// spaces stop at their bound.
+#[cfg(test)]
+pub fn room_for_output() {
+    println!("{:1$}", "", usize::from(u16::MAX));
+    for _ in 0..1 << 17 {
+        let before = this_thread();
+        print!(" ");
+        if this_thread() != before {
+            break;
+        }
+    }
+    println!();
+}
+
 /// This thread's frees so far, whatever its tag.
 #[cfg(test)]
 pub fn this_thread_frees() -> u64 {

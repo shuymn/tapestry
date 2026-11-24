@@ -3304,7 +3304,10 @@ fn a_render_panic_in_a_play_leaves_the_result_runtime_to_the_game_thread() {
     assert!(scripts.inactive().is_none());
     assert!(scripts.retire(crate::screens::Quiet::Closed(interval.close())));
     assert!(gone.load(Ordering::Acquire));
-    assert_eq!(rig.link.exit(), crate::render_side::RenderEnd::Panicked);
+    assert_eq!(
+        rig.link.exit(),
+        crate::render_side::RenderEnd::Panicked("the render thread fails (a test)".to_owned())
+    );
 }
 
 /// C13 on result: a retirement while the view runs is terminal: the
