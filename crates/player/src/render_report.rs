@@ -519,6 +519,7 @@ mod tests {
             report(format_args!("render: warm {}", 1));
             entered.recv_timeout(BOUND).unwrap();
             let e = render::RenderError::SurfaceLost;
+            crate::alloc_count::room_for_output();
             let before = crate::alloc_count::this_thread();
             // Past the capacity: the last ones are dropped.
             for n in 0..CAPACITY + 4 {

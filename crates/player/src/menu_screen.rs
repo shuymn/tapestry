@@ -2926,9 +2926,10 @@ mod tests {
     }
 
     /// A screen with a window to tell draws the launch screen, the game's
-    /// name at the opacity of its time, and its presented frame tells the
-    /// window, black ones included; one for plays only draws black, and
-    /// one without a window draws no launch screen.
+    /// name at the opacity of its time; one for plays only draws black, and
+    /// one without a window draws no launch screen. Offscreen, where no
+    /// swap chain counts a present, no frame tells the window; on a window,
+    /// the splash's first frame does, black as it is.
     #[test]
     fn the_splash_tells_the_window_of_its_frame() {
         use std::time::Duration;
@@ -2949,7 +2950,7 @@ mod tests {
             Some(Ok(render::FrameOutcome::Shown))
         ));
         assert_eq!(lit(&screen), 0);
-        assert!(sent.1.load(Ordering::Acquire));
+        assert!(!sent.1.load(Ordering::Acquire));
         assert!(matches!(
             screen.splash(Duration::from_millis(750)),
             Some(Ok(render::FrameOutcome::Shown))
@@ -2966,9 +2967,27 @@ mod tests {
             Some(Ok(render::FrameOutcome::Shown))
         ));
         assert_eq!(lit(&screen), 0);
-        assert!(sent.1.load(Ordering::Acquire));
+        assert!(!sent.1.load(Ordering::Acquire));
         let mut screen = MenuScreen::new(warp(), None);
         assert!(screen.splash(Duration::ZERO).is_none());
+
+        let told = crate::test_window::on_own_desktop(|| {
+            let popup = crate::test_window::Popup::new(320, 180);
+            let r = Renderer::new(popup.target(320, 180), AdapterChoice::Warp).unwrap();
+            let sent = Sent::default();
+            let mut screen = MenuScreen::new(r, None).with_sink(Box::new(sent.clone()));
+            // A swap chain may skip its first frames; a few are enough.
+            for _ in 0..10 {
+                assert!(screen.splash(Duration::ZERO).is_some());
+                if sent.1.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            drop(screen);
+            drop(popup);
+            sent.1.load(Ordering::Acquire)
+        });
+        assert!(told, "the splash's frame on a window did not tell it");
     }
 
     /// A screen for plays only draws the skin's wait and the load's lines

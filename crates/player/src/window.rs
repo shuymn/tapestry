@@ -212,9 +212,8 @@ pub fn set_startup_bound(bound: Duration) {
     let _ = STARTUP_BOUND.set(bound);
 }
 
-/// The startup's bound of the window that opens, and of a headless
-/// run's first screen ([`crate::render_side::spawn`]).
-pub(crate) fn startup_bound() -> Duration {
+/// The startup's bound of the window that opens.
+fn startup_bound() -> Duration {
     #[cfg(feature = "dev-tools")]
     if let Some(b) = STARTUP_BOUND.get() {
         return *b;
@@ -1797,36 +1796,6 @@ mod tests {
         }
     }
 
-    /// Moves this thread, which has no window yet, to a new desktop of its
-    /// own: its windows are seen on no screen and take no foreground on
-    /// the user's desktop. The desktop goes with the process.
-    fn own_desktop() {
-        use windows::Win32::Foundation::GENERIC_ALL;
-        use windows::Win32::System::StationsAndDesktops::{
-            CreateDesktopW, DESKTOP_CONTROL_FLAGS, SetThreadDesktop,
-        };
-        use windows::core::PCWSTR;
-        let name: Vec<u16> = format!("tapestry-test-{}", std::process::id())
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        // SAFETY: `name` is NUL-terminated and outlives the call.
-        let desktop = unsafe {
-            CreateDesktopW(
-                PCWSTR(name.as_ptr()),
-                PCWSTR::null(),
-                None,
-                DESKTOP_CONTROL_FLAGS(0),
-                GENERIC_ALL.0,
-                None,
-            )
-        }
-        .unwrap();
-        // SAFETY: the desktop was just made, and this thread has no window
-        // or hook.
-        unsafe { SetThreadDesktop(desktop) }.unwrap();
-    }
-
     /// The window made as the player makes it, at the event loop's first
     /// resume.
     struct Made(Option<Result<winit::window::Window, winit::error::OsError>>);
@@ -1864,7 +1833,7 @@ mod tests {
         use winit::platform::windows::EventLoopBuilderExtWindows;
 
         let run = std::thread::spawn(|| {
-            own_desktop();
+            crate::test_window::own_desktop();
             let sent = SendInputCount::install();
             let mut event_loop = EventLoop::<super::Ask>::with_user_event()
                 .with_any_thread(true)
@@ -2803,6 +2772,7 @@ mod tests {
         }
         // A frame the swap chain counted, as a window's first is.
         let confirmed = timing(Some(1));
+        crate::alloc_count::room_for_output();
         let before = crate::alloc_count::this_thread();
         assert!(screen.shown(&confirmed));
         assert_eq!(crate::alloc_count::this_thread() - before, 0);

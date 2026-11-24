@@ -633,7 +633,9 @@ mod tests {
     }
 
     /// Key config's frame tells the hidden window it was presented, as a
-    /// menu's or a play's does: its window shows then, not at the deadline.
+    /// menu's or a play's does, once the swap chain counted it: its window
+    /// shows then. An offscreen frame, which no swap chain counts, does
+    /// not (design.md "Showing the window").
     #[test]
     fn a_key_config_frame_tells_the_window() {
         use std::sync::Arc;
@@ -641,25 +643,41 @@ mod tests {
 
         use render::{AdapterChoice, Renderer, Target};
 
-        let target = Target::Offscreen {
-            width: 64,
-            height: 36,
-        };
-        let controls = crate::controls::Controls::new(input::QpcClock::start());
-        let presented = Arc::new(AtomicBool::new(false));
-        let mut screen = super::Screen {
-            renderer: Renderer::new(target, AdapterChoice::Warp).unwrap(),
-            controls: &controls,
-            presented: Arc::clone(&presented),
-        };
         let flow = KeyConfigFlow::new(KeyConfigs {
             keyboard: DeviceSettings::default().keyboard,
             controller: DeviceSettings::default().controller,
             controller_device: None,
         });
-        assert!(!presented.load(Ordering::Acquire));
-        screen.show(&flow);
-        assert!(presented.load(Ordering::Acquire));
-        assert!(!controls.quitting());
+        let told = |target: Target| {
+            let controls = crate::controls::Controls::new(input::QpcClock::start());
+            let presented = Arc::new(AtomicBool::new(false));
+            let mut screen = super::Screen {
+                renderer: Renderer::new(target, AdapterChoice::Warp).unwrap(),
+                controls: &controls,
+                presented: Arc::clone(&presented),
+            };
+            assert!(!presented.load(Ordering::Acquire));
+            // A swap chain may skip its first frames; a few are enough.
+            for _ in 0..10 {
+                screen.show(&flow);
+                if presented.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            assert!(!controls.quitting());
+            presented.load(Ordering::Acquire)
+        };
+        let offscreen = Target::Offscreen {
+            width: 64,
+            height: 36,
+        };
+        assert!(!told(offscreen), "an offscreen frame told the window");
+        let window = crate::test_window::on_own_desktop(|| {
+            let popup = crate::test_window::Popup::new(64, 36);
+            let told = told(popup.target(64, 36));
+            drop(popup);
+            told
+        });
+        assert!(window, "a window's frame did not tell it");
     }
 }
