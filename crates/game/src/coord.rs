@@ -59,9 +59,11 @@ pub use scoped::{Failure, Joined, LoadFailure, ScopedJob, Spawner};
 /// Foreground permits: the chosen chart's decode threads, from a choice to
 /// its READY state (design.md "Load Pipeline", system friendliness).
 pub const FOREGROUND_PERMITS: usize = 4;
-/// The most speculative permits, whatever the setting.
+/// The most speculative permits anything asks for: the development flag's
+/// stress test above the production cap (design.md "Load Pipeline",
+/// system friendliness).
 pub const SPECULATIVE_MAX: usize = 2;
-/// The speculative permits by default.
+/// The speculative permits when speculation is on: the production cap.
 pub const SPECULATIVE_DEFAULT: usize = 1;
 /// The cores speculation leaves to the rest of the machine.
 pub const RESERVED_CORES: usize = 2;
