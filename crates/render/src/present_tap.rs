@@ -36,6 +36,30 @@ pub struct PresentFrame {
     pub rgba: Vec<u8>,
 }
 
+/// A window frame's present on the host counter (raw QPC ticks, the
+/// clock a system present trace stamps), read right before and right
+/// after the call that presents it, and the swap chain it was presented
+/// on: a run record joins its presents with that trace's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentStamps {
+    /// The counter right before the present call.
+    pub pre_qpc: i64,
+    /// The counter right after it returned.
+    pub post_qpc: i64,
+    /// The swap chain's interface address.
+    pub swap_chain: usize,
+}
+
+/// The host counter now, raw QPC ticks.
+#[must_use]
+pub fn qpc_now() -> i64 {
+    let mut ticks = 0;
+    // SAFETY: writes one i64; the counter cannot fail on Windows XP and
+    // later.
+    let _ = unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut ticks) };
+    ticks
+}
+
 /// How long a copy may take to be readable once its frame was submitted.
 const COPY_WAIT: Duration = Duration::from_secs(2);
 

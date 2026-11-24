@@ -15,7 +15,9 @@ windows-only = true
 default = []
 # Development features. Never enabled in production builds (R3): a fault
 # injected into the text preparation's wait for the GPU.
-dev-tools = ["skin-model/dev-tools"]
+# The run record's present stamps (`Renderer::present_stamps`) read the
+# host counter.
+dev-tools = ["skin-model/dev-tools", "windows/Win32_System_Performance"]
 
 [dependencies]
 bms-model.workspace = true

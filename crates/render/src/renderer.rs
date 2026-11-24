@@ -1935,6 +1935,11 @@ pub struct Renderer {
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
+    /// The last window frame's present on the host counter and its swap
+    /// chain; `None` before one, and after an offscreen frame (dev-tools,
+    /// [`present_stamps`](Self::present_stamps)).
+    #[cfg(feature = "dev-tools")]
+    present_stamps: Option<crate::PresentStamps>,
     /// How long an offscreen frame waits for the frame before it, `None`
     /// without a bound, in place of [`OFFSCREEN_FRAME_WAIT`] (dev-tools,
     /// [`set_offscreen_frame_wait`](Self::set_offscreen_frame_wait)).
@@ -2234,6 +2239,8 @@ impl Renderer {
             pages_upload: None,
             pages_report: None,
             pacer: Pacer::default(),
+            #[cfg(feature = "dev-tools")]
+            present_stamps: None,
             #[cfg(feature = "dev-tools")]
             offscreen_wait: Some(OFFSCREEN_FRAME_WAIT),
             clear: wgpu::Color::BLACK,
@@ -10280,7 +10287,18 @@ impl Renderer {
                         .as_ref()
                         .and_then(|c| unsafe { c.GetLastPresentCount() }.ok())
                 });
+                #[cfg(feature = "dev-tools")]
+                let pre_qpc = crate::present_tap::qpc_now();
                 self.gpu.queue().present(t);
+                #[cfg(feature = "dev-tools")]
+                {
+                    let post_qpc = crate::present_tap::qpc_now();
+                    self.present_stamps = self.chain().map(|c| crate::PresentStamps {
+                        pre_qpc,
+                        post_qpc,
+                        swap_chain: windows::core::Interface::as_raw(c) as usize,
+                    });
+                }
                 out.present_count = self.chain().and_then(|c| {
                     // SAFETY: a plain query of the live swap chain.
                     unsafe { c.GetLastPresentCount() }.ok()
@@ -10302,6 +10320,10 @@ impl Renderer {
                 // wait for the GPU (a chart's preparation, a read back)
                 // waits for about one frame, as behind a swap chain.
                 self.pacer.submitted(submitted);
+                #[cfg(feature = "dev-tools")]
+                {
+                    self.present_stamps = None;
+                }
             }
         }
         Ok(out)
@@ -10357,6 +10379,15 @@ impl Renderer {
         w.configure(self.gpu.device());
         self.present_tap = Some(tap);
         Ok(())
+    }
+
+    /// Development builds: the last window frame's present on the host
+    /// counter, read right before and after its present call, and its swap
+    /// chain's address; `None` before one and after an offscreen frame.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn present_stamps(&self) -> Option<crate::PresentStamps> {
+        self.present_stamps
     }
 
     fn chain(&self) -> Option<&IDXGISwapChain3> {

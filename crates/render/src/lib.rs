@@ -99,7 +99,7 @@ pub use outline::{
 };
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 #[cfg(feature = "dev-tools")]
-pub use present_tap::{PresentFrame, PresentTap};
+pub use present_tap::{PresentFrame, PresentStamps, PresentTap};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::UploadTiming;
