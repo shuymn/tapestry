@@ -106,9 +106,9 @@ impl Handoffs {
                 }
             });
         if let Err(e) = &started {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: the retirement worker did not start, retired pages are dropped with their arrays: {e}"
-            );
+            ));
         }
         Self {
             places: [None; PLACES],
@@ -190,9 +190,9 @@ impl Handoffs {
             }
             Err(TrySendError::Full((_, part))) => Err(part),
             Err(TrySendError::Disconnected((_, part))) => {
-                eprintln!(
+                crate::render_report::report(format_args!(
                     "render: the retirement worker ended, retired pages are dropped with their arrays"
-                );
+                ));
                 self.tx = None;
                 Err(part)
             }
