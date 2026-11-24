@@ -15,7 +15,9 @@
 //! slot it takes must hold a known state, its own index, the game's frame
 //! size, a run already started, a sequence above every frame taken before
 //! it, and in the current run a stamp inside the run's window that rises
-//! with the sequence, and those words, read again once its frame is
+//! with the sequence, a duration of at least 1 µs and at most
+//! [`MAX_FRAME_US`] whose end does not overflow, and those words, read
+//! again once its frame is
 //! copied, must be what they were before the copy (a change undone before
 //! that second read goes unseen). Anything else is a [`Fault`], which fails
 //! the video's player: the reader keeps it and reads nothing more. A copy
@@ -69,9 +71,9 @@
 //! the decoder's progress at [`PROGRESS_WORD`] and its [`State`] at
 //! [`STATE_WORD`], which the game reads only to supervise the worker
 //! ([`supervision`]), then two words reserved, written zero and not
-//! read), then the slots, each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its
-//! own index, its frame's bytes and two words reserved, written zero and
-//! not read) followed by its frame: the
+//! read), then the slots, each [`SLOT_HEADER_WORDS`] (its state, sequence,
+//! run, stamp, its own index, its frame's bytes, its duration and one word
+//! reserved, written zero and not read) followed by its frame: the
 //! luma plane, then
 //! the two chroma planes, each half the width and height rounded up (I420),
 //! packed little-endian into words, the last word's spare bytes zero.
@@ -93,6 +95,10 @@ pub const MAX_PIXELS: u64 = 4_194_304;
 /// The longest side of a frame.
 pub const MAX_SIDE: u32 = 8_192;
 
+/// The longest a frame lasts, in µs: an hour, the longest chart. A slot's
+/// duration past it fails the player ("Threat Model" T02).
+pub const MAX_FRAME_US: i64 = 3_600_000_000;
+
 /// The words of a ring's header.
 pub const HEADER_WORDS: usize = 16;
 
@@ -103,7 +109,7 @@ pub const SLOT_HEADER_WORDS: usize = 8;
 pub const CHUNK_WORDS: usize = 8_192;
 
 /// The layout's version, in the header.
-pub const VERSION: u64 = 5;
+pub const VERSION: u64 = 6;
 
 /// The header's first word.
 const MAGIC: u64 = u64::from_le_bytes(*b"TAPRING1");
@@ -195,8 +201,9 @@ const S_RUN: usize = 2;
 const S_STAMP: usize = 3;
 const S_INDEX: usize = 4;
 const S_BYTES: usize = 5;
-// Words 6 and 7 are reserved: written zero, not read.
-const S_RESERVED: [usize; 2] = [6, 7];
+const S_DURATION: usize = 6;
+// Word 7 is reserved: written zero, not read.
+const S_RESERVED: usize = 7;
 
 /// A slot holding no frame, which the worker may claim.
 const FREE: u64 = 0;
@@ -314,11 +321,21 @@ impl Window {
     }
 }
 
-/// A frame the reader took: its sequence and its stamp.
+/// A frame the reader took: its sequence, its stamp and its duration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub seq: u64,
     pub stamp: i64,
+    pub duration: i64,
+}
+
+/// A frame's media time, as the worker publishes it: its stamp and how
+/// long it lasts, both in µs (design.md "Rendering and Skins", video
+/// frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub at: i64,
+    pub duration: i64,
 }
 
 /// What a peek found.
@@ -329,6 +346,10 @@ pub struct Peek {
     /// Whether it freed slots (of earlier runs): the game then signals the
     /// worker, which may be waiting for one.
     pub freed: bool,
+    /// Whether a published frame of the current run stays in the ring
+    /// untaken once the frame due, if any, is taken: newer than it, or any
+    /// when none is due.
+    pub left: bool,
 }
 
 /// A frame [`Reader::peek`] found due, which [`Reader::take`] copies.
@@ -350,6 +371,12 @@ impl Due {
     #[must_use]
     pub const fn seq(&self) -> u64 {
         self.chosen.seq
+    }
+
+    /// How long the frame lasts.
+    #[must_use]
+    pub const fn duration(&self) -> i64 {
+        self.chosen.duration
     }
 }
 
@@ -380,6 +407,9 @@ pub enum Fault {
     /// A stamp outside the run's window.
     #[error("slot {slot}: stamp {value} outside the run")]
     Stamp { slot: u8, value: i64 },
+    /// A duration of 0, past [`MAX_FRAME_US`], or whose end overflows.
+    #[error("slot {slot}: a duration of {value}")]
+    Duration { slot: u8, value: u64 },
     /// A slot that changed while its frame was copied.
     #[error("slot {slot}: changed while it was read")]
     Changed { slot: u8 },
@@ -400,6 +430,7 @@ struct Found {
     seq: u64,
     run: u64,
     stamp: i64,
+    duration: i64,
 }
 
 impl Found {
@@ -649,6 +680,7 @@ impl Reader {
         Ok(Frame {
             seq: c.seq,
             stamp: c.stamp,
+            duration: c.duration,
         })
     }
 
@@ -705,6 +737,8 @@ impl Reader {
             Pick::Due(due) => published.filter(|a| a.stamp <= due).max_by_key(|a| a.seq),
             Pick::First => published.min_by_key(|a| a.seq),
         };
+        let after = chosen.map_or(0, |c| c.seq);
+        let left = current().any(|a| a.seq <= committed && a.seq > after);
         let due = chosen.copied().map(|chosen| {
             let mut up_to = [None; SLOTS];
             for (u, a) in up_to.iter_mut().zip(&found) {
@@ -712,7 +746,7 @@ impl Reader {
             }
             Due { chosen, up_to }
         });
-        Ok(Peek { due, freed })
+        Ok(Peek { due, freed, left })
     }
 
     /// Slot `slot`'s published frame, checked, or `None` while it holds
@@ -748,18 +782,25 @@ impl Reader {
                 value: run,
             });
         }
+        let stamp = load(S_STAMP)?.cast_signed();
+        let value = load(S_DURATION)?;
+        let duration = value.cast_signed();
+        if !(1..=MAX_FRAME_US).contains(&duration) || stamp.checked_add(duration).is_none() {
+            return Err(Fault::Duration { slot: index, value });
+        }
         Ok(Some(Found {
             slot,
             seq: load(S_SEQ)?,
             run,
-            stamp: load(S_STAMP)?.cast_signed(),
+            stamp,
+            duration,
         }))
     }
 
     /// Copies `c`'s frame into `sink` at `pitch`, word by word through a
     /// stack buffer, then reads its slot's words again and checks they still
-    /// name that frame: the same state, sequence, run, stamp, index and frame
-    /// size. A change undone before this second read goes unseen.
+    /// name that frame: the same state, sequence, run, stamp, duration,
+    /// index and frame size. A change undone before this second read goes unseen.
     fn copy<W: Words + ?Sized>(
         &self,
         ring: &W,
@@ -831,6 +872,7 @@ impl Reader {
             && load(S_SEQ) == Some(c.seq)
             && load(S_RUN) == Some(c.run)
             && load(S_STAMP) == Some(c.stamp.cast_unsigned())
+            && load(S_DURATION) == Some(c.duration.cast_unsigned())
             && load(S_INDEX) == Some(wide(c.slot))
             && load(S_BYTES) == Some(wide(self.geometry.frame_bytes()));
         if same {
@@ -974,8 +1016,8 @@ impl Writer {
         })
     }
 
-    /// Publishes `frame` in `slot` as sequence `seq` of run `run`, stamped
-    /// `stamp`: writes its bytes and then the slot's words, marks it ready
+    /// Publishes `frame` in `slot` as sequence `seq` of run `run`, at
+    /// `stamp` (its stamp and duration): writes its bytes and then the slot's words, marks it ready
     /// once all are written, and then raises the watermark to `seq`. Frames
     /// are published in sequence order, a run's after the command that
     /// starts it and never one of an earlier run after it (the module's
@@ -992,7 +1034,7 @@ impl Writer {
         frame: &[u8],
         seq: u64,
         run: u64,
-        stamp: i64,
+        stamp: Stamp,
     ) -> Result<(), Refused> {
         if frame.len() != self.geometry.frame_bytes() {
             return Err(Refused::Frame(frame.len()));
@@ -1021,11 +1063,11 @@ impl Writer {
         let fields = [
             (S_SEQ, seq),
             (S_RUN, run),
-            (S_STAMP, stamp.cast_unsigned()),
+            (S_STAMP, stamp.at.cast_unsigned()),
             (S_INDEX, wide(slot.0)),
             (S_BYTES, wide(frame.len())),
-            (S_RESERVED[0], 0),
-            (S_RESERVED[1], 0),
+            (S_DURATION, stamp.duration.cast_unsigned()),
+            (S_RESERVED, 0),
         ];
         for (i, v) in fields {
             word(ring, base + i)

@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use game::Preparation;
+use game::Rig as _;
 use skin_model::bga::BgaEntry;
 
 use super::{begin, imports, on_rig, polled, stage};
@@ -178,5 +179,184 @@ fn a_session_not_showing_the_bga_reads_nothing_and_is_ready_unwaited() {
         let seen = screens.bga.lock().unwrap();
         let table = seen.current().expect("published before ready");
         assert!(matches!(table.entries(), [BgaEntry::Picture(c)] if c.native == [640, 480]));
+    });
+}
+
+/// With no coordinator (the direct launch), the BGA job runs while the
+/// render thread prepares the attempt, so its video manifest reaches the
+/// render thread before that preparation answers (design.md "Load
+/// Pipeline"): a screen that answers only once a manifest has come, as a
+/// play's movie set does, is ready well inside its own deadline, with the
+/// chart's video file in the manifest.
+#[test]
+fn direct_play_waits_for_the_manifest() {
+    let _serial = imports::serial();
+    let (dir, l) = crate::imports::facts::tests::loaded_kept(
+        "#BMP01 a.png\n#BMP02 v.mp4\n#00104:0102\n",
+        "tapestry",
+    );
+    crate::bga::tests::png(dir.path(), "a.png", [64, 64], [200, 0, 0]);
+    std::fs::write(dir.path().join("v.mp4"), b"x").unwrap();
+    let screens = Installers::default();
+    screens.wait_manifest.store(true, Ordering::Release);
+    on_rig(l.chart(), &screens, false, |rig| {
+        rig.render
+            .set_timeouts(Duration::from_secs(2), Duration::from_secs(5));
+        let began = Instant::now();
+        let mut h = begin(rig, &l);
+        let ready = polled(rig, &mut h).unwrap();
+        assert_eq!(ready, Preparation::Ready);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(*screens.manifests.lock().unwrap(), [1], "the video's file");
+        let log = screens.log();
+        let manifest = log.iter().position(|l| l.ends_with(" manifest"));
+        let prepared = log.iter().position(|l| l.contains(" prepare "));
+        assert!(manifest.is_some() && prepared.is_some(), "{log:?}");
+    });
+}
+
+/// Sets the BGA job's per-read delay, and clears it when dropped.
+struct ReadDelay;
+
+impl ReadDelay {
+    fn set(ms: u64) -> Self {
+        crate::bga::READ_DELAY_MS.store(ms, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ReadDelay {
+    fn drop(&mut self) {
+        crate::bga::READ_DELAY_MS.store(0, Ordering::SeqCst);
+    }
+}
+
+/// With a coordinator (song selection), a chart chosen while the job of
+/// the chart before is still reading (it reads on for 800 ms after its
+/// choice is left) has its own job begin as soon as that one ends, while
+/// its screen is prepared: the screen, which answers only once a manifest
+/// has come, as a play's movie set does, answers well inside the
+/// preparation's deadline, with the chosen chart's video file in the
+/// manifest (design.md "Load Pipeline", movies at READY).
+#[test]
+fn a_menu_preparation_starts_its_bga_job_while_its_screen_waits() {
+    let _serial = imports::serial();
+    let (_dir_a, a) = chart_with_bga();
+    let (dir_b, b) = crate::imports::facts::tests::loaded_kept(
+        "#BMP01 a.png\n#BMP02 v.mp4\n#00104:0102\n",
+        "tapestry",
+    );
+    crate::bga::tests::png(dir_b.path(), "a.png", [64, 64], [200, 0, 0]);
+    std::fs::write(dir_b.path().join("v.mp4"), b"x").unwrap();
+    let list = tempfile::tempdir().unwrap();
+    let screens = Installers::default();
+    screens.wait_manifest.store(true, Ordering::Release);
+    on_rig(a.chart(), &screens, false, |rig| {
+        let _let_go = LetGo;
+        let (sel, _) = crate::selection::tests::tree(list.path(), &[&["b.bms"]]);
+        rig.selection = Some(sel);
+        rig.render
+            .set_timeouts(Duration::from_secs(5), Duration::from_secs(10));
+        // Chart A chosen: its job held past its array's begin, then let go
+        // into a read that takes 800 ms whatever happens meanwhile.
+        HOLD.store(true, Ordering::Release);
+        let delay = ReadDelay::set(800);
+        rig.chart_images_at_choice(&a);
+        super::until("A's job held", || crate::bga::HELD.load(Ordering::Acquire));
+        HOLD.store(false, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(delay);
+        // Chart B chosen and prepared while A's job still reads.
+        rig.bga.renew();
+        screens.manifests.lock().unwrap().clear();
+        let began = Instant::now();
+        let mut h = begin(rig, &b);
+        let ready = polled(rig, &mut h).unwrap();
+        assert_eq!(ready, Preparation::Ready);
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(*screens.manifests.lock().unwrap(), [1], "B's video file");
+    });
+}
+
+/// Holds each BGA read at its gate, and lets it go when dropped.
+struct ReadGate;
+
+impl ReadGate {
+    fn set() -> Self {
+        crate::bga::READ_GATE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ReadGate {
+    fn drop(&mut self) {
+        crate::bga::READ_GATE.store(false, Ordering::Release);
+    }
+}
+
+/// A quit pending as the screen's wait looks at the BGA job begins no job:
+/// with the job of the chart before ended while the chosen chart's screen
+/// waits, the wait stops on the quit and the chosen chart's job is not
+/// begun.
+#[test]
+fn a_stopped_screen_wait_begins_no_bga_job() {
+    let _serial = imports::serial();
+    let (_dir_a, a) = chart_with_bga();
+    let (dir_b, b) = crate::imports::facts::tests::loaded_kept(
+        "#BMP01 a.png\n#BMP02 v.mp4\n#00104:0102\n",
+        "tapestry",
+    );
+    crate::bga::tests::png(dir_b.path(), "a.png", [64, 64], [200, 0, 0]);
+    std::fs::write(dir_b.path().join("v.mp4"), b"x").unwrap();
+    let list = tempfile::tempdir().unwrap();
+    let screens = Installers::default();
+    screens.wait_manifest.store(true, Ordering::Release);
+    on_rig(a.chart(), &screens, false, |rig| {
+        let _let_go = LetGo;
+        let (sel, _) = crate::selection::tests::tree(list.path(), &[&["b.bms"]]);
+        rig.selection = Some(sel);
+        rig.render
+            .set_timeouts(Duration::from_secs(5), Duration::from_secs(10));
+        // Chart A's job held inside a read, whatever happens meanwhile;
+        // chart B chosen and prepared up to its screen.
+        let gate = ReadGate::set();
+        rig.chart_images_at_choice(&a);
+        super::until("A's read held", || {
+            crate::bga::READ_WAITING.load(Ordering::Acquire)
+        });
+        // A's manifest, sent before its reads, is not B's.
+        super::until("A's manifest", || {
+            !screens.manifests.lock().unwrap().is_empty()
+        });
+        screens.manifests.lock().unwrap().clear();
+        rig.bga.renew();
+        let mut h = begin(rig, &b);
+        let began = Instant::now();
+        // Its screen's wait looks at the job at least once while A reads.
+        let mut waited = false;
+        while !waited {
+            assert!(
+                began.elapsed() < super::watchdog(),
+                "never reached its screen"
+            );
+            waited = stage(rig) == "screen";
+            let until = Instant::now() + Duration::from_millis(100);
+            let polled = rig.poll_preparation(&mut h, until);
+            assert!(matches!(polled, Ok(game::PrepPoll::Pending)), "{polled:?}");
+        }
+        assert_eq!(stage(rig), "screen");
+        assert!(!rig.bga.obsolete_ended(), "A's job still reads");
+        // The quit pending, and A's job ended, its end not yet taken.
+        rig.controls.command(game::Command::Quit);
+        drop(gate);
+        super::until("A's job ended", || rig.bga.obsolete_ended());
+        let (begun, _) = rig.bga.counts();
+        assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Cancelled);
+        assert_eq!(rig.bga.counts().0, begun, "no job begun");
     });
 }

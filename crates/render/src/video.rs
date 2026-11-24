@@ -34,9 +34,13 @@ pub const FLAG_VIDEO_BT601: u32 = 1 << 21;
 /// The movie's range is full (else limited).
 pub const FLAG_VIDEO_FULL: u32 = 1 << 22;
 
-/// The movies a screen plays at most (design.md "Rendering and Skins",
-/// skin movies): one slot each.
-pub const MAX_MOVIES: u32 = 2;
+/// The movie slots of a screen (design.md "Rendering and Skins", skin
+/// movies): the first two for the skin's movies, the other two for the
+/// chart's videos (BGA).
+pub const MAX_MOVIES: u32 = skin_model::movie::SLOTS as u32;
+
+/// The planes the video group binds: three a slot.
+const PLANES: usize = 3 * skin_model::movie::SLOTS;
 
 /// The uv of a movie's whole frame: its planes are its own size.
 pub const VIDEO_UV: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
@@ -46,19 +50,29 @@ pub(crate) const GROUP: u32 = 2;
 
 /// The video group's layout: per slot, its Y, U and V planes.
 pub(crate) fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let plane = |binding| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    };
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("video"),
-        entries: &[plane(0), plane(1), plane(2), plane(3), plane(4), plane(5)],
+        entries: &entries(),
+    })
+}
+
+/// The video group's layout entries: slot `i`'s Y, U and V planes at
+/// bindings `3i`, `3i + 1` and `3i + 2`.
+pub(crate) fn entries() -> [wgpu::BindGroupLayoutEntry; PLANES] {
+    let mut binding = 0;
+    [(); PLANES].map(|()| {
+        let entry = wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        binding += 1;
+        entry
     })
 }
 
@@ -149,7 +163,7 @@ impl Video {
     /// the 1×1 stand-in.
     pub(crate) fn new(gpu: &Gpu, layout: &wgpu::BindGroupLayout) -> Self {
         let blank = Movie::sized(gpu, 1, 1);
-        let movies = [None, None];
+        let movies = std::array::from_fn(|_| None);
         let bind = bind(gpu, layout, &blank, &movies);
         Self {
             layout: layout.clone(),
@@ -161,7 +175,7 @@ impl Video {
 
     /// Replaces slot `slot`'s planes and buffer with ones of a movie of
     /// `width` × `height`: a movie's admission, not a frame's upload. The
-    /// other slot keeps its planes, its frame and its queued copy.
+    /// other slots keep their planes, their frames and their queued copies.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn reserve(&mut self, gpu: &Gpu, slot: u32, width: u32, height: u32) {
         let Some(m) = self.movies.get_mut(slot as usize) else {
@@ -172,7 +186,7 @@ impl Video {
     }
 
     /// Releases slot `slot`'s planes and buffer, its movie or its screen
-    /// gone: the slot binds the stand-in again. The other slot keeps its
+    /// gone: the slot binds the stand-in again. The other slots keep their
     /// own.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn release(&mut self, gpu: &Gpu, slot: u32) {
@@ -283,26 +297,22 @@ fn bind(
     movies: &[Option<Movie>; MAX_MOVIES as usize],
 ) -> wgpu::BindGroup {
     let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-    let planes = |m: &Option<Movie>| {
-        let m = m.as_ref().unwrap_or(blank);
-        [view(&m.y), view(&m.u), view(&m.v)]
-    };
-    let [m0, m1] = movies;
-    let [[y0, u0, v0], [y1, u1, v1]] = [planes(m0), planes(m1)];
-    let entry = |binding, view| wgpu::BindGroupEntry {
-        binding,
-        resource: wgpu::BindingResource::TextureView(view),
-    };
+    let views: [wgpu::TextureView; PLANES] = std::array::from_fn(|i| {
+        let m = movies.get(i / 3).and_then(Option::as_ref).unwrap_or(blank);
+        view([&m.y, &m.u, &m.v].get(i % 3).copied().unwrap_or(&m.y))
+    });
+    let mut binding = 0;
+    let entries = views.each_ref().map(|view| {
+        let entry = wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        };
+        binding += 1;
+        entry
+    });
     gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("video"),
         layout,
-        entries: &[
-            entry(0, &y0),
-            entry(1, &u0),
-            entry(2, &v0),
-            entry(3, &y1),
-            entry(4, &u1),
-            entry(5, &v1),
-        ],
+        entries: &entries,
     })
 }

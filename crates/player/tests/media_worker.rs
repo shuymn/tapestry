@@ -319,6 +319,14 @@ const READY: u64 = 2;
 /// A frame taken from a ring.
 struct Taken {
     stamp: i64,
+    #[cfg_attr(
+        not(feature = "dev-tools"),
+        expect(
+            dead_code,
+            reason = "the duration tests generate their clips with dev-tools"
+        )
+    )]
+    duration: i64,
     bytes: Vec<u8>,
 }
 
@@ -368,6 +376,7 @@ fn take_to_last(
         if let Some(frame) = ring.poll(due) {
             taken.push(Taken {
                 stamp: frame.stamp,
+                duration: frame.duration,
                 bytes: ring.staged(),
             });
             due = frame.stamp + interval * 3 / 2;
@@ -395,6 +404,7 @@ fn take_one(worker: &Worker, ring: &mut Ring, due: i64) -> Taken {
         if let Some(frame) = ring.poll(due) {
             return Taken {
                 stamp: frame.stamp,
+                duration: frame.duration,
                 bytes: ring.staged(),
             };
         }
@@ -483,7 +493,10 @@ fn worker_operations_succeed_under_the_recipe() {
         at: 2_000_000,
     });
     let landed = match worker.reply() {
-        Reply::Sought { landed, .. } => landed,
+        Reply::Sought {
+            landed: Some(landed),
+            ..
+        } => landed,
         other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
     };
     assert!(take_one(&worker, &mut ring, landed).stamp >= 2_000_000);
@@ -651,7 +664,7 @@ fn worker_seek_lands_on_target_after_back_off() {
             id: worker.last,
             player: 3,
             run,
-            landed: 1_500_000,
+            landed: Some(1_500_000),
             attempts: 2,
         },
         "the worker's log:\n{}",
@@ -969,7 +982,10 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     let run = ring.start_run(at);
     worker.send(&Order::Seek { player: 1, run, at });
     let landed = match worker.reply() {
-        Reply::Sought { landed, .. } => landed,
+        Reply::Sought {
+            landed: Some(landed),
+            ..
+        } => landed,
         other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
     };
     assert_eq!(landed, at);
@@ -978,6 +994,70 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     std::thread::sleep(Duration::from_millis(200));
     let taken = take_seq(&worker, &mut ring, landed);
     assert_eq!((taken.1, taken.2), (at, 24));
+    worker.close(1);
+}
+
+/// Every seek is answered (design.md "Rendering and Skins", video frames):
+/// one that finds no frame at or after its time by an answer with no
+/// landing, then its run's end; one that finds a frame by its landing,
+/// though the run before had ended.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn every_seek_is_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two seconds at 24 fps.
+    let path = gen_clip(dir.path(), "e.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let empty = |worker: &mut Worker, ring: &mut Ring| {
+        let run = ring.start_run(10_000_000);
+        worker.send(&Order::Seek {
+            player: 1,
+            run,
+            at: 10_000_000,
+        });
+        let sought = Reply::Sought {
+            id: worker.last,
+            player: 1,
+            run,
+            landed: None,
+            attempts: 0,
+        };
+        for want in [sought, Reply::Ended { player: 1, run }] {
+            assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+        }
+    };
+    // Past the clip's end, while run 1 decodes.
+    empty(&mut worker, &mut ring);
+    // Inside the clip, after that run ended: a landing.
+    let at = stamp_of(24, 24);
+    let run = ring.start_run(at);
+    worker.send(&Order::Seek { player: 1, run, at });
+    assert!(
+        matches!(
+            worker.reply(),
+            Reply::Sought { id, player: 1, run: r, landed: Some(l), .. }
+                if id == worker.last && r == run && l == at
+        ),
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    assert_eq!(take_seq(&worker, &mut ring, at).1, at);
+    // Past the end again.
+    empty(&mut worker, &mut ring);
     worker.close(1);
 }
 
@@ -1471,12 +1551,25 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
             run,
             at: 10_000_000,
         });
-        let want = if seam {
-            refused(2)
+        if seam {
+            assert_eq!(
+                worker.reply(),
+                refused(2),
+                "the worker's log:\n{}",
+                worker.log()
+            );
         } else {
-            Reply::Ended { player: 2, run }
-        };
-        assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+            let sought = Reply::Sought {
+                id: worker.last,
+                player: 2,
+                run,
+                landed: None,
+                attempts: 0,
+            };
+            for want in [sought, Reply::Ended { player: 2, run }] {
+                assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+            }
+        }
         for player in [1, 2] {
             worker.close(player);
         }
@@ -1936,7 +2029,10 @@ fn worker_decodes_zlib_compressed_containers() {
             at: 2_000_000,
         });
         let landed = match worker.reply() {
-            Reply::Sought { landed, .. } => landed,
+            Reply::Sought {
+                landed: Some(landed),
+                ..
+            } => landed,
             other => panic!("{name}: {other:?}; the worker's log:\n{}", worker.log()),
         };
         let at = take_one(&worker, &mut ring, landed);
@@ -3719,4 +3815,306 @@ fn a_worker_ending_with_the_watchers_code_is_its_own_end() {
     // SAFETY: the worker's process handle, which has every access.
     unsafe { TerminateProcess(worker.process(), verdict::ENDED_BY_MESSAGE) }.unwrap();
     assert_eq!(ended(&worker), End::Exited(verdict::ENDED_BY_MESSAGE));
+}
+
+/// A point a test holds the watcher at, in its hook before each of its own
+/// terminations, until the test opens it (60 s at most): how many times the
+/// watcher reached it.
+struct Hold {
+    reached: std::sync::atomic::AtomicUsize,
+    open: std::sync::atomic::AtomicBool,
+}
+
+impl Hold {
+    const fn new() -> Self {
+        Self {
+            reached: std::sync::atomic::AtomicUsize::new(0),
+            open: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The watcher's side: counts itself and waits for the test.
+    fn pass(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.reached.fetch_add(1, Ordering::AcqRel);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.open.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn reached(&self) -> usize {
+        self.reached.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn open(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// How long the game's termination for a hang may take to end a worker
+/// while the watcher is held: the call ends the job's process at once, and
+/// the rest is slack for a loaded machine. A termination left to the held
+/// watcher ends nothing until it is let go.
+const HUNG_BOUND: Duration = Duration::from_secs(5);
+
+/// The hold of the test that spares a closing peer.
+#[cfg(feature = "dev-tools")]
+static SPARE_HOLD: Hold = Hold::new();
+
+#[cfg(feature = "dev-tools")]
+fn hold_for_spare(_: HANDLE) {
+    SPARE_HOLD.pass();
+}
+
+/// The hold of the test that bounds the game's termination.
+static BOUND_HOLD: Hold = Hold::new();
+
+fn hold_for_bound(_: HANDLE) {
+    BOUND_HOLD.pass();
+}
+
+/// Opens file `a` as player 1 and `b` as player 2 in a worker launched
+/// under `setup`, which reads the two opens only, closes player 2 for a
+/// reason not its file's ([`media_host::Worker::spare`]), the close never
+/// read, ends the worker itself with exit `own` first if given, then has
+/// the game terminate it for a hang and reaps it: its end and the players
+/// that failed.
+#[cfg(feature = "dev-tools")]
+fn spare_and_end(
+    stage: &Stage,
+    setup: &Setup,
+    files: [&Path; 2],
+    own: Option<u32>,
+    strikes: &mut Strikes,
+) -> (End, Vec<u8>) {
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    let mut worker = stage.launch(setup).unwrap();
+    worker
+        .open(1, &std::fs::File::open(files[0]).unwrap(), strikes)
+        .unwrap();
+    worker
+        .open(2, &std::fs::File::open(files[1]).unwrap(), strikes)
+        .unwrap();
+    worker.close(2).unwrap();
+    worker.spare(2);
+    if let Some(code) = own {
+        // SAFETY: the worker's process handle, which has every access.
+        unsafe { TerminateProcess(worker.process(), code) }.unwrap();
+        assert_eq!(worker.wait_exit(REPLY), Some(code));
+    }
+    worker.terminate_hung();
+    assert_eq!(
+        worker.wait_exit(HUNG_BOUND),
+        Some(media_host::EXIT_HUNG),
+        "{:?}",
+        worker.watch_events()
+    );
+    let deadline = Instant::now() + REPLY;
+    let mut failed = Vec::new();
+    loop {
+        if let Some(end) = worker.reap(strikes, |p| failed.push(p)) {
+            return (end, failed);
+        }
+        assert!(Instant::now() < deadline, "{:?}", worker.watch_events());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A peer closed for its peer's loss in a worker the game terminates for
+/// a hang is not struck, on the game's own record: the system accepted its
+/// termination, and the worker ended with its code. The watcher takes no
+/// part: it is held at any termination of its own, and reaches none. The
+/// other file, open when the worker ended, is struck. The control: a worker
+/// that ends itself with that very code before the game looks gets no such
+/// record, and both its files are struck.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_hang_termination_the_game_made_spares_a_closing_peer() {
+    let a_path = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let b_path = root().join("crates/player/tests/media/zlib/plain.mov");
+    let id = |path: &Path| FileId::of(&std::fs::File::open(path).unwrap()).unwrap();
+    let (a, b) = (id(&a_path), id(&b_path));
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    let held = watch::Variation {
+        before_terminate: Some(hold_for_spare),
+        ..watch::Variation::default()
+    };
+    let setup = recipe()
+        .args_of(&["--dev-serve", "deaf=2"])
+        .watching_as(held);
+    let files = [a_path.as_path(), b_path.as_path()];
+    let ours = spare_and_end(&stage, &setup, files, None, &mut strikes);
+    assert_eq!(ours, (End::Exited(media_host::EXIT_HUNG), vec![1, 2]));
+    assert_eq!((strikes.of(a), strikes.of(b)), (1, 0));
+    assert_eq!(SPARE_HOLD.reached(), 0);
+
+    let own = Some(media_host::EXIT_HUNG);
+    let its_own = spare_and_end(&stage, &setup, files, own, &mut strikes);
+    assert_eq!(its_own, (End::Exited(media_host::EXIT_HUNG), vec![1, 2]));
+    assert_eq!((strikes.of(a), strikes.of(b)), (2, 1));
+    assert_eq!(SPARE_HOLD.reached(), 0);
+    SPARE_HOLD.open();
+}
+
+/// The game's termination for a hang ends the worker whatever its watcher
+/// is doing: the watcher is held inside a memory termination of its own
+/// (on the job's message, held just before its call), and the worker's
+/// process still ends within [`HUNG_BOUND`] of the game's call. Let go,
+/// the watcher records the end with the game's code, which its own
+/// termination did not make, as the worker's own.
+// Covers: T02
+#[test]
+fn a_hang_termination_ends_the_worker_while_its_watcher_is_held() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+
+    let stage = Stage::new();
+    let held = watch::Variation {
+        before_terminate: Some(hold_for_bound),
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(held)).unwrap();
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    let deadline = Instant::now() + REPLY;
+    while BOUND_HOLD.reached() == 0 {
+        assert!(Instant::now() < deadline, "{:?}", worker.watch_events());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let asked = Instant::now();
+    worker.terminate_hung();
+    let code = worker.wait_exit(HUNG_BOUND);
+    let took = asked.elapsed();
+    // Still held in its first termination, which it has not made.
+    let reached = BOUND_HOLD.reached();
+    BOUND_HOLD.open();
+    eprintln!("the worker ended {took:?} after the game's call");
+    assert_eq!(code, Some(media_host::EXIT_HUNG), "{took:?}");
+    assert_eq!(reached, 1);
+    assert_eq!(ended(&worker), End::Exited(media_host::EXIT_HUNG));
+    assert_eq!(
+        worker.wait_exit(Duration::ZERO),
+        Some(media_host::EXIT_HUNG)
+    );
+}
+
+/// Each frame goes out with its duration (design.md "Rendering and
+/// Skins", video frames): a constant-rate clip's durations tile its
+/// stamps, the next frame's stamp minus its own to the µs, and the last
+/// one's is the frame period.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_frame_is_published_with_its_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "d.mpg", LOOPED);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(1, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 1
+        }
+    );
+    let taken = take_all(&worker, &mut ring, 1, 0, stamp_of(1, 24));
+    assert_eq!(taken.len(), 48, "every frame");
+    let durations: Vec<i64> = taken.iter().map(|t| t.duration).collect();
+    let mut want: Vec<i64> = taken.windows(2).map(|w| w[1].stamp - w[0].stamp).collect();
+    want.push(stamp_of(48, 24) - stamp_of(47, 24));
+    assert_eq!(
+        durations,
+        want,
+        "the worker's log:
+{}",
+        worker.log()
+    );
+    assert!(want.contains(&41_666) && want.contains(&41_667), "{want:?}");
+    worker.close(1);
+}
+
+/// A frame that states no duration of its own lasts the stream's average
+/// period (design.md "Rendering and Skins", video frames): motion JPEG in
+/// Matroska states none, so each frame, the last one included, is
+/// published lasting its period in the container's 1 ms ticks, 40 ms at
+/// 25 fps and 42 ms at 24 fps, and a chart video's end comes after its
+/// last frame has shown for a period.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_frame_with_no_duration_of_its_own_lasts_the_average_period() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, spec, rate) in [
+        ("j25.mkv", "mjpeg matroska 176x96 25 30 1", 25),
+        ("j24.mkv", "mjpeg matroska 176x96 24 30 1", 24),
+    ] {
+        let path = gen_clip(dir.path(), name, spec);
+        let mut worker = Worker::start(&[]);
+        let probe = worker.open(1, &path);
+        assert!(matches!(probe, Reply::Probed { .. }), "{name}: {probe:?}");
+        let mut ring = Ring::new(176, 96);
+        assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
+        let taken = take_all(&worker, &mut ring, 1, 0, 1_000_000 / rate);
+        assert_eq!(taken.len(), 30, "{name}: every frame");
+        let durations: Vec<i64> = taken.iter().map(|t| t.duration).collect();
+        // The 41.7 ms period at 24 fps rounds to 42 of the container's
+        // ticks (the stamps alone choose frames).
+        let want = if rate == 25 { 40_000 } else { 42_000 };
+        assert_eq!(durations, [want; 30], "{name}: {}", worker.log());
+        worker.close(1);
+    }
+}
+
+/// A seek's landing goes out with its own duration: frame 24 of a 24 fps
+/// clip, sought at 1 s, lasts until frame 25's stamp.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_seek_landing_carries_its_own_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "s.mpg", LOOPED);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(2, &path);
+    assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+    let mut ring = Ring::new(320, 240);
+    assert_eq!(
+        worker.play(2, &ring),
+        Reply::Playing {
+            id: worker.last,
+            player: 2
+        }
+    );
+    let first = take_one(&worker, &mut ring, 0);
+    assert_eq!((first.stamp, first.duration), (0, stamp_of(1, 24)));
+    let run = ring.start_run(1_000_000);
+    worker.send(&Order::Seek {
+        player: 2,
+        run,
+        at: 1_000_000,
+    });
+    assert!(
+        matches!(
+            worker.reply(),
+            Reply::Sought {
+                landed: Some(1_000_000),
+                ..
+            }
+        ),
+        "the worker's log:
+{}",
+        worker.log()
+    );
+    let landed = take_one(&worker, &mut ring, 1_000_000);
+    assert_eq!(
+        (landed.stamp, landed.duration, painted(&landed.bytes, 320)),
+        (1_000_000, stamp_of(25, 24) - 1_000_000, 24)
+    );
+    worker.close(2);
 }

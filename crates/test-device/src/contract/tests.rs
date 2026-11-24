@@ -190,7 +190,7 @@ fn rule(
     inputs: Vec<File>,
 ) -> CheckRule {
     CheckRule {
-        id,
+        id: id.into(),
         producer,
         outcome,
         inputs,
@@ -1726,4 +1726,82 @@ fn a_run_of_another_runner_commit_fails() {
         &check(&Single::expectation(), s.dir.path(), "000000000000"),
         "role `run`: run.jsonl names runner commit `fedcba987654`, the reservation `000000000000`",
     );
+}
+
+/// A single run's expectation recast as a set's role: every rule names the
+/// role, each check id is the role's (`A1/n1.neutral`), and its own
+/// provenance is left out; a set composed of two roles and one provenance
+/// over both links has no problems, while keeping each role's provenance
+/// declares a check twice. An expectation with an inner run, or a set, is
+/// not a role.
+#[test]
+fn a_set_provenance_and_role_ids_pass_problems() {
+    let single = Single::expectation();
+    let a = single.as_role("A1").unwrap();
+    assert!(a.exits.iter().all(|e| e.role == "A1"));
+    assert!(
+        a.exits
+            .iter()
+            .filter_map(|e| e.spawn)
+            .all(|s| s.role == "A1")
+    );
+    assert!(a.records.iter().all(|r| r.role == "A1"));
+    let ids: Vec<&str> = a.checks.iter().map(|c| &*c.id).collect();
+    assert_eq!(ids, ["A1/n1.neutral", "A1/n1.shot"]);
+    assert!(
+        a.checks
+            .iter()
+            .flat_map(|c| c
+                .inputs
+                .iter()
+                .map(|f| f.role)
+                .chain(c.events.iter().map(|e| e.role)))
+            .all(|r| r == "A1")
+    );
+    let b = single.as_role("B1").unwrap();
+    let compose = |own_provenance: bool| {
+        let mut checks = vec![rule(
+            "provenance",
+            "judge",
+            Outcome::Pass,
+            vec![file("A1", LINK), file("B1", LINK)],
+        )];
+        for r in [&a, &b] {
+            if own_provenance {
+                checks.push(rule("provenance", "judge", Outcome::Pass, vec![]));
+            }
+            checks.extend(r.checks.iter().cloned());
+        }
+        Expectation {
+            row: "pair",
+            binding: Binding::Set,
+            roles: vec![
+                Role {
+                    name: "A1",
+                    row: "sink",
+                },
+                Role {
+                    name: "B1",
+                    row: "sink",
+                },
+            ],
+            exits: [&a, &b].iter().flat_map(|r| r.exits.clone()).collect(),
+            records: [&a, &b].iter().flat_map(|r| r.records.clone()).collect(),
+            checks,
+            negative: None,
+        }
+    };
+    assert_eq!(compose(false).problems(), Vec::<String>::new());
+    assert!(
+        compose(true)
+            .problems()
+            .contains(&"a check is declared twice".to_owned())
+    );
+    let mut inner = single.clone();
+    inner.roles.push(Role {
+        name: INNER,
+        row: "sink",
+    });
+    assert!(inner.as_role("A1").is_none());
+    assert!(compose(false).as_role("A1").is_none());
 }

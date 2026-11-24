@@ -20,6 +20,9 @@ struct Fake {
     geometry: Geometry,
     staged: AtomicBool,
     freed: AtomicU64,
+    want: AtomicU64,
+    ended: AtomicU64,
+    empty: AtomicU64,
 }
 
 impl Fake {
@@ -39,6 +42,9 @@ impl Fake {
             geometry,
             staged: AtomicBool::new(false),
             freed: AtomicU64::new(0),
+            want: AtomicU64::new(0),
+            ended: AtomicU64::new(0),
+            empty: AtomicU64::new(0),
         })
     }
 
@@ -46,17 +52,29 @@ impl Fake {
         *self.status.lock().unwrap() = status;
     }
 
-    fn loss(&self) -> Option<Loss> {
-        *self.loss.lock().unwrap()
-    }
-
     /// Publishes a frame of run 1 whose every byte is `id`.
     fn publish(&self, seq: u64, stamp: i64, id: u8) {
+        self.publish_run(seq, 1, stamp, 33_333, id);
+    }
+
+    /// Publishes a frame of run `run` stamped `stamp` lasting `duration`
+    /// whose every byte is `id`.
+    fn publish_run(&self, seq: u64, run: u64, stamp: i64, duration: i64, id: u8) {
         let writer = Writer::attach(self.words.as_slice()).unwrap();
         let slot = writer.claim(self.words.as_slice()).unwrap();
         let frame = vec![id; self.geometry.frame_bytes()];
         writer
-            .publish(self.words.as_slice(), slot, &frame, seq, 1, stamp)
+            .publish(
+                self.words.as_slice(),
+                slot,
+                &frame,
+                seq,
+                run,
+                skin_model::media::Stamp {
+                    at: stamp,
+                    duration,
+                },
+            )
             .unwrap();
     }
 }
@@ -106,6 +124,22 @@ impl Source for Fake {
     fn refused(&self) -> bool {
         self.loss() == Some(Loss::OverTotal)
     }
+
+    fn loss(&self) -> Option<Loss> {
+        *self.loss.lock().unwrap()
+    }
+
+    fn want(&self, run: u64) {
+        self.want.store(run, Ordering::SeqCst);
+    }
+
+    fn ended(&self) -> u64 {
+        self.ended.load(Ordering::SeqCst)
+    }
+
+    fn empty(&self) -> u64 {
+        self.empty.load(Ordering::SeqCst)
+    }
 }
 
 /// Planes that keep the luma rows each write took, by slot; a slot's
@@ -115,7 +149,7 @@ impl Source for Fake {
 struct Kept {
     reserved: Vec<[u32; 3]>,
     released: Vec<u32>,
-    luma: [Vec<u8>; 2],
+    luma: [Vec<u8>; SLOTS],
     refuse: bool,
     slow: Option<Duration>,
 }
@@ -156,7 +190,7 @@ impl Planes for Kept {
 }
 
 fn movies(a: Option<&Arc<Fake>>, b: Option<&Arc<Fake>>, start: Instant) -> Movies<Fake> {
-    Movies::new([a.cloned(), b.cloned()], start)
+    Movies::skin([a.cloned(), b.cloned()], start)
 }
 
 /// A selection frame's movie work at frame time `at`: the admission
@@ -170,7 +204,7 @@ fn tick(m: &mut Movies<Fake>, planes: &mut dyn Planes, at: i64, now: Instant) ->
 }
 
 /// The slots `shows` gives a frame to: those a build draws.
-fn drawn(shows: MovieShows) -> [bool; MAX_MOVIES] {
+fn drawn(shows: MovieShows) -> [bool; SLOTS] {
     shows.map(|s| matches!(s, MovieShow::Frame { .. }))
 }
 
@@ -188,7 +222,12 @@ fn each_state_shows_what_it_should() {
     // Both pending: nothing.
     assert_eq!(
         tick(&mut m, &mut planes, 0, start),
-        [MovieShow::Nothing, MovieShow::Nothing]
+        [
+            MovieShow::Nothing,
+            MovieShow::Nothing,
+            MovieShow::Nothing,
+            MovieShow::Nothing
+        ]
     );
     // Slot 1 live while slot 0 is pending (the session judged its total):
     // admitted, its frame taken and shown.
@@ -308,7 +347,7 @@ fn a_ring_fault_loses_the_movie_in_that_frame_and_it_stays_black() {
     let mut planes = Kept::default();
     assert!(matches!(
         tick(&mut m, &mut planes, 0, start),
-        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }, ..]
     ));
     // Slot 1's state word set to one the protocol has not.
     let state = a.geometry.frame_start(1) - SLOT_HEADER_WORDS;
@@ -460,13 +499,13 @@ fn a_movie_s_clock_starts_only_at_a_presented_frame_that_draws_it() {
     m.admit(&mut planes, start);
     let shows = m.frame(&mut planes, 1_000_000, start);
     assert!(matches!(shows[0], MovieShow::Frame { .. }));
-    m.presented(true, [false, false]);
+    m.presented(true, [false, false, false, false]);
     let _ = m.frame(&mut planes, 1_100_000, start);
-    m.presented(false, [true, false]);
-    m.presented(true, [true, false]);
+    m.presented(false, [true, false, false, false]);
+    m.presented(true, [true, false, false, false]);
     let _ = m.frame(&mut planes, 2_000_000, start);
     assert!(holds(&planes, 0, 1), "frame 0 until its clock starts");
-    m.presented(true, [true, false]);
+    m.presented(true, [true, false, false, false]);
     let _ = m.frame(&mut planes, 2_000_000 + period - 1, start);
     assert!(holds(&planes, 0, 1));
     let _ = m.frame(&mut planes, 2_000_000 + period, start);
@@ -499,9 +538,9 @@ fn a_movie_keeps_its_clock_through_ready_while_its_peer_starts_there() {
     let (_, shows) = m.poll(&mut planes, 1_000_000, start);
     assert!(matches!(
         shows,
-        [MovieShow::Frame { .. }, MovieShow::Frame { .. }]
+        [MovieShow::Frame { .. }, MovieShow::Frame { .. }, ..]
     ));
-    m.presented(true, [true, false]);
+    m.presented(true, [true, false, false, false]);
     // READY, 150 ms on.
     let ready = 1_150_000;
     let shows = m.frame(&mut planes, ready, start);
@@ -557,7 +596,15 @@ fn a_take_crossing_the_deadline_expires_a_pending_peer_in_the_same_poll() {
     let (settled, shows) = m.prepare(&mut planes, now);
     assert_eq!(a.loss(), Some(Loss::Preparation));
     assert_eq!(b.loss(), Some(Loss::Preparation), "the pending peer");
-    assert_eq!(shows, [MovieShow::Lost, MovieShow::Lost]);
+    assert_eq!(
+        shows,
+        [
+            MovieShow::Lost,
+            MovieShow::Lost,
+            MovieShow::Nothing,
+            MovieShow::Nothing
+        ]
+    );
     assert!(settled);
 }
 
@@ -667,7 +714,12 @@ fn the_preparation_deadline_loses_what_is_not_settled() {
     let mut planes = Kept::default();
     assert_eq!(
         tick(&mut m, &mut planes, 0, deadline + Duration::from_millis(1)),
-        [MovieShow::Lost, MovieShow::Lost]
+        [
+            MovieShow::Lost,
+            MovieShow::Lost,
+            MovieShow::Nothing,
+            MovieShow::Nothing
+        ]
     );
 }
 
@@ -700,43 +752,82 @@ impl Planes for Preallocated {
 }
 
 /// The movie hook allocates nothing (design.md "Scope of No Allocation"):
-/// frames that peek a movie admitted at the boundary before them (its first
-/// frame by a first peek), take its due frames into the planes, show them
-/// and start its clock at the first presented, each counted on this thread
-/// whole, the take's sink included; with a positive control.
+/// play frames over all four slots, each counted on this thread whole, the
+/// take's sink included: the skin movies admitted at the boundary before
+/// them, their due frames taken and their clocks started at the first
+/// presented; the chart videos started on chart time, one restarted (its
+/// run started, wanted and the session woken by an unpark), the other
+/// ended at its last frame's end, their due frames taken. With a positive
+/// control.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn movie_upload_hook_alloc() {
     use crate::alloc_count::this_thread;
+    use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga, TimeUs};
     let start = Instant::now();
-    let a = Fake::new(64, 32);
-    a.set(Status::Live);
-    // The worker's four slots, published before the count.
-    for seq in 1..=4_u64 {
-        a.publish(
-            seq,
-            i64::try_from(seq).unwrap() * 16_667,
-            u8::try_from(seq).unwrap(),
-        );
+    let fakes: [Arc<Fake>; 4] = std::array::from_fn(|_| Fake::new(64, 32));
+    for (n, f) in fakes.iter().enumerate() {
+        f.set(Status::Live);
+        // Each ring's frames published before the count: the skin
+        // movies' four, the chart videos' three, a period of 16 667 µs.
+        let frames = if n < 2 { 4_u64 } else { 3 };
+        for seq in 1..=frames {
+            let k = i64::try_from(seq).unwrap();
+            let stamp = if n < 2 { k * 16_667 } else { (k - 1) * 16_667 };
+            f.publish_run(seq, 1, stamp, 16_667, u8::try_from(seq).unwrap());
+        }
     }
-    let mut m = movies(Some(&a), None, start);
+    // Slot 2's file starts at 0 and again at 50 ms, slot 3's at 0.
+    let ev = |t, id| BgaEvent {
+        time: TimeUs(t),
+        image: Some(BgaImageId(id)),
+    };
+    let image = |id| BgaImage {
+        id,
+        name: format!("{id}.mp4"),
+    };
+    let bga = ChartBga::new(
+        vec![image(1), image(2)],
+        vec![ev(0, 0), ev(50_000, 0)],
+        vec![ev(0, 1)],
+        vec![],
+    )
+    .unwrap();
+    let videos = ChartVideos::of(&bga, &[Some(2), Some(3)]);
+    let mut m = Movies::new(fakes.clone().map(Some), start);
+    m.set_chart(Arc::new(videos), i64::MIN);
+    m.set_waker(crate::media_host::session::Waker::new(
+        std::thread::current(),
+    ));
     let mut planes = Preallocated {
         bytes: vec![0; 64 * 32 * 2],
     };
     m.admit(&mut planes, start);
+    let (_, _) = m.prepare(&mut planes, start);
+    fakes[3].ended.store(1, Ordering::SeqCst);
     let before = this_thread();
-    let mut shown = 0;
+    let mut shown = [0; 4];
+    let mut last = MovieShows::default();
     for k in 1..=4_i64 {
-        let shows = m.frame(&mut planes, k * 16_667, start);
+        let at = k * 16_667;
+        let shows = m.play_frame(&mut planes, at, ChartAt { now: at, k: 20 }, start);
         m.presented(true, drawn(shows));
-        if matches!(shows[0], MovieShow::Frame { .. }) {
-            shown += 1;
+        for (n, s) in shows.iter().enumerate() {
+            if matches!(s, MovieShow::Frame { .. }) {
+                shown[n] += 1;
+            }
         }
+        last = shows;
     }
     let after = this_thread();
     assert_eq!(after - before, 0, "allocations");
-    assert_eq!(shown, 4, "each due frame taken and shown");
-    assert_eq!(planes.bytes[0], 4, "the newest frame's bytes");
+    assert_eq!(shown[..2], [4, 4], "each skin movie's due frames shown");
+    assert_eq!(m.wakes(), 1, "slot 2 restarted at 50 ms");
+    assert_eq!(fakes[2].want.load(Ordering::SeqCst), 2);
+    assert!(shown[2] == 4, "slot 2 held across its restart");
+    assert_eq!(last[3], MovieShow::Nothing, "slot 3 ended at 50 001 µs");
+    assert!(shown[3] >= 2, "slot 3's due frames shown before its end");
+    assert_eq!(planes.bytes[0], 4, "the last take: slot 1's fourth frame");
     // The positive control: an allocation on this thread is counted.
     let v = std::hint::black_box(vec![0_u8; 16]);
     assert!(this_thread() > after);
@@ -796,3 +887,6 @@ fn a_first_frame_stall_loses_the_movie_and_a_later_one_keeps_its_frame() {
     assert!(holds(&planes, 1, 60), "the due frame");
     assert_eq!(b.loss(), None);
 }
+
+#[cfg(feature = "dev-tools")]
+mod chart;

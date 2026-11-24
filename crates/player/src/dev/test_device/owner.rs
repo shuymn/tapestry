@@ -177,24 +177,41 @@ pub fn join_within(
     t.join().map_err(|_| format!("{what} panicked"))
 }
 
-/// The run an outer run in `set` reserved for `role` running `row`: the
-/// outer's run id (the inner's set), the inner's run id and its folder,
-/// which is made here (`create_dir`, so a role runs once). The reservation
-/// is the outer's `start` record, the first line of its `run.jsonl`.
+/// The run reserved in `set` for `role` running `row` on the device's build
+/// `build`: the reserving id (a set's id, or the outer run's id, the
+/// inner's set), the role's run id and its folder, which is made here
+/// (`create_dir`, so a role runs once). The reservation is the set's
+/// `reservation.jsonl` (read with the strict reader) when `set` holds one,
+/// else the outer run's `start` record, the first line of its `run.jsonl`;
+/// either must reserve `role` for `row` and `build`.
 ///
 /// # Errors
 ///
-/// No such reservation, or the folder exists.
-pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, String, PathBuf)> {
-    let text = std::fs::read_to_string(set.join(test_device::contract::RUN))
-        .with_context(|| format!("the reserving run in {}", set.display()))?;
-    let first = text.lines().next().unwrap_or_default();
-    let Ok(Run::Start(start)) = serde_json::from_str::<Run>(first) else {
-        anyhow::bail!("{}'s first record is not a `start`", set.display());
+/// No such reservation, another row or build, or the folder exists.
+pub fn reserved(
+    set: &Path,
+    role: &str,
+    row: &str,
+    build: &str,
+) -> anyhow::Result<(String, String, PathBuf)> {
+    let (id, reserved_build, inner) = match reservation(set)? {
+        Some(s) => (s.set, s.build, s.roles.into_iter().find(|r| r.role == role)),
+        None => {
+            let text = std::fs::read_to_string(set.join(test_device::contract::RUN))
+                .with_context(|| format!("the reserving run in {}", set.display()))?;
+            let first = text.lines().next().unwrap_or_default();
+            let Ok(Run::Start(start)) = serde_json::from_str::<Run>(first) else {
+                anyhow::bail!("{}'s first record is not a `start`", set.display());
+            };
+            (
+                start.run,
+                start.build,
+                start.inner.filter(|r| r.role == role),
+            )
+        }
     };
-    let outer = start.run;
-    let Some(inner) = start.inner.filter(|r| r.role == role) else {
-        anyhow::bail!("the run in {} reserved no role `{role}`", set.display());
+    let Some(inner) = inner else {
+        anyhow::bail!("{} reserves no role `{role}`", set.display());
     };
     if inner.row != row {
         anyhow::bail!(
@@ -202,9 +219,40 @@ pub fn reserved(set: &Path, role: &str, row: &str) -> anyhow::Result<(String, St
             inner.row
         );
     }
+    if reserved_build != build {
+        anyhow::bail!(
+            "{} is reserved for build `{reserved_build}`, not `{build}`",
+            set.display()
+        );
+    }
     let dir = set.join(&inner.dir);
     reserve(&dir)?;
-    Ok((outer, inner.run, dir))
+    Ok((id, inner.run, dir))
+}
+
+/// The set reserved in `dir`, if `dir` holds a `reservation.jsonl`, read
+/// as `check` reads it: one `reserved` record, whole.
+///
+/// # Errors
+///
+/// The file is there but does not read.
+pub fn reservation(dir: &Path) -> anyhow::Result<Option<test_device::evidence::Set>> {
+    use test_device::evidence::{self, Reservation};
+    let path = dir.join(test_device::contract::RESERVATION);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    let stream = evidence::read::<Reservation>(&bytes)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    stream
+        .finished(false)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    match stream.records.into_iter().next() {
+        Some(Reservation::Reserved(s)) => Ok(Some(s)),
+        None => anyhow::bail!("{} holds no reservation", path.display()),
+    }
 }
 
 /// Checks the recorder's `ready` against the child the runner spawned: the
@@ -383,20 +431,24 @@ mod tests {
             set,
             &json!({"role": "inner", "row": "sink", "run": id, "dir": "inner"}),
         );
-        let (outer, run, dir) = reserved(set, "inner", "sink").unwrap();
+        let (outer, run, dir) = reserved(set, "inner", "sink", "0123456789ab").unwrap();
         assert_eq!(outer, "a".repeat(32));
         assert_eq!(run, id);
         assert_eq!(dir, set.join("inner"));
         assert!(dir.is_dir());
         // A role runs once.
-        assert!(reserved(set, "inner", "sink").is_err());
+        assert!(reserved(set, "inner", "sink", "0123456789ab").is_err());
         // Another role or row is not reserved.
         trash_dir(&dir);
-        assert!(reserved(set, "other", "sink").is_err());
-        assert!(reserved(set, "inner", "p1").is_err());
+        assert!(reserved(set, "other", "sink", "0123456789ab").is_err());
+        assert!(reserved(set, "inner", "p1", "0123456789ab").is_err());
+        // Another build than the reserving run's.
+        let e = reserved(set, "inner", "sink", "ba9876543210").unwrap_err();
+        assert!(format!("{e:#}").contains("reserved for build"), "{e:#}");
+        assert!(!set.join("inner").exists());
         // No reservation at all.
         outer_start(set, &serde_json::Value::Null);
-        assert!(reserved(set, "inner", "sink").is_err());
+        assert!(reserved(set, "inner", "sink", "0123456789ab").is_err());
     }
 
     /// A join gives up after its wait, naming the thread, and succeeds once

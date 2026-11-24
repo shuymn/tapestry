@@ -942,12 +942,23 @@ impl PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
-            preparation_stops(
+            if preparation_stops(
                 rig.quitting(),
                 rig.controls.leaving(),
                 rig.input_failure(),
                 rig.audio_failure(),
-            )
+            ) {
+                return true;
+            }
+            // With a coordinator, the BGA job begins as soon as the job of
+            // the choice before ends, so its video manifest reaches the
+            // render thread while the attempt's movies still wait for it
+            // (design.md "Load Pipeline"); the direct launch ran it above.
+            // A wait that stops begins none.
+            if let Some(s) = &rig.selection {
+                rig.bga.step(Some((&s.coord, s.spawner)), &|| false);
+            }
+            false
         });
         self.adjust = adjust;
         let answered = answered?;
@@ -2911,6 +2922,26 @@ impl Rig for PlayerRig<'_> {
                     Some(staged) => prep.stage = self.after_image(&mut prep, skin, staged),
                 },
                 PrepStage::Screen(mut pending) => {
+                    // With no coordinator (the direct launch) the BGA job
+                    // runs here, on the game thread, so its video manifest
+                    // reaches the render thread while it prepares the
+                    // attempt, whose movies wait for it (design.md "Load
+                    // Pipeline"); with one, it runs beside since the
+                    // preparation began, or begins while this stage waits
+                    // once the job of the choice before ends. A play that
+                    // does not show the BGA sent its empty manifest as the
+                    // preparation began.
+                    if self.selection.is_none() && self.bga_session.shown() {
+                        let stops = || {
+                            preparation_stops(
+                                self.quitting(),
+                                self.controls.leaving(),
+                                self.input_failure(),
+                                self.audio_failure(),
+                            )
+                        };
+                        self.bga.clone().step(None, &stops);
+                    }
                     match self.poll_screen(&prep, &mut pending, deadline) {
                         None => {
                             prep.stage = PrepStage::Screen(pending);

@@ -26,6 +26,7 @@
 //! after that observer's kill, is a cut, and any other is the process
 //! ending by itself ([`ending`]).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -146,7 +147,9 @@ impl Count {
 /// must have, the files it reads and the observed events it reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckRule {
-    pub id: &'static str,
+    /// Its id: a literal for a row's own checks, or, in a set's composed
+    /// expectation, the role's name and the role row's id (`A1/p1.volumes`).
+    pub id: Cow<'static, str>,
     pub producer: &'static str,
     pub outcome: Outcome,
     pub inputs: Vec<File>,
@@ -235,7 +238,7 @@ impl Expectation {
                 crate::provenance::CHECK
             ));
         }
-        let ids: BTreeSet<&str> = self.checks.iter().map(|c| c.id).collect();
+        let ids: BTreeSet<&str> = self.checks.iter().map(|c| &*c.id).collect();
         if ids.len() != self.checks.len() {
             out.push("a check is declared twice".to_owned());
         }
@@ -249,6 +252,80 @@ impl Expectation {
             }
         }
         out
+    }
+}
+
+/// A single run's expectation recast as one role of a set: its exits,
+/// records and checks with its role renamed, each check's id prefixed with
+/// the role (`A1/p1.volumes`), and its own `provenance` left out, since the
+/// set states one provenance over every role's links.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsRole {
+    pub exits: Vec<ExitRule>,
+    pub records: Vec<RecordRule>,
+    pub checks: Vec<CheckRule>,
+}
+
+impl Expectation {
+    /// This expectation as role `role` of a set, or `None` when it is not a
+    /// single run's (one role, [`SINGLE`], with no inner run).
+    #[must_use]
+    pub fn as_role(&self, role: &'static str) -> Option<AsRole> {
+        if self.binding != Binding::Run || self.roles.iter().any(|r| r.name != SINGLE) {
+            return None;
+        }
+        let name = |r: &'static str| if r == SINGLE { role } else { r };
+        let exits = self
+            .exits
+            .iter()
+            .map(|e| ExitRule {
+                role: name(e.role),
+                spawn: e.spawn.map(|s| Spawned {
+                    role: name(s.role),
+                    ..s
+                }),
+                ..*e
+            })
+            .collect();
+        let records = self
+            .records
+            .iter()
+            .map(|r| RecordRule {
+                role: name(r.role),
+                ..*r
+            })
+            .collect();
+        let checks = self
+            .checks
+            .iter()
+            .filter(|c| c.id != crate::provenance::CHECK)
+            .map(|c| CheckRule {
+                id: Cow::Owned(format!("{role}/{}", c.id)),
+                producer: c.producer,
+                outcome: c.outcome,
+                inputs: c
+                    .inputs
+                    .iter()
+                    .map(|f| File {
+                        role: name(f.role),
+                        path: f.path,
+                    })
+                    .collect(),
+                events: c
+                    .events
+                    .iter()
+                    .map(|e| Event {
+                        role: name(e.role),
+                        ..*e
+                    })
+                    .collect(),
+            })
+            .collect();
+        Some(AsRole {
+            exits,
+            records,
+            checks,
+        })
     }
 }
 
@@ -1362,7 +1439,7 @@ fn check_verdicts(e: &Expectation, dir: &Path, id: &str, view: &View, report: &m
         }
     }
     for rule in &e.checks {
-        match verdicts.remove(rule.id).as_deref() {
+        match verdicts.remove(&*rule.id).as_deref() {
             None | Some([]) => report.add(format!("check `{}` is missing", rule.id)),
             Some([v]) => check_one(rule, v, dir, view, report),
             Some(more) => report.add(format!("check `{}` has {} verdicts", rule.id, more.len())),
@@ -1380,7 +1457,7 @@ fn check_one(
     view: &View,
     report: &mut Report,
 ) {
-    let id = rule.id;
+    let id = &rule.id;
     if v.producer.name != rule.producer {
         report.add(format!(
             "check `{id}` is produced by `{}`, the row declares `{}`",
@@ -1490,7 +1567,8 @@ fn is_hex(s: &str, len: usize) -> bool {
 }
 
 /// One folder name: no separator, not `.` or `..`.
-fn one_segment(s: &str) -> bool {
+#[must_use]
+pub fn one_segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', ':'])
 }
 

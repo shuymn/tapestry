@@ -44,12 +44,16 @@ const RING_RUN: usize = 2;
 const RING_STAMP: usize = 3;
 const RING_INDEX: usize = 4;
 const RING_BYTES: usize = 5;
-/// The first of a slot header's two reserved words.
-const RING_RESERVED: usize = 6;
+const RING_DURATION: usize = 6;
+/// A slot header's reserved word.
+const RING_RESERVED: usize = 7;
+/// How long the seeds' frames last, in µs.
+pub const RING_FRAME_US: i64 = 33_333;
 
 /// A frame ring of `size` ([`crate::RING_SIZES`], with
 /// [`crate::RING_SECOND_RUN`] in its run started) as the game sets it up,
-/// with `frames` published, each (sequence, run, stamp), then each of
+/// with `frames` published, each (sequence, run, stamp) lasting
+/// [`RING_FRAME_US`], then each of
 /// `words` (slot, slot header word, value) written over it: the input
 /// [`crate::ring_bytes`] reads at `due`.
 fn ring_seed(
@@ -58,7 +62,7 @@ fn ring_seed(
     frames: &[(u64, u64, i64)],
     words: &[(usize, usize, u64)],
 ) -> Vec<u8> {
-    use skin_model::media::{Geometry, Reader, SLOT_HEADER_WORDS, Writer};
+    use skin_model::media::{Geometry, Reader, SLOT_HEADER_WORDS, Stamp, Writer};
     use std::sync::atomic::{AtomicU64, Ordering};
     let [w, h] = crate::RING_SIZES[usize::from(size % 4)];
     let g = Geometry::new(w, h).expect("a ring's size");
@@ -74,7 +78,17 @@ fn ring_seed(
             .collect();
         let slot = writer.claim(&*mem).expect("a free slot");
         writer
-            .publish(&*mem, slot, &frame, seq, run, stamp)
+            .publish(
+                &*mem,
+                slot,
+                &frame,
+                seq,
+                run,
+                Stamp {
+                    at: stamp,
+                    duration: RING_FRAME_US,
+                },
+            )
             .expect("a frame of the ring's size");
     }
     for &(slot, i, v) in words {
@@ -90,7 +104,9 @@ fn ring_seed(
 
 /// `ring_bytes` seeds ([`crate::ring_bytes`]): rings of each size whose
 /// frames are due, not due yet, filling every slot, of an earlier run, or
-/// above the watermark; and one for each check a slot can fail.
+/// above the watermark; and one for each check a slot can fail, a
+/// duration of 0, past the longest frame, and one whose end overflows
+/// among them.
 #[must_use]
 pub fn rings() -> Vec<Seed> {
     let two = [(1, 1, 1_000), (2, 1, 1_000_000)];
@@ -141,11 +157,26 @@ pub fn rings() -> Vec<Seed> {
         ),
         (
             "reserved",
+            ring_seed(1, 1_500, &[(1, 1, 1_000)], &[(0, RING_RESERVED, u64::MAX)]),
+        ),
+        (
+            "duration_zero",
+            ring_seed(3, 1_000, &two, &[(1, RING_DURATION, 0)]),
+        ),
+        (
+            "duration_long",
+            ring_seed(3, 1_000, &two, &[(0, RING_DURATION, 3_600_000_001)]),
+        ),
+        (
+            "duration_end",
             ring_seed(
-                1,
-                1_500,
-                &[(1, 1, 1_000)],
-                &[(0, RING_RESERVED, u64::MAX), (0, RING_RESERVED + 1, 1)],
+                3,
+                1_000,
+                &two,
+                &[
+                    (1, RING_STAMP, (i64::MAX - 1).cast_unsigned()),
+                    (1, RING_DURATION, 2),
+                ],
             ),
         ),
     ]

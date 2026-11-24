@@ -530,7 +530,9 @@ pub const IN_PLAY: &[Site] = &[
     // play.
     Site::File("crates/skin-model/src/media.rs"),
     // A video's state, which the game thread's preparation deadline and
-    // the render side's staged frames and ring faults change each frame.
+    // the render side's staged frames and ring faults change each frame,
+    // and its runs and the session's wake, which a chart video's hook
+    // writes and reads each play frame.
     Site::File("crates/player/src/media_host/movie.rs"),
     // The skin movie hook: each play and selection frame reads, peeks and
     // takes the screen's movies before the build (their admission is a
@@ -539,11 +541,12 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns(
         "crates/skin-model/src/bga.rs",
         &[
+            "ChartVideos::starts",
             "BgaTable::drawable",
             "BgaTable::published",
             "BgaTable::key",
             "BgaTable::get",
-            "NullMedia::frame",
+            "ChartVideos::slot",
             "BgaStretch::place",
         ],
     ),

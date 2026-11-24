@@ -8,7 +8,10 @@
 //! The session's part is pure: [`answer`] takes a player's stage, its
 //! video and the screen being shown, and a result the worker sent (matched
 //! by its command's id, judged late or in time on its arrival), and gives
-//! the stage that follows and what the session does next. The screen shown
+//! the stage that follows and what the session does next. A player has at
+//! most one seek in flight ([`seek_for`]): every seek is answered, and an
+//! answer that is not the in-flight seek's, or an end for a run newer than
+//! the newest answered, loses the player. The screen shown
 //! is a shared word the game changes when it leaves a screen, the
 //! cancellation of that screen's videos: [`confirm`] reads it again after
 //! the answer's step, and withdraws a step that a screen change raced, so
@@ -20,7 +23,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::thread::Thread;
 
 /// Where a video stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +74,10 @@ pub enum Loss {
     /// pixel total ([`skin_model::movie::MAX_MOVIE_PIXELS`]). It draws
     /// nothing.
     OverTotal,
+    /// Lost with its peer: the chart's videos are one panel, and the other
+    /// one's loss loses this one too. It is closed as any lost video is and
+    /// ends no worker, so it strikes nothing.
+    Peer,
 }
 
 impl Loss {
@@ -82,11 +90,12 @@ impl Loss {
                 "a video is refused: over cap (the screen's movies pass their 2048×2048 luma pixels)"
                     .to_owned()
             }
+            Self::Peer => "a video is lost with its peer (Peer)".to_owned(),
             why => format!("a video is lost ({why:?})"),
         }
     }
 
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Queue,
         Self::Launch,
         Self::Struck,
@@ -100,6 +109,7 @@ impl Loss {
         Self::Preparation,
         Self::Fault,
         Self::OverTotal,
+        Self::Peer,
     ];
 }
 
@@ -215,6 +225,78 @@ impl Cell {
     }
 }
 
+/// A video's runs as the render side and the session share them, one
+/// word each: the newest run the render side wants sought, the newest run
+/// whose end the worker reported, and the newest run whose seek the worker
+/// answered with no frame (an empty run); 0 for none.
+#[derive(Debug, Default)]
+pub struct Runs {
+    want: AtomicU64,
+    ended: AtomicU64,
+    empty: AtomicU64,
+}
+
+impl Runs {
+    /// The render side wants run `run`, which its reader started, sought:
+    /// the session seeks the newest run wanted once no seek of the video
+    /// is in flight. One word written; the caller then wakes the session
+    /// ([`Waker::wake`]).
+    pub fn want(&self, run: u64) {
+        self.want.store(run, Ordering::Release);
+    }
+
+    /// The newest run wanted sought.
+    pub fn wanted(&self) -> u64 {
+        self.want.load(Ordering::Acquire)
+    }
+
+    /// The newest run whose end the worker reported: the worker published
+    /// every frame of that run before reporting it.
+    pub fn ended(&self) -> u64 {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Run `run`'s end, as the session took it.
+    pub fn end(&self, run: u64) {
+        self.ended.store(run, Ordering::Release);
+    }
+
+    /// The newest run whose seek found no frame: that run's end, once
+    /// reported, needs no frame of it.
+    pub fn empty(&self) -> u64 {
+        self.empty.load(Ordering::Acquire)
+    }
+
+    /// Run `run`'s seek was answered with no frame.
+    pub fn found_empty(&self, run: u64) {
+        self.empty.store(run, Ordering::Release);
+    }
+}
+
+/// Wakes the media session: its thread, unparked apart from the request
+/// queue. Holding one keeps no session alive: dropping the game's handle
+/// ends it.
+#[derive(Clone, Debug)]
+pub struct Waker {
+    session: Thread,
+}
+
+impl Waker {
+    /// A waker that unparks `session`, the session's thread.
+    pub const fn new(session: Thread) -> Self {
+        Self { session }
+    }
+
+    /// Asks the session to look now, never waiting and allocating nothing:
+    /// it unparks the session's thread, so wakes take no place of the
+    /// request queue. Wakes coalesce into the thread's one token: a wake
+    /// while the session looks ends its next sleep at once, so a want
+    /// stored before the wake is read by a look after it.
+    pub fn wake(&self) {
+        self.session.unpark();
+    }
+}
+
 /// Where a player stands in the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -226,6 +308,9 @@ pub enum Stage {
     Playing(u32),
     /// Playing into its ring.
     Live,
+    /// Playing into its ring, its seek `id` for run `run` sent and not
+    /// answered.
+    Seeking { id: u32, run: u64 },
     /// Its close sent.
     Closing(u32),
     /// Refused or failed in the worker, which waits to close it.
@@ -243,6 +328,10 @@ pub enum Outcome {
     Playing(u32),
     /// A command of its rejected.
     Rejected(u32),
+    /// A seek's answer (the seek's id, its run), with or without a landing.
+    Sought { id: u32, run: u64 },
+    /// The end of a run's video.
+    Ended(u64),
     /// The player failed.
     Failed,
 }
@@ -262,12 +351,28 @@ pub enum Then {
     /// The answer came past its deadline and left nothing to close: the
     /// worker is marked.
     Mark,
+    /// Run `run`'s video ended: the video's ended run.
+    End(u64),
+}
+
+/// The run to seek for a player at `stage` whose newest run sought or
+/// played is `sought`, while the render side wants run `want` sought: the
+/// wanted run, when it is newer and no seek is in flight. Wants made while
+/// a seek is in flight wait for its answer, and then only the newest is
+/// sought.
+pub fn seek_for(stage: Stage, sought: u64, want: u64) -> Option<u64> {
+    (stage == Stage::Live && want > sought).then_some(want)
 }
 
 /// What `result`, which arrived `late` or in time, does to a player at
-/// `stage` whose video is `movie` while the screen of `current` is shown:
-/// the stage that follows and what the session does next. A result that
-/// does not answer the stage's command changes nothing; the video moves
+/// `stage` whose video is `movie` while the screen of `current` is shown,
+/// its newest run answered sought or played being `sought`: the stage that
+/// follows and what the session does next. A result that does not answer
+/// the stage's command changes nothing, but a seek's answer other than the
+/// in-flight seek's (with one in flight, it cannot be stale) and an end for
+/// a run newer than the newest answered (the run in flight included, its
+/// answer not taken yet) lose the player; an end for an older run (one
+/// that ended before its seek arrived) changes nothing. The video moves
 /// only by its cell's own steps, and only for the screen shown.
 pub fn answer(
     stage: Stage,
@@ -275,12 +380,14 @@ pub fn answer(
     current: u64,
     result: Outcome,
     late: bool,
+    sought: u64,
 ) -> (Stage, Then) {
     let shown = movie.generation() == current;
     match (stage, result) {
         // The deadline first, whatever the answer says.
         (Stage::Opening(open), Outcome::Probed(id) | Outcome::Refused(id))
         | (Stage::Playing(open), Outcome::Playing(id) | Outcome::Rejected(id))
+        | (Stage::Seeking { id: open, .. }, Outcome::Sought { id, .. } | Outcome::Rejected(id))
             if open == id && late =>
         {
             movie.lose(Loss::Answer);
@@ -320,7 +427,30 @@ pub fn answer(
             movie.lose(Loss::Failed);
             (Stage::Idle, Then::Close)
         }
-        (Stage::Playing(_) | Stage::Live | Stage::Idle, Outcome::Failed) => {
+        (Stage::Seeking { id: seek, run }, Outcome::Sought { id, run: r })
+            if seek == id && run == r =>
+        {
+            (Stage::Live, Then::Nothing)
+        }
+        (Stage::Seeking { id: seek, .. }, Outcome::Rejected(id)) if seek == id => {
+            movie.lose(Loss::Failed);
+            (Stage::Idle, Then::Close)
+        }
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Sought { .. }) => {
+            movie.lose(Loss::Answer);
+            (stage, Then::Close)
+        }
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run > sought => {
+            movie.lose(Loss::Answer);
+            (stage, Then::Close)
+        }
+        (Stage::Live | Stage::Seeking { .. }, Outcome::Ended(run)) if run == sought => {
+            (stage, Then::End(run))
+        }
+        (
+            Stage::Playing(_) | Stage::Live | Stage::Seeking { .. } | Stage::Idle,
+            Outcome::Failed,
+        ) => {
             movie.lose(Loss::Failed);
             (Stage::Idle, Then::Close)
         }
@@ -351,7 +481,7 @@ pub fn confirm(stage: Stage, movie: &Cell, current: u64, then: Then) -> (Stage, 
 pub fn unwanted(stage: Stage, movie: &Cell, current: u64) -> bool {
     let gone = movie.generation() != current || movie.status() == Status::Lost;
     match stage {
-        Stage::Live | Stage::Idle => gone,
+        Stage::Live | Stage::Seeking { .. } | Stage::Idle => gone,
         Stage::Opening(_) | Stage::Playing(_) => movie.generation() != current,
         Stage::Queued | Stage::Closing(_) => false,
     }

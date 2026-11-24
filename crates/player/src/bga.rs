@@ -21,8 +21,17 @@
 //!   dropped before the picture whose cell would overflow it is decoded, so
 //!   a decode and one batch are all the job holds.
 //! - **Absence.** A refused reservation or allocation, or a refused array
-//!   or write, publishes every picture absent; a picture that cannot be
-//!   read is absent alone. Play starts in every case.
+//!   or write, publishes every picture absent, the videos' entries kept; a
+//!   picture that cannot be read is absent alone. Play starts in every
+//!   case.
+//! - **Videos.** Right after it resolves the names, before it reuses or
+//!   reads any picture, the job hands the render thread the attempt's video
+//!   manifest ([`BgaMsg::Videos`]): at most two video files, chosen by
+//!   their first start ([`ChartVideos::choose`]), each opened read-only
+//!   inside the chart folder and checked on its handle as a skin movie's
+//!   is, and each slot's starts. A play with nothing to read (the BGA not
+//!   shown, a chart without it, or a job that cannot start) sends an empty
+//!   one. A refused reservation leaves the videos as they are.
 //! - **Direct launch:** with no coordinator, the job runs on the game
 //!   thread in the preparation.
 
@@ -35,7 +44,9 @@ use game::coord::{
     Class, Coordinator, JobKey, JobKind, Outcome, OwnedJob, Owner, Scope, Settled, Spawner,
 };
 use render::BgaFault;
-use skin_model::bga::{self, BgaBinding, BgaCell, BgaEntry, BgaKey, BgaTable, CellPlace};
+use skin_model::bga::{
+    self, BgaBinding, BgaCell, BgaEntry, BgaKey, BgaTable, CellPlace, ChartVideos, MAX_CHART_FILES,
+};
 use skin_model::chart_image::{Absent, ChartDir, Identity};
 
 use crate::render_side::BgaPublisher;
@@ -104,6 +115,27 @@ pub const FAIL_PANIC: u8 = 2;
 #[cfg(test)]
 pub static READ_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// While set, each whole file read waits, its job cancelled or not, for
+/// at most 30 s (tests).
+#[cfg(test)]
+pub static READ_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a read waits at [`READ_GATE`] (tests).
+#[cfg(test)]
+pub static READ_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A read's wait at [`READ_DELAY_MS`] and then at [`READ_GATE`] (tests).
+#[cfg(test)]
+fn read_waits() {
+    std::thread::sleep(Duration::from_millis(READ_DELAY_MS.load(Ordering::SeqCst)));
+    let end = Instant::now() + Duration::from_secs(30);
+    while READ_GATE.load(Ordering::Acquire) && Instant::now() < end {
+        READ_WAITING.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    READ_WAITING.store(false, Ordering::Release);
+}
+
 /// Whether the job's spawn is refused (tests: [`FAIL`]).
 fn spawn_refused() -> bool {
     #[cfg(test)]
@@ -168,12 +200,13 @@ fn hold(cancel: &dyn Fn() -> bool) {
 }
 
 /// What an attempt's BGA reads: the chart's folder and each `#BMPxx`
-/// name by its id's index (none for a chart without BGA, or for a play
-/// that does not show it).
+/// name by its id's index, and the chart's BGA events its videos start by
+/// (none for a chart without BGA, or for a play that does not show it).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Want {
     pub dir: PathBuf,
     pub names: Vec<String>,
+    pub bga: Option<bms_model::ChartBga>,
 }
 
 impl Want {
@@ -190,7 +223,122 @@ impl Want {
                 .map_or_else(Vec::new, |b| {
                     b.images().iter().map(|i| i.name.clone()).collect()
                 }),
+            bga: chart.bga.clone().filter(|_| shown),
         }
+    }
+}
+
+/// An attempt's video manifest (design.md "Rendering and Skins", BGA):
+/// each chart slot's file, opened read-only inside the chart folder and
+/// checked on its handle, and the chart's videos (each id's slot and each
+/// slot's starts). Dropped, its files close.
+#[derive(Debug, Default)]
+pub struct Manifest {
+    pub files: [Option<std::fs::File>; MAX_CHART_FILES],
+    pub videos: Arc<ChartVideos>,
+}
+
+/// The manifests alive (tests).
+#[cfg(test)]
+pub static MANIFESTS: AtomicU64 = AtomicU64::new(0);
+
+impl Manifest {
+    /// No video: a play with nothing to read.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::made([None, None], ChartVideos::default())
+    }
+
+    fn made(files: [Option<std::fs::File>; MAX_CHART_FILES], videos: ChartVideos) -> Self {
+        #[cfg(test)]
+        MANIFESTS.fetch_add(1, Ordering::SeqCst);
+        Self {
+            files,
+            videos: Arc::new(videos),
+        }
+    }
+
+    /// A manifest of `files` and `videos` (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn of_files(files: [Option<std::fs::File>; MAX_CHART_FILES], videos: ChartVideos) -> Self {
+        Self::made(files, videos)
+    }
+
+    /// `want`'s manifest from its names' `bindings`: the files ranked by
+    /// their first start ([`ChartVideos::choose`]), each one chosen opened
+    /// and checked; a file that cannot be is absent, its ids with no slot.
+    fn of(want: &Want, bindings: &[BgaBinding]) -> Self {
+        let Some(chart) = &want.bga else {
+            return Self::empty();
+        };
+        // Each id's file: its canonical path, one file however many ids
+        // name it.
+        let mut paths: Vec<&Path> = Vec::new();
+        let file_of: Vec<Option<usize>> = bindings
+            .iter()
+            .map(|b| match b {
+                BgaBinding::Resolved {
+                    path, video: true, ..
+                } => Some(
+                    paths
+                        .iter()
+                        .position(|p| *p == path.as_path())
+                        .unwrap_or_else(|| {
+                            paths.push(path);
+                            paths.len() - 1
+                        }),
+                ),
+                _ => None,
+            })
+            .collect();
+        let (mut slots, chosen) = ChartVideos::choose(chart, &file_of);
+        let mut files: [Option<std::fs::File>; MAX_CHART_FILES] = [None, None];
+        for ((out, file), slot) in files
+            .iter_mut()
+            .zip(chosen)
+            .zip(skin_model::movie::CHART_SLOTS)
+        {
+            let Some(path) = file.and_then(|f| paths.get(f)) else {
+                continue;
+            };
+            match open_video(path) {
+                Ok(f) => *out = Some(f),
+                Err(e) => {
+                    log::warn!("bga: the video {} is not played: {e}", path.display());
+                    let slot = u8::try_from(slot).ok();
+                    for s in &mut slots {
+                        if *s == slot {
+                            *s = None;
+                        }
+                    }
+                }
+            }
+        }
+        Self::made(files, ChartVideos::of(chart, &slots))
+    }
+}
+
+#[cfg(test)]
+impl Drop for Manifest {
+    fn drop(&mut self) {
+        MANIFESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Opens the video at canonical `path` read-only and checks its handle: its
+/// final path must be the canonical path the folder check passed, so a
+/// name swapped for a link between the check and the open is refused.
+fn open_video(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    let at = crate::movie_screen::final_path(&file)?;
+    if at == path {
+        Ok(file)
+    } else {
+        Err(std::io::Error::other(format!(
+            "the file opened is {} rather than {}",
+            at.display(),
+            path.display()
+        )))
     }
 }
 
@@ -232,6 +380,10 @@ pub enum BgaMsg {
     /// the render thread's next frame boundary that runs a heavy
     /// operation, with an array in use.
     Drop,
+    /// The attempt's video manifest, which the play's movie set takes
+    /// ([`crate::movie_screen::MovieSet::chart`]); a stale one is dropped,
+    /// its files closed.
+    Videos(Manifest),
 }
 
 /// The render thread's answer to [`BgaMsg::Publish`] and its bound, in one
@@ -548,18 +700,15 @@ fn read_and_publish(
     };
     let absent = || vec![BgaEntry::Absent; n];
     if n == 0 {
+        let _ = link.send(generation, BgaMsg::Videos(Manifest::empty()));
         out.end = publish(None, Vec::new());
-        return out;
-    }
-    if !reserve(TERMS) {
-        log::warn!("bga: its memory was not granted; the pictures are absent");
-        out.end = publish(None, absent());
         return out;
     }
     let dir = match ChartDir::new(&want.dir) {
         Ok(dir) => dir,
         Err(e) => {
             log::warn!("bga: the chart's folder: {e}");
+            let _ = link.send(generation, BgaMsg::Videos(Manifest::empty()));
             out.end = publish(None, absent());
             return out;
         }
@@ -575,6 +724,25 @@ fn read_and_publish(
         .map(|name| bga::resolve(&dir, name, identity))
         .collect();
     if cancel() {
+        return out;
+    }
+    // The videos first: neither a reuse nor a refused reservation erases
+    // them.
+    let _ = link.send(generation, BgaMsg::Videos(Manifest::of(want, &bindings)));
+    // A fallback leaves every picture absent and every video its entry, so
+    // the videos handed over still draw from their slots.
+    let absent = || {
+        bindings
+            .iter()
+            .map(|b| match b {
+                BgaBinding::Resolved { video: true, .. } => BgaEntry::Video,
+                _ => BgaEntry::Absent,
+            })
+            .collect::<Vec<_>>()
+    };
+    if !reserve(TERMS) {
+        log::warn!("bga: its memory was not granted; the pictures are absent");
+        out.end = publish(None, absent());
         return out;
     }
     if let Some(k) = prior.filter(|k| k.same(&want.dir, &bindings)) {
@@ -697,7 +865,7 @@ fn read_and_publish(
         #[cfg(feature = "dev-tools")]
         let reading = Instant::now();
         #[cfg(test)]
-        std::thread::sleep(Duration::from_millis(READ_DELAY_MS.load(Ordering::SeqCst)));
+        read_waits();
         let read = bga::read_picture(path, file, native, cancel, identity, limit());
         #[cfg(feature = "dev-tools")]
         {
@@ -866,6 +1034,11 @@ impl BgaWorker {
         if c.want.as_ref() != Some(&want) || c.used {
             c.renew();
         }
+        // Nothing to read: its empty video manifest goes now, so the
+        // attempt's movies do not wait for a step.
+        if want.names.is_empty() {
+            let _ = c.link.send(c.current(), BgaMsg::Videos(Manifest::empty()));
+        }
         c.want = Some(want);
     }
 
@@ -989,6 +1162,15 @@ impl BgaWorker {
         c.job.is_none() && c.obsolete.is_empty()
     }
 
+    /// Whether a job made obsolete is held and every such job's thread
+    /// ended, their ends not yet taken (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn obsolete_ended(&self) -> bool {
+        let c = self.core();
+        !c.obsolete.is_empty() && c.obsolete.iter().all(OwnedJob::finished)
+    }
+
     /// The current generation (tests).
     #[cfg(test)]
     #[must_use]
@@ -1063,6 +1245,10 @@ impl Core {
     /// [`take_finished`](Self::take_finished), unanswered past the link's
     /// bound.
     fn publish_absent(&mut self, n: usize) {
+        // Nothing read: no video either.
+        let _ = self
+            .link
+            .send(self.current(), BgaMsg::Videos(Manifest::empty()));
         let answer = Answer::new(self.link.bound());
         let message = BgaMsg::Publish {
             key: None,

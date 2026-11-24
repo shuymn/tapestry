@@ -15,17 +15,29 @@
 //!   gone, a reply that does not decode or one past the reply queue (the
 //!   replies' end), fails the whole worker. Beats do not excuse a stuck
 //!   write.
-//! - **Acknowledgements** (L2): an open or a play not answered within
-//!   [`Deadlines::answer`] of its own command's write, a close within
+//! - **Acknowledgements** (L2): an open, a play or a seek not answered
+//!   within [`Deadlines::answer`] of its own command's write, a close within
 //!   [`Deadlines::close`], loses that player's video; an answer that
 //!   arrives later, by the reader's stamp, counts as none. The worker,
-//!   marked, is terminated once no player of it is live. A result moves a
+//!   marked, is terminated once no player of it is live, each player not
+//!   closing yet closed first. A result moves a
 //!   player only when it echoes the command the player waits on
 //!   ([`super::movie::answer`]), and a player goes when the worker's
 //!   tracker frees its id.
+//! - **Seeks**: the render side writes the newest run it wants sought into
+//!   its video's want word ([`Movie::want`]) and wakes the session
+//!   ([`Waker`]), so a seek starts without waiting for the tick. A wake
+//!   unparks the session's thread, apart from its request queue, which
+//!   holds opens alone: a wake never crowds out an open, and one that comes
+//!   while the session looks ends its next sleep at once. A live player has at most one
+//!   seek in flight, for the newest run wanted, from the clip's start;
+//!   wants made meanwhile are coalesced and the newest sought once it is
+//!   answered. An end the worker reports for the newest run whose seek was
+//!   answered becomes the video's ended run ([`Movie::ended`]).
 //! - **Progress** (L3): a decoding player whose progress word has not risen
-//!   for [`Deadlines::progress`] is lost. Waiting for a free slot excuses it
-//!   only while every slot holds a frame the game has not freed, by the
+//!   for [`Deadlines::progress`] is lost, a seek in flight or answered
+//!   included: a seek keeps the window it found. Waiting for a free slot
+//!   excuses it only while every slot holds a frame the game has not freed, by the
 //!   game's own count of the slots it freed; from the first look that finds
 //!   a slot free the window runs again. An end excuses it only as an end
 //!   for good: a looping play never ends.
@@ -33,11 +45,18 @@
 //!   whole worker.
 //!
 //! A failure of the whole worker loses every one of its players first, each
-//! by one atomic step that writes nothing else, then terminates its job ([`super::EXIT_HUNG`]) and reaps it: the files it had
-//! open get their strikes. The next video a screen needs launches a new
-//! worker. The launch runs on a thread of its own, so a launch held up
+//! by one atomic step that writes nothing else, then has its job
+//! terminated for a hang ([`Worker::terminate_hung`]), directly, and reaps
+//! it: the files it had open get their strikes, but for a file the session
+//! was closing because its peer was lost ([`Loss::Peer`]): a worker the
+//! game's accepted termination ended, with its code, does not strike it;
+//! one that ended on its own does, whatever its exit code. The next video a screen
+//! needs launches a new worker. The launch runs on a thread of its own, so a launch held up
 //! (another launch staging its copies) holds neither the game nor the
 //! session.
+//!
+//! The session's end, the game's handle dropped, loses every video it holds
+//! and every open its queue still holds, none of them launched.
 //!
 //! Each video's [`Movie`] is shared with the game: the session moves it
 //! from pending to absent (refused at its probe), live (its ring set up)
@@ -49,9 +68,12 @@
 
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+#[cfg(test)]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 use skin_model::media::control::{Command, Matrix, Range, Reply};
@@ -102,11 +124,11 @@ pub const PREPARATION: Duration = Duration::from_secs(3);
 /// The most players the session holds in a worker at once: the worker's.
 const PLAYERS: u8 = 8;
 
-/// The requests the session's queue holds.
+/// The requests the session's queue holds: opens alone.
 const REQUESTS: usize = 32;
 
 use super::movie::{Cell, Outcome, Stage, Then};
-pub use super::movie::{Loss, Status};
+pub use super::movie::{Loss, Runs, Status, Waker};
 
 /// A video a screen asked for, shared between the game, the render side
 /// and the session. Its state is a [`Cell`]: each thread changes it by one
@@ -117,16 +139,96 @@ pub struct Movie {
     live: OnceLock<Live>,
     /// Slots the render side freed.
     freed: AtomicU64,
+    /// Its runs as the render side and the session share them: the run
+    /// wanted sought, the run ended and the run found empty.
+    pub runs: Runs,
+    /// One of the chart's videos: a loss of one loses the other
+    /// ([`Loss::Peer`]).
+    chart: bool,
+    /// The media time the session's seeks start from (tests; the game's
+    /// are 0, the clip's start).
+    #[cfg(test)]
+    seek_at: AtomicI64,
 }
 
 impl Movie {
     /// A pending video of the screen of `generation`.
     pub fn new(generation: u64) -> Arc<Self> {
+        Self::made(generation, false)
+    }
+
+    /// A pending chart video of the screen of `generation`: a loss of one
+    /// of the screen's chart videos loses the others with it.
+    pub fn chart(generation: u64) -> Arc<Self> {
+        Self::made(generation, true)
+    }
+
+    fn made(generation: u64, chart: bool) -> Arc<Self> {
         Arc::new(Self {
             cell: Cell::new(generation),
             live: OnceLock::new(),
             freed: AtomicU64::new(0),
+            runs: Runs::default(),
+            chart,
+            #[cfg(test)]
+            seek_at: AtomicI64::new(0),
         })
+    }
+
+    /// Whether it is one of the chart's videos.
+    pub const fn is_chart(&self) -> bool {
+        self.chart
+    }
+
+    /// The newest run the render side wants sought, 0 for none (tests).
+    #[cfg(test)]
+    pub fn wanted(&self) -> u64 {
+        self.runs.wanted()
+    }
+
+    /// The newest run whose seek the worker answered with no frame, 0 for
+    /// none: that run's end, once reported, needs no frame of it.
+    pub fn empty(&self) -> u64 {
+        self.runs.empty()
+    }
+
+    /// Run `run` ended, `empty` when its seek found no frame, as the
+    /// session records the worker's answers (tests).
+    #[cfg(test)]
+    pub fn end_run(&self, run: u64, empty: bool) {
+        if empty {
+            self.runs.found_empty(run);
+        }
+        self.runs.end(run);
+    }
+
+    /// The render side wants run `run`, which its reader started, sought:
+    /// the session seeks the newest run wanted once no seek of the video is
+    /// in flight. It writes one word and allocates nothing; the caller then
+    /// wakes the session ([`Waker::wake`]).
+    pub fn want(&self, run: u64) {
+        self.runs.want(run);
+    }
+
+    /// The newest run whose end the worker reported, 0 for none: the
+    /// worker published every frame of that run before reporting it.
+    pub fn ended(&self) -> u64 {
+        self.runs.ended()
+    }
+
+    /// Has the session's seeks start at `at` µs instead of the clip's
+    /// start (tests).
+    #[cfg(test)]
+    pub fn seek_from(&self, at: i64) {
+        self.seek_at.store(at, Ordering::Release);
+    }
+
+    /// Where the session's seeks start: the clip's start.
+    fn seek_at(&self) -> i64 {
+        #[cfg(test)]
+        return self.seek_at.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        0
     }
 
     /// Where it stands.
@@ -301,8 +403,6 @@ enum Request {
         file: std::fs::File,
         looping: bool,
     },
-    /// End the session.
-    Quit,
     /// Fill the worker's command pipe with `len` bytes written apart from
     /// the writer, so the writer's next command waits (a test's).
     #[cfg(test)]
@@ -330,10 +430,18 @@ pub enum Event {
     Launched { pid: u32 },
     /// A video lost, for `why`.
     Lost { why: Loss },
-    /// A worker's job terminated for a hang (`why`).
+    /// The session's call that terminates a worker's job for a hang
+    /// (`why`), made: the worker's end is its process's, or
+    /// [`Event::Reaped`].
     Terminated { pid: u32, why: Loss },
     /// A worker reaped.
     Reaped { pid: u32 },
+    /// A seek for `run` sent, as command `id`.
+    Seek { run: u64, id: u32 },
+    /// A seek for `run` answered, `landed` or not.
+    Sought { run: u64, landed: Option<i64> },
+    /// Run `run`'s end taken as the video's ended run.
+    Ended { run: u64 },
     /// An open handed to the worker.
     Opened,
     /// A player's close answered.
@@ -350,6 +458,12 @@ struct Shared {
     pid: AtomicU32,
     /// Videos the game's hand-offs lost (L1), for the session to log.
     queue_lost: AtomicU32,
+    /// The game's handle has gone: the session ends at its next turn,
+    /// whoever holds a [`Waker`].
+    quit: AtomicBool,
+    /// The worker's writer's account of its writes (tests).
+    #[cfg(test)]
+    transport: Mutex<Option<Arc<super::writer::Transport>>>,
     #[cfg(test)]
     events: Mutex<Vec<(Duration, Event)>>,
     #[cfg(test)]
@@ -381,6 +495,8 @@ macro_rules! event {
 pub struct Session {
     tx: SyncSender<Request>,
     shared: Arc<Shared>,
+    /// The session's thread, unparked by each request and wake.
+    thread: Thread,
 }
 
 impl Session {
@@ -391,11 +507,38 @@ impl Session {
     ///
     /// When its thread does not start.
     pub fn start(launching: Launching, deadlines: Deadlines) -> std::io::Result<Self> {
+        Self::spawn(launching, deadlines, |_| {})
+    }
+
+    /// Starts the session as [`Self::start`] does, `turn` run at each of
+    /// its turns' held points (tests).
+    ///
+    /// # Errors
+    ///
+    /// When its thread does not start.
+    #[cfg(test)]
+    pub fn start_held(
+        launching: Launching,
+        deadlines: Deadlines,
+        turn: impl FnMut(Held) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::spawn(launching, deadlines, move |s| s.turn = Some(Box::new(turn)))
+    }
+
+    /// Starts the session's thread, its supervisor first given to `set`.
+    fn spawn(
+        launching: Launching,
+        deadlines: Deadlines,
+        set: impl FnOnce(&mut Supervisor) + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(REQUESTS);
         let shared = Arc::new(Shared {
             generation: AtomicU64::new(0),
             pid: AtomicU32::new(0),
             queue_lost: AtomicU32::new(0),
+            quit: AtomicBool::new(false),
+            #[cfg(test)]
+            transport: Mutex::new(None),
             #[cfg(test)]
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -403,13 +546,19 @@ impl Session {
             #[cfg(test)]
             beats: Mutex::new(Vec::new()),
         });
-        {
+        let thread = {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("media session".to_owned())
-                .spawn(move || Supervisor::new(launching, deadlines, shared).run(&rx))?;
-        }
-        Ok(Self { tx, shared })
+                .spawn(move || {
+                    let mut supervisor = Supervisor::new(launching, deadlines, shared);
+                    set(&mut supervisor);
+                    supervisor.run(&rx);
+                })?
+                .thread()
+                .clone()
+        };
+        Ok(Self { tx, shared, thread })
     }
 
     /// Shows the screen of `generation`: the videos of other generations
@@ -428,17 +577,40 @@ impl Session {
             file,
             looping,
         };
-        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-            self.tx.try_send(request)
-            && movie.lose(Loss::Queue)
-        {
-            self.shared.queue_lost.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(request) {
+            Ok(()) => self.thread.unpark(),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                if movie.lose(Loss::Queue) {
+                    self.shared.queue_lost.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
     /// The worker's process id, 0 without one.
     pub fn pid(&self) -> u32 {
         self.shared.pid.load(Ordering::Acquire)
+    }
+
+    /// The render side's handle for waking the session when a video wants
+    /// a seek.
+    pub fn waker(&self) -> Waker {
+        Waker::new(self.thread.clone())
+    }
+
+    /// When command `id` was written whole, on the clock of
+    /// [`Self::events`], once the worker's writer has written it (tests).
+    #[cfg(test)]
+    pub fn written(&self, id: u32) -> Option<Duration> {
+        let transport = self.shared.transport.lock().ok()?.clone()?;
+        let at = transport.written(id).ok()??;
+        Some(at.saturating_duration_since(self.shared.origin))
+    }
+
+    /// The time on the clock of [`Self::events`] (tests).
+    #[cfg(test)]
+    pub fn now(&self) -> Duration {
+        self.shared.origin.elapsed()
     }
 
     /// The beats of the worker so far, after its launch's handshake began.
@@ -456,7 +628,9 @@ impl Session {
     /// while the worker reads nothing.
     #[cfg(test)]
     pub fn stuff(&self, len: usize) {
-        let _ = self.tx.try_send(Request::Stuff(len));
+        if self.tx.try_send(Request::Stuff(len)).is_ok() {
+            self.thread.unpark();
+        }
     }
 
     /// What the session did so far.
@@ -472,7 +646,10 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(Request::Quit);
+        // The flag ends the session at its next turn, which the unpark
+        // starts at once.
+        self.shared.quit.store(true, Ordering::Release);
+        self.thread.unpark();
     }
 }
 
@@ -497,6 +674,9 @@ struct Player {
     /// every earlier video of its screen has its ring or is gone
     /// ([`Supervisor::admit_probe`]).
     held: Option<Probe>,
+    /// The newest run answered sought or played: run 1, played, until a
+    /// seek's answer.
+    sought: u64,
 }
 
 /// What a probe said of a video, as its ring is made from it.
@@ -552,7 +732,9 @@ impl Player {
             return None;
         }
         match self.stage {
-            Stage::Opening(id) | Stage::Playing(id) => Some((id, deadlines.answer)),
+            Stage::Opening(id) | Stage::Playing(id) | Stage::Seeking { id, .. } => {
+                Some((id, deadlines.answer))
+            }
             Stage::Closing(id) => Some((id, deadlines.close)),
             Stage::Queued | Stage::Live | Stage::Idle => None,
         }
@@ -633,6 +815,25 @@ struct Supervisor {
     /// Every ring's creation fails (tests).
     #[cfg(test)]
     ring_fails: bool,
+    /// The commands sent with no worker (tests).
+    #[cfg(test)]
+    sent: Vec<Command>,
+    /// Runs at each turn's held points (a test's).
+    #[cfg(test)]
+    turn: Option<Box<dyn FnMut(Held) + Send>>,
+}
+
+/// Where a test holds the session's turn.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// The requests are taken; the session has not read its end.
+    Taken,
+    /// The look has judged the players' deadlines and not yet ended a
+    /// marked worker with nothing live.
+    Judged,
+    /// The session has looked and not slept yet.
+    Looked,
 }
 
 impl Supervisor {
@@ -655,40 +856,60 @@ impl Supervisor {
             charged: (0, 0),
             #[cfg(test)]
             ring_fails: false,
+            #[cfg(test)]
+            sent: Vec::new(),
+            #[cfg(test)]
+            turn: None,
         }
     }
 
     fn run(mut self, rx: &Receiver<Request>) {
         loop {
-            match rx.recv_timeout(self.deadlines.tick) {
-                Ok(Request::Open {
-                    movie,
-                    file,
-                    looping,
-                }) => self.queue(movie, file, looping),
-                #[cfg(test)]
-                Ok(Request::Stuff(len)) => self.stuff(len),
-                Ok(Request::Quit) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-            // Every request waiting, before the look.
-            loop {
+            // The requests waiting before the look, at most a queue's
+            // worth, so no sender keeps the session from looking.
+            let mut gone = false;
+            for _ in 0..REQUESTS {
                 match rx.try_recv() {
-                    Ok(Request::Open {
-                        movie,
-                        file,
-                        looping,
-                    }) => self.queue(movie, file, looping),
-                    #[cfg(test)]
-                    Ok(Request::Stuff(len)) => self.stuff(len),
-                    Ok(Request::Quit) | Err(TryRecvError::Disconnected) => return self.quit(),
+                    Ok(request) => self.request(request),
                     Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        gone = true;
+                        break;
+                    }
                 }
+            }
+            #[cfg(test)]
+            if let Some(turn) = &mut self.turn {
+                turn(Held::Taken);
+            }
+            if gone || self.shared.quit.load(Ordering::Acquire) {
+                break;
             }
             self.look();
             self.note_losses();
+            #[cfg(test)]
+            if let Some(turn) = &mut self.turn {
+                turn(Held::Looked);
+            }
+            // Until a request, a wake or the end unparks the thread, or the
+            // tick: one that came since the last sleep ends this one at
+            // once, so none is lost.
+            std::thread::park_timeout(self.deadlines.tick);
         }
-        self.quit();
+        self.quit(rx);
+    }
+
+    /// Takes `request`.
+    fn request(&mut self, request: Request) {
+        match request {
+            Request::Open {
+                movie,
+                file,
+                looping,
+            } => self.queue(movie, file, looping),
+            #[cfg(test)]
+            Request::Stuff(len) => self.stuff(len),
+        }
     }
 
     /// Writes `len` bytes on the worker's command pipe from a thread of its
@@ -721,6 +942,7 @@ impl Supervisor {
             progress: (0, now),
             noted: false,
             held: None,
+            sought: 1,
         });
     }
 
@@ -773,8 +995,29 @@ impl Supervisor {
         if self.worker.is_none() {
             return;
         }
+        if let Err(why) = self.seek_wanted(generation) {
+            self.fail_worker(why);
+            return;
+        }
+        self.lose_peers();
         self.judge(generation, now, settled);
+        #[cfg(test)]
+        if let Some(turn) = &mut self.turn {
+            turn(Held::Judged);
+        }
         if self.marked && !self.players.iter().any(Player::live) {
+            // A player lost since the judgement (a peer the game lost
+            // meanwhile) is closed before the termination, so its file is
+            // spared as any closed for its peer's loss.
+            for i in 0..self.players.len() {
+                let open = self.players.get(i).is_some_and(|p| {
+                    !matches!(p.stage, Stage::Closing(_) | Stage::Idle | Stage::Queued)
+                });
+                if open && let Err(why) = self.close(i) {
+                    self.fail_worker(why);
+                    return;
+                }
+            }
             self.fail_worker(Loss::Answer);
         }
     }
@@ -832,6 +1075,10 @@ impl Supervisor {
             Ok(worker) => {
                 self.shared.pid.store(worker.pid(), Ordering::Release);
                 event!(self.shared, Event::Launched { pid: worker.pid() });
+                #[cfg(test)]
+                if let Ok(mut transport) = self.shared.transport.lock() {
+                    *transport = worker.transport().cloned();
+                }
                 self.notes.note(format!("worker {} launched", worker.pid()));
                 self.worker = Some(worker);
                 self.marked = false;
@@ -1028,15 +1275,24 @@ impl Supervisor {
             Reply::Playing { player, id, .. } => (player, Some(Outcome::Playing(id))),
             Reply::Rejected { player, id, .. } => (player, Some(Outcome::Rejected(id))),
             Reply::Failed { player, .. } => (player, Some(Outcome::Failed)),
+            Reply::Sought {
+                player,
+                id,
+                run,
+                landed,
+                ..
+            } => {
+                event!(self.shared, Event::Sought { run, landed });
+                #[cfg(not(test))]
+                let _ = landed;
+                (player, Some(Outcome::Sought { id, run }))
+            }
+            Reply::Ended { player, run } => (player, Some(Outcome::Ended(run))),
             Reply::Closed { player, id, .. } => {
                 self.closed(player, id, at);
                 return Ok(());
             }
-            Reply::Sought { .. }
-            | Reply::Ended { .. }
-            | Reply::Hello { .. }
-            | Reply::Log { .. }
-            | Reply::Beat => return Ok(()),
+            Reply::Hello { .. } | Reply::Log { .. } | Reply::Beat => return Ok(()),
         };
         let Some(outcome) = outcome else {
             return Ok(());
@@ -1051,13 +1307,23 @@ impl Supervisor {
         };
         #[cfg(test)]
         let before = p.movie.status();
-        let (stage, then) = super::movie::answer(p.stage, &p.movie.cell, generation, outcome, late);
+        let (stage, then) =
+            super::movie::answer(p.stage, &p.movie.cell, generation, outcome, late, p.sought);
         // The screen shown, read again after the answer's step.
         let generation = self.shared.generation.load(Ordering::SeqCst);
         let (stage, then) = super::movie::confirm(stage, &p.movie.cell, generation, then);
-        if stage == Stage::Live && p.stage != Stage::Live {
-            // The progress window starts when playback does.
+        if stage == Stage::Live && matches!(p.stage, Stage::Playing(_)) {
+            // The progress window starts when playback does; a seek keeps
+            // the window it found, its last count and time.
             p.progress = (0, Instant::now());
+        }
+        if let (Stage::Seeking { run, .. }, Stage::Live) = (p.stage, stage) {
+            p.sought = run;
+            // An answer with no frame: the run is empty, and its end, which
+            // follows, needs no frame of it.
+            if let Reply::Sought { landed: None, .. } = reply {
+                p.movie.runs.found_empty(run);
+            }
         }
         p.stage = stage;
         #[cfg(test)]
@@ -1068,6 +1334,11 @@ impl Supervisor {
         }
         match then {
             Then::Nothing => Ok(()),
+            Then::End(run) => {
+                p.movie.runs.end(run);
+                event!(self.shared, Event::Ended { run });
+                Ok(())
+            }
             Then::Close => self.close(i),
             Then::Mark => {
                 self.marked = true;
@@ -1319,7 +1590,79 @@ impl Supervisor {
         }
     }
 
-    /// Sends player `i` its close.
+    /// Sends each live player of the screen shown whose video wants a run
+    /// newer than its newest sought, and has no seek in flight, a seek for
+    /// that run from the clip's start ([`super::movie::seek_for`]).
+    fn seek_wanted(&mut self, generation: u64) -> Result<(), Loss> {
+        for i in 0..self.players.len() {
+            let Some(p) = self.players.get(i) else { break };
+            let want = p.movie.runs.wanted();
+            let Some(run) = super::movie::seek_for(p.stage, p.sought, want) else {
+                continue;
+            };
+            if p.movie.generation() != generation || p.movie.status() != Status::Live {
+                continue;
+            }
+            let seek = Command::Seek {
+                player: p.id,
+                run,
+                at: p.movie.seek_at(),
+            };
+            let id = self.send(&seek)?;
+            if let Some(p) = self.players.get_mut(i) {
+                p.wait_on(Stage::Seeking { id, run });
+            }
+            event!(self.shared, Event::Seek { run, id });
+        }
+        Ok(())
+    }
+
+    /// Loses with [`Loss::Peer`] every chart video pending or live whose
+    /// screen has a chart video lost for another reason than its peer's or
+    /// the pixel total: the chart's videos are one panel. The judgement
+    /// then closes them, sparing their files ([`Self::close`]).
+    fn lose_peers(&mut self) {
+        for i in 0..self.players.len() {
+            let Some(p) = self.players.get(i) else { break };
+            if !p.movie.chart
+                || !p
+                    .movie
+                    .loss()
+                    .is_some_and(|why| !matches!(why, Loss::Peer | Loss::OverTotal))
+            {
+                continue;
+            }
+            let generation = p.movie.generation();
+            for q in &self.players {
+                if q.movie.chart
+                    && q.movie.generation() == generation
+                    && matches!(q.movie.status(), Status::Pending | Status::Live)
+                    && q.movie.lose(Loss::Peer)
+                {
+                    event!(self.shared, Event::Lost { why: Loss::Peer });
+                }
+            }
+        }
+    }
+
+    /// Queues `command` for the worker: its id. With no worker, a test's
+    /// session keeps it instead.
+    fn send(&mut self, command: &Command) -> Result<u32, Loss> {
+        #[cfg(test)]
+        if self.worker.is_none() {
+            self.sent.push(command.clone());
+            return Ok(u32::try_from(self.sent.len()).unwrap_or(u32::MAX));
+        }
+        self.worker
+            .as_mut()
+            .ok_or(Loss::Transport)?
+            .send(command)
+            .map_err(|_| Loss::Transport)
+    }
+
+    /// Sends player `i` its close. A player closed because its peer was
+    /// lost has its file spared by a worker the game terminates
+    /// ([`Worker::spare`]).
     fn close(&mut self, i: usize) -> Result<(), Loss> {
         let (Some(p), Some(worker)) = (self.players.get_mut(i), self.worker.as_mut()) else {
             return Ok(());
@@ -1329,6 +1672,9 @@ impl Supervisor {
         }
         match worker.close(p.id) {
             Ok(close) => {
+                if p.movie.loss() == Some(Loss::Peer) {
+                    worker.spare(p.id);
+                }
                 p.wait_on(Stage::Closing(close));
                 Ok(())
             }
@@ -1361,7 +1707,7 @@ impl Supervisor {
             if lost.iter().any(|(l, _)| *l == i) {
                 continue;
             }
-            if p.stage == Stage::Live
+            if matches!(p.stage, Stage::Live | Stage::Seeking { .. })
                 && p.movie.generation() == generation
                 && p.movie.status() != Status::Lost
                 && let Some(why) = progress(p, now, self.deadlines.progress)
@@ -1399,11 +1745,22 @@ impl Supervisor {
         }
     }
 
-    /// Ends the session: every video lost, the workers dropped (their jobs
-    /// end after a grace, without waiting).
-    fn quit(&mut self) {
+    /// Ends the session: every video lost, those of the opens `rx` still
+    /// holds included, none launched; the workers dropped (their jobs end
+    /// after a grace, without waiting). The game's handle is gone, so no
+    /// open comes after the ones `rx` holds.
+    fn quit(&mut self, rx: &Receiver<Request>) {
         for p in &self.players {
             p.movie.lose(Loss::Ended);
+        }
+        while let Ok(request) = rx.try_recv() {
+            match request {
+                Request::Open { movie, .. } => {
+                    movie.lose(Loss::Ended);
+                }
+                #[cfg(test)]
+                Request::Stuff(_) => {}
+            }
         }
         self.players.clear();
         self.worker = None;
@@ -1502,6 +1859,8 @@ mod tests {
             generation: AtomicU64::new(generation),
             pid: AtomicU32::new(0),
             queue_lost: AtomicU32::new(0),
+            quit: AtomicBool::new(false),
+            transport: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             origin: Instant::now(),
             beats: Mutex::new(Vec::new()),
@@ -1528,7 +1887,568 @@ mod tests {
             progress: (0, now),
             noted: false,
             held: None,
+            sought: 1,
         }
+    }
+
+    /// A player of `movie`, by `id`, playing run 1 into its ring, its video
+    /// live on the screen shown.
+    fn live(movie: &Arc<Movie>, id: u8) -> Player {
+        assert!(movie.cell.go_live());
+        Player {
+            stage: Stage::Live,
+            ..opening(movie, id)
+        }
+    }
+
+    /// The seek of `run` for player `player` the session sends.
+    fn seek(player: u8, run: u64) -> Command {
+        Command::Seek { player, run, at: 0 }
+    }
+
+    /// The worker's answer to seek `id` of player 1 for `run`, landing at
+    /// `landed`.
+    fn sought(id: u32, run: u64, landed: Option<i64>) -> Reply {
+        Reply::Sought {
+            id,
+            player: 1,
+            run,
+            landed,
+            attempts: u8::from(landed.is_some()),
+        }
+    }
+
+    /// The worker's report that run `run` of player 1 ended.
+    fn ended(run: u64) -> Reply {
+        Reply::Ended { player: 1, run }
+    }
+
+    /// A session showing screen 1 with one live player, 1, of a video
+    /// whose run `run` was sought and answered with a landing.
+    fn sought_to(run: u64) -> (Supervisor, Arc<Movie>) {
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        movie.want(run);
+        s.seek_wanted(1).unwrap();
+        let id = u32::try_from(s.sent.len()).unwrap();
+        s.take(Instant::now(), &sought(id, run, Some(40_000)))
+            .unwrap();
+        assert_eq!(
+            (s.players[0].stage, s.players[0].sought),
+            (Stage::Live, run)
+        );
+        (s, movie)
+    }
+
+    /// Runs wanted before the session's turn are sought once, for the
+    /// newest, from the clip's start; nothing more until a newer want.
+    // Covers: T02
+    #[test]
+    fn a_seek_is_sent_for_the_newest_want() {
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        // No want: no seek.
+        s.seek_wanted(1).unwrap();
+        assert!(s.sent.is_empty());
+        movie.want(3);
+        movie.want(4);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [seek(1, 4)]);
+        assert_eq!(s.players[0].stage, Stage::Seeking { id: 1, run: 4 });
+        s.take(Instant::now(), &sought(1, 4, Some(40_000))).unwrap();
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [seek(1, 4)], "run 4 is sought already");
+        assert_eq!(movie.loss(), None);
+    }
+
+    /// Wants made while a seek is in flight wait for its answer, and then
+    /// only the newest is sought.
+    // Covers: T02
+    #[test]
+    fn wants_during_a_seek_are_coalesced() {
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        movie.want(3);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [seek(1, 3)]);
+        movie.want(4);
+        s.seek_wanted(1).unwrap();
+        movie.want(5);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [seek(1, 3)], "one seek in flight");
+        s.take(Instant::now(), &sought(1, 3, Some(40_000))).unwrap();
+        assert_eq!(s.players[0].sought, 3);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [seek(1, 3), seek(1, 5)]);
+        assert_eq!(s.players[0].stage, Stage::Seeking { id: 2, run: 5 });
+        assert_eq!(movie.loss(), None);
+    }
+
+    /// An end for a run older than the newest sought (it ended before its
+    /// seek arrived) changes nothing; one for the newest is the video's
+    /// ended run.
+    // Covers: T02
+    #[test]
+    fn a_stale_end_is_inert() {
+        let (mut s, movie) = sought_to(4);
+        s.take(Instant::now(), &ended(3)).unwrap();
+        assert_eq!(movie.ended(), 0, "a stale end");
+        assert_eq!(
+            (s.players[0].stage, movie.status()),
+            (Stage::Live, Status::Live)
+        );
+        assert_eq!(movie.loss(), None);
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!(movie.ended(), 4);
+        assert_eq!(movie.loss(), None);
+    }
+
+    /// An end for a run newer than any sought loses the player.
+    // Covers: T02
+    #[test]
+    fn an_end_for_a_run_not_sought_fails_the_player() {
+        let (mut s, movie) = sought_to(4);
+        s.take(Instant::now(), &ended(5)).unwrap();
+        assert_eq!(movie.loss(), Some(Loss::Answer));
+        assert_eq!(movie.ended(), 0);
+        // So does one newer than the run in flight.
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        movie.want(3);
+        s.seek_wanted(1).unwrap();
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!(movie.loss(), Some(Loss::Answer));
+    }
+
+    /// With one seek in flight an answer to another cannot be stale: it
+    /// loses the player, as an answer with no seek in flight does; the
+    /// in-flight seek's own answer does not.
+    // Covers: T02
+    #[test]
+    fn a_sought_with_another_id_fails_the_player() {
+        for (answer, lost) in [
+            (sought(1, 3, Some(40_000)), None),
+            (sought(2, 3, Some(40_000)), Some(Loss::Answer)),
+            (sought(1, 4, Some(40_000)), Some(Loss::Answer)),
+        ] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(3);
+            s.seek_wanted(1).unwrap();
+            s.take(Instant::now(), &answer).unwrap();
+            assert_eq!(movie.loss(), lost, "{answer:?}");
+        }
+        // Nothing in flight.
+        let (mut s, movie) = sought_to(3);
+        s.take(Instant::now(), &sought(1, 3, Some(40_000))).unwrap();
+        assert_eq!(movie.loss(), Some(Loss::Answer));
+    }
+
+    /// An empty seek is answered with no landing, then its run's end: the
+    /// player is live, its ended run that run, and nothing is lost.
+    // Covers: T02
+    #[test]
+    fn an_empty_seek_is_answered_then_ended() {
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        movie.want(4);
+        s.seek_wanted(1).unwrap();
+        s.take(Instant::now(), &sought(1, 4, None)).unwrap();
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!(s.players[0].stage, Stage::Live);
+        assert_eq!(s.players[0].sought, 4);
+        assert_eq!(movie.ended(), 4);
+        assert_eq!(movie.empty(), 4, "run 4 recorded empty");
+        assert_eq!((movie.status(), movie.loss()), (Status::Live, None));
+        // A seek that lands records nothing empty.
+        let (_, landed) = sought_to(5);
+        assert_eq!(landed.empty(), 0);
+    }
+
+    /// A chart video lost for its own reason loses the screen's other
+    /// chart video with its peer's reason, which the judgement then closes;
+    /// a skin movie, a chart video of another screen and one refused at
+    /// the pixel total are left as they are, and a refusal at the total
+    /// starts no peer loss.
+    // Covers: T02
+    #[test]
+    fn a_chart_loss_loses_its_peer_in_the_session() {
+        let mut s = supervisor(1);
+        let (a, b, skin, other) = (
+            Movie::chart(1),
+            Movie::chart(1),
+            Movie::new(1),
+            Movie::chart(2),
+        );
+        s.players = vec![live(&a, 1), live(&b, 2), live(&skin, 3), live(&other, 4)];
+        assert!(a.lose(Loss::OverTotal));
+        s.lose_peers();
+        assert_eq!(b.loss(), None, "a refusal at the total starts no peer loss");
+        let c = Movie::chart(1);
+        s.players.push(live(&c, 5));
+        assert!(c.lose(Loss::Progress));
+        s.lose_peers();
+        assert_eq!(b.loss(), Some(Loss::Peer));
+        assert_eq!((skin.loss(), other.loss()), (None, None));
+        assert_eq!(a.loss(), Some(Loss::OverTotal), "the refused one stays so");
+        assert!(
+            super::super::movie::unwanted(s.players[1].stage, &b.cell, 1),
+            "the judgement closes the peer"
+        );
+    }
+
+    /// The pixel total takes the chart's videos first, as a play's set
+    /// declares them first: a 2048×1536 chart video gets its ring and a
+    /// 1280×1024 skin movie after it is refused with none; four movies of
+    /// 1024×1024, exactly the total together, are all admitted.
+    // Covers: T02
+    #[test]
+    fn the_pixel_total_takes_the_chart_first() {
+        let probe = |width, height| Probe {
+            width,
+            height,
+            duration: 1_000_000,
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
+        };
+        // Admits each player's probe in turn, its video live once its ring
+        // is made, as the worker's play answer makes it.
+        let admit = |movies: &[Arc<Movie>], sizes: &[(u32, u32)]| {
+            let mut s = supervisor(1);
+            s.players = movies
+                .iter()
+                .enumerate()
+                .map(|(i, m)| opening(m, u8::try_from(i + 1).unwrap()))
+                .collect();
+            for (i, (m, (w, h))) in movies.iter().zip(sizes).enumerate() {
+                s.admit_probe(i, probe(*w, *h)).unwrap();
+                if m.loss().is_none() {
+                    assert!(m.cell.go_live());
+                }
+            }
+            s.charged.1
+        };
+        let (chart, skin) = (Movie::chart(1), Movie::new(1));
+        let charged = admit(
+            &[Arc::clone(&chart), Arc::clone(&skin)],
+            &[(2048, 1536), (1280, 1024)],
+        );
+        assert_eq!((chart.loss(), skin.loss()), (None, Some(Loss::OverTotal)));
+        assert_eq!(charged, 2048 * 1536, "no ring for the refused");
+        let four = [
+            Movie::chart(1),
+            Movie::chart(1),
+            Movie::new(1),
+            Movie::new(1),
+        ];
+        let charged = admit(&four, &[(1024, 1024); 4]);
+        assert!(four.iter().all(|m| m.loss().is_none()));
+        assert_eq!(charged, skin_model::movie::MAX_MOVIE_PIXELS);
+    }
+
+    /// A seek not answered within the answer deadline of its write loses
+    /// its player for the answer, and marks the worker; at the deadline it
+    /// is still waited on.
+    // Covers: T02
+    #[test]
+    fn an_unanswered_seek_loses_its_player() {
+        let limit = Deadlines::GAME.answer;
+        for (since, lost) in [
+            (limit, None),
+            (limit + Duration::from_millis(1), Some(Loss::Answer)),
+        ] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(2);
+            s.seek_wanted(1).unwrap();
+            let now = Instant::now();
+            // The session saw the seek written `since` before now.
+            s.players[0].written = Some(now.checked_sub(since).unwrap());
+            s.judge(1, now, true);
+            assert_eq!(movie.loss(), lost, "{since:?}");
+            assert_eq!(s.marked, lost.is_some());
+        }
+    }
+
+    /// An end for the run in flight, its seek not answered yet, loses the
+    /// player: the worker answers a seek before any end of its run. The
+    /// ended run stays the last answered run's.
+    // Covers: T02
+    #[test]
+    fn an_end_before_its_seek_is_answered_fails_the_player() {
+        let (mut s, movie) = sought_to(4);
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!(movie.ended(), 4);
+        movie.want(5);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.players[0].stage, Stage::Seeking { id: 2, run: 5 });
+        s.take(Instant::now(), &ended(5)).unwrap();
+        assert_eq!(movie.ended(), 4, "run 5's end before its answer");
+        assert_eq!(movie.loss(), Some(Loss::Answer));
+        // An end of the run answered last, run 4, while 5 is in flight is
+        // that run's end, not a loss.
+        let (mut s, movie) = sought_to(4);
+        movie.want(5);
+        s.seek_wanted(1).unwrap();
+        s.take(Instant::now(), &ended(4)).unwrap();
+        assert_eq!((movie.ended(), movie.loss()), (4, None));
+        assert_eq!(s.players[0].stage, Stage::Seeking { id: 2, run: 5 });
+    }
+
+    /// The worker's rejection of the seek in flight fails the player; a
+    /// rejection of another command does not.
+    // Covers: T02
+    #[test]
+    fn a_rejected_seek_fails_the_player() {
+        for (id, lost) in [(2, None), (1, Some(Loss::Failed))] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(3);
+            s.seek_wanted(1).unwrap();
+            let rejected = Reply::Rejected {
+                id,
+                player: 1,
+                code: 87,
+            };
+            s.take(Instant::now(), &rejected).unwrap();
+            assert_eq!(movie.loss(), lost, "a rejection of command {id}");
+            let stage = if lost.is_some() {
+                Stage::Idle
+            } else {
+                Stage::Seeking { id: 1, run: 3 }
+            };
+            assert_eq!(s.players[0].stage, stage);
+            assert!(!s.marked);
+        }
+    }
+
+    /// A seek keeps the progress window it found: a decoder whose word has
+    /// not risen since 2.001 s ago is lost for its progress, with its seek
+    /// in flight (sent 0.5 s ago) or answered meanwhile.
+    // Covers: T02
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_seek_keeps_the_progress_window() {
+        for answered in [false, true] {
+            let mut s = supervisor(1);
+            let movie = Movie::live_here(1, 64, 48);
+            let words = movie.live().unwrap().ring.words();
+            words[media::PROGRESS_WORD].store(7, Ordering::Release);
+            words[media::STATE_WORD].store(State::Decoding.word(), Ordering::Release);
+            let now = Instant::now();
+            let since = now.checked_sub(MS(2_001)).unwrap();
+            s.players = vec![Player {
+                stage: Stage::Live,
+                progress: (7, since),
+                ..opening(&movie, 1)
+            }];
+            movie.want(2);
+            s.seek_wanted(1).unwrap();
+            s.players[0].written = Some(now.checked_sub(MS(500)).unwrap());
+            if answered {
+                s.take(Instant::now(), &sought(1, 2, Some(40_000))).unwrap();
+                assert_eq!(s.players[0].stage, Stage::Live);
+            }
+            s.judge(1, now, true);
+            assert_eq!(movie.loss(), Some(Loss::Progress), "answered: {answered}");
+        }
+    }
+
+    /// A file to hand the session.
+    fn file() -> std::fs::File {
+        std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap()
+    }
+
+    /// The session `s` on a thread of its own, which starts its turns once
+    /// `before` has used the game's handle: the handle, and the thread.
+    fn started(
+        s: Supervisor,
+        before: impl FnOnce(&Session),
+    ) -> (Session, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel(REQUESTS);
+        let (go, gone) = mpsc::channel::<()>();
+        let shared = Arc::clone(&s.shared);
+        let thread = std::thread::spawn(move || {
+            if gone.recv().is_ok() {
+                s.run(&rx);
+            }
+        });
+        let session = Session {
+            tx,
+            shared,
+            thread: thread.thread().clone(),
+        };
+        before(&session);
+        go.send(()).unwrap();
+        (session, thread)
+    }
+
+    /// What lets a held turn go. A turn waits on it without parking its
+    /// thread: a channel's wait parks it, and would take the wake a test
+    /// makes meanwhile.
+    #[derive(Default)]
+    struct Gate {
+        /// The turns let go and not taken yet, `u32::MAX` for all.
+        passes: Mutex<u32>,
+        opened: std::sync::Condvar,
+    }
+
+    impl Gate {
+        /// Lets the next held turn go.
+        fn open(&self) {
+            let mut passes = self.passes.lock().unwrap();
+            *passes = passes.saturating_add(1);
+            self.opened.notify_all();
+        }
+
+        /// Lets every held turn go from now on.
+        fn open_all(&self) {
+            *self.passes.lock().unwrap() = u32::MAX;
+            self.opened.notify_all();
+        }
+
+        /// Waits until a held turn may go, up to 10 s, and takes its pass.
+        fn pass(&self) {
+            let passes = self.passes.lock().unwrap();
+            let (mut passes, _) = self
+                .opened
+                .wait_timeout_while(passes, Duration::from_secs(10), |n| *n == 0)
+                .unwrap();
+            if *passes != u32::MAX {
+                *passes = passes.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Has `s` report each of its turns' held points `at` to the receiver
+    /// returned and wait there until the gate returned lets it go. At
+    /// [`Held::Looked`] it first takes any wake left from before, so the
+    /// next turn comes only from a wake made while it is held.
+    fn hold_at(s: &mut Supervisor, at: Held) -> (Receiver<()>, Arc<Gate>) {
+        let (turned, turns) = mpsc::channel();
+        let gate = Arc::new(Gate::default());
+        let held_by = Arc::clone(&gate);
+        s.turn = Some(Box::new(move |held| {
+            if held != at {
+                return;
+            }
+            if held == Held::Looked {
+                std::thread::park_timeout(Duration::ZERO);
+            }
+            let _ = turned.send(());
+            held_by.pass();
+        }));
+        (turns, gate)
+    }
+
+    /// Wakes take no place of the request queue: however many come, a
+    /// queue's worth of opens all find room and nothing is lost at the
+    /// hand-off.
+    // Covers: T02
+    #[test]
+    fn wakes_never_crowd_out_an_open() {
+        let (tx, rx) = mpsc::sync_channel(REQUESTS);
+        let session = Session {
+            tx,
+            shared: supervisor(1).shared,
+            thread: std::thread::current(),
+        };
+        let waker = session.waker();
+        for _ in 0..REQUESTS {
+            waker.wake();
+        }
+        let movies: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                let movie = Movie::new(1);
+                session.open(&movie, file(), false);
+                movie
+            })
+            .collect();
+        let lost = movies.iter().filter(|m| m.loss().is_some()).count();
+        let opens = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|r| matches!(r, Request::Open { .. }))
+            .count();
+        assert_eq!((lost, opens), (0, REQUESTS));
+    }
+
+    /// A wake is never lost: one made after the session has looked (read
+    /// the wants) and before it sleeps, held there, ends its sleep at once.
+    /// The session takes another turn long before its tick (60 s here),
+    /// three times over.
+    // Covers: T02
+    #[test]
+    fn a_wake_before_the_sleep_is_not_lost() {
+        let mut s = supervisor(1);
+        s.deadlines.tick = Duration::from_secs(60);
+        let (turns, gate) = hold_at(&mut s, Held::Looked);
+        let (session, ended) = started(s, |_| {});
+        let waker = session.waker();
+        let mut turned = Vec::new();
+        for _ in 0..3 {
+            turned.push(turns.recv_timeout(Duration::from_secs(10)).is_ok());
+            waker.wake();
+            gate.open();
+        }
+        turned.push(turns.recv_timeout(Duration::from_secs(10)).is_ok());
+        drop(session);
+        gate.open_all();
+        ended.join().unwrap();
+        assert_eq!(turned, [true; 4], "a wake waited for the tick");
+    }
+
+    /// A waker held after the game's handle is dropped keeps no session
+    /// alive, and the drop ends it at once, not at its tick (60 s here).
+    // Covers: T02
+    #[test]
+    fn a_retained_waker_keeps_no_session_alive() {
+        let mut s = supervisor(1);
+        s.deadlines.tick = Duration::from_secs(60);
+        let (turns, gate) = hold_at(&mut s, Held::Looked);
+        let (session, ended) = started(s, |_| {});
+        let waker = session.waker();
+        // The session asleep after its first look.
+        turns.recv_timeout(Duration::from_secs(10)).unwrap();
+        gate.open_all();
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ended.join();
+            let _ = done.send(());
+        });
+        drop(session);
+        let finished = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(waker);
+        assert!(finished, "the session outlived the game's handle");
+    }
+
+    /// An open the session's queue took before the game's handle went is
+    /// lost with the session's end, never left pending: the session is held once it has taken its requests (the first open
+    /// among them), one more open is accepted and the handle dropped, then
+    /// the session goes on.
+    // Covers: T02
+    #[test]
+    fn an_open_accepted_before_the_end_is_lost_with_it() {
+        let mut s = supervisor(1);
+        let (held, gate) = hold_at(&mut s, Held::Taken);
+        let first = Movie::new(1);
+        let (session, ended) = started(s, |session| session.open(&first, file(), false));
+        held.recv_timeout(Duration::from_secs(10)).unwrap();
+        let late = Movie::new(1);
+        session.open(&late, file(), false);
+        drop(session);
+        gate.open();
+        ended.join().unwrap();
+        assert_eq!(
+            (first.loss(), late.loss()),
+            (Some(Loss::Ended), Some(Loss::Ended))
+        );
     }
 
     /// A probe of `width` × `height`.

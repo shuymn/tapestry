@@ -8,7 +8,8 @@
 
 use bms_model::{BgaEvent, BgaImageId, ChartBga, PoorSequence, TimeUs};
 
-use crate::bga::{BgaEntry, BgaStretch, BgaTable, NullMedia, SOLID};
+use crate::bga::{BgaEntry, BgaStretch, BgaTable, ChartVideos, SOLID};
+use crate::movie::{CHART_SLOTS, MovieShow, MovieShows};
 use crate::quad::{ClipRect, Filter, QuadBatch};
 use crate::widget::Brush;
 
@@ -120,22 +121,85 @@ impl BgaClock {
     }
 }
 
+/// Where a frame's chart videos come from: the slot each video id plays
+/// in, and what each movie slot shows this frame.
+#[derive(Clone, Copy)]
+pub(crate) struct Media<'a> {
+    pub(crate) videos: Option<&'a ChartVideos>,
+    pub(crate) shows: &'a MovieShows,
+}
+
+impl Media<'_> {
+    /// Whether a chart video is lost: the panel is then opaque black.
+    fn lost(&self) -> bool {
+        CHART_SLOTS
+            .iter()
+            .any(|s| matches!(self.shows.get(*s), Some(MovieShow::Lost)))
+    }
+
+    /// What video id `id`'s slot shows, if the id has one.
+    fn show(&self, id: BgaImageId) -> Option<(usize, MovieShow)> {
+        let slot = self.videos?.slot(id)?;
+        Some((slot, *self.shows.get(slot)?))
+    }
+}
+
 /// What one BGA element draws from at a frame.
 pub(crate) struct Parts<'a> {
     pub(crate) show: Show,
     pub(crate) table: &'a BgaTable,
-    pub(crate) media: NullMedia,
+    /// Whether the table's pictures may draw: it describes the live
+    /// array. Its videos draw either way.
+    pub(crate) pictures: bool,
+    pub(crate) media: Media<'a>,
     pub(crate) stretch: BgaStretch,
     /// Target pixels per canvas pixel.
     pub(crate) scale: f32,
 }
 
 impl Parts<'_> {
+    // Source: SF-024
+    /// Pushes video `id`'s frame from its chart movie slot, placed by the
+    /// stretch against the video's size, at its linear samples and opaque;
+    /// `false` when its slot shows none.
+    fn video(
+        &self,
+        out: &mut QuadBatch,
+        brush: &Brush,
+        rect: [f32; 4],
+        trim: Option<ClipRect>,
+        id: BgaImageId,
+    ) -> bool {
+        let Some((
+            slot,
+            MovieShow::Frame {
+                uv,
+                layer,
+                size,
+                bt601,
+                full,
+            },
+        )) = self.media.show(id)
+        else {
+            return false;
+        };
+        let f = crate::FrameUv { uv, layer };
+        let (r, f, native) = self.stretch.place(rect, size, f, self.scale);
+        let b = Brush { native, ..*brush };
+        out.push_movie(slot, |out| {
+            b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+        });
+        true
+    }
+
     /// Pushes the element's quads over its placed `rect` with `brush`'s
     /// key, transform and colour (see [`Show`]): the placeholder in black
     /// at the brush's alpha over the whole rect, each picture met by the
     /// stretch against its drawn size, the base and a poor picture at
-    /// their linear samples, the layer keyed.
+    /// their linear samples, the layer keyed; a video's frame, from its
+    /// chart movie slot, at its linear samples and opaque on every
+    /// channel. While a chart video is lost, one opaque black quad over
+    /// the rect, whatever the brush's colour and blend, and nothing else.
     pub(crate) fn draw(
         &self,
         out: &mut QuadBatch,
@@ -156,10 +220,22 @@ impl Parts<'_> {
             };
             b.push_clipped(out, rect, SOLID, Filter::Linear, trim);
         };
+        if self.media.lost() {
+            let black = Brush {
+                key: crate::quad::RunKey {
+                    blend: crate::quad::Blend::Alpha,
+                    ..brush.key
+                },
+                color: [0.0, 0.0, 0.0, 1.0],
+                ..*brush
+            };
+            black.push_clipped(out, rect, SOLID, Filter::Linear, trim);
+            return;
+        }
         let picture = |out: &mut QuadBatch, id: BgaImageId, filter: Filter| {
             let cell = match self.table.get(id) {
-                BgaEntry::Picture(c) => Some(c),
-                BgaEntry::Video => self.media.frame(id),
+                BgaEntry::Picture(c) => self.pictures.then_some(c),
+                BgaEntry::Video => return self.video(out, brush, rect, trim, id),
                 BgaEntry::Absent => None,
             };
             let Some(c) = cell else {

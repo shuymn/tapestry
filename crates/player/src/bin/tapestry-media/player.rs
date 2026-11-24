@@ -17,7 +17,8 @@
 //! game drops one behind its clock only for a newer frame that is also
 //! due. A frame is published before the next one is converted, so a
 //! blocked conversion leaves the frame due in the ring. It answers the end
-//! of the video, a seek and a failure; a failed or refused player only
+//! of the video, every seek (one that finds no frame with no landing, then
+//! the run's end) and a failure; a failed or refused player only
 //! waits to be closed. A looping play starts again at the video's start at
 //! each end, in the same run, its stamps rising on, and never ends. It
 //! counts every frame its decoder returns in the ring's progress word and
@@ -30,7 +31,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
-use skin_model::media::{PROGRESS_WORD, State, Writer};
+use skin_model::media::{PROGRESS_WORD, Stamp, State, Writer};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
@@ -232,7 +233,7 @@ struct Playing {
     /// The sequence of the last frame published in the ring.
     seq: u64,
     /// The stamp of the frame in `frame`, converted and not published yet.
-    held: Option<i64>,
+    held: Option<Stamp>,
     /// The run's video has ended.
     ended: bool,
 }
@@ -276,7 +277,8 @@ impl Playing {
     }
 
     /// Positions the video at `at` µs for run `run` and answers seek `id`
-    /// with where it landed, or that nothing is at or after it.
+    /// with where it landed, or, when nothing is at or after it, with no
+    /// landing and then the run's end: every seek is answered.
     fn seek(&mut self, id: u32, run: u64, at: i64, out: &Out) -> Result<(), (Failure, i32)> {
         self.run = run;
         self.floor = at;
@@ -286,16 +288,26 @@ impl Playing {
         self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
             Some(landed) => {
-                self.held = Some(landed.stamp);
+                self.held = Some(Stamp {
+                    at: landed.stamp,
+                    duration: self.input.duration(),
+                });
                 out.send(&Reply::Sought {
                     id,
                     player: self.player,
                     run,
-                    landed: landed.stamp,
+                    landed: Some(landed.stamp),
                     attempts: landed.attempts,
                 });
             }
             None => {
+                out.send(&Reply::Sought {
+                    id,
+                    player: self.player,
+                    run,
+                    landed: None,
+                    attempts: 0,
+                });
                 self.ended = true;
                 self.writer.state(self.view.words(), State::Ended);
                 out.send(&Reply::Ended {
@@ -313,13 +325,17 @@ impl Playing {
     fn decode(&mut self, after: Option<i64>) -> Result<Decoded, (Failure, i32)> {
         let floor = self.floor;
         let keep = |stamp: i64| stamp >= floor && after.is_none_or(|l| stamp > l);
+        let timed = |input: &Input, at: i64| Stamp {
+            at,
+            duration: input.duration(),
+        };
         Ok(match self.input.next()? {
-            Some(stamp) if keep(stamp) => Decoded::Frame(stamp),
+            Some(stamp) if keep(stamp) => Decoded::Frame(timed(&self.input, stamp)),
             Some(_) => Decoded::Skipped,
             None if self.looping => {
                 let stamp = self.input.restart()?;
                 if keep(stamp) {
-                    Decoded::Frame(stamp)
+                    Decoded::Frame(timed(&self.input, stamp))
                 } else {
                     Decoded::Skipped
                 }
@@ -367,7 +383,7 @@ impl Playing {
             .publish(words, slot, &self.frame, seq, self.run, stamp)
             .map_err(|_| (Failure::Ring, 0))?;
         self.seq = seq;
-        self.last = Some(stamp);
+        self.last = Some(stamp.at);
         self.held = None;
         freeze_at(self.player, Freeze::Decoding);
         Ok(())
@@ -376,8 +392,9 @@ impl Playing {
 
 /// What a decode gave.
 enum Decoded {
-    /// A frame to publish, by its stamp, for the input to convert.
-    Frame(i64),
+    /// A frame to publish, by its stamp and duration, for the input to
+    /// convert.
+    Frame(Stamp),
     /// A frame not to publish (below the run's start, or not rising).
     Skipped,
     /// The video's end.

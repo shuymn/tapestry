@@ -143,6 +143,10 @@ pub struct Look {
     /// The chart's BGA filling [`BGA_RECT`] (stretch 0) on the untimed
     /// `screen` timer, over the image.
     pub bga: bool,
+    /// With `bga`, a second `bga` destination filling [`BGA_RECT_2`],
+    /// additive, tinted and at half alpha, over the image beside the
+    /// first.
+    pub bga_second: bool,
     /// The loading time the skin declares ([`skin_model::Skin::loadend`]).
     pub loadend: Option<TimeUs>,
     /// Two skin movies filling [`MOVIE_A`] (slot 0) and [`MOVIE_B`]
@@ -312,6 +316,9 @@ pub const BACK_MARK: [i32; 4] = [1_500, 800, 100, 100];
 pub const NO_BACK_MARK: [i32; 4] = [1_700, 800, 100, 100];
 /// Where [`Look::bga`]'s BGA draws: within the image's left half.
 pub const BGA_RECT: [i32; 4] = [100, 100, 400, 400];
+/// Where [`Look::bga_second`]'s BGA draws: beside the first, within the
+/// image's left half.
+pub const BGA_RECT_2: [i32; 4] = [560, 100, 300, 300];
 
 impl Look {
     /// `rgba` over the left half, under a clip of the left half.
@@ -334,6 +341,7 @@ impl Look {
             full_lanes: false,
             chart: false,
             bga: false,
+            bga_second: false,
             loadend: None,
             movies: false,
         }
@@ -523,6 +531,31 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
             timer: TimerRef::Builtin(skin_model::timer::SCREEN),
             ..image(BGA_RECT, false)
         });
+        if look.bga_second {
+            let [x, y, w, h] = BGA_RECT_2;
+            // Half alpha, tinted: the lost panel's black ignores both.
+            let props = [x, y, w, h, 128, 255, 160, 64, 0].map(Some);
+            let track = Track::new(
+                &[KeyDef {
+                    at: TimeUs(0),
+                    props,
+                }],
+                Ease::Linear,
+                End::Hold,
+            )
+            .unwrap();
+            elements.push(ElementDef {
+                source: Source::Bga {
+                    stretch: skin_model::bga::BgaStretch::Whole(
+                        skin_model::chart_image::ChartStretch::Fill,
+                    ),
+                },
+                track,
+                timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                blend: Blend::Add,
+                ..image(BGA_RECT_2, false)
+            });
+        }
     }
     if look.finish {
         elements.push(ElementDef {

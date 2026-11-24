@@ -302,7 +302,17 @@ impl WorkerModel {
                     log: RefCell::new(Vec::new()),
                 };
                 self.writer
-                    .publish(&view, slot, &frame(seq), seq, run, stamp)
+                    .publish(
+                        &view,
+                        slot,
+                        &frame(seq),
+                        seq,
+                        run,
+                        skin_model::media::Stamp {
+                            at: stamp,
+                            duration: 33_333,
+                        },
+                    )
                     .unwrap();
                 assert_publication_order(&view.log.borrow(), g, index);
                 self.seq = seq;

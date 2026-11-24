@@ -1007,6 +1007,8 @@ fn movies_shown(r: &mut Renderer) {
             full: false,
         },
         MovieShow::Lost,
+        MovieShow::Nothing,
+        MovieShow::Nothing,
     ]);
 }
 

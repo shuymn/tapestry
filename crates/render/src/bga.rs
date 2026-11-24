@@ -89,17 +89,22 @@ pub(crate) struct BgaArray {
 pub(crate) fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bga"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2Array,
-                multisampled: false,
-            },
-            count: None,
-        }],
+        entries: &entries(),
     })
+}
+
+/// The BGA group's layout entries: the array.
+pub(crate) const fn entries() -> [wgpu::BindGroupLayoutEntry; 1] {
+    [wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }]
 }
 
 fn texture(gpu: &Gpu, side: u32, pages: u32) -> wgpu::Texture {
