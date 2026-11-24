@@ -1337,7 +1337,7 @@ fn play(
             monitor,
             Some((Arc::clone(&menu), Arc::default())),
         )
-        .map(|(w, s, t)| (w, s, Some(t), None))
+        .map(|(w, s, t)| (w, s, InputThreads::raw(t)))
     } else {
         open_window_and_clocked(
             &controls,
@@ -1349,9 +1349,9 @@ fn play(
             monitor,
             Some((Arc::clone(&menu), Arc::default())),
         )
-        .map(|(w, s, t)| (w, s, None, Some(t)))
+        .map(|(w, s, t)| (w, s, InputThreads::clocked(t)))
     };
-    let (window_thread, surface, raw_thread, clocked_thread) = match started {
+    let (window_thread, surface, inputs) = match started {
         Ok(started) => started,
         Err(e) => {
             audio.exit();
@@ -1398,13 +1398,13 @@ fn play(
         measure,
         Box::new(NoFrames),
         shown.deadline(),
-        &|| controls.quitting(),
+        quitting(&controls),
     );
     let render = match render {
         Ok(r) => r,
         Err(e) => {
             audio.exit_by(shown.deadline());
-            return render_not_started(window_thread, e);
+            return render_not_started(window_thread, inputs, e);
         }
     };
     render.follow(&window_thread.extent());
@@ -1412,6 +1412,7 @@ fn play(
         return end_startup(
             end,
             shown.deadline(),
+            inputs,
             |by| audio.exit_by(by),
             |by| render.exit_by(by),
             |rendered, by| window_thread.close_by(rendered, by),
@@ -1448,15 +1449,7 @@ fn play(
     let ended = rig.shut_down();
     report_render_end(&ended.rendered);
     window_thread.close_after(ended.rendered.released());
-    // Not joined: an input thread that stopped answering must not hold up
-    // the exit or the report of why the run ended. Its wake report is not
-    // used here.
-    if let Some(t) = raw_thread {
-        t.detach();
-    }
-    if let Some(t) = clocked_thread {
-        t.detach();
-    }
+    inputs.detach();
     ran?;
     ended.page?;
     #[cfg(feature = "dev-tools")]
@@ -1503,42 +1496,108 @@ fn window_make(
 }
 
 /// Whether the window must stay open after the render thread did not
-/// start with `e`: a thread left detached past the deadline or at a close
-/// may still make its surface on it, so the window lives to the process's
-/// exit.
+/// start with `e`: a thread left detached past the deadline, at a close
+/// or after its failure may still make its surface on it, so the window
+/// lives to the process's exit.
 fn keeps_window(e: &ScreenError) -> bool {
-    matches!(e, ScreenError::NoStart | ScreenError::Cancelled)
+    matches!(
+        e,
+        ScreenError::NoStart | ScreenError::Cancelled | ScreenError::LeftRunning(_)
+    )
+}
+
+/// The run's input thread, on Raw Input or clocked (autoplay), whichever
+/// the launch started.
+#[derive(Default)]
+struct InputThreads {
+    raw: Option<InputThread>,
+    clocked: Option<ClockedThread>,
+}
+
+impl InputThreads {
+    /// The Raw Input thread `t`.
+    fn raw(t: InputThread) -> Self {
+        Self {
+            raw: Some(t),
+            clocked: None,
+        }
+    }
+
+    /// The clocked thread `t`.
+    fn clocked(t: ClockedThread) -> Self {
+        Self {
+            raw: None,
+            clocked: Some(t),
+        }
+    }
+
+    /// Stops the threads without joining them: an input thread that
+    /// stopped answering must not hold up the exit or the report of why
+    /// the run ended. Its wake report is not used.
+    fn detach(self) {
+        if let Some(t) = self.raw {
+            t.detach();
+        }
+        if let Some(t) = self.clocked {
+            t.detach();
+        }
+    }
 }
 
 /// Ends a startup whose render thread did not start with `e`: the window
 /// is never shown, and closes unless [`keeps_window`], its thread waited
-/// for until the startup's deadline at the latest. A close is the run's
-/// end, no failure; anything else fails the run.
-fn render_not_started(window: window::WindowThread, e: ScreenError) -> anyhow::Result<()> {
-    log_file::finishing();
+/// for until the startup's deadline at the latest; the input threads are
+/// left unjoined. A close is the run's end, no failure; anything else
+/// fails the run.
+fn render_not_started(
+    window: window::WindowThread,
+    inputs: InputThreads,
+    e: ScreenError,
+) -> anyhow::Result<()> {
     let shown = window.shown();
+    not_started(&shown, inputs, e, |close, by| window.close_by(close, by))
+}
+
+/// [`render_not_started`] on the startup's outcome `shown`, the window
+/// closed through `close` (told whether it may close, and until when its
+/// thread is waited for). A failure that finds the window closed (the
+/// close settled first, under the outcome's lock) ends the run as the
+/// close.
+fn not_started(
+    shown: &window::WindowShown,
+    inputs: InputThreads,
+    e: ScreenError,
+    close: impl FnOnce(bool, std::time::Instant),
+) -> anyhow::Result<()> {
+    inputs.detach();
+    log_file::finishing();
     shown.fail(window::StartFailure::Render(e.to_string()));
-    window.close_by(!keeps_window(&e), shown.deadline());
+    close(!keeps_window(&e), shown.deadline());
     match e {
         ScreenError::Cancelled => Ok(()),
+        _ if shown.readiness() == window::Readiness::Closed => Ok(()),
         e => Err(e.into()),
     }
 }
 
 /// Ends a run whose startup ended without its first present (`end`): the
-/// log's records stop waiting on a blocked writer first ([`log_file::finishing`]),
-/// then the audio thread (`audio`), the render thread (`render`) and the
-/// window (`close`, told whether the renderer is gone) are each waited for
-/// until `by`, the startup's deadline, at the latest, so the outcome is
-/// reported by then; a thread still running is left to the process's exit,
-/// and a window a render thread may still draw into stays open.
+/// input threads are stopped without being joined ([`InputThreads::detach`])
+/// and the log's records stop waiting on a blocked writer first
+/// ([`log_file::finishing`]), then the audio thread (`audio`), the render
+/// thread (`render`) and the window (`close`, told whether the renderer is
+/// gone) are each waited for until `by`, the startup's deadline, at the
+/// latest, so the outcome is reported by then; a thread still running is
+/// left to the process's exit, and a window a render thread may still draw
+/// into stays open.
 fn end_startup(
     end: window::StartEnd,
     by: std::time::Instant,
+    inputs: InputThreads,
     audio: impl FnOnce(std::time::Instant),
     render: impl FnOnce(std::time::Instant) -> RenderEnd,
     close: impl FnOnce(bool, std::time::Instant),
 ) -> anyhow::Result<()> {
+    inputs.detach();
     log_file::finishing();
     audio(by);
     let rendered = render(by);
@@ -1565,8 +1624,17 @@ pub(crate) fn join_by<T>(
     Some(handle.join())
 }
 
+/// Whether the run's startup is cancelled: the controls closed (the
+/// window's close, or a quit), asked by the startup's wait and by the
+/// render thread before each build made again.
+fn quitting(controls: &Arc<Controls>) -> render_side::Cancel {
+    let c = Arc::clone(controls);
+    Arc::new(move || c.quitting())
+}
+
 /// Waits for the startup's outcome ([`window::WindowShown::wait_ready`]),
-/// the render thread's failure waking the wait as a close does.
+/// the render thread's failure waking the wait as a close does and failing
+/// the startup with its cause ([`render_side::RenderLink::failure`]).
 fn wait_ready(
     shown: &window::WindowShown,
     controls: &Arc<Controls>,
@@ -1574,11 +1642,7 @@ fn wait_ready(
 ) -> Result<(), window::StartEnd> {
     let c = Arc::clone(controls);
     render.set_game_wake(Arc::new(move || c.wake_game()));
-    shown.wait_ready(&|| controls.quitting(), &|| {
-        render
-            .failed()
-            .then(|| "the render thread failed before its first frame".to_owned())
-    })
+    shown.wait_ready(&|| controls.quitting(), &|| render.failure())
 }
 
 /// The run's end for a startup that ended without its first present: a
@@ -1935,7 +1999,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     monitor,
                     Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
-                .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
+                .map(|(w, s, t)| (Some(w), Some(s), InputThreads::clocked(t)))
             } else {
                 open_window_and_input(
                     &controls,
@@ -1948,21 +2012,21 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     monitor,
                     Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
-                .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
+                .map(|(w, s, t)| (Some(w), Some(s), InputThreads::raw(t)))
             }
         };
     }
     #[cfg(feature = "dev-tools")]
     let started = if headless {
         ClockedThread::spawn(clock, sources, &waker, wake)
-            .map(|t| (None, None, None, Some(t)))
+            .map(|t| (None, None, InputThreads::clocked(t)))
             .context("input")
     } else {
         windowed!()
     };
     #[cfg(not(feature = "dev-tools"))]
     let started = windowed!();
-    let (window_thread, surface, raw_thread, clocked_thread) = match started {
+    let (window_thread, surface, inputs) = match started {
         Ok(started) => started,
         Err(e) => {
             audio.exit();
@@ -2072,18 +2136,20 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         measure,
         frames,
         deadline,
-        &|| controls.quitting(),
+        quitting(&controls),
     ) {
         Ok(r) => r,
         Err(e) => {
             audio.exit_by(deadline);
             return match window_thread {
-                Some(w) => render_not_started(w, e),
-                None if keeps_window(&e) => match e {
-                    ScreenError::Cancelled => Ok(()),
-                    e => Err(e.into()),
-                },
-                None => Err(e.into()),
+                Some(w) => render_not_started(w, inputs, e),
+                None => {
+                    inputs.detach();
+                    match e {
+                        ScreenError::Cancelled => Ok(()),
+                        e => Err(e.into()),
+                    }
+                }
             };
         }
     };
@@ -2100,6 +2166,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         return end_startup(
             end,
             shown.deadline(),
+            inputs,
             |by| audio.exit_by(by),
             |by| render.exit_by(by),
             |rendered, by| {
@@ -2275,12 +2342,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     // A practice page job's panic found as the run ended ends it with it.
     let ran = ran.and(ended.page.map_err(game::LiveError::Load));
     // As in `play`: not joined.
-    if let Some(t) = raw_thread {
-        t.detach();
-    }
-    if let Some(t) = clocked_thread {
-        t.detach();
-    }
+    inputs.detach();
     if let Some(e) = failed {
         return Err(e);
     }
@@ -3774,7 +3836,7 @@ mod tests {
                 measure,
                 Box::new(NoFrames),
                 Instant::now() + Duration::from_secs(3_600),
-                &|| false,
+                Arc::new(|| false),
             )
             .err()
         });
@@ -3797,13 +3859,17 @@ mod tests {
     }
 
     /// W3.5: a render thread left detached (past the startup's deadline,
-    /// or at a close) may still make its surface on the window, which
-    /// then stays open; one that ended lets it close.
+    /// at a close, or after a failure it had not ended from by the
+    /// deadline) may still make its surface on the window, which then
+    /// stays open; one that ended lets it close.
     #[test]
     fn a_detached_renderer_keeps_the_window() {
         use crate::render_side::ScreenError;
         assert!(super::keeps_window(&ScreenError::NoStart));
         assert!(super::keeps_window(&ScreenError::Cancelled));
+        assert!(super::keeps_window(&ScreenError::LeftRunning(Box::new(
+            ScreenError::Render(render::RenderError::SurfaceLost)
+        ))));
         assert!(!super::keeps_window(&ScreenError::EndedWhileStarting));
         assert!(!super::keeps_window(&ScreenError::PanickedWhileStarting(
             "x".to_owned()
@@ -3900,6 +3966,7 @@ mod tests {
         let e = super::end_startup(
             StartEnd::Failed(StartFailure::NoFrame(Duration::from_secs(30))),
             by,
+            super::InputThreads::default(),
             |at| seen.borrow_mut().push(("audio", at, true)),
             |at| {
                 seen.borrow_mut().push(("render", at, true));
@@ -3943,6 +4010,99 @@ mod tests {
         let left = rx.recv_timeout(Duration::from_secs(5));
         drop(release);
         assert_eq!(left, Ok(true), "the join waited past its instant");
+    }
+
+    /// An input thread whose wake is blocked (until the sender returned is
+    /// used or dropped, at most 10 s), its wake under way.
+    fn blocked_input() -> (super::InputThreads, std::sync::mpsc::Sender<()>) {
+        use std::time::Duration;
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let waker = input::Waker::new().unwrap();
+        let t = input::ClockedThread::spawn(
+            input::QpcClock::start(),
+            super::sources(),
+            &waker,
+            move |_, _| {
+                let _ = entered_tx.send(());
+                let _ = released.recv_timeout(Duration::from_secs(10));
+                input::Phase::Tail
+            },
+        )
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        (super::InputThreads::clocked(t), release)
+    }
+
+    /// W6.1: a failed startup's end, on each of its paths (the render
+    /// thread not started, the first present not reached), leaves an input
+    /// thread whose wake is blocked unjoined, so the reason is reported by
+    /// the deadline.
+    #[test]
+    fn a_failed_startups_end_leaves_a_blocked_input_thread() {
+        use std::time::{Duration, Instant};
+
+        use crate::render_side::{RenderEnd, ScreenError};
+        use crate::window::{Readiness, StartEnd, StartFailure, WindowShown};
+
+        let (inputs, release) = blocked_input();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let by = Instant::now() + Duration::from_millis(50);
+            let e = super::end_startup(
+                StartEnd::Failed(StartFailure::NoFrame(Duration::from_secs(30))),
+                by,
+                inputs,
+                |_| {},
+                |_| RenderEnd::Joined,
+                |_, _| {},
+            );
+            let _ = tx.send(e.is_err());
+        });
+        let ended = rx.recv_timeout(Duration::from_secs(5));
+        drop(release);
+        assert_eq!(ended, Ok(true), "the end waited for the input thread");
+
+        let (inputs, release) = blocked_input();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let shown = WindowShown::settled(Readiness::Pending);
+            let e = super::not_started(&shown, inputs, ScreenError::NoStart, |_, _| {});
+            let _ = tx.send(e.is_err());
+        });
+        let ended = rx.recv_timeout(Duration::from_secs(5));
+        drop(release);
+        assert_eq!(ended, Ok(true), "the end waited for the input thread");
+    }
+
+    /// W6.5: a render thread's failure that finds the window closed (the
+    /// close settled the startup first) ends the run as the close; one
+    /// that finds the startup pending fails it.
+    #[test]
+    fn a_failure_after_the_close_ends_as_the_close() {
+        use crate::render_side::ScreenError;
+        use crate::window::{Readiness, WindowShown};
+
+        let failure = || ScreenError::Render(render::RenderError::SurfaceLost);
+        let closed = WindowShown::settled(Readiness::Closed);
+        let ended = super::not_started(
+            &closed,
+            super::InputThreads::default(),
+            failure(),
+            |_, _| {},
+        );
+        assert!(ended.is_ok(), "{ended:?}");
+        assert_eq!(closed.readiness(), Readiness::Closed);
+        let pending = WindowShown::settled(Readiness::Pending);
+        assert!(
+            super::not_started(
+                &pending,
+                super::InputThreads::default(),
+                failure(),
+                |_, _| {}
+            )
+            .is_err()
+        );
     }
 
     /// W4.2: a present tap whose reconfigure the surface refused fails the

@@ -1398,6 +1398,12 @@ pub enum ScreenError {
     /// the thread is left to the process's exit.
     #[error("the window closed while the render thread was starting")]
     Cancelled,
+    /// The render thread failed its first screen with the error inside and
+    /// had not ended by the startup's deadline ([`spawn_until`]): it is
+    /// left to the process's exit, and the window it may still draw into
+    /// stays open.
+    #[error(transparent)]
+    LeftRunning(Box<ScreenError>),
     /// The window was not shown at its first frame (design.md "Showing
     /// the window"): no play opens.
     #[error("the window was not shown: {0}")]
@@ -1990,6 +1996,11 @@ impl std::fmt::Debug for GameWake {
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
+    /// The report line of the first failure since [`failed`](Self::failed)
+    /// was last cleared, for the startup's outcome to say why
+    /// ([`RenderLink::failure`]): a fixed record, so a frame's failure
+    /// keeps it with nothing allocated.
+    cause: Mutex<Option<crate::render_report::Line>>,
     /// The one owner of the screen's rebuild after a loss: none, one under
     /// way, or the failure no one has reported yet. Every look, recovery
     /// and preparation goes through [`serve_recovery`]; the render thread
@@ -2377,6 +2388,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             failed: AtomicBool::new(false),
+            cause: Mutex::new(None),
             recovery: Mutex::new(Recovery::Idle),
             chart_generation: Arc::default(),
             bga_generation: Arc::default(),
@@ -2699,6 +2711,23 @@ impl Shared {
     fn latch_failed(&self) {
         self.failed.store(true, Ordering::Release);
         self.game_wake.wake();
+    }
+
+    /// Reports the failure `line` ([`crate::render_report::report`]) and
+    /// keeps it as the cause, unless one is kept already; the caller then
+    /// latches the failure.
+    fn report_failure(&self, line: std::fmt::Arguments<'_>) {
+        crate::render_report::report(line);
+        let mut cause = self.cause.lock().unwrap_or_else(PoisonError::into_inner);
+        if cause.is_none() {
+            *cause = Some(crate::render_report::Line::format(line));
+        }
+    }
+
+    /// Clears the failure and its cause: a screen built again.
+    fn clear_failed(&self) {
+        *self.cause.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.failed.store(false, Ordering::Release);
     }
 
     fn selection_slot(&self) -> std::sync::MutexGuard<'_, SelectionSlot> {
@@ -4810,6 +4839,25 @@ impl RenderLink {
         self.shared.failed.load(Ordering::Acquire)
     }
 
+    /// Why the screen failed, when [`failed`](Self::failed): the first
+    /// failure's report line since the screen was last built, or a line
+    /// saying only that it failed when the failure reported none (the
+    /// thread's panic or end). `None` while it has not failed.
+    pub fn failure(&self) -> Option<String> {
+        if !self.failed() {
+            return None;
+        }
+        let cause = self
+            .shared
+            .cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Some(cause.as_ref().map_or_else(
+            || "the render thread failed before its first frame".to_owned(),
+            |line| line.as_str().to_owned(),
+        ))
+    }
+
     /// A reply found disconnected: the render thread ended, which is the
     /// screen's failure, latched before the reply's error is returned.
     fn ended(&self) -> ScreenError {
@@ -5494,7 +5542,7 @@ pub fn spawn(
         measure,
         frames,
         Instant::now() + startup_bound(),
-        &|| false,
+        Arc::new(|| false),
     )
 }
 
@@ -5508,6 +5556,10 @@ fn startup_bound() -> Duration {
     STARTUP_TIMEOUT
 }
 
+/// Whether the startup was cancelled (the window closed), asked on the
+/// game thread and on the render thread alike ([`spawn_until`]).
+pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Starts the render thread; `make` builds the screen on it, and the chart,
 /// when there is one yet, is prepared before this returns, so every upload
 /// is done before the first READY state (design.md "Display Latency and
@@ -5515,15 +5567,20 @@ fn startup_bound() -> Duration {
 /// The first screen is waited for until `deadline`, in slices that end at
 /// once when `cancelled` (the window closed); a build the window's surface
 /// refused in a way a build made again may pass is made again
-/// ([`startup_build`]). The render thread's report lines go to the log
-/// through a reporter of its own ([`crate::render_report`]).
+/// ([`startup_build`]), unless `cancelled` by then. A failed build's reply
+/// that finds the window closed ends as the close. A thread that failed is
+/// waited for, with its reporter, until `deadline` at the latest. The
+/// render thread's report lines go to the log through a reporter of its
+/// own ([`crate::render_report`]).
 ///
 /// # Errors
 ///
 /// Why the screen could not be built or could not draw the chart; the
 /// thread's panic while building, with its message; no screen by
-/// `deadline` ([`ScreenError::NoStart`]) or a close before it
-/// ([`ScreenError::Cancelled`]), the thread then left detached.
+/// `deadline` ([`ScreenError::NoStart`]) or a close before its reply
+/// ([`ScreenError::Cancelled`]), the thread then left detached; a failure
+/// whose thread had not ended by `deadline`, left detached
+/// ([`ScreenError::LeftRunning`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "spawn's inputs, beside the startup's deadline and its cancel"
@@ -5537,7 +5594,7 @@ pub fn spawn_until(
     measure: Measure,
     frames: Box<dyn FrameSink>,
     deadline: Instant,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: Cancel,
 ) -> Result<RenderLink, ScreenError> {
     let (producer, reporter) = match crate::render_report::start(crate::log_file::warn_sink()) {
         Ok((p, r)) => (Some(p), Some(r)),
@@ -5555,15 +5612,18 @@ pub fn spawn_until(
     let scripts = Scripts::new();
     let thread_scripts = scripts.clone();
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
-    // Set once the wait below gave up (the deadline or a close): the
-    // builder, left detached, makes no build after it.
-    let abandoned = Arc::new(AtomicBool::new(false));
-    let thread_abandoned = Arc::clone(&abandoned);
+    // The close the wait below looks at, which the builder looks at too
+    // before each build made again: one signal for both.
+    let thread_cancelled = Arc::clone(&cancelled);
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
             // Dropped when the thread ends, however it ends.
             let _ended = ended_tx;
+            // A local, so a panic drops it before the factory, which the
+            // closure holds: the wait learns of the panic while a slow
+            // drop of the factory is still under way.
+            let ready_tx = ready_tx;
             match producer {
                 Some(p) => crate::render_report::install(p),
                 None => crate::render_report::stderr_only(),
@@ -5587,7 +5647,7 @@ pub fn spawn_until(
                 chart.as_deref(),
                 section.as_ref(),
                 deadline,
-                &thread_abandoned,
+                &*thread_cancelled,
                 &mut std::thread::sleep,
             );
             let screen = match built {
@@ -5743,23 +5803,24 @@ pub fn spawn_until(
     };
     let answer = match answer {
         Ok(answer) => answer,
-        // Ended without an answer: a panic, whose message the join gives.
+        // Ended without an answer: a panic, whose message the join gives,
+        // the thread waited for until the deadline (its unwinding may drop
+        // a device the driver holds).
         Err(ScreenError::EndedWhileStarting) => {
-            return Err(match handle.join() {
-                Err(payload) => {
+            return Err(match crate::join_by(handle, end_by(deadline)) {
+                Some(Err(payload)) => {
                     ScreenError::PanickedWhileStarting(game::coord::JobPanic::of(&*payload).0)
                 }
-                Ok(()) => ScreenError::EndedWhileStarting,
+                Some(Ok(())) => ScreenError::EndedWhileStarting,
+                None => ScreenError::LeftRunning(Box::new(ScreenError::EndedWhileStarting)),
             });
         }
         // Past the deadline or cancelled, the thread and its reporter are
         // left detached: the build under way may still finish, and the
         // window it may draw into stays open (the caller's); no build
-        // starts after it.
-        Err(e) => {
-            abandoned.store(true, Ordering::Release);
-            return Err(e);
-        }
+        // starts after it, the builder looking at the same deadline and
+        // close.
+        Err(e) => return Err(e),
     };
     match answer {
         Ok(()) => Ok(RenderLink {
@@ -5780,13 +5841,31 @@ pub fn spawn_until(
             reporter,
         }),
         Err(e) => {
-            let _ = handle.join();
+            // A close before this look wins over the failure it raced:
+            // the run ends as at a close, as the window's outcome does.
+            let e = if cancelled() {
+                ScreenError::Cancelled
+            } else {
+                ScreenError::Render(e)
+            };
+            let by = end_by(deadline);
+            let joined = crate::join_by(handle, by).is_some();
             if let Some(r) = reporter {
-                let _ = r.join(EXIT_TIMEOUT);
+                let _ = r.join(by.saturating_duration_since(Instant::now()));
             }
-            Err(e.into())
+            Err(match e {
+                e @ ScreenError::Cancelled => e,
+                e if !joined => ScreenError::LeftRunning(Box::new(e)),
+                e => e,
+            })
         }
     }
+}
+
+/// The instant a failed startup's threads are waited for until: the
+/// startup's `deadline`, and never past the render thread's end bound.
+fn end_by(deadline: Instant) -> Instant {
+    deadline.min(Instant::now() + EXIT_TIMEOUT)
 }
 
 /// Builds the render thread's first screen through `make`: a build the
@@ -5795,12 +5874,13 @@ pub fn spawn_until(
 /// one's surface and device dropped first, [`STARTUP_RETRY`] later, at most
 /// [`STARTUP_BUILDS`] builds and none that would start past `deadline`;
 /// each refusal is reported. The pause between builds is `pause`'s, and
-/// right before each build made again the deadline and `abandoned` (the
-/// startup's wait gave up) are looked at once more, so a pause or a report
-/// that ran late starts no build past them. While a build runs, wgpu's own
-/// error records made inside its surface's configure on this thread are
-/// copied to the report lines (design.md "Log File"), so a refused swap
-/// chain's system error is on record.
+/// right before each build made again the deadline and `cancelled` (the
+/// window closed, the same signal the startup's wait looks at) are looked
+/// at once more, so a pause or a report that ran late starts no build past
+/// them, whether or not the wait has seen them yet. While a build runs,
+/// wgpu's own error records made inside its surface's configure on this
+/// thread are copied to the report lines (design.md "Log File"), so a
+/// refused swap chain's system error is on record.
 ///
 /// # Errors
 ///
@@ -5810,7 +5890,7 @@ fn startup_build(
     chart: Option<&Chart>,
     section: Option<&Section>,
     deadline: Instant,
-    abandoned: &AtomicBool,
+    cancelled: &dyn Fn() -> bool,
     pause: &mut dyn FnMut(Duration),
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut builds = 1;
@@ -5847,7 +5927,7 @@ fn startup_build(
         }
         builds += 1;
         pause(STARTUP_RETRY);
-        if abandoned.load(Ordering::Acquire) || Instant::now() >= deadline {
+        if cancelled() || Instant::now() >= deadline {
             return Err(e);
         }
     }
@@ -8721,7 +8801,7 @@ impl Run {
                         }
                     }
                     self.first_frame = Some(first);
-                    crate::render_report::report(format_args!(
+                    self.shared.report_failure(format_args!(
                         "render: {}",
                         Chain(&RenderError::DeviceLost)
                     ));
@@ -9316,7 +9396,8 @@ impl Run {
                         // failure, but the screen, its device and its
                         // resources stay, for the next preparation.
                         self.measure.failed(&effects);
-                        crate::render_report::report(format_args!("render: {}", Chain(&e)));
+                        self.shared
+                            .report_failure(format_args!("render: {}", Chain(&e)));
                         self.shared.latch_failed();
                         mode = Mode::Idle;
                         continue;
@@ -10414,7 +10495,8 @@ impl Run {
                     if matches!(mode, Mode::Play { .. }) {
                         self.measure.failed(&effects);
                     }
-                    crate::render_report::report(format_args!("render: {}", Chain(&e)));
+                    self.shared
+                        .report_failure(format_args!("render: {}", Chain(&e)));
                     self.drop_screen();
                     self.shared.latch_failed();
                     mode = Mode::Idle;
@@ -10935,7 +11017,8 @@ impl Run {
         if let Some(s) = &mut self.screen
             && let Err(e) = s.wait_step(bound)
         {
-            crate::render_report::report(format_args!("render: {}", Chain(&e)));
+            self.shared
+                .report_failure(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
             self.shared.latch_failed();
@@ -11196,7 +11279,8 @@ impl Run {
             if let Some(s) = &mut self.screen
                 && let Err(e) = s.poll_completion()
             {
-                crate::render_report::report(format_args!("render: {}", Chain(&e)));
+                self.shared
+                    .report_failure(format_args!("render: {}", Chain(&e)));
                 self.drop_screen();
                 self.granted = false;
                 self.shared.latch_failed();
@@ -11612,7 +11696,7 @@ impl Run {
             self.applied = None;
             self.decision_rebuilt(decision_refused)?;
         }
-        self.shared.failed.store(false, Ordering::Release);
+        self.shared.clear_failed();
         Ok(())
     }
 
@@ -12951,7 +13035,7 @@ impl Run {
             }
         };
         if ready.is_ok() {
-            self.shared.failed.store(false, Ordering::Release);
+            self.shared.clear_failed();
         } else {
             self.keep_page_font();
             self.screen = None;
@@ -13064,7 +13148,7 @@ impl Run {
                 self.disable_decision(format!("{}", Chain(&e)));
             }
             crate::decision_side::Boundary::Failed(e) => {
-                crate::render_report::report(format_args!(
+                self.shared.report_failure(format_args!(
                     "render: the decision labels' device failed: {}",
                     Chain(&e)
                 ));
@@ -14641,7 +14725,8 @@ impl Run {
             }
         }
         if let Some(e) = failed {
-            crate::render_report::report(format_args!("render: {}", Chain(&e)));
+            self.shared
+                .report_failure(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
             self.shared.latch_failed();

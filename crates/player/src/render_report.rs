@@ -35,6 +35,7 @@ pub(crate) const CAPACITY: usize = 64;
 pub(crate) const LINE: usize = 512;
 
 /// One line, fixed in size, so a push moves it with nothing allocated.
+#[derive(Debug)]
 pub(crate) struct Line {
     len: usize,
     bytes: [u8; LINE],

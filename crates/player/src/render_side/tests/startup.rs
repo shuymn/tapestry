@@ -96,7 +96,7 @@ fn refusing(ok: u32, refusal: fn() -> RenderError) -> (Arc<AtomicU32>, MakeScree
 fn start(
     make: MakeScreen,
     deadline: Instant,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<super::super::RenderLink, ScreenError> {
     let clock = QpcClock::start();
     spawn_until(
@@ -108,7 +108,7 @@ fn start(
         measure(clock),
         Box::new(NoFrames),
         deadline,
-        cancelled,
+        Arc::new(cancelled),
     )
 }
 
@@ -118,13 +118,13 @@ fn start(
 #[test]
 fn a_refused_configure_is_built_again() {
     let (builds, make) = refusing(2, || refused(true));
-    let link = start(make, far(), &|| false).unwrap();
+    let link = start(make, far(), || false).unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 2);
     assert_eq!(link.exit(), super::super::RenderEnd::Joined);
     // No client area yet, as a window restored from minimized has, is
     // built again too.
     let (builds, make) = refusing(2, || RenderError::NoArea);
-    let link = start(make, far(), &|| false).unwrap();
+    let link = start(make, far(), || false).unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 2);
     link.exit();
 }
@@ -142,7 +142,7 @@ fn refused_configures_fail_the_startup() {
         None,
         None,
         deadline,
-        &AtomicBool::new(false),
+        &|| false,
         &mut std::thread::sleep,
     )
     .err()
@@ -169,7 +169,7 @@ fn a_permanent_refusal_is_not_retried() {
         None,
         None,
         far(),
-        &AtomicBool::new(false),
+        &|| false,
         &mut std::thread::sleep,
     )
     .err()
@@ -197,7 +197,7 @@ fn other_build_errors_are_not_retried() {
         None,
         None,
         far(),
-        &AtomicBool::new(false),
+        &|| false,
         &mut std::thread::sleep,
     )
     .err()
@@ -217,7 +217,7 @@ fn retries_stop_at_the_deadline() {
         None,
         None,
         deadline,
-        &AtomicBool::new(false),
+        &|| false,
         &mut std::thread::sleep,
     )
     .err()
@@ -248,7 +248,7 @@ fn held() -> (mpsc::Sender<()>, MakeScreen) {
 fn a_startup_build_past_the_deadline_fails() {
     let (release, make) = held();
     let asked = Instant::now();
-    let e = start(make, asked + Duration::from_millis(200), &|| false)
+    let e = start(make, asked + Duration::from_millis(200), || false)
         .err()
         .unwrap();
     assert!(matches!(e, ScreenError::NoStart), "{e:?}");
@@ -261,17 +261,16 @@ fn a_startup_build_past_the_deadline_fails() {
 #[test]
 fn a_close_ends_the_build_wait() {
     let (release, make) = held();
-    let closed = std::sync::atomic::AtomicBool::new(false);
+    let closed = Arc::new(AtomicBool::new(false));
     let asked = Instant::now();
-    let e = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(50));
-            closed.store(true, Ordering::SeqCst);
-        });
-        start(make, far(), &|| closed.load(Ordering::SeqCst))
-            .err()
-            .unwrap()
+    let closer = Arc::clone(&closed);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        closer.store(true, Ordering::SeqCst);
     });
+    let e = start(make, far(), move || closed.load(Ordering::SeqCst))
+        .err()
+        .unwrap();
     assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
     assert!(asked.elapsed() < Duration::from_secs(60));
     drop(release);
@@ -282,7 +281,7 @@ fn a_close_ends_the_build_wait() {
 #[test]
 fn a_startup_panic_is_reported_with_its_message() {
     let make: MakeScreen = Box::new(|_| panic!("the first build fails (a test)"));
-    let e = start(make, far(), &|| false).err().unwrap();
+    let e = start(make, far(), || false).err().unwrap();
     match e {
         ScreenError::PanickedWhileStarting(m) => {
             assert_eq!(m, "the first build fails (a test)");
@@ -303,7 +302,7 @@ fn a_failed_frame_reaches_the_log() {
                 frames: 0,
             }) as Box<dyn Screen>)
         });
-        let link = start(make, far(), &|| false).unwrap();
+        let link = start(make, far(), || false).unwrap();
         link.send(RenderMsg::Menu(Box::default()));
         assert!(wait_until(|| link.failed()));
         assert_eq!(link.exit(), super::super::RenderEnd::Joined);
@@ -320,34 +319,164 @@ fn a_retry_held_past_the_deadline_is_not_built() {
     // Far enough for the retry to be planned before the pause.
     let deadline = Instant::now() + super::super::STARTUP_RETRY * 4;
     let mut held = |_| std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-    let e = startup_build(
-        &mut make,
-        None,
-        None,
-        deadline,
-        &AtomicBool::new(false),
-        &mut held,
-    )
-    .err()
-    .unwrap();
+    let e = startup_build(&mut make, None, None, deadline, &|| false, &mut held)
+        .err()
+        .unwrap();
     assert!(e.is_retryable_configure(), "{e:?}");
     assert_eq!(builds.load(Ordering::SeqCst), 1);
 }
 
 /// W5.5: a close during the pause between builds starts no build after
 /// it: the startup's wait gives up at the close, and the builder, left
-/// detached, looks at that before its next build.
+/// detached, looks at the same close before its next build.
 #[test]
 fn a_close_during_the_backoff_starts_no_build() {
     let (builds, make) = refusing(u32::MAX, || refused(true));
     let counted = Arc::clone(&builds);
-    let e = start(make, far(), &|| counted.load(Ordering::SeqCst) >= 1)
+    let e = start(make, far(), move || counted.load(Ordering::SeqCst) >= 1)
         .err()
         .unwrap();
     assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
     // Past the pause: a builder that did not look would have built again.
     std::thread::sleep(super::super::STARTUP_RETRY * 3);
     assert_eq!(builds.load(Ordering::SeqCst), 1);
+}
+
+/// W6.5: a close the startup's wait has not seen yet (the wait held)
+/// still starts no build after the pause: the builder looks at the close
+/// itself, not at the wait's giving up.
+#[test]
+fn a_close_while_the_wait_is_held_starts_no_build() {
+    let builds = Arc::new(AtomicU32::new(0));
+    let closed = Arc::new(AtomicBool::new(false));
+    let (counter, closer) = (Arc::clone(&builds), Arc::clone(&closed));
+    let make: MakeScreen = Box::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        closer.store(true, Ordering::SeqCst);
+        Err(refused(true))
+    });
+    let (let_go, held) = mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let cancelled = move || {
+        let c = closed.load(Ordering::SeqCst);
+        // The wait, off the render thread, is held once it would see the
+        // close (at most 10 s).
+        if c && std::thread::current().name() != Some("render") {
+            let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(10));
+        }
+        c
+    };
+    let waiter = std::thread::spawn(move || start(make, far(), cancelled).err());
+    std::thread::sleep(super::super::STARTUP_RETRY * 3);
+    let built = builds.load(Ordering::SeqCst);
+    drop(let_go);
+    let e = waiter.join().unwrap().unwrap();
+    assert_eq!(built, 1, "a build started after the close");
+    assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
+}
+
+/// W6.5: a failed build's reply that arrives after the window closed ends
+/// the startup as the close, whether or not the wait looked at the close
+/// before the reply.
+#[test]
+fn a_close_before_a_failed_build_reply_ends_as_the_close() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let closer = Arc::clone(&closed);
+    let make: MakeScreen = Box::new(move |_| {
+        closer.store(true, Ordering::SeqCst);
+        Err(refused(false))
+    });
+    let e = start(make, far(), move || closed.load(Ordering::SeqCst))
+        .err()
+        .unwrap();
+    assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
+}
+
+/// A value whose drop waits until the returned sender is used or dropped,
+/// at most 10 s: a device the driver holds as it is dropped.
+fn held_drop() -> (mpsc::Sender<()>, impl Send + 'static) {
+    struct Held(std::sync::Mutex<mpsc::Receiver<()>>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Ok(rx) = self.0.lock() {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+    let (release, held) = mpsc::channel::<()>();
+    (release, Held(std::sync::Mutex::new(held)))
+}
+
+/// Starts a render thread over `make` with `deadline`, on a thread of its
+/// own: its error and when it came, waited for at most 10 s.
+fn failed_by(make: MakeScreen, deadline: Instant) -> Option<(ScreenError, Instant)> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let e = start(make, deadline, || false).err();
+        let _ = tx.send(e.map(|e| (e, Instant::now())));
+    });
+    rx.recv_timeout(Duration::from_secs(10)).ok().flatten()
+}
+
+/// W6.2: a failed build's end is waited for until the deadline only: a
+/// render thread whose end is held up (the factory's drop held) is left
+/// with the failure, and its window kept; a reporter held up in its write
+/// (the log's sink held by another thread) is waited for no longer either.
+#[test]
+fn a_failed_build_is_waited_for_until_the_deadline_only() {
+    let (release, guard) = held_drop();
+    let make: MakeScreen = Box::new(move |_| {
+        let _keep = &guard;
+        Err(refused(false))
+    });
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let ended = failed_by(make, deadline);
+    drop(release);
+    let (e, at) = ended.expect("the failed build's end waited for its thread");
+    assert!(
+        matches!(&e, ScreenError::LeftRunning(inner) if matches!(**inner, ScreenError::Render(_))),
+        "{e:?}"
+    );
+    assert!(crate::keeps_window(&e));
+    let late = at.saturating_duration_since(deadline);
+    assert!(late < Duration::from_secs(1), "{late:?} past the deadline");
+
+    let logs = tempfile::tempdir().unwrap();
+    crate::log_file::start(logs.path(), "test");
+    let sink = crate::log_file::hold();
+    // A refusal too near the deadline to be built again: reported, so the
+    // reporter is held in its write.
+    let (_builds, make) = refusing(u32::MAX, || refused(true));
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let ended = failed_by(make, deadline);
+    drop(sink);
+    let (e, at) = ended.expect("the failed build's end waited for its reporter");
+    assert!(matches!(e, ScreenError::Render(_)), "{e:?}");
+    let late = at.saturating_duration_since(deadline);
+    assert!(late < Duration::from_secs(1), "{late:?} past the deadline");
+}
+
+/// W6.2: a panic while the first screen is built whose unwinding is held
+/// up (the factory's drop held) is waited for until the deadline only, and
+/// the thread left with its window kept.
+#[test]
+fn a_startup_panic_held_in_its_unwinding_is_left_by_the_deadline() {
+    let (release, guard) = held_drop();
+    let make: MakeScreen = Box::new(move |_| {
+        let _keep = &guard;
+        panic!("the first build fails (a test)")
+    });
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let ended = failed_by(make, deadline);
+    drop(release);
+    let (e, at) = ended.expect("the panic's end waited for its thread");
+    assert!(
+        matches!(&e, ScreenError::LeftRunning(inner) if matches!(**inner, ScreenError::EndedWhileStarting)),
+        "{e:?}"
+    );
+    assert!(crate::keeps_window(&e));
+    let late = at.saturating_duration_since(deadline);
+    assert!(late < Duration::from_secs(1), "{late:?} past the deadline");
 }
 
 /// A screen whose menu frames wait until the returned sender is used or
@@ -406,7 +535,7 @@ fn stuck() -> (mpsc::Sender<()>, MakeScreen) {
 #[test]
 fn a_renderer_stuck_after_its_build_reply_is_left_by_the_deadline() {
     let (release, make) = stuck();
-    let link = start(make, far(), &|| false).unwrap();
+    let link = start(make, far(), || false).unwrap();
     link.send(RenderMsg::Menu(Box::default()));
     std::thread::sleep(Duration::from_millis(100));
     let by = Instant::now() + Duration::from_millis(200);
@@ -428,7 +557,7 @@ fn a_failed_frame_wakes_the_game() {
             frames: 0,
         }) as Box<dyn Screen>)
     });
-    let link = start(make, far(), &|| false).unwrap();
+    let link = start(make, far(), || false).unwrap();
     let (tx, woken) = mpsc::sync_channel::<()>(8);
     link.set_game_wake(Arc::new(move || {
         let _ = tx.try_send(());
@@ -439,6 +568,33 @@ fn a_failed_frame_wakes_the_game() {
         "the game was not woken"
     );
     assert!(link.failed());
+    link.exit();
+}
+
+/// W6.6: the startup that a failed first frame fails says why: the
+/// frame's report line is the startup's failure, as the run's error
+/// gives it, not only that the render thread failed.
+#[test]
+fn a_failed_first_frame_is_the_startups_failure_with_its_cause() {
+    use crate::window::{StartEnd, StartFailure, WindowShown};
+
+    let make: MakeScreen = Box::new(|_| {
+        Ok(Box::new(Still {
+            fail_at: Some(1),
+            frames: 0,
+        }) as Box<dyn Screen>)
+    });
+    let link = start(make, far(), || false).unwrap();
+    let controls = Arc::new(crate::controls::Controls::new(QpcClock::start()));
+    controls.set_game(std::thread::current());
+    let shown = WindowShown::pending_for(Duration::from_secs(10));
+    link.send(RenderMsg::Menu(Box::default()));
+    assert_eq!(
+        crate::wait_ready(&shown, &controls, &link),
+        Err(StartEnd::Failed(StartFailure::Render(
+            "render: surface lost".to_owned()
+        )))
+    );
     link.exit();
 }
 
@@ -475,7 +631,7 @@ fn wgpu_errors_are_taken_only_inside_the_configure() {
             None,
             None,
             Instant::now(),
-            &AtomicBool::new(false),
+            &|| false,
             &mut std::thread::sleep,
         )
         .err()

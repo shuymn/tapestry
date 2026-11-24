@@ -160,14 +160,13 @@ impl Shared {
             .clone()
     }
 
-    /// Moves `Pending` to `to` when `allowed`; whether it did. Waiters are
-    /// told.
-    fn advance(&self, to: Readiness, allowed: bool) -> bool {
+    /// Moves `Pending` to `to`; whether it did. Waiters are told.
+    fn advance(&self, to: Readiness) -> bool {
         let mut r = self
             .readiness
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if *r != Readiness::Pending || !allowed {
+        if *r != Readiness::Pending {
             return false;
         }
         *r = to;
@@ -175,17 +174,29 @@ impl Shared {
         true
     }
 
-    /// Takes the first present at `now` for the show: only while
-    /// `Pending` and before the deadline, compared here, so a present
-    /// looked at past it fails the startup even if the look came late.
+    /// Takes the first present looked at `now` for the show: only while
+    /// `Pending` and before the deadline, compared with the later of `now`
+    /// and the clock read under the lock, so a present looked at past it,
+    /// or a look that reached the lock past it, fails the startup.
     fn claim(&self, now: Instant) -> bool {
-        self.advance(Readiness::Showing, now < self.deadline)
+        let mut r = self
+            .readiness
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *r != Readiness::Pending || now.max(Instant::now()) >= self.deadline {
+            return false;
+        }
+        *r = Readiness::Showing;
+        self.readiness_changed.notify_all();
+        true
     }
 
     /// The window was shown and its focus published: `Showing` ends in
-    /// `FirstPresent`, and the waiters are released. Whether it did: a
-    /// show still held at the deadline was failed by then
-    /// ([`give_up`](Self::give_up)).
+    /// `FirstPresent`, and the waiters are released, if the clock read
+    /// under the lock is still before the deadline. Past it, a show held
+    /// that long fails the startup here (`NoFrame`), whether or not the
+    /// game's wait gave up first ([`give_up`](Self::give_up)). Whether it
+    /// settled `FirstPresent`.
     fn settle(&self) -> bool {
         let mut r = self
             .readiness
@@ -194,21 +205,25 @@ impl Shared {
         if *r != Readiness::Showing {
             return false;
         }
-        *r = Readiness::FirstPresent;
+        *r = if Instant::now() < self.deadline {
+            Readiness::FirstPresent
+        } else {
+            Readiness::Failed(StartFailure::NoFrame(self.bound))
+        };
         self.readiness_changed.notify_all();
-        true
+        *r == Readiness::FirstPresent
     }
 
     /// Fails the startup for `why`, unless the first present was taken,
     /// the window closed or it failed already; whether it did.
     fn fail(&self, why: StartFailure) -> bool {
-        self.advance(Readiness::Failed(why), true)
+        self.advance(Readiness::Failed(why))
     }
 
     /// The window was closed: a startup still `Pending` ends `Closed`, so
     /// no present taken later shows it; whether it did.
     fn close(&self) -> bool {
-        self.advance(Readiness::Closed, true)
+        self.advance(Readiness::Closed)
     }
 
     /// Fails the startup for `why` at its deadline, a show still held then
@@ -995,6 +1010,20 @@ impl WindowShown {
             })
             .unwrap_or_else(PoisonError::into_inner);
         r.clone()
+    }
+
+    /// A startup `Pending`, due within `bound` from now (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_for(bound: Duration) -> Self {
+        Self(Arc::new(Shared::new(bound)))
+    }
+
+    /// Shows the window at a present now, as the window thread does: the
+    /// claim, then the settlement; whether it settled `FirstPresent`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn show_now(&self) -> bool {
+        self.0.claim(Instant::now()) && self.0.settle()
     }
 
     /// A startup whose outcome is `r`, its deadline far (tests).
@@ -2269,6 +2298,64 @@ mod tests {
         assert_eq!(done, ["show", "hide"]);
         assert!(!focused, "a window hidden again kept its focus");
         assert!(matches!(shared.readiness(), super::Readiness::Failed(_)));
+    }
+
+    /// W5.1: with the game's wait held (it has not looked at the deadline),
+    /// a show that returns past the deadline still fails the startup, the
+    /// clock read under the outcome's lock: the window is hidden again
+    /// with no focus, and the waiters find the failure. A present looked
+    /// at before the deadline whose look reaches the lock past it is not
+    /// taken.
+    #[test]
+    fn a_show_that_returns_past_the_deadline_fails_without_the_waiter() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        /// A window whose show returns once the deadline has passed.
+        struct LateShow {
+            until: Instant,
+            done: std::cell::RefCell<Vec<&'static str>>,
+        }
+        impl super::ShowWindow for LateShow {
+            fn show_active(&self) {
+                self.done.borrow_mut().push("show");
+                std::thread::sleep(self.until.saturating_duration_since(Instant::now()));
+            }
+            fn has_focus(&self) -> bool {
+                true
+            }
+            fn ask_foreground(&self) -> bool {
+                true
+            }
+            fn flash(&self) {}
+            fn hide(&self) {
+                self.done.borrow_mut().push("hide");
+            }
+        }
+
+        let c = Controls::new(QpcClock::start());
+        let bound = Duration::from_millis(100);
+        let shared = super::Shared::new(bound);
+        shared.presented.store(true, Ordering::Release);
+        let w = LateShow {
+            until: shared.deadline + Duration::from_millis(50),
+            done: std::cell::RefCell::default(),
+        };
+        let mut showing = super::Showing::default();
+        let polled = showing.poll(&w, |f| c.focus(f), || c.close(), &shared, Instant::now());
+        assert_eq!(polled, super::Polled::Settled);
+        assert_eq!(w.done.take(), ["show", "hide"]);
+        assert!(!c.focused(), "a window hidden again kept its focus");
+        assert_eq!(
+            shared.readiness(),
+            super::Readiness::Failed(super::StartFailure::NoFrame(bound))
+        );
+
+        let shared = super::Shared::new(bound);
+        let looked = Instant::now();
+        std::thread::sleep(bound + Duration::from_millis(20));
+        assert!(!shared.claim(looked), "a look that reached the lock late");
+        assert_eq!(shared.readiness(), super::Readiness::Pending);
     }
 
     /// W5.3: a close settles the startup in the same move a show would
