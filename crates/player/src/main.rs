@@ -1823,11 +1823,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     let run_record = s.dev.transitions.clone().map(|path| {
         dev::transitions::start_game_marks(clock);
-        let book = scenario
-            .as_ref()
-            .map_or_else(dev::transitions::Transitions::default, |sc| {
-                sc.transitions.clone()
-            });
+        let book = dev::transitions::run_record_book(scenario.as_ref().map(|sc| &sc.transitions));
         (path, book)
     });
     #[cfg(feature = "dev-tools")]
@@ -2099,21 +2095,31 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(t) = clocked_thread {
         t.detach();
     }
-    if let Some(e) = failed {
-        return Err(e);
-    }
     // The windowed run's raw record, written off the render thread now
-    // that it has ended.
+    // that it has ended, a failed run's too, its last line saying how the
+    // run ended.
     #[cfg(feature = "dev-tools")]
     if let Some((path, book)) = run_record {
-        let lines = book
-            .run_lines(dev::transitions::RunHeader::of(clock))
-            .map_err(anyhow::Error::msg)?;
-        let mut text = lines.join("\n");
-        text.push('\n');
-        std::fs::write(&path, text)
-            .with_context(|| format!("dev: the transition record {}", path.display()))?;
-        println!("dev: transition record written to {}", path.display());
+        let status = if failed.is_some() || ran.is_err() {
+            dev::transitions::RunStatus::Failed
+        } else if script_failed.is_some() {
+            dev::transitions::RunStatus::ScriptFailed
+        } else {
+            dev::transitions::RunStatus::Ok
+        };
+        let header = dev::transitions::RunHeader::of(clock);
+        match dev::transitions::write_run_record(&path, &book, header, status) {
+            Ok(()) => println!(
+                "dev: transition record written to {} ({})",
+                path.display(),
+                status.name()
+            ),
+            Err(e) if failed.is_some() => eprintln!("{e}"),
+            Err(e) => return Err(anyhow::Error::msg(e)),
+        }
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
     #[cfg(feature = "dev-tools")]
     if let Some((sc, script)) = scenario {
