@@ -2184,7 +2184,7 @@ mod tests {
         );
     }
 
-    /// W3.8: a show the window thread still holds at the deadline (its
+    /// W5.1: a show the window thread still holds at the deadline (its
     /// show or focus call stalled) fails the startup there: the game's
     /// wait publishes the failure itself and returns at the deadline; the
     /// show, once it returns, hides the window again with no focus.
@@ -2271,7 +2271,7 @@ mod tests {
         assert!(matches!(shared.readiness(), super::Readiness::Failed(_)));
     }
 
-    /// W3.9: a close settles the startup in the same move a show would
+    /// W5.3: a close settles the startup in the same move a show would
     /// take: a present counted after the close and before the window
     /// thread's next look never shows the window, and the game's wait ends
     /// as at a close even before it asks the controls.

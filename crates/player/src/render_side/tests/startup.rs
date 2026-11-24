@@ -417,7 +417,7 @@ fn a_renderer_stuck_after_its_build_reply_is_left_by_the_deadline() {
     drop(release);
 }
 
-/// W5.3: a frame the render thread fails wakes the game at once, so a
+/// W5.4: a frame the render thread fails wakes the game at once, so a
 /// startup waiting on its first present fails with it rather than at its
 /// deadline.
 #[test]
