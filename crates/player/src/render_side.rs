@@ -5481,15 +5481,14 @@ pub fn spawn(
     )
 }
 
-/// How long [`spawn`] waits for the first screen: the startup's bound
-/// (`--dev-render-timeout` sets it), and in tests the watchdog's, which
-/// only catches a thread that never builds.
+/// How long [`spawn`] waits for the first screen: the startup's bound, and
+/// in tests the watchdog's, which only catches a thread that never builds.
 #[cfg(any(test, feature = "dev-tools"))]
 fn startup_bound() -> Duration {
     #[cfg(test)]
     return hook_bound();
     #[cfg(not(test))]
-    crate::window::startup_bound()
+    STARTUP_TIMEOUT
 }
 
 /// Starts the render thread; `make` builds the screen on it, and the chart,

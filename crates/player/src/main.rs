@@ -105,6 +105,8 @@ mod render_json;
 #[cfg(test)]
 #[path = "../../render/tests/outline_support/mod.rs"]
 mod render_outline;
+#[cfg(test)]
+mod test_window;
 #[cfg(all(test, feature = "dev-tools"))]
 mod warp_turn;
 
@@ -2009,11 +2011,6 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         || std::time::Instant::now() + render_side::STARTUP_TIMEOUT,
         window::WindowShown::deadline,
     );
-    #[cfg(feature = "dev-tools")]
-    let deadline = match (&shown, s.dev.render_timeout) {
-        (None, Some(bound)) => std::time::Instant::now() + bound,
-        _ => deadline,
-    };
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut render = match render_side::spawn_until(
         make,

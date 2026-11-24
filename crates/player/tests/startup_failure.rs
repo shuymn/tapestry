@@ -95,8 +95,9 @@ fn a_render_panic_while_starting_fails_the_run_with_its_message() {
     );
 }
 
-/// W3.6: a first screen not built within the startup's bound fails the
-/// run at the bound, not at the build's end, which is left detached.
+/// W3.6: a first screen not built within the startup's bound (30 s, a
+/// headless run's whatever its render bound) fails the run at the bound,
+/// not at the build's end, which is left detached.
 #[test]
 fn a_first_screen_past_the_bound_fails_the_run() {
     let (_dir, chart, appdata) = fixture();
@@ -104,8 +105,8 @@ fn a_first_screen_past_the_bound_fails_the_run() {
     let out = run(
         &chart,
         &appdata,
-        "1",
-        &[("TAPESTRY_DEV_BUILD_HOLD_MS", "30000")],
+        "600",
+        &[("TAPESTRY_DEV_BUILD_HOLD_MS", "90000")],
     );
     failed_with(
         &out,
@@ -113,7 +114,7 @@ fn a_first_screen_past_the_bound_fails_the_run() {
         "the render thread did not build its first screen in time",
     );
     assert!(
-        began.elapsed() < Duration::from_secs(25),
+        began.elapsed() < Duration::from_secs(80),
         "{:?}",
         began.elapsed()
     );
