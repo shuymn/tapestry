@@ -2095,18 +2095,47 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(t) = clocked_thread {
         t.detach();
     }
+    // The scenario's conclusion, before the windowed run's record says how
+    // the run ended.
+    #[cfg(feature = "dev-tools")]
+    let ran_failed = ran.is_err();
+    #[cfg(feature = "dev-tools")]
+    let (ran, concluded) = match (failed.is_none(), scenario) {
+        (true, Some((sc, script))) => {
+            // The transition record, printed off the render thread now that
+            // it has ended (design.md "Shortening Launch-Based Checks").
+            // The transition probe's marks first (`TAPESTRY_LOOP_PROBE`).
+            crate::dev::loop_probe::dump();
+            let record = sc.transitions.lines();
+            if let Ok((lines, _)) = &record {
+                for l in lines {
+                    println!("{l}");
+                }
+            }
+            let concluded = dev::scenario::conclude(
+                ran,
+                script.as_ref(),
+                sc.pending,
+                rendered,
+                &sc.captures,
+                record.map(|(_, lost)| lost),
+                sc.shots.as_ref(),
+            );
+            (Ok(()), Some(concluded))
+        }
+        _ => (ran, None),
+    };
     // The windowed run's raw record, written off the render thread now
     // that it has ended, a failed run's too, its last line saying how the
-    // run ended.
+    // run ended: the game's and the screen's failures, the render thread's
+    // end and the run's checks all known.
     #[cfg(feature = "dev-tools")]
     if let Some((path, book)) = run_record {
-        let status = if failed.is_some() || ran.is_err() {
-            dev::transitions::RunStatus::Failed
-        } else if script_failed.is_some() {
-            dev::transitions::RunStatus::ScriptFailed
-        } else {
-            dev::transitions::RunStatus::Ok
-        };
+        let status = dev::transitions::RunStatus::of(
+            failed.is_some() || ran_failed,
+            rendered == RenderEnd::Joined,
+            script_failed.is_some() || concluded.as_ref().is_some_and(Result::is_err),
+        );
         let header = dev::transitions::RunHeader::of(clock);
         match dev::transitions::write_run_record(&path, &book, header, status) {
             Ok(()) => println!(
@@ -2122,26 +2151,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         return Err(e);
     }
     #[cfg(feature = "dev-tools")]
-    if let Some((sc, script)) = scenario {
-        // The transition record, printed off the render thread now that
-        // it has ended (design.md "Shortening Launch-Based Checks").
-        // The transition probe's marks first (`TAPESTRY_LOOP_PROBE`).
-        crate::dev::loop_probe::dump();
-        let record = sc.transitions.lines();
-        if let Ok((lines, _)) = &record {
-            for l in lines {
-                println!("{l}");
-            }
-        }
-        return dev::scenario::conclude(
-            ran,
-            script.as_ref(),
-            sc.pending,
-            rendered,
-            &sc.captures,
-            record.map(|(_, lost)| lost),
-            sc.shots.as_ref(),
-        );
+    if let Some(concluded) = concluded {
+        return concluded;
     }
     ran?;
     #[cfg(feature = "dev-tools")]

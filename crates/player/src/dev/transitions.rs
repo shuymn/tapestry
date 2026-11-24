@@ -752,28 +752,45 @@ pub struct RunHeader {
     pub pid: u32,
 }
 
-/// How a windowed run ended, the record's last line: `ok` when the run
-/// ended with no error, `failed` when the game or the screen failed,
-/// `script-failed` when the select script failed. A record cut short (a
-/// crash, a write that did not complete) has no such line.
+/// How a windowed run ended, the record's last line, decided once the
+/// render thread's end and the run's checks are known: `ok` when the run
+/// ended with no error, its render thread joined and its checks passed;
+/// `failed` when the game or the screen failed, or the render thread
+/// panicked or was left running (then no present is known to precede the
+/// end); `check-failed` when the select script or the scenario's checks
+/// failed. A record cut short (a crash, a write that did not complete) has
+/// no such line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunStatus {
     /// The run ended with no error.
     Ok,
-    /// The game or the screen failed.
+    /// The game, the screen or the render thread failed.
     Failed,
-    /// The select script failed.
-    ScriptFailed,
+    /// The select script or the scenario's checks failed.
+    CheckFailed,
 }
 
 impl RunStatus {
+    /// The status of a run that `failed` (the game or the screen), whose
+    /// render thread was `joined` or not, and whose checks failed or not.
+    #[must_use]
+    pub const fn of(failed: bool, joined: bool, checks_failed: bool) -> Self {
+        if failed || !joined {
+            Self::Failed
+        } else if checks_failed {
+            Self::CheckFailed
+        } else {
+            Self::Ok
+        }
+    }
+
     /// Its name on the record's last line.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Failed => "failed",
-            Self::ScriptFailed => "script-failed",
+            Self::CheckFailed => "check-failed",
         }
     }
 }
@@ -895,10 +912,12 @@ pub fn run_record_book(scenario: Option<&Transitions>) -> Transitions {
 }
 
 /// Writes a windowed run's raw record to `path` ([`Transitions::run_lines`]).
+/// A book still held (a render thread left running) writes the header and a
+/// `failed` end alone, so the run is still told apart.
 ///
 /// # Errors
 ///
-/// The book is held by another thread, or the file cannot be written.
+/// The file cannot be written.
 pub fn write_run_record(
     path: &std::path::Path,
     book: &Transitions,
@@ -909,7 +928,16 @@ pub fn write_run_record(
         qpc: render::present_tap::qpc_now(),
         status,
     };
-    let mut text = book.run_lines(header, end)?.join("\n");
+    let lines = book.run_lines(header, end).unwrap_or_else(|_| {
+        let failed = RunEnd {
+            status: RunStatus::Failed,
+            ..end
+        };
+        let mut lines = run_record_lines(header, &[], &[], None, (0, 0), failed);
+        lines.retain(|l| l.starts_with("run ") || l.starts_with("end "));
+        lines
+    });
+    let mut text = lines.join("\n");
     text.push('\n');
     std::fs::write(path, text)
         .map_err(|e| format!("dev: the transition record {}: {e}", path.display()))
@@ -1442,7 +1470,47 @@ mod tests {
                 "end 70000 failed",
             ]
         );
-        assert_eq!(RunStatus::ScriptFailed.name(), "script-failed");
+        assert_eq!(RunStatus::CheckFailed.name(), "check-failed");
+    }
+
+    /// The status is decided by the run's failure, its render thread's end
+    /// and its checks: a render thread not joined fails the run whatever
+    /// else held, and a failed check alone is `check-failed`.
+    #[test]
+    fn the_status_takes_the_render_end_and_the_checks() {
+        use super::RunStatus;
+        assert_eq!(RunStatus::of(false, true, false), RunStatus::Ok);
+        assert_eq!(RunStatus::of(true, true, false), RunStatus::Failed);
+        assert_eq!(RunStatus::of(false, false, false), RunStatus::Failed);
+        assert_eq!(RunStatus::of(false, false, true), RunStatus::Failed);
+        assert_eq!(RunStatus::of(false, true, true), RunStatus::CheckFailed);
+        assert_eq!(RunStatus::of(true, false, true), RunStatus::Failed);
+    }
+
+    /// A book still held by a render thread left running writes the header
+    /// and a failed end alone.
+    #[test]
+    fn a_held_book_writes_a_failed_end() {
+        use super::{RunHeader, RunStatus, write_run_record};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.txt");
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let book = Transitions::with_capacity(4);
+        let held = book.hold();
+        write_run_record(&path, &book, header, RunStatus::Ok).unwrap();
+        drop(held);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[0], "run qpc-frequency 10000000 qpc-origin 0 pid 1");
+        assert!(
+            lines[1].starts_with("end ") && lines[1].ends_with(" failed"),
+            "{text}"
+        );
     }
 
     /// The game book's marks past its room are lost marks in the record
