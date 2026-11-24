@@ -1541,6 +1541,61 @@ pub fn startup(
     Ok(started)
 }
 
+/// The startup probe of the pending result skin `pending`, imported once
+/// on the selection path after the installations (design.md "beatoraja
+/// Lua Skins", the result skin's preload; "State Model", Startup) on a
+/// `skin-import` thread, as every import runs ([`run_cancellable`]). When
+/// `kept` (the kept probe's rule, [`crate::result_skin::kept_probe_fits`])
+/// and a result runtime permit is free, it is imported kept, else plain
+/// ([`crate::result_skin::PendingResult::import_probe`]).
+///
+/// # Errors
+///
+/// [`StartupEnd::Closed`] once `stop` (the window's close) is seen: the
+/// import is cancelled and waited for at most [`STOP_WAIT`].
+pub fn result_probe(
+    pending: &Arc<crate::result_skin::PendingResult>,
+    scripts: &crate::screens::Scripts,
+    kept: bool,
+    mut stop: impl FnMut() -> bool,
+) -> Result<crate::result_skin::ProbeOutcome, StartupEnd> {
+    use crate::result_skin::ProbeOutcome;
+    let permit = if kept {
+        scripts.result_permit(&[])
+    } else {
+        None
+    };
+    #[cfg(feature = "dev-tools")]
+    let began = Instant::now();
+    let pending = Arc::clone(pending);
+    let ran = run_cancellable(
+        move |cancel: &Cancel| pending.import_probe(permit, cancel),
+        &mut stop,
+    );
+    let outcome = match ran {
+        _ if stop() => return Err(StartupEnd::Closed),
+        Ran::Abandoned => return Err(StartupEnd::Closed),
+        Ran::Refused(why) => ProbeOutcome::Refused(why),
+        Ran::Done(outcome) => outcome,
+    };
+    #[cfg(feature = "dev-tools")]
+    {
+        let us = crate::dev::loop_probe::us(began.elapsed());
+        crate::dev::loop_probe::mark("pre:import", us);
+        if crate::dev::loop_probe::on() {
+            let what = match &outcome {
+                ProbeOutcome::Probe(p) if p.kept() => "kept".to_owned(),
+                ProbeOutcome::Probe(_) => "plain".to_owned(),
+                ProbeOutcome::Stopped(fact) => format!("stopped {fact:?}"),
+                ProbeOutcome::Refused(_) => "refused".to_owned(),
+                ProbeOutcome::Bundle => "bundle".to_owned(),
+            };
+            println!("dev: pre:import {us} us {what}");
+        }
+    }
+    Ok(outcome)
+}
+
 /// Prints and logs `kind`'s outcome line ([`line`]).
 fn report(kind: ScreenKind, shown: &Shown) {
     let l = line(kind, shown);

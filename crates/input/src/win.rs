@@ -176,6 +176,13 @@ impl QpcClock {
         self.frequency
     }
 
+    /// The raw QPC value the clock reads 0 at: with [`frequency`](Self::frequency),
+    /// what turns its times back into raw QPC (a system trace's clock).
+    #[must_use]
+    pub const fn origin(&self) -> i64 {
+        self.origin
+    }
+
     /// A raw QPC value another API reported (DXGI frame statistics, a
     /// display capture) as this clock's time.
     #[must_use]

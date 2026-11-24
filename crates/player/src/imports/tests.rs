@@ -2051,6 +2051,8 @@ fn the_reports_carry_text_only() {
 }
 
 mod attempt;
+#[cfg(feature = "dev-tools")]
+mod probe;
 mod startup;
 
 /// A JSON skin's import observes the stop its caller gives, as a Lua

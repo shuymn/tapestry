@@ -127,16 +127,66 @@ pub(crate) enum Site {
     Trailing,
     /// Each mip level of each page.
     Mip,
+    /// Before each page's allocation.
+    Page,
     /// After a chart image's decode ([`crate::chart_image`]).
     Decoded,
     /// After a chart image's fit into its slot.
     Fitted,
+    /// An atlas plan's start, before its rectangles pass.
+    PlanRects,
+    /// After the rectangles pass, before the cells' order is sorted.
+    PlanSort,
+    /// After the sort, before the area and largest-side scans.
+    PlanScan,
+    /// Before each candidate side's table setup.
+    PlanSide,
+    /// After a side's table setup, before its first placement.
+    PlanPlace,
+    /// Every [`PLAN_BATCH`](crate::atlas::pack::PLAN_BATCH) units inside
+    /// the rectangles pass.
+    PlanRectWork,
+    /// Every [`PLAN_BATCH`](crate::atlas::pack::PLAN_BATCH) page tries
+    /// inside a side's placements.
+    PlanPlaceWork,
+    /// After the side search, before the plan's texel check.
+    PlanEnd,
+    /// Every [`PLAN_BATCH`](crate::atlas::pack::PLAN_BATCH) units inside
+    /// a sheet union ([`super::Sheet::union_checked`]): a cell inserted
+    /// or a file compared.
+    UnionWork,
 }
 
-#[cfg(test)]
+impl Site {
+    /// The site's code in the development marks ([`crate::dev::site`]).
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Read => 0,
+            Self::Band => 1,
+            Self::Trailing => 2,
+            Self::Mip => 3,
+            Self::Page => 4,
+            Self::Decoded => 5,
+            Self::Fitted => 6,
+            Self::PlanRects => 7,
+            Self::PlanSort => 8,
+            Self::PlanScan => 9,
+            Self::PlanSide => 10,
+            Self::PlanPlace => 11,
+            Self::PlanRectWork => 12,
+            Self::PlanPlaceWork => 13,
+            Self::PlanEnd => 14,
+            Self::UnionWork => 15,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "dev-tools"))]
 thread_local! {
     /// The site this thread last asked at: a test's cancellation can
-    /// answer for one site only.
+    /// answer for one site only, and a development cancel names the
+    /// stretch it closes ([`crate::dev::last_site`]).
     pub(crate) static SITE: Cell<Option<Site>> = const { Cell::new(None) };
 }
 
@@ -154,9 +204,9 @@ impl std::error::Error for Cancelled {}
 
 /// Asks `cancel` at `site`.
 pub(crate) fn checkpoint(cancel: &dyn Fn() -> bool, site: Site) -> Result<(), Cancelled> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-tools"))]
     SITE.with(|s| s.set(Some(site)));
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "dev-tools")))]
     let _ = site;
     if cancel() { Err(Cancelled) } else { Ok(()) }
 }

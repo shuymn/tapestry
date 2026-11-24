@@ -261,6 +261,14 @@ pub fn mark(tag: &'static str, v: i64) {
     }
 }
 
+/// Keeps a mark at `at`, a time read earlier on the probe's clock
+/// ([`stamp`]), as the probe's own work.
+pub fn mark_at(tag: &'static str, at: TimeUs, v: i64) {
+    if REC.on() {
+        render::probe::own(|| REC.mark_at(tag, at, v));
+    }
+}
+
 /// The probe's clock now, the game's, for a mark kept later at this time
 /// ([`opened`]); none with the probe off.
 pub fn stamp() -> Option<TimeUs> {
@@ -340,6 +348,48 @@ impl Drop for Caller {
     }
 }
 
+/// Marks every permit taken and given back on `coord`, and every job's
+/// wait, as `co:take`, `co:free`, `co:wait`, `co:rewait`, `co:retry` and
+/// `co:unwait` (the probe on): the task in bits 24–55 (0 for a lease with
+/// no job), the class in bits 20–23 (0 maintenance, 1 foreground, 2
+/// speculative), the class's count after the change in bits 10–19 and
+/// its cap in bits 0–9 (1023 for a class with no cap). The coordinator
+/// calls it under its state lock: it only fills a slot.
+pub fn observe_permits(coord: &game::coord::Coordinator) {
+    if !on() {
+        return;
+    }
+    coord.observe_permits(std::sync::Arc::new(|c: game::coord::PermitChange| {
+        use game::coord::{Class, PermitEvent};
+        let tag = match c.event {
+            PermitEvent::Take => "co:take",
+            PermitEvent::Free => "co:free",
+            PermitEvent::Wait => "co:wait",
+            PermitEvent::Rewait => "co:rewait",
+            PermitEvent::Retry => "co:retry",
+            PermitEvent::Unwait => "co:unwait",
+        };
+        REC.mark(
+            tag,
+            permit_value(&c, |k| match k {
+                Class::Maintenance => 0,
+                Class::Foreground => 1,
+                Class::Speculative => 2,
+            }),
+        );
+    }));
+}
+
+/// A `co:*` mark's value ([`observe_permits`]).
+fn permit_value(c: &game::coord::PermitChange, class: impl Fn(game::coord::Class) -> i64) -> i64 {
+    let task = i64::try_from(c.task & 0xFFFF_FFFF).unwrap_or(0);
+    let count = i64::try_from(c.count.min(1022)).unwrap_or(1022);
+    let cap = c
+        .cap
+        .map_or(1023, |n| i64::try_from(n.min(1022)).unwrap_or(1022));
+    task << 24 | class(c.class) << 20 | count << 10 | cap
+}
+
 /// Whether the marks were printed.
 static DUMPED: AtomicBool = AtomicBool::new(false);
 
@@ -352,6 +402,14 @@ pub fn dump() {
         return;
     }
     let (marks, unfilled) = REC.marks();
+    if let Some(clock) = REC.clock.get() {
+        // The probe's µs back to raw QPC, a system trace's clock.
+        println!(
+            "dev: probe origin {} {}",
+            clock.origin(),
+            clock.frequency().hz()
+        );
+    }
     for (t, tag, v) in marks {
         println!("dev: probe {t} {tag} {v}");
     }

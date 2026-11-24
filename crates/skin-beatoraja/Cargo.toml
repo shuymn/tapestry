@@ -65,6 +65,12 @@ required-features = ["dev-tools"]
 name = "lua_report_walk"
 required-features = ["dev-tools"]
 
+# The atlas planning timed between its asks, run by hand (an ignored
+# test; design.md "Load Pipeline").
+[[test]]
+name = "plan_phases"
+required-features = ["dev-tools"]
+
 [[bench]]
 name = "import"
 harness = false

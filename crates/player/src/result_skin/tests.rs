@@ -39,7 +39,7 @@ pub(crate) fn skin(pre: &str, images: &str) -> tempfile::TempDir {
 }
 
 /// As [`skin`], reading `reads` instead of 154.
-fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
+pub(crate) fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     png(d.path(), "s.png", 64, 16);
     png(d.path(), "big.png", 300, 20);
@@ -114,7 +114,7 @@ pub(crate) fn view(nr: u32) -> ViewFacts {
 }
 
 /// [`view`] of a chart at play level `level`.
-fn view_at(level: i32, nr: u32) -> ViewFacts {
+pub(crate) fn view_at(level: i32, nr: u32) -> ViewFacts {
     let mut v = probe_view(ResultChart {
         level: Some(level),
         ..chart()
@@ -892,6 +892,31 @@ struct Bomb;
 impl Drop for Bomb {
     fn drop(&mut self) {
         panic!("the payload's drop");
+    }
+}
+
+/// Run inside the probe-miss diagnostic, when set (E20's dev-only time).
+pub(crate) static IN_PROBE_MISS: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+pub(super) fn in_probe_miss() {
+    let hook = *IN_PROBE_MISS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run at the atlas step's release's return, when set (E23).
+pub(crate) static AT_RELEASE: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+/// The atlas step's release returned: [`AT_RELEASE`] runs.
+pub(super) fn released() {
+    let hook = *AT_RELEASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -1689,7 +1714,7 @@ fn a_full_report_retries_nothing() {
 /// B (100×100) fit together, C (200×200) with neither. At level 7 it shows
 /// C; otherwise A for the probe (154 = 1), A and B for 154 = 2, B for 3
 /// and C for 4.
-fn cells_skin() -> (tempfile::TempDir, Arc<super::PendingResult>) {
+pub(crate) fn cells_skin() -> (tempfile::TempDir, Arc<super::PendingResult>) {
     let d = skin_reading(
         "local lv = ms.number(96)\nlocal nr = ms.number(154)",
         "local A = { id = \"a\", src = \"h\", x = 0, y = 0, w = 100, h = 100 }\n\
@@ -1847,7 +1872,7 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
     let p = pending(d.path(), LIMITS);
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
     let super::ImageStage::Running(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
     else {
         panic!("a job runs");
     };
@@ -1885,7 +1910,7 @@ fn shown_script(rs: &ResultSkin) -> crate::screens::ScriptGen {
 /// A pending result skin reading 154 whose image `jd` (a cell of its own)
 /// is drawn only by a `draw` function the runtime runs, as a skin draws
 /// its judgment details; its dot drawn as usual.
-fn runtime_drawn_skin() -> tempfile::TempDir {
+pub(crate) fn runtime_drawn_skin() -> tempfile::TempDir {
     skin(
         "local calls = 0 rt_id = \"jd\" rt_draw = function() calls = calls + 1 return calls > 0 end",
         "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 }, \
@@ -1911,7 +1936,7 @@ fn the_probe_packs_the_cells_a_runtime_draws() {
     REACHED.store(false, SeqCst);
     GATE.store(true, SeqCst);
     let super::ImageStage::Running(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
     else {
         GATE.store(false, SeqCst);
         panic!("a job runs");
@@ -2427,4 +2452,25 @@ fn an_ended_lifetimes_presentation_protects_nothing() {
         crate::screens::ViewCommit::Committed
     );
     assert!(scripts.result_slot(Some(e)).runs_result(&notes));
+}
+
+/// The kept probe's rule set at startup with the probe (design.md
+/// "beatoraja Lua Skins", the result skin's preload): the first attempt's
+/// call is a second decision, and a change drops the preload with the
+/// probe's record and atlas; the same decision keeps it.
+#[test]
+fn a_changed_mode_drops_the_startup_preload() {
+    let _s = serial();
+    let d = runtime_drawn_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+    rs.set_kept_probe(true);
+    let outcome = crate::imports::result_probe(&p, rs.scripts(), true, || false).unwrap();
+    rs.set_preload(outcome);
+    assert_eq!(rs.preloaded(), Some(true), "the kept probe waits");
+    rs.set_kept_probe(true);
+    assert_eq!(rs.preloaded(), Some(true), "the same decision keeps it");
+    rs.set_kept_probe(false);
+    assert_eq!(rs.preloaded(), None, "a change drops it");
+    assert!(rs.image().is_none());
 }

@@ -46,7 +46,7 @@ const MARK_DST: &str = "{ id = \"mark\", dst = { { x = 1200, y = 520, w = 40, h 
 
 /// What the frames read back at [`CHART_AT`] and [`MARK_AT`] while armed.
 #[derive(Clone, Default)]
-struct Seen {
+pub(super) struct Seen {
     armed: Arc<AtomicBool>,
     last: Arc<Mutex<Option<[[u8; 3]; 2]>>>,
 }
@@ -98,7 +98,7 @@ fn near(a: [u8; 3], b: [u8; 3]) -> bool {
 /// selection, whose coordinator runs the images' jobs, so the
 /// preparation's polls wait for them in its facts stage; without, the
 /// direct launch reads them on the game thread.
-fn on_warp<R>(
+pub(super) fn on_warp<R>(
     chart: &bms_model::Chart,
     coord: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
@@ -303,7 +303,7 @@ pub(super) fn prepared(rig: &mut PlayerRig<'_>, loaded: &game::Loaded) {
 
 /// The preparation `h` polled to its end, ready, its final readiness
 /// ready; not committed.
-fn readied(rig: &mut PlayerRig<'_>, h: &mut game::PrepHandle) {
+pub(super) fn readied(rig: &mut PlayerRig<'_>, h: &mut game::PrepHandle) {
     assert_eq!(polled(rig, h).unwrap(), Preparation::Ready);
     assert!(matches!(
         rig.ready_attempt(1, h),
@@ -544,7 +544,7 @@ const ENTRIES: u64 = 4;
 const MENUS: u64 = 400 << 20;
 
 /// The pages the attempt's result uploads, and their level-0 texels.
-fn uploaded(rig: &PlayerRig<'_>) -> (skin_model::AtlasId, u64) {
+pub(super) fn uploaded(rig: &PlayerRig<'_>) -> (skin_model::AtlasId, u64) {
     match rig.result_skin.upload() {
         Some(Upload::Pages(pages)) => (pages.id(), render::pages_texels(&pages)),
         other => panic!("not pages: {other:?}"),
