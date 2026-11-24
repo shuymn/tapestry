@@ -392,6 +392,58 @@ fn a_close_before_a_failed_build_reply_ends_as_the_close() {
     assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
 }
 
+/// W7.3: the window's deadline fails the startup and then closes the
+/// controls, so the render thread's wait may end as a cancel; that cancel
+/// is the deadline's failure, not a close, whether the failed build's
+/// reply comes after the deadline or the wait sees the close first.
+#[test]
+fn a_cancel_after_the_deadline_failed_the_startup_is_the_failure() {
+    use crate::window::{StartFailure, WindowShown};
+
+    let bound = Duration::from_secs(30);
+    // The window thread's deadline: the failure, then the controls' close.
+    let failed = move |shown: &WindowShown, closed: &AtomicBool| {
+        shown.fail(StartFailure::NoFrame(bound));
+        closed.store(true, Ordering::SeqCst);
+    };
+    let ended = |shown: &WindowShown, e: ScreenError| {
+        assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
+        let run = crate::not_started(shown, crate::InputThreads::default(), e, |_, _| {});
+        let e = run.expect_err("the deadline's failure ended as a close");
+        assert!(e.to_string().contains("no frame was presented"), "{e}");
+    };
+
+    // The reply after the deadline: the build fails once the startup has.
+    let shown = WindowShown::pending_for(bound);
+    let closed = Arc::new(AtomicBool::new(false));
+    let (build_side, flag) = (shown.clone(), Arc::clone(&closed));
+    let make: MakeScreen = Box::new(move |_| {
+        failed(&build_side, &flag);
+        Err(refused(false))
+    });
+    let seen = Arc::clone(&closed);
+    let e = start(make, far(), move || seen.load(Ordering::SeqCst))
+        .err()
+        .unwrap();
+    ended(&shown, e);
+
+    // The wait sees the close first, the build still under way.
+    let shown = WindowShown::pending_for(bound);
+    let closed = Arc::new(AtomicBool::new(false));
+    let (release, make) = held();
+    let (window_side, flag) = (shown.clone(), Arc::clone(&closed));
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        failed(&window_side, &flag);
+    });
+    let seen = Arc::clone(&closed);
+    let e = start(make, far(), move || seen.load(Ordering::SeqCst))
+        .err()
+        .unwrap();
+    drop(release);
+    ended(&shown, e);
+}
+
 /// A value whose drop waits until the returned sender is used or dropped,
 /// at most 10 s: a device the driver holds as it is dropped.
 fn held_drop() -> (mpsc::Sender<()>, impl Send + 'static) {

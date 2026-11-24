@@ -1562,7 +1562,9 @@ fn render_not_started(
 /// closed through `close` (told whether it may close, and until when its
 /// thread is waited for). A failure that finds the window closed (the
 /// close settled first, under the outcome's lock) ends the run as the
-/// close.
+/// close. A cancel that finds the startup already failed is that failure:
+/// the window's deadline fails the startup, then closes the controls, so
+/// the render thread's wait can end as a cancel.
 fn not_started(
     shown: &window::WindowShown,
     inputs: InputThreads,
@@ -1571,12 +1573,16 @@ fn not_started(
 ) -> anyhow::Result<()> {
     inputs.detach();
     log_file::finishing();
+    let settled = shown.readiness();
     shown.fail(window::StartFailure::Render(e.to_string()));
     close(!keeps_window(&e), shown.deadline());
-    match e {
-        ScreenError::Cancelled => Ok(()),
+    match (settled, e) {
+        (window::Readiness::Failed(why), ScreenError::Cancelled) => {
+            startup_end(window::StartEnd::Failed(why))
+        }
+        (_, ScreenError::Cancelled) => Ok(()),
         _ if shown.readiness() == window::Readiness::Closed => Ok(()),
-        e => Err(e.into()),
+        (_, e) => Err(e.into()),
     }
 }
 
