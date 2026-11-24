@@ -73,12 +73,12 @@ fn normalise(name: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// A length that may be read: at most [`MAX_FILE_BYTES`].
-fn checked_len(meta: &fs::Metadata) -> Result<u64, PathError> {
+/// A length that may be read: at most `cap`.
+fn checked_len(meta: &fs::Metadata, cap: u64) -> Result<u64, PathError> {
     if !meta.is_file() {
         return Err(PathError::NotAFile);
     }
-    if meta.len() > MAX_FILE_BYTES {
+    if meta.len() > cap {
         return Err(PathError::TooLarge);
     }
     Ok(meta.len())
@@ -89,6 +89,16 @@ fn checked_len(meta: &fs::Metadata) -> Result<u64, PathError> {
 /// then a regular file of at most [`MAX_FILE_BYTES`]. The file-type check
 /// runs before any open, because opening a FIFO blocks.
 pub(crate) fn resolve(root: &Path, name: &str) -> Result<(PathBuf, u64), PathError> {
+    resolve_within(root, name, MAX_FILE_BYTES)
+}
+
+/// [`resolve`] with a file of at most `cap` bytes in place of
+/// [`MAX_FILE_BYTES`] (a chart video's own cap).
+pub(crate) fn resolve_within(
+    root: &Path,
+    name: &str,
+    cap: u64,
+) -> Result<(PathBuf, u64), PathError> {
     if !is_confined_name(name) {
         return Err(PathError::Rejected);
     }
@@ -102,7 +112,7 @@ pub(crate) fn resolve(root: &Path, name: &str) -> Result<(PathBuf, u64), PathErr
         return Err(PathError::Escapes);
     }
     let meta = fs::metadata(&canonical).map_err(PathError::Io)?;
-    let len = checked_len(&meta)?;
+    let len = checked_len(&meta, cap)?;
     Ok((canonical, len))
 }
 
@@ -110,9 +120,15 @@ pub(crate) fn resolve(root: &Path, name: &str) -> Result<(PathBuf, u64), PathErr
 /// regular file of at most [`MAX_FILE_BYTES`]. Returns the file and its
 /// length.
 pub(crate) fn open(canonical: &Path) -> Result<(File, u64), PathError> {
+    open_within(canonical, MAX_FILE_BYTES)
+}
+
+/// [`open`] with a file of at most `cap` bytes in place of
+/// [`MAX_FILE_BYTES`] (a chart video's own cap).
+pub(crate) fn open_within(canonical: &Path, cap: u64) -> Result<(File, u64), PathError> {
     let file = File::open(canonical).map_err(PathError::Io)?;
     let meta = file.metadata().map_err(PathError::Io)?;
-    let len = checked_len(&meta)?;
+    let len = checked_len(&meta, cap)?;
     Ok((file, len))
 }
 

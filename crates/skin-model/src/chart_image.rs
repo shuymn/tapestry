@@ -129,6 +129,8 @@ pub enum Unresolved {
     NotAFile,
     #[error("the file is larger than {MAX_FILE_BYTES} bytes")]
     TooLarge,
+    #[error("the video is larger than {} bytes", crate::bga::MAX_VIDEO_FILE_BYTES)]
+    VideoTooLarge,
     #[error("the file cannot be read: {0}")]
     Io(io::ErrorKind),
 }
@@ -491,7 +493,17 @@ pub(crate) fn observe(
     canonical: &Path,
     identity: Identity<'_>,
 ) -> Result<(File, FileKey), PathError> {
-    let (file, _) = path::open(canonical)?;
+    observe_within(canonical, identity, crate::image::MAX_FILE_BYTES)
+}
+
+/// [`observe`] within `cap` bytes in place of the images' cap (a chart
+/// video's own, [`crate::bga::MAX_VIDEO_FILE_BYTES`]).
+pub(crate) fn observe_within(
+    canonical: &Path,
+    identity: Identity<'_>,
+    cap: u64,
+) -> Result<(File, FileKey), PathError> {
+    let (file, _) = path::open_within(canonical, cap)?;
     let meta = file.metadata().map_err(PathError::Io)?;
     let key = FileKey::of(&meta, &file, identity);
     Ok((file, key))
