@@ -27,7 +27,7 @@ pub use chart::{
     BgmEvent, Chart, ChartIdentity, ChartMeta, ChartSummary, HeaderValue, JudgmentHeader,
     JudgmentHeaderName, LANE_COUNT, Lane, LnMode, Note, NoteKind, SoundId, SoundRef,
 };
-pub use clock::{TimeSource, VirtualClock};
+pub use clock::{Deadline, TimeSource, VirtualClock};
 pub use error::{EndpointLocation, EndpointPart, ModelError, PresentationError};
 pub use info::{ChartInfo, END_WINDOW_SECONDS};
 pub use main_tempo::{MAIN_HISTOGRAM_LIMIT, MainError, main_tempo};

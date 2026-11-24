@@ -52,13 +52,87 @@ impl TimeSource for VirtualClock {
     }
 }
 
+/// An instant on a [`TimeSource`]'s timeline by which something is due.
+/// The caller reads the time and passes it in, so a deadline never reads
+/// a clock itself and a test drives it with a [`VirtualClock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Deadline {
+    at: TimeUs,
+}
+
+impl Deadline {
+    /// The deadline at `at`.
+    #[must_use]
+    pub const fn at_time(at: TimeUs) -> Self {
+        Self { at }
+    }
+
+    /// The deadline `d` after `now`; the timeline's end when that
+    /// overflows.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn after(now: TimeUs, d: TimeUs) -> Self {
+        Self {
+            at: TimeUs(now.0.saturating_add(d.0)),
+        }
+    }
+
+    /// When it is due.
+    #[must_use]
+    pub const fn at(self) -> TimeUs {
+        self.at
+    }
+
+    /// Whether it has passed at `now`: from its own instant on.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn passed(self, now: TimeUs) -> bool {
+        now.0 >= self.at.0
+    }
+
+    /// The time left at `now`; none once it has passed.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn left(self, now: TimeUs) -> TimeUs {
+        let left = self.at.0.saturating_sub(now.0);
+        TimeUs(if left > 0 { left } else { 0 })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{TimeSource, VirtualClock};
+    use super::{Deadline, TimeSource, VirtualClock};
     use crate::TimeUs;
+
+    /// A deadline passes at its own microsecond, not one before.
+    #[test]
+    fn a_deadline_passes_at_its_instant() {
+        let clock = VirtualClock::new(TimeUs(0));
+        let d = Deadline::after(clock.now(), TimeUs(1_041));
+        assert_eq!(d.at(), TimeUs(1_041));
+        clock.set(TimeUs(1_040));
+        assert!(!d.passed(clock.now()));
+        clock.set(TimeUs(1_041));
+        assert!(d.passed(clock.now()));
+        clock.set(TimeUs(1_042));
+        assert!(d.passed(clock.now()));
+    }
+
+    /// The time left counts down to the instant and stays none past it.
+    #[test]
+    fn left_saturates_past_the_deadline() {
+        let d = Deadline::at_time(TimeUs(4_000));
+        assert_eq!(d.left(TimeUs(2_959)), TimeUs(1_041));
+        assert_eq!(d.left(TimeUs(4_000)), TimeUs(0));
+        assert_eq!(d.left(TimeUs(4_250)), TimeUs(0));
+        assert_eq!(
+            Deadline::after(TimeUs(i64::MAX - 1), TimeUs(5)).at(),
+            TimeUs(i64::MAX)
+        );
+    }
 
     #[test]
     fn virtual_clock_moves_only_when_told() {

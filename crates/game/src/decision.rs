@@ -16,7 +16,7 @@
 //! [`DecisionLifetime`], so a takeover of a screen that ended changes
 //! nothing.
 
-use bms_model::TimeUs;
+use bms_model::{Deadline, TimeUs};
 
 /// The built-in presentation's time from the choice (design.md "Play
 /// Lifecycle", the decision screen).
@@ -153,7 +153,7 @@ pub enum Served<T> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Decision {
     /// The deadline on the rig's clock; none when the screen is off.
-    deadline: Option<TimeUs>,
+    deadline: Option<Deadline>,
     /// The choice's instant, on the rig's clock.
     origin: TimeUs,
     /// The presentation shown; none when the screen is off.
@@ -201,7 +201,7 @@ impl Decision {
         practice: bool,
     ) -> Self {
         Self {
-            deadline: shown.map(|s| TimeUs(now.0.saturating_add(s.time().0))),
+            deadline: shown.map(|s| Deadline::after(now, s.time())),
             origin: now,
             shown,
             lifetime: shown.map(|_| lifetime),
@@ -219,7 +219,10 @@ impl Decision {
     /// The deadline, when on.
     #[must_use]
     pub const fn deadline(&self) -> Option<TimeUs> {
-        self.deadline
+        match self.deadline {
+            Some(d) => Some(d.at()),
+            None => None,
+        }
     }
 
     /// The choice's instant.
@@ -253,11 +256,11 @@ impl Decision {
         if self.lifetime != Some(takeover.lifetime) {
             return false;
         }
-        let deadline = TimeUs(self.origin.0.saturating_add(DECISION_TIME.0));
+        let deadline = Deadline::after(self.origin, DECISION_TIME);
         self.deadline = Some(deadline);
         self.shown = Some(DecisionShown::BuiltIn);
         // A deadline still ahead: no longer past it.
-        if now.0 < deadline.0 {
+        if !deadline.passed(now) {
             self.waiting = false;
         }
         true
@@ -290,7 +293,7 @@ impl Decision {
     /// Whether the screen is off, or its deadline was stepped or passed.
     #[must_use]
     pub fn past(&self, now: TimeUs) -> bool {
-        self.deadline.is_none_or(|d| now.0 >= d.0)
+        self.deadline.is_none_or(|d| d.passed(now))
     }
 
     /// How a wait the rig owns left the screen, if it did.
@@ -355,7 +358,7 @@ impl Decision {
             }
         }
         if let Some(deadline) = self.deadline
-            && now.0 >= deadline.0
+            && deadline.passed(now)
         {
             if self.latched {
                 return Verdict::Return;
@@ -401,6 +404,31 @@ mod tests {
             Some(DecisionShown::BuiltIn),
             true,
         )
+    }
+
+    /// The screen's deadline is a deadline on the rig's clock: past from
+    /// its own microsecond, not one before, and the step runs there.
+    #[test]
+    fn past_turns_at_the_deadline() {
+        let shown = DecisionShown::Skin {
+            slot: 1,
+            generation: 7,
+            scene: TimeUs(1_000_000),
+            fadeout: TimeUs(250_041),
+        };
+        let mut d = Decision::begin(TimeUs(2_000), DecisionLifetime(1), Some(shown), false);
+        let due = TimeUs(1_252_041);
+        assert_eq!(d.deadline(), Some(due));
+        assert!(!d.past(TimeUs(due.0 - 1)));
+        assert!(d.past(due));
+        assert_eq!(
+            d.classify(Origin::Load, TimeUs(due.0 - 1), false, false, None),
+            Verdict::Continue
+        );
+        assert_eq!(
+            d.classify(Origin::Load, due, false, false, None),
+            Verdict::Step
+        );
     }
 
     /// Off, every look continues; a refusal returns at once.

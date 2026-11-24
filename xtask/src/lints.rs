@@ -141,6 +141,11 @@ pub const IN_PLAY: &[Site] = &[
         "crates/bms-model/src/lib.rs",
         &["TimeUs::checked_add", "TimeUs::checked_sub"],
     ),
+    // The upload slice's budget, read at every frame boundary.
+    Site::Fns(
+        "crates/bms-model/src/clock.rs",
+        &["Deadline::after", "Deadline::passed", "Deadline::left"],
+    ),
     Site::Fns(
         "crates/bms-model/src/chart.rs",
         &[
