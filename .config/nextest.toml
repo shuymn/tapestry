@@ -12,5 +12,5 @@ threads-required = "num-test-threads"
 # other test process's, so under the suite's load it can fall behind the
 # frame due (design.md "Testing Strategy").
 [[profile.default.overrides]]
-filter = 'package(player) & binary(scenario) & (test(=a_chart_video_plays_and_a_crash_blacks_its_panel) | test(=chart_video_frames_follow_chart_time_in_a_scenario))'
+filter = 'package(player) & binary(scenario) & (test(=a_chart_video_plays_and_a_crash_blacks_its_panel) | test(=chart_video_frames_follow_chart_time_in_a_scenario) | test(=render_app_zero_with_video_bga))'
 threads-required = "num-test-threads"
