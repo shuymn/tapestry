@@ -26,6 +26,7 @@ pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
         )),
         play_level: Fact::Known(level_of(&loaded.labels().playlevel)),
         result: Fact::Unavailable,
+        result_inputs: Fact::Unavailable,
         total: Fact::Known(game::song_total(loaded.chart())),
         chart_notes: Fact::Known(skin_model::chart_notes(loaded.chart())),
     }

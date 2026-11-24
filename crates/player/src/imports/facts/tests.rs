@@ -242,6 +242,7 @@ fn an_attempt_reads_the_references_class_whatever_the_preset() {
                         judge_class: Fact::Known(class),
                         play_level: Fact::Known(0),
                         result: Fact::Unavailable,
+                        result_inputs: Fact::Unavailable,
                         total: Fact::Known(260),
                         chart_notes: Fact::Known(1),
                     },

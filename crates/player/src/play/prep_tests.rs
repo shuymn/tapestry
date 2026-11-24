@@ -31,6 +31,8 @@ mod result_flow;
 #[cfg(feature = "dev-tools")]
 mod result_hold;
 mod result_images;
+#[cfg(feature = "dev-tools")]
+mod result_preload;
 mod settle;
 
 /// How long a test waits for what must come; `TAPESTRY_TEST_WATCHDOG`

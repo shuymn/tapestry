@@ -1593,5 +1593,454 @@ fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
     assert_eq!(witnessed(&b), (2, Vec::new()));
 }
 
+/// A load under a held pause (a bank look's, say) while the result skin's
+/// preload pack runs: the load claims the pack, so the pause does not stop
+/// it; the pack stays on its speculative permit through the decode, which
+/// is granted every foreground permit its pool runs a worker for, as with
+/// no preload; once the decode has ended the pack is promoted, and moves
+/// to the foreground at its next checkpoint.
+#[test]
+fn a_claimed_preload_leaves_the_decode_its_width() {
+    use crate::result_skin::preload_tests::{Opened, REACHED, Seam, gate, preloaded_with};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let builds = crate::result_skin::builds();
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.result_skin =
+                preloaded_with(skin.path(), &seam, Some(rig.render.scripts().clone()));
+            let control = rig.result_skin.preload_control().unwrap();
+            sel(rig).shelf.set_preload(Arc::clone(&control));
+            gate(2);
+            rig.poll_preload();
+            until("the pack's checkpoint", || REACHED.load(Ordering::SeqCst));
+            assert_eq!(b.coord.held(Class::Speculative), 1);
+            sel(rig).shelf.pause();
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert!(control.claimed(), "the load claimed it");
+            // The decode began beside no foreground permit of the pack's, and
+            // ran every worker it would without it.
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+            assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
+            assert!(seam.left.lock().unwrap().is_empty(), "speculative so far");
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+            assert_eq!(*seam.left.lock().unwrap(), ["result-preload"], "promoted");
+            rig.poll_preload();
+            assert!(rig.result_skin.image().is_some(), "packed, not stopped");
+            assert_eq!(crate::result_skin::builds(), builds + 1);
+        },
+    );
+}
+
+/// Why no speculative preload pack can run.
+#[derive(Clone, Copy, Debug)]
+enum Alone {
+    /// The coordinator has no speculative permit.
+    SpeculationOff,
+    /// A pack's thread was refused background mode.
+    Refused,
+}
+
+/// A choice to play under `alone`, where the pack can run only as
+/// foreground work: the choice's look claims it but begins nothing, so
+/// the cold bank's decode is granted every foreground permit its pool
+/// runs a worker for; the load itself begins the pack in the foreground
+/// once the decode has ended, with no look after it, and the attempt
+/// finds it packed (design.md "beatoraja Lua Skins", the result skin's
+/// preload: begun as foreground work after the decode).
+fn a_foreground_only_preload_leaves_a_cold_bank_its_width(alone: Alone) {
+    use crate::result_skin::preload_tests::{Opened, REACHED, Seam, gate, preloaded_with};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let coord = match alone {
+        Alone::SpeculationOff => Coordinator::new(game::coord::Caps {
+            foreground: game::coord::FOREGROUND_PERMITS,
+            speculative: 0,
+        }),
+        Alone::Refused => coordinator(),
+    };
+    let mut b = bench_on(coord, dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    seam.refuse
+        .store(matches!(alone, Alone::Refused), Ordering::SeqCst);
+    let builds = crate::result_skin::builds();
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.result_skin =
+                preloaded_with(skin.path(), &seam, Some(rig.render.scripts().clone()));
+            let control = rig.result_skin.preload_control().unwrap();
+            sel(rig).shelf.set_preload(Arc::clone(&control));
+            // A look before the choice: a refused pack ends at once.
+            until("no pack in flight", || {
+                rig.poll_preload();
+                rig.result_skin.preload_state().1.is_none()
+            });
+            gate(2);
+            // The choice's look: the claim, the pause, the poll.
+            rig.preload_claim = sel(rig).shelf.claim_preload();
+            sel(rig).shelf.choose(&path);
+            rig.poll_preload();
+            if rig.result_skin.preload_state().1.is_some() {
+                until("the pack's checkpoint", || REACHED.load(Ordering::SeqCst));
+            }
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready, "{alone:?}");
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)], "{alone:?}");
+            assert_eq!(
+                decoded(&b.decodes),
+                [(Speed::NORMAL, granted(0, 4), 0)],
+                "{alone:?}"
+            );
+            // Begun by the load after the decode, with no look since.
+            assert!(
+                rig.result_skin.preload_state().1.is_some(),
+                "{alone:?}: not begun after the decode"
+            );
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+            let claim = rig.preload_claim.take();
+            assert!(claim.is_some(), "{alone:?}: claimed");
+            assert!(control.claimed());
+            let stage = rig.result_skin.begin_image_stage(
+                crate::result_skin::tests::chart(),
+                Some(skin_beatoraja::JudgeClass::Normal),
+                claim,
+            );
+            assert!(
+                matches!(
+                    stage,
+                    crate::result_skin::ImageStage::Ready(crate::result_skin::Staged::Ready)
+                ),
+                "{alone:?}: the attempt finds it packed"
+            );
+            assert!(rig.result_skin.image().is_some(), "{alone:?}");
+            assert!(
+                seam.left.lock().unwrap().is_empty(),
+                "{alone:?}: no mode change"
+            );
+            assert_eq!(crate::result_skin::builds(), builds + 1, "{alone:?}");
+        },
+    );
+}
+
+#[test]
+fn with_speculation_off_a_preload_leaves_a_cold_bank_its_width() {
+    a_foreground_only_preload_leaves_a_cold_bank_its_width(Alone::SpeculationOff);
+}
+
+#[test]
+fn with_background_mode_refused_a_preload_leaves_a_cold_bank_its_width() {
+    a_foreground_only_preload_leaves_a_cold_bank_its_width(Alone::Refused);
+}
+
+/// The rig's result skin preloaded, its pack begun at a look and held at
+/// its checkpoint whatever it is told, on its speculative permit, the
+/// shelf's pause requested as a choice's would be. Its control, and the
+/// skin's folder.
+fn held_preload(
+    rig: &mut PlayerRig<'_>,
+    seam: &Arc<crate::result_skin::preload_tests::Seam>,
+    coord: &Coordinator,
+) -> (Arc<crate::result_skin::PreloadControl>, tempfile::TempDir) {
+    use crate::result_skin::preload_tests::{REACHED, gate, preloaded_with};
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    rig.result_skin = preloaded_with(skin.path(), seam, Some(rig.render.scripts().clone()));
+    let control = rig.result_skin.preload_control().unwrap();
+    sel(rig).shelf.set_preload(Arc::clone(&control));
+    gate(2);
+    rig.poll_preload();
+    until("the pack's checkpoint", || REACHED.load(Ordering::SeqCst));
+    assert_eq!(coord.held(Class::Speculative), 1);
+    sel(rig).shelf.pause();
+    (control, skin)
+}
+
+/// The claimed pack passes one checkpoint while the chosen chart's bank
+/// decodes, and is still speculative there; it moves to the foreground
+/// only at a checkpoint after the decode has ended (design.md "Load
+/// Pipeline", Pauses: the claimed pack is promoted once the chosen chart's
+/// bank no longer decodes).
+#[test]
+fn a_claimed_preload_stays_speculative_until_the_decode_ends() {
+    use crate::result_skin::preload_tests::{Opened, Seam, gate, step};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    // At the Bank's decode (the first decode begun): the pack let through
+    // one checkpoint, and the classes it left background mode for then.
+    let at_decode: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
+    let first = Arc::new(AtomicBool::new(true));
+    let decodes = {
+        let (seam, at_decode) = (Arc::clone(&seam), Arc::clone(&at_decode));
+        decodes_with(hook(move |p, _, _| {
+            if matches!(p, Probe::Decode(_)) && first.swap(false, Ordering::SeqCst) {
+                assert!(step(), "the pack's checkpoint during the decode");
+                *at_decode.lock().unwrap() = Some(seam.left.lock().unwrap().clone());
+            }
+        }))
+    };
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert!(control.claimed(), "the load claimed it");
+            assert_eq!(
+                *at_decode.lock().unwrap(),
+                Some(Vec::new()),
+                "speculative at its checkpoint during the decode"
+            );
+            assert!(seam.left.lock().unwrap().is_empty(), "held since");
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+            assert_eq!(
+                *seam.left.lock().unwrap(),
+                ["result-preload"],
+                "foreground after the decode"
+            );
+        },
+    );
+}
+
+/// A discard in Preparing while the adopted pack holds a foreground permit
+/// between its checkpoints, held there whatever it is told, then a cold
+/// chart's load: the claim's end revokes the pack's permit at once, so the
+/// next decode is granted every foreground permit its pool runs a worker
+/// for though the pack has not yielded (design.md "Load Pipeline", the
+/// coordinator: the chosen chart's bank draws the foreground pool).
+#[test]
+fn a_discarded_adopted_pack_leaves_the_next_cold_bank_its_width() {
+    use crate::result_skin::preload_tests::{Opened, Seam, gate, step};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            // The attempt adopts the claimed pack, which moves to the
+            // foreground at its next checkpoint.
+            let stage = rig.result_skin.begin_image_stage(
+                crate::result_skin::tests::chart(),
+                Some(skin_beatoraja::JudgeClass::Normal),
+                Some(control.claim()),
+            );
+            assert!(matches!(stage, crate::result_skin::ImageStage::Adopted(_)));
+            assert!(step(), "a checkpoint in the foreground");
+            assert_eq!(b.coord.held(Class::Foreground), 1);
+            // The discard: the stage drops with its claim; the pack, held
+            // between its checkpoints, has not yielded its permit.
+            drop(stage);
+            assert!(!control.claimed());
+            assert_eq!(b.coord.held(Class::Foreground), 0, "revoked at once");
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+            assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+        },
+    );
+}
+
+/// A quit right after the adopted pack's checkpoint read that it should
+/// move to the foreground, before it moves its permit there: the pack is
+/// held between the two, the claim's end (the stage dropped) withdraws
+/// the promotion, the pack goes on unpaused, and once let go its move
+/// reads the class again
+/// under the lock that takes the permit, so it stays speculative and the
+/// next cold chart's bank is granted every foreground permit its pool
+/// runs a worker for (design.md "Load Pipeline", the coordinator: the
+/// chosen chart's bank draws the foreground pool).
+#[test]
+fn a_quit_before_the_promoted_pack_moves_leaves_the_next_cold_bank_its_width() {
+    use crate::result_skin::preload_tests::{Opened, Seam, back_since, gate, pass};
+    /// Lets the held move go however the test ends.
+    struct Released(Arc<AtomicBool>);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song_of(dir.path(), 3);
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            // The pack's next move is held, once, after its read.
+            let (armed, reached, release) = (
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let _released = Released(Arc::clone(&release));
+            {
+                let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+                b.coord.before_move(move || {
+                    if !armed.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    reached.store(true, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                });
+            }
+            // The attempt adopts the claimed pack, promoting it.
+            let stage = rig.result_skin.begin_image_stage(
+                crate::result_skin::tests::chart(),
+                Some(skin_beatoraja::JudgeClass::Normal),
+                Some(control.claim()),
+            );
+            assert!(matches!(stage, crate::result_skin::ImageStage::Adopted(_)));
+            let arrived = pass();
+            until("the pack's move", || reached.load(Ordering::SeqCst));
+            assert_eq!(b.coord.held(Class::Foreground), 0, "not moved yet");
+            // The quit: the stage drops with its claim, and the select
+            // screen's pause ends, so the pack goes on speculatively.
+            drop(stage);
+            assert!(!control.claimed());
+            sel(rig).shelf.release();
+            release.store(true, Ordering::SeqCst);
+            until("the pack's next checkpoint", || back_since(arrived));
+            let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
+            assert_eq!(got, Loading::Ready);
+            assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+            assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
+            assert_eq!(b.coord.held(Class::Speculative), 1, "its own class");
+            assert!(seam.left.lock().unwrap().is_empty(), "never promoted");
+            gate(0);
+            until("the pack's end", || control.wait_ended(Duration::ZERO));
+        },
+    );
+}
+
+/// How a choice's load ends before Preparing.
+#[derive(Clone, Copy, Debug)]
+enum LoadEnd {
+    /// The quit key while the chosen chart's bank decodes.
+    Quit,
+    /// The bank refused (a sound past the length cap).
+    Refused,
+}
+
+/// A load that claimed the running pack ends before Preparing, `how`, and
+/// the chart is left as App leaves it (`left_chart`): the claim ends there,
+/// and the pack, never promoted (its chart's bank never decoded), goes on
+/// in the speculative class and packs (design.md "State Model", the
+/// decision screen).
+fn a_load_ending_before_preparing_ends_the_claim(how: LoadEnd) {
+    use crate::result_skin::preload_tests::{Opened, Seam, gate};
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let (decodes, stopped) = match how {
+        LoadEnd::Quit => {
+            let (hook, stopped) = leave_at(Probe::Decode(Speed::NORMAL), Leave::Quit);
+            (decodes_with(hook), Some(stopped))
+        }
+        LoadEnd::Refused => {
+            // 600 s + 1 frame declared at 8 kHz, past the length cap (as
+            // `a_bank_too_large_is_refused_through_its_job`).
+            let mut bytes = wav(&square(0.01, 1_000));
+            let data: u32 = 4_800_001 * 2;
+            bytes[4..8].copy_from_slice(&(36 + data).to_le_bytes());
+            bytes[40..44].copy_from_slice(&data.to_le_bytes());
+            std::fs::write(dir.path().join("song").join("key.wav"), bytes).unwrap();
+            (Decodes::default(), None)
+        }
+    };
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let seam = Arc::new(Seam::default());
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            let (control, _skin) = held_preload(rig, &seam, &b.coord);
+            let (_, job) = rig.result_skin.preload_state();
+            let got = rig.load_chart(&loaded, &mut game::Decision::off());
+            match how {
+                LoadEnd::Quit => assert_eq!(outcome(got), Loading::Cancelled),
+                LoadEnd::Refused => assert!(matches!(got, Err(ChartLoadError::Sounds(_)))),
+            }
+            if let Some(stopped) = stopped {
+                assert!(stopped.load(Ordering::SeqCst), "{how:?}: the decode's stop");
+            }
+            assert!(
+                control.claimed(),
+                "{how:?}: claimed until the chart is left"
+            );
+            while game::Rig::take(rig).is_some() {}
+            rig.left_chart().unwrap();
+            assert!(!control.claimed(), "{how:?}: the claim ended");
+            assert!(rig.preload_claim.is_none());
+            assert_eq!(rig.result_skin.preload_state(), (None, job), "{how:?}");
+            sel(rig).shelf.release();
+            gate(0);
+            until("the pack's collection", || {
+                rig.poll_preload();
+                rig.result_skin.preload_state().1.is_none()
+            });
+            assert!(
+                seam.left.lock().unwrap().is_empty(),
+                "{how:?}: never promoted"
+            );
+            assert!(rig.result_skin.image().is_some(), "{how:?}: packed");
+        },
+    );
+}
+
+#[test]
+fn a_quit_during_the_decode_ends_the_preload_claim() {
+    a_load_ending_before_preparing_ends_the_claim(LoadEnd::Quit);
+}
+
+#[test]
+fn a_refused_load_ends_the_preload_claim() {
+    a_load_ending_before_preparing_ends_the_claim(LoadEnd::Refused);
+}
+
 mod page;
 mod served;

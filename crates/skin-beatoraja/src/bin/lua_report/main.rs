@@ -131,6 +131,7 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
                 }
                 let view = dense_view();
                 facts.result = Fact::Known(ResultFields::of(&view));
+                facts.result_inputs = Fact::Known(());
                 choice.result = Some(view);
                 args = rest;
             }

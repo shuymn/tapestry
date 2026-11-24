@@ -902,6 +902,19 @@ impl PageJobs {
         }
     }
 
+    /// Whether the result skin's preload may pack beside the page
+    /// (design.md "State Model", the practice page): not while its bank
+    /// waits for its prerequisites (the measurement or the release
+    /// barrier's unload), while its bank or its measurement runs, or while
+    /// its gain is unknown with a measurement still due, so the pack never
+    /// takes the speculative permit before them. With no page open, and
+    /// once the page is left ([`leave`](Self::leave)), it may.
+    pub const fn preload_may_run(&self) -> bool {
+        let measure_due =
+            self.chart.is_some() && self.key.is_some() && !self.gain_known && !self.measure_tried;
+        self.pending.is_none() && self.bank.is_none() && self.measure.is_none() && !measure_due
+    }
+
     /// The gain was found without the page: no Start measures it.
     pub const fn known(&mut self) {
         self.gain_known = true;

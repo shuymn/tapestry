@@ -1553,6 +1553,23 @@ impl Selection {
                 Some(SelectStep::SlowChartLoad(ms)) => crate::dev::slow_chart_load(ms),
                 Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
+                Some(SelectStep::HoldPreload(at)) => crate::result_skin::gaps::hold(at),
+                Some(SelectStep::ReleasePreload { on_adopt }) => {
+                    if on_adopt {
+                        crate::result_skin::gaps::release_on_adopt();
+                    } else {
+                        crate::result_skin::gaps::release();
+                    }
+                }
+                Some(SelectStep::PreloadHeld) => {
+                    if crate::result_skin::gaps::held().is_none() {
+                        if script.watchdog_expired() {
+                            script.fail("the preload pack never held".to_owned());
+                            controls.close();
+                        }
+                        return false;
+                    }
+                }
                 Some(SelectStep::Background(running)) => {
                     let done = if running {
                         crate::dev::background_held()
@@ -2083,6 +2100,53 @@ enum Driven {
     Wait,
     /// The script failed: the run ends.
     Failed,
+    /// The script closes the window (`close`): the run ends.
+    Close,
+}
+
+/// The `--dev-select` steps due on the practice page (dev-tools; a run
+/// with no scenario): `sleep`, the preload's hold steps and `close` run
+/// as on the select screen, `practice-back` leaves the page, and any
+/// other step waits for the select screen.
+#[cfg(feature = "dev-tools")]
+fn drive_practice_select(script: &mut crate::dev::SelectScript) -> Driven {
+    use crate::dev::SelectStep;
+    loop {
+        match script.front().cloned() {
+            Some(SelectStep::Sleep(ms)) => {
+                if !script.slept(ms) {
+                    return Driven::Wait;
+                }
+            }
+            Some(SelectStep::HoldPreload(at)) => crate::result_skin::gaps::hold(at),
+            Some(SelectStep::ReleasePreload { on_adopt }) => {
+                if on_adopt {
+                    crate::result_skin::gaps::release_on_adopt();
+                } else {
+                    crate::result_skin::gaps::release();
+                }
+            }
+            Some(SelectStep::PreloadHeld) => {
+                if crate::result_skin::gaps::held().is_none() {
+                    if script.watchdog_expired() {
+                        script.fail("the preload pack never held".to_owned());
+                        return Driven::Failed;
+                    }
+                    return Driven::Wait;
+                }
+            }
+            Some(SelectStep::PracticeBack) => {
+                script.done();
+                return Driven::Key(MenuKey::Escape);
+            }
+            Some(SelectStep::Close) => {
+                script.done();
+                return Driven::Close;
+            }
+            _ => return Driven::Wait,
+        }
+        script.done();
+    }
 }
 
 /// The scripted step due on the practice page (a scenario's `practice`):
@@ -2932,6 +2996,12 @@ impl PlayerRig<'_> {
             if let Some(script) = &mut sel.script {
                 script.chose();
             }
+            // A choice to play claims the result skin's preload before
+            // its pause (design.md "State Model", the decision screen).
+            self.preload_claim = match pick {
+                Pick::Play(_) => sel.shelf.claim_preload(),
+                Pick::Practice(_) => None,
+            };
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
             self.ready_figure_due = true;
@@ -3011,6 +3081,9 @@ impl PlayerRig<'_> {
                 sc.captures.arm_select(k, lifetime, revision);
             }
         }
+        // The result skin's preload, after the choice's pause if this look
+        // chose (design.md "Load Pipeline", Pauses).
+        self.poll_preload();
         chosen
     }
 
@@ -3285,6 +3358,22 @@ impl PlayerRig<'_> {
     /// fails the run.
     #[cfg(feature = "dev-tools")]
     fn script_practice(&mut self) -> bool {
+        if self.scenario.is_none() {
+            let Some(script) = self.selection.as_mut().and_then(|s| s.script.as_mut()) else {
+                return false;
+            };
+            return match drive_practice_select(script) {
+                Driven::Key(key) => {
+                    self.result_input.menu.push(MenuInput::Key(key));
+                    true
+                }
+                Driven::Wait => false,
+                Driven::Failed | Driven::Close => {
+                    self.controls.close();
+                    false
+                }
+            };
+        }
         let (Some(sc), Some(script)) = (
             &mut self.scenario,
             self.selection.as_mut().and_then(|s| s.script.as_mut()),
@@ -3297,7 +3386,7 @@ impl PlayerRig<'_> {
                 true
             }
             Driven::Wait => false,
-            Driven::Failed => {
+            Driven::Failed | Driven::Close => {
                 self.controls.close();
                 false
             }
@@ -3586,6 +3675,12 @@ impl PlayerRig<'_> {
                 sel.shelf.stop_awaiting();
             }
         }
+        // A Start claims the result skin's preload as a choice to play
+        // does, whatever pause holds (design.md "State Model", the
+        // practice page); a choice to play claimed it already.
+        if self.preload_claim.is_none() {
+            self.preload_claim = sel.shelf.claim_preload();
+        }
         // Requested again after the practice page released it, as a
         // choice does.
         sel.shelf.choose(loaded.path());
@@ -3750,6 +3845,19 @@ impl PlayerRig<'_> {
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
+        // The bank no longer decodes: the claimed preload pack is promoted
+        // to the foreground pool it no longer draws (design.md "Load
+        // Pipeline", Pauses).
+        if let Some(claim) = &self.preload_claim {
+            claim.promote();
+        }
+        if self.preload_claim.is_some() {
+            // A pack that can run only in the foreground begins here, the
+            // one point every load passes after its decode, so the attempt
+            // adopts it whether or not a look comes first (design.md
+            // "beatoraja Lua Skins", the result skin's preload).
+            self.poll_preload();
+        }
         #[cfg(test)]
         if let Some(gate) = self.selection.as_ref().and_then(|s| s.after_bank.as_ref()) {
             gate();
@@ -4137,9 +4245,12 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), game::LiveError<ScreenError>> {
-        // The page's jobs go on through the decision screen.
-        if origin == game::Origin::Jobs {
-            self.poll_page()?;
+        // The page's jobs go on through the decision screen, and the
+        // result skin's preload with them.
+        match origin {
+            game::Origin::Jobs => self.poll_page()?,
+            game::Origin::Loading => {}
+            _ => self.poll_preload(),
         }
         Ok(())
     }
@@ -4289,6 +4400,8 @@ impl AppRig for PlayerRig<'_> {
     /// nowhere (design.md "Load Pipeline"), but a panic one published
     /// meanwhile that a Start was responsible for, which ends the run.
     fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // The choice's claim on the result skin's preload ends with it.
+        self.preload_claim = None;
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
@@ -4309,6 +4422,8 @@ impl AppRig for PlayerRig<'_> {
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
         self.leave_result();
+        // The chosen chart's claim on the result skin's preload ends.
+        self.preload_claim = None;
         // A result left for selection, by back or its scene time
         // (dev-tools).
         #[cfg(feature = "dev-tools")]
@@ -4435,6 +4550,8 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn poll_page(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // The preload's pack stops before the page admits its jobs.
+        self.gate_preload();
         match self.begin_page_when_ready() {
             Ok(()) => {}
             Err(PageBegin::Failed(failure)) => return Err(game::LiveError::Load(failure)),
@@ -4457,7 +4574,9 @@ impl AppRig for PlayerRig<'_> {
         };
         sel.page
             .poll(&sel.coord, sel.spawner, &mut sel.shelf)
-            .map_err(game::LiveError::Load)
+            .map_err(game::LiveError::Load)?;
+        self.poll_preload();
+        Ok(())
     }
 
     /// A Start taken on the practice page, before anything of it begins
@@ -4482,6 +4601,11 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.leave_result();
+        // A Start's claim on the result skin's preload ends with its
+        // return to the page, where the page's jobs decide again: the
+        // pack's stop latched before the pause is released below.
+        self.preload_claim = None;
+        self.gate_preload();
         // A result left for the practice page (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
@@ -6894,6 +7018,44 @@ pub(crate) mod tests {
             }
         }
         (keys, super::Driven::Wait)
+    }
+
+    /// A `--dev-select` run on the practice page: its waits run, Back
+    /// leaves the page, `close` ends the run, and a step of the select
+    /// screen waits there.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_dev_select_run_steps_on_the_practice_page() {
+        let mut script =
+            crate::dev::SelectScript::parse("sleep=0,practice-back,sleep=0,close").unwrap();
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Key(MenuKey::Escape)
+        ));
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Close
+        ));
+        assert!(script.front().is_none());
+        // A select screen's step waits for it; a long sleep holds Back.
+        let mut script = crate::dev::SelectScript::parse("pick=a.bme,practice-back").unwrap();
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Wait
+        ));
+        assert!(matches!(
+            script.front(),
+            Some(crate::dev::SelectStep::Pick(_))
+        ));
+        let mut script = crate::dev::SelectScript::parse("sleep=60000,practice-back").unwrap();
+        assert!(matches!(
+            super::drive_practice_select(&mut script),
+            super::Driven::Wait
+        ));
+        assert!(matches!(
+            script.front(),
+            Some(crate::dev::SelectStep::Sleep(60_000))
+        ));
     }
 
     /// Setting a page far from where it opens takes a key per showing of

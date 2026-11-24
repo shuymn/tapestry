@@ -525,6 +525,121 @@ fn a_quit_while_joining_keeps_the_page_job_for_the_next_start() {
     assert!(begun(&b.decodes).is_empty());
 }
 
+/// A Start cancelled while it joins the page's bank (the quit key): the
+/// Start claimed the result skin's preload, and the return to the page
+/// ends the claim, so the page's jobs decide again: no pack begins while
+/// the page's bank decodes, and one begins once its jobs have ended
+/// (design.md "State Model", the practice page).
+#[test]
+fn a_cancelled_start_ends_its_preload_claim() {
+    use crate::result_skin::preload_tests::{Seam, preloaded_with};
+    let _serial = crate::imports::tests::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "p8c", &page);
+    let (held, go) = page.hold(PageAt::File(0));
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let start = practiced(dir.path(), &path, Speed::NORMAL);
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.result_skin =
+                preloaded_with(skin.path(), &seam, Some(rig.render.scripts().clone()));
+            let control = rig.result_skin.preload_control().unwrap();
+            sel(rig).shelf.set_preload(Arc::clone(&control));
+            read_page(rig, &read);
+            held.recv_timeout(watchdog()).expect("the page's decode");
+            rig.controls.command(game::Command::Quit);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
+            assert!(control.claimed(), "the Start claimed it");
+            while game::Rig::take(rig).is_some() {}
+            rig.entered_practice(&game::PracticeScreen::new(
+                read.chart(),
+                &rules::tapestry(),
+                0,
+            ));
+            assert!(!control.claimed(), "the claim ended");
+            assert!(rig.preload_claim.is_none());
+            // The page's bank decodes: no pack.
+            rig.poll_page().unwrap();
+            rig.poll_preload();
+            assert_eq!(rig.result_skin.preload_state(), (Some(true), None));
+            go.send(()).unwrap();
+            passes_until_idle(rig);
+            rig.poll_preload();
+            assert!(
+                rig.result_skin.preload_state().1.is_some(),
+                "a pack once the page's jobs ended"
+            );
+            until("the pack's collection", || {
+                rig.poll_preload();
+                rig.result_skin.preload_state().1.is_none()
+            });
+        },
+    );
+}
+
+/// A Start's return to the page while the page's bank waits for its
+/// prerequisites: the Start's claim ends there, and the pack it exempted
+/// from the pause, between its checkpoints on the one speculative
+/// permit, has its stop latched before the page releases the pause, so
+/// it never keeps the permit the page's bank waits for (design.md "State
+/// Model", the practice page).
+#[test]
+fn a_return_to_the_page_stops_the_pack_before_the_release() {
+    use crate::result_skin::preload_tests::{Opened, REACHED, Seam, gate, preloaded_with};
+    use std::sync::atomic::Ordering::SeqCst;
+    let _serial = crate::imports::tests::serial();
+    let _g = Opened;
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "p8d", &page);
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let skin = crate::result_skin::tests::runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.result_skin =
+                preloaded_with(skin.path(), &seam, Some(rig.render.scripts().clone()));
+            let control = rig.result_skin.preload_control().unwrap();
+            sel(rig).shelf.set_preload(Arc::clone(&control));
+            // Held whatever it is told, as between two checkpoints.
+            gate(2);
+            rig.poll_preload();
+            until("the pack's checkpoint", || REACHED.load(SeqCst));
+            // A Start's claim and its pause, as its load takes them.
+            rig.preload_claim = sel(rig).shelf.claim_preload();
+            sel(rig).shelf.choose(&path);
+            // The page's bank waits for its prerequisites.
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
+            assert!(!sel(rig).page.preload_may_run());
+            rig.entered_practice(&game::PracticeScreen::new(
+                read.chart(),
+                &rules::tapestry(),
+                0,
+            ));
+            assert!(!control.claimed(), "the claim ended");
+            // Its next checkpoint, the pause released: it stops.
+            gate(1);
+            assert!(
+                control.wait_ended(std::time::Duration::from_secs(10)),
+                "the pack went on past the release"
+            );
+        },
+    );
+}
+
 /// P8b, P14: a page bank the Start joined panics: inside the Start's wait,
 /// or after a quit left it to the page and a second Start finds it
 /// published. Either way the Start was responsible: the run ends.
