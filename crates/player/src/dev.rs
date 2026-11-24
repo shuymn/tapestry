@@ -3307,6 +3307,18 @@ pub fn frame_fault() {
     }
 }
 
+/// An event's time as an outside recorder can compare it: the performance
+/// counter's raw value and the system tick count in ms, the clock a
+/// WinEvent's own time (`dwmsEventTime`) is on. Allocates nothing.
+pub fn event_stamp() -> (i64, u64) {
+    let mut qpc = 0;
+    // SAFETY: writes the counter into a local.
+    let _ = unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut qpc) };
+    // SAFETY: no arguments; reads the tick count.
+    let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    (qpc, tick)
+}
+
 /// The startup cause probe's gate: a file path; each window renderer's
 /// first configure waits until the file exists (at most two minutes),
 /// then records the window's state ([`configure_probe`]).

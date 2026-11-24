@@ -66,7 +66,8 @@ thread_local! {
 /// error of a refused swap chain.
 const GPU_TARGETS: [&str; 2] = ["wgpu_hal", "wgpu_core"];
 
-/// Takes, while `on`, wgpu's error records on this thread as render report
+/// Takes, while `on`, wgpu's error records made on this thread inside a
+/// window surface's configure ([`render::configuring`]) as render report
 /// lines ([`crate::render_report::report`]) instead of rejecting them: the
 /// render thread turns it on around its startup builds only, so a refused
 /// swap chain's system error is on record, and no wgpu record takes the
@@ -112,6 +113,15 @@ pub fn start(dir: &Path, command: &str) {
 /// is on.
 pub fn finish(code: u8) {
     LOG.finish(code);
+}
+
+/// Holds the global log's sink until the returned guard drops, as a writer
+/// blocked in another thread holds it (tests).
+#[cfg(test)]
+pub(crate) fn hold() -> impl Sized {
+    LOG.state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Prints every warning on stderr as `warning: <w>`, as the command always
@@ -258,7 +268,7 @@ fn taken(m: &Metadata<'_>) -> bool {
 }
 
 /// Whether a record is one of wgpu's errors taken on this thread now
-/// ([`capture_gpu_errors`]).
+/// ([`capture_gpu_errors`]): inside a window surface's configure only.
 fn gpu_error(m: &Metadata<'_>) -> bool {
     m.level() == Level::Error
         && GPU_TARGETS.iter().any(|t| {
@@ -268,6 +278,7 @@ fn gpu_error(m: &Metadata<'_>) -> bool {
                     .is_some_and(|r| r.starts_with("::"))
         })
         && GPU_ERRORS.try_with(Cell::get).unwrap_or(false)
+        && render::configuring()
 }
 
 /// A logger over one [`Logged`] sink, empty until one is put in.
@@ -877,8 +888,8 @@ pub(crate) mod tests {
 
     /// W1.5: wgpu's error records on a thread are taken, as report lines
     /// and without the sink's lock, only while that thread captures them
-    /// (its startup builds); its other levels and every record outside the
-    /// capture are rejected as before.
+    /// (its startup builds) and is inside a surface's configure; its other
+    /// levels and every record outside the capture are rejected as before.
     #[test]
     fn wgpu_errors_are_taken_only_during_a_startup_configure() {
         let log = memory_log();
@@ -889,27 +900,33 @@ pub(crate) mod tests {
         let hal = |level| metadata("wgpu_hal::dx12::adapter", level);
         assert!(!log.enabled(&hal(Level::Error)));
         super::capture_gpu_errors(true);
-        assert!(log.enabled(&hal(Level::Error)));
-        assert!(log.enabled(&metadata("wgpu_core", Level::Error)));
-        assert!(!log.enabled(&hal(Level::Warn)));
-        assert!(!log.enabled(&metadata("wgpu_halo", Level::Error)));
-        // Taken with the sink held elsewhere: no lock.
-        let guard = log.state.lock().unwrap();
-        log.log(&record_of(
-            "wgpu_hal::dx12::adapter",
-            Level::Error,
-            format_args!("CreateSwapChainForHwnd failed: 0x887A0001"),
-        ));
-        drop(guard);
-        // Another thread captures nothing.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| assert!(!log.enabled(&hal(Level::Error))))
-                .join()
-                .unwrap();
+        // A startup build outside its configure: rejected.
+        assert!(!log.enabled(&hal(Level::Error)));
+        render::while_configuring(|| {
+            assert!(log.enabled(&hal(Level::Error)));
+            assert!(log.enabled(&metadata("wgpu_core", Level::Error)));
+            assert!(!log.enabled(&hal(Level::Warn)));
+            assert!(!log.enabled(&metadata("wgpu_halo", Level::Error)));
+            // Taken with the sink held elsewhere: no lock.
+            let guard = log.state.lock().unwrap();
+            log.log(&record_of(
+                "wgpu_hal::dx12::adapter",
+                Level::Error,
+                format_args!("CreateSwapChainForHwnd failed: 0x887A0001"),
+            ));
+            drop(guard);
+            // Another thread captures nothing.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| assert!(!log.enabled(&hal(Level::Error))))
+                    .join()
+                    .unwrap();
+            });
         });
         super::capture_gpu_errors(false);
-        assert!(!log.enabled(&hal(Level::Error)));
+        assert!(!render::while_configuring(
+            || log.enabled(&hal(Level::Error))
+        ));
         log.log(&record_of(
             "wgpu_hal::dx12::adapter",
             Level::Error,

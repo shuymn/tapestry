@@ -1346,13 +1346,19 @@ impl MenuScreen {
         if t.confirmed()
             && let Some(flag) = &self.presented
         {
+            // The confirmation's time, taken before the window can see the
+            // flag, so it precedes any show the flag causes (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            let stamp = (!flag.load(Ordering::Acquire)).then(crate::dev::event_stamp);
             let first = !flag.swap(true, Ordering::AcqRel);
-            // The first confirmed present's count (dev-tools, the
-            // startup's order against the window's show).
+            // The first confirmed present's count and time (dev-tools, the
+            // startup's order against the window's show, whose event a
+            // recorder stamps on the same tick count).
             #[cfg(feature = "dev-tools")]
             if first {
+                let (qpc, tick) = stamp.unwrap_or_default();
                 println!(
-                    "dev: first present confirmed, present count {}",
+                    "dev: first present confirmed, present count {}, qpc {qpc}, tick {tick}",
                     t.present_count.unwrap_or(0)
                 );
             }

@@ -5,8 +5,10 @@
 //! each line into a fixed record ([`Line`], cut at [`LINE`] bytes) and
 //! pushes it onto a preallocated single-producer ring of [`CAPACITY`]
 //! records ([`rtrb`], as the measurement's queues are), then wakes the
-//! reporter by unparking it: nothing here waits, locks or allocates on the
-//! render thread. A line that finds the ring full is dropped and counted,
+//! reporter by unparking it: the copy to the log neither waits, locks nor
+//! allocates on the render thread. The print on stderr before it takes
+//! stderr's own lock and writes, as every print does, and may stall the
+//! render thread while stderr is blocked. A line that finds the ring full is dropped and counted,
 //! and the count is written before the reporter's next line or as it ends
 //! (a lossy non-blocking writer, as tracing-appender's and spdlog's are).
 //!
@@ -242,10 +244,10 @@ fn set_route(route: Route) {
     });
 }
 
-/// Prints `args` on stderr, and copies it to the log: through this
-/// thread's reporter, if it has one, else directly unless the thread is
-/// stderr-only. Allocates nothing on a thread with a reporter once it is
-/// installed.
+/// Prints `args` on stderr (under stderr's lock), and copies it to the
+/// log: through this thread's reporter, if it has one, without a lock,
+/// else directly unless the thread is stderr-only. Allocates nothing on a
+/// thread with a reporter once it is installed.
 pub(crate) fn report(args: fmt::Arguments<'_>) {
     eprintln!("{args}");
     let _ = ROUTE.try_with(|r| {

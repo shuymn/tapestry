@@ -1403,17 +1403,19 @@ fn play(
     let render = match render {
         Ok(r) => r,
         Err(e) => {
-            audio.exit();
+            audio.exit_by(shown.deadline());
             return render_not_started(window_thread, e);
         }
     };
     render.follow(&window_thread.extent());
     if let Err(end) = wait_ready(&shown, &controls, &render) {
-        audio.exit();
-        let rendered = render.exit();
-        report_render_end(&rendered);
-        window_thread.close_after(rendered.released());
-        return startup_end(end);
+        return end_startup(
+            end,
+            shown.deadline(),
+            |by| audio.exit_by(by),
+            |by| render.exit_by(by),
+            |rendered, by| window_thread.close_by(rendered, by),
+        );
     }
     let threads = Threads {
         input,
@@ -1509,17 +1511,58 @@ fn keeps_window(e: &ScreenError) -> bool {
 }
 
 /// Ends a startup whose render thread did not start with `e`: the window
-/// is never shown, and closes unless [`keeps_window`]. A close is the
-/// run's end, no failure; anything else fails the run.
+/// is never shown, and closes unless [`keeps_window`], its thread waited
+/// for until the startup's deadline at the latest. A close is the run's
+/// end, no failure; anything else fails the run.
 fn render_not_started(window: window::WindowThread, e: ScreenError) -> anyhow::Result<()> {
-    window
-        .shown()
-        .fail(window::StartFailure::Render(e.to_string()));
-    window.close_after(!keeps_window(&e));
+    log_file::finishing();
+    let shown = window.shown();
+    shown.fail(window::StartFailure::Render(e.to_string()));
+    window.close_by(!keeps_window(&e), shown.deadline());
     match e {
         ScreenError::Cancelled => Ok(()),
         e => Err(e.into()),
     }
+}
+
+/// Ends a run whose startup ended without its first present (`end`): the
+/// log's records stop waiting on a blocked writer first ([`log_file::finishing`]),
+/// then the audio thread (`audio`), the render thread (`render`) and the
+/// window (`close`, told whether the renderer is gone) are each waited for
+/// until `by`, the startup's deadline, at the latest, so the outcome is
+/// reported by then; a thread still running is left to the process's exit,
+/// and a window a render thread may still draw into stays open.
+fn end_startup(
+    end: window::StartEnd,
+    by: std::time::Instant,
+    audio: impl FnOnce(std::time::Instant),
+    render: impl FnOnce(std::time::Instant) -> RenderEnd,
+    close: impl FnOnce(bool, std::time::Instant),
+) -> anyhow::Result<()> {
+    log_file::finishing();
+    audio(by);
+    let rendered = render(by);
+    report_render_end(&rendered);
+    close(rendered.released(), by);
+    startup_end(end)
+}
+
+/// Joins `handle` if its thread ends by `by`: its result, or `None` with
+/// the thread left running to the process's exit. It looks at the thread
+/// every millisecond, as a scoped job's waiter does
+/// ([`game::coord::ScopedJob::wait`]).
+pub(crate) fn join_by<T>(
+    handle: std::thread::JoinHandle<T>,
+    by: std::time::Instant,
+) -> Option<std::thread::Result<T>> {
+    while !handle.is_finished() {
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::park_timeout(left.min(std::time::Duration::from_millis(1)));
+    }
+    Some(handle.join())
 }
 
 /// Waits for the startup's outcome ([`window::WindowShown::wait_ready`]),
@@ -1557,10 +1600,18 @@ fn render_end_line(end: &RenderEnd) -> Option<String> {
     }
 }
 
-/// Prints and logs [`render_end_line`], if any.
+/// Prints and logs [`render_end_line`], if any. The run is ending: the
+/// log's records stop waiting on a writer blocked in another thread (the
+/// render thread's reporter) first ([`log_file::finishing`]).
 fn report_render_end(end: &RenderEnd) {
+    report_render_end_to(end, &mut std::io::stderr().lock());
+}
+
+/// [`report_render_end`], printing on `err`.
+fn report_render_end_to(end: &RenderEnd, err: &mut impl std::io::Write) {
+    log_file::finishing();
     if let Some(line) = render_end_line(end) {
-        eprintln!("{line}");
+        let _ = writeln!(err, "{line}");
         log::error!("{line}");
     }
 }
@@ -2025,7 +2076,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     ) {
         Ok(r) => r,
         Err(e) => {
-            audio.exit();
+            audio.exit_by(deadline);
             return match window_thread {
                 Some(w) => render_not_started(w, e),
                 None if keeps_window(&e) => match e {
@@ -2046,13 +2097,17 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(shown) = &shown
         && let Err(end) = wait_ready(shown, &controls, &render)
     {
-        audio.exit();
-        let rendered = render.exit();
-        report_render_end(&rendered);
-        if let Some(w) = window_thread {
-            w.close_after(rendered.released());
-        }
-        return startup_end(end);
+        return end_startup(
+            end,
+            shown.deadline(),
+            |by| audio.exit_by(by),
+            |by| render.exit_by(by),
+            |rendered, by| {
+                if let Some(w) = window_thread {
+                    w.close_by(rendered, by);
+                }
+            },
+        );
     }
     let threads = Threads {
         input,
@@ -3794,6 +3849,100 @@ mod tests {
         assert!(super::panicked(&RenderEnd::Stuck).is_ok());
         assert_eq!(super::render_end_line(&RenderEnd::Joined), None);
         assert!(super::panicked(&RenderEnd::Joined).is_ok());
+    }
+
+    /// W5.2: the render thread's end is reported past a log writer blocked
+    /// in another thread (the reporter, holding the log's sink): the report
+    /// enters the run's end first, so its record waits for the sink at
+    /// most the finishing bound, and its line still reaches stderr; once
+    /// the sink is free, the line reaches the log too.
+    #[test]
+    fn a_render_end_is_reported_past_a_blocked_log_writer() {
+        use std::time::Duration;
+
+        use crate::render_side::RenderEnd;
+        let logs = tempfile::tempdir().unwrap();
+        crate::log_file::start(logs.path(), "test");
+        let held = crate::log_file::hold();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut err = Vec::new();
+            super::report_render_end_to(&RenderEnd::Stuck, &mut err);
+            let _ = tx.send(err);
+        });
+        let err = rx.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        let err = err.expect("the report waited on the blocked writer");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "render: the render thread did not end\n"
+        );
+        super::report_render_end_to(&RenderEnd::Stuck, &mut Vec::new());
+        let log = std::fs::read_to_string(logs.path().join("tapestry.log")).unwrap();
+        assert!(
+            log.contains("render: the render thread did not end"),
+            "{log}"
+        );
+    }
+
+    /// W5.1: a failed startup's end waits for its threads until the
+    /// startup's deadline only, each told the same instant, and reports
+    /// the render thread's end; a renderer left running keeps the window.
+    #[test]
+    fn a_failed_startups_end_is_due_by_its_deadline() {
+        use std::cell::RefCell;
+        use std::time::{Duration, Instant};
+
+        use crate::render_side::RenderEnd;
+        use crate::window::{StartEnd, StartFailure};
+        let by = Instant::now() + Duration::from_millis(50);
+        let seen = RefCell::new(Vec::new());
+        let e = super::end_startup(
+            StartEnd::Failed(StartFailure::NoFrame(Duration::from_secs(30))),
+            by,
+            |at| seen.borrow_mut().push(("audio", at, true)),
+            |at| {
+                seen.borrow_mut().push(("render", at, true));
+                RenderEnd::Stuck
+            },
+            |rendered, at| seen.borrow_mut().push(("close", at, rendered)),
+        )
+        .unwrap_err();
+        assert!(e.to_string().starts_with("the window was not shown: "));
+        assert_eq!(
+            seen.into_inner(),
+            [
+                ("audio", by, true),
+                ("render", by, true),
+                ("close", by, false)
+            ]
+        );
+    }
+
+    /// W5.1: a thread joined by an instant is joined when it ends by then,
+    /// and left running when it does not, the wait ending at the instant.
+    #[test]
+    fn a_thread_is_joined_by_an_instant_or_left() {
+        use std::time::{Duration, Instant};
+        let ended = std::thread::spawn(|| 7);
+        assert_eq!(
+            super::join_by(ended, Instant::now() + Duration::from_secs(10))
+                .unwrap()
+                .unwrap(),
+            7
+        );
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let running = std::thread::spawn(move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        });
+        let by = Instant::now() + Duration::from_millis(100);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::join_by(running, by).is_none());
+        });
+        let left = rx.recv_timeout(Duration::from_secs(5));
+        drop(release);
+        assert_eq!(left, Ok(true), "the join waited past its instant");
     }
 
     /// W4.2: a present tap whose reconfigure the surface refused fails the

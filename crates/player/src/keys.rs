@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use eval::ControlId;
@@ -20,6 +21,7 @@ use render::{AdapterChoice, Renderer, Target};
 use crate::controls::Controls;
 use crate::end_screen::key_name;
 use crate::menu_screen::WindowSink as _;
+use crate::window::{Readiness, StartFailure, WindowShown};
 
 /// A bound control's name: a keyboard key by its scan code, a controller's
 /// button by its number and its axis by its HID usage, each after its
@@ -190,22 +192,16 @@ struct Screen<'a> {
     controls: &'a Controls,
     /// Set by a presented frame: the hidden window shows then.
     presented: Arc<AtomicBool>,
+    /// The startup's outcome, which a failed first frame fails.
+    shown: WindowShown,
 }
 
 impl KeyScreen for Screen<'_> {
     fn show(&mut self, flow: &KeyConfigFlow) {
         let lines = lines(flow);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        match self.renderer.text_frame(&refs) {
-            Ok(t) if t.confirmed() => self.presented.store(true, Ordering::Release),
-            Ok(_) => {}
-            Err(e) => {
-                // The screen is lost: nothing more can be shown, so the
-                // key config ends as if the window closed.
-                eprintln!("render: {}", game::Chain(&e));
-                self.controls.close();
-            }
-        }
+        let drawn = self.renderer.text_frame(&refs);
+        framed(drawn, &self.presented, &self.shown, self.controls);
     }
 
     fn wait(&mut self) {
@@ -217,6 +213,48 @@ impl KeyScreen for Screen<'_> {
     fn closed(&self) -> bool {
         self.controls.quitting()
     }
+}
+
+/// What a key config frame `drawn` tells: a present the swap chain
+/// confirmed tells the window (`presented`), which shows then; a failed
+/// frame loses the screen, so the key config ends as if the window closed,
+/// and before the first present it fails the startup with why (`shown`,
+/// design.md "Showing the window"), which fails the run.
+fn framed(
+    drawn: Result<render::FrameTiming, render::RenderError>,
+    presented: &AtomicBool,
+    shown: &WindowShown,
+    controls: &Controls,
+) {
+    match drawn {
+        Ok(t) if t.confirmed() => presented.store(true, Ordering::Release),
+        Ok(_) => {}
+        Err(e) => {
+            let line = format!("render: {}", game::Chain(&e));
+            eprintln!("{line}");
+            shown.fail(StartFailure::Render(line));
+            controls.close();
+        }
+    }
+}
+
+/// Makes `make`'s value on a thread of its own and waits for it until
+/// `deadline`: `None` past it, the thread left running to the process's
+/// exit, so a renderer whose creation hangs (a swap chain Windows holds)
+/// does not hold the key config past the startup's deadline.
+fn make_by<T: Send + 'static>(
+    deadline: Instant,
+    make: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("render".into())
+        .spawn(move || {
+            let _ = tx.send(make());
+        })
+        .ok()?;
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
 }
 
 /// Puts a finished key config into `device`: the bindings, the scratch
@@ -285,15 +323,25 @@ pub fn run(
         width: surface.width,
         height: surface.height,
     };
-    let renderer = match Renderer::new(target, AdapterChoice::HighPerformance) {
-        Ok(r) => r,
-        Err(e) => {
+    let shown = window_thread.shown();
+    let made = make_by(shown.deadline(), move || {
+        Renderer::new(target, AdapterChoice::HighPerformance)
+    });
+    let renderer = match made {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => {
             drop(input);
-            window_thread
-                .shown()
-                .fail(crate::window::StartFailure::Render(e.to_string()));
-            window_thread.close();
+            shown.fail(StartFailure::Render(e.to_string()));
+            window_thread.close_by(true, shown.deadline());
             return Err(e.into());
+        }
+        // Not made by the deadline: the thread making it may still make
+        // its surface on the window, which stays open to the exit.
+        None => {
+            drop(input);
+            let why = "the renderer was not made by the startup's deadline";
+            shown.fail(StartFailure::Render(why.to_owned()));
+            anyhow::bail!("the window was not shown: {why}");
         }
     };
     #[cfg(feature = "dev-tools")]
@@ -302,6 +350,7 @@ pub fn run(
         renderer,
         controls: &controls,
         presented: window_thread.link().presented(),
+        shown: shown.clone(),
     };
     let current = KeyConfigs::from(&device);
     let end = capture_keys(&capture, &mut screen, current, device.scratch.wrap);
@@ -310,12 +359,14 @@ pub fn run(
     drop(script);
     drop(input);
     // A window never shown (no frame by the startup's deadline, which
-    // closed the controls) fails the key config, not a close.
-    let readiness = window_thread.shown().readiness();
-    window_thread.close();
-    if let crate::window::Readiness::Failed(why) = readiness {
+    // closed the controls, or a failed first frame) fails the key config,
+    // not a close; its window thread is waited for no longer than the
+    // deadline.
+    if let Readiness::Failed(why) = shown.readiness() {
+        window_thread.close_by(true, shown.deadline());
         anyhow::bail!("the window was not shown: {why}");
     }
+    window_thread.close();
     match end {
         KeyConfigEnd::Done(keys, widened, menu_reversed, adjust_reversed) => {
             apply(&mut device, keys, widened, menu_reversed, adjust_reversed);
@@ -655,6 +706,7 @@ mod tests {
                 renderer: Renderer::new(target, AdapterChoice::Warp).unwrap(),
                 controls: &controls,
                 presented: Arc::clone(&presented),
+                shown: crate::window::WindowShown::settled(crate::window::Readiness::Pending),
             };
             assert!(!presented.load(Ordering::Acquire));
             // A swap chain may skip its first frames; a few are enough.
@@ -679,5 +731,61 @@ mod tests {
             told
         });
         assert!(window, "a window's frame did not tell it");
+    }
+
+    /// W5.4: a key config frame that fails before the first present fails
+    /// the startup with why, so the run fails rather than ending as a
+    /// close; one failing after it ends the key config as a close.
+    #[test]
+    fn a_failed_first_key_config_frame_fails_the_startup() {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::window::{Readiness, StartFailure, WindowShown};
+
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let shown = WindowShown::settled(Readiness::Pending);
+        let presented = AtomicBool::new(false);
+        super::framed(
+            Err(render::RenderError::SurfaceLost),
+            &presented,
+            &shown,
+            &controls,
+        );
+        assert_eq!(
+            shown.readiness(),
+            Readiness::Failed(StartFailure::Render("render: surface lost".to_owned()))
+        );
+        assert!(controls.quitting());
+        // Past the first present: a close only.
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let shown = WindowShown::settled(Readiness::FirstPresent);
+        super::framed(
+            Err(render::RenderError::SurfaceLost),
+            &presented,
+            &shown,
+            &controls,
+        );
+        assert_eq!(shown.readiness(), Readiness::FirstPresent);
+        assert!(controls.quitting());
+    }
+
+    /// W5.4: the key config's renderer is waited for until the startup's
+    /// deadline only: one whose making hangs is left to its thread, and the
+    /// wait ends at the deadline.
+    #[test]
+    fn a_renderer_not_made_by_the_deadline_is_left() {
+        use std::time::Instant;
+
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let made = super::make_by(deadline, move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        });
+        assert!(made.is_none());
+        let late = Instant::now().saturating_duration_since(deadline);
+        assert!(late < Duration::from_secs(2), "{late:?} past the deadline");
+        drop(release);
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(super::make_by(far, || 5), Some(5));
     }
 }

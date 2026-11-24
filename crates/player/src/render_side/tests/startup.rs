@@ -137,9 +137,16 @@ fn refused_configures_fail_the_startup() {
     // A deadline far past the builds' pauses, which an unbounded retry
     // would still end.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let e = startup_build(&mut make, None, None, deadline)
-        .err()
-        .unwrap();
+    let e = startup_build(
+        &mut make,
+        None,
+        None,
+        deadline,
+        &AtomicBool::new(false),
+        &mut std::thread::sleep,
+    )
+    .err()
+    .unwrap();
     assert!(
         matches!(
             e,
@@ -157,7 +164,16 @@ fn refused_configures_fail_the_startup() {
 #[test]
 fn a_permanent_refusal_is_not_retried() {
     let (builds, mut make) = refusing(u32::MAX, || refused(false));
-    let e = startup_build(&mut make, None, None, far()).err().unwrap();
+    let e = startup_build(
+        &mut make,
+        None,
+        None,
+        far(),
+        &AtomicBool::new(false),
+        &mut std::thread::sleep,
+    )
+    .err()
+    .unwrap();
     assert!(
         matches!(
             e,
@@ -176,7 +192,16 @@ fn a_permanent_refusal_is_not_retried() {
 #[test]
 fn other_build_errors_are_not_retried() {
     let (builds, mut make) = refusing(u32::MAX, || RenderError::SurfaceLost);
-    let e = startup_build(&mut make, None, None, far()).err().unwrap();
+    let e = startup_build(
+        &mut make,
+        None,
+        None,
+        far(),
+        &AtomicBool::new(false),
+        &mut std::thread::sleep,
+    )
+    .err()
+    .unwrap();
     assert!(matches!(e, RenderError::SurfaceLost), "{e:?}");
     assert_eq!(builds.load(Ordering::SeqCst), 1);
 }
@@ -187,9 +212,16 @@ fn other_build_errors_are_not_retried() {
 fn retries_stop_at_the_deadline() {
     let (builds, mut make) = refusing(u32::MAX, || refused(true));
     let deadline = Instant::now() + super::super::STARTUP_RETRY / 2;
-    let e = startup_build(&mut make, None, None, deadline)
-        .err()
-        .unwrap();
+    let e = startup_build(
+        &mut make,
+        None,
+        None,
+        deadline,
+        &AtomicBool::new(false),
+        &mut std::thread::sleep,
+    )
+    .err()
+    .unwrap();
     assert!(e.is_retryable_configure(), "{e:?}");
     assert_eq!(builds.load(Ordering::SeqCst), 1);
 }
@@ -277,4 +309,190 @@ fn a_failed_frame_reaches_the_log() {
         assert_eq!(link.exit(), super::super::RenderEnd::Joined);
     });
     assert_eq!(lines, ["render: surface lost"], "{lines:?}");
+}
+
+/// W5.5: a retry whose pause ran past the deadline (a scheduler's delay, a
+/// report line held up on stderr) starts no build: the deadline is looked
+/// at once more right before the factory is called.
+#[test]
+fn a_retry_held_past_the_deadline_is_not_built() {
+    let (builds, mut make) = refusing(u32::MAX, || refused(true));
+    // Far enough for the retry to be planned before the pause.
+    let deadline = Instant::now() + super::super::STARTUP_RETRY * 4;
+    let mut held = |_| std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    let e = startup_build(
+        &mut make,
+        None,
+        None,
+        deadline,
+        &AtomicBool::new(false),
+        &mut held,
+    )
+    .err()
+    .unwrap();
+    assert!(e.is_retryable_configure(), "{e:?}");
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+}
+
+/// W5.5: a close during the pause between builds starts no build after
+/// it: the startup's wait gives up at the close, and the builder, left
+/// detached, looks at that before its next build.
+#[test]
+fn a_close_during_the_backoff_starts_no_build() {
+    let (builds, make) = refusing(u32::MAX, || refused(true));
+    let counted = Arc::clone(&builds);
+    let e = start(make, far(), &|| counted.load(Ordering::SeqCst) >= 1)
+        .err()
+        .unwrap();
+    assert!(matches!(e, ScreenError::Cancelled), "{e:?}");
+    // Past the pause: a builder that did not look would have built again.
+    std::thread::sleep(super::super::STARTUP_RETRY * 3);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+}
+
+/// A screen whose menu frames wait until the returned sender is used or
+/// dropped, at most 10 s: a renderer stuck after its build's reply.
+fn stuck() -> (mpsc::Sender<()>, MakeScreen) {
+    struct Stuck(std::sync::Mutex<mpsc::Receiver<()>>);
+    impl Screen for Stuck {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            let _ = self.0.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+    let (release, held) = mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(Some(held));
+    let make: MakeScreen = Box::new(move |_| {
+        let rx = held.lock().unwrap().take().unwrap();
+        Ok(Box::new(Stuck(std::sync::Mutex::new(rx))) as Box<dyn Screen>)
+    });
+    (release, make)
+}
+
+/// W5.1: a render thread stuck after its build's reply (in its first
+/// frame) is waited for at its end only until the instant given, the
+/// startup's deadline, and left detached: the outcome is not held up by
+/// the render thread's own end bound.
+#[test]
+fn a_renderer_stuck_after_its_build_reply_is_left_by_the_deadline() {
+    let (release, make) = stuck();
+    let link = start(make, far(), &|| false).unwrap();
+    link.send(RenderMsg::Menu(Box::default()));
+    std::thread::sleep(Duration::from_millis(100));
+    let by = Instant::now() + Duration::from_millis(200);
+    let end = link.exit_by(by);
+    let late = Instant::now().saturating_duration_since(by);
+    assert_eq!(end, super::super::RenderEnd::Stuck);
+    assert!(late < Duration::from_secs(1), "{late:?} past the instant");
+    drop(release);
+}
+
+/// W5.3: a frame the render thread fails wakes the game at once, so a
+/// startup waiting on its first present fails with it rather than at its
+/// deadline.
+#[test]
+fn a_failed_frame_wakes_the_game() {
+    let make: MakeScreen = Box::new(|_| {
+        Ok(Box::new(Still {
+            fail_at: Some(1),
+            frames: 0,
+        }) as Box<dyn Screen>)
+    });
+    let link = start(make, far(), &|| false).unwrap();
+    let (tx, woken) = mpsc::sync_channel::<()>(8);
+    link.set_game_wake(Arc::new(move || {
+        let _ = tx.try_send(());
+    }));
+    link.send(RenderMsg::Menu(Box::default()));
+    assert!(
+        woken.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the game was not woken"
+    );
+    assert!(link.failed());
+    link.exit();
+}
+
+/// W5.7: during a startup build, wgpu's error records are taken into the
+/// report lines only from inside the window surface's configure: a record
+/// the build makes elsewhere (here before its renderer, as device creation
+/// could) is rejected, and the hardware layer's record of a refused swap
+/// chain (a second flip-model swap chain on one window) is taken.
+#[test]
+fn wgpu_errors_are_taken_only_inside_the_configure() {
+    let logs = tempfile::tempdir().unwrap();
+    crate::log_file::start(logs.path(), "test");
+    let lines = crate::test_window::on_own_desktop(|| {
+        let popup = crate::test_window::Popup::new(64, 36);
+        // The window's one flip-model swap chain.
+        let first =
+            render::Renderer::new(popup.target(64, 36), render::AdapterChoice::Warp).unwrap();
+        let (tx, lines) = mpsc::channel::<String>();
+        let (producer, reporter) = crate::render_report::start(Box::new(move |l| {
+            let _ = tx.send(l.to_owned());
+        }))
+        .unwrap();
+        crate::render_report::install(producer);
+        let target = popup.target(64, 36);
+        let mut target = Some(target);
+        let mut make: MakeScreen = Box::new(move |_| {
+            log::error!(target: "wgpu_core::device", "outside the configure (a test)");
+            let t = target.take().ok_or(RenderError::NoArea)?;
+            render::Renderer::new(t, render::AdapterChoice::Warp)?;
+            Err(RenderError::NoArea)
+        });
+        let e = startup_build(
+            &mut make,
+            None,
+            None,
+            Instant::now(),
+            &AtomicBool::new(false),
+            &mut std::thread::sleep,
+        )
+        .err()
+        .unwrap();
+        assert!(e.is_retryable_configure(), "{e:?}");
+        crate::render_report::stderr_only();
+        assert!(reporter.join(Duration::from_secs(10)));
+        drop(first);
+        drop(popup);
+        lines.try_iter().collect::<Vec<String>>()
+    });
+    assert!(
+        lines.iter().all(|l| !l.contains("outside the configure")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("render: wgpu_hal")),
+        "{lines:?}"
+    );
 }

@@ -2693,6 +2693,14 @@ impl Shared {
 }
 
 impl Shared {
+    /// Latches the screen's failure and wakes the game thread, so a game
+    /// waiting on the render thread (the startup's outcome, READY) sees it
+    /// at once rather than at its bound.
+    fn latch_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.game_wake.wake();
+    }
+
     fn selection_slot(&self) -> std::sync::MutexGuard<'_, SelectionSlot> {
         self.selection
             .lock()
@@ -4958,8 +4966,17 @@ impl RenderLink {
     /// Ends the thread and waits for it at most [`EXIT_TIMEOUT`]; when it
     /// is [`RenderEnd::Stuck`], the window it draws into must stay open.
     pub fn exit(self) -> RenderEnd {
+        let by = Instant::now() + self.exit_timeout;
+        self.exit_by(by)
+    }
+
+    /// [`exit`](Self::exit), waiting for the thread and its reporter until
+    /// `by` at the latest: a failed startup's end, due by its deadline.
+    pub fn exit_by(self, by: Instant) -> RenderEnd {
+        let by = by.min(Instant::now() + self.exit_timeout);
+        let left = || by.saturating_duration_since(Instant::now());
         self.send(RenderMsg::Exit);
-        let end = match self.ended.recv_timeout(self.exit_timeout) {
+        let end = match self.ended.recv_timeout(left()) {
             // Detached: a thread stuck in the screen's work must not hold
             // up the exit. The caller keeps the window open and reports
             // it; its reporter goes on while it does.
@@ -4974,7 +4991,7 @@ impl RenderLink {
         if end.released()
             && let Some(reporter) = self.reporter
         {
-            let _ = reporter.join(self.exit_timeout);
+            let _ = reporter.join(left());
         }
         // No play runs any more: the parked runtimes are destroyed here,
         // unless an interval was left open, when they are leaked.
@@ -5538,6 +5555,10 @@ pub fn spawn_until(
     let scripts = Scripts::new();
     let thread_scripts = scripts.clone();
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
+    // Set once the wait below gave up (the deadline or a close): the
+    // builder, left detached, makes no build after it.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let thread_abandoned = Arc::clone(&abandoned);
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
@@ -5561,18 +5582,25 @@ pub fn spawn_until(
             crate::dev::read_render_faults();
             #[cfg(feature = "dev-tools")]
             crate::dev::read_script_switches();
-            let screen =
-                match startup_build(&mut make, chart.as_deref(), section.as_ref(), deadline) {
-                    Ok(screen) => {
-                        thread_shared.built(screen.as_ref());
-                        let _ = ready_tx.send(Ok(()));
-                        screen
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
+            let built = startup_build(
+                &mut make,
+                chart.as_deref(),
+                section.as_ref(),
+                deadline,
+                &thread_abandoned,
+                &mut std::thread::sleep,
+            );
+            let screen = match built {
+                Ok(screen) => {
+                    thread_shared.built(screen.as_ref());
+                    let _ = ready_tx.send(Ok(()));
+                    screen
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
             // The startup build is no rebuild: the allowance starts free.
             let heavy_seen = screen.heavy_ops().count;
             let handoffs = crate::retire_worker::Handoffs::start(
@@ -5725,9 +5753,13 @@ pub fn spawn_until(
             });
         }
         // Past the deadline or cancelled, the thread and its reporter are
-        // left detached: the build may still finish, and the window it
-        // may draw into stays open (the caller's).
-        Err(e) => return Err(e),
+        // left detached: the build under way may still finish, and the
+        // window it may draw into stays open (the caller's); no build
+        // starts after it.
+        Err(e) => {
+            abandoned.store(true, Ordering::Release);
+            return Err(e);
+        }
     };
     match answer {
         Ok(()) => Ok(RenderLink {
@@ -5762,9 +5794,13 @@ pub fn spawn_until(
 /// ([`RenderError::is_retryable_configure`]) is made again, the failed
 /// one's surface and device dropped first, [`STARTUP_RETRY`] later, at most
 /// [`STARTUP_BUILDS`] builds and none that would start past `deadline`;
-/// each refusal is reported. While a build runs, wgpu's own error records
-/// on this thread are copied to the report lines (design.md "Log File"),
-/// so a refused swap chain's system error is on record.
+/// each refusal is reported. The pause between builds is `pause`'s, and
+/// right before each build made again the deadline and `abandoned` (the
+/// startup's wait gave up) are looked at once more, so a pause or a report
+/// that ran late starts no build past them. While a build runs, wgpu's own
+/// error records made inside its surface's configure on this thread are
+/// copied to the report lines (design.md "Log File"), so a refused swap
+/// chain's system error is on record.
 ///
 /// # Errors
 ///
@@ -5774,6 +5810,8 @@ fn startup_build(
     chart: Option<&Chart>,
     section: Option<&Section>,
     deadline: Instant,
+    abandoned: &AtomicBool,
+    pause: &mut dyn FnMut(Duration),
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut builds = 1;
     loop {
@@ -5808,7 +5846,10 @@ fn startup_build(
             return Err(e);
         }
         builds += 1;
-        std::thread::sleep(STARTUP_RETRY);
+        pause(STARTUP_RETRY);
+        if abandoned.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(e);
+        }
     }
 }
 
@@ -7931,7 +7972,7 @@ impl Run {
                         self.chart = None;
                         self.section = None;
                         if self.prepare().is_err() {
-                            self.shared.failed.store(true, Ordering::Release);
+                            self.shared.latch_failed();
                         }
                     }
                     let _ = reply.send(ready);
@@ -8685,7 +8726,7 @@ impl Run {
                         Chain(&RenderError::DeviceLost)
                     ));
                     self.drop_screen();
-                    self.shared.failed.store(true, Ordering::Release);
+                    self.shared.latch_failed();
                     mode = Mode::Idle;
                     continue;
                 }
@@ -9276,7 +9317,7 @@ impl Run {
                         // resources stay, for the next preparation.
                         self.measure.failed(&effects);
                         crate::render_report::report(format_args!("render: {}", Chain(&e)));
-                        self.shared.failed.store(true, Ordering::Release);
+                        self.shared.latch_failed();
                         mode = Mode::Idle;
                         continue;
                     }
@@ -10375,7 +10416,7 @@ impl Run {
                     }
                     crate::render_report::report(format_args!("render: {}", Chain(&e)));
                     self.drop_screen();
-                    self.shared.failed.store(true, Ordering::Release);
+                    self.shared.latch_failed();
                     mode = Mode::Idle;
                 }
             }
@@ -10897,7 +10938,7 @@ impl Run {
             crate::render_report::report(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
         }
     }
 
@@ -11158,7 +11199,7 @@ impl Run {
                 crate::render_report::report(format_args!("render: {}", Chain(&e)));
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 dropped = true;
             }
             while self.handoffs.has_free()
@@ -12558,7 +12599,7 @@ impl Run {
             return Ok(Preparation::Ready);
         };
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let Some(screen) = &mut self.screen else {
@@ -12648,7 +12689,7 @@ impl Run {
             Err(e) => {
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 Err(e)
             }
         }
@@ -12698,7 +12739,7 @@ impl Run {
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let shared = Arc::clone(&self.shared);
@@ -12732,7 +12773,7 @@ impl Run {
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Some(Err(e));
         }
         #[cfg(feature = "dev-tools")]
@@ -12820,7 +12861,7 @@ impl Run {
     /// for a screen built again.
     fn remove(&mut self, request: u64, kind: ScreenKind) -> Result<Preparation, RenderError> {
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let Some(screen) = &mut self.screen else {
@@ -13029,7 +13070,7 @@ impl Run {
                 ));
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 return true;
             }
         }
@@ -13983,7 +14024,7 @@ impl Run {
                 let _ = reply.send(PagesAnswer::Lost);
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
             }
         }
     }
@@ -14603,7 +14644,7 @@ impl Run {
             crate::render_report::report(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return;
         }
         if let Some(why) = refused {
@@ -15122,7 +15163,7 @@ impl Run {
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let Some(screen) = &mut self.screen else {
@@ -15218,7 +15259,7 @@ impl Run {
             Err(e) => {
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 Err(e)
             }
         }
