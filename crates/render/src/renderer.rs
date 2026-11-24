@@ -563,6 +563,13 @@ pub enum RenderError {
         #[source]
         source: wgpu::Error,
     },
+    /// The device was lost before or during a configure of the window's
+    /// surface, which is left unconfigured; a renderer built again on a new
+    /// device may pass. A variant of its own, with nothing to format until
+    /// it is reported, so a frame's reconfigure returns it with nothing
+    /// allocated.
+    #[error("surface: configure refused: the device was lost")]
+    ConfigureDeviceLost,
     /// A menu's text could not be drawn as prepared.
     #[error("text")]
     Text(#[source] glyphon::RenderError),
@@ -639,7 +646,8 @@ impl RenderError {
     }
 
     /// Whether this is a refusal of the window's surface a renderer built
-    /// again may pass: a retryable configure refusal, or no client area.
+    /// again may pass: a retryable configure refusal, a device lost at the
+    /// configure, or no client area.
     #[must_use]
     pub const fn is_retryable_configure(&self) -> bool {
         matches!(
@@ -647,7 +655,8 @@ impl RenderError {
             Self::SurfaceConfigure {
                 retryable: true,
                 ..
-            } | Self::NoArea
+            } | Self::ConfigureDeviceLost
+                | Self::NoArea
         )
     }
 

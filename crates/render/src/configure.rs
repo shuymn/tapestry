@@ -55,7 +55,9 @@ pub fn while_configuring<R>(f: impl FnOnce() -> R) -> R {
 ///
 /// # Errors
 ///
-/// [`RenderError::SurfaceConfigure`] with what refused it.
+/// [`RenderError::SurfaceConfigure`] with what refused it;
+/// [`RenderError::ConfigureDeviceLost`] for a lost device, made with
+/// nothing allocated (a frame's reconfigure returns it).
 pub(crate) fn configure(
     surface: &wgpu::Surface<'_>,
     gpu: &Gpu,
@@ -84,9 +86,7 @@ pub(crate) fn configure(
     });
     match refused {
         Some(e) => Err(RenderError::surface_configure(e)),
-        None if gpu.lost() => Err(RenderError::surface_configure(refusal(Refusal::Device(
-            wgpu::wgc::device::DeviceError::Lost,
-        )))),
+        None if gpu.lost() => Err(RenderError::ConfigureDeviceLost),
         None => Ok(()),
     }
 }

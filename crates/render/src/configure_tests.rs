@@ -149,7 +149,7 @@ fn a_refused_configure_is_an_error() {
 }
 
 /// W5.6: a configure on a device that was lost is a retryable refusal,
-/// returned: wgpu reports the device's loss through its lost callback
+/// returned as a variant made with nothing allocated: wgpu reports the device's loss through its lost callback
 /// alone, past the error scopes, and leaves the surface unconfigured, so
 /// without a look at the loss the configure would say it succeeded.
 #[test]
@@ -167,16 +167,9 @@ fn a_configure_on_a_lost_device_is_an_error() {
             panic!("a window renderer has a window");
         };
         let e = w.configure(&gpu).unwrap_err();
-        assert!(
-            matches!(
-                e,
-                RenderError::SurfaceConfigure {
-                    retryable: true,
-                    ..
-                }
-            ),
-            "{e:?}"
-        );
+        // Its own variant: nothing boxed or formatted on a frame's path.
+        assert!(matches!(e, RenderError::ConfigureDeviceLost), "{e:?}");
+        assert!(e.is_retryable_configure());
         drop(r);
     });
 }
