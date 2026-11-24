@@ -260,18 +260,36 @@ fn starting(shown: &WindowShown) -> bool {
     matches!(shown.readiness(), Readiness::Pending | Readiness::Showing)
 }
 
+/// What the key config's first screen worker hands the game thread as it
+/// ends ([`first_screen`]).
+enum Handoff<R> {
+    /// The window was shown: the renderer, for the key config.
+    Shown(R),
+    /// The startup ended without it, and the worker has dropped its
+    /// renderer, if it made one; why the worker failed, if it did.
+    Ended(Option<String>),
+}
+
+/// How often the worker looks for the startup's outcome once its first
+/// present was counted.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Makes the key config's renderer through `make` and draws its first
 /// screen through `frame`, `pause` between frames, on a worker `spawn`
-/// starts, until the startup has an outcome or the controls close
-/// (design.md "Showing the window"): a driver stalled in the first frame holds the worker, not the
-/// game thread. A frame tells the window of its present and fails the
-/// startup when it fails ([`framed`]); a renderer not made fails it with
-/// the error, and the worker's panic with its message. The game thread
-/// waits for the outcome ([`WindowShown::wait_ready`]), woken by the
-/// worker's end and the window's: the first present (the worker hands the
-/// renderer back), a close, a failure, or the deadline. A worker that
-/// cannot be started fails the startup with why. Past an outcome without a
-/// present, the worker is waited for until the deadline only, then left.
+/// starts (design.md "Showing the window"): a driver stalled in the first
+/// frame holds the worker, not the game thread. A frame tells the window of
+/// its present and fails the startup when it fails ([`framed`]); a renderer
+/// not made fails it with the error, and the worker's panic with its
+/// message. Once a present is counted the worker draws no more and waits
+/// for the outcome, so nothing it does then can stall in the driver. The
+/// game thread waits for the outcome ([`WindowShown::wait_ready`]), woken
+/// by the worker's end and the window's: the first present (the worker
+/// hands the renderer back), a close, a failure, or the deadline. A worker
+/// that cannot be started fails the startup with why. Without a present,
+/// the worker drops its renderer itself, so a surface's destruction that
+/// waits on the driver holds the worker only, and says when it is done;
+/// the game thread waits for that until the deadline only, the worker then
+/// left (`left`) with the window it may still use.
 fn first_screen<R: Send + 'static>(
     shown: &WindowShown,
     controls: &Arc<Controls>,
@@ -281,32 +299,45 @@ fn first_screen<R: Send + 'static>(
     mut frame: impl FnMut(&mut R) -> Result<render::FrameTiming, render::RenderError> + Send + 'static,
     mut pause: impl FnMut(&R) + Send + 'static,
 ) -> FirstScreen<R> {
-    let (tx, rx) = mpsc::sync_channel::<Result<R, String>>(1);
+    let (tx, rx) = mpsc::sync_channel::<Handoff<R>>(1);
     let worker_shown = shown.clone();
     let worker_controls = Arc::clone(controls);
     let worker = move || {
         let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut r = make().map_err(|e| format!("render: {}", game::Chain(&e)))?;
             let open = || starting(&worker_shown) && !worker_controls.quitting();
-            while open() {
+            let counted = || presented.load(Ordering::Acquire);
+            while open() && !counted() {
                 framed(frame(&mut r), &presented, &worker_shown, &worker_controls);
-                if open() {
+                if open() && !counted() {
                     pause(&r);
                 }
             }
-            Ok(r)
+            // A counted present: the window settles the outcome by the
+            // deadline at the latest, and no more frames are drawn.
+            while open() {
+                std::thread::sleep(SETTLE_POLL);
+            }
+            if worker_shown.readiness() == Readiness::FirstPresent {
+                return Ok(Some(r));
+            }
+            drop(r);
+            Ok(None)
         }));
-        let drawn = drawn.unwrap_or_else(|payload| {
-            Err(format!(
+        let handoff = match drawn {
+            Ok(Ok(Some(r))) => Handoff::Shown(r),
+            Ok(Ok(None)) => Handoff::Ended(None),
+            Ok(Err(why)) => Handoff::Ended(Some(why)),
+            Err(payload) => Handoff::Ended(Some(format!(
                 "the render thread panicked while starting: {}",
                 game::coord::JobPanic::of(&*payload).0
-            ))
-        });
-        if let Err(why) = &drawn {
+            ))),
+        };
+        if let Handoff::Ended(Some(why)) = &handoff {
             eprintln!("{why}");
             worker_shown.fail(StartFailure::Render(why.clone()));
         }
-        let _ = tx.send(drawn);
+        let _ = tx.send(handoff);
         worker_controls.wake_game();
     };
     if let Err(e) = spawn(Box::new(worker)) {
@@ -315,15 +346,23 @@ fn first_screen<R: Send + 'static>(
         shown.fail(StartFailure::Render(why));
     }
     let end = match shown.wait_ready(&|| controls.quitting(), &|| None) {
-        Ok(()) => match rx.recv() {
-            Ok(Ok(r)) => return FirstScreen::Shown(r),
-            Ok(Err(why)) => StartEnd::Failed(StartFailure::Render(why)),
-            Err(mpsc::RecvError) => StartEnd::Failed(StartFailure::Render(
-                "the render thread ended while starting".to_owned(),
-            )),
-        },
+        Ok(()) => {
+            // The worker draws nothing once the present was counted, so
+            // its handoff follows the outcome within its poll.
+            let end = match rx.recv() {
+                Ok(Handoff::Shown(r)) => return FirstScreen::Shown(r),
+                Ok(Handoff::Ended(Some(why))) => StartEnd::Failed(StartFailure::Render(why)),
+                Ok(Handoff::Ended(None)) if controls.quitting() => StartEnd::Closed,
+                Ok(Handoff::Ended(None)) | Err(mpsc::RecvError) => StartEnd::Failed(
+                    StartFailure::Render("the render thread ended while starting".to_owned()),
+                ),
+            };
+            return FirstScreen::Ended { end, left: false };
+        }
         Err(end) => end,
     };
+    // The worker's end, its renderer dropped there, waited for until the
+    // deadline only.
     let left = rx
         .recv_timeout(
             shown
@@ -1057,5 +1096,118 @@ mod tests {
             |_| std::thread::sleep(Duration::from_millis(1)),
         );
         assert!(matches!(started, super::FirstScreen::Shown(7)));
+    }
+
+    /// A renderer whose drop waits until its sender is used or dropped (at
+    /// most 10 s), as a surface's destruction waits on the driver, noting
+    /// the thread it was dropped on.
+    struct HeldDrop {
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        dropped_on: std::sync::Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
+    }
+
+    impl Drop for HeldDrop {
+        fn drop(&mut self) {
+            *self.dropped_on.lock().unwrap() = Some(std::thread::current().id());
+            if let Ok(rx) = self.release.lock() {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+
+    /// W7.1: a key config renderer whose startup failed (its first frame)
+    /// is dropped on the worker, not the game thread: a destruction that
+    /// waits on the driver holds the worker, the game thread's wait ends
+    /// by the deadline, and the worker is left with the window.
+    #[test]
+    fn an_unshown_key_config_renderer_is_dropped_on_its_worker() {
+        use std::time::Instant;
+
+        use crate::window::{StartEnd, StartFailure, WindowShown};
+
+        let controls = game_controls();
+        let shown = WindowShown::pending_for(Duration::from_millis(300));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let dropped_on = std::sync::Arc::default();
+        let renderer = HeldDrop {
+            release: std::sync::Mutex::new(held),
+            dropped_on: std::sync::Arc::clone(&dropped_on),
+        };
+        let started = super::first_screen(
+            &shown,
+            &controls,
+            std::sync::Arc::default(),
+            spawned,
+            move || Ok(renderer),
+            |_| Err(render::RenderError::SurfaceLost),
+            |_| {},
+        );
+        let late = Instant::now().saturating_duration_since(shown.deadline());
+        let (end, left) = ended(started);
+        drop(release);
+        assert_eq!(
+            end,
+            StartEnd::Failed(StartFailure::Render("render: surface lost".to_owned()))
+        );
+        assert!(left, "a worker still dropping its renderer was not left");
+        assert!(late < Duration::from_secs(1), "{late:?} past the deadline");
+        let on = *dropped_on.lock().unwrap();
+        assert!(on.is_some(), "the renderer was not dropped");
+        assert_ne!(
+            on,
+            Some(std::thread::current().id()),
+            "dropped on the game thread"
+        );
+    }
+
+    /// W7.2: once its first present is counted, the key config's worker
+    /// draws no more frame before the window settles the outcome, so the
+    /// renderer's handoff cannot wait on a frame stalled in the driver.
+    #[test]
+    fn no_key_config_frame_is_drawn_past_the_first_counted_present() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::Instant;
+
+        use crate::window::WindowShown;
+
+        let controls = game_controls();
+        let shown = WindowShown::pending_for(Duration::from_secs(10));
+        let presented = std::sync::Arc::new(AtomicBool::new(false));
+        let window_side = (std::sync::Arc::clone(&presented), shown.clone());
+        // The window thread's part, late: it shows 100 ms after the count.
+        std::thread::spawn(move || {
+            let (presented, shown) = window_side;
+            while !presented.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(shown.show_now());
+        });
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let frames = std::sync::Arc::new(AtomicU32::new(0));
+        let counted = std::sync::Arc::clone(&frames);
+        // The first frame is counted; a second one stalls (at most 10 s).
+        let frame = move |(): &mut ()| {
+            if counted.fetch_add(1, Ordering::SeqCst) > 0 {
+                let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            }
+            Ok(frame_timing(true))
+        };
+        let asked = Instant::now();
+        let started = super::first_screen(
+            &shown,
+            &controls,
+            presented,
+            spawned,
+            || Ok(()),
+            frame,
+            |()| {},
+        );
+        let took = asked.elapsed();
+        drop(release);
+        assert!(matches!(started, super::FirstScreen::Shown(())));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
     }
 }
