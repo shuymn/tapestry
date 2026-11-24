@@ -416,7 +416,16 @@ pub fn run(
                 .spawn(worker)
                 .map(drop)
         },
-        move || Renderer::new(target, AdapterChoice::HighPerformance),
+        move || {
+            // The startup faults a menu's render thread takes (dev-tools):
+            // a refused configure, a build held or a panic in it.
+            #[cfg(feature = "dev-tools")]
+            {
+                crate::dev::read_render_faults();
+                crate::dev::startup_faults();
+            }
+            Renderer::new(target, AdapterChoice::HighPerformance)
+        },
         move |r| {
             let refs: Vec<&str> = first.iter().map(String::as_str).collect();
             r.text_frame(&refs)
