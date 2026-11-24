@@ -1024,6 +1024,139 @@ fn demotion_while_queued_admits_in_its_own_class() {
     assert_eq!(held(&coord), (0, 0));
 }
 
+/// A revoked promotion: the foreground permit the task's thread holds goes
+/// back to the pool at once, before its next checkpoint, so every
+/// foreground permit is free to others; the checkpoint then gives nothing
+/// back twice and waits for a permit of its own class, the hook called
+/// with it. A task holding a permit of its own class gives nothing back.
+#[test]
+fn a_revoked_promotion_frees_the_foreground_permit_at_once() {
+    let coord = Coordinator::new(CAPS);
+    let hook = Hook::default();
+    let task = coord.task::<Vec<(usize, usize)>>(Class::Speculative);
+    let promoter = task.promoter();
+    let outcome = task.run(&watchdog(), &|c| hook.call(c), |ctx| {
+        promoter.promote();
+        let _ = ctx.checkpoint();
+        let promoted = held(&coord);
+        promoter.revoke();
+        let revoked = held(&coord);
+        // Every foreground permit is the next work's, the task's included.
+        let taken: Vec<_> = (0..FOREGROUND_PERMITS)
+            .filter_map(|_| coord.try_lease(Class::Foreground))
+            .collect();
+        let full = taken.len();
+        drop(taken);
+        let _ = ctx.checkpoint();
+        let moved = held(&coord);
+        // Revoked again in its own class: nothing goes back.
+        promoter.revoke();
+        let kept = held(&coord);
+        vec![promoted, revoked, (0, full), moved, kept]
+    });
+    assert_eq!(
+        outcome,
+        Outcome::Done(vec![
+            (0, 1),
+            (0, 0),
+            (0, FOREGROUND_PERMITS),
+            (1, 0),
+            (1, 0)
+        ])
+    );
+    assert_eq!(hook.calls(), vec![Class::Foreground, Class::Speculative]);
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// A revoked promotion promoted again before the task's next checkpoint:
+/// the checkpoint does not compute on the revoked permit, it takes a
+/// foreground permit afresh.
+#[test]
+fn a_revoked_promotion_promoted_again_takes_a_new_permit() {
+    let coord = Coordinator::new(CAPS);
+    let task = coord.task::<Vec<(usize, usize)>>(Class::Speculative);
+    let promoter = task.promoter();
+    let outcome = task.run(&watchdog(), NOTHING, |ctx| {
+        promoter.promote();
+        let _ = ctx.checkpoint();
+        promoter.revoke();
+        promoter.promote();
+        let between = held(&coord);
+        let _ = ctx.checkpoint();
+        vec![between, held(&coord)]
+    });
+    assert_eq!(outcome, Outcome::Done(vec![(0, 0), (0, 1)]));
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// A promotion revoked after the task's checkpoint read the class it
+/// should run in and before it moves its permit there: the move reads the
+/// class again under its own lock, so the task stays out of the foreground
+/// and every foreground permit is left to the work that comes next; the
+/// run's hook is never called (its thread never leaves its own class).
+#[test]
+fn a_promotion_revoked_before_the_move_takes_no_foreground_permit() {
+    let coord = Coordinator::new(CAPS);
+    let hook = Hook::default();
+    let task = coord.task::<Vec<(usize, usize)>>(Class::Speculative);
+    let promoter = task.promoter();
+    {
+        let (promoter, revoked) = (promoter.clone(), AtomicBool::new(false));
+        coord.before_move(move || {
+            if !revoked.swap(true, Ordering::SeqCst) {
+                promoter.revoke();
+            }
+        });
+    }
+    let outcome = task.run(&watchdog(), &|c| hook.call(c), |ctx| {
+        promoter.promote();
+        let _ = ctx.checkpoint();
+        let after = held(&coord);
+        let taken: Vec<_> = (0..FOREGROUND_PERMITS)
+            .filter_map(|_| coord.try_lease(Class::Foreground))
+            .collect();
+        vec![after, (taken.len(), 0)]
+    });
+    assert_eq!(
+        outcome,
+        Outcome::Done(vec![(1, 0), (FOREGROUND_PERMITS, 0)])
+    );
+    assert!(hook.calls().is_empty(), "{:?}", hook.calls());
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// A task run on a new thread, its thread in the normal mode: the hook is
+/// called at its first admission in its speculative class, also after a
+/// promotion withdrawn before it; one admitted in the foreground calls
+/// none. A task whose caller set its thread up calls none at its own
+/// class.
+#[test]
+fn a_task_on_a_new_thread_sets_its_mode_at_its_first_permit() {
+    let coord = Coordinator::new(CAPS);
+    let hook = Hook::default();
+    let task = coord.task::<()>(Class::Speculative).on_new_thread();
+    let promoter = task.promoter();
+    promoter.promote();
+    promoter.demote();
+    let _ = task.run(&watchdog(), &|c| hook.call(c), |_| ());
+    assert_eq!(hook.calls(), vec![Class::Speculative]);
+
+    let hook = Hook::default();
+    let task = coord.task::<()>(Class::Speculative).on_new_thread();
+    task.promoter().promote();
+    let _ = task.run(&watchdog(), &|c| hook.call(c), |_| ());
+    assert!(
+        hook.calls().is_empty(),
+        "admitted in the normal mode's class"
+    );
+
+    let hook = Hook::default();
+    let task = coord.task::<()>(Class::Speculative);
+    let _ = task.run(&watchdog(), &|c| hook.call(c), |_| ());
+    assert!(hook.calls().is_empty(), "set up by its caller");
+    assert_eq!(held(&coord), (0, 0));
+}
+
 /// Another thread (a decode pool's) changes no permit: its checkpoint
 /// applies no promotion and its idle keeps the permit; the job's own
 /// thread applies the promotion.

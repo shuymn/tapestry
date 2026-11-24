@@ -535,6 +535,7 @@ fn a_cancel_stops_the_build_at_each_site() {
         (Site::Band, 2),
         (Site::Trailing, 1),
         (Site::Mip, 2),
+        (Site::Page, 1),
     ] {
         let (r, asked) = cancel_at(&bytes, site, n);
         assert!(matches!(r, Err(AtlasError::Cancelled)), "{site:?}: {r:?}");

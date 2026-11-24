@@ -990,6 +990,14 @@ pub enum SelectStep {
     /// Press P on the chart under the cursor (a scenario's `practice`): its
     /// practice page opens, the chart playing this input.
     PracticeKey(scenario::InputRef),
+    /// The result skin's preload pack holds at a checkpoint from now on
+    /// (`hold-preload=<site>:<n>[:before|:after]`), marking `pre:hold`.
+    HoldPreload(crate::result_skin::gaps::HoldAt),
+    /// Wait until the preload pack holds (`preload-held`).
+    PreloadHeld,
+    /// Let the preload's hold go (`release-preload`), or let it go once the
+    /// attempt adopts the held pack (`release-preload=adopted`).
+    ReleasePreload { on_adopt: bool },
     /// On the practice page: press keys until it shows this.
     PracticeSet(scenario::PracticeGoal),
     /// On the practice page: Start.
@@ -1083,8 +1091,12 @@ pub struct SlowLoad {
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
 /// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
 /// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading`,
-/// `slow-measuring=<ms>`, `hold-background`, `background=<running|idle>`
-/// and `close`.
+/// `slow-measuring=<ms>`, `hold-background`, `background=<running|idle>`,
+/// `hold-preload=<site>:<n>[:before|:after]`, `preload-held`,
+/// `release-preload[=adopted]`, `practice`, `practice-back` and `close`.
+/// After `practice` the page shows: there `sleep`, the preload's hold
+/// steps and `close` run as on the select screen, `practice-back` leaves
+/// the page (Escape), and any other step waits for the select screen.
 /// Selection steps run on the select screen (`prev-preset` and
 /// `next-preset` press F11 and F12; `close-measuring` and
 /// `quit-measuring` close the window or press the quit key once the next
@@ -1186,7 +1198,7 @@ impl SelectScript {
                 Some(("row", f)) => Ok(SelectStep::Row(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, hold-preload=, preload-held, release-preload[=adopted], practice, practice-back, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -1219,6 +1231,12 @@ impl SelectScript {
                 Some(("press-loading", phase)) => LoadPhase::named(phase)
                     .map(SelectStep::PressLoading)
                     .ok_or_else(|| format!("{s} takes decoding, measuring, preparing or chart-load")),
+                Some(("hold-preload", at)) => {
+                    crate::result_skin::gaps::HoldAt::parse(at).map(SelectStep::HoldPreload)
+                }
+                Some(("release-preload", "adopted")) => {
+                    Ok(SelectStep::ReleasePreload { on_adopt: true })
+                }
                 Some(("background", "running")) => Ok(SelectStep::Background(true)),
                 Some(("background", "idle")) => Ok(SelectStep::Background(false)),
                 None if s == "enter" => Ok(SelectStep::Enter),
@@ -1243,9 +1261,17 @@ impl SelectScript {
                     Ok(SelectStep::Specializing(mode.0, mode.1))
                 }
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
+                None if s == "preload-held" => Ok(SelectStep::PreloadHeld),
+                None if s == "release-preload" => {
+                    Ok(SelectStep::ReleasePreload { on_adopt: false })
+                }
+                None if s == "practice" => {
+                    Ok(SelectStep::PracticeKey(scenario::InputRef::Auto))
+                }
+                None if s == "practice-back" => Ok(SelectStep::PracticeBack),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, hold-preload=, preload-held, release-preload[=adopted], practice, practice-back, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
@@ -1523,11 +1549,12 @@ impl MenuStats {
     }
 
     /// Prints what was kept, if anything, as the frames of the `screen`
-    /// named, and starts over.
-    pub fn report(&mut self, screen: &str) {
+    /// named, and starts over: the frames it held.
+    pub fn report(&mut self, screen: &str) -> usize {
         if self.cpu_us.is_empty() {
-            return;
+            return 0;
         }
+        let frames = self.cpu_us.len();
         let q = |v: &mut Vec<u64>, p: usize| {
             v.sort_unstable();
             v.get((v.len().saturating_sub(1)) * p / 100)
@@ -1561,6 +1588,7 @@ impl MenuStats {
             self.app,
         );
         *self = Self::default();
+        frames
     }
 }
 

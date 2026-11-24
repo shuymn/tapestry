@@ -31,7 +31,7 @@ use ::image::RgbaImage;
 use crate::image::decode::{self, Bands, Site};
 use crate::image::{self, Stop};
 use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
-use pack::PackError;
+use pack::{PackError, Work};
 use uv::{FrameUv, UvTable};
 
 /// The bytes a cell keeps in the atlas's tables while its files are read
@@ -109,6 +109,60 @@ pub struct PlanShape {
     pub layers: u32,
     /// Level-0 texels over every layer, as the renderer charges them.
     pub texels: u64,
+}
+
+/// A sheet's atlas planned: its cells' rectangles in the version read and
+/// their packing, checked against the limits and [`MAX_ATLAS_TEXELS`]
+/// ([`Sheet::plan_atlas`]). It borrows the sheet it packed, so it builds
+/// only that sheet's atlas, and the build packs nothing again.
+#[derive(Debug)]
+pub struct AtlasPlan<'a> {
+    sheet: &'a Sheet,
+    variant: Variant,
+    limits: AtlasLimits,
+    kept: KeptLayers,
+    rects: Vec<[u32; 4]>,
+    packing: pack::Packing,
+}
+
+impl AtlasPlan<'_> {
+    /// Its level-0 texels over every layer, the reserved and kept ones
+    /// included: what [`Sheet::plan_keeping`] returns.
+    #[must_use]
+    pub fn texels(&self) -> u64 {
+        let layers = self.limits.reserved_layers + self.kept.count();
+        pack::cost(layers, self.packing.pages, self.packing.side)
+    }
+
+    /// Its shape (measurement): [`Sheet::plan_shape`]'s.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn shape(&self) -> PlanShape {
+        let layers = self.limits.reserved_layers + self.kept.count();
+        PlanShape {
+            side: self.packing.side,
+            pages: self.packing.pages,
+            layers: layers + self.packing.pages,
+            texels: self.texels(),
+        }
+    }
+
+    /// Builds the planned atlas: [`Sheet::atlas_keeping`]'s build, with no
+    /// packing of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sheet::atlas`] after its packing.
+    pub fn build(self, cancel: &dyn Fn() -> bool) -> Result<Atlas, AtlasError> {
+        self.sheet.build(
+            self.variant,
+            self.limits,
+            self.kept,
+            self.rects,
+            self.packing,
+            cancel,
+        )
+    }
 }
 
 /// The layers an atlas keeps after its pages, each the page side square
@@ -647,9 +701,11 @@ impl Sheet {
     /// ([`MAX_IMAGE_TEXELS`](crate::MAX_IMAGE_TEXELS),
     /// [`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)).
     ///
-    /// `cancel` is asked as each file's bytes are read, before each band
-    /// and each read after a banded file's rows, and before each page's
-    /// mip level.
+    /// `cancel` is asked during the packing ([`plan_atlas`](Self::plan_atlas)),
+    /// before each page's allocation, as each file's bytes are read, before
+    /// each band and each read after a banded file's rows, and before each
+    /// page's mip level. A cancel that already says stop is seen at the
+    /// packing's first ask, before any refusal is computed from the cells.
     ///
     /// # Errors
     ///
@@ -696,8 +752,39 @@ impl Sheet {
         kept: KeptLayers,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
-        let (rects, packing) = self.packing(variant, limits, kept)?;
-        self.build(variant, limits, kept, rects, packing, cancel)
+        self.plan_atlas(variant, limits, kept, cancel)?
+            .build(cancel)
+    }
+
+    /// The packing of this sheet's atlas of `variant` within `limits`,
+    /// keeping `kept`, and every check made before the build allocates or
+    /// reads anything; no file is read. The packing asks `cancel` at each
+    /// phase boundary (before the rectangles pass, the order, the scans,
+    /// each candidate side and its first placement, and at its end) and
+    /// after every [`PLAN_BATCH`](pack::PLAN_BATCH) units of attempted work.
+    /// The limits are checked first; a cancel that already says stop is
+    /// then seen before any refusal is computed from the cells.
+    ///
+    /// # Errors
+    ///
+    /// [`AtlasError::Cancelled`] once `cancel` said so; otherwise as
+    /// [`plan`](Self::plan).
+    pub fn plan_atlas(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        kept: KeptLayers,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<AtlasPlan<'_>, AtlasError> {
+        let (rects, packing) = self.packing(variant, limits, kept, &mut Work::new(cancel))?;
+        Ok(AtlasPlan {
+            sheet: self,
+            variant,
+            limits,
+            kept,
+            rects,
+            packing,
+        })
     }
 
     /// Whether this sheet's atlas of `variant` fits `limits` (with a text
@@ -731,9 +818,7 @@ impl Sheet {
         limits: AtlasLimits,
         kept: KeptLayers,
     ) -> Result<u64, AtlasError> {
-        let (_, packing) = self.packing(variant, limits, kept)?;
-        let layers = limits.reserved_layers + kept.count();
-        Ok(pack::cost(layers, packing.pages, packing.side))
+        Ok(self.plan_atlas(variant, limits, kept, &|| false)?.texels())
     }
 
     /// [`plan_keeping`](Self::plan_keeping)'s packing (measurement): its
@@ -750,33 +835,40 @@ impl Sheet {
         limits: AtlasLimits,
         kept: KeptLayers,
     ) -> Result<PlanShape, AtlasError> {
-        let (_, packing) = self.packing(variant, limits, kept)?;
-        let layers = limits.reserved_layers + kept.count();
-        Ok(PlanShape {
-            side: packing.side,
-            pages: packing.pages,
-            layers: layers + packing.pages,
-            texels: pack::cost(layers, packing.pages, packing.side),
-        })
+        Ok(self.plan_atlas(variant, limits, kept, &|| false)?.shape())
     }
 
     /// Each cell's rectangle in the version `variant` reads, and their
-    /// packing within `limits`, checked against [`MAX_ATLAS_TEXELS`].
+    /// packing within `limits`, checked against [`MAX_ATLAS_TEXELS`],
+    /// asking `work` ([`plan_atlas`](Self::plan_atlas)).
     fn packing(
         &self,
         variant: Variant,
         limits: AtlasLimits,
         kept: KeptLayers,
+        work: &mut Work<'_>,
     ) -> Result<(Vec<[u32; 4]>, pack::Packing), AtlasError> {
+        #[cfg(any(test, feature = "dev-tools"))]
+        crate::dev::PACKINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        pack::bump(&pack::PACKINGS_HERE);
+        let cancelled = |e: PackError| match e {
+            PackError::TooManyPages => AtlasError::TooManyPages,
+            PackError::Misaligned => AtlasError::Misaligned,
+            PackError::Cancelled => AtlasError::Cancelled,
+        };
         let extra = kept.count();
         let min_side = if kept.any() { MIN_TEXT_SIDE } else { 0 };
         let max_pages = page_cap(&limits, extra)?;
         let cap = pack::side_cap(limits.max_side.min(MAX_PAGE_SIDE));
         let files = self.files();
+        work.phase(Site::PlanRects).map_err(cancelled)?;
         // Each cell's rectangle in the version the variant reads.
         let mut rects = Vec::with_capacity(self.cells().len());
         let mut padded = Vec::with_capacity(self.cells().len());
         for cell in self.cells() {
+            #[cfg(test)]
+            pack::RECT_UNITS.with(|c| c.set(c.get() + 1));
             // A generated cell has one size in both variants.
             let hi = match cell.source {
                 CellSource::File(f) => usize::try_from(f)
@@ -794,12 +886,12 @@ impl Sheet {
             let size = allocation([w, h], cap).ok_or(AtlasError::CellTooLarge { w, h })?;
             rects.push(rect);
             padded.push(size);
+            work.unit(Site::PlanRectWork).map_err(cancelled)?;
         }
         let kept = limits.reserved_layers + extra;
-        let packing = pack::pack(&padded, cap, max_pages, kept, min_side).map_err(|e| match e {
-            PackError::TooManyPages => AtlasError::TooManyPages,
-            PackError::Misaligned => AtlasError::Misaligned,
-        })?;
+        let packing =
+            pack::pack(&padded, cap, max_pages, kept, min_side, work).map_err(cancelled)?;
+        work.phase(Site::PlanEnd).map_err(cancelled)?;
         // Only the rectangles and the places stay beside the files
         // ([`CELL_TABLE_BYTES`]).
         drop(padded);
@@ -828,6 +920,9 @@ impl Sheet {
             .try_reserve_exact(usize::try_from(packing.pages).unwrap_or(usize::MAX))
             .map_err(|_| AtlasError::AtlasAlloc)?;
         for _ in 0..packing.pages {
+            // A stop is seen before each page's levels are allocated, so a
+            // stopped build allocates no further page.
+            decode::checkpoint(cancel, Site::Page).map_err(|_| AtlasError::Cancelled)?;
             let level = |k: u32| alloc_level(u64::from(side >> k) * u64::from(side >> k) * 4);
             pages.push(Page {
                 levels: [level(0)?, level(1)?, level(2)?, level(3)?],
@@ -855,6 +950,8 @@ impl Sheet {
             None
         };
         // The placements are made only once every file is read and freed.
+        #[cfg(any(test, feature = "dev-tools"))]
+        crate::dev::note(crate::dev::kind::HELD);
         let (files, cells) = self.held(variant, limits.reserved_layers, &rects, &packing)?;
         drop((rects, packing));
         let pages = PackedPages {
@@ -870,6 +967,8 @@ impl Sheet {
             cells,
         };
         // The sheet's own table is a rebind to the pages it just filled.
+        #[cfg(any(test, feature = "dev-tools"))]
+        crate::dev::note(crate::dev::kind::BINDING);
         let uvs = pages
             .uvs_for(self, variant, kept)
             .map_err(|_| AtlasError::Misaligned)?;
@@ -970,6 +1069,8 @@ impl Sheet {
             Some((version, FileAt { file, hi }))
         };
         let mut total = 0_u64;
+        #[cfg(any(test, feature = "dev-tools"))]
+        crate::dev::note(crate::dev::kind::METADATA);
         for &(file, _, _) in &used {
             let Some((version, at)) = version(file) else {
                 continue;
@@ -1024,12 +1125,20 @@ impl Sheet {
                 .source()
                 .decode(bytes, at, header, cancel, &mut router)?
             {
-                Some(image) => router.blit(&image),
+                Some(image) => {
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    crate::dev::note(crate::dev::kind::BLIT);
+                    router.blit(&image);
+                }
                 None => router.complete(),
             }
         }
 
         // The generated cells, after the files.
+        #[cfg(any(test, feature = "dev-tools"))]
+        if cells.get(start..).is_some_and(|c| !c.is_empty()) {
+            crate::dev::note(crate::dev::kind::BLIT);
+        }
         for (i, cell) in cells.iter().enumerate().skip(start) {
             let CellSource::Solid(color, grid) = cell.source else {
                 continue;
@@ -1177,6 +1286,9 @@ impl Bands for Router<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod plan_tests;
 
 #[cfg(test)]
 mod tests {

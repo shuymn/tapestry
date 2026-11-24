@@ -2315,6 +2315,10 @@ struct Shared {
     /// Each result view's staging withdrawn with its side (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     withdrawals: Mutex<Vec<Withdrawal>>,
+    /// Each select screen frame report the render thread wrote: the
+    /// frames it held (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    select_reports: Mutex<Vec<usize>>,
     /// The result view stagings ended, ready or not (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     stagings_ended: AtomicU64,
@@ -2540,6 +2544,8 @@ impl Shared {
             messages: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
             withdrawals: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "dev-tools"))]
+            select_reports: Mutex::new(Vec::new()),
             #[cfg(all(test, feature = "dev-tools"))]
             stagings_ended: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -4403,6 +4409,17 @@ impl RenderLink {
         self.shared.messages.load(Ordering::SeqCst)
     }
 
+    /// The select screen frame reports written so far, each the frames it
+    /// held (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn select_reports(&self) -> Vec<usize> {
+        self.shared
+            .select_reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The result view stagings withdrawn with their side so far (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn withdrawals(&self) -> Vec<Withdrawal> {
@@ -5762,6 +5779,10 @@ pub fn spawn_until(
                 gauge_looks: None,
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
+                #[cfg(feature = "dev-tools")]
+                select_stats: crate::dev::MenuStats::default(),
+                #[cfg(feature = "dev-tools")]
+                select_visit: None,
                 #[cfg(feature = "dev-tools")]
                 loading_stats: crate::dev::MenuStats::default(),
                 selection: None,
@@ -7731,9 +7752,17 @@ struct Run {
     /// The committed attempt's gauges' looks (dev-tools).
     #[cfg(feature = "dev-tools")]
     gauge_looks: Option<Vec<skin_model::GaugeLook>>,
-    /// The select screen's frames (dev-tools).
+    /// A menu page's frames (dev-tools): the decision screen, the practice
+    /// page and the other pages.
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
+    /// The select screen's frames (dev-tools), of the selection lifetime
+    /// `select_visit` names: reported once, as that lifetime ends or the
+    /// render loop does, whatever messages come during the visit.
+    #[cfg(feature = "dev-tools")]
+    select_stats: crate::dev::MenuStats,
+    #[cfg(feature = "dev-tools")]
+    select_visit: Option<u64>,
     /// The loading state's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     loading_stats: crate::dev::MenuStats,
@@ -7980,11 +8009,21 @@ impl Run {
                 self.result_hold = None;
             }
             self.allow_destruction(&mode);
-            // The select screen is left: its frames are reported; and the
-            // loading state's, once it is left.
+            // A menu page is left: its frames are reported; and the
+            // loading state's, once it is left. The select screen's are
+            // its visit's, reported once its selection lifetime has ended,
+            // whatever this turn took (a message handled below may end the
+            // turn before its frame).
             #[cfg(feature = "dev-tools")]
             if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_) | RenderMsg::PracticePage(_))) {
-                self.menu_stats.report("select");
+                self.menu_stats.report("menu");
+            }
+            #[cfg(feature = "dev-tools")]
+            if self
+                .select_visit
+                .is_some_and(|l| !self.shared.selection_current(l))
+            {
+                Self::report_select(&mut self.select_stats, &mut self.select_visit, &self.shared);
             }
             #[cfg(feature = "dev-tools")]
             if msg.is_ok()
@@ -9682,8 +9721,18 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
-                        self.menu_stats.frame(d.timing.cpu, after - before, changed);
-                        self.menu_stats
+                        let lifetime = shown.update.lifetime;
+                        if self.select_visit != Some(lifetime) {
+                            Self::report_select(
+                                &mut self.select_stats,
+                                &mut self.select_visit,
+                                &self.shared,
+                            );
+                            self.select_visit = Some(lifetime);
+                        }
+                        self.select_stats
+                            .frame(d.timing.cpu, after - before, changed);
+                        self.select_stats
                             .app(crate::alloc_count::app_allocations().saturating_sub(app_before));
                         skin_frame = shown.logic.is_some() && d.refused.is_none();
                         // What a refusal put on the screen, once drawn.
@@ -13879,11 +13928,33 @@ impl Run {
         self.result.as_ref()
     }
 
-    /// The render loop ended (dev-tools): the select and result screens'
-    /// whole frames still held are reported, and the run's present log is
+    /// Reports the select screen's frames held, of the visit that ended
+    /// (dev-tools): once per selection lifetime, a cursor move or a pool
+    /// write during it leaving them held.
+    #[cfg(feature = "dev-tools")]
+    fn report_select(stats: &mut crate::dev::MenuStats, visit: &mut Option<u64>, shared: &Shared) {
+        *visit = None;
+        let reported = stats.report("select");
+        #[cfg(test)]
+        if reported > 0 {
+            shared
+                .select_reports
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(reported);
+        }
+        #[cfg(not(test))]
+        let _ = (reported, shared);
+    }
+
+    /// The render loop ended (dev-tools): the select screen's and menu
+    /// pages' frames and the select and result screens' whole frames still
+    /// held are reported, and the run's present log is
     /// handed to `tapestry measure select`.
     #[cfg(feature = "dev-tools")]
     fn flush_screen_frames(&mut self) {
+        Self::report_select(&mut self.select_stats, &mut self.select_visit, &self.shared);
+        self.menu_stats.report("menu");
         let freq = self.clock.frequency().hz();
         self.select_frames.report("select", freq);
         self.result_frames.report("result", freq);

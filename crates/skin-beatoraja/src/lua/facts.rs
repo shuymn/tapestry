@@ -209,6 +209,14 @@ pub struct ImportFacts {
     /// ([`ResultFields::of`] the view); read on [`ScreenKind::Result`]
     /// only, through the result profile.
     pub result: Fact<ResultFields>,
+    /// The viewed result's attempt inputs (its chart's facts and the
+    /// play's target): [`Fact::Known`] wherever [`Self::result`] is given,
+    /// except in the startup probe ([`Self::result_probe`]), whose result
+    /// values are the probe's and whose attempt inputs are pending. While
+    /// pending, a result number or option whose expression or validity
+    /// names one reads [`Fact::Pending`] (design.md "beatoraja Lua Skins",
+    /// the result skin's preload).
+    pub result_inputs: Fact<()>,
     /// The chart's gauge total, as the song information gives it
     /// (`game::song_total`, past `i32` saturated); read by a play text's
     /// value only.
@@ -229,6 +237,7 @@ impl ImportFacts {
             judge_class: Fact::Unavailable,
             play_level: Fact::Unavailable,
             result: Fact::Unavailable,
+            result_inputs: Fact::Unavailable,
             total: Fact::Unavailable,
             chart_notes: Fact::Unavailable,
         }
@@ -236,7 +245,8 @@ impl ImportFacts {
 
     /// The base snapshot: the session's facts known, the chart's pending
     /// (unavailable on [`ScreenKind::Selection`], which has no chart), and
-    /// the result's pending on [`ScreenKind::Result`].
+    /// the result's and its attempt inputs pending on
+    /// [`ScreenKind::Result`].
     #[must_use]
     pub fn base(scene: ScreenKind, autoplay: Fact<bool>) -> Self {
         let (judge_class, play_level, chart) = if scene == ScreenKind::Selection {
@@ -244,10 +254,11 @@ impl ImportFacts {
         } else {
             (Fact::Pending, Fact::Pending, Fact::Pending)
         };
-        let result = if scene == ScreenKind::Result {
-            Fact::Pending
+        // The result and its attempt inputs: both pending on the result.
+        let (result, result_inputs) = if scene == ScreenKind::Result {
+            (Fact::Pending, Fact::Pending)
         } else {
-            Fact::Unavailable
+            (Fact::Unavailable, Fact::Unavailable)
         };
         Self {
             scene,
@@ -255,8 +266,23 @@ impl ImportFacts {
             judge_class,
             play_level,
             result,
+            result_inputs,
             total: chart,
             chart_notes: chart,
+        }
+    }
+
+    /// The startup probe's snapshot on [`ScreenKind::Result`]: the result
+    /// values `fields` (the probe's), every attempt input pending (the
+    /// chart's facts, its judgment class and the play's target), as the
+    /// base gives them otherwise (design.md "beatoraja Lua Skins", the
+    /// result skin's preload).
+    #[must_use]
+    pub fn result_probe(fields: ResultFields) -> Self {
+        Self {
+            result: Fact::Known(fields),
+            result_inputs: Fact::Pending,
+            ..Self::base(ScreenKind::Result, Fact::Unavailable)
         }
     }
 
@@ -280,14 +306,35 @@ impl ImportFacts {
             },
             FactId::ChartTotal => Self::int(self.total),
             FactId::ChartNotes => Self::int(self.chart_notes),
-            FactId::ResultNumber(n) => self.read_result(|fields| {
-                let Some(Class::Bridge(v)) = profile::number(n) else {
-                    return Read::Unavailable;
-                };
-                profile::read_number(&v, fields)
-            }),
-            FactId::ResultOption(n) => self.read_result(|fields| profile::read_option(n, fields)),
+            FactId::ResultNumber(n) => {
+                let bridged = profile::number(n);
+                if let Some(Class::Bridge(v)) = bridged
+                    && self.inputs_pending(&[v.expr, v.guard])
+                {
+                    return Fact::Pending;
+                }
+                self.read_result(|fields| {
+                    let Some(Class::Bridge(v)) = bridged else {
+                        return Read::Unavailable;
+                    };
+                    profile::read_number(&v, fields)
+                })
+            }
+            FactId::ResultOption(n) => {
+                if let Some(Class::Bridge(ResOption::Expr(src))) = profile::option(n)
+                    && self.inputs_pending(&[src, profile::option_guard(n)])
+                {
+                    return Fact::Pending;
+                }
+                self.read_result(|fields| profile::read_option(n, fields))
+            }
         }
+    }
+
+    /// Whether the attempt inputs are pending and one of the result schema
+    /// expressions `srcs` names one.
+    fn inputs_pending(&self, srcs: &[&str]) -> bool {
+        self.result_inputs == Fact::Pending && srcs.iter().any(|s| names_attempt_input(s))
     }
 
     /// A chart fact as an int.
@@ -376,17 +423,28 @@ impl FactId {
 /// Whether the result schema expression `src` reads only the chart's
 /// fields other than its judged notes, and the play's target.
 fn chart_only(src: &str) -> bool {
+    names(src).all(|t| {
+        matches!(
+            t,
+            "if" | "then" | "else" | "true" | "false" | "abs" | "clamp"
+        ) || (t.starts_with("chart.") && !t.starts_with("chart.notes"))
+            // The play's target: a fact of the attempt, the same in
+            // every view.
+            || t == "target.ex"
+    })
+}
+
+/// Whether the result schema expression `src` names an attempt input: a
+/// chart field (its judged notes included) or the play's target.
+fn names_attempt_input(src: &str) -> bool {
+    names(src).any(|t| t.starts_with("chart.") || t.starts_with("target."))
+}
+
+/// The identifier tokens of the result schema expression `src`: its
+/// field names, keywords and functions, without its numbers.
+fn names(src: &str) -> impl Iterator<Item = &str> {
     src.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
         .filter(|t| !t.is_empty() && !t.starts_with(|c: char| c.is_ascii_digit()))
-        .all(|t| {
-            matches!(
-                t,
-                "if" | "then" | "else" | "true" | "false" | "abs" | "clamp"
-            ) || (t.starts_with("chart.") && !t.starts_with("chart.notes"))
-                // The play's target: a fact of the attempt, the same in
-                // every view.
-                || t == "target.ex"
-        })
 }
 
 /// A fact's derived value, as an import read it.

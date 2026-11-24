@@ -28,7 +28,11 @@
 //!   runs on a foreground permit, taken at its admission or moved at its
 //!   next checkpoint, and returns to its own class when demoted. Only its
 //!   own thread changes its permit, and the run's hook is called there at
-//!   each change of class (the player changes the thread's mode).
+//!   each change of class (the player changes the thread's mode). A task's
+//!   promotion can also be revoked ([`Promoter::revoke`]), a revocable
+//!   lease: the foreground permit its thread holds goes back to the pool at
+//!   once, before the thread yields it at its next checkpoint, so the
+//!   foreground work that comes next has the pool's full width.
 //! - **Outcomes** ([`Outcome`]) carry no policy: done, cancelled, or
 //!   panicked with the panic caught at the job's boundary, its admission
 //!   and hooks included. The caller decides what a panic means.
@@ -55,9 +59,11 @@ pub use scoped::{Failure, Joined, LoadFailure, ScopedJob, Spawner};
 /// Foreground permits: the chosen chart's decode threads, from a choice to
 /// its READY state (design.md "Load Pipeline", system friendliness).
 pub const FOREGROUND_PERMITS: usize = 4;
-/// The most speculative permits, whatever the setting.
+/// The most speculative permits anything asks for: the development flag's
+/// stress test above the production cap (design.md "Load Pipeline",
+/// system friendliness).
 pub const SPECULATIVE_MAX: usize = 2;
-/// The speculative permits by default.
+/// The speculative permits when speculation is on: the production cap.
 pub const SPECULATIVE_DEFAULT: usize = 1;
 /// The cores speculation leaves to the rest of the machine.
 pub const RESERVED_CORES: usize = 2;
@@ -358,7 +364,67 @@ struct Job {
     owned: bool,
     /// A keyed job's `Arc<Slot<T>>`.
     slot: Option<Arc<dyn Any + Send + Sync>>,
+    /// The class of the permit its own thread holds, while it holds one.
+    holds: Option<Class>,
+    /// Its foreground permit was revoked ([`Promoter::revoke`]): given
+    /// back to the pool already, so the lease its thread still holds gives
+    /// nothing back as it drops, and is neither moved nor computed on past
+    /// the thread's next checkpoint.
+    revoked: bool,
+    /// The class its open wait for a permit is for (dev-tools: the
+    /// permit observer's `Wait` … `Take` or `Unwait`).
+    #[cfg(any(test, feature = "dev-tools"))]
+    wait: Option<Class>,
+    /// Its wanted class changed while it waited: its next try is marked
+    /// ([`PermitEvent::Retry`]).
+    #[cfg(any(test, feature = "dev-tools"))]
+    retry: bool,
 }
+
+/// What the permit observer is told ([`Coordinator::observe_permits`],
+/// dev-tools).
+#[cfg(any(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermitEvent {
+    /// A permit taken.
+    Take,
+    /// A permit given back: a lease's drop, a move's old class, or a
+    /// revocation.
+    Free,
+    /// A job began to wait for a permit: its admission's first failed
+    /// take.
+    Wait,
+    /// The class an open waiter wants changed (a promotion, demotion or
+    /// revocation), told by that change under the state lock.
+    Rewait,
+    /// A waiter's first try after a [`Rewait`](Self::Rewait): its
+    /// observation of the change.
+    Retry,
+    /// A waiter stopped waiting without a permit: its stop, its cancel,
+    /// or a class with no permit.
+    Unwait,
+}
+
+/// One change the permit observer sees, in the state lock's order
+/// (dev-tools).
+#[cfg(any(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PermitChange {
+    /// What changed.
+    pub event: PermitEvent,
+    /// The job it is of; 0 for a lease with no job.
+    pub task: u64,
+    /// The class taken, given, or waited for.
+    pub class: Class,
+    /// The class's permits held after the change.
+    pub count: usize,
+    /// The class's cap; none for a class without one.
+    pub cap: Option<usize>,
+}
+
+/// The permit observer (dev-tools).
+#[cfg(any(test, feature = "dev-tools"))]
+pub type PermitObserver = Arc<dyn Fn(PermitChange) + Send + Sync>;
 
 impl Job {
     /// The class it should run in now.
@@ -373,6 +439,9 @@ impl Job {
 
 /// Everything that decides a job's fate, under one lock.
 struct State {
+    /// The permit observer and the caps it reports (dev-tools).
+    #[cfg(any(test, feature = "dev-tools"))]
+    observer: Option<(PermitObserver, Caps)>,
     held: [usize; 3],
     generations: [u64; 3],
     next_id: u64,
@@ -387,8 +456,9 @@ impl State {
         self.next_id
     }
 
-    /// Takes a permit of `class` if one is free.
-    fn take_permit(&mut self, caps: Caps, class: Class) -> bool {
+    /// Takes a permit of `class` for job `task` (0 for none) if one is
+    /// free.
+    fn take_permit(&mut self, caps: Caps, class: Class, task: u64) -> bool {
         let Some(held) = self.held.get_mut(class.index()) else {
             return false;
         };
@@ -396,12 +466,77 @@ impl State {
             return false;
         }
         *held += 1;
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.tell(PermitEvent::Take, task, class);
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let _ = task;
         true
     }
 
-    fn give_permit(&mut self, class: Class) {
+    /// Gives back job `task`'s (0 for none) permit of `class`.
+    fn give_permit(&mut self, class: Class, task: u64) {
         if let Some(held) = self.held.get_mut(class.index()) {
             *held = held.saturating_sub(1);
+        }
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.tell(PermitEvent::Free, task, class);
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let _ = task;
+    }
+
+    /// Tells the observer, if any, of `event` (dev-tools).
+    #[cfg(any(test, feature = "dev-tools"))]
+    fn tell(&self, event: PermitEvent, task: u64, class: Class) {
+        if let Some((observer, caps)) = &self.observer {
+            observer(PermitChange {
+                event,
+                task,
+                class,
+                count: self.held.get(class.index()).copied().unwrap_or(0),
+                cap: caps.of(class),
+            });
+        }
+    }
+
+    /// Job `id` failed to take a permit of `class`: its wait opens at the
+    /// first failure (dev-tools).
+    #[cfg(any(test, feature = "dev-tools"))]
+    fn begin_wait(&mut self, id: u64, class: Class) {
+        let open = self.jobs.get_mut(&id).is_some_and(|job| {
+            let open = job.wait.is_none();
+            job.wait = Some(class);
+            open
+        });
+        if open {
+            self.tell(PermitEvent::Wait, id, class);
+        }
+    }
+
+    /// Job `id` tries again: the first try after a class change is marked
+    /// (dev-tools).
+    #[cfg(any(test, feature = "dev-tools"))]
+    fn try_mark(&mut self, id: u64, class: Class) {
+        if self
+            .jobs
+            .get_mut(&id)
+            .is_some_and(|job| std::mem::take(&mut job.retry))
+        {
+            self.tell(PermitEvent::Retry, id, class);
+        }
+    }
+
+    /// Job `id`'s wait ends: with its take (already told), or without a
+    /// permit (dev-tools).
+    #[cfg(any(test, feature = "dev-tools"))]
+    fn end_wait(&mut self, id: u64, took: bool) {
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return;
+        };
+        job.retry = false;
+        if let Some(class) = job.wait.take()
+            && !took
+        {
+            self.tell(PermitEvent::Unwait, id, class);
         }
     }
 
@@ -468,9 +603,24 @@ impl State {
         Some(job)
     }
 
+    /// Sets job `id`'s foreground interest. An open waiter whose wanted
+    /// class changes is re-classed here, under the lock that changed it,
+    /// whether or not its thread has woken (dev-tools: `Rewait`).
     fn set_promoted(&mut self, id: u64, promoted: bool) {
-        if let Some(job) = self.jobs.get_mut(&id) {
-            job.promoted = promoted;
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return;
+        };
+        #[cfg(any(test, feature = "dev-tools"))]
+        let before = job.want();
+        job.promoted = promoted;
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            let after = job.want();
+            if job.wait.is_some() && after != before {
+                job.wait = Some(after);
+                job.retry = true;
+                self.tell(PermitEvent::Rewait, id, after);
+            }
         }
     }
 }
@@ -508,7 +658,15 @@ struct Shared {
     /// Where tests hold a job's finish.
     #[cfg(test)]
     cuts: Mutex<Cuts>,
+    /// Run on a job's own thread at each checkpoint that holds a permit,
+    /// before the permit is moved ([`Coordinator::before_move`]).
+    #[cfg(any(test, feature = "dev-tools"))]
+    before_move: Mutex<Option<MoveHook>>,
 }
+
+/// A hook a test holds a job's checkpoint with ([`Coordinator::before_move`]).
+#[cfg(any(test, feature = "dev-tools"))]
+type MoveHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Where a test holds a job: as its admission begins, between its
 /// computation and its finish, and inside the finish between the registry
@@ -519,6 +677,8 @@ struct Cuts {
     before_finish: Option<Arc<Gate>>,
     in_finish: Option<Arc<Gate>>,
     admission: Option<Arc<Gate>>,
+    /// Before each try of an admission after its first.
+    retry: Option<Arc<Gate>>,
 }
 
 /// A point threads stop at until a test opens it (tests).
@@ -604,6 +764,8 @@ impl Coordinator {
             shared: Arc::new(Shared {
                 caps,
                 state: Mutex::new(State {
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    observer: None,
                     held: [0; 3],
                     generations: [0; 3],
                     next_id: 0,
@@ -615,8 +777,24 @@ impl Coordinator {
                 unsettled: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 cuts: Mutex::new(Cuts::default()),
+                #[cfg(any(test, feature = "dev-tools"))]
+                before_move: Mutex::new(None),
             }),
         }
+    }
+
+    /// Runs `hook` from now on, on a job's own thread, at each checkpoint
+    /// that holds a permit, after the checkpoint first read the class the
+    /// job should run in and before it moves the permit there (tests and
+    /// dev-tools builds): a test holds the job between the two.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[doc(hidden)]
+    pub fn before_move(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .shared
+            .before_move
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
     }
 
     /// Holds each job from now on as its admission begins, before it reads
@@ -630,6 +808,29 @@ impl Coordinator {
             .unwrap_or_else(PoisonError::into_inner)
             .admission = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// Holds each admission from now on before each try after its first
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn cut_retry(&self) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        self.shared
+            .cuts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retry = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Tells `observer` of every permit taken and given back and of every
+    /// job's wait from now on, under the state lock, in its order
+    /// (dev-tools: the preload's pause latency measurement). It must only
+    /// record: it runs with the lock held.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[doc(hidden)]
+    pub fn observe_permits(&self, observer: PermitObserver) {
+        self.shared.lock().observer = Some((observer, self.shared.caps));
     }
 
     /// Holds each job's end from now on: before its finish, or inside it
@@ -689,10 +890,11 @@ impl Coordinator {
     pub fn try_lease(&self, class: Class) -> Option<Lease> {
         self.shared
             .lock()
-            .take_permit(self.shared.caps, class)
+            .take_permit(self.shared.caps, class, 0)
             .then(|| Lease {
                 shared: Arc::clone(&self.shared),
                 class,
+                job: None,
             })
     }
 
@@ -708,10 +910,11 @@ impl Coordinator {
                 return None;
             }
             let mut state = self.shared.lock();
-            if state.take_permit(self.shared.caps, class) {
+            if state.take_permit(self.shared.caps, class, 0) {
                 return Some(Lease {
                     shared: Arc::clone(&self.shared),
                     class,
+                    job: None,
                 });
             }
             drop(
@@ -800,6 +1003,12 @@ impl Coordinator {
                     responsible: false,
                     owned: false,
                     slot: Some(any_slot),
+                    holds: None,
+                    revoked: false,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    wait: None,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    retry: false,
                 },
             );
             state.keys.insert(key, id);
@@ -844,6 +1053,12 @@ impl Coordinator {
                     responsible: false,
                     owned: false,
                     slot: None,
+                    holds: None,
+                    revoked: false,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    wait: None,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    retry: false,
                 },
             );
             id
@@ -888,6 +1103,9 @@ pub enum Taken<T> {
 pub struct Lease {
     shared: Arc<Shared>,
     class: Class,
+    /// The job whose own thread holds it, which a revocation can take it
+    /// from ([`Promoter::revoke`]); none for a lease taken directly.
+    job: Option<u64>,
 }
 
 impl std::fmt::Debug for Lease {
@@ -905,17 +1123,31 @@ impl Lease {
         self.class
     }
 
-    /// Moves it to `class` if a permit of `class` is free; whether it is
-    /// of `class` now.
+    /// Moves it to `class` if a permit of `class` is free, it was not
+    /// revoked and its job, if any, still wants `class`; whether it is of
+    /// `class` now. The job's wanted class is read under the lock that
+    /// takes the permit, as an admission reads it, so a promotion revoked
+    /// or withdrawn after its caller read the class never takes a
+    /// foreground permit.
     pub fn move_to(&mut self, class: Class) -> bool {
         if self.class == class {
             return true;
         }
-        let from = self.class;
+        let (from, job) = (self.class, self.job);
         let moved = self.shared.update(|state| {
-            let moved = state.take_permit(self.shared.caps, class);
+            if job
+                .and_then(|id| state.jobs.get(&id))
+                .is_some_and(|j| j.revoked || j.want() != class)
+            {
+                return false;
+            }
+            let task = job.unwrap_or(0);
+            let moved = state.take_permit(self.shared.caps, class, task);
             if moved {
-                state.give_permit(from);
+                state.give_permit(from, task);
+                if let Some(j) = job.and_then(|id| state.jobs.get_mut(&id)) {
+                    j.holds = Some(class);
+                }
             }
             moved
         });
@@ -927,9 +1159,18 @@ impl Lease {
 }
 
 impl Drop for Lease {
+    /// Its permit goes back, unless a revocation gave it back already.
     fn drop(&mut self) {
-        let class = self.class;
-        self.shared.update(|state| state.give_permit(class));
+        let (class, job) = (self.class, self.job);
+        self.shared.update(|state| {
+            if let Some(j) = job.and_then(|id| state.jobs.get_mut(&id)) {
+                j.holds = None;
+                if std::mem::take(&mut j.revoked) {
+                    return;
+                }
+            }
+            state.give_permit(class, job.unwrap_or(0));
+        });
     }
 }
 
@@ -1013,6 +1254,31 @@ impl Promoter {
         self.shared
             .update(|state| state.set_promoted(self.job, false));
     }
+
+    /// The interest ends, and the foreground permit its thread holds, if
+    /// any, is revoked: given back to the pool now rather than at the
+    /// thread's next checkpoint (a revocable lease, as a file lease or an
+    /// opportunistic lock is broken for the next opener). The thread
+    /// computes on without a permit until that checkpoint, which lets the
+    /// revoked lease go and waits for a permit of the class wanted then,
+    /// as the checkpoint's own move does when no permit is free
+    /// ([`Ctx::checkpoint`]). Foreground work that comes next, a bank's
+    /// decode workers, so never finds a demoted task's permit taken.
+    pub fn revoke(&self) {
+        self.shared.update(|state| {
+            state.set_promoted(self.job, false);
+            let Some(job) = state.jobs.get_mut(&self.job) else {
+                return;
+            };
+            let revoke = job.holds == Some(Class::Foreground)
+                && job.base != Class::Foreground
+                && !job.revoked;
+            if revoke {
+                job.revoked = true;
+                state.give_permit(Class::Foreground, self.job);
+            }
+        });
+    }
 }
 
 /// A job to run on the caller's thread ([`Runner::run`]). Dropped without
@@ -1025,7 +1291,8 @@ pub struct Runner<T> {
     /// or a joinable job, whose caller set the thread up (the background
     /// worker enters background mode before its jobs; a scoped job's base
     /// is the foreground); the normal mode, the foreground's, for an owned
-    /// job's new thread.
+    /// job's new thread and for a task run on a new thread
+    /// ([`Runner::on_new_thread`]).
     mode: Class,
     slot: Option<Arc<Slot<T>>>,
     done: bool,
@@ -1041,6 +1308,24 @@ impl<T> std::fmt::Debug for Runner<T> {
 }
 
 impl<T> Runner<T> {
+    /// It runs on a thread of its own that begins in the normal mode, the
+    /// foreground's, as an owned job's does: the hook is called at its
+    /// first admission in another class, so the thread's mode is set for
+    /// the class of its first actual permit before its work, whatever
+    /// class was wanted when the task was made.
+    #[must_use]
+    pub const fn on_new_thread(mut self) -> Self {
+        self.mode = Class::Foreground;
+        self
+    }
+
+    /// Its job's id, the task a permit observer names (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn task_id(&self) -> u64 {
+        self.id
+    }
+
     /// Its promoter.
     #[must_use]
     pub fn promoter(&self) -> Promoter {
@@ -1318,18 +1603,39 @@ impl Ctx<'_> {
     }
 
     /// Moves the permit to the class wanted now; `false` when the wait for
-    /// one was stopped.
+    /// one was stopped. A revoked permit is let go, giving nothing back,
+    /// and a permit of the class wanted is waited for. The move reads the
+    /// wanted class again under its own lock ([`Lease::move_to`]): one
+    /// that changed since the read here lets the permit go and waits for
+    /// one of the class wanted then.
     fn retarget(&self) -> bool {
-        let want = self.want();
+        let (want, revoked) = self
+            .shared
+            .lock()
+            .jobs
+            .get(&self.id)
+            .map_or((self.base, false), |j| (j.want(), j.revoked));
         let mut lease = self.lease();
         let Some(held) = lease.as_mut() else {
             drop(lease);
             return self.admit();
         };
-        if held.class() == want {
+        if !revoked && held.class() == want {
             return true;
         }
-        if held.move_to(want) {
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            let hook = self
+                .shared
+                .before_move
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        if !revoked && held.move_to(want) {
             drop(lease);
             self.apply(want);
             return true;
@@ -1359,29 +1665,70 @@ impl Ctx<'_> {
                 gate.pass();
             }
         }
+        #[cfg(test)]
+        let mut first = true;
         loop {
+            #[cfg(test)]
+            {
+                if !first {
+                    let gate = self
+                        .shared
+                        .cuts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .retry
+                        .clone();
+                    if let Some(gate) = gate {
+                        gate.pass();
+                    }
+                }
+                first = false;
+            }
             if (self.stop)() {
-                self.shared.lock().terminate(self.id);
+                let mut state = self.shared.lock();
+                #[cfg(any(test, feature = "dev-tools"))]
+                state.end_wait(self.id, false);
+                state.terminate(self.id);
                 return false;
             }
             let mut state = self.shared.lock();
+            #[cfg(any(test, feature = "dev-tools"))]
+            if state
+                .jobs
+                .get(&self.id)
+                .is_some_and(|j| j.cancel != Cancel::No)
+            {
+                state.end_wait(self.id, false);
+            }
             if state.observe(self.id) {
                 return false;
             }
             let want = state.jobs.get(&self.id).map_or(self.base, Job::want);
             if self.shared.caps.of(want) == Some(0) {
+                #[cfg(any(test, feature = "dev-tools"))]
+                state.end_wait(self.id, false);
                 state.terminate(self.id);
                 return false;
             }
-            if state.take_permit(self.shared.caps, want) {
+            #[cfg(any(test, feature = "dev-tools"))]
+            state.try_mark(self.id, want);
+            if state.take_permit(self.shared.caps, want, self.id) {
+                #[cfg(any(test, feature = "dev-tools"))]
+                state.end_wait(self.id, true);
+                if let Some(job) = state.jobs.get_mut(&self.id) {
+                    job.holds = Some(want);
+                }
                 drop(state);
                 *self.lease() = Some(Lease {
                     shared: Arc::clone(self.shared),
                     class: want,
+                    job: Some(self.id),
                 });
                 self.apply(want);
                 return true;
             }
+            #[cfg(any(test, feature = "dev-tools"))]
+            state.begin_wait(self.id, want);
             drop(
                 self.shared
                     .changed
@@ -1414,3 +1761,6 @@ impl Ctx<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod observer_tests;

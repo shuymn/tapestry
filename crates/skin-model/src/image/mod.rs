@@ -16,6 +16,8 @@ pub(crate) mod fnt;
 pub(crate) mod font;
 pub(crate) mod path;
 pub(crate) mod source;
+#[cfg(test)]
+mod union_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -26,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::TimeUs;
 
 use crate::atlas::Variant;
+use crate::atlas::pack::{PackError, Work};
 use crate::quad::Filter;
 use crate::skin::TimerRef;
 use crate::track::MAX_KEY_US;
@@ -903,29 +906,65 @@ impl Sheet {
     /// headers) are one file, and cells of the same file and rectangle, or
     /// colour and size, one cell. It has no images or fonts and reads no
     /// file. `None` when `other` is of another skin folder.
+    ///
+    /// [`union_checked`](Self::union_checked) that asks nothing.
     #[must_use]
     pub fn union(&self, other: &Sheet) -> Option<Sheet> {
+        self.union_with(other, &mut Work::never()).ok().flatten()
+    }
+
+    /// [`union`](Self::union), asking `cancel` after every
+    /// [`PLAN_BATCH`](crate::atlas::pack::PLAN_BATCH) units of its work,
+    /// a cell inserted or a file compared, so a union at the limits stops
+    /// within the planning's cadence (design.md "Load Pipeline").
+    ///
+    /// # Errors
+    ///
+    /// [`AtlasError::Cancelled`](crate::AtlasError::Cancelled) once
+    /// `cancel` said so; no other.
+    pub fn union_checked(
+        &self,
+        other: &Sheet,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Sheet>, crate::AtlasError> {
+        self.union_with(other, &mut Work::new(cancel))
+            .map_err(|_| crate::AtlasError::Cancelled)
+    }
+
+    fn union_with(&self, other: &Sheet, work: &mut Work<'_>) -> Result<Option<Sheet>, PackError> {
         if self.root != other.root {
-            return None;
+            return Ok(None);
         }
         let same = |a: &File, b: &File| a.lo == b.lo && a.hi == b.hi;
         let mut files: Vec<File> = self.files.to_vec();
         let mut cell_ids = BTreeSet::new();
         for c in self.cells.iter() {
             cell_ids.insert(*c);
+            Self::union_unit(work)?;
         }
         for c in other.cells.iter() {
             let source = match c.source {
                 CellSource::File(f) => {
-                    let file = other.files.get(usize::try_from(f).ok()?)?;
-                    let i = match files.iter().position(|g| same(g, file)) {
-                        Some(i) => i,
-                        None => {
-                            files.push(file.clone());
-                            files.len() - 1
-                        }
+                    let Some(file) = usize::try_from(f).ok().and_then(|f| other.files.get(f))
+                    else {
+                        return Ok(None);
                     };
-                    CellSource::File(u32::try_from(i).ok()?)
+                    let mut found = None;
+                    for (i, g) in files.iter().enumerate() {
+                        Self::union_unit(work)?;
+                        if same(g, file) {
+                            found = Some(i);
+                            break;
+                        }
+                    }
+                    let i = found.unwrap_or_else(|| {
+                        files.push(file.clone());
+                        files.len() - 1
+                    });
+                    let Ok(i) = u32::try_from(i) else {
+                        return Ok(None);
+                    };
+                    CellSource::File(i)
                 }
                 s @ CellSource::Solid(..) => s,
             };
@@ -933,11 +972,12 @@ impl Sheet {
                 source,
                 rect: c.rect,
             });
+            Self::union_unit(work)?;
         }
         // One frame per cell, in the cells' order.
         let cells: Vec<Cell> = cell_ids.into_iter().collect();
         let frames: Vec<u32> = (0_u32..).take(cells.len()).collect();
-        Some(Self {
+        Ok(Some(Self {
             id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
             root: self.root.clone(),
             source: self.source.clone(),
@@ -951,7 +991,14 @@ impl Sheet {
             bitmap_fonts: Box::new([]),
             #[cfg(any(test, feature = "dev-tools"))]
             charged: Vec::new(),
-        })
+        }))
+    }
+
+    /// One unit of a union's work ([`Self::union_checked`]).
+    fn union_unit(work: &mut Work<'_>) -> Result<(), PackError> {
+        #[cfg(test)]
+        crate::atlas::pack::bump(&crate::atlas::pack::UNION_UNITS);
+        work.unit(decode::Site::UnionWork)
     }
 
     /// The frames across all images: the length of every uv table built

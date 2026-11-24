@@ -1085,6 +1085,7 @@ fn rig<'a>(
         views_shown: 0,
         result_outro: None,
         decision_claim: None,
+        preload_claim: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
         #[cfg(test)]
@@ -1729,6 +1730,34 @@ fn start_skins(
     )
 }
 
+/// The selection path's startup probe of a pending result skin, after the
+/// installations (design.md "beatoraja Lua Skins", the result skin's
+/// preload): the kept probe's rule decided from the reported charges and
+/// set at once, so the first attempt's decision is a second one, then the
+/// probe imported and handed to the result skin, whose preload then
+/// pauses with the shelf. `tapestry play` keeps its image stage at the
+/// attempt and runs none.
+///
+/// # Errors
+///
+/// [`imports::StartupEnd::Closed`] once the window's close is seen.
+fn preload_result(rig: &mut PlayerRig<'_>) -> Result<(), imports::StartupEnd> {
+    let Some(pending) = rig.result_skin.pending_start() else {
+        return Ok(());
+    };
+    let kept = crate::result_skin::kept_probe_fits(rig.render.result_status().menus);
+    rig.result_skin.set_kept_probe(kept);
+    let outcome = imports::result_probe(&pending, rig.render.scripts(), kept, || {
+        rig.controls.quitting()
+    })?;
+    rig.result_skin.set_preload(outcome);
+    // Its pack pauses with the scan.
+    if let (Some(control), Some(sel)) = (rig.result_skin.preload_control(), &mut rig.selection) {
+        sel.shelf.set_preload(control);
+    }
+    Ok(())
+}
+
 /// `tapestry play`'s chart after its skins: a play skin that cannot be
 /// used fails the run before any recording opens, and a close during
 /// startup ends it with nothing played.
@@ -1907,6 +1936,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         _ => caps,
     };
     let coord = game::coord::Coordinator::new(caps);
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::observe_permits(&coord);
     #[cfg_attr(
         not(feature = "dev-tools"),
         expect(unused_mut, reason = "`--dev-stop-timeout` sets its bound")
@@ -2285,7 +2316,11 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             if let Some(sel) = &mut rig.selection {
                 sel.started(notices, started.selection);
             }
-            (true, None)
+            match preload_result(&mut rig) {
+                Ok(()) => (true, None),
+                Err(imports::StartupEnd::Closed) => (false, None),
+                Err(imports::StartupEnd::Failed(e)) => (false, Some(e)),
+            }
         }
         Err(imports::StartupEnd::Closed) => (false, None),
         Err(imports::StartupEnd::Failed(e)) => (false, Some(e)),
