@@ -4,10 +4,14 @@
 //! window receives `WM_DISPLAYCHANGE` (through a window subclass, which
 //! sees the messages sent to the window procedure that winit's message
 //! hook never sees), moves to another monitor or changes scale, and
-//! published to the [`Extent`] apart from its size.
+//! published to the [`Extent`] apart from its size ([`RateFeed`]). A
+//! window whose subclass cannot be installed has no observer of a mode
+//! change, so its rate is published as unknown and stays so: every pass
+//! then takes the whole slice, the design's unknown-rate fallback.
 
 use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -49,7 +53,21 @@ impl Source {
             Self::Unknown => "nowhere",
         }
     }
+
+    /// Its number for [`LAST_SOURCE`].
+    const fn code(self) -> u8 {
+        match self {
+            Self::DisplayConfig => 1,
+            Self::DisplaySettings => 2,
+            Self::Unknown => 3,
+        }
+    }
 }
+
+/// The source of the rate published last ([`Source::code`]), 0 before
+/// one: a change of source is noted even at the same rate, so a run's log
+/// says where each rate came from.
+static LAST_SOURCE: AtomicU8 = AtomicU8::new(0);
 
 /// Reads the refresh rate of a window's monitor: mHz (0: unknown) and
 /// where it came from. [`read`], or a test's.
@@ -69,10 +87,13 @@ pub fn read(hwnd: HWND) -> (u32, Source) {
 }
 
 /// Reads the rate with `read` and publishes it to `extent`; the console
-/// notes each change (monitor names stay out of it).
-pub fn publish(extent: &Extent, hwnd: HWND, read: ReadRate) {
+/// notes each change of rate or of its source (monitor names stay out of
+/// it).
+fn publish(extent: &Extent, hwnd: HWND, read: ReadRate) {
     let (mhz, source) = read(hwnd);
-    if extent.publish_rate(mhz) != mhz {
+    let rate_changed = extent.publish_rate(mhz) != mhz;
+    let source_changed = LAST_SOURCE.swap(source.code(), Ordering::AcqRel) != source.code();
+    if rate_changed || source_changed {
         // Written, not printed: this runs inside a window procedure, where
         // a panic cannot unwind.
         let _ = writeln!(
@@ -80,6 +101,61 @@ pub fn publish(extent: &Extent, hwnd: HWND, read: ReadRate) {
             "window: refresh rate {mhz} mHz from the {}",
             source.name()
         );
+    }
+}
+
+/// The window's refresh-rate feed: its subclass, installed first, and the
+/// rate published to the [`Extent`] at the window's creation, at each
+/// display change and at each event that may have moved it to another
+/// monitor ([`window_event`](Self::window_event)). When the subclass
+/// cannot be installed, no display change would be seen, so the rate is
+/// published unknown (0) and never read again: the boundaries then take
+/// the whole slice ("Screen Transitions and Loading", rate delivery).
+pub struct RateFeed {
+    hwnd: HWND,
+    read: ReadRate,
+    watch: Option<Watch>,
+}
+
+impl RateFeed {
+    /// Starts the feed of `hwnd` (a window of this thread) to `extent`,
+    /// reading with `read`.
+    pub fn start(hwnd: HWND, extent: &Arc<Extent>, read: ReadRate) -> Self {
+        let watch = Watch::install(hwnd, Arc::clone(extent), read);
+        if watch.is_some() {
+            publish(extent, hwnd, read);
+        } else {
+            extent.publish_rate(0);
+            LAST_SOURCE.store(Source::Unknown.code(), Ordering::Release);
+            let _ = writeln!(
+                std::io::stdout(),
+                "window: the display-change watch could not be installed: refresh rate unknown"
+            );
+        }
+        Self { hwnd, read, watch }
+    }
+
+    /// Whether display changes are observed: the subclass is installed
+    /// (tests).
+    #[cfg(test)]
+    pub const fn watching(&self) -> bool {
+        self.watch.is_some()
+    }
+
+    /// The window's `event`: one that may have changed its monitor reads
+    /// the rate again ([`rereads`]).
+    pub fn window_event(&self, extent: &Extent, event: &WindowEvent) {
+        if rereads(event) {
+            self.reread(extent);
+        }
+    }
+
+    /// Reads the rate again and publishes it, while display changes are
+    /// observed; an unobserved window's stays unknown.
+    pub fn reread(&self, extent: &Extent) {
+        if self.watch.is_some() {
+            publish(extent, self.hwnd, self.read);
+        }
     }
 }
 
@@ -293,8 +369,30 @@ mod tests {
     use winit::dpi::PhysicalPosition;
     use winit::event::WindowEvent;
 
-    use super::{Source, Watch, rational_mhz, rereads};
+    use super::{RateFeed, Source, Watch, rational_mhz, rereads};
     use crate::render_side::Extent;
+
+    /// A hidden window of this thread.
+    fn hidden_window() -> HWND {
+        // SAFETY: a predefined class, no parent, no creation data.
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap()
+    }
 
     /// C3d: the active mode's rational rate, whole before the division;
     /// a zero denominator is no rate.
@@ -307,17 +405,68 @@ mod tests {
         assert_eq!(rational_mhz(u32::MAX, 1), None);
     }
 
-    /// C3c: a move and a scale change read the rate again; a resize does
-    /// not (its size goes its own way).
+    /// The rates `moves`' read gives, in turn.
+    static MOVES: AtomicU32 = AtomicU32::new(0);
+
+    fn moves(_hwnd: HWND) -> (u32, Source) {
+        let rate = match MOVES.fetch_add(1, Ordering::SeqCst) {
+            0 => 60_000,
+            1 => 143_856,
+            _ => 240_085,
+        };
+        (rate, Source::DisplayConfig)
+    }
+
+    /// C3c: the window's feed publishes the rate read at its start, and
+    /// again at a move and at a scale change (which comes with a move
+    /// across monitors), each through the event handler the window calls;
+    /// a resize reads nothing. winit makes no scale-change event outside
+    /// itself, so its rereading is driven through the same handler's
+    /// rereading.
     #[test]
     fn a_move_publishes_the_rate() {
-        assert!(rereads(&WindowEvent::Moved(PhysicalPosition::new(
-            1_920, 0
-        ))));
-        assert!(!rereads(&WindowEvent::Resized(
-            winit::dpi::PhysicalSize::new(1_280, 720)
-        )));
+        let hwnd = hidden_window();
+        let extent = Arc::new(Extent::default());
+        let feed = RateFeed::start(hwnd, &extent, moves);
+        assert!(feed.watching());
+        assert_eq!(extent.rate_mhz(), 60_000, "read at the start");
+        feed.window_event(
+            &extent,
+            &WindowEvent::Moved(PhysicalPosition::new(1_920, 0)),
+        );
+        assert_eq!(extent.rate_mhz(), 143_856, "read at a move");
+        feed.window_event(
+            &extent,
+            &WindowEvent::Resized(winit::dpi::PhysicalSize::new(1_280, 720)),
+        );
+        assert_eq!(extent.rate_mhz(), 143_856, "a resize reads nothing");
+        feed.reread(&extent);
+        assert_eq!(extent.rate_mhz(), 240_085, "read at a scale change");
         assert!(!rereads(&WindowEvent::CloseRequested));
+        drop(feed);
+        // SAFETY: made above, on this thread.
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    fn at_240(_hwnd: HWND) -> (u32, Source) {
+        (240_085, Source::DisplayConfig)
+    }
+
+    /// M1: a window whose subclass cannot be installed (no window at all
+    /// here, which `SetWindowSubclass` refuses) publishes the rate as
+    /// unknown, over one known before, and keeps it unknown through a
+    /// move: with no observer of a display change, no stale rate is
+    /// advertised.
+    #[test]
+    fn a_failed_watch_leaves_the_rate_unknown() {
+        let extent = Arc::new(Extent::default());
+        extent.publish_rate(60_000);
+        let feed = RateFeed::start(HWND::default(), &extent, at_240);
+        assert!(!feed.watching());
+        assert_eq!(extent.rate_mhz(), 0, "unknown at the start");
+        feed.window_event(&extent, &WindowEvent::Moved(PhysicalPosition::new(0, 0)));
+        feed.reread(&extent);
+        assert_eq!(extent.rate_mhz(), 0, "still unknown after a move");
     }
 
     /// The rates the test's read gives, in turn.
@@ -336,24 +485,7 @@ mod tests {
     /// untouched; once the subclass is gone, a message publishes nothing.
     #[test]
     fn a_sent_display_change_publishes_the_rate() {
-        // SAFETY: a predefined class, no parent, no creation data.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("STATIC"),
-                w!(""),
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                None,
-                None,
-            )
-        }
-        .unwrap();
+        let hwnd = hidden_window();
         let extent = Arc::new(Extent::default());
         let watch = Watch::install(hwnd, Arc::clone(&extent), rates).unwrap();
         assert_eq!(extent.rate_mhz(), 0);

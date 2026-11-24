@@ -339,9 +339,9 @@ struct App {
     /// The monitor to open on, by name; the primary when `None`.
     monitor: Option<String>,
     ready: Option<Sender<anyhow::Result<Surface>>>,
-    /// The window's subclass publishing its monitor's refresh rate at each
-    /// display change; removed before the window goes.
-    rate_watch: Option<crate::refresh_rate::Watch>,
+    /// The window's refresh-rate feed: its subclass publishing the rate at
+    /// each display change, removed before the window goes.
+    rate_feed: Option<crate::refresh_rate::RateFeed>,
     window: Option<Window>,
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
@@ -380,15 +380,13 @@ impl ApplicationHandler<Ask> for App {
                 let surface = surface(&w);
                 let _ = ready.send(surface);
                 publish(&self.shared.extent, &w);
-                if let Some(h) = hwnd(&w) {
-                    let extent = &self.shared.extent;
-                    crate::refresh_rate::publish(extent, h, crate::refresh_rate::read);
-                    self.rate_watch = crate::refresh_rate::Watch::install(
+                self.rate_feed = hwnd(&w).map(|h| {
+                    crate::refresh_rate::RateFeed::start(
                         h,
-                        Arc::clone(extent),
+                        &self.shared.extent,
                         crate::refresh_rate::read,
-                    );
-                }
+                    )
+                });
                 self.window = Some(w);
                 self.showing = Some(Showing::new(Instant::now()));
                 self.poll_showing(event_loop);
@@ -401,10 +399,8 @@ impl ApplicationHandler<Ask> for App {
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if crate::refresh_rate::rereads(&event)
-            && let Some(h) = self.window.as_ref().and_then(hwnd)
-        {
-            crate::refresh_rate::publish(&self.shared.extent, h, crate::refresh_rate::read);
+        if let Some(feed) = &self.rate_feed {
+            feed.window_event(&self.shared.extent, &event);
         }
         match event {
             WindowEvent::Focused(focused) => {
@@ -522,7 +518,7 @@ impl ApplicationHandler<Ask> for App {
                 // The window goes before the loop ends, on its own thread,
                 // and its watch of the foreground with it.
                 self.topmost = Topmost::default();
-                self.rate_watch = None;
+                self.rate_feed = None;
                 self.window = None;
                 event_loop.exit();
             }
@@ -893,7 +889,7 @@ pub fn open(
                 keys: Keys::new(retry, quit),
                 monitor,
                 ready: Some(ready_tx),
-                rate_watch: None,
+                rate_feed: None,
                 window: None,
                 menu,
                 ime: ImeState::default(),
