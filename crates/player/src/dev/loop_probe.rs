@@ -413,18 +413,6 @@ pub fn dump() {
     for (t, tag, v) in marks {
         println!("dev: probe {t} {tag} {v}");
     }
-    // The probe's clock against QPC, read together: a test puts a QPC time
-    // it read (a fault's injection) on the marks' clock.
-    if let Some(t) = REC.now() {
-        let (mut qpc, mut frequency) = (0, 0);
-        // SAFETY: each writes the local it is given.
-        unsafe {
-            let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut qpc);
-            let _ =
-                windows::Win32::System::Performance::QueryPerformanceFrequency(&raw mut frequency);
-        }
-        println!("dev: probe-clock {qpc} {frequency} {t}");
-    }
     let past = REC.dropped();
     println!(
         "dev: probe-dropped {} (past the room {past}, unfilled {unfilled})",

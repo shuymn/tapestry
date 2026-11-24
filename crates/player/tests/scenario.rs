@@ -5177,22 +5177,24 @@ fn crash(pid: u32) -> i64 {
 }
 
 /// The game's probe clock time (µs) of `qpc`, a QPC time read in this
-/// process, from the game's `dev: probe-clock` line in `stdout`.
+/// process: the game's `dev: probe origin <origin> <hz>` line in `stdout`
+/// gives the clock's own conversion (`input::time::qpc_to_us`), QPC
+/// being one counter across the machine's processes.
 fn game_time_of(stdout: &str, qpc: i64) -> i64 {
-    let line = lines(stdout, "dev: probe-clock ")
+    let line = lines(stdout, "dev: probe origin ")
         .first()
         .copied()
-        .unwrap_or_else(|| panic!("no probe clock: {stdout}"));
+        .unwrap_or_else(|| panic!("no probe origin: {stdout}"));
     let v: Vec<i64> = line
         .split(' ')
-        .skip(2)
+        .skip(3)
         .map(|w| w.parse().unwrap())
         .collect();
-    let [at, frequency, us] = v[..] else {
+    let [origin, frequency] = v[..] else {
         panic!("{line}");
     };
-    let before = i128::from(at - qpc) * 1_000_000 / i128::from(frequency);
-    us - i64::try_from(before).unwrap()
+    let us = (i128::from(qpc) - i128::from(origin)) * 1_000_000;
+    i64::try_from(us.div_euclid(i128::from(frequency))).unwrap()
 }
 
 /// Waits up to `limit` for the capture `name` in `dir` to be written whole
