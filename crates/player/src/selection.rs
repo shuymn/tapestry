@@ -4182,6 +4182,15 @@ impl AppRig for PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::loop_probe::mark("g:show_decision", 0);
+        // The decision's effective end: its choice, the scene and the
+        // fade-out (a run record's mark).
+        #[cfg(feature = "dev-tools")]
+        if let Some(end) = d.deadline() {
+            let lifetime = d
+                .lifetime()
+                .map_or(0, |l| i64::try_from(l.0).unwrap_or(i64::MAX));
+            crate::dev::transitions::game_mark("decision-end", end, lifetime);
+        }
         self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         // The decision sound, once per decision screen whichever
@@ -4319,6 +4328,8 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn show_refusal(&mut self, refusal: &LoadRefusal<ChartLoadError>) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::game_mark_now("refusal", 0);
         let name = file_name(&refusal.chart);
         let why = Chain(&refusal.reason).to_string();
         println!("select: refused {name}: {why}");

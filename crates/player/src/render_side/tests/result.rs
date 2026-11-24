@@ -2600,6 +2600,32 @@ fn fade_alpha(drawn: &Mutex<Vec<Drawn>>) -> Option<f32> {
         .map(|q| q.color[3])
 }
 
+/// A windowed run's record marks the result outro's end, its start plus
+/// the skin's fade-out, with its start, when the outro begins
+/// (development builds).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_outro_s_end_is_marked() {
+    use crate::dev::transitions::{kept_game_marks, start_game_marks};
+    use game::Rig as _;
+    on_shown_result("skin.fadeout = 500\n", TIMER2_DOT, |p, _, _, _, _| {
+        start_game_marks(QpcClock::start());
+        let outro = p.result_timing().expect("the skin's timing").outro;
+        assert_eq!(outro, TimeUs(500_000));
+        let at = p.now();
+        assert!(matches!(
+            p.begin_outro(at, None),
+            game::Outro::Begun(Some(_))
+        ));
+        let marks: Vec<_> = kept_game_marks().iter().map(|m| (m.0, m.1, m.2)).collect();
+        assert_eq!(
+            marks,
+            [(u64::try_from(at.0 + outro.0).unwrap(), "outro-end", at.0)]
+        );
+        p.accept_leaving(game::MenuCommand::Back);
+    });
+}
+
 /// C5b through the real `PlayerRig`: a leaving command's outro begun
 /// (`begin_outro`), then its `accept_leaving`, whose settle of the result
 /// skin holds: meanwhile every frame keeps the pinned view, and the

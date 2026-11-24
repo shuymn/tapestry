@@ -254,6 +254,10 @@ struct Tail {
     /// Closing ([`Rig::closing_began`]).
     readies: u32,
     closings: u32,
+    /// The full play's fade-out as [`Rig::fade_began`] gave it: its start
+    /// and its end on the clock (development builds).
+    #[cfg(feature = "dev-tools")]
+    fade_began: Option<(TimeUs, TimeUs)>,
 }
 
 impl Tail {
@@ -352,6 +356,8 @@ impl Tail {
             audio_done_at: None,
             readies: 0,
             closings: 0,
+            #[cfg(feature = "dev-tools")]
+            fade_began: None,
         }
     }
 
@@ -487,6 +493,11 @@ impl Rig for Tail {
 
     fn closing_began(&mut self) {
         self.closings += 1;
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
+        self.fade_began = Some((from, to));
     }
 
     fn stepped(&mut self, _aborted: bool) {
@@ -940,6 +951,21 @@ fn the_result_waits_for_the_finish_margin_and_the_fade_out() {
     assert_eq!(report.tally.combo, report.tally.max_combo);
     assert!(!report.tail_skipped);
     assert_eq!(rig.cancels, 0);
+}
+
+/// The fade-out's start and its end, the start plus the skin's fadeout,
+/// reach the rig on its clock when the fade-out begins (development
+/// builds: a run record's mark).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_fade_out_s_span_reaches_the_rig() {
+    let (rig, _) = ending(all_hits(), 500, declared(3_000, 1_000));
+    let origin = rig.origin.unwrap().0;
+    assert_eq!(
+        rig.fade_began
+            .map(|(from, to)| (from.0 - origin, to.0 - origin)),
+        Some((T + 8_000 * MS, T + 9_000 * MS))
+    );
 }
 
 /// Audio still sounding at the hold's deadline delays the fade-out until

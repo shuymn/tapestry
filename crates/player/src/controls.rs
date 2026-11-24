@@ -494,6 +494,9 @@ impl Controls {
     /// The window was asked to close, or its event loop ended: the game
     /// quits.
     pub fn close(&self) {
+        // The first close on the host counter, for a windowed run's record.
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::close_stamp();
         self.quit.store(true, Ordering::Release);
         self.wake_game();
     }
@@ -654,6 +657,19 @@ mod tests {
         c.close();
         assert!(c.quitting());
         assert_eq!(c.take(), None);
+    }
+
+    /// A close stamps a windowed run's record with the host counter
+    /// (development builds).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_close_stamps_the_run_record() {
+        let c = Controls::new(QpcClock::start());
+        assert_eq!(crate::dev::transitions::close_qpc(), None);
+        let before = render::present_tap::qpc_now();
+        c.close();
+        let stamped = crate::dev::transitions::close_qpc().expect("stamped");
+        assert!(stamped >= before, "{stamped} < {before}");
     }
 
     #[test]

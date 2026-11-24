@@ -1816,6 +1816,20 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(us) = s.dev.upload_slice_us {
         dev::pin_upload_slice(us);
     }
+    // A windowed run's raw transition record (`--dev-transitions`): its
+    // book and the game thread's marks reserved before any play. A
+    // scenario's frame sink records into the scenario's book, which the
+    // record then reads.
+    #[cfg(feature = "dev-tools")]
+    let run_record = s.dev.transitions.clone().map(|path| {
+        dev::transitions::start_game_marks(clock);
+        let book = scenario
+            .as_ref()
+            .map_or_else(dev::transitions::Transitions::default, |sc| {
+                sc.transitions.clone()
+            });
+        (path, book)
+    });
     #[cfg(feature = "dev-tools")]
     let shot_tap = s.dev.shot_pipe.clone().map(|name| {
         let tap = dev::present_shot::Tap::new();
@@ -1885,7 +1899,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             clock,
         )),
         (None, Some(dir)) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
-        (None, None) => Box::new(NoFrames),
+        (None, None) => match &run_record {
+            Some((_, book)) => Box::new(dev::transitions::RunFrames::new(book.clone())),
+            None => Box::new(NoFrames),
+        },
     };
     #[cfg(not(feature = "dev-tools"))]
     let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
@@ -2084,6 +2101,19 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     }
     if let Some(e) = failed {
         return Err(e);
+    }
+    // The windowed run's raw record, written off the render thread now
+    // that it has ended.
+    #[cfg(feature = "dev-tools")]
+    if let Some((path, book)) = run_record {
+        let lines = book
+            .run_lines(dev::transitions::RunHeader::of(clock))
+            .map_err(anyhow::Error::msg)?;
+        let mut text = lines.join("\n");
+        text.push('\n');
+        std::fs::write(&path, text)
+            .with_context(|| format!("dev: the transition record {}", path.display()))?;
+        println!("dev: transition record written to {}", path.display());
     }
     #[cfg(feature = "dev-tools")]
     if let Some((sc, script)) = scenario {

@@ -1248,6 +1248,13 @@ pub trait Screen: Send {
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
+    /// The last window frame's present on the host counter and its swap
+    /// chain ([`render::Renderer::present_stamps`]); none by default
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn present_stamps(&self) -> Option<render::PresentStamps> {
+        None
+    }
 
     /// The last play frame's list, for a skin that keeps one.
     #[cfg(feature = "dev-tools")]

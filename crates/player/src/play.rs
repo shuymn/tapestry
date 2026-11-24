@@ -2606,6 +2606,14 @@ impl Rig for PlayerRig<'_> {
         self.result_outro = Some(at);
         #[cfg(feature = "dev-tools")]
         println!("dev: result outro began, view {pinned:?} pinned");
+        // The outro's effective end: its start and the skin's fade-out,
+        // at once for the built-in presentation (a run record's mark).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::game_mark(
+            "outro-end",
+            TimeUs(at.0.saturating_add(timing.map_or(0, |t| t.outro.0))),
+            at.0,
+        );
         #[cfg(not(feature = "dev-tools"))]
         let _ = pinned;
         // The fade-out's start: a skin's (its timing given) swaps the
@@ -2688,6 +2696,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn discard_attempt(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::game_mark_now("withdrawal", 0);
         let _ = self.drop_prep();
         self.render.discard_attempt();
     }
@@ -3527,6 +3537,11 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
         self.audio.control.ring_out(fade_at, end_at);
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
+        crate::dev::transitions::game_mark("play-fade-end", to, from.0);
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

@@ -19,14 +19,26 @@
 //! merges overlapping marks so no time is counted twice, and keeps what no
 //! mark covers, its largest uncovered piece with its endpoints; a count of
 //! frames not presented covers no time.
+//!
+//! A windowed run keeps the same book (`--dev-transitions <file>`,
+//! [`RunFrames`]) and writes it raw at its end ([`Transitions::run_lines`]),
+//! for a joiner to match with a system present trace: each present with
+//! the host counter read right before and after its present call and its
+//! swap chain ([`render::PresentStamps`]), the counter's frequency and the
+//! clock's origin to put the clock's µs on the same counter, the game
+//! thread's marks ([`game_mark`], a second book of the loop probe's
+//! lock-free kind, the game thread its writer) and the first close
+//! ([`close_stamp`]). Nothing is derived during the run.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use bms_model::TimeUs;
+use input::QpcClock;
 
 use crate::measure::{HoldEnd, HoldStamp, Stage, State};
 
@@ -161,11 +173,13 @@ pub enum Record {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Raw {
     /// A presented frame of `stage` at `at`, after `unpresented` frames
-    /// not presented since the last present.
+    /// not presented since the last present, and its present on the host
+    /// counter when it went to a window.
     Present {
         stage: Stage,
         at: TimeUs,
         unpresented: u32,
+        stamps: Option<render::PresentStamps>,
     },
     /// A hold or a read-back.
     Mark(Mark),
@@ -349,6 +363,7 @@ fn derive(raw: &[Raw]) -> Vec<Record> {
             stage,
             at,
             unpresented,
+            ..
         } = *r
         {
             match (last, open) {
@@ -648,7 +663,20 @@ impl Recorder {
     /// A presented frame of `stage` at `at`, with its loading lifetime's
     /// hold if the render thread held it. Returns the change it ends: a
     /// transition, or a presentation change.
+    #[cfg(test)]
     pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) -> Option<Change> {
+        self.frame_stamped(stage, at, hold, None)
+    }
+
+    /// [`frame`](Self::frame), with the frame's present on the host
+    /// counter when it went to a window.
+    pub fn frame_stamped(
+        &mut self,
+        stage: Stage,
+        at: TimeUs,
+        hold: Option<HoldStamp>,
+        stamps: Option<render::PresentStamps>,
+    ) -> Option<Change> {
         if let Some(h) = hold {
             self.hold(h);
         }
@@ -657,6 +685,7 @@ impl Recorder {
             stage,
             at,
             unpresented,
+            stamps,
         });
         let ended = self.last.and_then(|(last, last_at)| {
             change(last, stage).map(|presentation| Change {
@@ -708,6 +737,211 @@ impl Recorder {
     /// result's page at `at`: the result was prepared since the play ended.
     pub fn result_taken(&self, at: TimeUs) {
         self.book.push(Raw::ResultTaken(at));
+    }
+}
+
+/// What a windowed run's record says of the run: the host counter's
+/// frequency and the clock's origin on it, and the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunHeader {
+    /// The host counter's ticks a second.
+    pub qpc_frequency: i64,
+    /// The counter's value the clock reads 0 at.
+    pub qpc_origin: i64,
+    /// The process ID a present trace names the run's presents by.
+    pub pid: u32,
+}
+
+impl RunHeader {
+    /// The header of this process on `clock`.
+    #[must_use]
+    pub fn of(clock: QpcClock) -> Self {
+        Self {
+            qpc_frequency: clock.frequency().hz(),
+            qpc_origin: clock.origin(),
+            pid: std::process::id(),
+        }
+    }
+}
+
+impl Transitions {
+    /// A windowed run's raw record (`--dev-transitions`), once the render
+    /// thread has ended: the header, every raw record in its order (each
+    /// present with its stamps and swap chain, `-` where it went to no
+    /// window), the game thread's marks, the first close on the host
+    /// counter and the records lost from either book. Times are the
+    /// clock's µs; the stamps and the close are raw counter ticks.
+    ///
+    /// # Errors
+    ///
+    /// The book is held by another thread.
+    pub fn run_lines(&self, header: RunHeader) -> Result<Vec<String>, String> {
+        let b = match self.0.try_lock() {
+            Ok(b) => b,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err("the transition record is held by the render thread".to_owned());
+            }
+        };
+        let (marks, game_lost) = GAME_MARKS.marks();
+        Ok(run_record_lines(
+            header,
+            &b.raw,
+            &marks,
+            close_qpc(),
+            (b.lost, game_lost),
+        ))
+    }
+}
+
+/// The lines of a windowed run's raw record ([`Transitions::run_lines`]).
+fn run_record_lines(
+    header: RunHeader,
+    raw: &[Raw],
+    marks: &[super::loop_probe::Mark],
+    close: Option<i64>,
+    (lost, game_lost): (u64, u64),
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(raw.len() + marks.len() + 4);
+    lines.push(format!(
+        "run qpc-frequency {} qpc-origin {} pid {}",
+        header.qpc_frequency, header.qpc_origin, header.pid
+    ));
+    for r in raw {
+        lines.push(match *r {
+            Raw::Present {
+                stage,
+                at,
+                unpresented,
+                stamps,
+            } => {
+                let stamps = stamps.map_or_else(
+                    || "- - -".to_owned(),
+                    |s| format!("{} {} {:#x}", s.pre_qpc, s.post_qpc, s.swap_chain),
+                );
+                format!(
+                    "present {stamps} {} {} {} {} {unpresented}",
+                    at.0,
+                    stage.state.name(),
+                    stage.lifetime,
+                    stage.drew.name()
+                )
+            }
+            Raw::Mark(m) => {
+                let ended = match m.kind {
+                    MarkKind::Hold(Some(why)) | MarkKind::ResultHold(why) => why.name(),
+                    _ => "-",
+                };
+                format!("mark {} {} {} {ended}", mark_name(m.kind), m.from.0, m.to.0)
+            }
+            Raw::PlayEnded(at) => format!("play-ended {}", at.0),
+            Raw::ResultTaken(at) => format!("result-taken {}", at.0),
+        });
+    }
+    for &(at, tag, v) in marks {
+        lines.push(format!("game {at} {tag} {v}"));
+    }
+    lines.push(close.map_or_else(|| "close none".to_owned(), |t| format!("close {t}")));
+    lines.push(format!("lost render {lost} game {game_lost}"));
+    lines
+}
+
+/// The game thread's marks a windowed run keeps: a run's few edges, with
+/// room to spare.
+const GAME_ROOM: usize = 4_096;
+
+/// The game thread's marks of a windowed run's record ([`game_mark`]).
+static GAME_MARKS: super::loop_probe::Recorder = super::loop_probe::Recorder::new();
+
+/// Starts keeping the game thread's marks on `clock`, their room
+/// reserved now, before any play (`--dev-transitions`).
+pub fn start_game_marks(clock: QpcClock) {
+    GAME_MARKS.turn_on(GAME_ROOM, clock);
+}
+
+/// Marks `tag` at `at` on the clock with `value`, when a windowed run
+/// keeps its record: one atomic step, no allocation, no wait.
+pub fn game_mark(tag: &'static str, at: TimeUs, value: i64) {
+    GAME_MARKS.mark_at(tag, at, value);
+}
+
+/// Marks `tag` now with `value` ([`game_mark`]).
+pub fn game_mark_now(tag: &'static str, value: i64) {
+    GAME_MARKS.mark(tag, value);
+}
+
+/// The game thread's marks kept so far, as `(at, tag, value)` (tests).
+#[cfg(test)]
+pub fn kept_game_marks() -> Vec<super::loop_probe::Mark> {
+    GAME_MARKS.marks().0
+}
+
+/// The first close's host counter, `i64::MIN` while none.
+static CLOSE_QPC: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// The window or a key asked to close: the first close's host counter is
+/// kept, a later one leaves it (one compare-and-swap, from any thread).
+pub fn close_stamp() {
+    let now = render::present_tap::qpc_now();
+    let _ = CLOSE_QPC.compare_exchange(i64::MIN, now, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// The first close's host counter, if any.
+pub(crate) fn close_qpc() -> Option<i64> {
+    let t = CLOSE_QPC.load(Ordering::Acquire);
+    (t != i64::MIN).then_some(t)
+}
+
+/// A windowed run's frame sink (`--dev-transitions`): it records each
+/// frame into the book as a scenario's sink does, with its present's
+/// stamps, and nothing else.
+#[derive(Debug)]
+pub struct RunFrames {
+    recorder: Recorder,
+}
+
+impl RunFrames {
+    /// The sink recording into `book`.
+    #[must_use]
+    pub const fn new(book: Transitions) -> Self {
+        Self {
+            recorder: Recorder::new(book),
+        }
+    }
+}
+
+impl crate::render_side::FrameSink for RunFrames {
+    fn frame(
+        &mut self,
+        screen: &dyn crate::render_side::Screen,
+        drawn: &crate::measure::Drawn<'_>,
+    ) {
+        if !drawn.timing.presented() {
+            self.recorder.unpresented();
+            return;
+        }
+        let _ = self.recorder.frame_stamped(
+            drawn.stage,
+            drawn.presented_at,
+            drawn.hold,
+            screen.present_stamps(),
+        );
+    }
+
+    fn play_ended(&mut self, at: TimeUs) {
+        self.recorder.play_ended(at);
+    }
+
+    fn result_taken(&mut self, at: TimeUs) {
+        self.recorder.result_taken(at);
+    }
+
+    fn hold_lost(&mut self, hold: HoldStamp) {
+        self.recorder.hold(hold);
+    }
+
+    fn result_hold(&mut self, hold: HoldStamp) {
+        self.recorder.result_hold(hold);
     }
 }
 
@@ -1050,5 +1284,122 @@ mod tests {
                 "dev: transitions: 8 records, lost 0, largest uncovered none",
             ]
         );
+    }
+
+    /// A windowed run's raw record keeps each present's stamps and swap
+    /// chain as raw ticks, `-` for one that went to no window, every
+    /// render mark, the game thread's marks, the first close and the
+    /// records each book lost, after the header that turns the clock's µs
+    /// into ticks.
+    #[test]
+    fn the_run_record_keeps_raw_presents_and_marks() {
+        use super::{Raw, RunHeader, run_record_lines};
+        let raw = [
+            Raw::Present {
+                stage: stage(State::Decision, 3, Drew::Skin),
+                at: TimeUs(1_000),
+                unpresented: 0,
+                stamps: Some(render::PresentStamps {
+                    pre_qpc: 50_000,
+                    post_qpc: 50_120,
+                    swap_chain: 0xabc0,
+                }),
+            },
+            Raw::Present {
+                stage: stage(State::Loading, 9, Drew::Pending),
+                at: TimeUs(5_166),
+                unpresented: 2,
+                stamps: None,
+            },
+            Raw::Mark(Mark {
+                kind: MarkKind::Hold(Some(HoldEnd::Skin)),
+                from: TimeUs(4_000),
+                to: TimeUs(5_000),
+            }),
+            Raw::PlayEnded(TimeUs(6_000)),
+            Raw::ResultTaken(TimeUs(6_500)),
+        ];
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 40_000,
+            pid: 77,
+        };
+        let marks = [(900, "decision-end", 3), (5_500, "refusal", 0)];
+        assert_eq!(
+            run_record_lines(header, &raw, &marks, Some(61_000), (0, 1)),
+            [
+                "run qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "present 50000 50120 0xabc0 1000 decision 3 skin 0",
+                "present - - - 5166 loading 9 pending 2",
+                "mark hold 4000 5000 skin",
+                "play-ended 6000",
+                "result-taken 6500",
+                "game 900 decision-end 3",
+                "game 5500 refusal 0",
+                "close 61000",
+                "lost render 0 game 1",
+            ]
+        );
+        assert_eq!(
+            run_record_lines(header, &[], &[], None, (2, 0)),
+            [
+                "run qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "close none",
+                "lost render 2 game 0",
+            ]
+        );
+    }
+
+    /// The recorder keeps a stamped frame's stamps in its raw record.
+    #[test]
+    fn a_stamped_frame_keeps_its_stamps() {
+        let book = Transitions::with_capacity(4);
+        let mut r = Recorder::new(book.clone());
+        let stamps = render::PresentStamps {
+            pre_qpc: 7,
+            post_qpc: 9,
+            swap_chain: 0x10,
+        };
+        r.frame_stamped(
+            stage(State::Selection, 1, Drew::Skin),
+            TimeUs(3),
+            None,
+            Some(stamps),
+        );
+        let raw = book.hold().raw.clone();
+        assert!(
+            matches!(raw.as_slice(), [super::Raw::Present { stamps: Some(s), .. }] if *s == stamps),
+            "{raw:?}"
+        );
+    }
+
+    /// The first close is kept: a later one leaves it.
+    #[test]
+    fn the_first_close_is_kept() {
+        assert_eq!(super::close_qpc(), None);
+        super::close_stamp();
+        let first = super::close_qpc().expect("stamped");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        super::close_stamp();
+        assert_eq!(super::close_qpc(), Some(first));
+    }
+
+    /// The game thread's marks are kept once started, with their tags and
+    /// values, and none before.
+    #[test]
+    fn game_marks_are_kept_once_started() {
+        super::game_mark("decision-end", TimeUs(10), 1);
+        assert!(
+            super::GAME_MARKS.marks().0.is_empty(),
+            "none before the start"
+        );
+        super::start_game_marks(input::QpcClock::start());
+        super::game_mark("decision-end", TimeUs(1_250), 4);
+        super::game_mark_now("refusal", 0);
+        let (marks, lost) = super::GAME_MARKS.marks();
+        assert_eq!(lost, 0);
+        let tags: Vec<_> = marks.iter().map(|&(_, t, v)| (t, v)).collect();
+        assert_eq!(tags, [("decision-end", 4), ("refusal", 0)]);
+        assert_eq!(marks.first().map(|m| m.0), Some(1_250));
     }
 }

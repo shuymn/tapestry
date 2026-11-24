@@ -2389,9 +2389,12 @@ impl FrameSink for ScenarioFrames {
             self.recorder.unpresented();
             return;
         }
-        let change = self
-            .recorder
-            .frame(drawn.stage, drawn.presented_at, drawn.hold);
+        let change = self.recorder.frame_stamped(
+            drawn.stage,
+            drawn.presented_at,
+            drawn.hold,
+            screen.present_stamps(),
+        );
         self.frame = self.frame.wrapping_add(1);
         // The first presented frame after a change: this frame, read back
         // now. Past the cap, the change is counted and not read back.
@@ -3037,6 +3040,7 @@ fn select_args(
             shot_pipe: None,
             freeze_skin_clock: false,
             upload_slice_us: None,
+            transitions: None,
             size: None,
             window: None,
             scenario: Some(session),
