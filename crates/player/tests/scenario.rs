@@ -929,6 +929,85 @@ fn a_headless_play_takes_a_size() {
     assert!(seen > 0);
 }
 
+/// Each chart slot's lag in a capture's sidecar `side`: the chart time of
+/// the play frame it was seen on and the lag, µs (`None` for none).
+fn side_chart_lag(side: &str) -> Vec<Option<(i64, i64)>> {
+    let key = "\"chart_lag\":[";
+    let from = side
+        .find(key)
+        .unwrap_or_else(|| panic!("chart_lag in {side}"))
+        + key.len();
+    let mut out = Vec::new();
+    let mut rest = &side[from..];
+    loop {
+        if let Some(r) = rest.strip_prefix("null") {
+            out.push(None);
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r.find(']').unwrap();
+            let (at, lag) = r[..end].split_once(',').unwrap();
+            out.push(Some((at.parse().unwrap(), lag.parse().unwrap())));
+            rest = &r[end + 1..];
+        }
+        match rest.strip_prefix(',') {
+            Some(r) => rest = r,
+            None => break,
+        }
+    }
+    assert!(rest.starts_with(']'), "chart_lag in {side}");
+    out
+}
+
+/// A fixture's whole folder copied under the target's test temp folder,
+/// named `name` and the time, when the test fails or
+/// `TAPESTRY_SCENARIO_KEEP` is set: the run's captures, display lists,
+/// measure and output stay to be read. Declared after its fixture, so it
+/// copies before the fixture's folder is removed.
+struct KeepOnFailure {
+    root: PathBuf,
+    name: &'static str,
+}
+
+impl KeepOnFailure {
+    fn of(fx: &Fixture, name: &'static str) -> Self {
+        Self {
+            root: fx._dir.path().to_path_buf(),
+            name,
+        }
+    }
+}
+
+impl Drop for KeepOnFailure {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && std::env::var_os("TAPESTRY_SCENARIO_KEEP").is_none() {
+            return;
+        }
+        fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(to)?;
+            for e in fs::read_dir(from)? {
+                let e = e?;
+                let (path, into) = (e.path(), to.join(e.file_name()));
+                if e.file_type()?.is_dir() {
+                    copy(&path, &into)?;
+                } else {
+                    fs::copy(&path, &into)?;
+                }
+            }
+            Ok(())
+        }
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let to = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("kept")
+            .join(format!("{}-{ms}", self.name));
+        match copy(&self.root, &to) {
+            Ok(()) => eprintln!("kept the fixture at {}", to.display()),
+            Err(e) => eprintln!("keeping the fixture at {} failed: {e}", to.display()),
+        }
+    }
+}
+
 /// `key` of a sidecar's JSON, as written.
 fn side_value(side: &str, key: &str) -> String {
     let rest = side
@@ -5494,11 +5573,14 @@ fn chart_video_frames_follow_chart_time_in_a_scenario() {
 /// missed note, and two skin movies, each through the media worker. The
 /// play's measure counts frames taken into each of the four slots and the
 /// restart, and the capture in the poor window draws the base's video
-/// alone. Its positive control: the BGA's draw made to allocate
-/// (dev-tools) is counted.
+/// alone. It prints how late each chart slot's picture was, the largest
+/// over the play and on each capture, and keeps its folder when it fails.
+/// Its positive control: the BGA's draw made to allocate (dev-tools) is
+/// counted.
 #[test]
 fn render_app_zero_with_video_bga() {
     let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "render_app_zero_with_video_bga");
     let dir = fx.library().join("w");
     fs::create_dir_all(&dir).unwrap();
     write_wav(&dir.join("key.wav"));
@@ -5560,8 +5642,13 @@ fn render_app_zero_with_video_bga() {
             .unwrap()
     };
     let (out, stdout, stderr) = fx.run_drained(&mut fx.command(&plays("all")), RUN_LIMIT);
+    fs::write(fx.base.join("all.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    let m = measured(&fx);
+    let mut m = measured(&fx);
+    let lag = m
+        .remove("chart_lag")
+        .expect("the chart slots' lag measured");
+    let largest = &lag["largest"];
     assert!(int(&m, "render_cpu_us", "count").unwrap() > 0, "{m:?}");
     assert_eq!(int(&m, "allocations", "render_app"), Some(0), "{m:?}");
     let takes: Vec<i64> = m["movies"]["takes"]
@@ -5593,17 +5680,44 @@ fn render_app_zero_with_video_bga() {
     };
     assert_eq!(movie_slots("c1000"), [0, 1, 2, 3]);
     assert_eq!(movie_slots("c2400"), [0, 1, 2]);
+    // How late each chart slot's picture was: the largest over the play,
+    // and on each captured frame, the base's (slot 2) bound to it by its
+    // chart time.
+    let lag_at = |name: &str| {
+        let side = fs::read_to_string(all.join(format!("{name}.json"))).unwrap();
+        let lags = side_chart_lag(&side);
+        let t = side_num(&side, "chart_us");
+        assert_eq!(lags.len(), 2, "{name}: {side}");
+        assert_eq!(
+            lags[0].map(|(at, _)| at),
+            Some(t),
+            "{name}: the base's lag seen on the captured frame: {side}"
+        );
+        lags
+    };
+    let lags = [("c1000", lag_at("c1000")), ("c2400", lag_at("c2400"))];
+    println!("chart lag: largest {largest}, at the captures {lags:?}");
     // The poor window's pixels are the base's clip's: its index due then.
     let t = chart_us(&all, "c2400");
     let got = coded_index(&rgb(&all.join("c2400.png")), 8);
-    assert_eq!(got, due_frame(t, 30), "c2400 at {t}: the base's clip");
+    assert_eq!(
+        got,
+        due_frame(t, 30),
+        "c2400 at {t}: the base's clip; lag at the captures {lags:?}, largest {largest}"
+    );
     let (out, stdout, stderr) = fx.run_drained(
         fx.command(&plays("control"))
             .env("TAPESTRY_DEV_BGA_ALLOCATE", "1"),
         RUN_LIMIT,
     );
+    fs::write(
+        fx.base.join("control.out.txt"),
+        format!("{stdout}\n{stderr}"),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    let m = measured(&fx);
+    let mut m = measured(&fx);
+    m.remove("chart_lag");
     assert!(
         int(&m, "allocations", "render_app").unwrap() > 0,
         "the positive control is counted: {m:?}"

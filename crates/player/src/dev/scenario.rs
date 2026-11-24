@@ -2785,6 +2785,16 @@ fn sidecar(
         }
         _ => String::new(),
     };
+    // Each chart slot's latest lag: the chart time of the play frame it was
+    // seen on, which a capture of that frame matches, and the lag, µs.
+    let chart_lag = skin_model::movie::CHART_SLOTS
+        .iter()
+        .map(|&i| {
+            crate::movie_frame::counts::latest(i)
+                .map_or_else(|| "null".to_owned(), |(at, lag)| format!("[{at},{lag}]"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
@@ -2816,7 +2826,7 @@ fn sidecar(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
          \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"screen_us\":{},\"completed_us\":{},\
-         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen},{decision}{transition}}}\n",
+         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},\"chart_lag\":[{chart_lag}],{screen},{decision}{transition}}}\n",
         axis.name(),
         axis.target(),
         phase(drawn),

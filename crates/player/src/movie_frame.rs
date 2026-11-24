@@ -241,15 +241,112 @@ const RUN_WINDOW: Window = Window {
 /// frames taken into its planes, the chart videos' restarts, and the
 /// frames a chart slot took from a run it restarted. A play's measure
 /// reports them from its start ([`crate::measure`]).
+///
+/// It also keeps how late each chart slot's picture is, from the play's
+/// chart videos being set ([`super::Movies::set_chart`]) or its measure
+/// starting, whichever is later: on each play
+/// frame that shows a frame of the run playing, its lag, the media time
+/// due less the stamp of the frame shown (under one frame's duration when
+/// the ring held the frame due). The first [`LAG_SAMPLES`] are kept in
+/// order, each slot's largest and latest besides; fixed statics written by
+/// the render thread alone, so recording allocates nothing.
 #[cfg(feature = "dev-tools")]
 pub mod counts {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
     use skin_model::movie::SLOTS;
 
     static TAKES: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
     static RESTARTS: AtomicU64 = AtomicU64::new(0);
     static RESTARTED_TAKES: AtomicU64 = AtomicU64::new(0);
+
+    /// How many lag samples a play keeps.
+    pub const LAG_SAMPLES: usize = 8192;
+    /// Each kept sample: slot, chart time, media time due, stamp shown.
+    static SAMPLES: [[AtomicI64; 4]; LAG_SAMPLES] =
+        [const { [const { AtomicI64::new(0) }; 4] }; LAG_SAMPLES];
+    static SAMPLED: AtomicUsize = AtomicUsize::new(0);
+    /// Samples past [`LAG_SAMPLES`], not kept.
+    static OVER: AtomicU64 = AtomicU64::new(0);
+    /// Each slot's latest and largest lag: its chart time and lag,
+    /// `i64::MIN` for none.
+    static LATEST: [[AtomicI64; 2]; SLOTS] =
+        [const { [const { AtomicI64::new(i64::MIN) }; 2] }; SLOTS];
+    static LARGEST: [[AtomicI64; 2]; SLOTS] =
+        [const { [const { AtomicI64::new(i64::MIN) }; 2] }; SLOTS];
+
+    /// A play's chart slot lags ([`lags`]).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Lags {
+        /// Each slot's largest lag: its chart time and lag, µs.
+        pub largest: [Option<(i64, i64)>; SLOTS],
+        /// The kept samples in order: slot, chart time, media time due,
+        /// stamp shown.
+        pub samples: Vec<[i64; 4]>,
+        /// The samples past those kept.
+        pub over: u64,
+    }
+
+    /// A play starts, or its chart videos were set: no lag recorded yet.
+    pub fn lag_reset() {
+        SAMPLED.store(0, Ordering::Release);
+        OVER.store(0, Ordering::Relaxed);
+        for [at, lag] in LATEST.iter().chain(&LARGEST) {
+            at.store(i64::MIN, Ordering::Relaxed);
+            lag.store(i64::MIN, Ordering::Relaxed);
+        }
+    }
+
+    /// Slot `i` shows the frame stamped `stamp` at chart time `at`, media
+    /// time `due` being due.
+    pub(super) fn lag(i: usize, at: i64, due: i64, stamp: i64) {
+        let lag = due.saturating_sub(stamp);
+        if let Some([a, l]) = LATEST.get(i) {
+            a.store(at, Ordering::Relaxed);
+            l.store(lag, Ordering::Relaxed);
+        }
+        if let Some([a, l]) = LARGEST.get(i)
+            && lag > l.load(Ordering::Relaxed)
+        {
+            a.store(at, Ordering::Relaxed);
+            l.store(lag, Ordering::Relaxed);
+        }
+        let n = SAMPLED.load(Ordering::Relaxed);
+        if let Some([s, a, d, t]) = SAMPLES.get(n) {
+            s.store(i64::try_from(i).unwrap_or(-1), Ordering::Relaxed);
+            a.store(at, Ordering::Relaxed);
+            d.store(due, Ordering::Relaxed);
+            t.store(stamp, Ordering::Relaxed);
+            SAMPLED.store(n + 1, Ordering::Release);
+        } else {
+            OVER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Slot `i`'s latest lag: its chart time and lag, µs.
+    pub fn latest(i: usize) -> Option<(i64, i64)> {
+        let [a, l] = LATEST.get(i)?;
+        let (a, l) = (a.load(Ordering::Relaxed), l.load(Ordering::Relaxed));
+        (l != i64::MIN).then_some((a, l))
+    }
+
+    /// The lags recorded since the chart videos were set (allocates: read
+    /// once the play ended).
+    pub fn lags() -> Lags {
+        let n = SAMPLED.load(Ordering::Acquire);
+        Lags {
+            largest: LARGEST.each_ref().map(|[a, l]| {
+                let (a, l) = (a.load(Ordering::Relaxed), l.load(Ordering::Relaxed));
+                (l != i64::MIN).then_some((a, l))
+            }),
+            samples: SAMPLES
+                .iter()
+                .take(n)
+                .map(|s| s.each_ref().map(|v| v.load(Ordering::Relaxed)))
+                .collect(),
+            over: OVER.load(Ordering::Relaxed),
+        }
+    }
 
     /// A frame taken into slot `i`'s planes.
     pub(super) fn took(i: usize) {
@@ -488,7 +585,10 @@ impl<S: Source> Movies<S> {
         self.videos = Some(videos);
         self.boundary = boundary;
         #[cfg(feature = "dev-tools")]
-        CHART_LOST_AT.store(i64::MIN, std::sync::atomic::Ordering::Release);
+        {
+            CHART_LOST_AT.store(i64::MIN, std::sync::atomic::Ordering::Release);
+            counts::lag_reset();
+        }
     }
 
     /// Wakes the media session through `waker` when a chart video wants a
@@ -1124,6 +1224,14 @@ impl<S: Source> Movies<S> {
             Chart::Restarting { run, hold, .. } => hold || slot.held.is_some_and(|h| h.run == run),
             Chart::Unstaged | Chart::Waiting { .. } | Chart::Ended => false,
         };
+        #[cfg(feature = "dev-tools")]
+        if let (Chart::Playing { run, .. }, Some(due), Some(c), Some(h)) =
+            (slot.chart, due, at, slot.held)
+            && h.run == run
+            && slot.shown
+        {
+            counts::lag(i, c.now, due, h.stamp);
+        }
         if shows && slot.shown {
             MovieShow::Frame {
                 uv: render::VIDEO_UV,
