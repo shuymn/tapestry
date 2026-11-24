@@ -7645,7 +7645,7 @@ impl Run {
             // The select screen is left: its frames are reported; and the
             // loading state's, once it is left.
             #[cfg(feature = "dev-tools")]
-            if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_) | RenderMsg::PracticePage(_))) {
+            if msg.is_ok() && !Self::keeps_select(&msg) {
                 self.menu_stats.report("select");
             }
             #[cfg(feature = "dev-tools")]
@@ -10294,6 +10294,18 @@ impl Run {
     /// which ends READY's cutoff (design.md "Memory Budget", its end):
     /// a loading lifetime's lines only for another lifetime than the one
     /// ended or paused last, whose sinks may still report late.
+    /// Whether `msg` keeps the select screen (dev-tools): a page of it, the
+    /// practice page, or a move of its cursor. Any other message leaves it,
+    /// and its frames are reported then, once: a report per scroll step
+    /// would write a line on the render thread while the list scrolls.
+    #[cfg(feature = "dev-tools")]
+    const fn keeps_select(msg: &Result<RenderMsg, TryRecvError>) -> bool {
+        matches!(
+            msg,
+            Ok(RenderMsg::Menu(_) | RenderMsg::PracticePage(_) | RenderMsg::SelectionChanged)
+        )
+    }
+
     /// Whether `msg` is another screen's, which ends a result hold still
     /// held (a screen built again keeps it).
     const fn ends_result_hold(msg: &Result<RenderMsg, TryRecvError>) -> bool {

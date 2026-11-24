@@ -469,6 +469,27 @@ fn a_when_timer_restarts_at_each_entry_and_survives_a_screen_built_again() {
     link.exit();
 }
 
+/// The select screen's frames are reported once it is left, not at each
+/// move of its cursor (dev-tools): a scroll keeps the screen, so the render
+/// thread writes no report line while the list scrolls.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_scroll_keeps_the_select_screens_frames_unreported() {
+    use std::sync::mpsc::TryRecvError;
+
+    use super::super::{RenderMsg, Run};
+    let keeps = |m: RenderMsg| Run::keeps_select(&Ok(m));
+    assert!(keeps(RenderMsg::SelectionChanged));
+    assert!(keeps(RenderMsg::Menu(Box::default())));
+    assert!(keeps(RenderMsg::PracticePage(Box::default())));
+    assert!(!keeps(RenderMsg::Loading(1)));
+    assert!(!keeps(RenderMsg::Decision {
+        page: Box::default(),
+        shown: None,
+    }));
+    assert!(!Run::keeps_select(&Err(TryRecvError::Empty)));
+}
+
 #[cfg(feature = "dev-tools")]
 mod images;
 #[cfg(feature = "dev-tools")]
