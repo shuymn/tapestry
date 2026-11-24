@@ -4185,12 +4185,7 @@ impl AppRig for PlayerRig<'_> {
         // The decision's effective end: its choice, the scene and the
         // fade-out (a run record's mark).
         #[cfg(feature = "dev-tools")]
-        if let Some(end) = d.deadline() {
-            let lifetime = d
-                .lifetime()
-                .map_or(0, |l| i64::try_from(l.0).unwrap_or(i64::MAX));
-            crate::dev::transitions::game_mark("decision-end", end, lifetime);
-        }
+        crate::dev::transitions::mark_decision_end(&d);
         self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         // The decision sound, once per decision screen whichever
@@ -4229,6 +4224,11 @@ impl AppRig for PlayerRig<'_> {
     /// skin, once.
     fn take_decision_takeover(&mut self) -> Option<game::DecisionTakeover> {
         self.render.take_decision_takeover()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn decision_revised(&mut self, d: &game::Decision) {
+        crate::dev::transitions::mark_decision_end(d);
     }
 
     fn screen_load_failed(&mut self) -> Option<ScreenError> {
@@ -6321,6 +6321,7 @@ pub(crate) mod tests {
             crate::render_side::tests::Installers::default().spawn_bare(),
             input::QpcClock::start(),
             |rig, _, end| {
+                crate::dev::transitions::start_game_marks(input::QpcClock::start());
                 rig.selection = Some(sel);
                 let (thread, _jobs, _waker, _clock) = input_thread(end);
                 let origin = rig.clock.now();
@@ -6363,6 +6364,19 @@ pub(crate) mod tests {
                 assert_eq!(d.origin(), origin);
                 assert_eq!(d.left(), None);
                 assert_eq!(rig.render.take_decision_takeover(), None, "taken twice");
+                // The run record's decision end follows the moved deadline.
+                let last = crate::dev::transitions::kept_game_marks()
+                    .into_iter()
+                    .rev()
+                    .find(|m| m.1 == "decision-end");
+                assert_eq!(
+                    last,
+                    Some((
+                        u64::try_from(origin.0 + 1_500_000).unwrap(),
+                        "decision-end",
+                        4
+                    ))
+                );
                 thread.stop().unwrap();
             },
         );

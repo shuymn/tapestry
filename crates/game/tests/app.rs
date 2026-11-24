@@ -517,6 +517,10 @@ struct Headless {
     takeover_due: Option<(i64, DecisionLifetime)>,
     /// Each takeover taken: the clock and the origin of the look before it.
     takeovers_taken: Vec<(i64, Option<game::Origin>)>,
+    /// The deadlines a takeover moved, as [`AppRig::decision_revised`]
+    /// reported them (development builds).
+    #[cfg(feature = "dev-tools")]
+    revised: Vec<Option<TimeUs>>,
     /// Back pressed this long (ms) after the next choice, as its press is
     /// observed.
     escape_in: Option<i64>,
@@ -815,6 +819,8 @@ impl Headless {
             takeover_in: None,
             takeover_due: None,
             takeovers_taken: Vec::new(),
+            #[cfg(feature = "dev-tools")]
+            revised: Vec::new(),
             escape_in: None,
             escape_due: None,
             escapes_taken: Vec::new(),
@@ -1657,6 +1663,11 @@ impl AppRig for Headless {
 
     fn take_decision_takeover(&mut self) -> Option<DecisionTakeover> {
         self.due_takeover()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn decision_revised(&mut self, d: &Decision) {
+        self.revised.push(d.deadline());
     }
 
     fn entered_decision(&mut self, pick: &Pick, mut d: Decision) -> Decision {
@@ -6332,6 +6343,29 @@ fn takeover_before_builtin_time_ends_at_1500() {
     );
     assert_eq!(one_step(&rig) - choice, 1_500 * MS);
     assert_eq!(rig.decisions.len(), 1, "no second decision screen");
+}
+
+/// A takeover App's look takes reports the deadline it moved to, the
+/// choice plus 1,500 ms (development builds: a run record's mark); one of
+/// another lifetime reports nothing.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_takeover_reports_the_moved_deadline() {
+    let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        skinned(rig);
+        rig.takeover_in = Some((1_000, 0));
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 0);
+    assert_eq!(rig.revised, [Some(TimeUs(choice + 1_500 * MS))]);
+    let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        skinned(rig);
+        rig.takeover_in = Some((1_000, 1));
+    });
+    ran.unwrap();
+    assert!(rig.revised.is_empty(), "{:?}", rig.revised);
 }
 
 /// The hold of a practice page's entry takes a takeover at its next look:

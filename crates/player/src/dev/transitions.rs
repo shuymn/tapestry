@@ -934,6 +934,18 @@ pub fn game_mark(tag: &'static str, at: TimeUs, value: i64) {
     GAME_MARKS.mark_at(tag, at, value);
 }
 
+/// Marks the decision screen's effective end, its deadline, with its
+/// lifetime: at its entry and again at a takeover that moves the deadline,
+/// the last mark of a lifetime being the one in force.
+pub fn mark_decision_end(d: &game::Decision) {
+    if let Some(end) = d.deadline() {
+        let lifetime = d
+            .lifetime()
+            .map_or(0, |l| i64::try_from(l.0).unwrap_or(i64::MAX));
+        game_mark("decision-end", end, lifetime);
+    }
+}
+
 /// Marks `tag` now with `value` ([`game_mark`]).
 pub fn game_mark_now(tag: &'static str, value: i64) {
     GAME_MARKS.mark(tag, value);
@@ -1511,6 +1523,46 @@ mod tests {
         assert_eq!((f[0], f[2]), ("end", "ok"), "{last}");
         assert!(f[1].parse::<i64>().unwrap() >= before, "{last}");
         assert!(text.ends_with('\n'));
+    }
+
+    /// The decision's end is marked with its lifetime, and marked again
+    /// when a takeover moves its deadline.
+    #[test]
+    fn the_decision_s_end_is_marked_again_when_it_moves() {
+        super::start_game_marks(input::QpcClock::start());
+        let lifetime = game::DecisionLifetime(6);
+        let mut d = game::Decision::begin(
+            TimeUs(1_000),
+            lifetime,
+            Some(game::DecisionShown::Skin {
+                slot: 0,
+                generation: 1,
+                scene: TimeUs(2_500_000),
+                fadeout: TimeUs(500_000),
+            }),
+            false,
+        );
+        super::mark_decision_end(&d);
+        assert!(d.apply_takeover(
+            game::DecisionTakeover {
+                lifetime,
+                at: TimeUs(2_000),
+                why: "refused".to_owned(),
+            },
+            TimeUs(2_000),
+        ));
+        super::mark_decision_end(&d);
+        let marks: Vec<_> = super::kept_game_marks()
+            .iter()
+            .map(|m| (m.0, m.1, m.2))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                (3_001_000, "decision-end", 6),
+                (1_501_000, "decision-end", 6)
+            ]
+        );
     }
 
     /// The recorder keeps a stamped frame's stamps in its raw record.

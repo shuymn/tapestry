@@ -447,7 +447,15 @@ impl Controls {
         // The decision skin's takeover, as App's look takes it: before the
         // classification, so the deadline then in force is judged.
         if let Some(takeover) = w.screen.as_ref().and_then(|s| s.take_decision_takeover()) {
-            let _ = w.decision.apply_takeover(takeover, now);
+            let applied = w.decision.apply_takeover(takeover, now);
+            // The deadline it moved, the decision's end in force (a run
+            // record's mark).
+            #[cfg(feature = "dev-tools")]
+            if applied {
+                crate::dev::transitions::mark_decision_end(&w.decision);
+            }
+            #[cfg(not(feature = "dev-tools"))]
+            let _ = applied;
         }
         let lifetime = w.decision.lifetime();
         let seen = w.decision.classify(w.origin, now, terminal, false, None);
