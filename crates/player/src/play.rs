@@ -3540,6 +3540,7 @@ impl Rig for PlayerRig<'_> {
     }
 
     #[cfg(feature = "dev-tools")]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
         crate::dev::transitions::game_mark("play-fade-end", to, from.0);
     }

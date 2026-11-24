@@ -52,6 +52,7 @@ pub struct PresentStamps {
 
 /// The host counter now, raw QPC ticks.
 #[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub fn qpc_now() -> i64 {
     let mut ticks = 0;
     // SAFETY: writes one i64; the counter cannot fail on Windows XP and
