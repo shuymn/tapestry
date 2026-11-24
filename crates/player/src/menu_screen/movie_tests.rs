@@ -898,7 +898,7 @@ pub(crate) fn bga_pixels(
         assert!(std::time::Instant::now() < end, "never ready");
         // A frame boundary: the staging's upload steps, then the movies'
         // admission.
-        let _ = s.upload_boundary(&mut || false);
+        let _ = s.upload_boundary(&mut || false, render::UPLOAD_TIME_SLICE);
         s.wait_step(std::time::Duration::from_millis(10)).unwrap();
         s.movie_boundary();
     };

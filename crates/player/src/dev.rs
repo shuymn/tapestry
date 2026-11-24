@@ -788,6 +788,22 @@ fn start(p: &mut lexopt::Parser) -> Result<TimeUs, UsageError> {
     ms.checked_mul(1_000).map(TimeUs).ok_or_else(bad)
 }
 
+/// The uploader's slice pinned for the run, µs; 0 for none
+/// (`--dev-upload-slice-us`).
+static UPLOAD_SLICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pins the uploader's slice of every frame boundary to `us` µs for the
+/// rest of the run (`--dev-upload-slice-us`).
+pub fn pin_upload_slice(us: u64) {
+    UPLOAD_SLICE_US.store(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The uploader's slice pinned for the run, if any.
+pub fn pinned_upload_slice() -> Option<std::time::Duration> {
+    let us = UPLOAD_SLICE_US.load(std::sync::atomic::Ordering::Relaxed);
+    (us > 0).then(|| std::time::Duration::from_micros(us))
+}
+
 /// The value of `--dev-render-timeout`, in seconds.
 fn render_timeout(p: &mut lexopt::Parser) -> Result<std::time::Duration, UsageError> {
     let secs = p
@@ -839,6 +855,11 @@ pub struct SelectOptions {
     /// (`--dev-freeze-skin-clock`, [`skin_clock`]): a test device's shots
     /// of the select screen are then the same frame in every run.
     pub freeze_skin_clock: bool,
+    /// The uploader's slice every frame boundary takes, µs, in place of
+    /// the one scaled to the refresh rate (`--dev-upload-slice-us <µs>`,
+    /// [`pin_upload_slice`]): the fixed baseline the scaled slice is
+    /// measured against.
+    pub upload_slice_us: Option<u64>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -883,6 +904,17 @@ impl SelectOptions {
                 self.shot_pipe = Some(name);
             }
             "dev-freeze-skin-clock" => self.freeze_skin_clock = true,
+            "dev-upload-slice-us" => {
+                let us = p
+                    .value()?
+                    .to_string_lossy()
+                    .parse()
+                    .ok()
+                    .filter(|&us| us > 0);
+                self.upload_slice_us = Some(us.ok_or_else(|| {
+                    UsageError::Usage("--dev-upload-slice-us takes microseconds".to_owned())
+                })?);
+            }
             "dev-speculative-permits" => {
                 let n = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-speculative-permits takes a count".to_owned())

@@ -1476,16 +1476,18 @@ impl Screen for MenuScreen {
         self.renderer.stage_bga_cells(key, cells)
     }
 
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
         // The attempt's images first; a result view's while it has none.
         let attempt = self.chart.is_some();
         let chart = match (&mut self.chart, &mut self.result_chart) {
             (Some((up, set)), _) | (None, Some((up, set))) => Some((up, set.fitted())),
             (None, None) => None,
         };
-        let mut up = self
-            .renderer
-            .upload_boundary_within(render::UPLOAD_TIME_SLICE, past, chart);
+        let mut up = self.renderer.upload_boundary_within(slice, past, chart);
         if attempt {
             if up.chart.is_some() {
                 self.chart = None;
@@ -1999,9 +2001,8 @@ impl Screen for MenuScreen {
     }
 
     #[cfg(all(test, feature = "dev-tools"))]
-    fn freeze_write_slice(&mut self, on: bool) {
-        self.renderer
-            .set_write_slice_clock(on.then_some(std::time::Duration::ZERO));
+    fn set_slice_clock(&mut self, clock: Option<std::sync::Arc<dyn bms_model::TimeSource>>) {
+        self.renderer.set_slice_clock(clock);
     }
 
     #[cfg(all(test, feature = "dev-tools"))]

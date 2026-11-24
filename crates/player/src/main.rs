@@ -65,6 +65,7 @@ mod preview_graphs;
 mod priority;
 #[cfg(feature = "dev-tools")]
 mod recording;
+mod refresh_rate;
 mod render_side;
 mod result_input;
 mod result_present;
@@ -1806,6 +1807,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     if s.dev.freeze_skin_clock {
         dev::skin_clock::freeze();
+    }
+    // The uploader's slice pinned for a baseline run
+    // (`--dev-upload-slice-us`).
+    #[cfg(feature = "dev-tools")]
+    if let Some(us) = s.dev.upload_slice_us {
+        dev::pin_upload_slice(us);
     }
     #[cfg(feature = "dev-tools")]
     let shot_tap = s.dev.shot_pipe.clone().map(|name| {

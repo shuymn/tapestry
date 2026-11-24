@@ -11,7 +11,8 @@
 //! it first.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(any(test, feature = "dev-tools"))]
+use std::time::Instant;
 
 use skin_model::PackedPages;
 
@@ -231,15 +232,10 @@ impl Renderer {
     /// A refusal retires the upload and is reported at the boundary.
     pub(super) fn write_pages_step(
         &mut self,
-        started: Instant,
-        steps: u32,
-        slice: Duration,
+        budget: bms_model::Deadline,
         past: &mut dyn crate::UploadGate,
     ) -> super::AtlasStep {
-        #[cfg(not(test))]
-        let _ = steps;
-        #[cfg(test)]
-        let cost = self.step_cost.get();
+        let clock = self.slice_source();
         #[cfg(test)]
         let (write_fault, submit_fault, submits, counts) = (
             self.step_write_fault,
@@ -257,13 +253,6 @@ impl Renderer {
             return super::AtlasStep::Nothing;
         }
         let (atlas, writes) = (&up.res.atlas, &mut up.writes);
-        let elapsed = || {
-            #[cfg(test)]
-            if let Some(each) = cost {
-                return each.saturating_mul(steps);
-            }
-            started.elapsed()
-        };
         let (submitted, refused) = skin_atlas::scoped(gpu.device(), || {
             #[cfg(test)]
             if let Some(f) = write_fault {
@@ -275,7 +264,7 @@ impl Renderer {
             }
             let (n, staged) =
                 super::atlas_writes(gpu, atlas, writes, past, crate::Payload::Pages, || {
-                    elapsed() >= slice
+                    budget.passed(clock.now())
                 });
             if n == 0 {
                 return None;

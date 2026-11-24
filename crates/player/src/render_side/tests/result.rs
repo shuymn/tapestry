@@ -331,7 +331,15 @@ impl Screen for Recorded {
             Err(e) => Err(e),
         })
     }
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+    #[cfg(feature = "dev-tools")]
+    fn set_slice_clock(&mut self, clock: Option<Arc<dyn bms_model::TimeSource>>) {
+        self.menu.set_slice_clock(clock);
+    }
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
         let setups = std::mem::take(&mut *self.faults.on_renderer.lock().unwrap());
         for f in setups {
             f(self.menu.renderer_mut());
@@ -341,7 +349,7 @@ impl Screen for Recorded {
         {
             self.menu.renderer_mut().gpu().device().destroy();
         }
-        let up = self.menu.upload_boundary(past);
+        let up = self.menu.upload_boundary(past, slice);
         let (log, _) = self.menu.renderer_mut().step_log();
         log.clone_into(
             &mut self

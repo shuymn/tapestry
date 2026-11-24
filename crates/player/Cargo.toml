@@ -39,7 +39,6 @@ dev-tools = [
     "windows/Win32_Devices_HumanInterfaceDevice",
     "windows/Win32_Devices_Properties",
     "windows/Win32_Devices_Usb",
-    "windows/Win32_Graphics_Gdi",
     "windows/Win32_Security",
     "windows/Win32_Security_Cryptography",
     "windows/Win32_System_IO",
@@ -80,7 +79,9 @@ toml = { workspace = true, optional = true }
 windows = { workspace = true, features = [
     "Wdk_Foundation",
     "Wdk_System_Threading",
+    "Win32_Devices_Display",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
@@ -100,6 +101,7 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 winit.workspace = true

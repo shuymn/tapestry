@@ -346,8 +346,12 @@ impl Screen for Recorder {
     ) -> Option<Result<Preparation, RenderError>> {
         self.menu.prepare_attempt(a, skin, request, lifetime)
     }
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-        self.menu.upload_boundary(past)
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
+        self.menu.upload_boundary(past, slice)
     }
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
