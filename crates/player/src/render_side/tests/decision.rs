@@ -1715,9 +1715,12 @@ fn restore_refusal_notice_stands_before_the_takeover() {
     // The rebuild asks from the test thread; a helper meets the render
     // thread at the rows and then at the notice, and notes what it finds
     // there before letting it go.
-    // The screen fails (its failure wakes the game), then is built again.
+    // The screen fails, then is built again. The failure is latched before
+    // its wake is sent, so the wakes are counted only once that wake came.
+    let before_failure = woken.load(Ordering::Acquire);
     rig.seen.fail.store(true, Ordering::Release);
-    assert!(wait_until(|| rig.link.failed()));
+    assert!(wait_until(|| woken.load(Ordering::Acquire) > before_failure));
+    assert!(rig.link.failed());
     rig.seen.fail.store(false, Ordering::Release);
     let failed_wakes = woken.load(Ordering::Acquire);
     let seen = Arc::clone(&rig.seen);
