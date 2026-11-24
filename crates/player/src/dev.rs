@@ -3193,17 +3193,26 @@ pub fn current_load() -> u64 {
 
 /// Stamps stage `name` now into load `load`, the one a step began in
 /// ([`current_load`]): nothing when a later choice has begun another, so
-/// a step of a load left behind stamps nothing into the next.
+/// a step of a load left behind stamps nothing into the next. The check
+/// and the stamp are one step under the stages' lock, so a choice that
+/// begins meanwhile waits for the stamp.
 pub fn stage_of(name: &'static str, load: u64) {
-    if load_stages().load == load {
-        stage_at(name, None);
+    let mut s = load_stages();
+    if s.load == load {
+        #[cfg(test)]
+        tests::checked();
+        stamp(&mut s, name, None);
     }
 }
 
 /// Stamps stage `name` at `at` (now when `None`): a start keeps its first
 /// stamp, anything else its last.
 pub fn stage_at(name: &'static str, at: Option<TimeUs>) {
-    let mut s = load_stages();
+    stamp(&mut load_stages(), name, at);
+}
+
+/// [`stage_at`] on the stages `s` the caller holds.
+fn stamp(s: &mut LoadStages, name: &'static str, at: Option<TimeUs>) {
     let Some((clock, chosen)) = s.since else {
         return;
     };
@@ -3444,7 +3453,59 @@ pub fn refuse_result_staging() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Mutex, PoisonError, TryLockError};
+    use std::time::Duration;
+
     use super::{adler32, crc32, png, read_bounded, read_limited};
+
+    /// The pause [`super::stage_of`] takes once, after its load check
+    /// passed, when a test set it: it says so, then waits to go on.
+    static PAUSE: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+    pub(super) fn checked() {
+        let pause = PAUSE.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some((checked, go)) = pause {
+            let _ = checked.send(());
+            let _ = go.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
+    /// A choice begun while a stage of the load before is being stamped
+    /// takes none of it: paused between its load check and its stamp, the
+    /// stamp still holds the stages, so the choice begins after it.
+    #[test]
+    fn a_choice_begun_during_a_stamp_takes_none_of_it() {
+        use super::{QpcClock, TimeSource as _, current_load, stage_of, stages_begin};
+        let clock = QpcClock::start();
+        stages_begin(clock, clock.now());
+        let before = current_load();
+        let (checked_tx, checked_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        *PAUSE.lock().unwrap() = Some((checked_tx, go_rx));
+        let stamping = std::thread::spawn(move || stage_of("media_launch_end", before));
+        checked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the load check");
+        // Let go after the check, the stages are free: the choice begins
+        // between the check and the stamp.
+        let held = matches!(super::LOAD_STAGES.try_lock(), Err(TryLockError::WouldBlock));
+        if !held {
+            stages_begin(clock, clock.now());
+        }
+        go_tx.send(()).unwrap();
+        stamping.join().unwrap();
+        if held {
+            stages_begin(clock, clock.now());
+        }
+        stage_of("ready", current_load());
+        let names: Vec<&str> = super::take_load_stages()
+            .unwrap()
+            .iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, ["ready"]);
+    }
 
     /// A stage stamped for a load a later choice has left behind is not
     /// kept: a launch handed off for one choice and ended after the next
