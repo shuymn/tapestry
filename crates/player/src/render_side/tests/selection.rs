@@ -469,25 +469,57 @@ fn a_when_timer_restarts_at_each_entry_and_survives_a_screen_built_again() {
     link.exit();
 }
 
-/// The select screen's frames are reported once it is left, not at each
-/// move of its cursor (dev-tools): a scroll keeps the screen, so the render
-/// thread writes no report line while the list scrolls.
+/// The select screen's frames are reported once per visit, as its
+/// selection lifetime ends (dev-tools): a move of its cursor and a pool
+/// write during the visit leave them held, so the one report holds every
+/// frame of the visit; a visit the render loop's end cuts short is
+/// reported then.
 #[cfg(feature = "dev-tools")]
 #[test]
-fn a_scroll_keeps_the_select_screens_frames_unreported() {
-    use std::sync::mpsc::TryRecvError;
-
-    use super::super::{RenderMsg, Run};
-    let keeps = |m: RenderMsg| Run::keeps_select(&Ok(m));
-    assert!(keeps(RenderMsg::SelectionChanged));
-    assert!(keeps(RenderMsg::Menu(Box::default())));
-    assert!(keeps(RenderMsg::PracticePage(Box::default())));
-    assert!(!keeps(RenderMsg::Loading(1)));
-    assert!(!keeps(RenderMsg::Decision {
-        page: Box::default(),
-        shown: None,
-    }));
-    assert!(!Run::keeps_select(&Err(TryRecvError::Empty)));
+fn the_select_screens_frames_are_reported_once_per_visit() {
+    use super::super::RenderMsg;
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let frames_of = |lifetime| {
+        seen(&screens)
+            .iter()
+            .filter(|s| s.lifetime == lifetime)
+            .count()
+    };
+    link.enter_selection(1);
+    link.show_selection(update(1, 1));
+    assert!(wait_until(|| frames_of(1) >= 3));
+    // A cursor move.
+    link.show_selection(update(1, 2));
+    assert!(wait_until(|| seen(&screens)
+        .iter()
+        .any(|s| s.revision == 2)));
+    // A pool write, answered (no pool here: stale), and frames after it.
+    let fits = Arc::new(crate::chart_images::ChartImages::absent(
+        &skin_model::chart_image::Absent::NoHeader,
+    ));
+    let answered = link.write_pool(0, 0, fits).recv_timeout(FENCE);
+    assert!(answered.is_ok(), "{answered:?}");
+    let before = frames_of(1);
+    assert!(wait_until(|| frames_of(1) >= before + 3));
+    assert!(
+        link.select_reports().is_empty(),
+        "{:?}",
+        link.select_reports()
+    );
+    // Left: one report, of the whole visit.
+    link.leave_selection();
+    assert!(link.fence(FENCE));
+    assert!(wait_until(|| !link.select_reports().is_empty()));
+    assert_eq!(link.select_reports(), vec![frames_of(1)]);
+    // The next visit, cut short by the loop's end: reported then.
+    link.enter_selection(2);
+    link.show_selection(update(2, 1));
+    assert!(wait_until(|| frames_of(2) >= 3));
+    link.send(RenderMsg::Exit);
+    assert!(wait_until(|| link.select_reports().len() == 2));
+    assert_eq!(link.select_reports(), vec![frames_of(1), frames_of(2)]);
+    link.exit();
 }
 
 #[cfg(feature = "dev-tools")]

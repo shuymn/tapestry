@@ -1549,11 +1549,12 @@ impl MenuStats {
     }
 
     /// Prints what was kept, if anything, as the frames of the `screen`
-    /// named, and starts over.
-    pub fn report(&mut self, screen: &str) {
+    /// named, and starts over: the frames it held.
+    pub fn report(&mut self, screen: &str) -> usize {
         if self.cpu_us.is_empty() {
-            return;
+            return 0;
         }
+        let frames = self.cpu_us.len();
         let q = |v: &mut Vec<u64>, p: usize| {
             v.sort_unstable();
             v.get((v.len().saturating_sub(1)) * p / 100)
@@ -1587,6 +1588,7 @@ impl MenuStats {
             self.app,
         );
         *self = Self::default();
+        frames
     }
 }
 
