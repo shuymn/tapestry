@@ -36,7 +36,7 @@ mod preload;
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) use preload::tests as preload_tests;
 use preload::{Adopted, Event, Preload};
-pub use preload::{PreloadClaim, PreloadControl};
+pub use preload::{PackCharge, PreloadClaim, PreloadControl};
 
 /// A result skin whose base import read a fact the base snapshot has
 /// pending: what each image stage and layout starts from, and the skin

@@ -221,6 +221,14 @@ pub struct PlayerRig<'a> {
     /// attempt is prepared with its specialization for the attempt's
     /// facts ([`crate::imports::PendingSkin`]).
     pub pending: Option<crate::imports::PendingSkin>,
+    /// The pending play skin's preparation during the decision screen of
+    /// a decided play ([`early::EarlyPrep`]): made at the play's decision
+    /// entry, begun once its chart is read, and taken by the attempt's
+    /// preparation, or ended when the choice is left.
+    pub early: Option<early::EarlyPrep>,
+    /// The early preparation's admission reads the host's headroom here
+    /// ([`crate::priority::System`]; a test's double).
+    pub machine: &'static (dyn crate::priority::Machine + Sync),
     /// The chart's own images' worker (S10-12): the run's one owner.
     pub chart_images: crate::chart_images::ChartImageWorker,
     /// The chart's BGA pictures' worker: the run's one owner.
@@ -1732,6 +1740,14 @@ impl PlayerRig<'_> {
             return Ok(SkinStep::Ready(AttemptSkin::InUse));
         };
         let facts = crate::imports::facts::attempt_facts(loaded, self.autoplay);
+        // What the decision screen's early preparation built is this
+        // attempt's kept specialization, reused below while its facts hold
+        // (design.md "Screen Transitions and Loading").
+        if let Some((s, ran)) = self.take_early()
+            && let Some(took) = ran
+        {
+            pending.adopt(s, took);
+        }
         let rig = &*self;
         let wait = || {
             println!("skin: play: building for the chart");
@@ -2030,6 +2046,9 @@ impl PlayerRig<'_> {
         // A preparation still running settles its job before the render
         // thread and the skins go.
         self.end_prep();
+        // A decision's early preparation still held: its job cancelled and
+        // given up within the stop bound once the run ends.
+        self.end_early();
         // The images' worker, stopped within its bound; its panic is never
         // the run's.
         self.chart_images.end();
@@ -4096,6 +4115,7 @@ pub(crate) fn scripted_end_over(
         && (render.end_page_drawn() || render.failed() || shown >= crate::dev::STEP_TIMEOUT)
 }
 
+pub mod early;
 mod loading;
 
 #[cfg(all(test, feature = "dev-tools"))]

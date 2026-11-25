@@ -986,6 +986,8 @@ fn rig<'a>(
         render,
         skin: render_side::SkinState::Ready,
         pending: None,
+        early: None,
+        machine: &crate::priority::System,
         chart_images,
         bga,
         play_chart: None,

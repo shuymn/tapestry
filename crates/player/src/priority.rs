@@ -99,7 +99,8 @@ fn set_current(priority: THREAD_PRIORITY) -> windows::core::Result<()> {
 }
 
 /// What the speculation setting is weighed against: the machine's cores
-/// and physical memory.
+/// and physical memory; and what the early preparation's admission reads
+/// fresh at each admission, the host's headroom.
 pub trait Machine {
     /// The cores available to the process.
     fn cores(&self) -> usize;
@@ -110,6 +111,17 @@ pub trait Machine {
     ///
     /// Why it cannot be read.
     fn memory(&self) -> Result<u64, String>;
+
+    /// The host's headroom in bytes, read now: the smaller of the
+    /// available physical memory and the commit headroom (the commit
+    /// limit less the commit charge), so what is resident is in it and
+    /// never charged again (design.md "Screen Transitions and Loading",
+    /// admission).
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be read.
+    fn headroom(&self) -> Result<u64, String>;
 }
 
 /// This machine.
@@ -130,6 +142,19 @@ impl Machine for System {
         // SAFETY: `status` is a valid MEMORYSTATUSEX with its length set.
         unsafe { GlobalMemoryStatusEx(&raw mut status) }.map_err(|e| e.to_string())?;
         Ok(status.ullTotalPhys)
+    }
+
+    fn headroom(&self) -> Result<u64, String> {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: u32::try_from(size_of::<MEMORYSTATUSEX>()).unwrap_or(u32::MAX),
+            ..MEMORYSTATUSEX::default()
+        };
+        // SAFETY: `status` is a valid MEMORYSTATUSEX with its length set.
+        unsafe { GlobalMemoryStatusEx(&raw mut status) }.map_err(|e| e.to_string())?;
+        // `ullAvailPageFile` is the commit headroom: the commit limit less
+        // the commit charge.
+        Ok(status.ullAvailPhys.min(status.ullAvailPageFile))
     }
 }
 
@@ -217,6 +242,10 @@ mod tests {
         fn memory(&self) -> Result<u64, String> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.memory.ok_or_else(|| "refused (test)".to_owned())
+        }
+
+        fn headroom(&self) -> Result<u64, String> {
+            Err("not read here (test)".to_owned())
         }
     }
 

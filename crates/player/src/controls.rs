@@ -60,6 +60,20 @@ pub struct DecisionWatch {
     /// The screen, built again from the wait's looks when it was lost
     /// ([`crate::render_side::RecoveryHandle::look`]); none: not served.
     pub screen: Option<crate::render_side::RecoveryHandle>,
+    /// A decided play's early preparation (design.md "Screen Transitions
+    /// and Loading"): its gate, whose refusal each look classifies with
+    /// and whose reveal the step commits first, and its serving step
+    /// (sending the early request); none without one.
+    pub early: Option<EarlyWatch>,
+}
+
+/// The early preparation as the load's looks serve it
+/// ([`DecisionWatch::early`]).
+pub struct EarlyWatch {
+    /// The gate.
+    pub gate: std::sync::Arc<crate::play::early::EarlyGate>,
+    /// The serving step, non-blocking ([`crate::play::early::EarlyGate::step`]).
+    pub step: Box<dyn Fn(&crate::play::early::EarlyGate) + Send + Sync>,
 }
 
 impl std::fmt::Debug for DecisionWatch {
@@ -458,18 +472,35 @@ impl Controls {
             let _ = applied;
         }
         let lifetime = w.decision.lifetime();
-        let seen = w.decision.classify(w.origin, now, terminal, false, None);
+        // The early preparation served, and a refusal it published
+        // classified with: latched here, before the deadline.
+        let refused = w.early.as_ref().and_then(|e| {
+            (e.step)(&e.gate);
+            e.gate.refused().map(|_| game::Reply::Refusal)
+        });
+        let mut seen = w.decision.classify(w.origin, now, terminal, false, refused);
         if seen == game::Verdict::Step {
-            if !w.decision.practice() {
-                // The play's deadline step: the lifetime shown, the loading
-                // state's tuning epoch, the input epoch's end, and a new
-                // scene. Each a lock-held update or a queued message.
-                (w.reveal)();
-                self.tuning.enter_loading(now);
-                self.open_epoch();
-                self.next_scene();
+            // The reveal committed against the gate's one state first: a
+            // refusal published before it reveals nothing and returns.
+            let committed = match &w.early {
+                Some(e) if !w.decision.practice() => e.gate.commit_reveal(),
+                _ => crate::play::early::Committed::Revealed,
+            };
+            if let crate::play::early::Committed::Refused(_) = committed {
+                seen = w.decision.refuse_step();
+            } else {
+                if !w.decision.practice() {
+                    // The play's deadline step: the lifetime shown, the
+                    // loading state's tuning epoch, the input epoch's end,
+                    // and a new scene. Each a lock-held update or a queued
+                    // message.
+                    (w.reveal)();
+                    self.tuning.enter_loading(now);
+                    self.open_epoch();
+                    self.next_scene();
+                }
+                w.decision.commit_step();
             }
-            w.decision.commit_step();
         }
         if seen.leaves() {
             w.decision.leave(seen);
@@ -840,6 +871,7 @@ mod tests {
                     }),
                     failures: failures.clone(),
                     screen: None,
+                    early: None,
                 }
             };
             c.close_epoch();

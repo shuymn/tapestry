@@ -1275,3 +1275,52 @@ fn no_pack_begins_after_the_warm_up() {
     assert_eq!(builds(), before + 1);
     drop(claim);
 }
+
+/// B13c: pages a stopped pack left in disposal are counted while their
+/// disposal has not run (design.md "Screen Transitions and Loading",
+/// admission): the early preparation's admission charges a pack that
+/// could begin again its whole bound then, the overlap while the pages
+/// retire, and nothing once they are freed.
+#[test]
+fn a_pack_in_disposal_counts_its_overlap() {
+    use crate::play::early::{Growth, PACK_BOUND};
+
+    /// Dropped on the disposal thread, held there until let go.
+    struct Held(std::sync::mpsc::Receiver<()>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(long());
+        }
+    }
+
+    let _s = crate::imports::tests::serial();
+    let d = runtime_drawn_skin();
+    let seam = Arc::new(Seam::default());
+    let mut rs = preloaded(d.path(), &seam);
+    let coord = coordinator(1);
+    look(&mut rs, &coord, true);
+    assert!(rs.pack_charge().running, "the pack runs");
+    let control = rs.preload_control().unwrap();
+    assert!(control.wait_ended(long()), "the pack's thread ends");
+    collected(&mut rs, &coord);
+    let (go, held) = std::sync::mpsc::channel();
+    rs.dispose(Held(held));
+    let charge = rs.pack_charge();
+    assert!(charge.disposing, "{charge:?}");
+    let again = crate::result_skin::PackCharge {
+        may_begin: true,
+        ..charge
+    };
+    assert_eq!(Growth::pack(again), PACK_BOUND);
+    go.send(()).unwrap();
+    until("the disposal ran", || !rs.pack_charge().disposing);
+    let charge = rs.pack_charge();
+    assert_eq!(
+        Growth::pack(crate::result_skin::PackCharge {
+            may_begin: true,
+            ..charge
+        }),
+        0
+    );
+}

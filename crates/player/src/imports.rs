@@ -137,8 +137,8 @@ impl PendingNote {
 
 /// A pending play skin built for an attempt's facts: the bundle, the
 /// import's report, and the facts it read, which say whether it fits
-/// another attempt ([`FactDeps::holds`]).
-#[derive(Debug)]
+/// another attempt ([`FactDeps::holds`]). A clone shares the bundle.
+#[derive(Clone, Debug)]
 pub struct Specialization {
     pub bundle: Arc<SkinBundle>,
     pub summary: Summary,
@@ -247,6 +247,33 @@ impl PendingSkin {
                 }
             },
         }
+    }
+
+    /// The specialization kept when it holds for `facts`, shared: the one
+    /// [`begin`](Self::begin) would reuse.
+    pub fn kept_for(&self, facts: &ImportFacts) -> Option<Specialization> {
+        self.cached
+            .as_ref()
+            .filter(|c| c.facts.holds(facts))
+            .cloned()
+    }
+
+    /// What each specialization starts from, shared with a job.
+    pub fn play(&self) -> Arc<PendingPlay> {
+        Arc::clone(&self.play)
+    }
+
+    /// `s`, built by a job of its own (the decision screen's early
+    /// specialization) `took` after its start, kept as this skin's one
+    /// specialization: logged as [`finish`](Self::finish) logs one, the
+    /// one kept before dropped.
+    pub fn adopt(&mut self, s: Specialization, took: Duration) {
+        let atlas = Atlas {
+            texels: s.bundle.atlas_texels(),
+            side: s.bundle.side(),
+        };
+        log_specialized(&s.summary, &s.facts, took, atlas, log::logger());
+        self.cached = Some(s);
     }
 
     /// [`attempt`](Self::attempt)'s start: the kept specialization when it
@@ -933,6 +960,24 @@ pub fn spawn_job_with<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
     on_sent: impl FnOnce() + Send + 'static,
 ) -> Result<Job<T>, String> {
+    spawn_job_completing(job, |_| {}, on_sent)
+}
+
+/// [`spawn_job_with`] with `on_outcome` called once on the job's thread
+/// with the outcome as it is sent, at the catch boundary: after the job
+/// returned or its panic was caught (sent as [`PANICKED`]), before the
+/// send and `on_sent`. Every outcome the job's owner would receive goes
+/// through it, so an owner that publishes it elsewhere (the decision
+/// screen's early gate) misses none.
+///
+/// # Errors
+///
+/// Why the thread could not start; `on_outcome` is then not called.
+pub fn spawn_job_completing<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+    on_outcome: impl FnOnce(&Result<T, &'static str>) + Send + 'static,
+    on_sent: impl FnOnce() + Send + 'static,
+) -> Result<Job<T>, String> {
     let cancel = Cancel::new();
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
     let theirs = cancel.clone();
@@ -952,6 +997,7 @@ pub fn spawn_job_with<T: Send + 'static>(
                 Err(PANICKED)
             }
         };
+        on_outcome(&sent);
         // Past an abandonment nobody receives: the outcome is dropped
         // here, on this thread.
         let _ = tx.send(sent);
@@ -1000,6 +1046,12 @@ impl<T> Job<T> {
             }
         }
         true
+    }
+
+    /// The job's cancel, shared: cancelling it stops the job as a quit
+    /// would, without a wait.
+    pub fn canceller(&self) -> Cancel {
+        self.cancel.clone()
     }
 
     /// Whether the attempt's quit or the run's end came during a wait

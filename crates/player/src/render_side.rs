@@ -2279,6 +2279,10 @@ struct Shared {
     result_entries: ResultEntries,
     /// What the render thread shows of the result kind.
     result_status: Mutex<ResultReport>,
+    /// The early staging's refusal the game thread has not taken: the
+    /// early request and why (a restage refused), read into the early
+    /// gate (design.md "Screen Transitions and Loading").
+    early_refusal: crate::play::early::RenderRefusal,
     /// Result frames hold after their lifetime's check while set, and
     /// whether one holds (tests).
     #[cfg(test)]
@@ -2544,6 +2548,7 @@ impl Shared {
             barrier: Mutex::new(ResultBarrier::default()),
             result_entries: ResultEntries::default(),
             result_status: Mutex::new(ResultReport::default()),
+            early_refusal: Arc::default(),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
             #[cfg(test)]
@@ -3660,6 +3665,12 @@ impl RenderLink {
     /// register.
     pub fn result_status(&self) -> ResultReport {
         self.shared.result_status().clone()
+    }
+
+    /// Where the render thread publishes an early staging's refusal for
+    /// the early gate.
+    pub fn early_refusal(&self) -> Option<crate::play::early::RenderRefusal> {
+        Some(Arc::clone(&self.shared.early_refusal))
     }
 
     /// Begins the result's pages upload of `pages` (design.md "Memory

@@ -1,0 +1,423 @@
+//! The pending play skin's preparation during the decision screen on the
+//! player's rig (design.md "Screen Transitions and Loading"; Threat Model
+//! T09): begun at the decided play's read, cancelled at the reveal without
+//! a wait, consumed by Preparing, refused through the gate, and joined at
+//! the settle sites. Real jobs on self-made skins, held by the jobs' test
+//! gates.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use game::AppRig as _;
+
+use super::*;
+use crate::play::early::{Committed, EarlyGate, EarlyPrep};
+
+/// A host whose headroom fits any growth.
+struct Fits;
+
+impl crate::priority::Machine for Fits {
+    fn cores(&self) -> usize {
+        1
+    }
+
+    fn memory(&self) -> Result<u64, String> {
+        Err("not read here (test)".to_owned())
+    }
+
+    fn headroom(&self) -> Result<u64, String> {
+        Ok(u64::MAX)
+    }
+}
+
+static FITS: Fits = Fits;
+
+/// The decided play's early preparation, as the decision's entry makes
+/// it, on `rig` with `skin` pending and a host that fits: its gate.
+fn decided(rig: &mut PlayerRig<'_>, skin: crate::imports::PendingSkin) -> Arc<EarlyGate> {
+    rig.pending = Some(skin);
+    rig.machine = &FITS;
+    let early = EarlyPrep::new(EarlyGate::new(rig.render.early_refusal()), 1);
+    let gate = Arc::clone(early.gate());
+    rig.early = Some(early);
+    gate
+}
+
+/// The gate's state, by name.
+fn state(gate: &EarlyGate) -> &'static str {
+    gate.state_name()
+}
+
+/// B1 (player): a decided play's specialization begins at its chart's
+/// read, before any load, on a job of its own, and ends specialized.
+#[test]
+fn early_specialization_starts_at_the_read() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let from = imports::jobs_counted();
+        rig.chart_read(&l);
+        assert_eq!(jobs_since(from).0, 1, "begun at the read");
+        until("the specialization ended", || {
+            state(&gate) == "ended specialized"
+        });
+        rig.left_chart().unwrap();
+        assert_eq!(jobs_since(from), (1, 1));
+    });
+}
+
+/// B6: an import still running at the play's deadline step is cancelled
+/// there and not waited for; Preparing begins afresh with a job of its
+/// own.
+// Covers: T09
+#[test]
+fn an_import_in_flight_at_the_reveal_is_cancelled() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(12);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let from = imports::jobs_counted();
+        let base = vm_hooks::live();
+        rig.chart_read(&l);
+        imports::executing(base);
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        assert_eq!(state(&gate), "cancelled at the reveal");
+        assert_eq!(jobs_since(from), (1, 0), "the reveal did not wait for it");
+        let _attempt = begin(rig, &l);
+        assert_eq!(stage(rig), "skin", "Preparing imports afresh");
+        assert_eq!(jobs_since(from), (2, 1), "the early job joined first");
+        rig.discard_attempt();
+        assert_eq!(jobs_since(from), (2, 2));
+    });
+}
+
+/// B6b: the same at a load wait's reveal ([`crate::controls::Controls::look`]).
+#[test]
+fn an_import_in_flight_at_a_load_wait_reveal_is_cancelled() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(12);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let from = imports::jobs_counted();
+        let base = vm_hooks::live();
+        rig.chart_read(&l);
+        imports::executing(base);
+        let reveals = Arc::new(AtomicUsize::new(0));
+        watch_past(rig, &reveals);
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Step));
+        let d = rig.controls.unwatch_decision().unwrap();
+        assert!(d.stepped());
+        assert_eq!(reveals.load(Ordering::SeqCst), 1);
+        assert_eq!(state(&gate), "cancelled at the reveal");
+        assert_eq!(jobs_since(from), (1, 0), "the reveal did not wait for it");
+        let _attempt = begin(rig, &l);
+        assert_eq!(stage(rig), "skin", "Preparing imports afresh");
+        rig.discard_attempt();
+        assert_eq!(jobs_since(from), (2, 2));
+    });
+}
+
+/// A play's decision past its deadline watched by the load's waits on
+/// `rig`, with its early preparation; each reveal counted in `reveals`.
+fn watch_past(rig: &PlayerRig<'_>, reveals: &Arc<AtomicUsize>) {
+    let now = bms_model::TimeSource::now(&rig.clock);
+    let d = game::Decision::begin(
+        bms_model::TimeUs(now.0 - 60_000_000),
+        game::DecisionLifetime(1),
+        Some(game::DecisionShown::BuiltIn),
+        false,
+    );
+    watch(rig, d, reveals);
+}
+
+/// `d` watched by the load's waits on `rig`, with its early preparation;
+/// each reveal counted in `reveals`.
+fn watch(rig: &PlayerRig<'_>, d: game::Decision, reveals: &Arc<AtomicUsize>) {
+    let counted = Arc::clone(reveals);
+    rig.controls.watch_decision(crate::controls::DecisionWatch {
+        decision: d,
+        origin: game::Origin::Load,
+        reveal: Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }),
+        failures: rig.failures.clone(),
+        screen: None,
+        early: rig.early_watch(),
+    });
+}
+
+/// B6c: an import that completed just before the reveal's commit, its
+/// thread held past its send and no step after it, is revealed with the
+/// commit and consumed by Preparing: no second import.
+#[test]
+fn a_completion_before_the_commit_is_kept() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let from = imports::jobs_counted();
+        imports::hold_exit(true);
+        rig.chart_read(&l);
+        until("the job held after its send", || {
+            imports::exit_waiting() == 1
+        });
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        assert_eq!(state(&gate), "revealed specialized");
+        imports::hold_exit(false);
+        let mut attempt = begin(rig, &l);
+        assert_ne!(stage(rig), "skin", "the early specialization is reused");
+        assert_eq!(jobs_since(from), (1, 1), "no second import");
+        assert_eq!(polled(rig, &mut attempt).unwrap(), game::Preparation::Ready);
+    });
+}
+
+/// B6e: a job that panics and one whose thread cannot start both end the
+/// gate refused; and the gate runs before the worker can publish: a worker
+/// at the gate's lock during the start finds the job running.
+#[test]
+fn a_panic_and_a_spawn_failure_complete_the_gate() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        imports::panic_next_job();
+        rig.chart_read(&l);
+        until("the panic refused", || state(&gate) == "ended refused");
+        let why = rig.early_refusal().expect("refused").reason;
+        assert!(why.contains(crate::imports::PANICKED), "{why}");
+        rig.left_chart().unwrap();
+
+        let skin = rig.pending.take().unwrap();
+        let gate = decided(rig, skin);
+        imports::refuse_spawn();
+        rig.chart_read(&l);
+        assert_eq!(state(&gate), "ended refused");
+        let why = rig.early_refusal().expect("refused").reason;
+        assert!(why.contains("cannot start"), "{why}");
+        rig.left_chart().unwrap();
+
+        let skin = rig.pending.take().unwrap();
+        let gate = decided(rig, skin);
+        let held = Arc::clone(&gate);
+        gate.after_spawn(move || {
+            until("the worker at the gate's lock", || held.completing() == 1);
+        });
+        rig.chart_read(&l);
+        until("the worker's thread ended", || imports::workers() == 0);
+        assert_eq!(state(&gate), "ended specialized");
+        rig.left_chart().unwrap();
+    });
+}
+
+/// B6f: a reveal before the chart is read commits on the gate made at the
+/// decision's entry, and the read after it begins nothing.
+#[test]
+fn a_reveal_before_the_read_starts_nothing() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let from = imports::jobs_counted();
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        rig.chart_read(&l);
+        assert_eq!(jobs_since(from), (0, 0), "nothing begun");
+        assert_eq!(state(&gate), "revealed");
+        let _attempt = begin(rig, &l);
+        assert_eq!(stage(rig), "skin", "today's begin");
+        rig.discard_attempt();
+    });
+}
+
+/// B9d: a refusal the cancelled job publishes after the commit is dropped
+/// on its worker: no early refusal, the loading state's route.
+#[test]
+fn a_refusal_after_the_commit_takes_the_loading_route() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(12);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let base = vm_hooks::live();
+        rig.chart_read(&l);
+        imports::executing(base);
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        until("the cancelled job's thread ended", || {
+            imports::workers() == 0
+        });
+        assert_eq!(gate.completing(), 1, "its outcome came to the gate");
+        assert_eq!(rig.early_refusal(), None);
+        assert_eq!(state(&gate), "cancelled at the reveal");
+        rig.left_chart().unwrap();
+    });
+}
+
+/// B12a: the choice left before Preparing (a quit in loading) cancels the
+/// job and joins it.
+#[test]
+fn ending_the_request_cancels_the_job() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(12);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        decided(rig, skin);
+        let from = imports::jobs_counted();
+        let base = vm_hooks::live();
+        rig.chart_read(&l);
+        imports::executing(base);
+        let _watchdog = crate::tests::Watchdog::arm("the early job's join");
+        rig.left_chart().unwrap();
+        assert!(rig.early.is_none());
+        assert_eq!(jobs_since(from), (1, 1), "cancelled and joined");
+        assert_eq!(vm_hooks::live(), base);
+    });
+}
+
+/// B12c: the early job is joined after the deadline's step, never in it:
+/// in `left_chart` for a quit.
+#[test]
+fn the_join_is_never_in_the_deadline_step() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(12);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        decided(rig, skin);
+        let from = imports::jobs_counted();
+        let base = vm_hooks::live();
+        rig.chart_read(&l);
+        imports::executing(base);
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        assert_eq!(jobs_since(from), (1, 0), "not joined in the step");
+        rig.left_chart().unwrap();
+        assert_eq!(jobs_since(from), (1, 1), "joined in left_chart");
+    });
+}
+
+/// B2c: a direct launch, with no decision's entry, specializes only in
+/// Preparing: its read begins nothing.
+#[test]
+fn a_direct_launch_specializes_in_preparing() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        rig.pending = Some(skin);
+        rig.machine = &FITS;
+        let from = imports::jobs_counted();
+        rig.chart_read(&l);
+        assert!(rig.early.is_none());
+        assert_eq!(jobs_since(from), (0, 0));
+        let mut attempt = begin(rig, &l);
+        assert_eq!(stage(rig), "skin");
+        assert_eq!(polled(rig, &mut attempt).unwrap(), game::Preparation::Ready);
+        assert_eq!(jobs_since(from), (1, 1));
+    });
+}
+
+/// B2d: a retry specializes only in Preparing: the decision's early
+/// preparation was the first attempt's, taken there.
+#[test]
+fn a_retry_specializes_in_preparing() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let (first, retry) = (at_level(13), at_level(14));
+    on_rig(first.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let from = imports::jobs_counted();
+        rig.chart_read(&first);
+        until("the specialization ended", || {
+            state(&gate) == "ended specialized"
+        });
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        let mut attempt = begin(rig, &first);
+        assert_ne!(stage(rig), "skin");
+        assert_eq!(polled(rig, &mut attempt).unwrap(), game::Preparation::Ready);
+        assert!(rig.early.is_none(), "taken by the first attempt");
+        let mut again = begin(rig, &retry);
+        assert_eq!(stage(rig), "skin", "the retry's own job");
+        assert_eq!(polled(rig, &mut again).unwrap(), game::Preparation::Ready);
+        assert_eq!(jobs_since(from), (2, 2));
+    });
+}
+
+/// B9c: a refusal published before a load wait's look ahead of the
+/// deadline latches there; at the deadline the look returns, revealing
+/// nothing.
+#[test]
+fn an_early_refusal_latches_at_a_load_wait_look_before_the_deadline() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        imports::refuse_spawn();
+        rig.chart_read(&l);
+        assert_eq!(state(&gate), "ended refused");
+        let reveals = Arc::new(AtomicUsize::new(0));
+        let now = bms_model::TimeSource::now(&rig.clock);
+        let d = game::Decision::begin(
+            now,
+            game::DecisionLifetime(1),
+            Some(game::DecisionShown::BuiltIn),
+            false,
+        );
+        let deadline = d.deadline().unwrap();
+        watch(rig, d, &reveals);
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Continue));
+        assert!(
+            bms_model::TimeSource::now(&rig.clock).0 < deadline.0,
+            "looked before the deadline"
+        );
+        assert!(rig.controls.with_watched(|d| d.unwrap().latched()));
+        until("the deadline", || {
+            bms_model::TimeSource::now(&rig.clock).0 >= deadline.0
+        });
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Return));
+        let d = rig.controls.unwatch_decision().unwrap();
+        assert!(!d.stepped());
+        assert_eq!(reveals.load(Ordering::SeqCst), 0);
+        rig.left_chart().unwrap();
+    });
+}
+
+/// B9c2: a refusal published between a load wait's classification and
+/// its commit reveals nothing and leaves the decision unstepped.
+#[test]
+fn a_refusal_between_classify_and_commit_is_not_revealed() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        let gate = decided(rig, skin);
+        let published = Arc::clone(&gate);
+        gate.before_commit(move || {
+            assert!(published.end(crate::play::early::EarlyOutcome::Refused(
+                game::PreparationRefusal {
+                    location: None,
+                    reason: "refused between".to_owned(),
+                }
+            )));
+        });
+        let reveals = Arc::new(AtomicUsize::new(0));
+        watch_past(rig, &reveals);
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Return));
+        let d = rig.controls.unwatch_decision().unwrap();
+        assert!(!d.stepped());
+        assert_eq!(reveals.load(Ordering::SeqCst), 0, "nothing revealed");
+        assert_eq!(
+            gate.commit_reveal(),
+            Committed::Refused(game::PreparationRefusal {
+                location: None,
+                reason: "refused between".to_owned(),
+            })
+        );
+        rig.chart_read(&l);
+        rig.left_chart().unwrap();
+    });
+}
