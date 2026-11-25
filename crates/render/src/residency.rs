@@ -786,6 +786,7 @@ pub mod fake {
 
         /// The device removed: the fence reads [`REMOVED`](super::REMOVED)
         /// and the device reports its removal.
+        #[cfg(feature = "dev-tools")]
         pub fn remove(&self) {
             let mut s = self.state();
             s.completed = super::REMOVED;
@@ -793,6 +794,7 @@ pub mod fake {
         }
 
         /// How many native calls it saw.
+        #[cfg(feature = "dev-tools")]
         #[must_use]
         pub fn calls(&self) -> usize {
             self.state().calls.len()
