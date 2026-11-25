@@ -2043,11 +2043,12 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// frame is read back, encoded or written. The render thread only reads
 /// the frame back (and its display list); the sink's writer thread encodes
 /// and writes it, so the encoding, which takes seconds on a loaded
-/// machine, delays no later frame and no capture due on one. At most
-/// [`WRITE_FRAMES`] frames and [`WRITE_BYTES`] bytes wait for or are in the
-/// writer: a frame past either fails its captures at once, so the render
-/// thread never waits for the writer. The play's end waits for the
-/// writer's backlog ([`FrameSink::finish`]).
+/// machine, delays no later frame and no capture due on one while the
+/// writer has room. At most [`WRITE_FRAMES`] frames and [`WRITE_BYTES`]
+/// bytes wait for or are in the writer: a frame past either waits for room
+/// on the render thread, a bounded queue's back-pressure, at most
+/// [`WRITE_WAIT`] once in a run ([`ScenarioFrames::admit`]). The play's end
+/// waits for the writer's backlog ([`FrameSink::finish`]).
 pub struct ScenarioFrames {
     captures: Captures,
     /// How long each capture's read-back stalls first: a test's stand-in
@@ -2061,6 +2062,15 @@ pub struct ScenarioFrames {
     backlog: Arc<(Mutex<Backlog>, Condvar)>,
     /// The bytes the backlog may hold: [`WRITE_BYTES`], less in tests.
     write_bytes: usize,
+    /// How long a frame past the backlog waits for room: [`WRITE_WAIT`],
+    /// less in tests.
+    write_wait: Duration,
+    /// A frame has waited [`Self::write_wait`] for room in vain: the writer
+    /// is stuck, and a later frame past the backlog fails at once.
+    waited_out: bool,
+    /// How long the writer sleeps before each frame (tests: a slow disk).
+    #[cfg(test)]
+    write_delay: Duration,
     /// The newest result seen, by its number, and when its first frame
     /// was presented: its captures' origin.
     result_origin: Option<(u64, TimeUs)>,
@@ -2082,6 +2092,12 @@ const WRITE_FRAMES: usize = 4;
 /// wait for or be in the writer at once: one frame of the largest target.
 /// One frame is taken whatever its size when nothing waits.
 const WRITE_BYTES: usize = super::MAX_SIZE_SIDE as usize * super::MAX_SIZE_SIDE as usize * 4;
+
+/// How long a frame past the backlog waits for the writer to make room
+/// before its captures fail: room comes as the oldest frame is written,
+/// which takes seconds on a loaded machine, and the wait stays below a
+/// holding step's when the run sets no render bound ([`super::HOLD_BOUND`]).
+const WRITE_WAIT: Duration = Duration::from_secs(30);
 
 /// What waits for or is in the writer.
 #[derive(Debug, Default)]
@@ -2282,6 +2298,10 @@ impl ScenarioFrames {
             writer: None,
             backlog: Arc::default(),
             write_bytes: WRITE_BYTES,
+            write_wait: WRITE_WAIT,
+            waited_out: false,
+            #[cfg(test)]
+            write_delay: Duration::ZERO,
             result_origin: None,
             recorder: Recorder::new(transitions),
             clock,
@@ -2290,18 +2310,38 @@ impl ScenarioFrames {
         }
     }
 
-    /// Reserves `bytes` of a frame in the backlog; why not when it is full.
-    fn admit(&self, bytes: usize) -> Result<(), String> {
-        let mut b = self
-            .backlog
-            .0
+    /// Reserves `bytes` of a frame in the backlog, waiting while it is full
+    /// for the writer to make room, at most [`Self::write_wait`]; why not
+    /// when it stays full. A slow writer delays the render thread rather
+    /// than failing the capture; a stuck one fails it within the wait, and
+    /// after that every frame past the backlog fails at once, so a run
+    /// waits on a stuck writer once.
+    fn admit(&mut self, bytes: usize) -> Result<(), String> {
+        let limit = self.write_bytes;
+        let full =
+            |b: &mut Backlog| b.frames >= WRITE_FRAMES || (b.frames > 0 && b.bytes + bytes > limit);
+        let wait = if self.waited_out {
+            Duration::ZERO
+        } else {
+            self.write_wait
+        };
+        let (lock, room) = &*self.backlog;
+        let b = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if b.frames >= WRITE_FRAMES || (b.frames > 0 && b.bytes + bytes > self.write_bytes) {
-            return Err(format!(
-                "the capture writer is behind ({} frames, {} bytes waiting; at most {WRITE_FRAMES} frames, {} bytes)",
-                b.frames, b.bytes, self.write_bytes
-            ));
+        let (mut b, _) = room
+            .wait_timeout_while(b, wait, full)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if full(&mut b) {
+            let why = format!(
+                "the capture writer is behind ({} frames, {} bytes waiting after {} ms; at most {WRITE_FRAMES} frames, {limit} bytes)",
+                b.frames,
+                b.bytes,
+                wait.as_millis()
+            );
+            drop(b);
+            self.waited_out = true;
+            return Err(why);
         }
         b.frames += 1;
         b.bytes += bytes;
@@ -2328,12 +2368,16 @@ impl ScenarioFrames {
     /// Starts the writer.
     fn start(&self) -> Result<Writer, String> {
         let (jobs, queue) = mpsc::channel::<Job>();
+        #[cfg(test)]
+        let delay = self.write_delay;
         let thread = std::thread::Builder::new()
             .name("capture writer".to_owned())
             // A job leaves the backlog as it drops: written, or discarded
             // with the queue when a panic ends the thread.
             .spawn(move || {
                 for mut job in queue {
+                    #[cfg(test)]
+                    std::thread::sleep(delay);
                     write_frame(&mut job);
                 }
             })
@@ -2467,7 +2511,8 @@ impl FrameSink for ScenarioFrames {
             return;
         }
         // The sink's own work on the render thread, marked in the record:
-        // the stall a test asks for, the read-back and the display list.
+        // the stall a test asks for, the read-back and the display list,
+        // and the wait for the writer's room.
         let r0 = self.clock.now();
         if let Some(stall) = self.stall
             && self
@@ -2485,16 +2530,17 @@ impl FrameSink for ScenarioFrames {
             .play
             .and_then(|_| screen.display_list())
             .map(|l| display_list_lines(&l, drawn));
+        let bytes = pixels.as_ref().map_or(0, |p| p.2.len())
+            + list
+                .as_ref()
+                .map_or(0, |l| l.as_ref().map_or_else(String::len, String::len));
+        let admitted = self.admit(bytes);
         self.recorder.mark(Mark {
             kind: MarkKind::ReadBack,
             from: r0,
             to: self.clock.now(),
         });
-        let bytes = pixels.as_ref().map_or(0, |p| p.2.len())
-            + list
-                .as_ref()
-                .map_or(0, |l| l.as_ref().map_or_else(String::len, String::len));
-        if let Err(why) = self.admit(bytes) {
+        if let Err(why) = admitted {
             let mut list = self.captures.lock();
             for (i, path, _, generation, _) in due {
                 if let Some(c) = list.get_mut(i)
@@ -4423,50 +4469,141 @@ pub(crate) mod tests {
         );
     }
 
-    /// A frame past the writer's backlog fails its captures at once, saying
-    /// so, and the render thread does not wait: by frames, and by bytes.
-    #[test]
-    fn a_frame_past_the_writers_backlog_fails_its_captures() {
+    /// Presents capture frame `k` through `sink` on a thread of its own and
+    /// times it: `None` when it has not returned within 20 s, `hold` then
+    /// released so that it can.
+    fn frame_timed(
+        sink: &mut super::ScenarioFrames,
+        screen: &Stalling,
+        k: i64,
+        hold: &mut Option<std::sync::RwLockWriteGuard<'static, ()>>,
+    ) -> Option<std::time::Duration> {
         use super::FrameSink as _;
 
-        let behind = |s: &CaptureState| matches!(s, CaptureState::Failed(why) if why.contains("the capture writer is behind"));
-        // By frames: one more than the backlog holds.
-        let n = super::WRITE_FRAMES + 1;
+        std::thread::scope(|s| {
+            let (ended, returned) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                let begun = std::time::Instant::now();
+                sink.frame(screen, &drawn(1, k));
+                let _ = ended.send(begun.elapsed());
+            });
+            let took = returned
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .ok();
+            if took.is_none() {
+                hold.take();
+            }
+            took
+        })
+    }
+
+    /// A slow writer delays a frame past its backlog until it has room
+    /// rather than failing its captures: every capture is written.
+    #[test]
+    fn a_slow_writer_delays_a_frame_past_its_backlog() {
+        use super::FrameSink as _;
+
+        let n = super::WRITE_FRAMES + 2;
         let (dir, c, mut sink, screen) = released_sink(n);
-        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.write_delay = std::time::Duration::from_millis(100);
         for k in 0..n {
             sink.frame(&screen, &drawn(1, k as i64));
         }
-        let states = c.states();
-        assert!(
-            states[..n - 1]
-                .iter()
-                .all(|s| *s == CaptureState::Saving(1)),
-            "{states:?}"
-        );
-        assert!(behind(&states[n - 1]), "{states:?}");
-        drop(hold);
         sink.finish();
         let states = c.states();
         assert!(
-            states[..n - 1]
+            states.iter().all(|s| *s == CaptureState::Succeeded),
+            "{states:?}"
+        );
+        assert!(dir.path().join(format!("{}.png", n - 1)).exists());
+    }
+
+    /// The selection screen's holding captures share the play's writer: a
+    /// slow one delays a selection frame past its backlog rather than
+    /// failing its capture.
+    #[test]
+    fn a_slow_writer_delays_a_selection_frame_past_its_backlog() {
+        use super::FrameSink as _;
+
+        let n = super::WRITE_FRAMES + 2;
+        // Holding selection captures, one on each frame from the update's.
+        let dir = tempfile::tempdir().unwrap();
+        let axes: Vec<_> = (0..n)
+            .map(|k| (super::Axis::Select(TimeUs(k as i64 * 1_000)), true))
+            .collect();
+        let c = screen_captures(dir.path(), &axes);
+        for k in 0..n {
+            c.arm_select(u16::try_from(k).unwrap(), 1, 1);
+        }
+        let (mut sink, screen) = released(&c);
+        sink.write_delay = std::time::Duration::from_millis(100);
+        for k in 0..n {
+            sink.frame(&screen, &selection_frame(1, 1, k as i64));
+        }
+        sink.finish();
+        let states = c.states();
+        assert!(
+            states.iter().all(|s| *s == CaptureState::Succeeded),
+            "{states:?}"
+        );
+        assert!(dir.path().join(format!("{}.png", n - 1)).exists());
+    }
+
+    /// A stuck writer fails a frame past its backlog once the frame has
+    /// waited its bound for room, saying so, and every later frame past it
+    /// at once, so a run waits on it once: by frames, and by bytes.
+    #[test]
+    fn a_stuck_writer_fails_a_frame_past_its_backlog_within_the_wait() {
+        use super::FrameSink as _;
+
+        let wait = std::time::Duration::from_millis(500);
+        let behind = |s: &CaptureState| matches!(s, CaptureState::Failed(why) if why.contains("the capture writer is behind"));
+        // By frames: two more than the backlog holds.
+        let n = super::WRITE_FRAMES + 2;
+        let (dir, c, mut sink, screen) = released_sink(n);
+        sink.write_wait = wait;
+        let mut hold = Some(super::HOLD_WRITES.write().unwrap());
+        for k in 0..n - 2 {
+            sink.frame(&screen, &drawn(1, k as i64));
+        }
+        let first = frame_timed(&mut sink, &screen, n as i64 - 2, &mut hold);
+        let later = frame_timed(&mut sink, &screen, n as i64 - 1, &mut hold);
+        drop(hold);
+        sink.finish();
+        let first = first.expect("the frame fails within its wait");
+        assert!(first >= wait, "the frame waited for room: {first:?}");
+        assert!(
+            later.is_some_and(|t| t < wait),
+            "a later frame fails at once: {later:?}"
+        );
+        let states = c.states();
+        assert!(
+            states[..n - 2]
                 .iter()
                 .all(|s| *s == CaptureState::Succeeded),
             "{states:?}"
         );
-        assert!(!dir.path().join(format!("{}.png", n - 1)).exists());
+        assert!(states[n - 2..].iter().all(behind), "{states:?}");
+        assert!(!dir.path().join(format!("{}.png", n - 2)).exists());
         // By bytes: each frame's pixels are 4 bytes, and the backlog holds 4.
-        let (dir, c, mut sink, screen) = released_sink(2);
+        let (dir, c, mut sink, screen) = released_sink(3);
         sink.write_bytes = 4;
-        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.write_wait = wait;
+        let mut hold = Some(super::HOLD_WRITES.write().unwrap());
         sink.frame(&screen, &drawn(1, 0));
-        sink.frame(&screen, &drawn(1, 1));
-        let states = c.states();
-        assert_eq!(states[0], CaptureState::Saving(1));
-        assert!(behind(&states[1]), "{states:?}");
+        let first = frame_timed(&mut sink, &screen, 1, &mut hold);
+        let later = frame_timed(&mut sink, &screen, 2, &mut hold);
         drop(hold);
         sink.finish();
-        assert_eq!(c.states()[0], CaptureState::Succeeded);
+        let first = first.expect("the frame fails within its wait");
+        assert!(first >= wait, "the frame waited for room: {first:?}");
+        assert!(
+            later.is_some_and(|t| t < wait),
+            "a later frame fails at once: {later:?}"
+        );
+        let states = c.states();
+        assert_eq!(states[0], CaptureState::Succeeded);
+        assert!(states[1..].iter().all(behind), "{states:?}");
         assert!(!dir.path().join("1.png").exists());
     }
 
