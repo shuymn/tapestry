@@ -5575,8 +5575,8 @@ fn fake_residency(rig: &Rig) -> render::FakeResidency {
 /// S-R5 (design.md "Screen Transitions and Loading", the frame-budgeted
 /// uploads): a pages ticket whose array's fence never completes, on an
 /// idle render thread with no frame to present, is answered once with the
-/// residency's timeout, about `CREATE_BOUND` after its ticket: the pass
-/// stays awake for the creation in flight.
+/// residency's timeout, no sooner than `CREATE_BOUND` after its ticket:
+/// the pass stays awake for the creation in flight.
 // Revert: the creation no longer keeps an idle pass awake -> no answer.
 #[test]
 fn an_idle_pass_times_out_a_pending_creation() {
@@ -5595,8 +5595,10 @@ fn an_idle_pass_times_out_a_pending_creation() {
     };
     let bound = Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
     assert!(why.contains("residency"), "{why}");
+    // No upper bound from the ask: the screen's build restarts the
+    // ticket's deadline, and under load it can take seconds.
+    // `pages_answer`'s own limit fails a ticket never answered.
     assert!(took >= bound, "answered after {took:?}");
-    assert!(took < bound * 4, "answered after {took:?}");
     assert_eq!(rig.link.result_status().installed, None);
     rig.link.exit();
 }
