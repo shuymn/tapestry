@@ -987,6 +987,10 @@ impl Drop for KeepOnFailure {
             for e in fs::read_dir(from)? {
                 let e = e?;
                 let (path, into) = (e.path(), to.join(e.file_name()));
+                // A link (a scenario's junction) is not followed.
+                if e.file_type()?.is_symlink() {
+                    continue;
+                }
                 if e.file_type()?.is_dir() {
                     copy(&path, &into)?;
                 } else {
