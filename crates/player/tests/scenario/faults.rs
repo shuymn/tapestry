@@ -4,7 +4,9 @@
 //! (`--dev-serve fire …`) fires only once the test has read back a known
 //! frame and acknowledged it (`TAPESTRY_DEV_FAULT_ACK`), at the fault's own
 //! seam, which stamps it on the performance counter; a fault of the whole
-//! worker is made by the test itself, by terminating or suspending it.
+//! worker is made by the test itself, by terminating or suspending it. The
+//! confined open's scenarios (T08) follow: a chart video named outside its
+//! folder, and one whose folder is swapped for a link at the open barrier.
 
 use std::time::Duration;
 
@@ -1775,4 +1777,149 @@ fn next_attempt_recovers_a_live_worker() {
         log.contains("a video is lost (Struck)"),
         "the struck file is not opened: {log}"
     );
+}
+
+/// Makes `link` a junction to the folder `target` (no privilege needed).
+fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+}
+
+/// The game's log of `fx`'s run.
+fn game_log(fx: &Fixture) -> String {
+    fs::read_to_string(fx.data().join("logs").join("tapestry.log")).unwrap()
+}
+
+/// A chart video named outside its chart's folder is refused when the name
+/// is resolved, before anything opens it (design.md "Threat Model" T08):
+/// the base plays `sub/clip.avi` from 0 s, `sub` a junction to a folder
+/// outside the chart's holding a coded clip, then the in-folder coded clip
+/// `in.avi` from 4 s. The outside name is logged absent for resolving
+/// outside the folder and never refused at its open (the open is not
+/// reached), so the worker is handed no file of it: the panel reads back
+/// black until 4 s, never a frame of the outside clip. The in-folder clip,
+/// whose opened handle's final path is its canonical path, shows the frame
+/// due from 4 s.
+// Covers: T08
+#[test]
+fn a_confined_open_refuses_a_name_outside_the_chart_folder() {
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(
+        &fx,
+        "a_confined_open_refuses_a_name_outside_the_chart_folder",
+    );
+    let outside = fx.base.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    gen_clip(&outside.join("clip.avi"), FAULT_CLIP);
+    let dir = fx.library().join("f");
+    fs::create_dir_all(&dir).unwrap();
+    junction(&dir.join("sub"), &outside);
+    write_wav(&dir.join("key.wav"));
+    gen_clip(&dir.join("in.avi"), FAULT_CLIP);
+    let text = format!(
+        "#PLAYER 1\n#TITLE confined\n#BPM 120\n#WAV01 key.wav\n\
+         #BMP01 sub/clip.avi\n#BMP02 in.avi\n#00138:01\n#00004:01\n#00204:02\n{FAULT_NOTES}\n"
+    );
+    fs::write(dir.join("f.bms"), &text).unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("f.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    let ats = fault_ats();
+    let run = run_fault(
+        &fx,
+        &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
+        &[],
+        |_| {},
+    );
+    run.ok();
+    let log = game_log(&fx);
+    assert!(
+        log.contains("bga: sub/clip.avi is absent: the name resolves outside the chart folder"),
+        "refused at resolution: {log}"
+    );
+    assert!(!log.contains("is not played"), "no open refused: {log}");
+    check_panel(&run, &ats, 4_000_000, i64::MAX, None);
+    assert!(
+        ats.iter()
+            .any(|at| run.chart_us(&format!("c{at}")) >= 4_000_000),
+        "a capture of the in-folder clip"
+    );
+}
+
+/// A chart video's folder swapped for a link between the name's resolution
+/// and its open is refused at the open (design.md "Threat Model" T08): the
+/// base plays `sub/clip.avi`, a coded clip inside the chart's folder. On
+/// the second play the game waits at the open barrier
+/// (`TAPESTRY_DEV_OPEN_GATE`, a file of the test's own) after resolving
+/// it; the test replaces `sub` with a junction to a folder outside the
+/// chart's holding another coded clip of that name, then opens the
+/// barrier. The opened handle's final path is the outside clip's, not the
+/// canonical path the folder check passed, so the open is refused and
+/// logged: every capture of that play reads back black, never a frame of
+/// the outside clip.
+// Covers: T08
+#[test]
+fn a_name_swapped_after_resolution_is_refused_at_open() {
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "a_name_swapped_after_resolution_is_refused_at_open");
+    let outside = fx.base.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    gen_clip(&outside.join("clip.avi"), FAULT_CLIP);
+    let dir = fx.library().join("f");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let chart = write_fault_chart(
+        &fx.library(),
+        "sub/clip.avi",
+        FAULT_CLIP,
+        "#00004:01",
+        FAULT_NOTES,
+    );
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("f.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    let gate = fx.base.join("open.gate");
+    let reached = fx.base.join("open.gate.reached");
+    let ats = fault_ats();
+    let run = run_fault(
+        &fx,
+        &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
+        &[("TAPESTRY_DEV_OPEN_GATE", gate.to_str().unwrap())],
+        |c| {
+            // The first play has opened its clip: the next open is the
+            // second play's.
+            fs::write(&gate, b"").unwrap();
+            until(c.game, "the open at its barrier", || reached.exists());
+            fs::rename(dir.join("sub"), dir.join("sub.before")).unwrap();
+            junction(&dir.join("sub"), &outside);
+            fs::remove_file(&gate).unwrap();
+        },
+    );
+    run.ok();
+    let log = game_log(&fx);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("clip.avi is not played: the file opened is")
+                && l.contains("outside")),
+        "refused at the open: {log}"
+    );
+    for at in &ats {
+        let px = run.px(&format!("c{at}"));
+        assert!(all_black(&px), "c{at}: {:?}, black", coded_index(&px, 7));
+    }
 }
