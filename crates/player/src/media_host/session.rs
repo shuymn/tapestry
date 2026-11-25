@@ -302,8 +302,8 @@ impl Movie {
     }
 
     /// The slots the render side's reader has freed over the ring's life
-    /// (tests).
-    #[cfg(all(test, feature = "dev-tools"))]
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
     pub fn freed_total(&self) -> u64 {
         self.freed.load(Ordering::Acquire)
     }
@@ -504,8 +504,14 @@ pub struct Observer {
     /// so the loss's time is never later than a reader's sight of it.
     pub now: fn() -> Option<i64>,
     /// A video lost for `why`, a chart video's when `chart`, seen at the
-    /// time `now` read.
-    pub lost: fn(Loss, bool, Option<i64>),
+    /// time `now` read, after the game freed `freed` of its ring's slots.
+    pub lost: fn(Loss, bool, Option<i64>, u64),
+    /// The worker answered that the fault the game fired takes effect, at
+    /// its performance counter's `qpc`.
+    pub fired: fn(i64),
+    /// The waiting check ([`Relay`]) found a live player full and waiting,
+    /// seen at the time `now` read.
+    pub waiting: fn(Waiting, Option<i64>),
     /// A load stage reached (`media_launch_start`, …), of the load whose
     /// stages began as `load` (the value `load` read when the step began).
     pub stage: fn(&'static str, u64),
@@ -523,30 +529,105 @@ fn observe_now() -> Option<i64> {
     OBSERVER.get().and_then(|o| (o.now)())
 }
 
-/// Tells the observer, if any, of a video lost for `why`, seen at `at`.
+/// Tells the observer, if any, of a video lost for `why`, seen at `at`,
+/// after the game freed `freed` of its slots.
 #[cfg(feature = "dev-tools")]
-fn observe_lost(why: Loss, chart: bool, at: Option<i64>) {
+fn observe_lost(why: Loss, chart: bool, at: Option<i64>, freed: u64) {
     if let Some(o) = OBSERVER.get() {
-        (o.lost)(why, chart, at);
+        (o.lost)(why, chart, at, freed);
     }
 }
 
+/// A live player the waiting check found full and waiting (dev-tools): its
+/// number, its screen's generation, whether it is a chart video's, the
+/// frames it published and the slots the game freed.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    pub player: u8,
+    pub generation: u64,
+    pub chart: bool,
+    pub published: u64,
+    pub freed: u64,
+}
+
+/// The development relay between a scenario and the session (dev-tools),
+/// polled on the session's thread at each turn, outside play's own work:
+/// - `TAPESTRY_DEV_FAULT_ACK` names a file of the test's own; once it
+///   exists, the session sends the worker one [`Command::Fire`], which fires
+///   the fault the worker's development options name.
+/// - `TAPESTRY_DEV_WAIT_ASK` names another; once it exists, the session
+///   notes every live player's generation and freed count at its next turn,
+///   and answers, at a later turn where every one of them is still live in
+///   that generation, waiting with every slot full (`freed + SLOTS <=
+///   published`) and freed no fewer, by writing `<file>.ready` and telling
+///   the observer of each ([`Observer::waiting`]): a full ring seen after
+///   the request, not one left from before it.
+/// - `TAPESTRY_DEV_PREPARATION_GATE` names a third; while it exists and the
+///   session has no worker but a launch under way or a video queued for
+///   one, it holds every screen's preparation deadline
+///   ([`PREPARATION_HELD`]), at most [`GATE_BOUND`] from the hold's start,
+///   so a launch slower than the deadline still ends in its own outcome.
+#[cfg(feature = "dev-tools")]
+#[derive(Default)]
+struct Relay {
+    fire: Option<PathBuf>,
+    fired: bool,
+    ask: Option<PathBuf>,
+    noted: Option<Vec<(u8, u64, u64)>>,
+    answered: bool,
+    hold: Option<PathBuf>,
+    held_since: Option<Instant>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl Relay {
+    fn from_env() -> Self {
+        Self {
+            fire: std::env::var_os("TAPESTRY_DEV_FAULT_ACK").map(PathBuf::from),
+            ask: std::env::var_os("TAPESTRY_DEV_WAIT_ASK").map(PathBuf::from),
+            hold: std::env::var_os("TAPESTRY_DEV_PREPARATION_GATE").map(PathBuf::from),
+            ..Self::default()
+        }
+    }
+}
+
+/// How long a development gate holds at most: an ended or stuck scenario
+/// leaves nothing held past it.
+#[cfg(feature = "dev-tools")]
+const GATE_BOUND: Duration = Duration::from_secs(60);
+
+/// Whether the session holds the screens' preparation deadlines
+/// (dev-tools; the preparation gate of [`Relay`]): set and cleared on the
+/// session's thread at its turn, read by [`crate::movie_frame::Movies`]
+/// before it applies a deadline. A launch's failure loses its queued
+/// videos at the turn's look, before the turn's relay clears it.
+#[cfg(feature = "dev-tools")]
+pub static PREPARATION_HELD: AtomicBool = AtomicBool::new(false);
+
 /// The launch gate (dev-tools): while the file `TAPESTRY_DEV_LAUNCH_GATE`
-/// names exists, the worker's launch waits on its own thread, at most a
-/// minute, before the launch takes anything the user's other launches
-/// share ([`super::launch::Launches`]). A scenario keeps its own game's
-/// launch past a screen's preparation deadline with it, and an ended game
-/// leaves nothing held.
+/// names exists, the worker's launch waits on its own thread, at most
+/// [`GATE_BOUND`], before the launch takes anything the user's other
+/// launches share ([`super::launch::Launches`]); `<gate>.reached` exists
+/// while it waits. A scenario keeps its own game's launch past a screen's
+/// preparation deadline with it, and an ended game leaves nothing held.
 #[cfg(feature = "dev-tools")]
 fn launch_gate() {
     let Some(gate) = std::env::var_os("TAPESTRY_DEV_LAUNCH_GATE") else {
         return;
     };
     let gate = std::path::Path::new(&gate);
+    if !gate.exists() {
+        return;
+    }
+    let mut reached = gate.as_os_str().to_owned();
+    reached.push(".reached");
+    let _ = std::fs::write(&reached, b"");
     let begun = Instant::now();
-    while gate.exists() && begun.elapsed() < Duration::from_secs(60) {
+    while gate.exists() && begun.elapsed() < GATE_BOUND {
         std::thread::sleep(Duration::from_millis(10));
     }
+    let _ = std::fs::remove_file(&reached);
 }
 
 /// Tells the observer, if any, of load stage `name` of load `load`.
@@ -579,7 +660,7 @@ macro_rules! lost {
         let why: Loss = $why;
         event!($shared, Event::Lost { why });
         #[cfg(feature = "dev-tools")]
-        observe_lost(why, $movie.chart, $seen);
+        observe_lost(why, $movie.chart, $seen, $movie.freed_total());
     }};
 }
 
@@ -948,6 +1029,8 @@ struct Supervisor {
     /// Runs at each turn's held points (a test's).
     #[cfg(test)]
     turn: Option<Box<dyn FnMut(Held) + Send>>,
+    #[cfg(feature = "dev-tools")]
+    relay: Relay,
 }
 
 /// Where a test holds the session's turn.
@@ -989,6 +1072,8 @@ impl Supervisor {
             sent: Vec::new(),
             #[cfg(test)]
             turn: None,
+            #[cfg(feature = "dev-tools")]
+            relay: Relay::from_env(),
         }
     }
 
@@ -1016,6 +1101,8 @@ impl Supervisor {
             }
             self.look();
             self.note_losses();
+            #[cfg(feature = "dev-tools")]
+            self.relay();
             #[cfg(test)]
             if let Some(turn) = &mut self.turn {
                 turn(Held::Looked);
@@ -1439,6 +1526,13 @@ impl Supervisor {
                 return Ok(());
             }
             Reply::Hello { .. } | Reply::Log { .. } | Reply::Beat => return Ok(()),
+            #[cfg(feature = "dev-tools")]
+            Reply::Fired { qpc } => {
+                if let Some(o) = OBSERVER.get() {
+                    (o.fired)(qpc);
+                }
+                return Ok(());
+            }
         };
         let Some(outcome) = outcome else {
             return Ok(());
@@ -1893,11 +1987,121 @@ impl Supervisor {
         }
     }
 
+    /// The preparation gate's turn ([`Relay`], [`PREPARATION_HELD`]).
+    #[cfg(feature = "dev-tools")]
+    fn hold_preparation(&mut self) {
+        let waiting = self.worker.is_none()
+            && (self.launching_now || self.players.iter().any(|p| p.stage == Stage::Queued));
+        let held = waiting && self.relay.hold.as_ref().is_some_and(|f| f.exists());
+        if !held {
+            self.relay.held_since = None;
+        }
+        let within = held
+            && self
+                .relay
+                .held_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+                < GATE_BOUND;
+        PREPARATION_HELD.store(within, Ordering::Release);
+    }
+
+    /// The development relay's turn ([`Relay`]).
+    #[cfg(feature = "dev-tools")]
+    fn relay(&mut self) {
+        self.hold_preparation();
+        if !self.relay.fired
+            && self.worker.is_some()
+            && self.relay.fire.as_ref().is_some_and(|f| f.exists())
+        {
+            self.relay.fired = true;
+            if let Err(why) = self.send(&Command::Fire) {
+                self.fail_worker(why);
+                return;
+            }
+            self.notes.note("the development fault fired".to_owned());
+        }
+        if self.relay.answered || !self.relay.ask.as_ref().is_some_and(|f| f.exists()) {
+            return;
+        }
+        let slots = u64::try_from(media::SLOTS).unwrap_or(u64::MAX);
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        let mut seen = Vec::new();
+        for p in &self.players {
+            if p.stage != Stage::Live
+                || p.movie.generation() != generation
+                || p.movie.status() == Status::Lost
+            {
+                continue;
+            }
+            let Some(live) = p.movie.live() else {
+                continue;
+            };
+            let words = live.ring.words();
+            let state = media::supervision(words).and_then(|(_, state)| state);
+            seen.push((
+                Waiting {
+                    player: p.id,
+                    generation: p.movie.generation(),
+                    chart: p.movie.chart,
+                    published: media::watermark(words).unwrap_or(0),
+                    freed: p.movie.freed_total(),
+                },
+                state,
+            ));
+        }
+        let Some(noted) = &self.relay.noted else {
+            self.relay.noted = Some(
+                seen.iter()
+                    .map(|(w, _)| (w.player, w.generation, w.freed))
+                    .collect(),
+            );
+            return;
+        };
+        let full = !seen.is_empty()
+            && seen.len() == noted.len()
+            && seen.iter().all(|(w, state)| {
+                *state == Some(State::Waiting)
+                    && w.freed.saturating_add(slots) <= w.published
+                    && noted.iter().any(|&(player, generation, freed)| {
+                        player == w.player && generation == w.generation && w.freed >= freed
+                    })
+            });
+        if !full {
+            return;
+        }
+        self.relay.answered = true;
+        let at = observe_now();
+        let mut text = String::new();
+        for (w, _) in &seen {
+            if let Some(o) = OBSERVER.get() {
+                (o.waiting)(*w, at);
+            }
+            text.push_str(&format!(
+                "{} {} {} {} {}\n",
+                w.player,
+                w.generation,
+                u8::from(w.chart),
+                w.published,
+                w.freed
+            ));
+        }
+        if let Some(ask) = &self.relay.ask {
+            let mut ready = ask.clone().into_os_string();
+            ready.push(".ready");
+            let _ = std::fs::write(ready, text);
+        }
+        self.notes.note("the waiting check answered".to_owned());
+    }
+
     /// Ends the session: every video lost, those of the opens `rx` still
     /// holds included, none launched; the workers dropped (their jobs end
     /// after a grace, without waiting). The game's handle is gone, so no
     /// open comes after the ones `rx` holds.
     fn quit(&mut self, rx: &Receiver<Request>) {
+        // An ended session holds no preparation.
+        #[cfg(feature = "dev-tools")]
+        PREPARATION_HELD.store(false, Ordering::Release);
         for p in &self.players {
             p.movie.lose(Loss::Ended);
         }

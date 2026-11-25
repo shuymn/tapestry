@@ -32,12 +32,21 @@
 //! - `--dev-serve <option>…`: serves the control pipe changed by each
 //!   option: `protocol=<n>` names protocol version `n` in the hello;
 //!   `deaf[=<n>]` reads no command after the hello's first `n` (none
-//!   without) while the control loop still beats; `freeze=<player>:<play|decoding|waiting>` freezes that player
+//!   without) while the control loop still beats; a `<player>` is its
+//!   number or its video's codec as its probe names it;
+//!   `freeze=<player>:<play|start|decoding|waiting>` freezes that player
 //!   for good before it answers its play, or once it has published a frame
 //!   while it says it decodes, or while it says it waits for a free slot;
 //!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion;
 //!   `stall-convert=<n>:<ms>` sleeps `ms` before the process's conversion
-//!   number `n`, counted from 0.
+//!   number `n`, counted from 0; `refuse-alloc=<player>` has the worker's
+//!   allocator refuse that player's next decode an allocation, which the
+//!   decode's check finds as a decoder's refusal; `garbage=<player>` writes
+//!   its next frame in a run not started; `balloon=<step>:<total>` commits
+//!   memory as `--dev-balloon` does, from a thread the fire starts; and
+//!   `fire` holds `freeze`, `refuse-alloc`, `garbage` and `balloon` until
+//!   the game's `Fire` command. Each fault answers `Fired` with the
+//!   performance counter at its seam as it takes effect.
 //! - `--dev-balloon <step> <total> [<last> [free]]`: answers the hello and
 //!   serves the control pipe while a thread commits memory the worker never
 //!   frees, `step` MiB at a time about 10 ms apart up to `total` MiB and
@@ -71,6 +80,18 @@ pub fn deaf(read: u32) -> bool {
     DEAF.get().is_some_and(|n| read >= *n)
 }
 
+/// Answers the game that the fault it fired takes effect now: the
+/// performance counter read here, at the fault's seam.
+pub fn fired() {
+    let mut qpc = 0;
+    // SAFETY: an out pointer to a local.
+    let _ = unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut qpc) };
+    crate::say(&format!("tapestry-media: a fault fires at {qpc}"));
+    if let Some(out) = crate::OUT.get() {
+        out.send(&skin_model::media::control::Reply::Fired { qpc });
+    }
+}
+
 /// Applies `--dev-serve`'s options.
 fn serve_options(options: &[String]) -> Result<(), String> {
     for option in options {
@@ -91,7 +112,7 @@ fn serve_options(options: &[String]) -> Result<(), String> {
                 let (player, at) = value
                     .split_once(':')
                     .ok_or_else(|| format!("{option}: freeze=<player>:<where>"))?;
-                let player = player.parse().map_err(|e| format!("{option}: {e}"))?;
+                let player = crate::player::Target::parse(player);
                 let at = match at {
                     "play" => crate::player::Freeze::Play,
                     "start" => crate::player::Freeze::Start,
@@ -112,6 +133,20 @@ fn serve_options(options: &[String]) -> Result<(), String> {
                 let at = at.parse().map_err(|e| format!("{option}: {e}"))?;
                 let ms = ms.parse().map_err(|e| format!("{option}: {e}"))?;
                 ffmpeg::stall_convert(at, ms);
+            }
+            "fire" => crate::player::on_fire(),
+            "refuse-alloc" => crate::player::refuse_alloc(crate::player::Target::parse(value)),
+            "garbage" => crate::player::garbage(crate::player::Target::parse(value)),
+            "balloon" => {
+                let (step, total) = value
+                    .split_once(':')
+                    .ok_or_else(|| format!("{option}: balloon=<step>:<total>"))?;
+                let step: usize = step.parse().map_err(|e| format!("{option}: {e}"))?;
+                let total = total.parse().map_err(|e| format!("{option}: {e}"))?;
+                if step == 0 {
+                    return Err(format!("{option}: a step of 0 MiB"));
+                }
+                crate::player::balloon(step, total);
             }
             _ => return Err(format!("--dev-serve: unknown option {option}")),
         }
@@ -242,7 +277,7 @@ fn balloon(args: &[String]) -> ExitCode {
 
 /// Commits `step` MiB at a time up to `total`, then `last` at once,
 /// released at once when `free` says so, stopping at the first refusal.
-fn inflate(step: usize, total: usize, last: usize, free: bool) {
+pub fn inflate(step: usize, total: usize, last: usize, free: bool) {
     use windows::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
 
     let mut committed = 0;

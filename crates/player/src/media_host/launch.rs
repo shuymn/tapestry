@@ -195,15 +195,18 @@ impl Restrictions {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 impl Restrictions {
-    /// No restriction.
-    pub const NONE: Self = Self(0);
-
     /// `self` without `r`.
     pub const fn without(self, r: Self) -> Self {
         Self(self.0 & !r.0)
     }
+}
+
+#[cfg(test)]
+impl Restrictions {
+    /// No restriction.
+    pub const NONE: Self = Self(0);
 
     /// `self` with `r`.
     pub const fn with(self, r: Self) -> Self {
@@ -318,7 +321,7 @@ pub struct Setup {
     expected: Restrictions,
     #[cfg(test)]
     fail_at: Option<Step>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-tools"))]
     args: Vec<String>,
     #[cfg(test)]
     handshake: Duration,
@@ -339,7 +342,7 @@ impl Setup {
             expected: Restrictions::RECIPE,
             #[cfg(test)]
             fail_at: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev-tools"))]
             args: Vec::new(),
             #[cfg(test)]
             handshake: HANDSHAKE,
@@ -377,12 +380,12 @@ impl Setup {
     }
 
     /// The worker's arguments.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-tools"))]
     fn args(&self) -> &[String] {
         &self.args
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "dev-tools")))]
     #[expect(
         clippy::unused_self,
         reason = "a test's setup passes the worker arguments; the recipe passes none"
@@ -473,6 +476,21 @@ impl Setup {
 /// game ([`worker_cpus`]).
 const PRIORITY: PROCESS_CREATION_FLAGS = NORMAL_PRIORITY_CLASS;
 
+#[cfg(any(test, feature = "dev-tools"))]
+impl Setup {
+    /// Passing the worker `args`.
+    pub fn args_of(mut self, args: &[&str]) -> Self {
+        self.args = args.iter().map(|&a| a.to_owned()).collect();
+        self
+    }
+
+    /// Checking exactly `r`.
+    pub const fn expecting(mut self, r: Restrictions) -> Self {
+        self.expected = r;
+        self
+    }
+}
+
 #[cfg(test)]
 impl Setup {
     /// Without `r`, applied or checked.
@@ -488,21 +506,9 @@ impl Setup {
         self
     }
 
-    /// Checking exactly `r`.
-    pub const fn expecting(mut self, r: Restrictions) -> Self {
-        self.expected = r;
-        self
-    }
-
     /// With `step` failing as if its call had.
     pub const fn failing_at(mut self, step: Step) -> Self {
         self.fail_at = Some(step);
-        self
-    }
-
-    /// Passing the worker `args`.
-    pub fn args_of(mut self, args: &[&str]) -> Self {
-        self.args = args.iter().map(|&a| a.to_owned()).collect();
         self
     }
 

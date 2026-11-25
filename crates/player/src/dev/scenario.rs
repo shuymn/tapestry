@@ -36,6 +36,8 @@
 //! # { chart_lost = true, file = … }: its first presented frame from the
 //! # one that first drew the chart's BGA panel lost (a chart video's
 //! # loss), which no frame is guaranteed to show; or
+//! # { skin_lost = true, file = … }: the same from the play frame that
+//! # first drew a skin movie lost; or
 //! # { loading = true, file = … }: its loading state's first frame; or
 //! # { loading_at = 1500, file = … }: ms on its loading state's clock,
 //! # since its loading lifetime's origin, the screen clock's (failed if the
@@ -541,6 +543,7 @@ struct CaptureSpec {
     result_at: Option<i64>,
     decision_at: Option<i64>,
     chart_lost: Option<bool>,
+    skin_lost: Option<bool>,
     hold: Option<bool>,
     file: PathBuf,
 }
@@ -820,7 +823,15 @@ fn capture_axis(c: &CaptureSpec) -> Result<(Axis, bool), String> {
             .map(TimeUs)
             .ok_or_else(|| format!("{name} is too large"))
     };
-    if let Some(lost) = c.chart_lost {
+    let lost = match (c.chart_lost, c.skin_lost) {
+        (None, None) => None,
+        (Some(lost), None) => Some((lost, Axis::ChartLost, "chart_lost")),
+        (None, Some(lost)) => Some((lost, Axis::SkinLost, "skin_lost")),
+        (Some(_), Some(_)) => {
+            return Err("chart_lost and skin_lost: each stands alone".to_owned());
+        }
+    };
+    if let Some((lost, axis, name)) = lost {
         let others = [
             c.at,
             c.ready_at,
@@ -834,12 +845,12 @@ fn capture_axis(c: &CaptureSpec) -> Result<(Axis, bool), String> {
         .any(Option::is_some)
             || c.loading.is_some();
         if !lost || others {
-            return Err("chart_lost = true stands alone".to_owned());
+            return Err(format!("{name} = true stands alone"));
         }
         if c.hold.is_some() {
             return Err("hold is for select_at and result_at".to_owned());
         }
-        return Ok((Axis::ChartLost, false));
+        return Ok((axis, false));
     }
     let axis = match (
         c.at,
@@ -1535,6 +1546,10 @@ pub enum Axis {
     /// chart's BGA panel lost ([`crate::movie_frame::CHART_LOST_AT`]): no
     /// frame is guaranteed.
     ChartLost,
+    /// The first presented frame from the play frame that first drew a
+    /// skin movie lost ([`crate::movie_frame::SKIN_LOST_AT`]): no frame is
+    /// guaranteed.
+    SkinLost,
 }
 
 impl Axis {
@@ -1550,6 +1565,7 @@ impl Axis {
             Self::Decision(_) => "decision",
             Self::Transition => "transition",
             Self::ChartLost => "chart_lost",
+            Self::SkinLost => "skin_lost",
         }
     }
 
@@ -1562,7 +1578,7 @@ impl Axis {
             | Self::Select(t)
             | Self::Result(t)
             | Self::Decision(t) => t.0,
-            Self::Loading | Self::Transition | Self::ChartLost => 0,
+            Self::Loading | Self::Transition | Self::ChartLost | Self::SkinLost => 0,
         }
     }
 
@@ -2695,7 +2711,7 @@ fn capture_due(
         }
         // Taken by the sink at its change, never from the list.
         Axis::Transition => return None,
-        Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) | Axis::ChartLost => {}
+        Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) | Axis::ChartLost | Axis::SkinLost => {}
     }
     let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
         return None;
@@ -2720,8 +2736,13 @@ fn capture_due(
             let start = drawn.view?.closing?;
             (t.0 - start.0 >= since.0).then_some(Due::Save(generation, Stamp::Play))
         }
-        Axis::ChartLost => {
-            let lost = crate::movie_frame::CHART_LOST_AT.load(std::sync::atomic::Ordering::Acquire);
+        Axis::ChartLost | Axis::SkinLost => {
+            let at = if c.axis == Axis::ChartLost {
+                &crate::movie_frame::CHART_LOST_AT
+            } else {
+                &crate::movie_frame::SKIN_LOST_AT
+            };
+            let lost = at.load(std::sync::atomic::Ordering::Acquire);
             (lost != i64::MIN && t.0 >= lost).then_some(Due::Save(generation, Stamp::Play))
         }
         Axis::Loading
@@ -4073,7 +4094,14 @@ pub(crate) mod tests {
             Ok(super::Axis::Closing(TimeUs(3_000)))
         );
         assert_eq!(capture("chart_lost = true, "), Ok(super::Axis::ChartLost));
-        for bad in ["chart_lost = false, ", "chart_lost = true, at = 1, "] {
+        assert_eq!(capture("skin_lost = true, "), Ok(super::Axis::SkinLost));
+        for bad in [
+            "chart_lost = false, ",
+            "chart_lost = true, at = 1, ",
+            "skin_lost = false, ",
+            "skin_lost = true, select_at = 1, ",
+            "chart_lost = true, skin_lost = true, ",
+        ] {
             let e = capture(bad).unwrap_err();
             assert!(e.contains("stands alone"), "{bad}: {e}");
         }
