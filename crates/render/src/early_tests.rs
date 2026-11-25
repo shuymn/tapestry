@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bms_model::{ChartBuilder, TimeUs};
-use render::{EarlyRoom, Renderer, SHARED_TEXELS, SkinBundle};
+use render::{EarlyRoom, RenderError, Renderer, SHARED_TEXELS, SkinBundle};
 use skin_model::ScreenKind;
+use skin_model::Variant;
 
 use crate::renderer::pool_tests::pool_bundle;
 use crate::test_common::{
@@ -157,6 +158,92 @@ fn the_early_staging_releases_the_result_at_boundaries() {
         Vec::new(),
         "destroyed in its call"
     );
+    r.discard();
+}
+
+/// `n` bundles of [`Look::left`] in green on one atlas's pages, each its
+/// own layout: one installed, the others stage a layout on its pages.
+fn on_one_pages(r: &Renderer, n: usize) -> Vec<Arc<SkinBundle>> {
+    let dir = tempfile::tempdir().unwrap();
+    let look = Look::left(GREEN);
+    let first = crate::test_decl::skin(dir.path(), &look);
+    let atlas = first
+        .atlas(Variant::Lo, r.atlas_limits(), &|| false)
+        .unwrap();
+    let mut all = Vec::with_capacity(n);
+    for _ in 1..n {
+        let s = crate::test_decl::skin(dir.path(), &look);
+        let rebound = atlas.rebind(s.sheet(), Variant::Lo, false).unwrap();
+        all.push(rebundle(&look, s, rebound));
+    }
+    all.insert(0, rebundle(&look, first, atlas));
+    all
+}
+
+/// `s` of `look` on `atlas`, with its clips.
+fn rebundle(look: &Look, s: skin_model::Skin, atlas: skin_model::Atlas) -> Arc<SkinBundle> {
+    let clips = render::ClipTable::new(look.clip.into_iter().collect()).unwrap();
+    Arc::new(SkinBundle::new(Arc::new(s), atlas, clips, skin_model::Side::Left).unwrap())
+}
+
+/// B14b2: the result's release waits for the pool's reduction to have
+/// its entries free: with the retirement list full of layouts retired
+/// with no charge (nothing charged, no entry free), its room waits; once a
+/// boundary destroyed them it is the release, which retires the pool and
+/// the result with nothing destroyed in its call, and once those are
+/// destroyed too the staging fits and is created.
+// Revert: the release taken with fewer than two entries free -> the
+// room answers the release over a full list.
+#[test]
+fn the_release_waits_for_the_pool_s_entries() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let layouts = on_one_pages(&r, 16);
+    commit(&mut r, ScreenKind::Result, &layouts[0], 3);
+    settle(&mut r);
+    assert!(r.pool().unwrap().layers > 1, "optional layers");
+    // Layouts staged on the result's pages, each superseding the last,
+    // until no entry is free.
+    r.set_destroy_allowed(false);
+    let mut full = false;
+    for (b, request) in layouts[1..].iter().zip(4_u64..) {
+        match r.install(ScreenKind::Result, b, request) {
+            Ok(_) => {}
+            Err(e) => {
+                assert!(matches!(e, RenderError::ListFull { .. }), "{e:?}");
+                full = true;
+                break;
+            }
+        }
+    }
+    assert!(full, "the list never filled");
+    r.discard();
+    assert!(r.filled() > 0);
+    assert_eq!(r.admission().filled, 0, "nothing charged");
+    let sel = r.admission().charge(ScreenKind::Selection);
+    let res = r.admission().charge(ScreenKind::Result);
+    let b = tiny(&r, BLUE);
+    r.state_candidate_charge(&b, SHARED_TEXELS - sel - res / 2);
+    assert_eq!(r.early_room(&b), EarlyRoom::Wait, "no entry free");
+    settle(&mut r);
+    assert_eq!(r.early_room(&b), EarlyRoom::Release);
+    let from = r.destructions_recorded();
+    r.release_result_deferred(&b).unwrap();
+    assert_eq!(
+        recorded_since(&r, from),
+        Vec::new(),
+        "destroyed in its call"
+    );
+    assert_eq!(r.pool(), None, "the live pool retired");
+    assert_eq!(r.early_room(&b), EarlyRoom::Wait, "its entries charged");
+    settle(&mut r);
+    assert_eq!(r.early_room(&b), EarlyRoom::Fits);
+    r.stage_early(&b, 40).unwrap();
+    assert_eq!(r.staged().map(|t| t.request), Some(40), "created");
     r.discard();
 }
 

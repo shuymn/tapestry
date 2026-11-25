@@ -6745,19 +6745,24 @@ fn a_refusal_at_the_step_is_not_revealed() {
 }
 
 /// B9e: a close at the look that reads an early refusal ends the run: the
-/// refusal is never shown.
+/// refusal is never shown, also when the close comes at the deadline's own
+/// look inside the chart's load, where no hold of the refusal follows.
 #[test]
 fn a_close_is_not_masked_by_an_early_refusal() {
-    for served in [None, Some(3_000)] {
-        let acts = vec![(0, Act::Choose(0)), (300, Act::Close)];
+    for (served, close) in [(None, 300), (Some(3_000), 300), (Some(3_000), 1_500)] {
+        let acts = vec![(0, Act::Choose(0)), (close, Act::Close)];
         let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
             decided_read_in_time(rig);
             rig.served_load_ms = served;
             rig.early_refusal_ms = Some(0);
         });
         ran.unwrap();
-        assert!(rig.refusals.is_empty(), "{served:?}: {:?}", rig.refusals);
-        assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
+        assert!(
+            rig.refusals.is_empty(),
+            "{served:?} {close}: {:?}",
+            rig.refusals
+        );
+        assert!(rig.deadline_steps.is_empty(), "{served:?} {close}: stepped");
     }
 }
 

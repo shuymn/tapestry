@@ -2976,8 +2976,10 @@ fn the_built_in_decision_keeps_the_hold() {
 }
 
 /// B8b: where a takeover replaced the decision skin with the built-in
-/// page, the first loading frame's hold stays.
-// Revert: the takeover not recorded as `BuiltIn` -> a loading page drawn
+/// page, the first loading frame's hold stays: the reveal lands right
+/// after the takeover's first frame, the refused one, presented, with no
+/// decision frame after it.
+// Revert: the takeover's frame recorded as `Skin` -> a loading page drawn
 // at once.
 #[test]
 fn a_takeover_keeps_the_hold() {
@@ -2988,19 +2990,40 @@ fn a_takeover_keeps_the_hold() {
     begin_held(&rig, "A");
     rig.choose("a", "A", 5);
     rig.skin_frames(0, 3);
+    let shared = std::sync::Arc::clone(&rig.link.shared);
+    let [before_token, _, before_stamp] = &shared.frame_gates;
+    /// Lets every frame go when dropped, a failing test's included.
+    struct LetGo<'a>(&'a [crate::render_side::TestGate; 3]);
+    impl Drop for LetGo<'_> {
+        fn drop(&mut self) {
+            for gate in self.0 {
+                gate.hold(false);
+            }
+        }
+    }
+    let _let_go = LetGo(&shared.frame_gates);
+    // A skin frame held after its draw; the next frame's build refused.
+    before_stamp.hold(true);
+    assert!(wait_until(|| before_stamp.waiting()));
+    before_token.hold(true);
     rig.seen.refuse_frame.store(true, Ordering::Release);
-    assert!(wait_until(|| {
-        rig.decided
-            .stamps_of(5)
-            .iter()
-            .filter(|s| **s == crate::measure::DecisionDrawnAs::Fallback)
-            .count()
-            >= 2
-    }));
+    before_stamp.hold(false);
+    assert!(wait_until(|| before_token.waiting()));
+    // The refused frame drawn, held before its record; the reveal sent.
+    before_stamp.hold(true);
+    before_token.hold(false);
+    assert!(wait_until(|| before_stamp.waiting()));
+    assert!(!rig.seen.refuse_frame.load(Ordering::Acquire), "refused");
     let (held, from) = (rig.link.held_passes(), rig.seen.len());
     reveal(&rig);
+    before_stamp.hold(false);
     assert!(wait_until(|| rig.link.held_passes() >= held + 5));
     assert_eq!(rig.seen.pages(from, "loading"), 0, "held");
+    assert_eq!(
+        rig.decided.stamps_of(5).last().copied(),
+        Some(crate::measure::DecisionDrawnAs::Fallback),
+        "the refused frame was the last decision frame"
+    );
     rig.link.exit();
 }
 

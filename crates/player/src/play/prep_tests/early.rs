@@ -235,6 +235,43 @@ fn a_reveal_before_the_read_starts_nothing() {
     });
 }
 
+/// B6f through the decided play's entry: the entry makes the gate before
+/// its fence, idle, so App's reveal before the chart's read commits on it
+/// and the read after it begins nothing.
+// Revert: the gate not made at the entry -> no gate for the reveal.
+#[test]
+fn the_entry_makes_the_gate_the_reveal_commits_on() {
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        rig.pending = Some(skin);
+        rig.machine = &FITS;
+        // No adjustment waits on the input thread, which none serves.
+        rig.adjust = None;
+        let charts = tempfile::tempdir().unwrap();
+        let (sel, roots) = crate::selection::tests::tree(charts.path(), &[&["a.bms"]]);
+        rig.selection = Some(sel);
+        let now = bms_model::TimeSource::now(&rig.clock);
+        let d = game::Decision::begin(
+            now,
+            game::DecisionLifetime(1),
+            Some(game::DecisionShown::BuiltIn),
+            false,
+        );
+        let _d = rig.entered_decision(&game::Pick::Play(roots[0].join("a.bms")), d);
+        let gate = Arc::clone(rig.early.as_ref().expect("the entry's gate").gate());
+        assert_eq!(state(&gate), "idle");
+        let from = imports::jobs_counted();
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        assert_eq!(state(&gate), "revealed");
+        rig.chart_read(&l);
+        assert_eq!(jobs_since(from), (0, 0), "nothing begun");
+        assert_eq!(state(&gate), "revealed");
+        rig.left_chart().unwrap();
+    });
+}
+
 /// B9d: a refusal the cancelled job publishes after the commit is dropped
 /// on its worker: no early refusal, the loading state's route.
 #[test]
