@@ -3290,16 +3290,43 @@ pub fn stage_busy(name: &'static str, took: Duration) {
 /// each video it loses is a transition probe mark `media:lost` whose value
 /// is the loss's reason ([`crate::media_host::session::Loss`] as a number),
 /// plus 256 for a chart video's, on the game's clock when the session saw
-/// it; the worker's launch and the chart videos' probes are load stages.
+/// it, with `media:lost_freed`, the slots the game had freed, at the same
+/// time; the worker's launch and the chart videos' probes are load stages.
+/// A development fault's fire is `fault:fired`, the worker's performance
+/// counter at its seam; the waiting check's answer is, for each player,
+/// `media:waiting` (its number, plus 256 for a chart video's, plus its
+/// generation times 65 536), `media:waiting_published` and
+/// `media:waiting_freed`, at one time.
 pub fn observe_media() {
     use crate::media_host::session::{OBSERVER, Observer};
     let _ = OBSERVER.set(Observer {
         now: || loop_probe::stamp().map(|t| t.0),
-        lost: |why, chart, at| {
+        lost: |why, chart, at, freed| {
             let v = why as i64 + if chart { 256 } else { 0 };
-            match at {
-                Some(at) => loop_probe::mark_at("media:lost", TimeUs(at), v),
-                None => loop_probe::mark("media:lost", v),
+            let Some(at) = at.or_else(|| loop_probe::stamp().map(|t| t.0)) else {
+                return;
+            };
+            loop_probe::mark_at("media:lost", TimeUs(at), v);
+            loop_probe::mark_at(
+                "media:lost_freed",
+                TimeUs(at),
+                i64::try_from(freed).unwrap_or(i64::MAX),
+            );
+        },
+        fired: |qpc| loop_probe::mark("fault:fired", qpc),
+        waiting: |w, at| {
+            let Some(at) = at.or_else(|| loop_probe::stamp().map(|t| t.0)) else {
+                return;
+            };
+            let id = i64::from(w.player)
+                | i64::from(u8::from(w.chart)) << 8
+                | i64::try_from(w.generation).unwrap_or(0) << 16;
+            loop_probe::mark_at("media:waiting", TimeUs(at), id);
+            for (tag, v) in [
+                ("media:waiting_published", w.published),
+                ("media:waiting_freed", w.freed),
+            ] {
+                loop_probe::mark_at(tag, TimeUs(at), i64::try_from(v).unwrap_or(i64::MAX));
             }
         },
         stage: stage_of,

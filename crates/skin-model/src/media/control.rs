@@ -75,6 +75,10 @@ pub enum Command {
     Close { player: u8 },
     /// End the worker.
     Quit,
+    /// Fire the fault the worker's development options name, armed until
+    /// now (dev-tools): a test sends it once its positive capture is in.
+    #[cfg(feature = "dev-tools")]
+    Fire,
 }
 
 /// The id of a reply that answers no command of the game's (a player's
@@ -149,6 +153,10 @@ pub enum Reply {
     /// The worker's control loop runs: sent at least every
     /// [`BEAT_INTERVAL_MS`], whether or not it holds players.
     Beat,
+    /// The fault [`Command::Fire`] armed takes effect now, at the worker's
+    /// performance counter `qpc`, read at the fault's own seam (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    Fired { qpc: i64 },
 }
 
 /// The longest the worker's control loop goes without a [`Reply::Beat`].
@@ -233,6 +241,13 @@ const PLAY: u8 = 2;
 const SEEK: u8 = 3;
 const CLOSE: u8 = 4;
 const QUIT: u8 = 5;
+#[cfg(feature = "dev-tools")]
+const FIRE: u8 = 6;
+/// The last command's tag.
+#[cfg(feature = "dev-tools")]
+const LAST_COMMAND: u8 = FIRE;
+#[cfg(not(feature = "dev-tools"))]
+const LAST_COMMAND: u8 = QUIT;
 
 const HELLO: u8 = 64;
 const PROBED: u8 = 65;
@@ -245,6 +260,8 @@ const CLOSED: u8 = 71;
 const LOG: u8 = 72;
 const REJECTED: u8 = 73;
 const BEAT: u8 = 74;
+#[cfg(feature = "dev-tools")]
+const FIRED: u8 = 75;
 
 /// The matrices by their code on the wire, their index.
 const MATRICES: [Matrix; 2] = [Matrix::Bt709, Matrix::Bt601];
@@ -298,6 +315,8 @@ impl Command {
             Self::Seek { player, run, at } => b.u8(SEEK).u32(id).u8(player).u64(run).i64(at),
             Self::Close { player } => b.u8(CLOSE).u32(id).u8(player),
             Self::Quit => b.u8(QUIT).u32(id),
+            #[cfg(feature = "dev-tools")]
+            Self::Fire => b.u8(FIRE).u32(id),
         };
         b.0
     }
@@ -311,7 +330,7 @@ impl Command {
     pub fn decode(message: &[u8]) -> Result<(u32, Self), Malformed> {
         let mut r = Fields::new(message)?;
         let tag = r.u8()?;
-        if !(OPEN..=QUIT).contains(&tag) {
+        if !(OPEN..=LAST_COMMAND).contains(&tag) {
             return Err(Malformed::Tag(tag));
         }
         let id = r.u32()?;
@@ -333,6 +352,8 @@ impl Command {
             },
             CLOSE => Self::Close { player: r.u8()? },
             QUIT => Self::Quit,
+            #[cfg(feature = "dev-tools")]
+            FIRE => Self::Fire,
             tag => return Err(Malformed::Tag(tag)),
         };
         r.end()?;
@@ -412,6 +433,8 @@ impl Reply {
             Self::Closed { id, player } => b.u8(CLOSED).u32(*id).u8(*player),
             Self::Log { text } => b.u8(LOG).texts(&[text]),
             Self::Beat => b.u8(BEAT),
+            #[cfg(feature = "dev-tools")]
+            Self::Fired { qpc } => b.u8(FIRED).i64(*qpc),
         };
         b.0
     }
@@ -477,6 +500,8 @@ impl Reply {
             },
             LOG => Self::Log { text: r.text()? },
             BEAT => Self::Beat,
+            #[cfg(feature = "dev-tools")]
+            FIRED => Self::Fired { qpc: r.i64()? },
             tag => return Err(Malformed::Tag(tag)),
         };
         r.end()?;

@@ -109,6 +109,14 @@ pub fn refuse_while_parked() {
 #[cfg(feature = "dev-tools")]
 static SLOW_CONVERT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Refuses an allocation for the player the calling thread works for,
+/// through the worker's own allocator (dev-tools), as a decoder's refused
+/// allocation is recorded: the player's next check fails it.
+#[cfg(feature = "dev-tools")]
+pub fn refuse_now() {
+    hooks::refuse_now();
+}
+
 /// Makes each frame's conversion sleep `ms` milliseconds first from now on
 /// (dev-tools).
 #[cfg(feature = "dev-tools")]

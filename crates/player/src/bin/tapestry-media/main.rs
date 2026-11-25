@@ -68,7 +68,7 @@ fn main() -> ExitCode {
 pub struct Out(Arc<Mutex<std::io::Stdout>>);
 
 /// The control pipe once the worker serves: diagnostics go there.
-static OUT: OnceLock<Out> = OnceLock::new();
+pub static OUT: OnceLock<Out> = OnceLock::new();
 
 /// Reports `line`, a diagnostic: to the game as a log reply while the
 /// worker serves, else to standard error.
@@ -248,6 +248,8 @@ fn serve_on(out: &Out) -> ExitCode {
                 quit = id;
                 break;
             }
+            #[cfg(feature = "dev-tools")]
+            Command::Fire => player::fire(),
         }
     }
     for (_, (tx, thread)) in std::mem::take(&mut players) {

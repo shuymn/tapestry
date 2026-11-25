@@ -57,23 +57,152 @@ pub enum Freeze {
     Waiting,
 }
 
-/// The player that freezes, and where (dev-tools).
+/// The player a development fault names (dev-tools): by its number, or by
+/// its video's codec as its probe names it, since the game numbers its
+/// players in the order their opens reach it.
 #[cfg(feature = "dev-tools")]
-static FREEZE: std::sync::Mutex<Option<(u8, Freeze)>> = std::sync::Mutex::new(None);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Player(u8),
+    Codec(String),
+}
 
-/// Has player `player` freeze at `at` (dev-tools).
 #[cfg(feature = "dev-tools")]
-pub fn freeze(player: u8, at: Freeze) {
-    if let Ok(mut f) = FREEZE.lock() {
-        *f = Some((player, at));
+impl Target {
+    /// `<number>`, or a codec's name.
+    pub fn parse(s: &str) -> Self {
+        s.parse()
+            .map_or_else(|_| Self::Codec(s.to_owned()), Self::Player)
+    }
+
+    /// Whether it names `player`, the calling player's thread's.
+    fn names(&self, player: u8) -> bool {
+        match self {
+            Self::Player(p) => *p == player,
+            Self::Codec(c) => CODEC.with(|codec| *codec.borrow() == *c),
+        }
     }
 }
 
+#[cfg(feature = "dev-tools")]
+thread_local! {
+    /// The codec of the calling player's video, once probed (dev-tools).
+    static CODEC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The player that freezes, and where (dev-tools).
+#[cfg(feature = "dev-tools")]
+static FREEZE: std::sync::Mutex<Option<(Target, Freeze)>> = std::sync::Mutex::new(None);
+
+/// Has the player `target` names freeze at `at` (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn freeze(target: Target, at: Freeze) {
+    if let Ok(mut f) = FREEZE.lock() {
+        *f = Some((target, at));
+    }
+}
+
+/// The faults `--dev-serve` names, fired at their own seams (dev-tools).
+/// With `fire`, every one of them, `freeze` included, waits for the game's
+/// [`skin_model::media::control::Command::Fire`], which a test sends once
+/// its positive capture is in; without, each fires as soon as its seam is
+/// reached. A fault firing answers [`Reply::Fired`] with the performance
+/// counter read at its seam, just before it takes effect.
+#[cfg(feature = "dev-tools")]
+mod faults {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::Target;
+
+    /// The faults wait for the game's `Fire`.
+    static ON_FIRE: AtomicBool = AtomicBool::new(false);
+    /// The game's `Fire` came.
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    /// The player whose next decode is refused an allocation.
+    static REFUSE: Mutex<Option<Target>> = Mutex::new(None);
+    /// The player whose next frame goes out in a run not started.
+    static GARBAGE: Mutex<Option<Target>> = Mutex::new(None);
+    /// The balloon started at the fire: its step and total, MiB.
+    static BALLOON: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+    pub fn on_fire() {
+        ON_FIRE.store(true, Ordering::Release);
+    }
+
+    pub fn refuse_alloc(target: Target) {
+        if let Ok(mut r) = REFUSE.lock() {
+            *r = Some(target);
+        }
+    }
+
+    pub fn garbage(target: Target) {
+        if let Ok(mut g) = GARBAGE.lock() {
+            *g = Some(target);
+        }
+    }
+
+    pub fn balloon(step: usize, total: usize) {
+        if let Ok(mut b) = BALLOON.lock() {
+            *b = Some((step, total));
+        }
+    }
+
+    /// Whether the faults may fire: the game's `Fire` came, or none is
+    /// awaited.
+    pub fn armed() -> bool {
+        !ON_FIRE.load(Ordering::Acquire) || FIRED.load(Ordering::Acquire)
+    }
+
+    /// The game's `Fire` (the control loop's): arms the faults, once, and
+    /// starts the balloon if one is set, whose seam is its thread's start.
+    pub fn fire() {
+        if FIRED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        crate::say("tapestry-media: the faults are armed");
+        if let Some((step, total)) = BALLOON.lock().ok().and_then(|b| *b) {
+            let _ = std::thread::Builder::new()
+                .name("balloon".to_owned())
+                .spawn(move || {
+                    crate::dev::fired();
+                    crate::dev::inflate(step, total, 0, false);
+                });
+        }
+    }
+
+    /// Takes the fault `slot` holds for `player` once armed: true once.
+    fn take(slot: &Mutex<Option<Target>>, player: u8) -> bool {
+        armed()
+            && slot
+                .lock()
+                .is_ok_and(|mut s| s.take_if(|t| t.names(player)).is_some())
+    }
+
+    pub fn refused(player: u8) -> bool {
+        take(&REFUSE, player)
+    }
+
+    pub fn garbled(player: u8) -> bool {
+        take(&GARBAGE, player)
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+pub use faults::{balloon, fire, garbage, on_fire, refuse_alloc};
+
 /// Freezes the calling player's thread for good when `player` is to
-/// freeze at `at` (dev-tools); returns at once otherwise.
+/// freeze at `at` (dev-tools) and the faults may fire, the fire stamped
+/// first; returns at once otherwise. One player freezes, once; the control
+/// loop goes on beating.
 #[cfg(feature = "dev-tools")]
 fn freeze_at(player: u8, at: Freeze) {
-    if FREEZE.lock().is_ok_and(|f| *f == Some((player, at))) {
+    let due = faults::armed()
+        && FREEZE
+            .lock()
+            .is_ok_and(|mut f| f.take_if(|(t, a)| *a == at && t.names(player)).is_some());
+    if due {
+        crate::dev::fired();
         crate::say(&format!(
             "tapestry-media: player {player} freezes at {at:?}"
         ));
@@ -122,6 +251,8 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
         }
     };
     let (width, height) = (probe.width, probe.height);
+    #[cfg(feature = "dev-tools")]
+    CODEC.with(|codec| codec.borrow_mut().clone_from(&probe.codec));
     out.send(&Reply::Probed {
         id: open,
         player,
@@ -359,6 +490,17 @@ impl Playing {
     fn step(&mut self, out: &Out) -> Result<(), (Failure, i32)> {
         let words = self.view.words();
         let Some(stamp) = self.held else {
+            #[cfg(feature = "dev-tools")]
+            if faults::refused(self.player) {
+                // The seam: the decode below finds the refusal recorded for
+                // this player, as one its decoder met.
+                crate::dev::fired();
+                crate::say(&format!(
+                    "tapestry-media: player {} is refused an allocation",
+                    self.player
+                ));
+                crate::ffmpeg::refuse_now();
+            }
             match self.decode(self.last)? {
                 Decoded::Frame(stamp) => {
                     self.input.convert(&mut self.frame)?;
@@ -378,9 +520,22 @@ impl Playing {
             return Ok(());
         };
         self.writer.state(words, State::Decoding);
+        #[cfg(feature = "dev-tools")]
+        let run = if faults::garbled(self.player) {
+            crate::dev::fired();
+            crate::say(&format!(
+                "tapestry-media: player {} writes a run not started",
+                self.player
+            ));
+            self.run.saturating_add(1_000_000)
+        } else {
+            self.run
+        };
+        #[cfg(not(feature = "dev-tools"))]
+        let run = self.run;
         let seq = self.seq.saturating_add(1);
         self.writer
-            .publish(words, slot, &self.frame, seq, self.run, stamp)
+            .publish(words, slot, &self.frame, seq, run, stamp)
             .map_err(|_| (Failure::Ring, 0))?;
         self.seq = seq;
         self.last = Some(stamp.at);
