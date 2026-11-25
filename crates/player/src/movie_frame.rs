@@ -538,6 +538,9 @@ pub struct Movies<S = Movie> {
     /// A play frame has shown the chart's panel lost (dev-tools).
     #[cfg(feature = "dev-tools")]
     lost_marked: bool,
+    /// A frame has shown a skin movie lost (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    skin_lost_marked: bool,
 }
 
 /// Whether the media session holds the preparation deadlines (dev-tools:
@@ -554,6 +557,28 @@ const fn preparation_held() -> bool {
     false
 }
 
+/// Marks the ring fault the render side found in chart slot `i` as the
+/// transition probe's `movies:ring_fault` (dev-tools): `i << 8` and the
+/// fault's kind, in [`Fault`](skin_model::media::Fault)'s order from 1 (a
+/// scenario tells the run check's rejection, 5, from another check's).
+#[cfg(feature = "dev-tools")]
+fn mark_fault(i: usize, fault: skin_model::media::Fault) {
+    use skin_model::media::Fault;
+    let kind = match fault {
+        Fault::Section => 1,
+        Fault::State { .. } => 2,
+        Fault::Index { .. } => 3,
+        Fault::Size { .. } => 4,
+        Fault::Run { .. } => 5,
+        Fault::Sequence { .. } => 6,
+        Fault::Stamp { .. } => 7,
+        Fault::Duration { .. } => 8,
+        Fault::Changed { .. } => 9,
+    };
+    let slot = i64::try_from(i).unwrap_or(i64::MAX >> 8);
+    crate::dev::loop_probe::mark("movies:ring_fault", (slot << 8) | kind);
+}
+
 /// The chart time of the play frame that first drew the chart's panel
 /// lost, of the play whose chart videos were set last ([`Movies::set_chart`];
 /// dev-tools: a scenario's `chart_lost` capture); `i64::MIN` until one
@@ -561,6 +586,12 @@ const fn preparation_held() -> bool {
 #[cfg(feature = "dev-tools")]
 pub static CHART_LOST_AT: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// The chart time of the play frame that first drew a skin movie lost, of
+/// the play whose chart videos were set last (dev-tools: a scenario's
+/// `skin_lost` capture); `i64::MIN` until one does.
+#[cfg(feature = "dev-tools")]
+pub static SKIN_LOST_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
 
 impl<S: Source> Movies<S> {
     /// The movies of a screen whose preparation started at `start`, by
@@ -578,6 +609,8 @@ impl<S: Source> Movies<S> {
             wakes: 0,
             #[cfg(feature = "dev-tools")]
             lost_marked: false,
+            #[cfg(feature = "dev-tools")]
+            skin_lost_marked: false,
         }
     }
 
@@ -601,6 +634,7 @@ impl<S: Source> Movies<S> {
         #[cfg(feature = "dev-tools")]
         {
             CHART_LOST_AT.store(i64::MIN, std::sync::atomic::Ordering::Release);
+            SKIN_LOST_AT.store(i64::MIN, std::sync::atomic::Ordering::Release);
             counts::lag_reset();
         }
     }
@@ -799,25 +833,33 @@ impl<S: Source> Movies<S> {
         }
         self.lose_peers(&mut shows);
         #[cfg(feature = "dev-tools")]
-        if let Some(c) = chart {
-            self.mark_lost(&shows, c.now);
-        }
+        self.mark_lost(&shows, chart.map(|c| c.now));
         shows
     }
 
-    /// The first play frame that shows the chart's panel lost marks its
-    /// chart time `now` (µs) as the transition probe's `movies:chart_lost`
-    /// (dev-tools): the frame from which the panel draws black.
+    /// Marks the frames from which lost movies draw black (dev-tools): the
+    /// first play frame that shows the chart's panel lost, its chart time
+    /// `now` (µs), as the transition probe's `movies:chart_lost`; the first
+    /// frame that shows a skin movie lost as `movies:skin_lost`, with a
+    /// play frame's chart time, else -1. A play frame's chart time is kept
+    /// for a scenario's `chart_lost` and `skin_lost` captures.
     #[cfg(feature = "dev-tools")]
-    fn mark_lost(&mut self, shows: &MovieShows, now: i64) {
-        if !self.lost_marked
-            && CHART_SLOTS
-                .iter()
-                .any(|&i| matches!(shows.get(i), Some(MovieShow::Lost)))
+    fn mark_lost(&mut self, shows: &MovieShows, now: Option<i64>) {
+        let lost = |i: usize| matches!(shows.get(i), Some(MovieShow::Lost));
+        if let Some(now) = now
+            && !self.lost_marked
+            && CHART_SLOTS.iter().any(|&i| lost(i))
         {
             self.lost_marked = true;
             crate::dev::loop_probe::mark("movies:chart_lost", now);
             CHART_LOST_AT.store(now, std::sync::atomic::Ordering::Release);
+        }
+        if !self.skin_lost_marked && (0..SLOTS).any(|i| !CHART_SLOTS.contains(&i) && lost(i)) {
+            self.skin_lost_marked = true;
+            crate::dev::loop_probe::mark("movies:skin_lost", now.unwrap_or(-1));
+            if let Some(now) = now {
+                SKIN_LOST_AT.store(now, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 
@@ -1141,9 +1183,16 @@ impl<S: Source> Movies<S> {
             };
             (due, peeked)
         };
-        let Ok(peek) = peeked else {
-            movie.lose(Loss::Fault);
-            return MovieShow::Lost;
+        let peek = match peeked {
+            Ok(peek) => peek,
+            Err(fault) => {
+                #[cfg(feature = "dev-tools")]
+                mark_fault(i, fault);
+                #[cfg(not(feature = "dev-tools"))]
+                let _ = fault;
+                movie.lose(Loss::Fault);
+                return MovieShow::Lost;
+            }
         };
         if peek.freed || freed {
             movie.freed(reader.freed());
@@ -1160,15 +1209,19 @@ impl<S: Source> Movies<S> {
                 let _region = crate::alloc_count::AppRegion::enter();
                 let taken = reader.take(words, d, pitch, sink);
                 let ok = taken.is_ok();
-                took = Some(taken.map(|f| (f.stamp, f.duration)).ok());
+                took = Some(taken.map(|f| (f.stamp, f.duration)));
                 ok
             });
             match took {
-                Some(None) => {
+                Some(Err(fault)) => {
+                    #[cfg(feature = "dev-tools")]
+                    mark_fault(i, fault);
+                    #[cfg(not(feature = "dev-tools"))]
+                    let _ = fault;
                     movie.lose(Loss::Fault);
                     return MovieShow::Lost;
                 }
-                Some(Some((stamp, duration))) => {
+                Some(Ok((stamp, duration))) => {
                     left = peek.left;
                     movie.freed(reader.freed());
                     if written {

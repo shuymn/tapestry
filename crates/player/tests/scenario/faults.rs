@@ -172,6 +172,62 @@ impl FaultRun {
         m
     }
 
+    /// The first frame that drew a skin movie lost: its time on the game's
+    /// clock and its chart time (-1 off play).
+    fn skin_lost(&self) -> (i64, i64) {
+        *self
+            .marks("movies:skin_lost")
+            .first()
+            .unwrap_or_else(|| panic!("a skin movie loss drawn: {}", self.stdout))
+    }
+
+    /// Checks the first play frame that drew the panel lost (the
+    /// [`LOST`] capture): drawn at or after `from` on the game's clock (the
+    /// session's sight of the loss, or the fault's stamp), captured at or
+    /// after its chart time, and black over the BGA. Its chart time.
+    fn check_lost_frame(&self, from: i64) -> i64 {
+        let (drawn, lost_us) = self.panel_lost();
+        assert!(from <= drawn, "drawn lost at {drawn}, before {from}");
+        let t = self.chart_us("lost");
+        assert!(t >= lost_us, "the lost capture at {t}, before {lost_us}");
+        assert!(
+            panel_black(&self.px("lost")),
+            "the first frame drawn lost, at {t}"
+        );
+        lost_us
+    }
+
+    /// Checks the first play frame that drew a skin movie lost (the
+    /// [`LOST_SKIN`] capture) as [`check_lost_frame`](Self::check_lost_frame)
+    /// does the panel's: black over both of its destinations.
+    fn check_skin_lost_frame(&self, from: i64) -> i64 {
+        let (drawn, lost_us) = self.skin_lost();
+        assert!(
+            from <= drawn,
+            "the skin movie drawn lost at {drawn}, before {from}"
+        );
+        let t = self.chart_us("lost_skin");
+        assert!(
+            t >= lost_us,
+            "the lost_skin capture at {t}, before {lost_us}"
+        );
+        assert!(
+            skin_black(&self.px("lost_skin")),
+            "the first frame drawn with the skin movie lost, at {t}"
+        );
+        lost_us
+    }
+
+    /// The ring faults the render side found in the second play: each
+    /// one's time on the game's clock and its kind ([`RING_FAULT_RUN`]'s
+    /// numbering).
+    fn ring_faults(&self) -> Vec<(i64, i64)> {
+        self.marks("movies:ring_fault")
+            .into_iter()
+            .map(|(at, v)| (at, v & 0xff))
+            .collect()
+    }
+
     /// The fault's stamp at its seam, on the game's clock, checked to come
     /// after the test's acknowledgement (A1).
     fn fired(&self) -> i64 {
@@ -364,6 +420,10 @@ fn worker_failure_blacks_the_panel_over_a_coloured_base() {
         fx
     };
     let fx = layered(true);
+    let _keep_control = KeepOnFailure::of(
+        &fx,
+        "worker_failure_blacks_the_panel_over_a_coloured_base-control",
+    );
     let run = run_fault(&fx, &fault_text(&ats, &[], select, play), &[], |_| {});
     run.ok();
     for at in &ats {
@@ -482,6 +542,15 @@ const FAULT_NOTES: &str = "#00111:01010101\n#00311:01010101";
 const FAULT_SELECT: &str = "select = { path = \"library/f/f.bms\" }";
 const FAULT_PLAY: &str = "play = { input = \"logs/f.tprl\", until = \"end\" }";
 
+/// The capture of the first play frame that drew the chart's panel lost.
+const LOST: &str = "capture = { chart_lost = true, file = \"lost.png\" }";
+/// The capture of the first play frame that drew a skin movie lost.
+const LOST_SKIN: &str = "capture = { skin_lost = true, file = \"lost_skin.png\" }";
+
+/// The kind of ring fault the render side marks for a frame of a run not
+/// started (`movies:ring_fault`, the run check's rejection).
+const RING_FAULT_RUN: i64 = 5;
+
 /// The fault scenarios' captures: every 237 ms, out of step with the
 /// clip's 100 ms frames, from 0 s to 7.8 s.
 fn fault_ats() -> Vec<i64> {
@@ -514,6 +583,18 @@ fn skin_witnesses(px: &[[u8; 3]]) -> [[u8; 3]; 2] {
 /// skin (y < 90, above the skin movie's) read back black.
 fn panel_black(px: &[[u8; 3]]) -> bool {
     all_black(&px[..90 * VIDEO_SIZE[0]])
+}
+
+/// Whether both destinations of [`install_fault_skin`]'s skin movie read
+/// back black, every pixel of each: rows 90 to 169 at x < 106 and x ≥ 214
+/// of a 320 × 180 capture.
+fn skin_black(px: &[[u8; 3]]) -> bool {
+    (90..170).all(|y| {
+        let row = y * VIDEO_SIZE[0];
+        (0..106)
+            .chain(214..VIDEO_SIZE[0])
+            .all(|x| px[row + x].iter().all(|&c| c <= 8))
+    })
 }
 
 /// Checks the BGA of each capture of `ats` in `run`, its chart video
@@ -586,33 +667,64 @@ fn second_record(fx: &Fixture) -> PlayRecord {
     replay::decode(&fs::read(record).unwrap(), &DecodeLimits::default()).unwrap()
 }
 
-/// What a play record holds that its timing does not change: its chart's
-/// identity and transform, its part, its input events and its end.
-type PlayFields = (
-    bms_model::ChartIdentity,
-    String,
-    PlayType,
-    Vec<PhysicalInputEvent>,
-    EndStatus,
-);
+/// Whether `rec`, a record of [`fault_fixture`]'s chart in `fx`, is
+/// complete and evaluable: a played attempt, no reason it is incomplete,
+/// no `#RANDOM` result, and evaluated from the chart without an error.
+fn check_complete(fx: &Fixture, rec: &PlayRecord) -> Result<(), String> {
+    if !rec.played() {
+        return Err("no played attempt".to_owned());
+    }
+    if rec.status.incomplete.any() {
+        return Err(format!("incomplete: {:?}", rec.status.incomplete));
+    }
+    if !rec.chart.identity.random_results.is_empty() {
+        return Err("#RANDOM results".to_owned());
+    }
+    let dir = fx.library().join("f");
+    let text = fs::read(dir.join("f.bms")).unwrap();
+    let chart = bms_parser::load_bms(&text, &dir, &Default::default())
+        .unwrap()
+        .chart;
+    let input = eval::EvalInput {
+        events: rec.events.clone(),
+        device: eval::DeviceProfile {
+            sources: rec
+                .devices
+                .sources
+                .iter()
+                .map(|s| s.profile.clone())
+                .collect(),
+        },
+        start: rec.start.clone(),
+        ..eval::EvalInput::default()
+    };
+    eval::evaluate(&chart, &input, &rules::beatoraja_style())
+        .map(|_| ())
+        .map_err(|e| format!("not evaluated: {e:?}"))
+}
 
-/// The [`PlayFields`] of `fx`'s second play.
-fn play_fields(fx: &Fixture) -> PlayFields {
-    let rec = second_record(fx);
-    (
-        rec.chart.identity,
-        rec.chart.transform.id,
-        rec.play_type,
-        rec.events,
-        rec.status.end,
-    )
+/// The record of `fx`'s second play, checked complete and evaluable
+/// ([`check_complete`]), with the two values a play draws or reads itself
+/// set apart: the chart's random seed, which selects nothing in a chart
+/// without `#RANDOM` (its results are checked empty), and the play clock's
+/// time when the record was finalized. Every other field is compared.
+fn comparable_record(fx: &Fixture) -> PlayRecord {
+    let mut rec = second_record(fx);
+    if let Err(why) = check_complete(fx, &rec) {
+        panic!("{why}: {rec:?}");
+    }
+    rec.chart.random_seed = 0;
+    rec.status.finalized = TimeUs(0);
+    rec
 }
 
 /// A healthy run of [`fault_fixture`]'s chart, its video from 0 s: the
 /// frame due in every capture of `ats`, the skin movie playing, no loss;
-/// its second play's [`PlayFields`].
-fn healthy_fault_run(ats: &[i64]) -> PlayFields {
+/// its second play's [`comparable_record`]. A record of it whose input
+/// failed is refused as incomplete.
+fn healthy_fault_run(ats: &[i64]) -> PlayRecord {
     let fx = fault_fixture("#00004:01");
+    let _keep = KeepOnFailure::of(&fx, "healthy_fault_run");
     let run = run_fault(
         &fx,
         &fault_text(ats, &[], FAULT_SELECT, FAULT_PLAY),
@@ -623,7 +735,14 @@ fn healthy_fault_run(ats: &[i64]) -> PlayFields {
     assert!(run.losses().is_empty(), "{}", run.stdout);
     check_panel(&run, ats, 0, i64::MAX, None);
     check_skin_movie_plays(&run, ats);
-    play_fields(&fx)
+    let rec = comparable_record(&fx);
+    let mut failed = rec.clone();
+    failed.status.incomplete.input_failed = true;
+    assert!(
+        check_complete(&fx, &failed).is_err(),
+        "a record whose input failed is refused"
+    );
+    rec
 }
 
 /// Waits until `done`, bounded by the run's limit and failing as soon as
@@ -703,7 +822,7 @@ fn failed_launch_blacks_the_panel_from_chart_time_zero() {
             "c{at}: black from chart time 0"
         );
     }
-    assert_eq!(play_fields(&fx), healthy);
+    assert_eq!(comparable_record(&fx), healthy);
 }
 
 /// A chart video lost while a miss shows the poor picture is drawn black
@@ -801,7 +920,7 @@ fn skin_movie_failure_blacks_its_destinations() {
     )];
     let run = run_fault(
         &fx,
-        &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
+        &fault_text(&ats, &[LOST_SKIN], FAULT_SELECT, FAULT_PLAY),
         &args,
         |c| {
             let px = c.due("c1185", 0);
@@ -822,19 +941,20 @@ fn skin_movie_failure_blacks_its_destinations() {
     );
     assert!(run.marks("movies:chart_lost").is_empty(), "{}", run.stdout);
     check_panel(&run, &ats, 0, i64::MAX, None);
-    let black: Vec<bool> = ats
-        .iter()
-        .map(|at| {
-            let w = skin_witnesses(&run.px(&format!("c{at}")));
-            assert!(
-                w[0] == w[1] || w.iter().all(|&p| shows(p)),
-                "c{at}: {w:?}, both or neither"
-            );
-            w.iter().all(|&p| near(p, [0; 3], 8))
-        })
-        .collect();
-    let first = black.iter().position(|&b| b).expect("the skin movie black");
-    assert!(first > 0 && black[first..].iter().all(|&b| b), "{black:?}");
+    let lost = run.check_skin_lost_frame(run.seen());
+    let mut after = 0;
+    for at in &ats {
+        let name = format!("c{at}");
+        let (px, t) = (run.px(&name), run.chart_us(&name));
+        if t >= lost {
+            assert!(skin_black(&px), "{name} at {t}: black from {lost}");
+            after += 1;
+        } else {
+            let w = skin_witnesses(&px);
+            assert!(w.iter().all(|&p| shows(p)), "{name} at {t}: {w:?}");
+        }
+    }
+    assert!(after > 0, "a capture after {lost}");
 }
 
 /// One chart player's allocation refused, after frames it showed, fails
@@ -857,7 +977,7 @@ fn decoder_alloc_refusal_blacks_only_its_panel() {
     )];
     let run = run_fault(
         &fx,
-        &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
+        &fault_text(&ats, &[LOST], FAULT_SELECT, FAULT_PLAY),
         &args,
         |c| {
             c.due("c1185", 0);
@@ -871,13 +991,13 @@ fn decoder_alloc_refusal_blacks_only_its_panel() {
         (0..=CRASH_SEEN).contains(&waited),
         "lost {waited} after the fire"
     );
-    let (_, lost) = run.panel_lost();
+    let lost = run.check_lost_frame(run.seen());
     assert!(
         check_panel(&run, &ats, 0, i64::MAX, Some(lost)) > 0,
         "a capture after {lost}"
     );
     check_skin_movie_plays(&run, &ats);
-    assert_eq!(play_fields(&fx), healthy);
+    assert_eq!(comparable_record(&fx), healthy);
 }
 
 /// A frame written into a chart video's ring in a run not started, after
@@ -896,7 +1016,7 @@ fn garbage_ring_fault_never_corrupts_play() {
     let args = [("TAPESTRY_DEV_WORKER_ARGS", "--dev-serve fire garbage=mjpeg")];
     let run = run_fault(
         &fx,
-        &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
+        &fault_text(&ats, &[LOST], FAULT_SELECT, FAULT_PLAY),
         &args,
         |c| {
             c.due("c1185", 0);
@@ -904,18 +1024,31 @@ fn garbage_ring_fault_never_corrupts_play() {
         },
     );
     run.ok();
-    let (drawn, lost) = run.panel_lost();
-    let waited = drawn - run.fired();
+    let fired = run.fired();
+    let (drawn, _) = run.panel_lost();
+    let waited = drawn - fired;
     assert!(
         (0..=CRASH_SEEN).contains(&waited),
         "drawn lost {waited} after the fire"
     );
+    // The run check alone rejected it: one fault, of a run not started,
+    // found from the fault's stamp to the frame that drew the panel lost.
+    let faults = run.ring_faults();
+    let [(found, kind)] = faults[..] else {
+        panic!("one ring fault: {faults:?}");
+    };
+    assert_eq!(kind, RING_FAULT_RUN, "{faults:?}");
+    assert!(
+        (fired..=drawn).contains(&found),
+        "found at {found}, fired at {fired}, drawn lost at {drawn}"
+    );
+    let lost = run.check_lost_frame(fired);
     assert!(
         check_panel(&run, &ats, 0, i64::MAX, Some(lost)) > 0,
         "a capture after {lost}"
     );
     check_skin_movie_plays(&run, &ats);
-    assert_eq!(play_fields(&fx), healthy);
+    assert_eq!(comparable_record(&fx), healthy);
 }
 
 /// A chart decoder that stops making progress, after frames it showed, is
@@ -933,6 +1066,8 @@ fn garbage_ring_fault_never_corrupts_play() {
 fn decoder_progress_stall_blacks_its_panel_only() {
     let ats = fault_ats();
     let fx = fault_fixture("#00204:01");
+    let _keep_control =
+        KeepOnFailure::of(&fx, "decoder_progress_stall_blacks_its_panel_only-control");
     let run = run_fault(
         &fx,
         &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
@@ -951,7 +1086,7 @@ fn decoder_progress_stall_blacks_its_panel_only() {
     )];
     let run = run_fault(
         &fx,
-        &fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY),
+        &fault_text(&ats, &[LOST], FAULT_SELECT, FAULT_PLAY),
         &args,
         |c| {
             c.due("c1185", 0);
@@ -973,7 +1108,7 @@ fn decoder_progress_stall_blacks_its_panel_only() {
     );
     // From the freeze to the loss, the panel holds the last frame the
     // player published.
-    let (_, lost) = run.panel_lost();
+    let lost = run.check_lost_frame(run.seen());
     let positive = run.chart_us("c1185") + 1;
     assert!(
         check_panel(&run, &ats, 0, positive, Some(lost)) > 0,
@@ -1008,7 +1143,7 @@ fn job_cap_terminates_the_worker_and_blacks_its_panels() {
         ats.iter()
             .map(|at| format!("capture = {{ at = {at}, file = \"c{at}.png\" }}")),
     );
-    steps.push(FAULT_SELECT.to_owned());
+    steps.extend([LOST, LOST_SKIN, FAULT_SELECT].map(str::to_owned));
     steps.extend(retried(6_200, "r", &again));
     steps.extend([FAULT_PLAY, "result = \"back\"", "quit = {}"].map(str::to_owned));
     let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
@@ -1041,20 +1176,23 @@ fn job_cap_terminates_the_worker_and_blacks_its_panels() {
         (0..=1_000_000 + CRASH_SEEN).contains(&waited),
         "lost {waited} after the fire"
     );
-    let (_, panel) = run.panel_lost();
+    let panel = run.check_lost_frame(run.seen());
+    let skin = run.check_skin_lost_frame(run.seen());
     let mut after = 0;
     for at in &ats {
         let name = format!("c{at}");
-        let t = run.chart_us(&name);
+        let (px, t) = (run.px(&name), run.chart_us(&name));
         if t >= panel {
-            assert!(
-                all_black(&run.px(&name)),
-                "{name} at {t}: black from {panel}"
-            );
+            assert!(panel_black(&px), "{name} at {t}: black from {panel}");
+        }
+        if t >= skin {
+            assert!(skin_black(&px), "{name} at {t}: black from {skin}");
+        }
+        if t >= panel.max(skin) {
             after += 1;
         }
     }
-    assert!(after > 0, "a capture after {panel}");
+    assert!(after > 0, "a capture after {panel} and {skin}");
     check_panel(&run, &ats, 0, panel, None);
     for at in &again {
         let name = format!("r{at}");
@@ -1372,6 +1510,7 @@ fn starved_worker_after_a_frame_blacks_its_panels() {
         .map(|at| format!("capture = {{ at = {at}, file = \"c{at}.png\" }}"))
         .collect();
     steps.extend(captures.iter().map(String::as_str));
+    steps.extend([LOST, LOST_SKIN]);
     steps.extend([FAULT_SELECT, FAULT_PLAY, "result = \"back\""]);
     steps.extend([
         "capture = { at = 474, file = \"n474.png\" }",
@@ -1410,15 +1549,23 @@ fn starved_worker_after_a_frame_blacks_its_panels() {
     let suspended = game_time_of(&run.stdout, suspended);
     check_starved(&run, suspended, run.chose, 2, 1);
     let seen = run.seen();
+    let panel = run.check_lost_frame(seen);
+    let skin = run.check_skin_lost_frame(seen);
     let mut after = 0;
     for at in &ats {
         let name = format!("c{at}");
-        if side(&run.dir, &name, "presented_us") > seen + CRASH_SEEN {
+        let (px, t) = (run.px(&name), run.chart_us(&name));
+        if t >= panel {
+            assert!(panel_black(&px), "{name} at {t}: black from {panel}");
+        }
+        if t >= skin {
+            assert!(skin_black(&px), "{name} at {t}: black from {skin}");
+        }
+        if t >= panel.max(skin) {
             after += 1;
-            assert!(all_black(&run.px(&name)), "{name}: black after the loss");
         }
     }
-    assert!(after > 0, "a capture after the loss at {seen}");
+    assert!(after > 0, "a capture after {panel} and {skin}");
 
     // On the selection screen: its skin movie alone.
     let fx = Fixture::new();
@@ -1487,19 +1634,24 @@ fn starved_worker_after_a_frame_blacks_its_panels() {
     };
     let suspended = game_time_of(&run.stdout, suspended);
     check_starved(&run, suspended, 0, 1, 0);
+    // The selection frame that first drew the movie lost is marked when it
+    // is built, after the frame before it was presented: every capture
+    // presented from that mark on is of that frame or a later one.
     let seen = run.seen();
+    let (drawn, _) = run.skin_lost();
+    assert!(seen <= drawn, "drawn lost at {drawn}, before {seen}");
     let mut after = 0;
     for k in first_shown.unwrap()..=48 {
         let name = format!("s{k}");
-        if side(&run.dir, &name, "presented_us") > seen + CRASH_SEEN {
+        if side(&run.dir, &name, "presented_us") >= drawn {
             after += 1;
             assert!(
                 !shows(witness(&run.px(&name))),
-                "{name}: black after the loss"
+                "{name}: black from the frame drawn lost at {drawn}"
             );
         }
     }
-    assert!(after > 0, "a capture after the loss at {seen}");
+    assert!(after > 0, "a capture after the loss drawn at {drawn}");
 }
 
 /// A selection skin whose only picture is a movie, `m.webm`, over the

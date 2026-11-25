@@ -2099,6 +2099,9 @@ impl Supervisor {
     /// after a grace, without waiting). The game's handle is gone, so no
     /// open comes after the ones `rx` holds.
     fn quit(&mut self, rx: &Receiver<Request>) {
+        // An ended session holds no preparation.
+        #[cfg(feature = "dev-tools")]
+        PREPARATION_HELD.store(false, Ordering::Release);
         for p in &self.players {
             p.movie.lose(Loss::Ended);
         }
