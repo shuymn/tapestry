@@ -357,6 +357,75 @@ fn the_chroma_location_follows_the_frame_its_planes_hold() {
     assert_eq!(chroma(shows[0]), Some(ChromaLocation::Bottom), "accepted");
 }
 
+/// A chart video's frames are drawn with the chroma location of the frame
+/// its planes hold (design.md "Rendering and Skins", video frames), as a
+/// skin movie's are: latched with each upload accepted, kept while no
+/// frame is due and when an upload is refused after its take, and changed
+/// with the next frame accepted.
+#[test]
+fn a_chart_video_s_chroma_location_follows_the_frame_its_planes_hold() {
+    use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga, TimeUs};
+    let chroma = |s: MovieShow| match s {
+        MovieShow::Frame { chroma, .. } => Some(chroma),
+        _ => None,
+    };
+    let start = Instant::now();
+    let fakes: [Arc<Fake>; 4] = std::array::from_fn(|_| Fake::new(16, 8));
+    let video = &fakes[2];
+    video.set(Status::Live);
+    video.publish_sited(1, 1, (0, 16_667), 1, ChromaLocation::Left);
+    // Slot 2's file starts at 0.
+    let bga = ChartBga::new(
+        vec![BgaImage {
+            id: 1,
+            name: "1.mp4".to_owned(),
+        }],
+        vec![BgaEvent {
+            time: TimeUs(0),
+            image: Some(BgaImageId(0)),
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut m = Movies::new(fakes.clone().map(Some), start);
+    m.set_chart(Arc::new(ChartVideos::of(&bga, &[Some(2)])), i64::MIN);
+    let mut planes = Kept::default();
+    m.admit(&mut planes, start);
+    let _ = m.prepare(&mut planes, start);
+    let mut frame = |planes: &mut Kept, at: i64| {
+        let shows = m.play_frame(planes, at, ChartAt { now: at, k: 20 }, start);
+        m.presented(true, drawn(shows));
+        shows[2]
+    };
+    assert_eq!(
+        chroma(frame(&mut planes, 1_000)),
+        Some(ChromaLocation::Left)
+    );
+    // None due: kept.
+    video.publish_sited(2, 1, (20_000, 16_667), 2, ChromaLocation::TopLeft);
+    assert_eq!(
+        chroma(frame(&mut planes, 10_000)),
+        Some(ChromaLocation::Left),
+        "none due"
+    );
+    // Taken from the ring, its upload refused: the planes keep frame 1.
+    planes.discard = true;
+    let shown = frame(&mut planes, 21_000);
+    assert!(holds(&planes, 2, 1), "the planes keep the first frame");
+    assert_eq!(
+        chroma(shown),
+        Some(ChromaLocation::Left),
+        "an upload refused"
+    );
+    // The next frame accepted: its location.
+    planes.discard = false;
+    video.publish_sited(3, 1, (30_000, 16_667), 3, ChromaLocation::Bottom);
+    let shown = frame(&mut planes, 31_000);
+    assert!(holds(&planes, 2, 3));
+    assert_eq!(chroma(shown), Some(ChromaLocation::Bottom), "accepted");
+}
+
 #[test]
 fn movie_picks_newest_frame_at_or_before_screen_time() {
     let start = Instant::now();

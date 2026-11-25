@@ -1295,7 +1295,8 @@ fn publish_sited(ring: &[AtomicU64], seq: u64, at: i64, chroma: ChromaLocation) 
 /// Skins", video frames): the peek's choice and the frame taken hold the
 /// one its slot held, every location FFmpeg names passes, and a slot word
 /// that names none (unspecified, or past the six) fails the player as a
-/// ring fault, which then reads nothing more.
+/// ring fault, which then reads nothing more. A ring of version 6, whose
+/// slots hold no location, is not this layout.
 // Covers: T02
 #[test]
 fn each_frame_carries_its_chroma_location() {
@@ -1332,6 +1333,13 @@ fn each_frame_carries_its_chroma_location() {
         assert_eq!(reader.peek(&watched, 6_000), Err(fault), "{value}: kept");
         assert_eq!(watched.take_log(), [], "{value}: nothing more read");
     }
+    let mem = section(g);
+    mem[1].store(6, Ordering::Relaxed);
+    assert_eq!(
+        Writer::attach(&*mem).err(),
+        Some(Refused::Layout),
+        "a version 6 ring"
+    );
 }
 
 /// A chroma location that changes to another valid one while its frame is
