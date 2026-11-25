@@ -760,6 +760,30 @@ fn a_third_file_and_a_poor_only_file_are_absent() {
     }
 }
 
+/// A name that resolves to no file it may read is absent and logged with
+/// its name and reason, once while its chart's folder stays the one
+/// resolved: here a video whose file is gone, which then has no slot and
+/// opens nothing; the retry logs nothing again.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_unresolved_name_is_logged_once_per_chart() {
+    use crate::result_skin::chart_tests::logged;
+    let (dir, w) = video_chart();
+    std::fs::remove_file(dir.path().join("v2.mp4")).unwrap();
+    let mut manifests = Vec::new();
+    let first = logged("bga: ", || manifests = answered_run(&w, None).1);
+    assert_eq!(first, ["bga: v2.mp4 is absent: no such file"]);
+    assert_eq!(
+        manifests[0].videos.slot(bms_model::BgaImageId(3)),
+        None,
+        "the gone video has no slot"
+    );
+    let again = logged("bga: ", || {
+        answered_run(&w, None);
+    });
+    assert_eq!(again, Vec::<String>::new(), "a retry logs nothing again");
+}
+
 /// A retry whose pictures are unchanged reuses the array, and its videos
 /// are handed over again, before the reuse: the next attempt opens its
 /// chart's videos anew.

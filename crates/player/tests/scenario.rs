@@ -929,6 +929,85 @@ fn a_headless_play_takes_a_size() {
     assert!(seen > 0);
 }
 
+/// Each chart slot's lag in a capture's sidecar `side`: the chart time of
+/// the play frame it was seen on and the lag, µs (`None` for none).
+fn side_chart_lag(side: &str) -> Vec<Option<(i64, i64)>> {
+    let key = "\"chart_lag\":[";
+    let from = side
+        .find(key)
+        .unwrap_or_else(|| panic!("chart_lag in {side}"))
+        + key.len();
+    let mut out = Vec::new();
+    let mut rest = &side[from..];
+    loop {
+        if let Some(r) = rest.strip_prefix("null") {
+            out.push(None);
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r.find(']').unwrap();
+            let (at, lag) = r[..end].split_once(',').unwrap();
+            out.push(Some((at.parse().unwrap(), lag.parse().unwrap())));
+            rest = &r[end + 1..];
+        }
+        match rest.strip_prefix(',') {
+            Some(r) => rest = r,
+            None => break,
+        }
+    }
+    assert!(rest.starts_with(']'), "chart_lag in {side}");
+    out
+}
+
+/// A fixture's whole folder copied under the target's test temp folder,
+/// named `name` and the time, when the test fails or
+/// `TAPESTRY_SCENARIO_KEEP` is set: the run's captures, display lists,
+/// measure and output stay to be read. Declared after its fixture, so it
+/// copies before the fixture's folder is removed.
+struct KeepOnFailure {
+    root: PathBuf,
+    name: &'static str,
+}
+
+impl KeepOnFailure {
+    fn of(fx: &Fixture, name: &'static str) -> Self {
+        Self {
+            root: fx._dir.path().to_path_buf(),
+            name,
+        }
+    }
+}
+
+impl Drop for KeepOnFailure {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && std::env::var_os("TAPESTRY_SCENARIO_KEEP").is_none() {
+            return;
+        }
+        fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(to)?;
+            for e in fs::read_dir(from)? {
+                let e = e?;
+                let (path, into) = (e.path(), to.join(e.file_name()));
+                if e.file_type()?.is_dir() {
+                    copy(&path, &into)?;
+                } else {
+                    fs::copy(&path, &into)?;
+                }
+            }
+            Ok(())
+        }
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let to = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("kept")
+            .join(format!("{}-{ms}", self.name));
+        match copy(&self.root, &to) {
+            Ok(()) => eprintln!("kept the fixture at {}", to.display()),
+            Err(e) => eprintln!("keeping the fixture at {} failed: {e}", to.display()),
+        }
+    }
+}
+
 /// `key` of a sidecar's JSON, as written.
 fn side_value(side: &str, key: &str) -> String {
     let rest = side
@@ -4870,4 +4949,902 @@ fn a_run_past_the_record_s_cap_exits_1() {
             }
         }
     }
+}
+
+/// The media worker built beside the game, which makes the coded clips.
+const WORKER: &str = env!("CARGO_BIN_EXE_tapestry-media");
+
+/// A clip of `spec` (`--dev-gen-clip`'s codec, container, size, rate,
+/// frames and group) at `path`: frame `i` shows `i` in the top row of its
+/// 16 × 16 blocks, bit `b` in block `b`.
+fn gen_clip(path: &Path, spec: &str) {
+    let out = Command::new(WORKER)
+        .arg("--dev-gen-clip")
+        .arg(path)
+        .args(spec.split(' '))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--dev-gen-clip {spec}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `w` × `h` PNG at `path`, `rgba` inside `rect` (x, y, w, h) and
+/// opaque black elsewhere.
+fn write_rect_png(path: &Path, [w, h]: [u32; 2], rect: [u32; 4], rgba: [u8; 4]) {
+    let file = fs::File::create(path).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let [rx, ry, rw, rh] = rect;
+    let texels: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .flat_map(|(x, y)| {
+            if (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y) {
+                rgba
+            } else {
+                [0, 0, 0, 255]
+            }
+        })
+        .collect();
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+}
+
+/// A play skin whose only element is the chart's BGA filling the canvas,
+/// each picture stretched to it whole (stretch 0): a 4:3 video of 320 × 240
+/// at a 320 × 180 capture is kept across and scaled 0.75 down.
+fn install_video_skin(fx: &Fixture) {
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "bga": {"id": "g"},
+            "destination": [{"id": "g", "stretch": 0,
+                "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]}]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The captures of a video scenario: 320 × 180 (small, so each PNG encodes quickly), the BGA filling them.
+const VIDEO_SIZE: [usize; 2] = [320, 180];
+
+/// The RGB pixels of the PNG at `path`, `VIDEO_SIZE`.
+fn rgb(path: &Path) -> Vec<[u8; 3]> {
+    let mut reader = png::Decoder::new(BufReader::new(fs::File::open(path).unwrap()))
+        .read_info()
+        .unwrap();
+    let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut rgba).unwrap();
+    assert_eq!(
+        [info.width as usize, info.height as usize],
+        VIDEO_SIZE,
+        "{}",
+        path.display()
+    );
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[r, g, b, _]| [r, g, b])
+        .collect()
+}
+
+/// The index a 320 × 240 coded clip's frame shows in a capture's pixels
+/// `px`, its blocks kept across and scaled 0.75 down: bit `b` in the green of
+/// block `b`'s centre (16 b + 8, 6), for `bits` bits; `None` when a block
+/// is neither dark nor bright, or when the clip's pattern under its row,
+/// never black, is black at (160, 60): no frame of the clip there (the
+/// black placeholder's blocks would read as frame 0's).
+fn coded_index(px: &[[u8; 3]], bits: usize) -> Option<u32> {
+    if px[60 * VIDEO_SIZE[0] + 160].iter().all(|&c| c <= 24) {
+        return None;
+    }
+    let mut index = 0;
+    for b in 0..bits {
+        let [_, g, _] = px[6 * VIDEO_SIZE[0] + 16 * b + 8];
+        match g {
+            0..64 => {}
+            192.. => index |= 1 << b,
+            _ => return None,
+        }
+    }
+    Some(index)
+}
+
+/// Whether every pixel of `px` is black within 8 of 0.
+fn all_black(px: &[[u8; 3]]) -> bool {
+    px.iter().all(|p| p.iter().all(|&c| c <= 8))
+}
+
+/// The newest frame of a clip at `rate` frames a second whose stamp,
+/// counted from its first, is at or before `media` µs: `None` before the
+/// first. Frame `i`'s stamp is `i / rate` s to the nearest µs, as the
+/// worker rescales its container's ticks.
+fn due_frame(media: i64, rate: i64) -> Option<u32> {
+    if media < 0 {
+        return None;
+    }
+    let stamp = |i: i64| (i * 1_000_000 + rate / 2) / rate;
+    let mut i = media * rate / 1_000_000;
+    while stamp(i + 1) <= media {
+        i += 1;
+    }
+    while stamp(i) > media {
+        i -= 1;
+    }
+    Some(u32::try_from(i).unwrap())
+}
+
+/// Whether `got` is the frame `due`.
+fn is_due(got: u32, due: u32) -> bool {
+    got == due
+}
+
+/// The capture `name`'s chart time, from its JSON beside it.
+fn chart_us(dir: &Path, name: &str) -> i64 {
+    side_num(
+        &fs::read_to_string(dir.join(format!("{name}.json"))).unwrap(),
+        "chart_us",
+    )
+}
+
+/// The transition probe's marks `tag` in `stdout`: each one's time on
+/// the game's clock and value.
+fn probe_marks(stdout: &str, tag: &str) -> Vec<(i64, i64)> {
+    lines(stdout, "dev: probe ")
+        .iter()
+        .filter_map(|l| {
+            let mut w = l.split(' ').skip(2);
+            let (t, g, v) = (w.next()?, w.next()?, w.next()?);
+            (g == tag).then(|| (t.parse().unwrap(), v.parse().unwrap()))
+        })
+        .collect()
+}
+
+/// The id of the media worker the game process `parent` launched, waiting
+/// up to `limit` for it: a child process of it named `tapestry-media.exe`.
+fn worker_of(parent: u32, limit: std::time::Duration) -> u32 {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let begun = std::time::Instant::now();
+    loop {
+        // SAFETY: a snapshot of the system's processes, closed below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.unwrap();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap(),
+            ..Default::default()
+        };
+        let mut found = None;
+        // SAFETY: the snapshot and an entry of its size.
+        let mut more = unsafe { Process32FirstW(snapshot, &raw mut entry) }.is_ok();
+        while more {
+            let name = String::from_utf16_lossy(&entry.szExeFile);
+            if entry.th32ParentProcessID == parent
+                && name.trim_end_matches('\0') == "tapestry-media.exe"
+            {
+                found = Some(entry.th32ProcessID);
+            }
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snapshot, &raw mut entry) }.is_ok();
+        }
+        // SAFETY: the snapshot, unused after this.
+        let _ = unsafe { CloseHandle(snapshot) };
+        if let Some(pid) = found {
+            return pid;
+        }
+        assert!(begun.elapsed() < limit, "no media worker of {parent}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Ends process `pid`, as a crash does: nobody asked it to. Returns the
+/// QPC time just before the call that ends it, once its exit is confirmed
+/// through the handle kept while it ended (termination is asynchronous).
+fn crash(pid: u32) -> i64 {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Performance::QueryPerformanceCounter;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+    // SAFETY: a process id; the handle is closed below.
+    let process =
+        unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) }.unwrap();
+    let mut at = 0;
+    // SAFETY: writes the local it is given.
+    unsafe { QueryPerformanceCounter(&raw mut at) }.unwrap();
+    // SAFETY: the process just opened to terminate.
+    unsafe { TerminateProcess(process, 1) }.unwrap();
+    // SAFETY: the process opened to wait on.
+    let ended = unsafe { WaitForSingleObject(process, 10_000) };
+    // SAFETY: the handle, unused after this.
+    let _ = unsafe { CloseHandle(process) };
+    assert_eq!(ended, WAIT_OBJECT_0, "{pid} ended");
+    at
+}
+
+/// The game's probe clock time (µs) of `qpc`, a QPC time read in this
+/// process: the game's `dev: probe origin <origin> <hz>` line in `stdout`
+/// gives the clock's own conversion (`input::time::qpc_to_us`), QPC
+/// being one counter across the machine's processes.
+fn game_time_of(stdout: &str, qpc: i64) -> i64 {
+    let line = lines(stdout, "dev: probe origin ")
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("no probe origin: {stdout}"));
+    let v: Vec<i64> = line
+        .split(' ')
+        .skip(3)
+        .map(|w| w.parse().unwrap())
+        .collect();
+    let [origin, frequency] = v[..] else {
+        panic!("{line}");
+    };
+    let us = (i128::from(qpc) - i128::from(origin)) * 1_000_000;
+    i64::try_from(us.div_euclid(i128::from(frequency))).unwrap()
+}
+
+/// Waits up to `limit` for the capture `name` in `dir` to be written whole
+/// (its JSON, written after its PNG, ending its line) by the game process
+/// `game`, failing at once when the game has ended first; when it is, the
+/// time it was seen.
+fn written(dir: &Path, name: &str, limit: std::time::Duration, game: u32) -> std::time::Instant {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: a handle to the game's process, closed below; a game already
+    // gone fails here.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, game) }
+        .unwrap_or_else(|e| panic!("{name} not written: the game is gone ({e})"));
+    let begun = std::time::Instant::now();
+    let seen = loop {
+        if fs::read_to_string(dir.join(format!("{name}.json"))).is_ok_and(|s| s.ends_with('\n')) {
+            break Ok(std::time::Instant::now());
+        }
+        // SAFETY: the handle opened above, polled without waiting.
+        if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
+            break Err("the game ended first");
+        }
+        if begun.elapsed() >= limit {
+            break Err("past the limit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    // SAFETY: the handle opened above, closed once.
+    unsafe { CloseHandle(process) }.unwrap();
+    seen.unwrap_or_else(|why| panic!("{name} not written: {why}"))
+}
+
+impl Fixture {
+    /// `command` run to its end within `limit` as [`run_drained`] runs it,
+    /// `during` given its process id while it runs; a failure of `during`
+    /// ends the run and fails the test with what it printed.
+    ///
+    /// [`run_drained`]: Self::run_drained
+    fn run_during(
+        &self,
+        command: &mut Command,
+        limit: std::time::Duration,
+        during: impl FnOnce(u32),
+    ) -> (Output, String, String) {
+        use std::io::Read as _;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let drain = |mut r: Box<dyn std::io::Read + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = r.read_to_end(&mut bytes);
+                let _ = tx.send(bytes);
+            });
+            rx
+        };
+        let out = drain(Box::new(child.stdout.take().unwrap()));
+        let err = drain(Box::new(child.stderr.take().unwrap()));
+        let begun = std::time::Instant::now();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| during(child.id())));
+        let status = loop {
+            if ran.is_err() {
+                break None;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if begun.elapsed() >= limit {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        if status.is_none() {
+            // Its worker, in a job the game closes with it, ends with it.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let read = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+            let bytes = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let (stdout, stderr) = (read(out), read(err));
+        if let Err(e) = ran {
+            eprintln!("{stdout}\n{stderr}");
+            std::panic::resume_unwind(e);
+        }
+        let Some(status) = status else {
+            panic!("the run did not end within {limit:?}\n{stdout}\n{stderr}");
+        };
+        let output = Output {
+            status,
+            stdout: stdout.clone().into_bytes(),
+            stderr: stderr.clone().into_bytes(),
+        };
+        (output, stdout, stderr)
+    }
+}
+
+/// How long the session takes at most to see a crashed worker, from the
+/// call that ended it: it looks at least every 100 ms (its tick), and the
+/// allowance covers a loaded machine's scheduling of the session.
+const CRASH_SEEN: i64 = 100_000 + 1_000_000;
+
+/// A chart with a coded base video and a layer picture, `v/v.bms`: the
+/// 10 s clip `clip.avi` (MJPEG, 320 × 240, 10 fps, frame `i` showing `i`) on the
+/// base from 0 s, a layer picture over it, black but for a green block at
+/// (200, 150) 100 × 80, from 0 s, and notes at 2.0 to 3.5 s and 6.0 to
+/// 7.5 s (120 BPM) with an invisible key-6 note.
+fn write_video_chart(library: &Path) -> bms_model::Chart {
+    let dir = library.join("v");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    gen_clip(&dir.join("clip.avi"), "mjpeg avi 320x240 10 100 1");
+    write_rect_png(
+        &dir.join("layer.png"),
+        [320, 240],
+        [200, 150, 100, 80],
+        [0, 200, 0, 255],
+    );
+    let text = "#PLAYER 1\n#TITLE video\n#BPM 120\n#WAV01 key.wav\n\
+                #BMP01 clip.avi\n#BMP02 layer.png\n\
+                #00138:01\n#00004:01\n#00007:02\n#00111:01010101\n#00311:01010101\n";
+    fs::write(dir.join("v.bms"), text).unwrap();
+    bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart
+}
+
+/// The scenario of a chart played twice in one run, at the video captures'
+/// size, written to `output`: the first play (the steps `first`, `select`
+/// and `play`, then the result left) launches the media worker, which the
+/// session keeps for the run, so the second, captured at each of `ats`
+/// (chart ms, `c<ms>.png`) and by the capture steps `more`, waits for no
+/// launch. A launch slowed past the preparation deadline on a loaded
+/// machine would otherwise play the captured chart without its videos, as
+/// designed.
+fn warmed_scenario(
+    output: &str,
+    first: &[&str],
+    ats: &[i64],
+    more: &[&str],
+    select: &str,
+    play: &str,
+) -> String {
+    let captures: Vec<String> = ats
+        .iter()
+        .map(|at| format!("capture = {{ at = {at}, file = \"c{at}.png\" }}"))
+        .collect();
+    let once = [select, play, "result = \"back\""];
+    let mut steps: Vec<&str> = first.to_vec();
+    steps.extend(once);
+    steps.extend(captures.iter().map(String::as_str));
+    steps.extend(more);
+    steps.extend(once);
+    steps.push("quit = {}");
+    scenario(&steps).replacen(
+        "output = \"out\"\n",
+        &format!("output = \"{output}\"\nsize = [320, 180]\n"),
+        1,
+    )
+}
+
+/// A chart's coded base video plays on chart time through the media worker
+/// (design.md "Rendering and Skins", BGA), on the chart's second play: each
+/// capture shows the frame due at its chart time, the green block of the
+/// layer picture over it. The first play's launch waits at the game's
+/// launch gate (dev-tools), shut until that play has begun, so its videos
+/// are lost at its preparation deadline and its panel draws black; the
+/// launch then completes and the session keeps the worker for the second
+/// play.
+/// The worker is then crashed after a capture read back so (design.md
+/// "Threat Model" T02): the session sees it, from the call that ended it,
+/// within its tick and an allowance, before the render side draws it, and
+/// sees no other loss in that play; the first frame that draws the panel
+/// lost reads back black over the whole panel, the layer picture too, as
+/// does every capture after it, and the frames before it still show the
+/// video. Play goes on to its end and its record is saved.
+// Covers: T02
+#[test]
+fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
+    // The capture after which the worker is crashed.
+    const KILL_AFTER: i64 = 12 * 237;
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "a_chart_video_plays_and_a_crash_blacks_its_panel");
+    let chart = write_video_chart(&fx.library());
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("v.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    // Every 237 ms, out of step with the clip's 100 ms frames, to 7.8 s, on
+    // the chart's second play; the first launches the worker.
+    let ats: Vec<i64> = (1..=33).map(|k| k * 237).collect();
+    let text = warmed_scenario(
+        "out",
+        &["capture = { at = 0, file = \"warm.png\" }"],
+        &ats,
+        &["capture = { chart_lost = true, file = \"lost.png\" }"],
+        "select = { path = \"library/v/v.bms\" }",
+        "play = { input = \"logs/v.tprl\", until = \"end\" }",
+    );
+    let dir = fx.base.join("out");
+    let mut killed = None;
+    // The game's launch gate, shut until the first play has begun: a file
+    // of this run's own, so nothing another process waits on is held.
+    let gate = fx.base.join("launch.gate");
+    fs::write(&gate, b"").unwrap();
+    let (out, stdout, stderr) = fx.run_during(
+        fx.command(&text)
+            .env("TAPESTRY_LOOP_PROBE", "1")
+            .env("TAPESTRY_DEV_LAUNCH_GATE", &gate),
+        RUN_LIMIT,
+        |game| {
+            written(&dir, "warm", RUN_LIMIT, game);
+            fs::remove_file(&gate).unwrap();
+            let name = format!("c{KILL_AFTER}");
+            written(&dir, &name, RUN_LIMIT, game);
+            let px = rgb(&dir.join(format!("{name}.png")));
+            let due = due_frame(chart_us(&dir, &name), 10).unwrap();
+            let got = coded_index(&px, 7);
+            assert!(
+                got.is_some_and(|g| is_due(g, due)),
+                "{name}: {got:?}, due {due:?}"
+            );
+            let worker = worker_of(game, std::time::Duration::from_secs(10));
+            killed = Some(crash(worker));
+        },
+    );
+    fs::write(fx.base.join("run.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let crashed = game_time_of(&stdout, killed.unwrap());
+    // The first play drew its panel lost from its start: the launch it
+    // waited for came after its preparation deadline.
+    let [(warm_chose, _), (chose, _)] = probe_marks(&stdout, "cur:chose")[..] else {
+        panic!("two choices: {stdout}");
+    };
+    assert!(
+        all_black(&rgb(&dir.join("warm.png"))),
+        "the first play's panel, lost at its preparation deadline"
+    );
+    assert!(
+        probe_marks(&stdout, "movies:chart_lost")
+            .iter()
+            .any(|m| (warm_chose..chose).contains(&m.0)),
+        "the first play drew its panel lost: {stdout}"
+    );
+    // The marks of the second play, from its choice.
+    let second = |tag: &str| -> Vec<(i64, i64)> {
+        probe_marks(&stdout, tag)
+            .into_iter()
+            .filter(|m| m.0 >= chose)
+            .collect()
+    };
+    // The session saw the chart video lost as its worker ended (`Ended`,
+    // a chart video's), after the crash and within the bound, and no
+    // other loss in that play; the render side then drew the panel lost.
+    let ended = 8 + 256;
+    let session = second("media:lost");
+    assert_eq!(
+        session.iter().map(|m| m.1).collect::<Vec<_>>(),
+        [ended],
+        "{stdout}"
+    );
+    let seen = session[0].0;
+    assert!(
+        (0..=CRASH_SEEN).contains(&(seen - crashed)),
+        "seen at {seen}, crashed at {crashed}"
+    );
+    let [(drawn_at, lost_chart_us)] = second("movies:chart_lost")[..] else {
+        panic!("one panel loss drawn: {stdout}");
+    };
+    assert!(seen <= drawn_at, "{session:?} {drawn_at}");
+    // The first frame that drew the panel lost, captured.
+    let lost_px = rgb(&dir.join("lost.png"));
+    let lost_t = chart_us(&dir, "lost");
+    assert!(
+        lost_t >= lost_chart_us && all_black(&lost_px),
+        "the frame at {lost_t}: black from {lost_chart_us}"
+    );
+    for at in &ats {
+        let name = format!("c{at}");
+        let px = rgb(&dir.join(format!("{name}.png")));
+        let t = chart_us(&dir, &name);
+        if t >= lost_chart_us {
+            assert!(all_black(&px), "{name} at {t}: black from {lost_chart_us}");
+            continue;
+        }
+        let due = due_frame(t, 10).unwrap();
+        let got = coded_index(&px, 7);
+        assert!(
+            got.is_some_and(|g| is_due(g, due)),
+            "{name} at {t}: {got:?}, due {due:?}"
+        );
+        let [r, g, b] = px[142 * VIDEO_SIZE[0] + 250];
+        assert!(
+            g > 128 && r < 64 && b < 64,
+            "{name}: the layer's green over the video"
+        );
+    }
+    assert!(
+        ats.iter()
+            .any(|at| chart_us(&dir, &format!("c{at}")) >= lost_chart_us),
+        "a capture after the loss"
+    );
+    let (records, _) = fx.played_records();
+    let [_, record] = &records[..] else {
+        panic!("two played records: {records:?}");
+    };
+    let rec = replay::decode(&fs::read(record).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
+}
+
+/// The `[load_stages]` of the measure file beside `record`, in their order.
+fn record_load_stages(record: &Path) -> Vec<(String, i64)> {
+    let text = fs::read_to_string(record.with_extension("measure.toml")).unwrap();
+    let section = text
+        .split("[load_stages]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no load stages: {text}"));
+    section
+        .lines()
+        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+        .map(|l| {
+            let (k, v) = l.split_once(" = ").unwrap();
+            (k.to_owned(), v.parse().unwrap())
+        })
+        .collect()
+}
+
+/// A 20 s coded clip (2 fps) started on the base at 1 s plays on chart
+/// time through the media worker (design.md "Rendering and Skins", BGA):
+/// every capture shows exactly the newest frame whose stamp, from the
+/// clip's first, is at or before its chart time less 1 s, the placeholder
+/// before the start and after the clip's last frame has ended (its stamp
+/// plus its duration). Captures land inside the first frame's interval
+/// (frame 0, told from the black placeholder) and inside the last frame's
+/// (shown until its end, not its stamp); the clip's 500 ms frames keep
+/// those intervals longer than a slow renderer's gaps between presented
+/// frames. Every frame shown carries its exact stamp, up to the last
+/// frame's. The chart is played twice: the first play's load stamps the
+/// worker's launch, the second's, the one captured, its video's probe and
+/// no launch, each in order before READY.
+#[test]
+fn chart_video_frames_follow_chart_time_in_a_scenario() {
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "chart_video_frames_follow_chart_time_in_a_scenario");
+    let dir = fx.library().join("t");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    gen_clip(&dir.join("clip.avi"), "mjpeg avi 320x240 2 40 1");
+    let text = "#PLAYER 1\n#TITLE timing\n#BPM 120\n#WAV01 key.wav\n#BMP01 clip.avi\n\
+                #00138:01\n#00004:0001\n#00111:01010101\n#01011:01010101\n";
+    fs::write(dir.join("t.bms"), text).unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("t.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    // Every 237 ms, out of step with the clip's 500 ms frames, to 21.6 s
+    // (the clip's last frame ends at 21 s), and every 40 ms through the
+    // first frame's interval (1.0 to 1.5 s) and the last's (20.5 to 21 s).
+    let mut ats: Vec<i64> = (1..=91).map(|k| k * 237).collect();
+    ats.extend((0..12).map(|k| 1_020 + 40 * k));
+    ats.extend((0..12).map(|k| 20_520 + 40 * k));
+    ats.sort_unstable();
+    ats.dedup();
+    let (out, stdout, stderr) = fx.run_drained(
+        &mut fx.command(&warmed_scenario(
+            "out",
+            &[],
+            &ats,
+            &[],
+            "select = { path = \"library/t/t.bms\" }",
+            "play = { input = \"logs/t.tprl\", until = \"end\" }",
+        )),
+        RUN_LIMIT,
+    );
+    fs::write(fx.base.join("run.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out_dir = fx.base.join("out");
+    let (mut shown, mut placeholder, mut first, mut last) = (0, 0, 0, 0);
+    for at in &ats {
+        let name = format!("c{at}");
+        let px = rgb(&out_dir.join(format!("{name}.png")));
+        let t = chart_us(&out_dir, &name);
+        // The start at 1 s; the clip's 40 frames end at 20 s of media.
+        let media = t - 1_000_000;
+        if !(0..20_000_000).contains(&media) {
+            assert!(all_black(&px), "{name} at {t}: the placeholder");
+            placeholder += 1;
+            continue;
+        }
+        let due = due_frame(media, 2).unwrap();
+        let got = coded_index(&px, 8);
+        assert!(
+            got.is_some_and(|g| is_due(g, due)),
+            "{name} at {t}: {got:?}, due {due:?}"
+        );
+        shown += 1;
+        match due {
+            0 => first += 1,
+            39 => last += 1,
+            _ => {}
+        }
+    }
+    assert!(shown >= 80 && placeholder >= 5, "{shown} {placeholder}");
+    assert!(
+        first > 0 && last > 0,
+        "captures inside the first frame's interval ({first}) and the last's ({last})"
+    );
+    let (records, _) = fx.played_records();
+    let [warm, record] = &records[..] else {
+        panic!("two played records: {records:?}");
+    };
+    // Every frame the second play showed carried its exact stamp, a multiple
+    // of the clip's 500 ms period, up to the last frame's: a stamp off the
+    // clip's time fails here whatever the captures' phase.
+    let measure: toml::Table = fs::read_to_string(record.with_extension("measure.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let lag = &measure["chart_lag"];
+    assert_eq!(lag["over"].as_integer(), Some(0), "{lag:?}");
+    let stamps: Vec<i64> = lag["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_array().unwrap()[3].as_integer().unwrap())
+        .collect();
+    assert!(stamps.iter().all(|s| s % 500_000 == 0), "{stamps:?}");
+    assert_eq!(stamps.iter().max(), Some(&19_500_000), "{stamps:?}");
+    let in_order = |stages: &[(String, i64)], order: &[&str]| {
+        let at = |k: &str| {
+            stages
+                .iter()
+                .find(|(n, _)| n == k)
+                .unwrap_or_else(|| panic!("no {k}: {stages:?}"))
+                .1
+        };
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) <= at(pair[1]), "{pair:?}: {stages:?}");
+        }
+        assert!(at(order[0]) >= 0, "{stages:?}");
+    };
+    // The first play's load stamps the worker's launch. Its end is there
+    // when the launch ended by READY; a launch past the preparation
+    // deadline ends after it, unstamped, and that play took no frame of
+    // its video.
+    let stages = record_load_stages(warm);
+    if stages.iter().any(|(n, _)| n == "media_launch_end") {
+        in_order(
+            &stages,
+            &["media_launch_start", "media_launch_end", "ready"],
+        );
+    } else {
+        in_order(&stages, &["media_launch_start", "ready"]);
+        let measure: toml::Table = fs::read_to_string(warm.with_extension("measure.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            measure["movies"]["takes"][2].as_integer(),
+            Some(0),
+            "a launch unstamped by READY, yet its video played: {measure:?}"
+        );
+    }
+    // The second's stamps its video's probe, and no launch: the worker was
+    // kept.
+    let stages = record_load_stages(record);
+    in_order(
+        &stages,
+        &["video_probes_start", "video_probes_end", "ready"],
+    );
+    assert!(
+        !stages.iter().any(|(n, _)| n.starts_with("media_launch")),
+        "{stages:?}"
+    );
+}
+
+/// The render thread's app region allocates nothing in any frame of a play
+/// whose movie hook runs all four movie slots (design.md "Scope of No
+/// Allocation"): a chart video on the base, started again inside its clip,
+/// another on the layer, the base's video in the poor window of every
+/// missed note, and two skin movies, each through the media worker, which a
+/// first play of the chart has launched. The second play's measure counts
+/// frames taken into each of the four slots and the restart, and its
+/// capture in the poor window draws the base's video alone, the frame the
+/// base's slot held. It prints how late each chart slot's picture was, the largest
+/// over the play and on each capture, and keeps its folder when it fails.
+/// Its positive control: the BGA's draw made to allocate (dev-tools) is
+/// counted.
+#[test]
+fn render_app_zero_with_video_bga() {
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "render_app_zero_with_video_bga");
+    let dir = fx.library().join("w");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    // Distinct clips: the base's 320 × 240, whose coded row a capture reads
+    // as its index, and the layer's 160 × 120, drawn twice as large, whose
+    // blocks a capture reads as another number.
+    gen_clip(&dir.join("a.mpg"), "mpeg1video mpeg 320x240 30 300 15");
+    gen_clip(&dir.join("b.mpg"), "mpeg1video mpeg 160x120 30 300 15");
+    // Base a.mpg at 0 s and again at 3 s, layer b.mpg at 0 s, the poor
+    // window naming a.mpg; four notes from 2 s, every one missed.
+    let text = "#PLAYER 1\n#TITLE all\n#BPM 120\n#WAV01 key.wav\n\
+                #BMP01 a.mpg\n#BMP02 b.mpg\n\
+                #00138:01\n#00004:01\n#00104:0001\n#00007:02\n#00006:01\n#00111:01010101\n";
+    fs::write(dir.join("w.bms"), text).unwrap();
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    for name in ["c.mpg", "d.mpg"] {
+        gen_clip(&skin.join(name), "mpeg1video mpeg 160x120 30 300 15");
+    }
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "source": [{"id": "c", "path": "c.mpg"}, {"id": "d", "path": "d.mpg"}],
+            "image": [{"id": "mc", "src": "c"}, {"id": "md", "src": "d"}],
+            "bga": {"id": "g"},
+            "destination": [
+                {"id": "g", "stretch": 0, "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]},
+                {"id": "mc", "dst": [{"x": 0, "y": 0, "w": 320, "h": 240}]},
+                {"id": "md", "dst": [{"x": 1600, "y": 0, "w": 320, "h": 240}]}]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    // The second play of the chart is the one measured and captured.
+    let plays = |output: &str| {
+        warmed_scenario(
+            output,
+            &[],
+            &[1_000, 2_400],
+            &[],
+            "select = { path = \"library/w/w.bms\" }",
+            "play = { input = { miss = \"all\" }, until = \"end\" }",
+        )
+    };
+    let measured = |fx: &Fixture| -> toml::Table {
+        let (records, _) = fx.played_records();
+        let last = records.last().expect("a played record");
+        fs::read_to_string(last.with_extension("measure.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let (out, stdout, stderr) = fx.run_drained(&mut fx.command(&plays("all")), RUN_LIMIT);
+    fs::write(fx.base.join("all.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let mut m = measured(&fx);
+    let lag = m
+        .remove("chart_lag")
+        .expect("the chart slots' lag measured");
+    let largest = &lag["largest"];
+    assert!(int(&m, "render_cpu_us", "count").unwrap() > 0, "{m:?}");
+    assert_eq!(int(&m, "allocations", "render_app"), Some(0), "{m:?}");
+    let takes: Vec<i64> = m["movies"]["takes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_integer().unwrap())
+        .collect();
+    assert_eq!(takes.len(), 4, "{m:?}");
+    assert!(takes.iter().all(|&t| t > 0), "each slot taken: {m:?}");
+    assert!(int(&m, "movies", "restarts").unwrap() >= 1, "{m:?}");
+    assert!(
+        int(&m, "movies", "restarted_takes").unwrap() >= 1,
+        "frames of the restarted run taken: {m:?}"
+    );
+    // Before any miss the BGA draws the base's and the layer's videos
+    // (chart slots 2 and 3) beside the skin's two (slots 0 and 1); in the
+    // poor window, the base's video alone in the poor picture's place.
+    let all = fx.base.join("all");
+    let movie_slots = |name: &str| {
+        let mut slots: Vec<i64> = fs::read_to_string(all.join(format!("{name}.jsonl")))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"filter\":\"Movie {"))
+            .map(|l| side_num(l, "layer"))
+            .collect();
+        slots.sort_unstable();
+        slots
+    };
+    assert_eq!(movie_slots("c1000"), [0, 1, 2, 3]);
+    assert_eq!(movie_slots("c2400"), [0, 1, 2]);
+    // How late each chart slot's picture was: the largest over the play,
+    // and on each captured frame, the base's (slot 2) bound to it by its
+    // chart time.
+    let lag_at = |name: &str| {
+        let side = fs::read_to_string(all.join(format!("{name}.json"))).unwrap();
+        let lags = side_chart_lag(&side);
+        let t = side_num(&side, "chart_us");
+        assert_eq!(lags.len(), 2, "{name}: {side}");
+        assert_eq!(
+            lags[0].map(|(at, _)| at),
+            Some(t),
+            "{name}: the base's lag seen on the captured frame: {side}"
+        );
+        lags
+    };
+    let lags = [("c1000", lag_at("c1000")), ("c2400", lag_at("c2400"))];
+    println!("chart lag: largest {largest}, at the captures {lags:?}");
+    // The poor window's pixels are the base's clip's: the frame its slot
+    // held on that frame, whose stamp is the chart time less the slot's lag
+    // (the base started at 0 s). How late that frame was is the ring's and
+    // the render rate's, not this check's: a frame due by chart time is
+    // the timing scenario's.
+    let t = chart_us(&all, "c2400");
+    let (_, base_lag) = lags[1].1[0].expect("the base's lag on c2400");
+    let held = u32::try_from(((t - base_lag) * 30 + 500_000) / 1_000_000).ok();
+    let got = coded_index(&rgb(&all.join("c2400.png")), 8);
+    assert_eq!(
+        got, held,
+        "c2400 at {t}: the base's clip; lag at the captures {lags:?}, largest {largest}"
+    );
+    let (out, stdout, stderr) = fx.run_drained(
+        fx.command(&plays("control"))
+            .env("TAPESTRY_DEV_BGA_ALLOCATE", "1"),
+        RUN_LIMIT,
+    );
+    fs::write(
+        fx.base.join("control.out.txt"),
+        format!("{stdout}\n{stderr}"),
+    )
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let mut m = measured(&fx);
+    m.remove("chart_lag");
+    assert!(
+        int(&m, "allocations", "render_app").unwrap() > 0,
+        "the positive control is counted: {m:?}"
+    );
 }

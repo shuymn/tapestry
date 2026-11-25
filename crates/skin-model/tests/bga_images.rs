@@ -404,6 +404,20 @@ fn a_large_picture_in_a_small_cell_is_refused_before_it_is_decoded() {
     assert_eq!(cell.padded, [64 + 2 * CELL_GUTTER, 48 + 2 * CELL_GUTTER]);
 }
 
+/// A video one byte past a picture's 64 MiB file cap resolves as a video,
+/// under its own cap (`MAX_VIDEO_FILE_BYTES`): the game reads none of it.
+/// A picture of that size stays over the images' cap.
+#[test]
+fn a_video_past_the_picture_file_cap_resolves() {
+    let d = dir();
+    for name in ["v.mpg", "p.png"] {
+        let f = File::create(d.path().join(name)).unwrap();
+        f.set_len((64 << 20) + 1).unwrap();
+    }
+    assert_eq!(resolved(d.path(), "v.mpg"), Ok(("v.mpg".to_owned(), true)));
+    assert_eq!(resolved(d.path(), "p.png"), Err(Unresolved::TooLarge));
+}
+
 fn sizes(n: usize, size: [u32; 2]) -> Vec<Option<[u32; 2]>> {
     vec![Some(stored_size(size)); n]
 }

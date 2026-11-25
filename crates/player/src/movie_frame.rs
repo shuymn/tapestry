@@ -237,6 +237,145 @@ const RUN_WINDOW: Window = Window {
     last: i64::MAX,
 };
 
+/// What the hooks did over the process's life (dev-tools): each slot's
+/// frames taken into its planes, the chart videos' restarts, and the
+/// frames a chart slot took from a run it restarted. A play's measure
+/// reports them from its start ([`crate::measure`]).
+///
+/// It also keeps how late each chart slot's picture is, from the play's
+/// chart videos being set ([`super::Movies::set_chart`]) or its measure
+/// starting, whichever is later: on each play
+/// frame that shows a frame of the run playing, its lag, the media time
+/// due less the stamp of the frame shown (under one frame's duration when
+/// the ring held the frame due). The first [`LAG_SAMPLES`] are kept in
+/// order, each slot's largest and latest besides; fixed statics written by
+/// the render thread alone, so recording allocates nothing.
+#[cfg(feature = "dev-tools")]
+pub mod counts {
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+    use skin_model::movie::SLOTS;
+
+    static TAKES: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static RESTARTS: AtomicU64 = AtomicU64::new(0);
+    static RESTARTED_TAKES: AtomicU64 = AtomicU64::new(0);
+
+    /// How many lag samples a play keeps.
+    pub const LAG_SAMPLES: usize = 8192;
+    /// Each kept sample: slot, chart time, media time due, stamp shown.
+    static SAMPLES: [[AtomicI64; 4]; LAG_SAMPLES] =
+        [const { [const { AtomicI64::new(0) }; 4] }; LAG_SAMPLES];
+    static SAMPLED: AtomicUsize = AtomicUsize::new(0);
+    /// Samples past [`LAG_SAMPLES`], not kept.
+    static OVER: AtomicU64 = AtomicU64::new(0);
+    /// Each slot's latest and largest lag: its chart time and lag,
+    /// `i64::MIN` for none.
+    static LATEST: [[AtomicI64; 2]; SLOTS] =
+        [const { [const { AtomicI64::new(i64::MIN) }; 2] }; SLOTS];
+    static LARGEST: [[AtomicI64; 2]; SLOTS] =
+        [const { [const { AtomicI64::new(i64::MIN) }; 2] }; SLOTS];
+
+    /// A play's chart slot lags ([`lags`]).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Lags {
+        /// Each slot's largest lag: its chart time and lag, µs.
+        pub largest: [Option<(i64, i64)>; SLOTS],
+        /// The kept samples in order: slot, chart time, media time due,
+        /// stamp shown.
+        pub samples: Vec<[i64; 4]>,
+        /// The samples past those kept.
+        pub over: u64,
+    }
+
+    /// A play starts, or its chart videos were set: no lag recorded yet.
+    pub fn lag_reset() {
+        SAMPLED.store(0, Ordering::Release);
+        OVER.store(0, Ordering::Relaxed);
+        for [at, lag] in LATEST.iter().chain(&LARGEST) {
+            at.store(i64::MIN, Ordering::Relaxed);
+            lag.store(i64::MIN, Ordering::Relaxed);
+        }
+    }
+
+    /// Slot `i` shows the frame stamped `stamp` at chart time `at`, media
+    /// time `due` being due.
+    pub(super) fn lag(i: usize, at: i64, due: i64, stamp: i64) {
+        let lag = due.saturating_sub(stamp);
+        if let Some([a, l]) = LATEST.get(i) {
+            a.store(at, Ordering::Relaxed);
+            l.store(lag, Ordering::Relaxed);
+        }
+        if let Some([a, l]) = LARGEST.get(i)
+            && lag > l.load(Ordering::Relaxed)
+        {
+            a.store(at, Ordering::Relaxed);
+            l.store(lag, Ordering::Relaxed);
+        }
+        let n = SAMPLED.load(Ordering::Relaxed);
+        if let Some([s, a, d, t]) = SAMPLES.get(n) {
+            s.store(i64::try_from(i).unwrap_or(-1), Ordering::Relaxed);
+            a.store(at, Ordering::Relaxed);
+            d.store(due, Ordering::Relaxed);
+            t.store(stamp, Ordering::Relaxed);
+            SAMPLED.store(n + 1, Ordering::Release);
+        } else {
+            OVER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Slot `i`'s latest lag: its chart time and lag, µs.
+    pub fn latest(i: usize) -> Option<(i64, i64)> {
+        let [a, l] = LATEST.get(i)?;
+        let (a, l) = (a.load(Ordering::Relaxed), l.load(Ordering::Relaxed));
+        (l != i64::MIN).then_some((a, l))
+    }
+
+    /// The lags recorded since the chart videos were set (allocates: read
+    /// once the play ended).
+    pub fn lags() -> Lags {
+        let n = SAMPLED.load(Ordering::Acquire);
+        Lags {
+            largest: LARGEST.each_ref().map(|[a, l]| {
+                let (a, l) = (a.load(Ordering::Relaxed), l.load(Ordering::Relaxed));
+                (l != i64::MIN).then_some((a, l))
+            }),
+            samples: SAMPLES
+                .iter()
+                .take(n)
+                .map(|s| s.each_ref().map(|v| v.load(Ordering::Relaxed)))
+                .collect(),
+            over: OVER.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A frame taken into slot `i`'s planes.
+    pub(super) fn took(i: usize) {
+        if let Some(t) = TAKES.get(i) {
+            t.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A chart video restarted.
+    pub(super) fn restarted() {
+        RESTARTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A chart slot took a frame of a run it restarted (after its first).
+    pub(super) fn took_restarted() {
+        RESTARTED_TAKES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each slot's takes, the restarts and the restarted runs' takes so
+    /// far.
+    pub fn now() -> ([u64; SLOTS], u64, u64) {
+        (
+            TAKES.each_ref().map(|t| t.load(Ordering::Relaxed)),
+            RESTARTS.load(Ordering::Relaxed),
+            RESTARTED_TAKES.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Where a chart video stands (design.md "Rendering and Skins", BGA).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chart {
@@ -396,7 +535,18 @@ pub struct Movies<S = Movie> {
     /// The wakes made (tests).
     #[cfg(test)]
     wakes: u32,
+    /// A play frame has shown the chart's panel lost (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    lost_marked: bool,
 }
+
+/// The chart time of the play frame that first drew the chart's panel
+/// lost, of the play whose chart videos were set last ([`Movies::set_chart`];
+/// dev-tools: a scenario's `chart_lost` capture); `i64::MIN` until one
+/// does.
+#[cfg(feature = "dev-tools")]
+pub static CHART_LOST_AT: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
 
 impl<S: Source> Movies<S> {
     /// The movies of a screen whose preparation started at `start`, by
@@ -412,6 +562,8 @@ impl<S: Source> Movies<S> {
             waker: None,
             #[cfg(test)]
             wakes: 0,
+            #[cfg(feature = "dev-tools")]
+            lost_marked: false,
         }
     }
 
@@ -432,6 +584,11 @@ impl<S: Source> Movies<S> {
     pub fn set_chart(&mut self, videos: Arc<ChartVideos>, boundary: i64) {
         self.videos = Some(videos);
         self.boundary = boundary;
+        #[cfg(feature = "dev-tools")]
+        {
+            CHART_LOST_AT.store(i64::MIN, std::sync::atomic::Ordering::Release);
+            counts::lag_reset();
+        }
     }
 
     /// Wakes the media session through `waker` when a chart video wants a
@@ -626,7 +783,27 @@ impl<S: Source> Movies<S> {
             }
         }
         self.lose_peers(&mut shows);
+        #[cfg(feature = "dev-tools")]
+        if let Some(c) = chart {
+            self.mark_lost(&shows, c.now);
+        }
         shows
+    }
+
+    /// The first play frame that shows the chart's panel lost marks its
+    /// chart time `now` (µs) as the transition probe's `movies:chart_lost`
+    /// (dev-tools): the frame from which the panel draws black.
+    #[cfg(feature = "dev-tools")]
+    fn mark_lost(&mut self, shows: &MovieShows, now: i64) {
+        if !self.lost_marked
+            && CHART_SLOTS
+                .iter()
+                .any(|&i| matches!(shows.get(i), Some(MovieShow::Lost)))
+        {
+            self.lost_marked = true;
+            crate::dev::loop_probe::mark("movies:chart_lost", now);
+            CHART_LOST_AT.store(now, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// A chart video lost for its own reason (not its peer's, not the
@@ -761,6 +938,8 @@ impl<S: Source> Movies<S> {
                         movie.freed(reader.freed());
                         if written {
                             slot.shown = true;
+                            #[cfg(feature = "dev-tools")]
+                            counts::took(i);
                             #[cfg(all(test, feature = "dev-tools"))]
                             {
                                 slot.stamp = Some(stamp);
@@ -901,6 +1080,8 @@ impl<S: Source> Movies<S> {
                                     });
                             let run = reader.start_run(RUN_WINDOW);
                             wanted = Some(run);
+                            #[cfg(feature = "dev-tools")]
+                            counts::restarted();
                             Chart::Restarting {
                                 run,
                                 start: e,
@@ -977,7 +1158,14 @@ impl<S: Source> Movies<S> {
                     movie.freed(reader.freed());
                     if written {
                         slot.shown = true;
+                        #[cfg(feature = "dev-tools")]
+                        counts::took(i);
                         let run = reader.run();
+                        // The first run is 1; a restart starts the next.
+                        #[cfg(feature = "dev-tools")]
+                        if run > 1 {
+                            counts::took_restarted();
+                        }
                         slot.held = Some(Held {
                             run,
                             stamp,
@@ -1036,6 +1224,14 @@ impl<S: Source> Movies<S> {
             Chart::Restarting { run, hold, .. } => hold || slot.held.is_some_and(|h| h.run == run),
             Chart::Unstaged | Chart::Waiting { .. } | Chart::Ended => false,
         };
+        #[cfg(feature = "dev-tools")]
+        if let (Chart::Playing { run, .. }, Some(due), Some(c), Some(h)) =
+            (slot.chart, due, at, slot.held)
+            && h.run == run
+            && slot.shown
+        {
+            counts::lag(i, c.now, due, h.stamp);
+        }
         if shows && slot.shown {
             MovieShow::Frame {
                 uv: render::VIDEO_UV,

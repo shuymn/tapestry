@@ -33,6 +33,9 @@
 //! # or { ready_at = 500, file = … }: ms since its first candidate's READY
 //! # state began; or { closing_at = 300, file = … }: ms since its Closing
 //! # began, which no frame is guaranteed to show; or
+//! # { chart_lost = true, file = … }: its first presented frame from the
+//! # one that first drew the chart's BGA panel lost (a chart video's
+//! # loss), which no frame is guaranteed to show; or
 //! # { loading = true, file = … }: its loading state's first frame; or
 //! # { loading_at = 1500, file = … }: ms on its loading state's clock,
 //! # since its loading lifetime's origin, the screen clock's (failed if the
@@ -537,6 +540,7 @@ struct CaptureSpec {
     select_at: Option<i64>,
     result_at: Option<i64>,
     decision_at: Option<i64>,
+    chart_lost: Option<bool>,
     hold: Option<bool>,
     file: PathBuf,
 }
@@ -816,6 +820,27 @@ fn capture_axis(c: &CaptureSpec) -> Result<(Axis, bool), String> {
             .map(TimeUs)
             .ok_or_else(|| format!("{name} is too large"))
     };
+    if let Some(lost) = c.chart_lost {
+        let others = [
+            c.at,
+            c.ready_at,
+            c.closing_at,
+            c.loading_at,
+            c.select_at,
+            c.result_at,
+            c.decision_at,
+        ]
+        .iter()
+        .any(Option::is_some)
+            || c.loading.is_some();
+        if !lost || others {
+            return Err("chart_lost = true stands alone".to_owned());
+        }
+        if c.hold.is_some() {
+            return Err("hold is for select_at and result_at".to_owned());
+        }
+        return Ok((Axis::ChartLost, false));
+    }
     let axis = match (
         c.at,
         c.ready_at,
@@ -1506,6 +1531,10 @@ pub enum Axis {
     /// The first presented frame after a transition or a presentation
     /// change (`[transitions] capture = true`): no step's.
     Transition,
+    /// The first presented frame from the play frame that first drew the
+    /// chart's BGA panel lost ([`crate::movie_frame::CHART_LOST_AT`]): no
+    /// frame is guaranteed.
+    ChartLost,
 }
 
 impl Axis {
@@ -1520,6 +1549,7 @@ impl Axis {
             Self::Result(_) => "result",
             Self::Decision(_) => "decision",
             Self::Transition => "transition",
+            Self::ChartLost => "chart_lost",
         }
     }
 
@@ -1532,7 +1562,7 @@ impl Axis {
             | Self::Select(t)
             | Self::Result(t)
             | Self::Decision(t) => t.0,
-            Self::Loading | Self::Transition => 0,
+            Self::Loading | Self::Transition | Self::ChartLost => 0,
         }
     }
 
@@ -2665,7 +2695,7 @@ fn capture_due(
         }
         // Taken by the sink at its change, never from the list.
         Axis::Transition => return None,
-        Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) => {}
+        Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) | Axis::ChartLost => {}
     }
     let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
         return None;
@@ -2689,6 +2719,10 @@ fn capture_due(
         Axis::Closing(since) => {
             let start = drawn.view?.closing?;
             (t.0 - start.0 >= since.0).then_some(Due::Save(generation, Stamp::Play))
+        }
+        Axis::ChartLost => {
+            let lost = crate::movie_frame::CHART_LOST_AT.load(std::sync::atomic::Ordering::Acquire);
+            (lost != i64::MIN && t.0 >= lost).then_some(Due::Save(generation, Stamp::Play))
         }
         Axis::Loading
         | Axis::LoadingAt(_)
@@ -2758,6 +2792,16 @@ fn sidecar(
         }
         _ => String::new(),
     };
+    // Each chart slot's latest lag: the chart time of the play frame it was
+    // seen on, which a capture of that frame matches, and the lag, µs.
+    let chart_lag = skin_model::movie::CHART_SLOTS
+        .iter()
+        .map(|&i| {
+            crate::movie_frame::counts::latest(i)
+                .map_or_else(|| "null".to_owned(), |(at, lag)| format!("[{at},{lag}]"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
@@ -2789,7 +2833,7 @@ fn sidecar(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
          \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"screen_us\":{},\"completed_us\":{},\
-         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen},{decision}{transition}}}\n",
+         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},\"chart_lag\":[{chart_lag}],{screen},{decision}{transition}}}\n",
         axis.name(),
         axis.target(),
         phase(drawn),
@@ -2919,7 +2963,8 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
         let _ = writeln!(
             out,
             "{{\"seq\":{seq},\"element_of\":{},\"rect\":{},\"pivot\":{},\"angle\":{},\"color\":{},\
-             \"blend\":\"{}\",\"clip\":{},\"clip_geometry\":{},\"clip_rect\":{},\"filter\":\"{:?}\",{source}}}",
+             \"blend\":\"{}\",\"clip\":{},\"clip_geometry\":{},\"clip_rect\":{},\"filter\":\"{:?}\",\
+             \"layer\":{},{source}}}",
             opt(q.element.map(i64::from)),
             json_array(&q.rect),
             json_array(&q.pivot),
@@ -2936,6 +2981,7 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
             q.clip_rect
                 .map_or_else(|| "null".to_owned(), |r| json_array(&r)),
             q.filter,
+            q.layer,
         );
     }
     Ok(out)
@@ -4026,6 +4072,11 @@ pub(crate) mod tests {
             capture("closing_at = 3, "),
             Ok(super::Axis::Closing(TimeUs(3_000)))
         );
+        assert_eq!(capture("chart_lost = true, "), Ok(super::Axis::ChartLost));
+        for bad in ["chart_lost = false, ", "chart_lost = true, at = 1, "] {
+            let e = capture(bad).unwrap_err();
+            assert!(e.contains("stands alone"), "{bad}: {e}");
+        }
         for bad in ["closing_at = 1, at = 1, ", "closing_at = 1, ready_at = 1, "] {
             let e = capture(bad).unwrap_err();
             assert!(e.contains("give one of"), "{bad}: {e}");
