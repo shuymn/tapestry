@@ -459,14 +459,17 @@ impl Controls {
         }
         let lifetime = w.decision.lifetime();
         let seen = w.decision.classify(w.origin, now, terminal, false, None);
-        if seen == game::Verdict::Step && !w.decision.practice() {
-            // The play's deadline step: the lifetime shown, the loading
-            // state's tuning epoch, the input epoch's end, and a new scene.
-            // Each a lock-held update or a queued message.
-            (w.reveal)();
-            self.tuning.enter_loading(now);
-            self.open_epoch();
-            self.next_scene();
+        if seen == game::Verdict::Step {
+            if !w.decision.practice() {
+                // The play's deadline step: the lifetime shown, the loading
+                // state's tuning epoch, the input epoch's end, and a new
+                // scene. Each a lock-held update or a queued message.
+                (w.reveal)();
+                self.tuning.enter_loading(now);
+                self.open_epoch();
+                self.next_scene();
+            }
+            w.decision.commit_step();
         }
         if seen.leaves() {
             w.decision.leave(seen);

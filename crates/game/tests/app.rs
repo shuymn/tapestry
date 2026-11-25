@@ -35,7 +35,7 @@ use game::{
     Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading, LoadingRig, LogicError,
     MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput, PracticeScreen,
     PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError, SessionEvent,
-    SessionEventSink, Settings,
+    SessionEventSink, Settings, StepOutcome,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -581,6 +581,18 @@ struct Headless {
     screen_fails_in_jobs: bool,
     /// The clock at each deadline step.
     deadline_steps: Vec<i64>,
+    /// Each chart read for a decided play ([`AppRig::chart_read`]): the
+    /// chart and how many [`Seen`] entries came before it.
+    chart_reads: Vec<(usize, usize)>,
+    /// The early preparation is refused this many ms after the chart's
+    /// read ([`AppRig::early_refusal`]); none: never.
+    early_refusal_ms: Option<i64>,
+    /// When the early refusal is published, set at the read.
+    early_refused_from: Option<i64>,
+    /// The deadline's step answers refused ([`StepOutcome::Refused`]).
+    refuse_at_step: bool,
+    /// The deadline's step answered refused.
+    step_refused: bool,
     /// The decision screen's epochs closed.
     closed_epochs: usize,
     /// Each decision look's origin and clock.
@@ -843,6 +855,11 @@ impl Headless {
             screen_fails_in_jobs: false,
             close_in_entry: false,
             deadline_steps: Vec::new(),
+            chart_reads: Vec::new(),
+            early_refusal_ms: None,
+            early_refused_from: None,
+            refuse_at_step: false,
+            step_refused: false,
             closed_epochs: 0,
             decision_looks: Vec::new(),
             waiting_seen: None,
@@ -1453,10 +1470,26 @@ impl AppRig for Headless {
                 if let Some(takeover) = self.due_takeover() {
                     let _ = decision.apply_takeover(takeover, self.clock.now());
                 }
-                match decision.classify(game::Origin::Load, self.clock.now(), terminal, false, None)
-                {
-                    game::Verdict::Continue => {}
-                    game::Verdict::Step => game::AppRig::deadline_step(self),
+                // The early refusal is read as the player's look reads it.
+                let reply = game::AppRig::early_refusal(self).map(|_| game::Reply::Refusal);
+                let seen = match decision.classify(
+                    game::Origin::Load,
+                    self.clock.now(),
+                    terminal,
+                    false,
+                    reply,
+                ) {
+                    game::Verdict::Step => match game::AppRig::deadline_step(self) {
+                        StepOutcome::Stepped => {
+                            decision.commit_step();
+                            game::Verdict::Step
+                        }
+                        StepOutcome::Refused(_) => decision.refuse_step(),
+                    },
+                    other => other,
+                };
+                match seen {
+                    game::Verdict::Continue | game::Verdict::Step => {}
                     other => {
                         decision.leave(other);
                         return Ok(Loading::Cancelled);
@@ -1636,6 +1669,7 @@ impl AppRig for Headless {
             }
             let seen = decision.classify(game::Origin::Jobs, TimeUs(self.at()), false, false, None);
             assert_eq!(seen, game::Verdict::Step, "the page's step in the read");
+            decision.commit_step();
         }
         // The page's bank waits for its prerequisites: the screen lost
         // now is found by the page's hold.
@@ -1770,11 +1804,33 @@ impl AppRig for Headless {
         Ok(())
     }
 
-    fn deadline_step(&mut self) {
+    fn deadline_step(&mut self) -> StepOutcome {
+        if self.refuse_at_step {
+            self.step_refused = true;
+            return StepOutcome::Refused(game::PreparationRefusal {
+                location: None,
+                reason: "refused at the step".to_owned(),
+            });
+        }
         self.deadline_steps.push(self.at());
         if let Some(i) = self.loading {
             self.loading_pages.push((i, self.at()));
         }
+        StepOutcome::Stepped
+    }
+
+    fn chart_read(&mut self, _loaded: &Loaded) {
+        self.chart_reads
+            .push((self.chosen.unwrap(), self.seen.len()));
+        self.early_refused_from = self.early_refusal_ms.map(|ms| self.at() + ms * MS);
+    }
+
+    fn early_refusal(&self) -> Option<game::PreparationRefusal> {
+        let published = self.early_refused_from.is_some_and(|t| self.at() >= t);
+        (published || self.step_refused).then(|| game::PreparationRefusal {
+            location: None,
+            reason: "refused early".to_owned(),
+        })
     }
 
     fn closed_epoch(&mut self) {
@@ -6588,4 +6644,144 @@ fn refused_load_held_to_the_skin_time() {
     assert!(rig.deadline_steps.is_empty());
     assert!(rig.loading_pages.is_empty());
     assert_eq!(rig.closed_epochs, 1);
+}
+
+/// B1: when a decided play's chart is read, the rig is told
+/// ([`AppRig::chart_read`]) before the bank's load begins: the read comes
+/// right before the load.
+#[test]
+fn chart_read_comes_before_the_bank_for_a_decided_play() {
+    let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, decided_read_in_time);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let [(0, before)] = rig.chart_reads[..] else {
+        panic!("{:?}", rig.chart_reads);
+    };
+    assert_eq!(rig.seen.get(before), Some(&Seen::Load(0)), "{:?}", rig.seen);
+}
+
+/// B2a: a chart chosen to practice is never read for the early
+/// preparation, with the decision screen on.
+#[test]
+fn no_chart_read_for_practice() {
+    let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.read_step_ms = 0;
+    });
+    ran.unwrap();
+    assert_eq!(rig.page_entered_at.len(), 1, "the page opened");
+    assert!(rig.chart_reads.is_empty(), "{:?}", rig.chart_reads);
+}
+
+/// B2b: with the decision screen off, a chart chosen to play loads without
+/// the early preparation's read.
+#[test]
+fn no_chart_read_with_the_decision_off() {
+    let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.seen.contains(&Seen::Load(0)), "{:?}", rig.seen);
+    assert!(rig.chart_reads.is_empty(), "{:?}", rig.chart_reads);
+}
+
+/// B9a: an early refusal published before the deadline, whether the load
+/// ended before it or still runs, returns to selection at the deadline
+/// with its reason: no step, no loading state.
+#[test]
+fn an_early_refusal_before_the_deadline_returns_with_its_reason() {
+    for served in [None, Some(3_000)] {
+        let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+        let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+            decided_read_in_time(rig);
+            rig.served_load_ms = served;
+            rig.early_refusal_ms = Some(100);
+        });
+        ran.unwrap();
+        assert!(
+            rig.violations.is_empty(),
+            "{served:?}: {:?}",
+            rig.violations
+        );
+        assert_eq!(rig.refusals, ["preparation"], "{served:?}");
+        let choice = chosen_at(&rig, 0);
+        let [refused] = rig.refused_at[..] else {
+            panic!("{served:?}: {:?}", rig.refused_at);
+        };
+        assert!(
+            refused >= choice + 1_500 * MS,
+            "{served:?}: shown at {refused}, before the deadline from {choice}"
+        );
+        assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
+        assert!(rig.loading_pages.is_empty(), "{served:?}: loading shown");
+        assert!(rig.opened_at.is_empty(), "{served:?}: opened");
+    }
+}
+
+/// B9b: the deadline's step itself answers refused: nothing revealed, the
+/// decision unstepped, and selection with the reason, whether the step is
+/// App's or the load wait's.
+#[test]
+fn a_refusal_at_the_step_is_not_revealed() {
+    for served in [None, Some(3_000)] {
+        let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+        let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+            decided_read_in_time(rig);
+            rig.served_load_ms = served;
+            rig.refuse_at_step = true;
+        });
+        ran.unwrap();
+        assert!(
+            rig.violations.is_empty(),
+            "{served:?}: {:?}",
+            rig.violations
+        );
+        assert_eq!(rig.refusals, ["preparation"], "{served:?}");
+        assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
+        assert!(rig.loading_pages.is_empty(), "{served:?}: loading shown");
+        assert!(rig.opened_at.is_empty(), "{served:?}: opened");
+    }
+}
+
+/// B9e: a close at the look that reads an early refusal ends the run: the
+/// refusal is never shown.
+#[test]
+fn a_close_is_not_masked_by_an_early_refusal() {
+    for served in [None, Some(3_000)] {
+        let acts = vec![(0, Act::Choose(0)), (300, Act::Close)];
+        let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+            decided_read_in_time(rig);
+            rig.served_load_ms = served;
+            rig.early_refusal_ms = Some(0);
+        });
+        ran.unwrap();
+        assert!(rig.refusals.is_empty(), "{served:?}: {:?}", rig.refusals);
+        assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
+    }
+}
+
+/// B17: practice's step is committed on its own path: the page opens
+/// once, the decision's epoch closes once, and no play step runs.
+#[test]
+fn practice_steps_once_and_opens_the_page() {
+    let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.read_step_ms = 0;
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.page_entered_at.len(), 1, "the page opened once");
+    assert_eq!(rig.closed_epochs, 1, "the decision's epoch closed once");
+    assert!(rig.deadline_steps.is_empty(), "a play's step ran");
+    assert_eq!(
+        rig.seen
+            .iter()
+            .filter(|s| matches!(s, Seen::Practice(_)))
+            .count(),
+        1,
+        "{:?}",
+        rig.seen
+    );
 }

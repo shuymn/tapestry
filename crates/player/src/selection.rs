@@ -4267,7 +4267,7 @@ impl AppRig for PlayerRig<'_> {
     /// The play's deadline: the loading state's tuning epoch, the input
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
-    fn deadline_step(&mut self) {
+    fn deadline_step(&mut self) -> game::StepOutcome {
         #[cfg(feature = "dev-tools")]
         crate::dev::stage("decision_end");
         self.end_decision();
@@ -4278,6 +4278,7 @@ impl AppRig for PlayerRig<'_> {
         self.begin_loading_epoch();
         self.controls.open_epoch();
         self.controls.next_scene();
+        game::StepOutcome::Stepped
     }
 
     /// The decision screen is left for the practice page or selection: the

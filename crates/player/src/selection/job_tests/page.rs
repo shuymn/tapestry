@@ -1612,6 +1612,7 @@ fn enter_page_at_deadline(rig: &mut PlayerRig<'_>, read: &Loaded, decision: &mut
         game::Verdict::Step,
         "the page's entry at the deadline"
     );
+    decision.commit_step();
     rig.closed_epoch();
     rig.entered_practice(&game::PracticeScreen::new(
         read.chart(),

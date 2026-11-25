@@ -186,9 +186,32 @@ pub trait AppRig: LoadingRig {
         let _ = origin;
         Ok(())
     }
-    /// The play's deadline: its loading state shown, its input epoch over.
-    /// Waits for no acknowledgement. Nothing by default.
-    fn deadline_step(&mut self) {}
+    /// The play's deadline: its loading state shown, its input epoch over,
+    /// and [`StepOutcome::Stepped`]; or, when the play's preparation begun
+    /// at the read ([`chart_read`](Self::chart_read)) was refused before
+    /// the reveal, nothing shown and [`StepOutcome::Refused`], which App
+    /// routes as that refusal with the decision unstepped. Waits for no
+    /// acknowledgement. By default stepped, showing nothing.
+    fn deadline_step(&mut self) -> StepOutcome {
+        StepOutcome::Stepped
+    }
+    /// The chart chosen to play with a decision screen was read
+    /// (`loaded`), before its load ([`load_chart`](Self::load_chart)): the
+    /// rig may begin the play's preparation that needs only the chart's
+    /// facts (design.md "Screen Transitions and Loading", the pending
+    /// play skin prepared during the decision screen). Never for practice,
+    /// a retry or a play without a decision screen. Nothing by default.
+    fn chart_read(&mut self, loaded: &Loaded) {
+        let _ = loaded;
+    }
+    /// A refusal of the play's preparation begun at the read, published
+    /// before the deadline's reveal: every look of App's reads it as a
+    /// refusal ([`Reply::Refusal`]), held to the deadline, and the flow
+    /// returns with it ([`Refused::Preparation`]). None by default, and
+    /// none once the reveal was committed.
+    fn early_refusal(&self) -> Option<PreparationRefusal> {
+        None
+    }
     /// The decision screen is left for selection or the practice page: its
     /// input epoch ends. Nothing by default.
     fn closed_epoch(&mut self) {}
@@ -307,6 +330,16 @@ pub enum Loading {
     /// ends with it, never as a refusal (design.md "Play Lifecycle", who
     /// loads).
     Failed(LoadFailure),
+}
+
+/// How the play's deadline step went ([`AppRig::deadline_step`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// The loading state was revealed: the step is committed.
+    Stepped,
+    /// The play's preparation was refused before the reveal: nothing was
+    /// revealed, and the flow returns with this refusal.
+    Refused(PreparationRefusal),
 }
 
 /// Why a chosen chart was refused.
@@ -812,6 +845,12 @@ impl App {
                 },
             }
         } else {
+            // The read's facts in hand, the play's preparation that needs
+            // only them may begin beside the load (a decision screen's
+            // play; practice and a play without one never).
+            if d.on() {
+                rig.chart_read(&loaded);
+            }
             match rig.load_chart(&loaded, d) {
                 // A screen lost in the chart's load is the screen's
                 // failure, which ends the run; anything else is refused.
@@ -819,16 +858,22 @@ impl App {
                     Some(lost) => Err(LiveError::Screen(lost)),
                     None => Ok(Chosen::Refused(Refused::Bank(e))),
                 },
-                Ok(Loading::Cancelled) => match d.take_left() {
-                    Some(left) => left_by(Ok(next_of(left)), rig),
-                    None => cancelled(rig).map(Chosen::Left),
+                Ok(Loading::Cancelled) => match (d.take_left(), rig.early_refusal()) {
+                    // A return the early preparation's refusal caused
+                    // (never a close: that leaves as [`Verdict::End`]).
+                    (Some(Verdict::Return), Some(r)) => {
+                        Ok(Chosen::Refused(Refused::Preparation(r)))
+                    }
+                    (Some(left), _) => left_by(Ok(next_of(left)), rig),
+                    (None, _) => cancelled(rig).map(Chosen::Left),
                 },
                 Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
                 // The loading state opens only after the deadline's step.
                 Ok(Loading::Ready) => match ready_at_deadline(d, rig) {
-                    Ok(false) => ended(rig).map(Chosen::Left),
+                    Ok(AtDeadline::Ended) => ended(rig).map(Chosen::Left),
+                    Ok(AtDeadline::Refused(r)) => Ok(Chosen::Refused(Refused::Preparation(r))),
                     Err(e) => Err(e),
-                    Ok(true) => match load_and_open(&mut loaded, rig) {
+                    Ok(AtDeadline::Stepped) => match load_and_open(&mut loaded, rig) {
                         Ok(leave) => Ok(Chosen::Left(leave)),
                         Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
                         Err(LiveError::Preparation(e)) => {
@@ -1027,11 +1072,14 @@ enum Next {
 }
 
 /// The decision screen's one look from `origin`, with `reply` in hand:
-/// the rig's tick, then a takeover applied, then the terminal causes and
-/// the escape read now (against the deadline then in force), then
-/// [`Decision::classify`], whose verdict it returns. A play's step runs
-/// its effect here ([`AppRig::deadline_step`]), once, as the decision
-/// latches it.
+/// the rig's tick, then a takeover applied, then the terminal causes, the
+/// escape (against the deadline then in force) and an early preparation's
+/// refusal ([`AppRig::early_refusal`], a refusal when no reply is in hand)
+/// read now, then [`Decision::classify`], whose verdict it returns. A
+/// play's step runs its effect here ([`AppRig::deadline_step`]), once,
+/// and is committed only when it revealed; refused there, the decision
+/// stays unstepped and the look returns [`Verdict::Return`]. Practice's
+/// step is committed here at once: it reveals nothing.
 fn look<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
@@ -1050,9 +1098,17 @@ fn look<R: AppRig>(
     }
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
-    let seen = d.classify(origin, rig.now(), terminal, escape, reply);
-    if seen == Verdict::Step && !d.practice() {
-        rig.deadline_step();
+    let reply = reply.or_else(|| rig.early_refusal().map(|_| Reply::Refusal));
+    let mut seen = d.classify(origin, rig.now(), terminal, escape, reply);
+    if seen == Verdict::Step {
+        if d.practice() {
+            d.commit_step();
+        } else {
+            match rig.deadline_step() {
+                StepOutcome::Stepped => d.commit_step(),
+                StepOutcome::Refused(_) => seen = d.refuse_step(),
+            }
+        }
     }
     Ok(seen)
 }
@@ -1179,18 +1235,32 @@ fn hold_refusal<R: AppRig>(
     }
 }
 
-/// A loaded play held to its deadline's step: `false` when the run ends
-/// or the window closes first.
+/// How a loaded play's hold to its deadline ended ([`ready_at_deadline`]).
+enum AtDeadline {
+    /// The step ran: the play opens.
+    Stepped,
+    /// The early preparation's refusal returned: back to selection with it.
+    Refused(PreparationRefusal),
+    /// The run ends, or the window closes.
+    Ended,
+}
+
+/// A loaded play held to its deadline's step. A return there is the early
+/// preparation's refusal when one is published ([`AppRig::early_refusal`]);
+/// any other leave ends the hold as the run's end or a close.
 fn ready_at_deadline<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
-) -> Result<bool, LiveError<R::ScreenError>> {
+) -> Result<AtDeadline, LiveError<R::ScreenError>> {
     if !d.on() || d.stepped() {
-        return Ok(true);
+        return Ok(AtDeadline::Stepped);
     }
     Ok(match hold(d, rig, Origin::Ready)? {
-        Next::Stepped | Next::Go | Next::Page => true,
-        Next::End | Next::Return | Next::Back => false,
+        Next::Stepped | Next::Go | Next::Page => AtDeadline::Stepped,
+        Next::Return => rig
+            .early_refusal()
+            .map_or(AtDeadline::Ended, AtDeadline::Refused),
+        Next::End | Next::Back => AtDeadline::Ended,
     })
 }
 
