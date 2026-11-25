@@ -697,6 +697,7 @@ impl EarlyPrep {
         self.from = Instant::now();
         let gate = Arc::clone(&self.gate);
         let job = &mut self.job;
+        let mut unspawned = None;
         let started = self.gate.start(|| {
             let spawned = imports::spawn_job_completing(
                 move |cancel: &Cancel| imports::specialize(&play, &facts, cancel),
@@ -715,14 +716,22 @@ impl EarlyPrep {
                     }
                 },
                 || {},
-            )?;
+            )
+            .inspect_err(|why| unspawned = Some(why.clone()))?;
             let cancel = spawned.canceller();
             *job = Some(spawned);
             Ok(cancel)
         });
         match started {
             Start::Running => log::info!("early: the specialization began"),
-            Start::Ended => log::info!("early: the specialization could not begin"),
+            Start::Ended => {
+                log::info!("early: the specialization could not begin");
+                // The thread that cannot start is this attempt's refusal,
+                // reported as the worker's would be.
+                if let Some(why) = unspawned {
+                    imports::ForAttempt::Refused(why).report(&imports::Specialized::Ran);
+                }
+            }
             Start::Late => log::info!("early: the reveal came first; today's begin"),
         }
         started
