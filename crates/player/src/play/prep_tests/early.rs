@@ -266,13 +266,16 @@ fn ending_the_request_cancels_the_job() {
     let (_dir, skin) = pending_play(LEVEL_SKIN);
     let l = at_level(12);
     on_rig(l.chart(), &Installers::default(), true, |rig| {
-        decided(rig, skin);
+        let gate = decided(rig, skin);
         let from = imports::jobs_counted();
         let base = vm_hooks::live();
         rig.chart_read(&l);
         imports::executing(base);
         let _watchdog = crate::tests::Watchdog::arm("the early job's join");
         rig.left_chart().unwrap();
+        // Ended by its cancel, not by running to its instruction limit.
+        let why = gate.refused().expect("the job's outcome").reason;
+        assert!(why.ends_with("the import was cancelled"), "{why}");
         assert!(rig.early.is_none());
         assert_eq!(jobs_since(from), (1, 1), "cancelled and joined");
         assert_eq!(vm_hooks::live(), base);
