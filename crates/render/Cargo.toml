@@ -53,9 +53,11 @@ skin-beatoraja.workspace = true
 png.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-# A plain Win32 window for the swap chain test.
+# A plain Win32 window for the swap chain tests, the configure tests' on a
+# desktop of their own.
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_StationsAndDesktops",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

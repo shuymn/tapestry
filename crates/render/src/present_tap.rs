@@ -27,6 +27,18 @@ pub trait PresentTap: Send + Sync {
     fn deliver(&self, frame: Result<PresentFrame, String>);
 }
 
+/// Why a tap was not set ([`crate::Renderer::set_present_tap`]).
+#[derive(Debug, thiserror::Error)]
+pub enum TapError {
+    /// The target has no frames to copy; the renderer is unchanged.
+    #[error("{0}")]
+    Unsupported(&'static str),
+    /// The surface refused its configuration with copies allowed: the
+    /// renderer must be built again.
+    #[error(transparent)]
+    Configure(crate::RenderError),
+}
+
 /// A presented frame's pixels: RGBA8 rows from the top, whatever the swap
 /// chain's own channel order, alpha as the frame left it.
 #[derive(Clone, Debug, PartialEq, Eq)]

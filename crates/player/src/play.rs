@@ -3066,6 +3066,18 @@ impl Rig for PlayerRig<'_> {
         handle: &game::PrepHandle,
     ) -> Result<game::Readiness<ScreenError>, ScreenError> {
         let _ = number;
+        // No play opens before the window's first present (design.md
+        // "Showing the window"), so the focus it gained when shown is the
+        // play's: the game waited for it at startup, and this reads it.
+        if let Some(window) = &self.window {
+            match window.readiness() {
+                crate::window::Readiness::FirstPresent => {}
+                crate::window::Readiness::Failed(why) => {
+                    return Err(ScreenError::NotShown(why.to_string()));
+                }
+                other => return Err(ScreenError::NotShown(format!("{other:?}"))),
+            }
+        }
         let lost = |screen| {
             game::Readiness::Stale(game::Stale {
                 screen,
@@ -3100,11 +3112,6 @@ impl Rig for PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         let p_open =
             crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
-        // The window gains its focus when shown: an opening before it
-        // would latch the play's focus loss at once.
-        if let Some(window) = &self.window {
-            window.wait_to_open();
-        }
         self.show_cursor(false);
         self.in_play = true;
         // A round's opening is not the full play's READY state: READY
@@ -3174,9 +3181,6 @@ impl Rig for PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         let p_open =
             crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
-        if let Some(window) = &self.window {
-            window.wait_to_open();
-        }
         // The previous opening's marker is taken first: the tap owes one
         // at most.
         if let Some((driver, mut pump)) = self.adjustments() {

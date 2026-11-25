@@ -450,3 +450,38 @@ fn a_refused_replacement_image_stage_falls_back_and_continues() {
         );
     });
 }
+
+/// W3.4: no play opens before the window's first present: with the
+/// startup failed or not yet settled, a ready preparation's attempt is
+/// refused as not shown; with the first present, it is ready.
+#[test]
+fn a_failed_startup_never_opens_a_play() {
+    use crate::render_side::ScreenError;
+    use crate::window::{Readiness, StartFailure, WindowShown};
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), false, |rig| {
+        let mut h = begin(rig, &l);
+        assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Ready);
+        let failed = Readiness::Failed(StartFailure::NoFrame(Duration::from_secs(30)));
+        for (readiness, opens) in [
+            (failed, false),
+            (Readiness::Pending, false),
+            (Readiness::Showing, false),
+            (Readiness::FirstPresent, true),
+        ] {
+            rig.window = Some(WindowShown::settled(readiness.clone()));
+            let r = rig.ready_attempt(1, &h);
+            if opens {
+                assert!(
+                    matches!(r, Ok(game::Readiness::Ready)),
+                    "{readiness:?}: {r:?}"
+                );
+            } else {
+                assert!(
+                    matches!(r, Err(ScreenError::NotShown(_))),
+                    "{readiness:?}: {r:?}"
+                );
+            }
+        }
+    });
+}

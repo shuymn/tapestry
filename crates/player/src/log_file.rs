@@ -13,12 +13,14 @@
 //! lifecycle code logs; the in-play files never name the facade (`cargo
 //! xtask check-lints`).
 
+use std::cell::Cell;
 use std::fmt::{self, Display, Write as _};
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::{Instant, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError as LockBusy};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
@@ -44,6 +46,54 @@ const LOCK: &str = "tapestry.lock";
 /// The global logger, empty until [`start`] fills it.
 static LOG: FileLog<File> = FileLog::new();
 
+/// Set once the run is ending ([`finishing`]): from then on a record waits
+/// for the sink at most [`FINISH_WAIT`], so a writer blocked in another
+/// thread (the render thread's reporter) holds up neither the run's last
+/// record nor its exit line.
+static FINISHING: AtomicBool = AtomicBool::new(false);
+
+/// How long a record waits for the sink once the run is ending.
+const FINISH_WAIT: Duration = Duration::from_millis(500);
+
+thread_local! {
+    /// Whether wgpu's own error records on this thread are taken, as
+    /// report lines ([`capture_gpu_errors`]).
+    static GPU_ERRORS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The targets whose error records [`capture_gpu_errors`] takes: wgpu's
+/// core and its hardware layer, which is the only one to name the system
+/// error of a refused swap chain.
+const GPU_TARGETS: [&str; 2] = ["wgpu_hal", "wgpu_core"];
+
+/// Takes, while `on`, wgpu's error records made on this thread inside a
+/// window surface's configure ([`render::configuring`]) as render report
+/// lines ([`crate::render_report::report`]) instead of rejecting them: the
+/// render thread turns it on around its startup builds only, so a refused
+/// swap chain's system error is on record, and no wgpu record takes the
+/// log's lock on the render thread (design.md "Log File").
+pub fn capture_gpu_errors(on: bool) {
+    GPU_ERRORS.with(|c| c.set(on));
+}
+
+/// The run is ending: the top-level report and the exit line come next,
+/// and neither waits on the sink past [`FINISH_WAIT`].
+pub fn finishing() {
+    FINISHING.store(true, Ordering::Release);
+}
+
+/// The render thread's report lines' sink: each line logged at Warn
+/// ([`crate::render_report`]'s reporter calls it on its own thread).
+pub fn warn_sink() -> crate::render_report::Sink {
+    Box::new(|line| log::warn!("{line}"))
+}
+
+/// Logs a report line made on a thread with no reporter of its own (the
+/// game thread's render-side lines), at Warn.
+pub fn warn_line(args: fmt::Arguments<'_>) {
+    log::warn!("{args}");
+}
+
 /// Starts logging into `dir` for `command`, once per process. On a failed
 /// open it prints one `log:` line on stderr and logging stays off; if
 /// another process holds the lease, logging stays off silently.
@@ -63,6 +113,15 @@ pub fn start(dir: &Path, command: &str) {
 /// is on.
 pub fn finish(code: u8) {
     LOG.finish(code);
+}
+
+/// Holds the global log's sink until the returned guard drops, as a writer
+/// blocked in another thread holds it (tests).
+#[cfg(test)]
+pub(crate) fn hold() -> impl Sized {
+    LOG.state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Prints every warning on stderr as `warning: <w>`, as the command always
@@ -208,6 +267,20 @@ fn taken(m: &Metadata<'_>) -> bool {
                 .is_some_and(|rest| rest.starts_with("::")))
 }
 
+/// Whether a record is one of wgpu's errors taken on this thread now
+/// ([`capture_gpu_errors`]): inside a window surface's configure only.
+fn gpu_error(m: &Metadata<'_>) -> bool {
+    m.level() == Level::Error
+        && GPU_TARGETS.iter().any(|t| {
+            m.target() == *t
+                || m.target()
+                    .strip_prefix(t)
+                    .is_some_and(|r| r.starts_with("::"))
+        })
+        && GPU_ERRORS.try_with(Cell::get).unwrap_or(false)
+        && render::configuring()
+}
+
 /// A logger over one [`Logged`] sink, empty until one is put in.
 struct FileLog<W> {
     state: Mutex<Option<Logged<W>>>,
@@ -221,10 +294,30 @@ impl<W> FileLog<W> {
     }
 }
 
+impl<W> FileLog<W> {
+    /// The sink's lock: waited for without a bound while the run goes on;
+    /// once it is ending ([`finishing`]), for at most [`FINISH_WAIT`],
+    /// then `None`. A poisoned lock is `None` too: the log is best effort.
+    fn lock(&self) -> Option<MutexGuard<'_, Option<Logged<W>>>> {
+        if !FINISHING.load(Ordering::Acquire) {
+            return self.state.lock().ok();
+        }
+        let until = Instant::now() + FINISH_WAIT;
+        loop {
+            match self.state.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(LockBusy::Poisoned(_)) => return None,
+                Err(LockBusy::WouldBlock) if Instant::now() >= until => return None,
+                Err(LockBusy::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+}
+
 impl<W: Write> FileLog<W> {
     /// The sink's exit line; the lease stays held.
     fn finish(&self, code: u8) {
-        if let Ok(mut state) = self.state.lock()
+        if let Some(mut state) = self.lock()
             && let Some(logged) = state.as_mut()
         {
             logged.sink.finish(code);
@@ -234,17 +327,26 @@ impl<W: Write> FileLog<W> {
 
 impl<W: Write + Send> Log for FileLog<W> {
     fn enabled(&self, m: &Metadata<'_>) -> bool {
-        taken(m)
+        taken(m) || gpu_error(m)
     }
 
     fn log(&self, record: &Record<'_>) {
+        // Taken as a report line, on the thread that turned it on, without
+        // the lock: its reporter writes it.
+        if gpu_error(record.metadata()) {
+            crate::render_report::report(format_args!(
+                "render: {}: {}",
+                record.target(),
+                record.args()
+            ));
+            return;
+        }
         // Before the lock: a rejected record takes no lock and is never
         // formatted.
         if !taken(record.metadata()) {
             return;
         }
-        // A poisoned lock is skipped: the log is best effort.
-        if let Ok(mut state) = self.state.lock()
+        if let Some(mut state) = self.lock()
             && let Some(logged) = state.as_mut()
         {
             logged.sink.record(record.level(), *record.args());
@@ -728,6 +830,117 @@ pub(crate) mod tests {
         // The positive control: a record of this crate is formatted.
         log.log(&record_of("tapestry::play", Level::Info, format_args!("x")));
         assert_eq!(formatted(&log), 1);
+    }
+
+    /// A logger over a sink in memory, its state for the test to hold.
+    fn memory_log() -> FileLog<Vec<u8>> {
+        let log = FileLog::<Vec<u8>>::new();
+        *log.state.lock().unwrap() = Some(Logged {
+            sink: sink(Vec::new(), Caps::FILE),
+            _lease: None,
+        });
+        log
+    }
+
+    /// W1.4: once the run is ending, a writer blocked in another thread
+    /// (the reporter's, holding the sink) holds up neither the top-level
+    /// report nor the exit line past the finishing bound; before it, a
+    /// record waits for the sink as it always has.
+    #[test]
+    fn finalization_passes_a_writer_blocked_in_another_thread() {
+        let log = memory_log();
+        let guard = log.state.lock().unwrap();
+        std::thread::scope(|scope| {
+            // The positive control: while the run goes on, a record waits.
+            let (tx, rx) = mpsc::channel();
+            let worker = scope.spawn(|| {
+                let tx = tx;
+                log.log(&record_of("tapestry", Level::Error, format_args!("early")));
+                let _ = tx.send(());
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "a record did not wait for the sink"
+            );
+            drop(guard);
+            worker.join().unwrap();
+        });
+        let guard = log.state.lock().unwrap();
+        super::finishing();
+        let returned = std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let worker = scope.spawn(|| {
+                let tx = tx;
+                log.log(&record_of("tapestry", Level::Error, format_args!("why")));
+                log.finish(1);
+                let _ = tx.send(());
+            });
+            let returned = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+            drop(guard);
+            worker.join().unwrap();
+            returned
+        });
+        assert!(returned, "the run's end waited on a blocked writer");
+        // The record that waited earlier was written.
+        let out = log.state.lock().unwrap().take().unwrap().sink.out.unwrap();
+        assert_eq!(messages(&String::from_utf8(out).unwrap()), ["early"]);
+    }
+
+    /// W1.5: wgpu's error records on a thread are taken, as report lines
+    /// and without the sink's lock, only while that thread captures them
+    /// (its startup builds) and is inside a surface's configure; its other
+    /// levels and every record outside the capture are rejected as before.
+    #[test]
+    fn wgpu_errors_are_taken_only_during_a_startup_configure() {
+        let log = memory_log();
+        let (tx, lines) = mpsc::channel::<String>();
+        let (producer, reporter) =
+            crate::render_report::start(Box::new(move |l| tx.send(l.to_owned()).unwrap())).unwrap();
+        crate::render_report::install(producer);
+        let hal = |level| metadata("wgpu_hal::dx12::adapter", level);
+        assert!(!log.enabled(&hal(Level::Error)));
+        super::capture_gpu_errors(true);
+        // A startup build outside its configure: rejected.
+        assert!(!log.enabled(&hal(Level::Error)));
+        render::while_configuring(|| {
+            assert!(log.enabled(&hal(Level::Error)));
+            assert!(log.enabled(&metadata("wgpu_core", Level::Error)));
+            assert!(!log.enabled(&hal(Level::Warn)));
+            assert!(!log.enabled(&metadata("wgpu_halo", Level::Error)));
+            // Taken with the sink held elsewhere: no lock.
+            let guard = log.state.lock().unwrap();
+            log.log(&record_of(
+                "wgpu_hal::dx12::adapter",
+                Level::Error,
+                format_args!("CreateSwapChainForHwnd failed: 0x887A0001"),
+            ));
+            drop(guard);
+            // Another thread captures nothing.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| assert!(!log.enabled(&hal(Level::Error))))
+                    .join()
+                    .unwrap();
+            });
+        });
+        super::capture_gpu_errors(false);
+        assert!(!render::while_configuring(
+            || log.enabled(&hal(Level::Error))
+        ));
+        log.log(&record_of(
+            "wgpu_hal::dx12::adapter",
+            Level::Error,
+            format_args!("after"),
+        ));
+        crate::render_report::stderr_only();
+        assert!(reporter.join(Duration::from_secs(10)));
+        let lines: Vec<String> = lines.try_iter().collect();
+        assert_eq!(
+            lines,
+            ["render: wgpu_hal::dx12::adapter: CreateSwapChainForHwnd failed: 0x887A0001"]
+        );
+        let formatted = log.state.lock().unwrap().as_ref().unwrap().sink.formatted;
+        assert_eq!(formatted, 0);
     }
 
     /// A logger that keeps each record's message.

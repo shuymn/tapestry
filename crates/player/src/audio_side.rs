@@ -62,6 +62,14 @@ impl AudioLink {
         self.control.exit();
         let _ = self.handle.join();
     }
+
+    /// Ends the thread and waits for it until `by` at the latest
+    /// ([`crate::join_by`]): past it, the thread is left to the process's
+    /// exit.
+    pub fn exit_by(mut self, by: std::time::Instant) {
+        self.control.exit();
+        let _ = crate::join_by(self.handle, by);
+    }
 }
 
 /// Why the audio thread did not start, with `E`, the output's error.

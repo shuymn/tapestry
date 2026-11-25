@@ -231,6 +231,20 @@ pub struct JobKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobPanic(pub String);
 
+impl JobPanic {
+    /// The panic whose payload is `payload` (a thread's join or a caught
+    /// unwind): its message, or a note that it had none.
+    #[must_use]
+    pub fn of(payload: &(dyn Any + Send)) -> Self {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_owned());
+        Self(message)
+    }
+}
+
 impl std::fmt::Display for JobPanic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -259,12 +273,7 @@ pub fn catch<T>(work: impl FnOnce() -> T) -> Result<T, JobPanic> {
 
 /// A caught panic's message.
 fn panic_of(payload: &(dyn Any + Send)) -> JobPanic {
-    let message = payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "a panic without a message".to_owned());
-    JobPanic(message)
+    JobPanic::of(payload)
 }
 
 /// Who answers for a job's failure as it publishes its outcome: the
