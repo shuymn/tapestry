@@ -8333,7 +8333,7 @@ impl Run {
                     // meanwhile with no entry filled is acknowledged at
                     // once by its swap, with no message's turn.
                     wait => {
-                        self.mark_waiting(self.screen.as_ref().map_or(0, |s| s.filled()));
+                        self.mark_waiting();
                         #[cfg(test)]
                         count_wait(
                             &self.shared,
@@ -9414,13 +9414,12 @@ impl Run {
             // at once, and found after it whichever way it returns.
             let minimized = screen.minimized();
             let swap_paced = screen.paced();
-            let filled = screen.filled();
             // An upload in hand steps in passes between frames ((r2)):
             // each pass waits for the grant or a HELD_PACE timer, never
             // for the GPU; offscreen or minimized, for its step until the
             // frame's deadline (design.md "Memory Budget", the uploader).
             let stepping = screen.upload_waited();
-            self.mark_waiting(filled);
+            self.mark_waiting();
             let Some(screen) = self.screen.as_mut() else {
                 self.mark_running();
                 continue;
@@ -11409,10 +11408,12 @@ impl Run {
     }
 
     /// Just before the frame's pacing or an idle pass's wait for its
-    /// message, outside READY's cutoff: waiting, with `filled` entries and
-    /// the request kept; cut off instead when it was asked with none
-    /// filled. A lost cutoff stays lost until its end.
-    fn mark_waiting(&mut self, filled: u32) {
+    /// message, outside READY's cutoff: waiting, with the filled entries
+    /// counted and the request kept; cut off instead when it was asked with
+    /// none filled. The count is read after the request's settlement, whose
+    /// withdrawn early staging may fill an entry. A lost cutoff stays lost
+    /// until its end.
+    fn mark_waiting(&mut self) {
         if self.cut_off {
             return;
         }
@@ -11439,6 +11440,7 @@ impl Run {
                 _ => {}
             }
             self.settle_for_cutoff(word);
+            let filled = self.screen.as_ref().map_or(0, |s| s.filled());
             if word & cutoff::ASKED != 0 && filled == 0 {
                 self.cut_off_now();
                 return;
@@ -21903,6 +21905,9 @@ pub(crate) mod tests {
         }
         fn discard(&mut self) {
             self.note("discard");
+            if self.shared.fill_on_discard.load(Ordering::Acquire) {
+                self.shared.filled.fetch_add(1, Ordering::AcqRel);
+            }
             self.staged = None;
             self.staged_score = None;
             self.staged_pace = None;
@@ -22295,6 +22300,9 @@ pub(crate) mod tests {
         fn text_settled(&self) -> bool {
             !self.shared.text_unsettled.load(Ordering::Acquire)
         }
+        fn filled(&self) -> u32 {
+            self.shared.filled.load(Ordering::Acquire)
+        }
         fn stage_early(
             &mut self,
             bundle: &Arc<render::SkinBundle>,
@@ -22565,6 +22573,11 @@ pub(crate) mod tests {
         pub(crate) texts: TextsAsked,
         /// The loading text is not settled while set.
         pub(crate) text_unsettled: Arc<AtomicBool>,
+        /// The retirement entries the screens count filled.
+        pub(crate) filled: Arc<AtomicU32>,
+        /// Each discard fills one more retirement entry while set, as a
+        /// withdrawn staging retires its atlas.
+        pub(crate) fill_on_discard: Arc<AtomicBool>,
     }
 
     /// One selection frame as an [`Installer`] saw it.

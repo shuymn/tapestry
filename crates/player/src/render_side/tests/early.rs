@@ -9,7 +9,7 @@
 use std::sync::atomic::Ordering::SeqCst;
 
 use super::*;
-use crate::render_side::{Answered, AttemptSkin, Extent, PendingAttempt, RenderLink};
+use crate::render_side::{Answered, AttemptSkin, CutoffPhase, Extent, PendingAttempt, RenderLink};
 
 /// A render thread with play's skin pending, a held loading lifetime of
 /// chart "T" published (nothing of it drawn) and the built-in decision
@@ -393,5 +393,34 @@ fn the_cutoff_waits_for_the_early_staging() {
     assert!(screens.staging().is_some());
     link.ask_cutoff();
     assert!(wait_until(|| screens.staging().is_none()));
+    link.exit();
+}
+
+/// READY's cutoff asked just before the frame's wait, the early staging's
+/// withdrawal filling a retirement entry: the render thread counts that
+/// entry, so it is not cut off until a boundary destroyed it.
+// Revert: the filled count read before the settlement -> cut off with the
+// entry filled.
+#[test]
+fn the_cutoff_counts_the_entry_the_withdrawal_fills() {
+    let (_chart, screens, link, _lifetime) = held();
+    let mut ticket = early(&link, &bundle());
+    answer(&mut ticket);
+    screens.fill_on_discard.store(true, SeqCst);
+    let gate = link.frame_gate(1);
+    gate.hold(true);
+    assert!(wait_until(|| gate.waiting()));
+    link.ask_cutoff();
+    gate.hold(false);
+    assert!(wait_until(|| screens.staging().is_none()));
+    assert_eq!(screens.filled.load(SeqCst), 1);
+    let frames = screens.menu_frames.lock().unwrap().len();
+    assert!(wait_until(
+        || screens.menu_frames.lock().unwrap().len() >= frames + 3
+    ));
+    assert_ne!(link.cutoff_phase(), CutoffPhase::CutOff);
+    screens.filled.store(0, SeqCst);
+    assert!(wait_until(|| link.cutoff_phase() == CutoffPhase::CutOff));
+    drop(ticket);
     link.exit();
 }
