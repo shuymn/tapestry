@@ -5848,3 +5848,6 @@ fn render_app_zero_with_video_bga() {
         "the positive control is counted: {m:?}"
     );
 }
+
+#[path = "scenario/faults.rs"]
+mod faults;
