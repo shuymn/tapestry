@@ -152,6 +152,10 @@ pub struct Specialization {
 pub struct PendingSkin {
     play: Arc<PendingPlay>,
     cached: Option<Specialization>,
+    /// The kept specialization was built by a job of its own for the
+    /// attempt to come ([`adopt`](Self::adopt)), not used yet: its first
+    /// use reports the job that ran, not a reuse.
+    adopted: bool,
 }
 
 /// The play skin of an attempt at a pending play skin
@@ -213,7 +217,11 @@ pub fn log_staged(took: Duration, answer: Result<&Preparation, &crate::render_si
 impl PendingSkin {
     /// `play`, no specialization kept yet.
     pub const fn new(play: Arc<PendingPlay>) -> Self {
-        Self { play, cached: None }
+        Self {
+            play,
+            cached: None,
+            adopted: false,
+        }
     }
 
     /// The skin of an attempt with `facts` (design.md "beatoraja Lua
@@ -274,6 +282,7 @@ impl PendingSkin {
         };
         log_specialized(&s.summary, &s.facts, took, atlas, log::logger());
         self.cached = Some(s);
+        self.adopted = true;
     }
 
     /// [`attempt`](Self::attempt)'s start: the kept specialization when it
@@ -282,11 +291,14 @@ impl PendingSkin {
     /// ([`Specializing::wait_until`]) and finished
     /// ([`finish`](Self::finish)).
     pub fn begin(&mut self, facts: ImportFacts, wait: impl FnOnce()) -> Begun {
+        let adopted = std::mem::take(&mut self.adopted);
         if let Some(kept) = self.cached.as_ref().filter(|c| c.facts.holds(&facts)) {
-            return Begun::Ready(
-                ForAttempt::Ready(Arc::clone(&kept.bundle)),
-                Specialized::Reused,
-            );
+            let how = if adopted {
+                Specialized::Ran
+            } else {
+                Specialized::Reused
+            };
+            return Begun::Ready(ForAttempt::Ready(Arc::clone(&kept.bundle)), how);
         }
         drop(self.cached.take());
         wait();

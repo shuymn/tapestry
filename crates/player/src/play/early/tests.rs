@@ -57,30 +57,33 @@ fn a_completion_after_the_commit_is_dropped() {
     assert_eq!(gate.refused(), None);
 }
 
-/// B9c3: the early staging refused before the reveal turns the ended
+/// B9c3: the early staging refused before the reveal, published by the
+/// render thread for the early request sent, turns the ended
 /// specialization into the refusal, the commit answering it and revealing
-/// nothing; published by the render thread for the early request sent,
-/// the same through the shared cell. After the reveal, neither changes
-/// the gate (the loading state's route).
+/// nothing; another request's refusal is not this gate's. After the reveal
+/// it changes nothing (the loading state's route).
 #[test]
 fn a_staging_refusal_before_the_reveal_refuses() {
-    let gate = EarlyGate::<u32>::new(None);
-    assert!(gate.end(EarlyOutcome::Specialized(1)));
-    gate.refuse_staging(refusal("no room"));
-    assert_eq!(gate.state_name(), "ended refused");
-    assert_eq!(gate.refused(), Some(refusal("no room")));
-    assert_eq!(gate.commit_reveal(), Committed::Refused(refusal("no room")));
-    assert_eq!(gate.state_name(), "ended refused", "nothing revealed");
-
     let cell: RenderRefusal = Arc::default();
     let gate = EarlyGate::<u32>::new(Some(Arc::clone(&cell)));
     assert!(gate.end(EarlyOutcome::Specialized(1)));
     gate.step(|s| (*s == 1).then_some(5));
     assert_eq!(gate.request(), Some(5), "the early request sent once");
-    // Another request's refusal is not this gate's.
+    gate.step(|_| Some(9));
+    assert_eq!(gate.request(), Some(5));
     *cell.lock().unwrap() = Some((4, refusal("other")));
     assert_eq!(gate.refused(), None);
-    *cell.lock().unwrap() = Some((5, refusal("restage refused")));
+    *cell.lock().unwrap() = Some((5, refusal("no room")));
+    assert_eq!(gate.refused(), Some(refusal("no room")));
+    assert_eq!(gate.state_name(), "ended refused");
+    assert_eq!(gate.commit_reveal(), Committed::Refused(refusal("no room")));
+    assert_eq!(gate.state_name(), "ended refused", "nothing revealed");
+
+    // Published after the last step: the commit reads it first.
+    let gate = EarlyGate::<u32>::new(Some(Arc::clone(&cell)));
+    assert!(gate.end(EarlyOutcome::Specialized(1)));
+    gate.step(|_| Some(6));
+    *cell.lock().unwrap() = Some((6, refusal("restage refused")));
     assert_eq!(
         gate.commit_reveal(),
         Committed::Refused(refusal("restage refused"))
@@ -88,10 +91,9 @@ fn a_staging_refusal_before_the_reveal_refuses() {
 
     let gate = EarlyGate::<u32>::new(Some(Arc::clone(&cell)));
     assert!(gate.end(EarlyOutcome::Specialized(1)));
-    gate.step(|_| Some(6));
+    gate.step(|_| Some(7));
     assert_eq!(gate.commit_reveal(), Committed::Revealed);
-    gate.refuse_staging(refusal("after"));
-    *cell.lock().unwrap() = Some((6, refusal("after")));
+    *cell.lock().unwrap() = Some((7, refusal("after")));
     assert_eq!(gate.refused(), None, "after the reveal: the loading route");
     assert_eq!(gate.state_name(), "revealed specialized");
 }

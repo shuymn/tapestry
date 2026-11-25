@@ -79,6 +79,10 @@ struct Inner<S> {
     state: State<S>,
     /// The early request sent for the staging, once sent.
     request: Option<u64>,
+    /// When it ended specialized (development builds: the early request's
+    /// delayed send).
+    #[cfg(feature = "dev-tools")]
+    ended_at: Option<Instant>,
 }
 
 /// The early preparation's gate: one lock over its state, shared by the
@@ -128,6 +132,8 @@ impl<S> EarlyGate<S> {
             inner: Mutex::new(Inner {
                 state: State::Idle,
                 request: None,
+                #[cfg(feature = "dev-tools")]
+                ended_at: None,
             }),
             render,
             #[cfg(test)]
@@ -203,31 +209,49 @@ impl<S> EarlyGate<S> {
         if !matches!(inner.state, State::Idle) {
             return false;
         }
+        #[cfg(feature = "dev-tools")]
+        {
+            inner.ended_at = Some(Instant::now());
+        }
         inner.state = State::Ended(outcome);
         true
     }
 
+    /// How long ago the gate ended (development builds: the early
+    /// request's delayed send).
+    #[cfg(feature = "dev-tools")]
+    pub fn ended_for(&self) -> Duration {
+        self.lock()
+            .ended_at
+            .map_or(Duration::ZERO, |at| at.elapsed())
+    }
+
     /// The worker's completion with `outcome`: kept only while the job
     /// runs; cancelled at the reveal (or anything else), dropped here.
-    pub fn complete(&self, outcome: EarlyOutcome<S>) {
+    /// Whether it was kept.
+    pub fn complete(&self, outcome: EarlyOutcome<S>) -> bool {
         #[cfg(test)]
         self.completing
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut inner = self.lock();
         match inner.state {
-            State::Running(_) => inner.state = State::Ended(outcome),
+            State::Running(_) => {
+                #[cfg(feature = "dev-tools")]
+                {
+                    inner.ended_at = Some(Instant::now());
+                }
+                inner.state = State::Ended(outcome);
+                true
+            }
             _ => {
                 drop(inner);
                 drop(outcome);
+                false
             }
         }
     }
 
     /// The early request sent, if any.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the render side's early request uses it next")
-    )]
     pub fn request(&self) -> Option<u64> {
         self.lock().request
     }
@@ -244,20 +268,6 @@ impl<S> EarlyGate<S> {
         }
         if let State::Ended(EarlyOutcome::Specialized(s)) = &inner.state {
             inner.request = send(s);
-        }
-    }
-
-    /// The early staging was refused before the reveal: an ended
-    /// specialization becomes the refusal. After the reveal it is the
-    /// loading state's (nothing changes here).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the render side's early request uses it next")
-    )]
-    pub fn refuse_staging(&self, refusal: PreparationRefusal) {
-        let mut inner = self.lock();
-        if let State::Ended(EarlyOutcome::Specialized(_)) = inner.state {
-            inner.state = State::Ended(EarlyOutcome::Refused(refusal));
         }
     }
 
@@ -511,10 +521,85 @@ pub fn admit(
     answer
 }
 
+/// The early request's sender and its ticket, shared by the looks that
+/// serve the gate (design.md "Screen Transitions and Loading", the
+/// request): sent once, before the reveal, when the gate ended
+/// specialized; ended by its owner whatever the ticket's state.
+#[derive(Debug)]
+pub struct EarlyLink {
+    sender: crate::render_side::EarlySender,
+    ticket: Mutex<Option<crate::render_side::PendingAttempt>>,
+}
+
+impl EarlyLink {
+    /// A link sending through `sender`.
+    pub fn new(sender: crate::render_side::EarlySender) -> Arc<Self> {
+        Arc::new(Self {
+            sender,
+            ticket: Mutex::new(None),
+        })
+    }
+
+    /// Serves `gate` (non-blocking): the render thread's refusal read in,
+    /// then the early request sent once for an ended specialization before
+    /// the reveal.
+    pub fn serve(&self, gate: &EarlyGate) {
+        // Read before the step, whose closure runs under the gate's lock.
+        #[cfg(feature = "dev-tools")]
+        let due = crate::dev::early_send_due(gate.ended_for());
+        gate.step(|s| {
+            #[cfg(feature = "dev-tools")]
+            if !due {
+                return None;
+            }
+            let ticket = self.sender.begin_early(Arc::clone(&s.bundle));
+            let request = ticket.request();
+            log::info!("early: the staging was asked as request {request}");
+            *self.ticket.lock().unwrap_or_else(PoisonError::into_inner) = Some(ticket);
+            Some(request)
+        });
+    }
+
+    /// The early request ended: dropped on the render thread, answered or
+    /// not, its ticket with it.
+    pub fn end(&self, request: u64) {
+        let ticket = self
+            .ticket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.sender.discard(request);
+        drop(ticket);
+    }
+
+    /// The early request's ticket, taken for the attempt that adopts it.
+    pub fn take_ticket(&self) -> Option<crate::render_side::PendingAttempt> {
+        self.ticket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// The early request handed to the attempt's preparation: its number,
+/// which the attempt's request adopts, and its ticket, dropped once the
+/// attempt's request is sent.
+#[derive(Debug)]
+pub struct Handoff {
+    pub request: u64,
+    /// Held until the attempt's request is sent: dropped open, it discards
+    /// the early request, which must come after the adoption.
+    #[expect(dead_code, reason = "held for its drop's order, never read")]
+    pub ticket: Option<crate::render_side::PendingAttempt>,
+}
+
 /// The early preparation of one decided play: the gate, the job it began,
 /// and the facts and skin it begins from when its admission was deferred.
 pub struct EarlyPrep {
     gate: Arc<EarlyGate>,
+    /// The early request's link to the render thread; none in tests of
+    /// the gate alone.
+    link: Option<Arc<EarlyLink>>,
     /// The decision lifetime it prepares for.
     lifetime: u64,
     /// The job, until joined.
@@ -539,6 +624,7 @@ impl EarlyPrep {
     pub fn new(gate: Arc<EarlyGate>, lifetime: u64) -> Self {
         Self {
             gate,
+            link: None,
             lifetime,
             job: None,
             from: Instant::now(),
@@ -549,6 +635,34 @@ impl EarlyPrep {
     /// The gate.
     pub const fn gate(&self) -> &Arc<EarlyGate> {
         &self.gate
+    }
+
+    /// With the early request sent through `link`.
+    #[must_use]
+    pub fn with_link(mut self, link: Arc<EarlyLink>) -> Self {
+        self.link = Some(link);
+        self
+    }
+
+    /// The early request's link, if any.
+    pub const fn link(&self) -> Option<&Arc<EarlyLink>> {
+        self.link.as_ref()
+    }
+
+    /// The early request sent, handed to the attempt that adopts it.
+    pub fn handoff(&self) -> Option<Handoff> {
+        let request = self.gate.request()?;
+        Some(Handoff {
+            request,
+            ticket: self.link.as_ref().and_then(|l| l.take_ticket()),
+        })
+    }
+
+    /// The early request sent, if any, ended on the render thread.
+    pub fn end_request(&self) {
+        if let (Some(link), Some(request)) = (&self.link, self.gate.request()) {
+            link.end(request);
+        }
     }
 
     /// Begins `play`'s specialization for `facts` on the gate: on a
@@ -566,7 +680,20 @@ impl EarlyPrep {
         let started = self.gate.start(|| {
             let spawned = imports::spawn_job_completing(
                 move |cancel: &Cancel| imports::specialize(&play, &facts, cancel),
-                move |sent| gate.complete(outcome_of(sent)),
+                move |sent| {
+                    let refused = match sent {
+                        Ok(Err(why)) => Some(why.clone()),
+                        Err(why) => Some((*why).to_owned()),
+                        Ok(Ok(_)) => None,
+                    };
+                    // A refusal the gate keeps is this attempt's skin
+                    // report, as Preparing's would be.
+                    if gate.complete(outcome_of(sent))
+                        && let Some(why) = refused
+                    {
+                        imports::ForAttempt::Refused(why).report(&imports::Specialized::Ran);
+                    }
+                },
                 || {},
             )?;
             let cancel = spawned.canceller();
@@ -593,6 +720,15 @@ impl EarlyPrep {
         facts: skin_beatoraja::ImportFacts,
     ) -> Admitted {
         let answer = admit(growth, machine.headroom(), false, self.gate.revealed());
+        // A script's step armed for the play skin's specialization acts on
+        // Preparing's job (development builds): the early start declines.
+        #[cfg(feature = "dev-tools")]
+        let answer = if crate::dev::play_specializing_armed() {
+            log::info!("early: declined, today's begin: a specializing step is armed");
+            Admitted::Declined("a specializing step is armed".to_owned())
+        } else {
+            answer
+        };
         match answer {
             Admitted::Yes => {
                 self.begin(play, facts);
@@ -664,9 +800,13 @@ impl super::PlayerRig<'_> {
     /// exists.
     pub(crate) fn early_watch(&self) -> Option<crate::controls::EarlyWatch> {
         let early = self.early.as_ref()?;
+        let link = early.link().cloned();
         Some(crate::controls::EarlyWatch {
             gate: Arc::clone(early.gate()),
-            step: Box::new(|gate: &EarlyGate| gate.step(|_| None)),
+            step: Box::new(move |gate: &EarlyGate| match &link {
+                Some(link) => link.serve(gate),
+                None => gate.step(|_| None),
+            }),
         })
     }
 
@@ -674,7 +814,10 @@ impl super::PlayerRig<'_> {
     /// (non-blocking).
     pub(crate) fn step_early(&self) {
         if let Some(early) = &self.early {
-            early.gate().step(|_| None);
+            match early.link() {
+                Some(link) => link.serve(early.gate()),
+                None => early.gate().step(|_| None),
+            }
         }
     }
 
@@ -724,6 +867,9 @@ impl super::PlayerRig<'_> {
         let mut early = self.early.take()?;
         let ran = early.has_job();
         let taken = early.take_specialized();
+        // The early request sent goes to the attempt's request, which
+        // adopts its staging when it still fits.
+        self.early_handoff = early.handoff();
         if early.join(|| self.run_ends()) {
             log::warn!("early: the import's thread was left to the process's exit");
         }
@@ -738,6 +884,7 @@ impl super::PlayerRig<'_> {
             return;
         };
         early.cancel();
+        early.end_request();
         if early.join(|| self.run_ends()) {
             log::warn!("early: the import's thread was left to the process's exit");
         }

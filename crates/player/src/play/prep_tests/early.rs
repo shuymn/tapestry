@@ -421,3 +421,107 @@ fn a_refusal_between_classify_and_commit_is_not_revealed() {
         rig.left_chart().unwrap();
     });
 }
+
+/// B10: an early staging refused after the reveal ends the attempt at
+/// once with its reason: the attempt's request is never sent, nothing
+/// staged afresh.
+// Revert: mapped to `Cancelled` -> the preparation answers cancelled.
+#[test]
+fn a_staging_refusal_after_the_reveal_returns_at_once() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, true, |rig| {
+        let gate = decided(rig, skin);
+        let link = crate::play::early::EarlyLink::new(rig.render.early_sender());
+        rig.early = rig.early.take().map(|e| e.with_link(link));
+        rig.render
+            .show_decision(crate::render_side::tests::one_line("page"), None);
+        // The early staging waits for its room.
+        screens.early_room.store(1, SeqCst);
+        rig.chart_read(&l);
+        until("the specialization ended", || {
+            state(&gate) == "ended specialized"
+        });
+        rig.step_early();
+        let request = gate.request().expect("the early request sent");
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        // Refused after the reveal's commit.
+        screens.early_room.store(3, SeqCst);
+        until("the early staging refused", || {
+            rig.render.early_refused(request).is_some()
+        });
+        let mut handle = begin(rig, &l);
+        let answer = polled(rig, &mut handle).unwrap();
+        assert!(
+            matches!(answer, game::Preparation::Refused(_)),
+            "{answer:?}"
+        );
+        assert!(
+            !screens.log().iter().any(|s| s.contains(" prepare ")),
+            "{:?}",
+            screens.log()
+        );
+        rig.discard_attempt();
+        rig.left_chart().unwrap();
+    });
+}
+
+/// B5e (player): an attempt adopting an early request whose staging
+/// released the result begins no result pages upload (the result's step
+/// reconciles the release); without the release its pages ticket begins.
+// Revert: `begin_pages_ticket` ignores the release -> a ticket begun.
+#[test]
+fn a_released_result_begins_no_pages_upload() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use crate::result_skin::{ResultSkin, ResultStart};
+
+    let _serial = imports::serial();
+    for release in [false, true] {
+        let (_dir, skin) = pending_play(LEVEL_SKIN);
+        let l = at_level(13);
+        let screens = Installers::default();
+        let result = super::result_flow::lua_result(
+            "local nr = ms.number(154)",
+            &format!("d[#d + 1] = {}", super::result_flow::MARK_DST),
+        );
+        let p =
+            crate::result_skin::tests::pending(result.path(), crate::result_skin::tests::LIMITS);
+        on_rig(l.chart(), &screens, true, |rig| {
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))))
+                .with_scripts(rig.render.scripts().clone());
+            let gate = decided(rig, skin);
+            let link = crate::play::early::EarlyLink::new(rig.render.early_sender());
+            rig.early = rig.early.take().map(|e| e.with_link(link));
+            rig.render
+                .show_decision(crate::render_side::tests::one_line("page"), None);
+            screens
+                .early_room
+                .store(if release { 2 } else { 0 }, SeqCst);
+            rig.chart_read(&l);
+            until("the specialization ended", || {
+                state(&gate) == "ended specialized"
+            });
+            rig.step_early();
+            let e = gate.request().expect("the early request sent");
+            if release {
+                until("the result released", || {
+                    rig.render.result_status().released == Some(e)
+                });
+            }
+            assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+            let mut handle = begin(rig, &l);
+            assert_eq!(polled(rig, &mut handle).unwrap(), game::Preparation::Ready);
+            assert_eq!(rig.pages_ticket.is_some(), !release, "release {release}");
+            if release {
+                assert_ne!(rig.render.result_status().released, Some(e), "followed");
+            }
+            rig.discard_attempt();
+            rig.left_chart().unwrap();
+        });
+    }
+}

@@ -317,6 +317,16 @@ pub fn specializing(stage: SpecializingStage, s: Specializing) {
     *SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner) = Some((s, stage, u64::MAX, None));
 }
 
+/// Whether a step is armed for the next play skin specialization
+/// (`<mode>-specializing`): the decision screen's early start declines,
+/// so the step acts on Preparing's job, the one it names.
+pub fn play_specializing_armed() -> bool {
+    SPECIALIZING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some_and(|(_, stage, _, _)| stage == SpecializingStage::Play)
+}
+
 /// The next specialization holds `ms` once its wait is shown
 /// (`slow-specializing`).
 pub fn slow_specializing(ms: u64) {
@@ -804,6 +814,25 @@ pub fn pinned_upload_slice() -> Option<std::time::Duration> {
     (us > 0).then(|| std::time::Duration::from_micros(us))
 }
 
+/// The early request's send held this long after the decision's early
+/// specialization ended, ms; 0 for none (`--dev-early-delay`): a fault
+/// that makes the early staging miss the reveal.
+static EARLY_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Holds every early request's send `ms` after its specialization ended,
+/// for the rest of the run (`--dev-early-delay`).
+pub fn delay_early(ms: u64) {
+    EARLY_DELAY_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the early request of a specialization that ended `ended_for`
+/// ago is sent now: at once without `--dev-early-delay`, else once the
+/// delay has passed.
+pub fn early_send_due(ended_for: std::time::Duration) -> bool {
+    let ms = EARLY_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    ended_for >= std::time::Duration::from_millis(ms)
+}
+
 /// The value of `--dev-render-timeout`, in seconds.
 fn render_timeout(p: &mut lexopt::Parser) -> Result<std::time::Duration, UsageError> {
     let secs = p
@@ -860,6 +889,10 @@ pub struct SelectOptions {
     /// [`pin_upload_slice`]): the fixed baseline the scaled slice is
     /// measured against.
     pub upload_slice_us: Option<u64>,
+    /// The early request's send held this long after the decision's early
+    /// specialization ended, ms (`--dev-early-delay <ms>`,
+    /// [`delay_early`]): the early staging's miss forced.
+    pub early_delay_ms: Option<u64>,
     /// Where a windowed run writes its raw transition record at its end
     /// (`--dev-transitions <file>`, [`transitions::RunFrames`]): its
     /// presents with their stamps on the host counter, the game thread's
@@ -920,6 +953,12 @@ impl SelectOptions {
                 self.upload_slice_us = Some(us.ok_or_else(|| {
                     UsageError::Usage("--dev-upload-slice-us takes microseconds".to_owned())
                 })?);
+            }
+            "dev-early-delay" => {
+                let ms = p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-early-delay takes milliseconds".to_owned())
+                })?;
+                self.early_delay_ms = Some(ms);
             }
             "dev-speculative-permits" => {
                 let n = p.value()?.to_string_lossy().parse().map_err(|_| {

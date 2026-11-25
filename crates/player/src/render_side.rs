@@ -1192,6 +1192,69 @@ pub trait Screen: Send {
     fn staged_token(&self) -> Option<PreparedToken> {
         None
     }
+    /// The staging held, ready or still stepping. The default: the one
+    /// ready ([`staged_token`](Self::staged_token)).
+    fn staged_any(&self) -> Option<PreparedToken> {
+        self.staged_token()
+    }
+    /// The staging whose pages are written, whose loading presentation
+    /// may draw while its attempt's text still steps. The default: the
+    /// one ready.
+    fn staged_drawable(&self) -> Option<PreparedToken> {
+        self.staged_token()
+    }
+    /// Stages `bundle`'s pages and loading presentation for the early
+    /// request `request`, destroying nothing in its call
+    /// ([`render::Renderer::stage_early`]): `Ok(None)` while it steps. The
+    /// default refuses: the screen draws no declarative skin.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's.
+    fn stage_early(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Option<PreparedToken>, RenderError> {
+        let _ = (bundle, request);
+        Err(RenderError::Skin(render::SkinError {
+            reason: "this screen draws no declarative skin".to_owned(),
+        }))
+    }
+    /// What the early staging of `bundle` needs before it is taken
+    /// ([`render::Renderer::early_room`]). The default: it fits.
+    fn early_room(&self, bundle: &Arc<SkinBundle>) -> render::EarlyRoom {
+        let _ = bundle;
+        render::EarlyRoom::Fits
+    }
+    /// The result's installation released for the early staging of
+    /// `bundle`, nothing destroyed in the call
+    /// ([`render::Renderer::release_result_deferred`]). The default
+    /// releases nothing.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's.
+    fn release_result_deferred(&mut self, bundle: &SkinBundle) -> Result<(), RenderError> {
+        let _ = bundle;
+        Ok(())
+    }
+    /// The early staging of `early` adopted by attempt `a` of `request`
+    /// ([`render::Renderer::adopt_staging`]), its staged loading text
+    /// re-keyed with it. The default adopts nothing.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's.
+    fn adopt_attempt(
+        &mut self,
+        early: u64,
+        request: u64,
+        a: &AttemptInput<'_>,
+    ) -> Result<bool, RenderError> {
+        let _ = (early, request, a);
+        Ok(false)
+    }
     /// Draws the play screen's loading state while play's skin is pending
     /// and no specialization of it is staged for or committed in the
     /// loading lifetime:
@@ -1494,6 +1557,19 @@ pub enum AttemptSkin {
     Specialized(Arc<SkinBundle>),
 }
 
+/// What an attempt's preparation request ([`RenderMsg::PrepareAttempt`])
+/// prepares.
+#[derive(Debug)]
+pub enum AttemptPart {
+    /// A decided play's early request, sent while the decision screen
+    /// shows: its specialization's atlas pages and loading presentation,
+    /// staged without destruction in its call, never committed; the
+    /// attempt adopts it (design.md "Screen Transitions and Loading").
+    Early,
+    /// The attempt, whole.
+    Full(Box<AttemptContext>),
+}
+
 /// What a selection ([`RenderMsg::Select`]) selects for its kind.
 #[derive(Debug)]
 pub enum Selected {
@@ -1535,12 +1611,16 @@ pub enum RenderMsg {
         /// none for a retry or a round: its staging draws that lifetime's
         /// loading frames only.
         lifetime: Option<u64>,
-        /// The attempt, owned.
-        attempt: Box<AttemptContext>,
+        /// The attempt, owned; or the early part of a decided play's
+        /// attempt (its play skin's pages and loading presentation only).
+        attempt: AttemptPart,
         /// The play skin it is prepared with.
         skin: AttemptSkin,
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+        /// The early request this attempt adopts, if one was sent for it
+        /// (design.md "Screen Transitions and Loading", adoption).
+        adopts: Option<u64>,
     },
     /// The attempt's final readiness, bounded: when what this request
     /// staged still fits the screen's structural inputs, stamp the
@@ -2981,6 +3061,19 @@ struct LoadingSlot {
 type TakenLoading = (Option<Box<MenuPage>>, Option<Box<LoadingUpdate>>);
 
 impl LoadingSlot {
+    /// The held lifetime's newest state, without taking it: its lifetime,
+    /// revision and chart, while the decision screen holds it. Allocates
+    /// nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn held_peek(&self) -> Option<(u64, u64, Arc<crate::loading_text::ChosenChart>)> {
+        if !self.held {
+            return None;
+        }
+        self.update
+            .as_ref()
+            .map(|u| (self.lifetime, u.revision, Arc::clone(&u.chart)))
+    }
+
     /// Puts `page` and `update` of lifetime `lifetime` in the slot, both
     /// replacing what waits, unless the lifetime ended or `update` is not
     /// newer than every state accepted in it: then nothing changes.
@@ -3349,8 +3442,9 @@ pub struct RenderLink {
     finish_timeout: Duration,
     /// The number of the last end page shown.
     end_pages: AtomicU64,
-    /// The number of the last attempt's preparation requested.
-    requests: AtomicU64,
+    /// The number of the last attempt's preparation requested, shared
+    /// with the early request's sender ([`EarlySender`]).
+    requests: Arc<AtomicU64>,
     /// The number of the last result pages upload begun, of its own
     /// sequence.
     page_uploads: AtomicU64,
@@ -3673,6 +3767,18 @@ impl RenderLink {
         Some(Arc::clone(&self.shared.early_refusal))
     }
 
+    /// The refusal the render thread published for early request
+    /// `request`, if any.
+    pub fn early_refused(&self, request: u64) -> Option<game::PreparationRefusal> {
+        self.shared
+            .early_refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(r, _)| *r == request)
+            .map(|(_, refused)| refused.clone())
+    }
+
     /// Begins the result's pages upload of `pages` (design.md "Memory
     /// Budget", the result pages upload), numbered apart from every
     /// request: the ticket to poll, withdrawn when dropped unanswered.
@@ -3890,27 +3996,32 @@ impl RenderLink {
     /// ([`PendingAttempt::wait_until`]) within the answer's bound from now.
     /// Dropped unanswered, the request is discarded, so its answer,
     /// however late, installs nothing.
+    #[cfg(test)]
     pub fn begin_attempt(&self, attempt: AttemptContext, skin: AttemptSkin) -> PendingAttempt {
-        let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
-        let (reply, rx) = mpsc::sync_channel(1);
-        // Read where the request is published: every lifetime change is
-        // this thread's, so it is the one the request belongs to however
-        // late the render thread takes it.
-        let lifetime = self.shared.current_lifetime();
-        self.send(RenderMsg::PrepareAttempt {
-            request,
-            lifetime,
-            attempt: Box::new(attempt),
-            skin,
-            reply,
-        });
-        PendingAttempt {
-            request,
-            rx,
-            bound: Instant::now() + self.answer_timeout,
+        self.begin_adopting(attempt, skin, None)
+    }
+
+    /// [`begin_attempt`](Self::begin_attempt) adopting the early request
+    /// `adopts`, if any (design.md "Screen Transitions and Loading",
+    /// adoption): its staging becomes the attempt's when it still fits.
+    pub fn begin_adopting(
+        &self,
+        attempt: AttemptContext,
+        skin: AttemptSkin,
+        adopts: Option<u64>,
+    ) -> PendingAttempt {
+        self.early_sender()
+            .begin(AttemptPart::Full(Box::new(attempt)), skin, adopts)
+    }
+
+    /// What sends a decided play's early request and ends it, from any
+    /// thread (the load's looks among them).
+    pub fn early_sender(&self) -> EarlySender {
+        EarlySender {
             tx: self.tx.clone(),
             shared: Arc::clone(&self.shared),
-            open: true,
+            requests: Arc::clone(&self.requests),
+            answer_timeout: self.answer_timeout,
         }
     }
 
@@ -5252,8 +5363,74 @@ fn reveal(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>) {
     }
 }
 
+/// Sends attempt requests of the render link's sequence from any thread
+/// ([`RenderLink::early_sender`]): the early request of a decided play
+/// and its end.
+#[derive(Clone)]
+pub struct EarlySender {
+    tx: Sender<RenderMsg>,
+    shared: Arc<Shared>,
+    requests: Arc<AtomicU64>,
+    answer_timeout: Duration,
+}
+
+impl std::fmt::Debug for EarlySender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EarlySender").finish_non_exhaustive()
+    }
+}
+
+impl EarlySender {
+    /// A request of `attempt` with `skin`, adopting `adopts`, published
+    /// in the loading lifetime current: its ticket.
+    fn begin(
+        &self,
+        attempt: AttemptPart,
+        skin: AttemptSkin,
+        adopts: Option<u64>,
+    ) -> PendingAttempt {
+        let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let (reply, rx) = mpsc::sync_channel(1);
+        // Read where the request is published: every lifetime change is
+        // the game thread's, so it is the one the request belongs to
+        // however late the render thread takes it.
+        let lifetime = self.shared.current_lifetime();
+        let _ = self.tx.send(RenderMsg::PrepareAttempt {
+            request,
+            lifetime,
+            attempt,
+            skin,
+            reply,
+            adopts,
+        });
+        PendingAttempt {
+            request,
+            rx,
+            bound: Instant::now() + self.answer_timeout,
+            tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
+            open: true,
+        }
+    }
+
+    /// The early request of a decided play staging `bundle`'s pages and
+    /// loading presentation, in the held loading lifetime: its ticket,
+    /// which an adoption answers [`Answered::adopted`]. Its owner ends it
+    /// ([`discard`](Self::discard)) whatever the ticket's state.
+    pub fn begin_early(&self, bundle: Arc<SkinBundle>) -> PendingAttempt {
+        self.begin(AttemptPart::Early, AttemptSkin::Specialized(bundle), None)
+    }
+
+    /// Drops request `request`'s preparation, answered or not, unless
+    /// committed or adopted.
+    pub fn discard(&self, request: u64) {
+        let _ = self.tx.send(RenderMsg::Discard(request));
+    }
+}
+
 /// An attempt's preparation asked of the render thread
 /// ([`RenderLink::begin_attempt`]), its answer not yet taken.
+#[derive(Debug)]
 pub struct PendingAttempt {
     request: u64,
     rx: Receiver<Result<Answered, RenderError>>,
@@ -5309,6 +5486,7 @@ impl PendingAttempt {
                 return Some(Ok(Answered {
                     preparation: Preparation::Cancelled,
                     screen: game::ScreenKey::default(),
+                    adopted: false,
                 }));
             }
             let now = Instant::now();
@@ -5319,6 +5497,25 @@ impl PendingAttempt {
             if until.is_some_and(|u| now >= u) {
                 return None;
             }
+        }
+    }
+
+    /// The answer if it came, without a wait (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn try_answer(&mut self) -> Option<Result<Answered, ScreenError>> {
+        if !self.open {
+            return None;
+        }
+        match self.rx.try_recv() {
+            Ok(answer) => {
+                self.open = false;
+                Some(answer.map_err(ScreenError::from))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.open = false;
+                Some(Err(ended(&self.shared)))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
         }
     }
 
@@ -5796,6 +5993,9 @@ pub fn spawn_until(
                 screen_resolved: None,
                 requested: 0,
                 attempt: None,
+                early: None,
+                early_tombstone: None,
+                decision_drawn: None,
                 prepared: None,
                 chart_generation: 0,
                 chart_table: None,
@@ -5921,7 +6121,7 @@ pub fn spawn_until(
             exit_timeout: EXIT_TIMEOUT,
             finish_timeout: FINISH_TIMEOUT,
             end_pages: AtomicU64::new(0),
-            requests: AtomicU64::new(0),
+            requests: Arc::new(AtomicU64::new(0)),
             page_uploads: AtomicU64::new(0),
             clock,
             scripts,
@@ -6313,6 +6513,40 @@ enum Presented {
     Placeholder,
 }
 
+/// What the draw rule reads of the play staging the loading frames may
+/// draw on `screen`: the attempt's answered ready (`prepared`), else the
+/// `early` staging answered, or the `attempt` adopting it, while its pages
+/// are written (design.md "Screen Transitions and Loading"). Allocates
+/// nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn candidate_of(
+    prepared: Option<&Prepared>,
+    early: Option<&EarlyRecord>,
+    attempt: Option<&Preparing>,
+    screen: &dyn Screen,
+) -> Option<Candidate> {
+    if let Some(p) = prepared {
+        return Some(p.candidate());
+    }
+    let drawable = screen.staged_drawable()?;
+    if let Some(r) = early.filter(|r| r.answered == Some(drawable)) {
+        return Some(Candidate {
+            token: drawable,
+            lifetime: r.lifetime,
+            declarative: true,
+            loadend: r.bundle.skin().loadend(),
+        });
+    }
+    attempt
+        .filter(|p| p.adopted && p.request == drawable.request)
+        .map(|p| Candidate {
+            token: drawable,
+            lifetime: p.lifetime,
+            declarative: true,
+            loadend: p.skin.as_ref().and_then(|b| b.skin().loadend()),
+        })
+}
+
 /// What loading lifetime `lifetime` draws: the ordinary presentation while
 /// play's skin is not pending; else the staging answered for a request
 /// published in that lifetime, while it is the newest play request, on
@@ -6350,6 +6584,15 @@ fn presentation_of(
     } else {
         Presented::Placeholder
     }
+}
+
+/// Where a loading lifetime's text is prepared ([`Run::text_candidate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadingTarget {
+    /// The staging `token` names.
+    Staged(PreparedToken),
+    /// The installed skin.
+    Installed,
 }
 
 /// What a preparation or a load leaves drawn: the splash stays until what
@@ -6992,6 +7235,45 @@ struct Preparing {
     /// only at a boundary whose heavy-operation allowance admits it
     /// (design.md "Load Pipeline", one heavy operation a frame interval).
     taken: bool,
+    /// The early request whose staging it adopts at its first take,
+    /// until adopted.
+    adopts: Option<u64>,
+    /// It adopted an early staging: the loading frames draw that staging
+    /// until it answers.
+    adopted: bool,
+}
+
+/// A decided play's early request on the render thread (design.md
+/// "Screen Transitions and Loading"): from its receipt until an attempt
+/// adopts it or it is discarded, apart from [`Prepared`], which keeps the
+/// attempt's fields. It never commits.
+struct EarlyRecord {
+    request: u64,
+    /// The loading lifetime its request was published in.
+    lifetime: Option<u64>,
+    bundle: Arc<SkinBundle>,
+    /// The screen's device and target its staging was taken on.
+    device: u64,
+    target: [u32; 2],
+    /// The play skin selection in use at its receipt.
+    play_selection: u64,
+    /// Its ticket's reply, until answered: a lost device does not answer
+    /// it (its staging is restaged on the screen built again).
+    reply: Option<mpsc::SyncSender<Result<Answered, RenderError>>>,
+    /// The screen took its staging at a boundary.
+    taken: bool,
+    /// Its staging answered ready: its token.
+    answered: Option<PreparedToken>,
+}
+
+/// What the last presented frame of the decision screen was drawn by
+/// (design.md "Screen Transitions and Loading", hold eligibility).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecisionDrawnAs {
+    /// The decision skin.
+    Skin,
+    /// The built-in decision page (a takeover included).
+    BuiltIn,
 }
 
 /// How an attempt's preparation ended on the render thread, with the
@@ -7002,6 +7284,9 @@ pub struct Answered {
     pub preparation: Preparation,
     /// The screen's device, target size and play skin selection.
     pub screen: game::ScreenKey,
+    /// An early request's answer when the attempt adopted it: its staging
+    /// is the attempt's from then on.
+    pub adopted: bool,
 }
 
 /// The final readiness's answer ([`RenderMsg::Ready`]).
@@ -7166,6 +7451,10 @@ struct FirstFrame {
     lifetime: u64,
     shown_at: TimeUs,
     ended: bool,
+    /// The decision screen's last presented frame before it was drawn by
+    /// the decision skin: a pending first frame is drawn at once, not held
+    /// (design.md "Screen Transitions and Loading", hold eligibility).
+    after_skin: bool,
     /// A presented frame of the lifetime was drawn by the play skin: from
     /// then on its loading text is no longer waited for.
     skinned: bool,
@@ -7369,6 +7658,8 @@ impl<H: FnMut() -> bool> render::UploadGate for PassGate<'_, H> {
 enum Creation {
     /// Play's staging: the attempt's first take.
     Play,
+    /// A decided play's early staging: its first take.
+    Early,
     /// The result pages' begin.
     Pages,
     /// A result skin's selection: its staging's first take.
@@ -7737,6 +8028,15 @@ struct Run {
     requested: u64,
     /// The attempt's preparation not yet answered.
     attempt: Option<Preparing>,
+    /// A decided play's early request, until adopted or discarded.
+    early: Option<EarlyRecord>,
+    /// An early staging refused for its request, until it is discarded or
+    /// the next early request comes: an attempt adopting it is refused
+    /// with the reason, never staged afresh.
+    early_tombstone: Option<(u64, game::PreparationRefusal)>,
+    /// What the decision screen's last presented frame was drawn by, until
+    /// the next loading lifetime's first frame takes it.
+    decision_drawn: Option<DecisionDrawnAs>,
     /// The attempt's preparation answered ready and not yet committed.
     prepared: Option<Prepared>,
     /// The chart images' generation the tables below were checked in.
@@ -8256,6 +8556,8 @@ impl Run {
                         });
                     }
                     self.decision = Some(page.clone());
+                    // Another decision screen: nothing of it presented yet.
+                    self.decision_drawn = None;
                     // The presentation chosen at the choice is not checked
                     // again here: a later invalidation is a recovery or a
                     // takeover, never a retrospective revision.
@@ -8446,6 +8748,7 @@ impl Run {
                     attempt,
                     skin,
                     reply,
+                    adopts,
                 }) => {
                     #[cfg(test)]
                     {
@@ -8456,9 +8759,15 @@ impl Run {
                             std::thread::sleep(Duration::from_millis(1));
                         }
                     }
-                    self.turntable.begin_presentation();
-                    self.begin_attempt(request, lifetime, attempt, skin, reply);
-                    mode = self.after_preparing(mode);
+                    match attempt {
+                        // Nothing of a play: the decision screen draws on.
+                        AttemptPart::Early => self.begin_early(request, lifetime, skin, reply),
+                        AttemptPart::Full(attempt) => {
+                            self.turntable.begin_presentation();
+                            self.begin_attempt(request, lifetime, attempt, skin, reply, adopts);
+                            mode = self.after_preparing(mode);
+                        }
+                    }
                     continue;
                 }
                 Ok(RenderMsg::PlayState(state)) => {
@@ -8761,6 +9070,7 @@ impl Run {
             }
             self.allow_destruction(&mode);
             self.poll_attempt();
+            self.poll_early();
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
@@ -8824,6 +9134,7 @@ impl Run {
             // in this pass (design.md "Memory Budget", the uploader).
             if std::mem::take(&mut self.staged_seen) {
                 self.poll_attempt();
+                self.poll_early();
                 self.poll_select();
             }
             if self.screen.is_none() {
@@ -8917,6 +9228,7 @@ impl Run {
                             lifetime,
                             shown_at,
                             ended: false,
+                            after_skin: self.decision_drawn.take() == Some(DecisionDrawnAs::Skin),
                             skinned: false,
                             #[cfg(feature = "dev-tools")]
                             hold: None,
@@ -8927,12 +9239,33 @@ impl Run {
                     && (presentation_of(
                         &self.committed,
                         self.specialized_in,
-                        self.prepared.as_ref().map(Prepared::candidate),
+                        candidate_of(
+                            self.prepared.as_ref(),
+                            self.early.as_ref(),
+                            self.attempt.as_ref(),
+                            &**screen,
+                        ),
                         self.requested,
-                        (screen.staged_token(), screen.device()),
+                        (screen.staged_drawable(), screen.device()),
                         lifetime,
                     ) == Presented::Placeholder
                         || text_unsettled(first.skinned, &**screen));
+                // After a skinned decision the play skin's staging missed
+                // the reveal: the pending presentation draws at once.
+                if pending && first.after_skin {
+                    first.ended = true;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        let miss = if text_unsettled(first.skinned, &**screen) {
+                            "text"
+                        } else {
+                            "atlas"
+                        };
+                        println!("dev: early: miss {miss}");
+                    }
+                    self.first_frame = Some(first);
+                    continue;
+                }
                 if pending && screen.device_lost() {
                     // The screen's failure, as a frame's.
                     first.ended = true;
@@ -9336,6 +9669,9 @@ impl Run {
             // A decision frame that drew its page without a refusal (its
             // lifetime ended): the page mode takes the screen.
             let mut decision_fallback = false;
+            // The decision skin built this frame (a refused one draws the
+            // page in its place: built-in for the hold).
+            let mut decision_skin = false;
             // What a frame of the decision screen drew (dev-tools): the
             // page drawn for it is decided by its record; the skinned
             // screen's frame by its build below.
@@ -9571,9 +9907,14 @@ impl Run {
                         presentation_of(
                             &self.committed,
                             self.specialized_in,
-                            self.prepared.as_ref().map(Prepared::candidate),
+                            candidate_of(
+                                self.prepared.as_ref(),
+                                self.early.as_ref(),
+                                self.attempt.as_ref(),
+                                &**screen,
+                            ),
                             self.requested,
-                            (screen.staged_token(), screen.device()),
+                            (screen.staged_drawable(), screen.device()),
                             l,
                         )
                     });
@@ -10151,6 +10492,7 @@ impl Run {
                     }
                     match built {
                         crate::decision_side::DecisionDrawn::Built => {
+                            decision_skin = true;
                             // Faults due for this frame (dev-tools): an
                             // allocation before the submission, outside the
                             // counted build, and a frame drawn lost.
@@ -10495,6 +10837,18 @@ impl Run {
             if matches!(mode, Mode::Result) {
                 skin_frame = skin_built;
             }
+            if drawn.as_ref().is_ok_and(|(t, _)| t.presented()) {
+                match &mode {
+                    Mode::Decision if decision_skin => {
+                        self.decision_drawn = Some(DecisionDrawnAs::Skin);
+                    }
+                    Mode::Decision => self.decision_drawn = Some(DecisionDrawnAs::BuiltIn),
+                    Mode::Menu { loading: None, .. } if self.decision.is_some() => {
+                        self.decision_drawn = Some(DecisionDrawnAs::BuiltIn);
+                    }
+                    _ => {}
+                }
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -10759,6 +11113,14 @@ impl Run {
     /// the frame interval's allowance at its end (design.md "Load
     /// Pipeline", the device rebuild).
     fn screen_built(&mut self) {
+        // The early staging went with the screen: restaged under the same
+        // request on this one, through its room as any early staging, its
+        // ticket left open.
+        if let Some(r) = &mut self.early {
+            r.taken = false;
+            r.answered = None;
+            r.device = 0;
+        }
         if let Some(s) = &mut self.screen {
             // The page font the screen it replaces read, or was reading.
             if let Some(font) = self.page_font.take() {
@@ -11010,12 +11372,17 @@ impl Run {
 
     /// READY's cutoff asked (`word`): the loading text in hand is cancelled
     /// before the render thread can acknowledge it, by cutting off or by
-    /// marking itself waiting, so no upload is kept under it (design.md
-    /// "Scope of No Allocation").
+    /// marking itself waiting, and an early staging never adopted is
+    /// withdrawn, so no upload is kept under it (design.md "Scope of No
+    /// Allocation"; "Screen Transitions and Loading").
     fn settle_for_cutoff(&mut self, word: u32) {
-        if word & cutoff::ASKED != 0
-            && let Some(s) = &mut self.screen
-        {
+        if word & cutoff::ASKED == 0 {
+            return;
+        }
+        if self.early.is_some() {
+            self.drop_early();
+        }
+        if let Some(s) = &mut self.screen {
             s.drop_loading_text();
         }
     }
@@ -11049,12 +11416,15 @@ impl Run {
         if self.cut_off {
             return;
         }
-        // Not waiting with a loading text in hand: the game's swap would
-        // cut off over it, so its request is left to the render thread's
-        // own look, which settles the text first.
-        if self.screen.as_ref().is_some_and(|s| s.loading_text_held()) {
+        // Not waiting with a loading text in hand or an early staging
+        // kept: the game's swap would cut off over it, so its request is
+        // left to the render thread's own look, which settles them first.
+        let unsettled = |run: &Self| {
+            run.early.is_some() || run.screen.as_ref().is_some_and(|s| s.loading_text_held())
+        };
+        if unsettled(self) {
             self.settle_for_cutoff(self.shared.cutoff.load(Ordering::Acquire));
-            if self.screen.as_ref().is_some_and(|s| s.loading_text_held()) {
+            if unsettled(self) {
                 return;
             }
         }
@@ -11269,9 +11639,14 @@ impl Run {
         let pending = presentation_of(
             &self.committed,
             self.specialized_in,
-            self.prepared.as_ref().map(Prepared::candidate),
+            candidate_of(
+                self.prepared.as_ref(),
+                self.early.as_ref(),
+                self.attempt.as_ref(),
+                &**screen,
+            ),
             self.requested,
-            (screen.staged_token(), screen.device()),
+            (screen.staged_drawable(), screen.device()),
             *lifetime,
         ) == Presented::Placeholder
             || text_unsettled(skinned, &**screen);
@@ -11294,30 +11669,35 @@ impl Run {
         if self.cut_off || self.shared.cutoff.load(Ordering::Acquire) & cutoff::ASKED != 0 {
             return;
         }
-        let Mode::Menu {
-            loading: Some(lifetime),
-            update: Some(update),
-            ..
-        } = mode
-        else {
+        // The loading state's lifetime and newest state; while the decision
+        // screen draws, the held lifetime's, for its early staging only.
+        let (lifetime, revision, chart, decision) = match mode {
+            Mode::Menu {
+                loading: Some(lifetime),
+                update: Some(update),
+                ..
+            } => (*lifetime, update.revision, Arc::clone(&update.chart), false),
+            Mode::Decision | Mode::Menu { loading: None, .. } if self.decision.is_some() => {
+                let Some((lifetime, revision, chart)) = self.shared.loading_slot().held_peek()
+                else {
+                    return;
+                };
+                (lifetime, revision, chart, true)
+            }
+            _ => return,
+        };
+        let Some(screen) = self.screen.as_deref() else {
             return;
         };
-        let Some(screen) = &mut self.screen else {
-            return;
+        let on = match self.text_candidate(screen, lifetime) {
+            None => return,
+            Some(LoadingTarget::Staged(token)) => Some(token),
+            Some(LoadingTarget::Installed) if !decision => None,
+            Some(LoadingTarget::Installed) => return,
         };
-        let on = match presentation_of(
-            &self.committed,
-            self.specialized_in,
-            self.prepared.as_ref().map(Prepared::candidate),
-            self.requested,
-            (screen.staged_token(), screen.device()),
-            *lifetime,
-        ) {
-            Presented::Placeholder => return,
-            Presented::Staged { token, .. } => Some(token),
-            Presented::Ordinary | Presented::Committed => None,
-        };
-        screen.loading_text(*lifetime, update.revision, &update.chart, on);
+        if let Some(screen) = self.screen.as_deref_mut() {
+            screen.loading_text(lifetime, revision, &chart, on);
+        }
     }
 
     /// Whether the loading hold shown at `shown_at` has reached its bound
@@ -11573,6 +11953,12 @@ impl Run {
                     self.poll_attempt();
                     self.creation_answered = self.attempt.is_none();
                 }
+                Creation::Early => {
+                    if let Some(r) = &mut self.early {
+                        r.taken = true;
+                    }
+                    self.poll_early();
+                }
                 Creation::Pages => {
                     if let Some((ticket, pages, reply)) = self.pages_owed.take() {
                         self.begin_pages(ticket, &pages, reply);
@@ -11614,7 +12000,7 @@ impl Run {
             #[cfg(test)]
             self.note_heavy_record(HeavyRec {
                 kind: match c {
-                    Creation::Play => HeavyKind::PlayCreation,
+                    Creation::Play | Creation::Early => HeavyKind::PlayCreation,
                     Creation::Pages => HeavyKind::PagesCreation,
                     Creation::Select => HeavyKind::SelectCreation,
                     Creation::ResultView => HeavyKind::ResultCreation,
@@ -11775,9 +12161,262 @@ impl Run {
 
     /// The creation owed to the boundary's allowance, if any: play's
     /// staging not yet taken, else a result pages begin.
+    fn begin_early(
+        &mut self,
+        request: u64,
+        lifetime: Option<u64>,
+        skin: AttemptSkin,
+        reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+    ) {
+        let AttemptSkin::Specialized(bundle) = skin else {
+            let _ = reply.send(Ok(
+                self.answered(refusal("an early request stages a specialization"))
+            ));
+            return;
+        };
+        if !self.newest(request) {
+            let _ = reply.send(Ok(self.answered(refusal("a newer request superseded it"))));
+            return;
+        }
+        self.supersede_attempts("a newer request superseded it");
+        self.drop_early();
+        self.early_tombstone = None;
+        self.early = Some(EarlyRecord {
+            request,
+            lifetime,
+            bundle,
+            device: 0,
+            target: [0, 0],
+            play_selection: self.play_selection,
+            reply: Some(reply),
+            taken: false,
+            answered: None,
+        });
+        self.poll_early();
+    }
+
+    /// Serves the early staging (design.md "Screen Transitions and
+    /// Loading"): before its take, the result's release it needs, made
+    /// with no destruction, or its refusal; once taken, its steps' answer.
+    /// A lost device answers nothing: the record stays, restaged on the
+    /// screen built again.
+    fn poll_early(&mut self) {
+        let (Some(r), Some(screen)) = (&mut self.early, &mut self.screen) else {
+            return;
+        };
+        if !r.taken {
+            match screen.early_room(&r.bundle) {
+                render::EarlyRoom::Release => {
+                    let request = r.request;
+                    match screen.release_result_deferred(&r.bundle) {
+                        Ok(()) => {
+                            crate::render_report::report(format_args!(
+                                "render: the early staging released the result's installation for request {request}"
+                            ));
+                            self.released = Some(request);
+                            self.reconcile_result();
+                        }
+                        Err(e) if e.is_refusal() => self.refuse_early(game::Chain(&e).to_string()),
+                        Err(_) => self.lose_early_screen(),
+                    }
+                }
+                render::EarlyRoom::Refused => {
+                    let why = render::RenderError::Admission {
+                        kind: ScreenKind::Play,
+                        needed: 0,
+                        limit: render::SHARED_TEXELS,
+                    };
+                    self.refuse_early(game::Chain(&why).to_string());
+                }
+                render::EarlyRoom::Fits | render::EarlyRoom::Wait => {}
+            }
+            return;
+        }
+        if r.answered.is_some() {
+            return;
+        }
+        if r.device == 0 {
+            r.device = screen.device();
+            r.target = screen.target();
+        }
+        match screen.stage_early(&r.bundle, r.request) {
+            Ok(Some(token)) => {
+                r.answered = Some(token);
+                let reply = r.reply.take();
+                let answer = Answered {
+                    preparation: Preparation::Ready,
+                    screen: game::ScreenKey {
+                        device: r.device,
+                        target: r.target,
+                        skin: r.play_selection,
+                    },
+                    adopted: false,
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(answer));
+                }
+            }
+            Ok(None) => {}
+            Err(e) if e.is_refusal() => self.refuse_early(game::Chain(&e).to_string()),
+            Err(_) => self.lose_early_screen(),
+        }
+    }
+
+    /// The early staging's device failed: no refusal, its ticket left
+    /// open, the screen dropped to be built again, where it is restaged.
+    fn lose_early_screen(&mut self) {
+        if let Some(r) = &mut self.early {
+            r.taken = false;
+            r.answered = None;
+            r.device = 0;
+        }
+        self.drop_screen();
+        self.granted = false;
+    }
+
+    /// The early staging refused for `why`, a genuine refusal: its record
+    /// dropped with what it staged, its ticket answered if open, and the
+    /// refusal published for the early gate and kept as the request's
+    /// tombstone, so no attempt adopting it stages afresh.
+    fn refuse_early(&mut self, why: String) {
+        let Some(r) = self.early.take() else {
+            return;
+        };
+        if let Some(screen) = &mut self.screen {
+            screen.discard_token(attempt_token(r.request, screen.device()));
+        }
+        let refused = game::PreparationRefusal {
+            location: None,
+            reason: why,
+        };
+        crate::render_report::report(format_args!(
+            "render: the early staging of request {} was refused: {}",
+            r.request, refused.reason
+        ));
+        if let Some(reply) = r.reply {
+            let _ = reply.send(Ok(self.answered(Preparation::Refused(refused.clone()))));
+        }
+        *self
+            .shared
+            .early_refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((r.request, refused.clone()));
+        self.early_tombstone = Some((r.request, refused));
+    }
+
+    /// The early record dropped, with what it staged.
+    fn drop_early(&mut self) {
+        if let Some(r) = self.early.take()
+            && let Some(screen) = &mut self.screen
+        {
+            screen.discard_token(attempt_token(r.request, screen.device()));
+        }
+    }
+
+    /// The early request `early` taken by the attempt of `request`
+    /// (`lifetime`, `skin`): whether its staging is adopted (taken, still
+    /// held, of the same lifetime, bundle, device, target and play
+    /// selection); otherwise a staging of its own is dropped and the
+    /// attempt stages afresh. Either way its ticket, if open, is answered
+    /// adopted, and a release it made follows to the attempt's request.
+    ///
+    /// # Errors
+    ///
+    /// The early staging's refusal kept for it: the attempt is refused.
+    fn promote(
+        &mut self,
+        early: u64,
+        request: u64,
+        lifetime: Option<u64>,
+        skin: &AttemptSkin,
+    ) -> Result<bool, game::PreparationRefusal> {
+        if let Some((_, refused)) = self.early_tombstone.as_ref().filter(|(r, _)| *r == early) {
+            return Err(refused.clone());
+        }
+        // The release follows the lifetime, promoted or staged afresh.
+        if self.released == Some(early) {
+            self.released = Some(request);
+            self.reconcile_result();
+        }
+        let Some(mut r) = self.early.take_if(|r| r.request == early) else {
+            return Ok(false);
+        };
+        let fits = self.screen.as_ref().is_some_and(|screen| {
+            r.taken
+                && screen.staged_any().is_some_and(|t| t.request == early)
+                && r.lifetime == lifetime
+                && matches!(skin, AttemptSkin::Specialized(b) if Arc::ptr_eq(b, &r.bundle))
+                && r.device == screen.device()
+                && r.target == screen.target()
+                && r.play_selection == self.play_selection
+        });
+        if let Some(reply) = r.reply.take() {
+            let mut answer = self.answered(Preparation::Ready);
+            answer.adopted = true;
+            let _ = reply.send(Ok(answer));
+        }
+        if !fits && let Some(screen) = &mut self.screen {
+            screen.discard_token(attempt_token(early, screen.device()));
+        }
+        Ok(fits)
+    }
+
+    /// The installation loading lifetime `lifetime`'s text is prepared for
+    /// (design.md "Screen Transitions and Loading", text and first-frame
+    /// readiness): the lifetime's current staging, the early one or the
+    /// attempt's, ready or still stepping, whatever draws; else, as the
+    /// frame draws it, a staging or the installed skin; none for the
+    /// pending presentation. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn text_candidate(&self, screen: &dyn Screen, lifetime: u64) -> Option<LoadingTarget> {
+        if self.committed.pending(ScreenKind::Play)
+            && let Some(t) = screen.staged_any().filter(|t| t.device == screen.device())
+        {
+            let early = self
+                .early
+                .as_ref()
+                .is_some_and(|r| r.request == t.request && r.lifetime == Some(lifetime));
+            let attempt = self
+                .attempt
+                .as_ref()
+                .is_some_and(|p| p.request == t.request && p.lifetime == Some(lifetime));
+            if early || attempt {
+                return Some(LoadingTarget::Staged(t));
+            }
+        }
+        let presented = presentation_of(
+            &self.committed,
+            self.specialized_in,
+            candidate_of(
+                self.prepared.as_ref(),
+                self.early.as_ref(),
+                self.attempt.as_ref(),
+                screen,
+            ),
+            self.requested,
+            (screen.staged_drawable(), screen.device()),
+            lifetime,
+        );
+        match presented {
+            Presented::Placeholder => None,
+            Presented::Staged { token, .. } => Some(LoadingTarget::Staged(token)),
+            Presented::Ordinary | Presented::Committed => Some(LoadingTarget::Installed),
+        }
+    }
+
     fn creation_owed(&self) -> Option<Creation> {
         if self.attempt.as_ref().is_some_and(|p| !p.taken) {
             Some(Creation::Play)
+        } else if self.early.as_ref().is_some_and(|r| {
+            // Owed once it fits with no destruction in its call: until then
+            // the boundaries' retirement path frees the room it needs.
+            !r.taken
+                && self
+                    .screen
+                    .as_ref()
+                    .is_some_and(|sc| sc.early_room(&r.bundle) == render::EarlyRoom::Fits)
+        }) {
+            Some(Creation::Early)
         } else if self.pages_owed.is_some() {
             Some(Creation::Pages)
         } else if self.select_hand.as_ref().is_some_and(|h| !h.taken) {
@@ -11888,6 +12527,7 @@ impl Run {
         attempt: Box<AttemptContext>,
         skin: AttemptSkin,
         reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+        adopts: Option<u64>,
     ) {
         #[cfg(test)]
         snapshot_waits(&self.shared, 0);
@@ -11896,6 +12536,19 @@ impl Run {
             let _ = reply.send(Ok(self.answered(refusal("a newer request superseded it"))));
             return;
         }
+        // The early request it adopts, before anything is superseded: its
+        // staging is the attempt's when it still fits; a refused one ends
+        // the attempt with its reason.
+        let adopted = match adopts {
+            Some(early) => match self.promote(early, request, lifetime, &skin) {
+                Ok(adopted) => adopted,
+                Err(refused) => {
+                    let _ = reply.send(Ok(self.answered(Preparation::Refused(refused))));
+                    return;
+                }
+            },
+            None => false,
+        };
         // An older preparation, answered or not, and whatever it staged.
         self.supersede_attempts("a newer request superseded it");
         let skin = match skin {
@@ -11914,7 +12567,10 @@ impl Run {
             attempt,
             skin,
             reply,
-            taken: false,
+            // An adoption needs no creation: taken at once.
+            taken: adopted,
+            adopts: adopted.then_some(adopts).flatten(),
+            adopted: false,
         };
         if let Err(e) = self.recover() {
             let _ = p.reply.send(Err(e));
@@ -11966,6 +12622,28 @@ impl Run {
         // Its first take waits for the boundary's allowance.
         if !p.taken {
             return;
+        }
+        // The early staging adopted in place, its writes going on.
+        if let Some(early) = p.adopts.take() {
+            match screen.adopt_attempt(early, p.request, &a) {
+                Ok(true) => p.adopted = true,
+                // It no longer holds that staging: staged afresh, taken at
+                // a boundary.
+                Ok(false) => {
+                    p.taken = false;
+                    return;
+                }
+                Err(e) if e.is_refusal() => {
+                    self.answer(Ok(refusal(game::Chain(&e).to_string())));
+                    return;
+                }
+                Err(e) => {
+                    self.drop_screen();
+                    self.granted = false;
+                    self.answer(Err(e));
+                    return;
+                }
+            }
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
@@ -12050,6 +12728,7 @@ impl Run {
         Answered {
             preparation,
             screen,
+            adopted: false,
         }
     }
 
@@ -13162,6 +13841,16 @@ impl Run {
     /// Drops the preparation of `request`, in progress or answered, unless
     /// committed: what it staged never installs.
     fn discard(&mut self, request: u64) {
+        if self.early.as_ref().is_some_and(|r| r.request == request) {
+            self.drop_early();
+        }
+        if self
+            .early_tombstone
+            .as_ref()
+            .is_some_and(|(r, _)| *r == request)
+        {
+            self.early_tombstone = None;
+        }
         if self.attempt.as_ref().is_some_and(|p| p.request == request) {
             self.attempt = None;
             if let Some(screen) = &mut self.screen {
@@ -18218,6 +18907,34 @@ pub(crate) mod tests {
         drop(control);
     }
 
+    /// The held lifetime's peek, which the decision screen's loading text
+    /// pass reads each pass (design.md "Screen Transitions and Loading"),
+    /// allocates and frees nothing. A vector made inside the same window
+    /// is counted (the control).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn held_peek_alloc() {
+        use crate::alloc_count::{this_thread, this_thread_frees};
+
+        let (_chart, _screens, link) = pending_link();
+        link.begin_loading_held(&chosen("T"), None);
+        link.loading().show(one_line("loading"));
+        let lifetime = link.loading_lifetime();
+        let (before, freed) = (this_thread(), this_thread_frees());
+        let peek = link.shared.loading_slot().held_peek();
+        let held = peek.as_ref().map(|(l, _, c)| (*l, c.title.is_some()));
+        drop(peek);
+        assert_eq!(
+            (this_thread() - before, this_thread_frees() - freed),
+            (0, 0)
+        );
+        assert_eq!(held, Some((lifetime, true)));
+        let control = std::hint::black_box(vec![0_u8; 16]);
+        assert_eq!(this_thread() - before, 1);
+        drop(control);
+        link.exit();
+    }
+
     /// V6b (design.md "Scope of No Allocation"; "State Model", system
     /// sounds, Result): the render thread's acknowledgement of a Result
     /// entry's first picture, its wake of the game thread, again for a
@@ -20972,6 +21689,10 @@ pub(crate) mod tests {
     /// What an [`Installer`] was asked, in order.
     type Log = Arc<std::sync::Mutex<Vec<String>>>;
 
+    /// Each loading text an [`Installer`] was asked: its lifetime and the
+    /// staging's request it is for.
+    pub(crate) type TextsAsked = Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>;
+
     /// A screen that stages a declarative skin's installation as the
     /// renderer does, noting each step with its device: a preparation
     /// answered (`prepare` with its request, the context's scratch side
@@ -21553,6 +22274,93 @@ pub(crate) mod tests {
         fn staged_token(&self) -> Option<render::PreparedToken> {
             self.staged_token
         }
+        fn staged_any(&self) -> Option<render::PreparedToken> {
+            self.staged_token
+        }
+        fn staged_drawable(&self) -> Option<render::PreparedToken> {
+            self.staged_token.filter(|t| self.held != Some(t.request))
+        }
+        fn loading_text(
+            &mut self,
+            lifetime: u64,
+            _revision: u64,
+            _chart: &Arc<crate::loading_text::ChosenChart>,
+            on: Option<render::PreparedToken>,
+        ) {
+            let mut texts = self.shared.texts.lock().unwrap();
+            if texts.len() < texts.capacity() {
+                texts.push((lifetime, on.map(|t| t.request)));
+            }
+        }
+        fn text_settled(&self) -> bool {
+            !self.shared.text_unsettled.load(Ordering::Acquire)
+        }
+        fn stage_early(
+            &mut self,
+            bundle: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Result<Option<render::PreparedToken>, RenderError> {
+            if self.shared.refuse_early.load(Ordering::Acquire) {
+                self.note(&format!("refuse early {request}"));
+                return Err(RenderError::Skin(render::SkinError {
+                    reason: "early refused (test)".to_owned(),
+                }));
+            }
+            let hold = self.shared.hold_staged.load(Ordering::Acquire) == request;
+            if self.staged_token.is_none_or(|t| t.request != request) {
+                self.note(&format!("early {request}"));
+                self.staged = Some((
+                    ScreenKind::Play,
+                    render::Installation::new(Arc::clone(bundle)),
+                ));
+                *self.shared.staging.lock().unwrap() = Some(Arc::clone(bundle));
+                self.staged_token = Some(render::PreparedToken {
+                    request,
+                    device: self.device,
+                    kind: ScreenKind::Play,
+                });
+            }
+            if hold {
+                self.held = Some(request);
+                return Ok(None);
+            }
+            self.held = None;
+            Ok(self.staged_token)
+        }
+        fn early_room(&self, _bundle: &Arc<render::SkinBundle>) -> render::EarlyRoom {
+            match self.shared.early_room.load(Ordering::Acquire) {
+                1 => render::EarlyRoom::Wait,
+                2 => render::EarlyRoom::Release,
+                3 => render::EarlyRoom::Refused,
+                _ => render::EarlyRoom::Fits,
+            }
+        }
+        fn release_result_deferred(
+            &mut self,
+            _bundle: &render::SkinBundle,
+        ) -> Result<(), RenderError> {
+            self.note("release");
+            self.shared.early_room.store(1, Ordering::Release);
+            Ok(())
+        }
+        fn adopt_attempt(
+            &mut self,
+            early: u64,
+            request: u64,
+            _a: &render::AttemptInput<'_>,
+        ) -> Result<bool, RenderError> {
+            match self.staged_token {
+                Some(t) if t.request == early => {
+                    self.note(&format!("adopt {early} {request}"));
+                    self.staged_token = Some(render::PreparedToken { request, ..t });
+                    if self.held == Some(early) {
+                        self.held = None;
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
         fn pending_loading(
             &mut self,
             _page: &crate::menu_screen::MenuPage,
@@ -21745,6 +22553,18 @@ pub(crate) mod tests {
         /// and the boundaries so far.
         pub(crate) slice_us: Arc<AtomicU64>,
         pub(crate) slice_boundaries: Arc<AtomicU64>,
+        /// What an early staging's room answers: 0 fits, 1 waits, 2 the
+        /// result's release first (then it waits), 3 refused.
+        pub(crate) early_room: Arc<std::sync::atomic::AtomicU8>,
+        /// Early stagings are refused as a skin refuses them while set.
+        pub(crate) refuse_early: Arc<AtomicBool>,
+        /// Each loading text asked: its lifetime and the staging's request
+        /// it is for (none: the installed skin); noted only while the
+        /// vector has room (a test reserves it), so noting never
+        /// allocates.
+        pub(crate) texts: TextsAsked,
+        /// The loading text is not settled while set.
+        pub(crate) text_unsettled: Arc<AtomicBool>,
     }
 
     /// One selection frame as an [`Installer`] saw it.
@@ -22061,9 +22881,10 @@ pub(crate) mod tests {
             link.send(RenderMsg::PrepareAttempt {
                 request,
                 lifetime: None,
-                attempt: Box::new(titled(&chart)),
+                attempt: super::AttemptPart::Full(Box::new(titled(&chart))),
                 skin: super::AttemptSkin::Specialized(Arc::clone(&held)),
                 reply,
+                adopts: None,
             });
             assert!(wait_until(|| screens.staging.lock().unwrap().is_some()));
             if next_in_use {
@@ -24406,9 +25227,10 @@ pub(crate) mod tests {
         link.send(RenderMsg::PrepareAttempt {
             request: 2,
             lifetime: None,
-            attempt: Box::new(titled(&chart)),
+            attempt: super::AttemptPart::Full(Box::new(titled(&chart))),
             skin: super::AttemptSkin::InUse,
             reply,
+            adopts: None,
         });
         let answer = rx.recv().unwrap().unwrap();
         assert!(
@@ -26754,6 +27576,10 @@ pub(crate) mod tests {
     // presentation, and the validity of the image it holds.
     #[cfg(feature = "dev-tools")]
     mod first_frame;
+    // A decided play's early request: staged, adopted or dropped,
+    // restaged, refused, withdrawn and settled at READY's cutoff.
+    #[cfg(feature = "dev-tools")]
+    mod early;
     // The retirement worker's places in the result's report, and READY's
     // cutoff.
     #[cfg(feature = "dev-tools")]

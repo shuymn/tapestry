@@ -226,6 +226,9 @@ pub struct PlayerRig<'a> {
     /// entry, begun once its chart is read, and taken by the attempt's
     /// preparation, or ended when the choice is left.
     pub early: Option<early::EarlyPrep>,
+    /// The early request handed to the attempt's preparation, until its
+    /// request is sent adopting it.
+    pub early_handoff: Option<early::Handoff>,
     /// The early preparation's admission reads the host's headroom here
     /// ([`crate::priority::System`]; a test's double).
     pub machine: &'static (dyn crate::priority::Machine + Sync),
@@ -877,10 +880,25 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::loop_probe::mark("att:send", 0);
         prep.staging = Instant::now();
-        let stage = PrepStage::Screen(self.render.begin_attempt(attempt, skin));
+        // The early request it adopts; a refusal of its staging published
+        // since the reveal ends the attempt with its reason at once (the
+        // render thread reported it).
+        let handoff = self.early_handoff.take();
+        if let Some(h) = &handoff
+            && let Some(refusal) = self.render.early_refused(h.request)
+        {
+            return PrepStage::Ended(Preparation::Refused(refusal));
+        }
+        let adopts = handoff.as_ref().map(|h| h.request);
+        let pending = self.render.begin_adopting(attempt, skin, adopts);
+        let request = pending.request();
+        let stage = PrepStage::Screen(pending);
+        // Its ticket goes once the attempt's request is out: the early
+        // request's discard, if any, comes after the adoption.
+        drop(handoff);
         // After its PrepareAttempt, so play's admission comes first on the
         // render thread.
-        self.begin_pages_ticket();
+        self.begin_pages_ticket([Some(request), adopts]);
         stage
     }
 
@@ -888,10 +906,16 @@ impl PlayerRig<'_> {
     /// the result pages upload, §5.1's step 3): begun when the attempt's
     /// result names pages whose atlas the result status does not name as
     /// installed; an earlier ticket is withdrawn first.
-    fn begin_pages_ticket(&mut self) {
+    fn begin_pages_ticket(&mut self, requests: [Option<u64>; 2]) {
         self.pages_ticket = None;
         let status = self.render.result_status();
         if status.disabled.is_some() {
+            return;
+        }
+        // The early staging released the result for this lifetime, under
+        // the early request or, followed, the attempt's: no pages upload
+        // begins before the result's step reconciles the release.
+        if status.released.is_some_and(|r| requests.contains(&Some(r))) {
             return;
         }
         let Some(crate::result_skin::Upload::Pages(pages)) = self.result_skin.upload() else {

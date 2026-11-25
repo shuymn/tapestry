@@ -42,7 +42,8 @@ const MARK_AT: (u32, u32) = (1_220, 540);
 /// The chart image's destination in a Lua skin.
 const CHART_DST: &str = "{ id = -100, dst = { { x = 100, y = 340, w = 400, h = 400 } } }";
 /// The mark's destination in a Lua skin.
-const MARK_DST: &str = "{ id = \"mark\", dst = { { x = 1200, y = 520, w = 40, h = 40 } } }";
+pub(super) const MARK_DST: &str =
+    "{ id = \"mark\", dst = { { x = 1200, y = 520, w = 40, h = 40 } } }";
 
 /// What the frames read back at [`CHART_AT`] and [`MARK_AT`] while armed.
 #[derive(Clone, Default)]
@@ -209,7 +210,7 @@ pub(super) fn chart(rgb: Option<[u8; 3]>) -> (tempfile::TempDir, game::Loaded) {
 
 /// A Lua result skin in `s.luaskin` running `pre` and placing `places`,
 /// its mark image `m.png` of [`MARK`] beside it.
-fn lua_result(pre: &str, places: &str) -> tempfile::TempDir {
+pub(super) fn lua_result(pre: &str, places: &str) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     png(d.path(), "m.png", MARK);
     std::fs::write(

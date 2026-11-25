@@ -4221,10 +4221,14 @@ impl AppRig for PlayerRig<'_> {
             && self.pending.is_some()
             && let Some(lifetime) = d.lifetime()
         {
-            self.early = Some(crate::play::early::EarlyPrep::new(
-                crate::play::early::EarlyGate::new(self.render.early_refusal()),
-                lifetime.0,
-            ));
+            let link = crate::play::early::EarlyLink::new(self.render.early_sender());
+            self.early = Some(
+                crate::play::early::EarlyPrep::new(
+                    crate::play::early::EarlyGate::new(self.render.early_refusal()),
+                    lifetime.0,
+                )
+                .with_link(link),
+            );
         }
         // The attempt's entry last: its fence waits on the input thread with
         // the screen and its sound already out, serving the decision screen

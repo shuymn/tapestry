@@ -35,6 +35,8 @@ extern crate self as render;
 #[cfg(test)]
 mod admission_tests;
 #[cfg(test)]
+mod early_tests;
+#[cfg(test)]
 #[path = "../tests/font_support/mod.rs"]
 mod font_support;
 #[cfg(test)]
@@ -113,9 +115,9 @@ pub use renderer::UploadTiming;
 pub use renderer::take_build_start;
 pub use renderer::{
     Admission, ChartOutcome, ChartTarget, ChartUpload, Class, CommitError, CpuParts, Destroyed,
-    Destruction, FrameOutcome, FrameTiming, GrantProbe, GrantWait, Handoff, HeavyOps, LoadingOn,
-    LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness, PagesBegun, PagesStep, Part,
-    PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError,
+    Destruction, EarlyRoom, FrameOutcome, FrameTiming, GrantProbe, GrantWait, Handoff, HeavyOps,
+    LoadingOn, LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness, PagesBegun, PagesStep,
+    Part, PreparedToken, RESULT_STRIP_SPRITES, RETAINED_ATLASES, RETIREMENT_ENTRIES, RenderError,
     Renderer, ResultChartBegin, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, TextDone,
     TextFault, VM_TEXELS, letterbox,
 };
