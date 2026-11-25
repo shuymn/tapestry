@@ -531,6 +531,24 @@ fn observe_lost(why: Loss, chart: bool, at: Option<i64>) {
     }
 }
 
+/// The launch gate (dev-tools): while the file `TAPESTRY_DEV_LAUNCH_GATE`
+/// names exists, the worker's launch waits on its own thread, at most a
+/// minute, before the launch takes anything the user's other launches
+/// share ([`super::launch::Launches`]). A scenario keeps its own game's
+/// launch past a screen's preparation deadline with it, and an ended game
+/// leaves nothing held.
+#[cfg(feature = "dev-tools")]
+fn launch_gate() {
+    let Some(gate) = std::env::var_os("TAPESTRY_DEV_LAUNCH_GATE") else {
+        return;
+    };
+    let gate = std::path::Path::new(&gate);
+    let begun = Instant::now();
+    while gate.exists() && begun.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Tells the observer, if any, of load stage `name` of load `load`.
 #[cfg(feature = "dev-tools")]
 fn observe_stage(name: &'static str, load: u64) {
@@ -1169,6 +1187,8 @@ impl Supervisor {
         let spawned = std::thread::Builder::new()
             .name("media worker launch".to_owned())
             .spawn(move || {
+                #[cfg(feature = "dev-tools")]
+                launch_gate();
                 let launched =
                     Worker::launch(&launching.installation, &launching.data, &launching.setup);
                 let _ = tx.send(Inner::Launched(launched));

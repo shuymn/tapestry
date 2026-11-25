@@ -4,8 +4,6 @@
 
 #![cfg(feature = "dev-tools")]
 
-mod media_support;
-
 use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,7 +13,6 @@ use bms_model::TimeUs;
 use eval::{InputStart, PhysicalInputEvent};
 use game::DeviceSettings;
 use input::DeviceKind;
-use media_support::media_host::launch::Launches;
 use replay::{
     BuildProvenance, ChartRecord, DecodeLimits, DeviceRecord, EndStatus, PlayRecord, PlayType,
     PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
@@ -5201,17 +5198,35 @@ fn game_time_of(stdout: &str, qpc: i64) -> i64 {
 }
 
 /// Waits up to `limit` for the capture `name` in `dir` to be written whole
-/// (its JSON, written after its PNG, ending its line); when it is, the
+/// (its JSON, written after its PNG, ending its line) by the game process
+/// `game`, failing at once when the game has ended first; when it is, the
 /// time it was seen.
-fn written(dir: &Path, name: &str, limit: std::time::Duration) -> std::time::Instant {
+fn written(dir: &Path, name: &str, limit: std::time::Duration, game: u32) -> std::time::Instant {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: a handle to the game's process, closed below; a game already
+    // gone fails here.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, game) }
+        .unwrap_or_else(|e| panic!("{name} not written: the game is gone ({e})"));
     let begun = std::time::Instant::now();
-    loop {
+    let seen = loop {
         if fs::read_to_string(dir.join(format!("{name}.json"))).is_ok_and(|s| s.ends_with('\n')) {
-            return std::time::Instant::now();
+            break Ok(std::time::Instant::now());
         }
-        assert!(begun.elapsed() < limit, "{name} not written");
+        // SAFETY: the handle opened above, polled without waiting.
+        if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
+            break Err("the game ended first");
+        }
+        if begun.elapsed() >= limit {
+            break Err("past the limit");
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    };
+    // SAFETY: the handle opened above, closed once.
+    unsafe { CloseHandle(process) }.unwrap();
+    seen.unwrap_or_else(|why| panic!("{name} not written: {why}"))
 }
 
 impl Fixture {
@@ -5352,10 +5367,11 @@ fn warmed_scenario(
 /// A chart's coded base video plays on chart time through the media worker
 /// (design.md "Rendering and Skins", BGA), on the chart's second play: each
 /// capture shows the frame due at its chart time, the green block of the
-/// layer picture over it. The first play's launch waits on the launches'
-/// mutex, held until that play has begun, so its videos are lost at its
-/// preparation deadline and its panel draws black; the launch then
-/// completes and the session keeps the worker for the second play.
+/// layer picture over it. The first play's launch waits at the game's
+/// launch gate (dev-tools), shut until that play has begun, so its videos
+/// are lost at its preparation deadline and its panel draws black; the
+/// launch then completes and the session keeps the worker for the second
+/// play.
 /// The worker is then crashed after a capture read back so (design.md
 /// "Threat Model" T02): the session sees it, from the call that ended it,
 /// within its tick and an allowance, before the render side draws it, and
@@ -5390,17 +5406,20 @@ fn a_chart_video_plays_and_a_crash_blacks_its_panel() {
     );
     let dir = fx.base.join("out");
     let mut killed = None;
-    // Another launch holds the launches' mutex until the first play has
-    // begun.
-    let held = Launches::hold().unwrap();
+    // The game's launch gate, shut until the first play has begun: a file
+    // of this run's own, so nothing another process waits on is held.
+    let gate = fx.base.join("launch.gate");
+    fs::write(&gate, b"").unwrap();
     let (out, stdout, stderr) = fx.run_during(
-        fx.command(&text).env("TAPESTRY_LOOP_PROBE", "1"),
+        fx.command(&text)
+            .env("TAPESTRY_LOOP_PROBE", "1")
+            .env("TAPESTRY_DEV_LAUNCH_GATE", &gate),
         RUN_LIMIT,
         |game| {
-            written(&dir, "warm", RUN_LIMIT);
-            drop(held);
+            written(&dir, "warm", RUN_LIMIT, game);
+            fs::remove_file(&gate).unwrap();
             let name = format!("c{KILL_AFTER}");
-            written(&dir, &name, RUN_LIMIT);
+            written(&dir, &name, RUN_LIMIT, game);
             let px = rgb(&dir.join(format!("{name}.png")));
             let due = due_frame(chart_us(&dir, &name), 10).unwrap();
             let got = coded_index(&px, 7);
