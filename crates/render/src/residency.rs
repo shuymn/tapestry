@@ -19,6 +19,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bms_model::TimeUs;
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7, D3D12_FENCE_FLAG_NONE,
     D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, D3D12_HEAP_FLAGS,
@@ -32,12 +33,14 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
 };
-use windows::core::Interface;
+use windows::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExW};
+use windows::core::{Interface, w};
 
 /// How long a ticket may take from its request to its array's import
-/// before it is answered with a timeout (`plans/limits-register.md`):
-/// about 54 times the longest request-to-ready time measured (37 ms for a
-/// 1.33 GB array), well inside the load's own bound.
+/// before it is answered with a timeout (design.md "Screen Transitions and
+/// Loading", the frame-budgeted uploads): about 54 times the longest
+/// request-to-ready time measured (37 ms for a 1.33 GB array), well inside
+/// the load's own bound.
 pub const CREATE_BOUND: TimeUs = TimeUs(2_000_000);
 
 /// The fence value a removed device reads: reserved, never signalled.
@@ -486,6 +489,9 @@ pub(crate) fn path(device: &wgpu::Device, adapter: Option<IDXGIAdapter3>) -> Pat
     let Some(device3) = device3 else {
         return Path::Sync("no ID3D12Device3");
     };
+    if !pin_libraries() {
+        return Path::Sync("d3d12.dll or dxgi.dll not pinned");
+    }
     // SAFETY: a fence made on the live device.
     let Ok(fence) = (unsafe { raw.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }) else {
         return Path::Sync("no residency fence");
@@ -501,6 +507,21 @@ pub(crate) fn path(device: &wgpu::Device, adapter: Option<IDXGIAdapter3>) -> Pat
         fence: shared,
         adapter,
     }))
+}
+
+/// Keeps `d3d12.dll` and `dxgi.dll` loaded until the process ends, as a
+/// program linked to them keeps them. `wgpu` loads both at run time and
+/// unloads them with its last instance, but this path's device, fence and
+/// adapter references and the arrays in a `ResidencyHolder` outlive the
+/// renderer: released after the unload, each `Release` would call into
+/// unmapped code.
+fn pin_libraries() -> bool {
+    [w!("d3d12.dll"), w!("dxgi.dll")].into_iter().all(|name| {
+        let mut module = HMODULE::default();
+        // SAFETY: a lookup of a module `wgpu` has loaded, by a static name,
+        // into a local; pinning only adds a reference the process keeps.
+        unsafe { GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, name, &raw mut module) }.is_ok()
+    })
 }
 
 /// A D3D12 fence and its device.

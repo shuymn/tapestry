@@ -187,6 +187,30 @@ fn a_real_request_returns_before_residency() {
     assert_eq!(colour(&mut r), [255, 0, 0]);
 }
 
+/// On the device's path, a request in flight when its renderer is dropped
+/// is handed to the holder, and the holder released after the renderer and
+/// its `wgpu` instance releases the array, the fence and the device with no
+/// call into an unloaded library. Only a release build shows the fault: a
+/// debug build's `wgpu` instance turns on the D3D12 debug layer, which keeps
+/// the libraries loaded.
+#[test]
+fn the_device_path_outlives_its_renderer() {
+    let holder = ResidencyHolder::default();
+    let mut r = offscreen(W, H);
+    r.use_device_path();
+    r.set_residency_holder(holder.clone());
+    let b = tiny(&r, RED);
+    let first = stage(&mut r, &b, 1).unwrap();
+    let asynchronous = r.array_creation().0 != "sync";
+    drop(b);
+    drop(r);
+    if asynchronous {
+        assert_eq!(first, None);
+        assert_eq!(holder.pending(), 1, "the request handed to the holder");
+    }
+    drop(holder);
+}
+
 /// S-R2: while a creation's fence is held, frames are presented and each
 /// boundary polls without waiting.
 #[test]
