@@ -1108,3 +1108,50 @@ fn loading_frames_draw_the_movies_on_either_installation() {
     assert!(t.presented());
     assert_movies(&read_back(&r), "staged");
 }
+
+/// The chosen chart's text prepared on an early staging follows the
+/// staging's adoption by the attempt (design.md "Screen Transitions and
+/// Loading", adoption): its steps go on under the attempt's request and
+/// install into that staging, whose loading frames then draw it.
+#[test]
+fn the_staged_text_follows_the_staging_s_adoption() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (a, _) = bundle(&r, dir.path(), &chart_texts([0, 0, 255, 255]));
+    let (b, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    let early = loop {
+        if let Some(t) = r.stage_early(&b, 2).unwrap() {
+            break t;
+        }
+        let _ = r.upload_boundary();
+        r.wait_step(std::time::Duration::from_secs(1)).unwrap();
+    };
+    r.enter_loading_on(LoadingOn::Staged(early), 1);
+    r.prepare_loading_text_on(
+        LoadingOn::Staged(early),
+        1,
+        1,
+        TextSlots::ALL,
+        &chosen("B", "", ""),
+    );
+    assert_eq!(r.loading_text_in_hand(), Some((1, 1)));
+    let ctx = context(&GAUGES, false);
+    assert!(r.adopt_staging(2, 3, &attempt(&r, &chart, &ctx)).unwrap());
+    assert_eq!(common::settle_text(&mut r), Ok(true));
+    let token = r.staged().expect("the adopted staging");
+    assert_eq!(token.request, 3);
+    let t = r
+        .loading_frame_on(LoadingOn::Staged(token), &frame_at(1, 0), &text)
+        .unwrap()
+        .unwrap();
+    assert!(t.presented());
+    assert_eq!(
+        texts(&read_back(&r))[0],
+        RED,
+        "the title drawn on the adopted staging"
+    );
+}
