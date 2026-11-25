@@ -531,6 +531,9 @@ struct App {
     /// The monitor to open on, by name; the primary when `None`.
     monitor: Option<String>,
     ready: Option<Sender<anyhow::Result<Surface>>>,
+    /// The window's refresh-rate feed: its subclass publishing the rate at
+    /// each display change, removed before the window goes.
+    rate_feed: Option<crate::refresh_rate::RateFeed>,
     window: Option<Window>,
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
@@ -569,6 +572,13 @@ impl ApplicationHandler<Ask> for App {
                 let surface = surface(&w);
                 let _ = ready.send(surface);
                 publish(&self.shared.extent, &w);
+                self.rate_feed = hwnd(&w).map(|h| {
+                    crate::refresh_rate::RateFeed::start(
+                        h,
+                        &self.shared.extent,
+                        crate::refresh_rate::read,
+                    )
+                });
                 self.window = Some(w);
                 self.showing = Some(Showing::default());
                 self.poll_showing(event_loop);
@@ -581,6 +591,9 @@ impl ApplicationHandler<Ask> for App {
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(feed) = &self.rate_feed {
+            feed.window_event(&self.shared.extent, &event);
+        }
         match event {
             WindowEvent::Focused(focused) => {
                 self.focus(focused);
@@ -697,6 +710,7 @@ impl ApplicationHandler<Ask> for App {
                 // The window goes before the loop ends, on its own thread,
                 // and its watch of the foreground with it.
                 self.topmost = Topmost::default();
+                self.rate_feed = None;
                 self.window = None;
                 event_loop.exit();
             }
@@ -1181,6 +1195,7 @@ pub fn open(
                 keys: Keys::new(retry, quit),
                 monitor,
                 ready: Some(ready_tx),
+                rate_feed: None,
                 window: None,
                 menu,
                 ime: ImeState::default(),

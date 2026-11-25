@@ -155,6 +155,10 @@ struct Fake {
     /// Every frame drawn puts the swap chain's grant back: every pass
     /// finds one ready.
     starve: AtomicBool,
+    /// The uploader's slice the last upload boundary was given, µs, and
+    /// the boundaries so far.
+    slice_us: AtomicU64,
+    slice_boundaries: AtomicU64,
 }
 
 /// The fake's swap chain grant while `Fake::probe` (one test uses it).
@@ -352,7 +356,14 @@ impl Screen for Timed {
             .push((frames, due, settled.is_some()));
         (settled? && self.0.staged.load(Ordering::SeqCst)).then_some(Ok(Preparation::Ready))
     }
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
+        let us = u64::try_from(slice.as_micros()).unwrap();
+        self.0.slice_us.store(us, Ordering::SeqCst);
+        self.0.slice_boundaries.fetch_add(1, Ordering::SeqCst);
         let mut up = render::Uploaded {
             bga: render::BgaStep::Idle,
             staged: None,
@@ -1172,6 +1183,75 @@ fn idle_destroys_one_entry_per_clock_pace_and_then_blocks() {
     let before = drained();
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(drained(), before, "Idle woke with nothing due");
+}
+
+/// The window followed at 1920×1080, its monitor at 240.085 Hz.
+fn follow_at_240(r: &Rig) -> Arc<crate::render_side::Extent> {
+    let extent = Arc::new(crate::render_side::Extent::default());
+    extent.publish(1_920, 1_080);
+    extent.publish_rate(240_085);
+    r.link.follow(&extent);
+    extent
+}
+
+/// The slice the upload boundaries are given once two more have run.
+#[track_caller]
+fn next_slice_us(r: &Rig) -> u64 {
+    let from = r.fake.slice_boundaries.load(Ordering::SeqCst);
+    assert!(wait_until(|| {
+        r.fake.slice_boundaries.load(Ordering::SeqCst) >= from + 2
+    }));
+    r.fake.slice_us.load(Ordering::SeqCst)
+}
+
+/// C2b: at 240 Hz the selection's passes upload for a quarter period;
+/// once the selection is left the loop is idle, and the boundaries of
+/// its idle passes, run for two due entries, upload for 4 ms.
+// Revert: `idle` dropped from `pass_presents` -> the idle slice 1041.
+#[test]
+fn an_idle_pass_uploads_with_4_ms() {
+    let r = Rig::new();
+    let _extent = follow_at_240(&r);
+    r.select(1);
+    r.until_frames(|f| f.iter().any(|(k, _, _)| *k == Kind::Selection));
+    assert_eq!(next_slice_us(&r), 1_041, "a presenting pass");
+    r.link.leave_selection();
+    // Idle: no frame drawn any more.
+    assert!(wait_until(|| {
+        let n = r.fake.state().frames.len();
+        std::thread::sleep(Duration::from_millis(40));
+        r.fake.state().frames.len() == n
+    }));
+    let from = r.fake.slice_boundaries.load(Ordering::SeqCst);
+    r.due(1, Duration::ZERO);
+    r.due(2, Duration::ZERO);
+    // A message wakes the blocked Idle loop once.
+    r.link.send(RenderMsg::Turntable {
+        number: 0,
+        pause: false,
+    });
+    let _ = r.until_ran(2);
+    assert!(r.fake.slice_boundaries.load(Ordering::SeqCst) > from);
+    assert_eq!(
+        r.fake.slice_us.load(Ordering::SeqCst),
+        4_000,
+        "an idle pass"
+    );
+}
+
+/// C2c: at 240 Hz a page's passes upload for a quarter period, and a
+/// minimized window's for 4 ms.
+// Revert: `minimized` ignored in `pass_presents` -> the minimized slice
+// 1041.
+#[test]
+fn a_minimized_pass_uploads_with_4_ms() {
+    let r = Rig::page();
+    let _extent = follow_at_240(&r);
+    r.fake.gate.release();
+    assert_eq!(next_slice_us(&r), 1_041, "a presenting pass");
+    r.fake.minimized.store(true, Ordering::SeqCst);
+    let _ = next_slice_us(&r);
+    assert_eq!(next_slice_us(&r), 4_000, "a minimized window's pass");
 }
 
 /// V17 (j): minimized, frames end invisible and each refills: one entry

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bms_model::Chart;
+use bms_model::{Chart, Deadline, TimeSource};
 use eval::Section;
 use skin_model::{
     AtlasId, AtlasLimits, BitmapLines, BuildError, ChartText, DecisionFrame, DecisionLabels,
@@ -1838,11 +1838,15 @@ pub struct Renderer {
     /// presented ([`set_present_tap`](Self::set_present_tap)).
     #[cfg(feature = "dev-tools")]
     present_tap: Option<Arc<dyn crate::present_tap::PresentTap>>,
-    /// Development builds: the time a staging step's writes have taken on
-    /// the boundary's slice clock, read instead of the real clock
-    /// ([`set_write_slice_clock`](Self::set_write_slice_clock)).
+    /// The clock the uploader's time slice is read on at each frame
+    /// boundary (design.md "Memory Budget", the uploader): the render
+    /// thread's clock its owner gives ([`set_slice_clock`](Self::set_slice_clock)),
+    /// or, for a renderer given none, a monotonic clock of its own.
+    slice_clock: Arc<dyn TimeSource>,
+    /// Development builds: a test's clock read in its place
+    /// ([`override_slice_clock`](Self::override_slice_clock)).
     #[cfg(feature = "dev-tools")]
-    write_slice_clock: Option<Duration>,
+    slice_override: Option<Arc<dyn TimeSource>>,
     /// Development builds: the chart-image bands written
     /// ([`chart_bands`](Self::chart_bands)).
     #[cfg(feature = "dev-tools")]
@@ -2109,10 +2113,15 @@ pub struct Renderer {
     /// read from its flag.
     #[cfg(test)]
     pub(crate) step_seen: std::cell::Cell<Option<bool>>,
-    /// Unit tests: the time each BGA step takes on the boundary's clock,
-    /// read instead of the real clock.
+    /// Unit tests: the time each step takes on the boundary's clock:
+    /// while set, the slice is read on [`step_clock`](Self::step_clock),
+    /// advanced by it after each step, instead of the slice clock.
     #[cfg(test)]
     pub(crate) step_cost: std::cell::Cell<Option<Duration>>,
+    /// Unit tests: the virtual clock [`step_cost`](Self::step_cost)
+    /// advances.
+    #[cfg(test)]
+    pub(crate) step_clock: Arc<bms_model::VirtualClock>,
     /// Unit tests: run inside a BGA step's scopes before its writes, and
     /// just before its submission, to make the device refuse there (or
     /// the step take time).
@@ -2232,8 +2241,9 @@ impl Renderer {
             step_delay: None,
             #[cfg(feature = "dev-tools")]
             present_tap: None,
+            slice_clock: Arc::new(crate::upload::MonoClock::new()),
             #[cfg(feature = "dev-tools")]
-            write_slice_clock: None,
+            slice_override: None,
             #[cfg(feature = "dev-tools")]
             chart_bands: 0,
             #[cfg(feature = "dev-tools")]
@@ -2349,6 +2359,8 @@ impl Renderer {
             step_seen: std::cell::Cell::new(None),
             #[cfg(test)]
             step_cost: std::cell::Cell::new(None),
+            #[cfg(test)]
+            step_clock: Arc::new(bms_model::VirtualClock::new(bms_model::TimeUs(0))),
             #[cfg(test)]
             step_write_fault: None,
             #[cfg(test)]
@@ -6420,7 +6432,8 @@ impl Renderer {
         if !staging_only {
             out.text = self.loading_report.take();
         }
-        let started = Instant::now();
+        let clock = self.slice_source();
+        let budget = Deadline::after(clock.now(), crate::upload::micros(slice));
         let mut steps = 0_u32;
         loop {
             if let Some(up) = self.bga_upload.as_ref()
@@ -6507,7 +6520,7 @@ impl Renderer {
                 continue;
             }
             if self.staging_steps() {
-                if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                if steps > 0 && budget.passed(clock.now()) {
                     break;
                 }
                 if past.past() {
@@ -6515,7 +6528,7 @@ impl Renderer {
                 }
                 if self.pending.as_ref().is_some_and(|p| p.writes.is_some()) {
                     let request = self.pending.as_ref().map(|p| p.token.request);
-                    let step = self.write_staging_step(started, steps, slice, past);
+                    let step = self.write_staging_step(budget, past);
                     // A refused step retired the staging: its one end.
                     if self.pending.is_none()
                         && let Some(r) = request
@@ -6523,7 +6536,7 @@ impl Renderer {
                         out.staged = Some(crate::StagingEnd::Refused(r));
                     }
                     if step == AtlasStep::Stepped {
-                        steps += 1;
+                        steps = self.step_done(steps);
                         continue;
                     }
                     break;
@@ -6531,7 +6544,7 @@ impl Renderer {
                 let request = self.pending.as_ref().map(|p| p.token.request);
                 match self.staging_text_step(past) {
                     StagingTextStep::Stepped => {
-                        steps += 1;
+                        steps = self.step_done(steps);
                         continue;
                     }
                     StagingTextStep::Finished => {
@@ -6564,7 +6577,7 @@ impl Renderer {
                     out.text = self.finish_loading_text(past);
                     continue;
                 }
-                if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                if steps > 0 && budget.passed(clock.now()) {
                     break;
                 }
                 if past.past() {
@@ -6591,7 +6604,7 @@ impl Renderer {
                     });
                     break;
                 }
-                steps += 1;
+                steps = self.step_done(steps);
                 continue;
             }
             // The attempt's chart images, before the BGA batch.
@@ -6605,7 +6618,7 @@ impl Renderer {
                     chart = None;
                     continue;
                 }
-                if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                if steps > 0 && budget.passed(clock.now()) {
                     break;
                 }
                 if past.past() {
@@ -6619,7 +6632,7 @@ impl Renderer {
                         break;
                     }
                 }
-                steps += 1;
+                steps = self.step_done(steps);
                 continue;
             }
             // A result view's text, after the chart images.
@@ -6630,7 +6643,7 @@ impl Renderer {
                     .and_then(|u| u.upload.as_ref())
                     .is_some_and(text_upload::TextUpload::written);
                 if !written {
-                    if steps > 0 && self.step_elapsed(started, steps) >= slice {
+                    if steps > 0 && budget.passed(clock.now()) {
                         break;
                     }
                     if past.past() {
@@ -6639,7 +6652,7 @@ impl Renderer {
                 }
                 match self.result_text_step(past) {
                     ResultTextStep::Stepped => {
-                        steps += 1;
+                        steps = self.step_done(steps);
                         continue;
                     }
                     ResultTextStep::Again | ResultTextStep::Ended => continue,
@@ -6655,7 +6668,7 @@ impl Renderer {
                 out.bga = crate::BgaStep::Done(Ok(()));
                 continue;
             }
-            if steps > 0 && self.step_elapsed(started, steps) >= slice {
+            if steps > 0 && budget.passed(clock.now()) {
                 break;
             }
             if past.past() {
@@ -6663,8 +6676,8 @@ impl Renderer {
             }
             let Some(up) = self.bga_upload.as_mut() else {
                 // The result pages, after the BGA batch.
-                if self.write_pages_step(started, steps, slice, past) == AtlasStep::Stepped {
-                    steps += 1;
+                if self.write_pages_step(budget, past) == AtlasStep::Stepped {
+                    steps = self.step_done(steps);
                     continue;
                 }
                 break;
@@ -6716,7 +6729,7 @@ impl Renderer {
                 out.bga = crate::BgaStep::Done(Err(crate::BgaFault::Refused));
                 break;
             }
-            steps += 1;
+            steps = self.step_done(steps);
         }
         if matches!(out.bga, crate::BgaStep::Idle) && self.bga_upload.is_some() {
             out.bga = crate::BgaStep::Pending;
@@ -6766,15 +6779,10 @@ impl Renderer {
     /// reserved, and is answered when its request is asked again.
     fn write_staging_step(
         &mut self,
-        started: Instant,
-        steps: u32,
-        slice: Duration,
+        budget: Deadline,
         past: &mut dyn crate::UploadGate,
     ) -> AtlasStep {
-        #[cfg(not(test))]
-        let _ = steps;
-        #[cfg(test)]
-        let cost = self.step_cost.get();
+        let clock = self.slice_source();
         #[cfg(test)]
         let (write_fault, submit_fault, submits, counts) = (
             self.step_write_fault,
@@ -6784,8 +6792,6 @@ impl Renderer {
         );
         #[cfg(feature = "dev-tools")]
         let refuse = std::mem::take(&mut self.step_refusal);
-        #[cfg(feature = "dev-tools")]
-        let slice_clock = self.write_slice_clock;
         let gpu = &self.gpu;
         let Some(p) = self.pending.as_mut() else {
             return AtlasStep::Nothing;
@@ -6798,17 +6804,6 @@ impl Renderer {
             return AtlasStep::Nothing;
         }
         let atlas = &r.atlas;
-        let elapsed = || {
-            #[cfg(test)]
-            if let Some(each) = cost {
-                return each.saturating_mul(steps);
-            }
-            #[cfg(feature = "dev-tools")]
-            if let Some(at) = slice_clock {
-                return at;
-            }
-            started.elapsed()
-        };
         #[cfg(feature = "dev-tools")]
         let mut wrote = 0_u64;
         let (submitted, refused) = skin_atlas::scoped(gpu.device(), || {
@@ -6822,7 +6817,7 @@ impl Renderer {
             }
             let (n, staged) =
                 atlas_writes(gpu, atlas, writes, past, crate::Payload::Staging, || {
-                    elapsed() >= slice
+                    budget.passed(clock.now())
                 });
             if n == 0 {
                 return None;
@@ -6936,13 +6931,20 @@ impl Renderer {
         self.step_delay = delay;
     }
 
-    /// Development builds: a staging step's writes read `elapsed` as the
-    /// time they took on the boundary's slice clock instead of the real
-    /// clock (`None`: the real one), so a test decides where the slice
-    /// closes a step whatever the machine's load.
+    /// Reads the uploader's time slice on `clock`, the clock of the thread
+    /// that owns the renderer (the render thread's), in place of the
+    /// renderer's own monotonic clock.
+    pub fn set_slice_clock(&mut self, clock: Arc<dyn TimeSource>) {
+        self.slice_clock = clock;
+    }
+
+    /// Development builds: the uploader's time slice read on `clock`
+    /// (`None`: the slice clock again), so a test decides where the slice
+    /// closes a boundary's steps, and a step's writes, whatever the
+    /// machine's load: a clock that does not move never spends the slice.
     #[cfg(feature = "dev-tools")]
-    pub const fn set_write_slice_clock(&mut self, elapsed: Option<Duration>) {
-        self.write_slice_clock = elapsed;
+    pub fn override_slice_clock(&mut self, clock: Option<Arc<dyn TimeSource>>) {
+        self.slice_override = clock;
     }
 
     /// Development builds: the writes of the staging's first
@@ -6964,14 +6966,28 @@ impl Renderer {
         self.chart_bands
     }
 
-    /// The time the boundary's `steps` steps took since `started`.
-    fn step_elapsed(&self, started: Instant, steps: u32) -> Duration {
+    /// The clock the boundary's slice is read on: the slice clock, or a
+    /// unit test's per-step clock.
+    pub(crate) fn slice_source(&self) -> Arc<dyn TimeSource> {
+        #[cfg(test)]
+        if self.step_cost.get().is_some() {
+            return Arc::clone(&self.step_clock) as Arc<dyn TimeSource>;
+        }
+        #[cfg(feature = "dev-tools")]
+        if let Some(clock) = &self.slice_override {
+            return Arc::clone(clock);
+        }
+        Arc::clone(&self.slice_clock)
+    }
+
+    /// One more step of the boundary taken (`steps` before it); a unit
+    /// test's per-step clock moves by its cost.
+    fn step_done(&self, steps: u32) -> u32 {
         #[cfg(test)]
         if let Some(each) = self.step_cost.get() {
-            return each.saturating_mul(steps);
+            self.step_clock.advance(crate::upload::micros(each));
         }
-        let _ = steps;
-        started.elapsed()
+        steps.saturating_add(1)
     }
 
     /// Whether the step in flight's completion was seen (or none is in

@@ -3036,6 +3036,7 @@ fn select_args(
             speculative_permits: None,
             shot_pipe: None,
             freeze_skin_clock: false,
+            upload_slice_us: None,
             size: None,
             window: None,
             scenario: Some(session),

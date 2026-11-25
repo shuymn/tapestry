@@ -141,6 +141,68 @@ fn a_held_staging_stops_writing_at_the_holds_bound() {
     rig.exit();
 }
 
+/// The atlas steps' writes of a staging of [`big`] while a loading
+/// lifetime presents its frames (play's skin not pending, so nothing
+/// holds them), the window followed at `rate_mhz` and the uploader's
+/// slice read on a clock that moves `per_read` µs at each read.
+fn staged_writes(rate_mhz: u32, per_read: i64) -> Vec<u64> {
+    let rig = Rig::new();
+    let extent = Arc::new(crate::render_side::Extent::default());
+    extent.publish(1_920, 1_080);
+    extent.publish_rate(rate_mhz);
+    rig.link.follow(&extent);
+    rig.link
+        .set_slice_clock(Some(Arc::new(crate::render_side::ReadStepClock::new(
+            per_read,
+        ))));
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let staged = big(&target);
+    rig.link.send(RenderMsg::Menu(Box::new(one_line("wait"))));
+    rig.link.loading().show(one_line("loading"));
+    assert!(wait_until(|| rig.link.loading_ack().is_some()));
+    let answer = rig
+        .link
+        .prepare_attempt_with(
+            super::titled(&chart),
+            super::super::AttemptSkin::Specialized(staged),
+            || false,
+        )
+        .unwrap();
+    assert_eq!(answer, Preparation::Ready);
+    let log = rig.faults.step_log.lock().unwrap().clone();
+    rig.exit();
+    log
+}
+
+/// C4: at 240.085 Hz the boundary's slice, a quarter period (1 041 µs),
+/// reaches the uploader through the screen: on a slice clock moving
+/// 500 µs at each look, the first atlas step closes after its third
+/// write (the looks at 500, 1 000 and 1 500 µs); at 60 Hz the 4 ms
+/// slice, on a clock moving 1 000 µs a look, after its fourth.
+// Revert: `MenuScreen::upload_boundary` passing `UPLOAD_TIME_SLICE` ->
+// the 240 Hz step takes 8 writes.
+#[test]
+fn the_boundary_s_slice_reaches_the_uploader() {
+    let fast = staged_writes(240_085, 500);
+    assert_eq!(fast.first(), Some(&3), "{fast:?}");
+    let slow = staged_writes(60_000, 1_000);
+    assert_eq!(slow.first(), Some(&4), "{slow:?}");
+}
+
+/// I4: a slice clock moving 5 ms at each look, past the whole slice at
+/// its first look after a write, closes every atlas step after one
+/// write: the writes split one a step.
+// Revert: a step's writes reading the renderer's own clock instead of
+// the slice clock -> a step of more than one write.
+#[test]
+fn an_advancing_slice_clock_splits_the_writes() {
+    let log = staged_writes(60_000, 5_000);
+    assert!(log.len() >= 3, "{log:?}");
+    assert!(log.iter().all(|&n| n == 1), "{log:?}");
+}
+
 /// After the wait page (Idle), an attempt staged with a play skin keeping
 /// a chart layer: its request, answered Ready.
 fn staged_attempt(rig: &Rig, skin: Arc<render::SkinBundle>) -> u64 {

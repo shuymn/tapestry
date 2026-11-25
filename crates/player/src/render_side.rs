@@ -243,8 +243,12 @@ pub trait Screen: Send {
     /// ([`render::Renderer::upload_boundary_within`]), `past` answering
     /// whether the pass's hold's bound has passed; nothing in hand by
     /// default.
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-        let _ = past;
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
+        let _ = (past, slice);
         render::Uploaded {
             bga: render::BgaStep::Idle,
             staged: None,
@@ -744,10 +748,10 @@ pub trait Screen: Send {
     /// submission (tests). Nothing by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn delay_steps(&mut self, _delay: Option<Duration>) {}
-    /// While `on`, a staging step's writes read no time passed on the
-    /// uploader's slice clock (dev-tools tests). Nothing by default.
+    /// Reads the uploader's slice on `clock` (`None`: the renderer's
+    /// own) (dev-tools tests). Nothing by default.
     #[cfg(all(test, feature = "dev-tools"))]
-    fn freeze_write_slice(&mut self, _on: bool) {}
+    fn set_slice_clock(&mut self, _clock: Option<Arc<dyn TimeSource>>) {}
     /// Has the device refuse the next staging step (tests). Nothing by
     /// default.
     #[cfg(all(test, feature = "dev-tools"))]
@@ -1283,6 +1287,11 @@ pub struct Extent {
     /// counted after its size is stored, so a count read comes with its
     /// size or a newer one.
     notices: AtomicU64,
+    /// The refresh rate of the window's monitor in mHz, 0 while unknown:
+    /// kept apart from the size and its notices, so a change of rate
+    /// never invalidates the held image or ends a hold, and read by each
+    /// pass's upload boundary, not by its resize.
+    refresh_mhz: AtomicU32,
     /// Where the wake goes, once a render thread follows the slot
     /// ([`RenderLink::follow`]).
     wake: Mutex<Option<Sender<RenderMsg>>>,
@@ -1301,6 +1310,7 @@ impl Default for Extent {
             size: AtomicU64::new(UNKNOWN),
             queued: AtomicBool::new(false),
             notices: AtomicU64::new(0),
+            refresh_mhz: AtomicU32::new(0),
             wake: Mutex::new(None),
             #[cfg(test)]
             counting: TestGate::default(),
@@ -1330,6 +1340,18 @@ impl Extent {
             // until the next registration clears it.
             let _ = tx.send(RenderMsg::Resize);
         }
+    }
+
+    /// Publishes the refresh rate of the window's monitor, mHz (0:
+    /// unknown): the rate the previous publish left.
+    pub fn publish_rate(&self, mhz: u32) -> u32 {
+        self.refresh_mhz.swap(mhz, Ordering::AcqRel)
+    }
+
+    /// The newest refresh rate published, mHz; 0 while unknown. Allocates
+    /// nothing: each pass's upload boundary reads it.
+    pub(crate) fn rate_mhz(&self) -> u32 {
+        self.refresh_mhz.load(Ordering::Acquire)
     }
 
     /// Takes the wake on its way: the render thread calls it as it takes a
@@ -2289,10 +2311,11 @@ struct Shared {
     /// submission, in µs; 0 none (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     step_delay_us: AtomicU64,
-    /// While set, a staging step's writes read no time passed on the
-    /// uploader's slice clock (tests).
+    /// The clock the uploader's slice is read on from the next boundary
+    /// on, `None` for the renderer's own, numbered by each change
+    /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    write_slice_frozen: AtomicBool,
+    slice_clock: SliceClockSlot,
     /// The next result view's creation lasts this much longer, in µs, and
     /// at its end moves the hold's clock to the second value (tests).
     #[cfg(test)]
@@ -2531,7 +2554,7 @@ impl Shared {
             #[cfg(all(test, feature = "dev-tools"))]
             step_delay_us: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
-            write_slice_frozen: AtomicBool::new(false),
+            slice_clock: SliceClockSlot::default(),
             #[cfg(test)]
             creation_hook: [AtomicI64::new(0), AtomicI64::new(i64::MIN)],
             #[cfg(test)]
@@ -4344,12 +4367,27 @@ impl RenderLink {
         self.shared.step_delay_us.store(us, Ordering::SeqCst);
     }
 
-    /// While `on`, a staging step's writes read no time passed on the
-    /// uploader's slice clock from the next boundary on, so only the
-    /// step's size and the hold's bound close it (tests).
+    /// While `on`, the uploader's slice clock does not move from the next
+    /// boundary on, so only the steps' sizes, the frame's gate and the
+    /// hold's bound close a boundary's steps and their writes (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn freeze_write_slice(&self, on: bool) {
-        self.shared.write_slice_frozen.store(on, Ordering::SeqCst);
+        self.set_slice_clock(
+            on.then(|| Arc::new(bms_model::VirtualClock::new(TimeUs(0))) as Arc<dyn TimeSource>),
+        );
+    }
+
+    /// Reads the uploader's slice on `clock` from the next boundary on
+    /// (`None`: the renderer's own clock) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_slice_clock(&self, clock: Option<Arc<dyn TimeSource>>) {
+        let mut slot = self
+            .shared
+            .slice_clock
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *slot = (slot.0 + 1, clock);
     }
 
     /// Makes the next result view's creation last `us` µs longer and, at
@@ -5717,6 +5755,10 @@ pub fn spawn_until(
                 wait_page: None,
                 wait_laid: false,
                 extent: None,
+                #[cfg(feature = "dev-tools")]
+                slice_used: None,
+                #[cfg(all(test, feature = "dev-tools"))]
+                slice_clock_applied: (0, 0),
                 applied: None,
                 selected: None,
                 play_selection: 0,
@@ -7049,6 +7091,32 @@ impl Image {
     }
 }
 
+/// The uploader's slice for a frame boundary (design.md "Memory Budget",
+/// the uploader): a quarter of the refresh period of a pass that
+/// presents at a known rate, at most [`render::UPLOAD_TIME_SLICE`];
+/// that whole slice otherwise, as no present waits on the pass.
+fn upload_slice(rate_mhz: u32, presents: bool) -> Duration {
+    if !presents || rate_mhz == 0 {
+        return render::UPLOAD_TIME_SLICE;
+    }
+    // A quarter of the period 1 000 000 000 / rate_mhz µs.
+    let quarter = Duration::from_micros(250_000_000 / u64::from(rate_mhz));
+    quarter.min(render::UPLOAD_TIME_SLICE)
+}
+
+/// Whether a pass presents a frame, as its schedule states: a held
+/// pass, an idle pass and a minimized window's present nothing.
+const fn pass_presents(held: bool, idle: bool, minimized: bool) -> bool {
+    !held && !idle && !minimized
+}
+
+/// Logs a change of the slice the boundaries use (development builds).
+#[cfg(feature = "dev-tools")]
+#[cold]
+fn log_slice(slice: Duration, rate_mhz: u32) {
+    eprintln!("dev: upload slice {} at {rate_mhz}", slice.as_micros());
+}
+
 /// The size notices `extent` published, none without one.
 fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
     extent.map_or(0, |e| e.notices())
@@ -7595,6 +7663,14 @@ struct Run {
     wait_laid: bool,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
+    /// The uploader's slice the boundaries used last and the rate it was
+    /// chosen at, logged at each change (development builds).
+    #[cfg(feature = "dev-tools")]
+    slice_used: Option<(Duration, u32)>,
+    /// The test slice clock's change and the screen's device it was
+    /// applied to last (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    slice_clock_applied: (u64, u64),
     /// The size last applied to the screen; `None` until one is, and for
     /// a screen built again.
     applied: Option<(u32, u32)>,
@@ -11648,6 +11724,27 @@ impl Run {
         self.pace_deadline.map_or(FrameDue::Never, FrameDue::At)
     }
 
+    /// The uploader's slice for this pass's boundary (design.md "Memory
+    /// Budget", the uploader): [`upload_slice`] of the rate the window
+    /// published last, read here at every boundary, and whether the pass
+    /// presents. Development builds take a pinned slice in its place
+    /// (`--dev-upload-slice-us`) and log each change.
+    fn boundary_slice(&mut self, mode: &Mode, held: Option<TimeUs>) -> Duration {
+        let minimized = self.screen.as_ref().is_some_and(|s| s.minimized());
+        let rate = self.extent.as_ref().map_or(0, |e| e.rate_mhz());
+        let presents = pass_presents(held.is_some(), matches!(mode, Mode::Idle), minimized);
+        let slice = upload_slice(rate, presents);
+        // A baseline run's pinned slice (development builds).
+        #[cfg(feature = "dev-tools")]
+        let slice = crate::dev::pinned_upload_slice().unwrap_or(slice);
+        #[cfg(feature = "dev-tools")]
+        if self.slice_used != Some((slice, rate)) {
+            self.slice_used = Some((slice, rate));
+            log_slice(slice, rate);
+        }
+        slice
+    }
+
     /// The creation owed to the boundary's allowance, if any: play's
     /// staging not yet taken, else a result pages begin.
     fn creation_owed(&self) -> Option<Creation> {
@@ -12392,7 +12489,17 @@ impl Run {
         if let Some(s) = self.screen.as_mut() {
             let us = self.shared.step_delay_us.load(Ordering::SeqCst);
             s.delay_steps((us > 0).then(|| Duration::from_micros(us)));
-            s.freeze_write_slice(self.shared.write_slice_frozen.load(Ordering::SeqCst));
+            let slot = self
+                .shared
+                .slice_clock
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let at = (slot.0, s.device());
+            if at != self.slice_clock_applied {
+                s.set_slice_clock(slot.1.clone());
+                self.slice_clock_applied = at;
+            }
         }
         if self.result_staging_paused() {
             return;
@@ -12410,6 +12517,7 @@ impl Run {
         );
         let mut pages_end = None;
         let frame = self.frame_due_by(mode, held);
+        let slice = self.boundary_slice(mode, held);
         let chart = self
             .chart_hand
             .as_ref()
@@ -12430,28 +12538,34 @@ impl Run {
         let step = match self.screen.as_mut() {
             Some(s) => {
                 let mut up = match held {
-                    Some(shown_at) => s.upload_boundary(&mut PassGate {
-                        frame,
-                        cut_off: self.cut_off,
-                        cutoff: Some(&self.shared.cutoff),
-                        hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
-                        chart,
-                        bga,
-                        loading,
-                        slot: Some(&self.shared.loading),
-                        granted: &mut granted,
-                    }),
-                    None => s.upload_boundary(&mut PassGate::<fn() -> bool> {
-                        frame,
-                        cut_off: self.cut_off,
-                        cutoff: Some(&self.shared.cutoff),
-                        hold: None,
-                        chart,
-                        bga,
-                        loading,
-                        slot: Some(&self.shared.loading),
-                        granted: &mut granted,
-                    }),
+                    Some(shown_at) => s.upload_boundary(
+                        &mut PassGate {
+                            frame,
+                            cut_off: self.cut_off,
+                            cutoff: Some(&self.shared.cutoff),
+                            hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
+                            chart,
+                            bga,
+                            loading,
+                            slot: Some(&self.shared.loading),
+                            granted: &mut granted,
+                        },
+                        slice,
+                    ),
+                    None => s.upload_boundary(
+                        &mut PassGate::<fn() -> bool> {
+                            frame,
+                            cut_off: self.cut_off,
+                            cutoff: Some(&self.shared.cutoff),
+                            hold: None,
+                            chart,
+                            bga,
+                            loading,
+                            slot: Some(&self.shared.loading),
+                            granted: &mut granted,
+                        },
+                        slice,
+                    ),
                 };
                 self.staged_seen |= up.staged.is_some();
                 pages_end = up.pages.take();
@@ -13586,6 +13700,47 @@ pub struct StepRecord {
     pub held: bool,
     pub pass: u64,
     pub at: Instant,
+}
+
+/// The clock the uploader's slice is read on, numbered by each change
+/// (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Default)]
+struct SliceClockSlot(Mutex<(u64, Option<Arc<dyn TimeSource>>)>);
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl std::fmt::Debug for SliceClockSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SliceClockSlot")
+    }
+}
+
+/// A slice clock that moves `step` µs at each read (tests): the
+/// uploader's own checks of its slice spend it, whatever the machine's
+/// load.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Debug)]
+pub struct ReadStepClock {
+    now: AtomicI64,
+    step: i64,
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl ReadStepClock {
+    /// A clock reading 0 first, then `step` µs more at each read.
+    pub const fn new(step: i64) -> Self {
+        Self {
+            now: AtomicI64::new(0),
+            step,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl TimeSource for ReadStepClock {
+    fn now(&self) -> TimeUs {
+        TimeUs(self.now.fetch_add(self.step, Ordering::SeqCst))
+    }
 }
 
 /// A hook run after a frame's pacing (tests): the hold's clock to set,
@@ -17984,6 +18139,57 @@ pub(crate) mod tests {
         assert_eq!(crate::alloc_count::this_thread() - before, 0);
     }
 
+    /// C1: a pass that presents at a known rate uploads for a quarter of
+    /// its refresh period, the active mode's rational rate in mHz.
+    #[test]
+    fn upload_slice_is_a_quarter_period() {
+        assert_eq!(
+            super::upload_slice(143_856, true),
+            Duration::from_micros(1_737)
+        );
+        assert_eq!(
+            super::upload_slice(240_085, true),
+            Duration::from_micros(1_041)
+        );
+    }
+
+    /// C1b: the slice is at most 4 ms, a slower rate's quarter period
+    /// included.
+    #[test]
+    fn upload_slice_is_capped_at_4_ms() {
+        assert_eq!(super::upload_slice(60_000, true), Duration::from_millis(4));
+        assert_eq!(super::upload_slice(30_000, true), Duration::from_millis(4));
+    }
+
+    /// C2d: an unknown rate (0) takes 4 ms.
+    #[test]
+    fn an_unknown_rate_takes_4_ms() {
+        assert_eq!(super::upload_slice(0, true), Duration::from_millis(4));
+    }
+
+    /// C6: the slice's choice allocates nothing; a vector made inside the
+    /// same window is counted (the control).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn upload_slice_alloc() {
+        let before = crate::alloc_count::this_thread();
+        let mut sum = Duration::ZERO;
+        for (rate, held, idle, minimized) in [
+            (240_085, false, false, false),
+            (143_856, true, false, false),
+            (60_000, false, true, false),
+            (0, false, false, true),
+        ] {
+            let presents = super::pass_presents(held, idle, minimized);
+            sum += super::upload_slice(std::hint::black_box(rate), presents);
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+        assert_eq!(sum, Duration::from_micros(1_041 + 3 * 4_000));
+        let control = std::hint::black_box(vec![0_u8; 16]);
+        assert_eq!(crate::alloc_count::this_thread() - before, 1);
+        drop(control);
+    }
+
     /// V6b (design.md "Scope of No Allocation"; "State Model", system
     /// sounds, Result): the render thread's acknowledgement of a Result
     /// entry's first picture, its wake of the game thread, again for a
@@ -19204,7 +19410,11 @@ pub(crate) mod tests {
         fn upload_waited(&self) -> bool {
             self.steps.load(Ordering::Acquire) > 0
         }
-        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
+        fn upload_boundary(
+            &mut self,
+            _past: &mut dyn render::UploadGate,
+            _slice: Duration,
+        ) -> render::Uploaded {
             if self
                 .steps
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -20923,7 +21133,14 @@ pub(crate) mod tests {
             b.pending = Some((key.array, cells.len(), bytes, boundaries));
             Ok(())
         }
-        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
+        fn upload_boundary(
+            &mut self,
+            _past: &mut dyn render::UploadGate,
+            slice: Duration,
+        ) -> render::Uploaded {
+            let us = u64::try_from(slice.as_micros()).unwrap();
+            self.shared.slice_us.store(us, Ordering::SeqCst);
+            self.shared.slice_boundaries.fetch_add(1, Ordering::SeqCst);
             let bga = (|| {
                 let mut b = self.shared.bga.lock().unwrap();
                 let Some((array, cells, bytes, left)) = b.pending else {
@@ -21437,6 +21654,10 @@ pub(crate) mod tests {
         /// clock and its chart time; noted only while the vector has room
         /// (a test reserves it), so noting never allocates.
         pub(crate) screen_clocks: Arc<std::sync::Mutex<Vec<(i64, i64, TimeUs)>>>,
+        /// The uploader's slice the last upload boundary was given, µs,
+        /// and the boundaries so far.
+        pub(crate) slice_us: Arc<AtomicU64>,
+        pub(crate) slice_boundaries: Arc<AtomicU64>,
     }
 
     /// One selection frame as an [`Installer`] saw it.
@@ -24605,8 +24826,12 @@ pub(crate) mod tests {
             }
             answer
         }
-        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-            self.menu.upload_boundary(past)
+        fn upload_boundary(
+            &mut self,
+            past: &mut dyn render::UploadGate,
+            slice: Duration,
+        ) -> render::Uploaded {
+            self.menu.upload_boundary(past, slice)
         }
         fn upload_state(&self) -> render::UploadState {
             self.menu.upload_state()
@@ -25051,7 +25276,11 @@ pub(crate) mod tests {
         ) -> Option<Result<Preparation, RenderError>> {
             self.menu.prepare_attempt(a, skin, request, lifetime)
         }
-        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        fn upload_boundary(
+            &mut self,
+            past: &mut dyn render::UploadGate,
+            slice: Duration,
+        ) -> render::Uploaded {
             if self.hold_up.load(Ordering::Acquire) {
                 return render::Uploaded {
                     bga: render::BgaStep::Idle,
@@ -25061,7 +25290,7 @@ pub(crate) mod tests {
                     pages: None,
                 };
             }
-            self.menu.upload_boundary(past)
+            self.menu.upload_boundary(past, slice)
         }
         fn upload_state(&self) -> render::UploadState {
             if self.hold_up.load(Ordering::Acquire) {

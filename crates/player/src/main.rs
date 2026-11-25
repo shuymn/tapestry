@@ -65,6 +65,7 @@ mod preview_graphs;
 mod priority;
 #[cfg(feature = "dev-tools")]
 mod recording;
+mod refresh_rate;
 mod render_report;
 mod render_side;
 mod result_input;
@@ -1367,7 +1368,13 @@ fn play(
     let make = window_make(
         surface,
         window_thread.extent(),
-        |target| Renderer::new(target, AdapterChoice::HighPerformance),
+        move |target| {
+            Renderer::new(target, AdapterChoice::HighPerformance).map(|mut r| {
+                // The uploader's slice on the render thread's clock.
+                r.set_slice_clock(Arc::new(clock));
+                r
+            })
+        },
         move |r, _| {
             let screen = MenuScreen::new(r, None)
                 .with_sink(Box::new(link.clone()))
@@ -2087,6 +2094,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if s.dev.freeze_skin_clock {
         dev::skin_clock::freeze();
     }
+    // The uploader's slice pinned for a baseline run
+    // (`--dev-upload-slice-us`).
+    #[cfg(feature = "dev-tools")]
+    if let Some(us) = s.dev.upload_slice_us {
+        dev::pin_upload_slice(us);
+    }
     #[cfg(feature = "dev-tools")]
     let shot_tap = s.dev.shot_pipe.clone().map(|name| {
         let tap = dev::present_shot::Tap::new();
@@ -2097,7 +2110,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         (Some(surface), Some((link, extent))) => window_make(
             surface,
             extent,
-            |target| Renderer::new(target, AdapterChoice::HighPerformance),
+            move |target| {
+                Renderer::new(target, AdapterChoice::HighPerformance).map(|mut r| {
+                    // The uploader's slice on the render thread's clock.
+                    r.set_slice_clock(Arc::new(clock));
+                    r
+                })
+            },
             move |r, font| {
                 #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
                 let mut r = r;
