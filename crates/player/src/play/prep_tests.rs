@@ -26,6 +26,7 @@ use crate::result_skin::{ResultSkin, ResultStart};
 
 mod adapter;
 mod bga;
+mod early;
 mod images;
 mod result_flow;
 #[cfg(feature = "dev-tools")]

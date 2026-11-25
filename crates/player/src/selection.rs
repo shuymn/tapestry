@@ -3634,6 +3634,7 @@ impl PlayerRig<'_> {
                 }),
                 failures: self.failures.clone(),
                 screen: Some(self.render.recovery_handle()),
+                early: self.early_watch(),
             });
         let out = f(self);
         // Only this wait unwatches what it watched.
@@ -3845,6 +3846,9 @@ impl PlayerRig<'_> {
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
+        // The bank's decode ended: an early start deferred at the read is
+        // admitted again, once, with fresh headroom.
+        self.readmit_early();
         // The bank no longer decodes: the claimed preload pack is promoted
         // to the foreground pool it no longer draws (design.md "Load
         // Pipeline", Pauses).
@@ -4208,6 +4212,24 @@ impl AppRig for PlayerRig<'_> {
             show_stage(&self.render, Some(&page), Stage::Chart);
             sel.loading = Some(page);
         }
+        // A decided play's early preparation: its gate exists before either
+        // deadline owner can reveal (this entry's wait below, App's look),
+        // so a reveal before the chart's read commits on it with nothing
+        // begun (design.md "Screen Transitions and Loading").
+        self.end_early();
+        if matches!(pick, Pick::Play(_))
+            && self.pending.is_some()
+            && let Some(lifetime) = d.lifetime()
+        {
+            let link = crate::play::early::EarlyLink::new(self.render.early_sender());
+            self.early = Some(
+                crate::play::early::EarlyPrep::new(
+                    crate::play::early::EarlyGate::new(self.render.early_refusal()),
+                    lifetime.0,
+                )
+                .with_link(link),
+            );
+        }
         // The attempt's entry last: its fence waits on the input thread with
         // the screen and its sound already out, serving the decision screen
         // (a leaving verdict is left in `d` for App to route).
@@ -4261,13 +4283,38 @@ impl AppRig for PlayerRig<'_> {
             game::Origin::Loading => {}
             _ => self.poll_preload(),
         }
+        self.step_early();
         Ok(())
+    }
+
+    /// The decided play's chart is read: the pending play skin's
+    /// specialization for the attempt's facts begins on the gate made at
+    /// the decision's entry, admitted against the host's headroom
+    /// (design.md "Screen Transitions and Loading").
+    fn chart_read(&mut self, loaded: &Loaded) {
+        self.begin_early(loaded);
+    }
+
+    /// The early preparation's refusal published before the reveal, or
+    /// the render thread's refusal of its staging published after it.
+    fn early_refusal(&self) -> Option<game::PreparationRefusal> {
+        self.early
+            .as_ref()
+            .and_then(|e| e.gate().refused().or_else(|| e.gate().late_refused()))
     }
 
     /// The play's deadline: the loading state's tuning epoch, the input
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
-    fn deadline_step(&mut self) {
+    fn deadline_step(&mut self) -> game::StepOutcome {
+        // The reveal committed against the gate's one state first: a
+        // refusal published before it reveals nothing. A job still running
+        // is cancelled there, never waited for.
+        if let Some(e) = &self.early
+            && let crate::play::early::Committed::Refused(r) = e.gate().commit_reveal()
+        {
+            return game::StepOutcome::Refused(r);
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::stage("decision_end");
         self.end_decision();
@@ -4278,6 +4325,7 @@ impl AppRig for PlayerRig<'_> {
         self.begin_loading_epoch();
         self.controls.open_epoch();
         self.controls.next_scene();
+        game::StepOutcome::Stepped
     }
 
     /// The decision screen is left for the practice page or selection: the
@@ -4411,6 +4459,10 @@ impl AppRig for PlayerRig<'_> {
     /// nowhere (design.md "Load Pipeline"), but a panic one published
     /// meanwhile that a Start was responsible for, which ends the run.
     fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // The choice's early preparation ends with it: its job cancelled and
+        // joined to its thread's end (a close's within the stop bound), its
+        // staging withdrawn.
+        self.end_early();
         // The choice's claim on the result skin's preload ends with it.
         self.preload_claim = None;
         // Its images' job was cancelled with the choice's scope below; its

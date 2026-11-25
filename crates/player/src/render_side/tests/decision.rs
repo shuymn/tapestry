@@ -237,6 +237,9 @@ struct Seen {
     /// The row plan's meeting point, signaled through `rows_moved`.
     rows: Mutex<RowsGate>,
     rows_moved: Condvar,
+    /// Each loading text asked: its lifetime and the staging's request it
+    /// is for; noted only while the vector has room (a test reserves it).
+    texts: Mutex<Vec<(u64, Option<u64>)>>,
 }
 
 /// A skin frame's time and its input and fade-out timers' starts.
@@ -370,6 +373,43 @@ impl Screen for Recorder {
     }
     fn discard(&mut self) {
         self.menu.discard();
+    }
+    fn discard_token(&mut self, token: render::PreparedToken) {
+        self.menu.discard_token(token);
+    }
+    fn staged_any(&self) -> Option<render::PreparedToken> {
+        self.menu.staged_any()
+    }
+    fn staged_drawable(&self) -> Option<render::PreparedToken> {
+        self.menu.staged_drawable()
+    }
+    fn stage_early(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Option<render::PreparedToken>, RenderError> {
+        self.menu.stage_early(bundle, request)
+    }
+    fn early_room(&self, bundle: &Arc<SkinBundle>) -> render::EarlyRoom {
+        self.menu.early_room(bundle)
+    }
+    fn loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        chart: &Arc<crate::loading_text::ChosenChart>,
+        on: Option<render::PreparedToken>,
+    ) {
+        {
+            let mut texts = self.seen.texts.lock().unwrap();
+            if texts.len() < texts.capacity() {
+                texts.push((lifetime, on.map(|t| t.request)));
+            }
+        }
+        self.menu.loading_text(lifetime, revision, chart, on);
+    }
+    fn text_settled(&self) -> bool {
+        self.menu.text_settled()
     }
     fn install(
         &mut self,
@@ -2870,4 +2910,147 @@ fn the_render_loop_records_selection_decision_and_its_fallback() {
         u32::try_from(rig.decided.stamps_of(5).len()).unwrap(),
         "{records:?}"
     );
+}
+
+/// Play's skin pending, the first frame's hold bounded by a bound no test
+/// reaches.
+fn pend_play(rig: &Rig) {
+    let answer = rig.link.pend(ScreenKind::Play).wait();
+    assert_eq!(answer.unwrap(), Preparation::Ready);
+    rig.link
+        .shared
+        .hold_bound
+        .store(3_600_000_000, Ordering::SeqCst);
+}
+
+/// A held loading lifetime of chart `title` begun and published, nothing
+/// of it drawn: its number.
+fn begin_held(rig: &Rig, title: &str) -> u64 {
+    rig.link.begin_loading_held(&super::chosen(title), None);
+    rig.link.loading().show(one_line("loading"));
+    rig.link.loading_lifetime()
+}
+
+/// The held lifetime revealed, as the decision screen's deadline does.
+fn reveal(rig: &Rig) {
+    rig.link.reveal_loading();
+    rig.link.loading().show(one_line("loading"));
+}
+
+/// B7: a reveal after the decision skin's last presented frame, play's
+/// skin pending and not ready (its early staging missed), draws its first
+/// loading frame at once: nothing held.
+// Revert: the hold kept for `Skin` -> held passes counted, no loading
+// page drawn.
+#[test]
+fn a_miss_after_a_skin_fade_draws_at_once() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    pend_play(&rig);
+    rig.prepared("a", "A");
+    begin_held(&rig, "A");
+    rig.choose("a", "A", 5);
+    rig.skin_frames(0, 3);
+    let (held, from) = (rig.link.held_passes(), rig.seen.len());
+    reveal(&rig);
+    assert!(wait_until(|| rig.seen.pages(from, "loading") >= 2));
+    assert_eq!(rig.link.held_passes(), held, "nothing held");
+    rig.link.exit();
+}
+
+/// B8a: where the last presented decision frame was the built-in page,
+/// the first loading frame's hold stays.
+// Revert: the hold dropped for `BuiltIn` -> a loading page drawn.
+#[test]
+fn the_built_in_decision_keeps_the_hold() {
+    let rig = Rig::bare(crate::warp_turn::take(), input::QpcClock::start());
+    pend_play(&rig);
+    begin_held(&rig, "A");
+    rig.link.show_decision(one_line("page"), None);
+    assert!(wait_until(|| rig.seen.pages(0, "page") >= 3));
+    let (held, from) = (rig.link.held_passes(), rig.seen.len());
+    reveal(&rig);
+    assert!(wait_until(|| rig.link.held_passes() >= held + 5));
+    assert_eq!(rig.seen.pages(from, "loading"), 0, "held");
+    rig.link.exit();
+}
+
+/// B8b: where a takeover replaced the decision skin with the built-in
+/// page, the first loading frame's hold stays: the reveal lands right
+/// after the takeover's first frame, the refused one, presented, with no
+/// decision frame after it.
+// Revert: the refused frame recorded under the decision mode, as the
+// skin's -> a loading page drawn at once.
+#[test]
+fn a_takeover_keeps_the_hold() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    pend_play(&rig);
+    rig.prepared("a", "A");
+    begin_held(&rig, "A");
+    rig.choose("a", "A", 5);
+    rig.skin_frames(0, 3);
+    let shared = std::sync::Arc::clone(&rig.link.shared);
+    let [before_token, _, before_stamp] = &shared.frame_gates;
+    /// Lets every frame go when dropped, a failing test's included.
+    struct LetGo<'a>(&'a [crate::render_side::TestGate; 3]);
+    impl Drop for LetGo<'_> {
+        fn drop(&mut self) {
+            for gate in self.0 {
+                gate.hold(false);
+            }
+        }
+    }
+    let _let_go = LetGo(&shared.frame_gates);
+    // A skin frame held after its draw; the next frame's build refused.
+    before_stamp.hold(true);
+    assert!(wait_until(|| before_stamp.waiting()));
+    before_token.hold(true);
+    rig.seen.refuse_frame.store(true, Ordering::Release);
+    before_stamp.hold(false);
+    assert!(wait_until(|| before_token.waiting()));
+    // The refused frame drawn, held before its record; the reveal sent.
+    before_stamp.hold(true);
+    before_token.hold(false);
+    assert!(wait_until(|| before_stamp.waiting()));
+    assert!(!rig.seen.refuse_frame.load(Ordering::Acquire), "refused");
+    let (held, from) = (rig.link.held_passes(), rig.seen.len());
+    reveal(&rig);
+    before_stamp.hold(false);
+    assert!(wait_until(|| rig.link.held_passes() >= held + 5));
+    assert_eq!(rig.seen.pages(from, "loading"), 0, "held");
+    assert_eq!(
+        rig.decided.stamps_of(5).last().copied(),
+        Some(crate::measure::DecisionDrawnAs::Fallback),
+        "the refused frame was the last decision frame"
+    );
+    rig.link.exit();
+}
+
+/// B16a: while the skinned decision draws a held lifetime with an early
+/// staging, the lifetime's loading text is prepared on that staging.
+// Revert: the `Mode::Decision` arm removed -> no text asked.
+#[test]
+fn loading_text_during_the_skinned_decision() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    pend_play(&rig);
+    rig.seen.texts.lock().unwrap().reserve(64);
+    rig.prepared("a", "A");
+    let lifetime = begin_held(&rig, "A");
+    rig.choose("a", "A", 5);
+    rig.skin_frames(0, 3);
+    let mut ticket = rig.link.early_sender().begin_early(super::bundle());
+    let e = ticket.request();
+    let a = ticket.wait_until(None, || false).unwrap().unwrap();
+    assert_eq!(a.preparation, Preparation::Ready);
+    assert!(wait_until(|| rig
+        .seen
+        .texts
+        .lock()
+        .unwrap()
+        .contains(&(lifetime, Some(e)))));
+    let from = rig.seen.len();
+    rig.skin_frames(from, 2);
+    rig.link.exit();
 }

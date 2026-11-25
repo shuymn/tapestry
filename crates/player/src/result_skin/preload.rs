@@ -220,7 +220,13 @@ type Disposal = Box<dyn FnOnce() + Send>;
 /// disposal after it, the run's end included, has it without starting a
 /// thread; it ends once the result skin lets it go and it has dropped
 /// everything handed to it.
-pub(super) struct Disposer(mpsc::Sender<Disposal>);
+pub(super) struct Disposer {
+    handed: mpsc::Sender<Disposal>,
+    /// The disposals handed and not yet run: while any is, the pages of a
+    /// stopped pack are still resident (the early preparation's admission
+    /// counts that overlap).
+    in_flight: Arc<AtomicUsize>,
+}
 
 impl std::fmt::Debug for Disposer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -232,24 +238,49 @@ impl Disposer {
     /// Its thread, started.
     fn start() -> std::io::Result<Self> {
         let (sender, handed) = mpsc::channel::<Disposal>();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let theirs = Arc::clone(&in_flight);
         std::thread::Builder::new()
             .name("result-dispose".to_owned())
             .spawn(move || {
                 for disposal in handed {
                     disposal();
+                    theirs.fetch_sub(1, Ordering::AcqRel);
                 }
             })?;
-        Ok(Self(sender))
+        Ok(Self {
+            handed: sender,
+            in_flight,
+        })
     }
 
-    /// Runs `disposal` on its thread. Should the thread be gone (it
-    /// panicked), it runs here, logged.
+    /// Runs `disposal` on its thread, counted in flight until it ran.
+    /// Should the thread be gone (it panicked), it runs here, logged.
     fn run(&self, disposal: Disposal) {
-        if let Err(mpsc::SendError(disposal)) = self.0.send(disposal) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        if let Err(mpsc::SendError(disposal)) = self.handed.send(disposal) {
             log::warn!("skin: result: the preload's disposal thread is gone; freed in place");
             disposal();
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
         }
     }
+
+    /// Whether a disposal handed is still to run.
+    fn disposing(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire) > 0
+    }
+}
+
+/// A result skin's preload as the early preparation's admission charges it
+/// ([`ResultSkin::pack_charge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackCharge {
+    /// A pack runs or stops, not yet collected: its growth may still come.
+    pub running: bool,
+    /// Pages of a stopped pack are still in disposal.
+    pub disposing: bool,
+    /// The preload waits and could begin a pack again.
+    pub may_begin: bool,
 }
 
 /// The preload's control, shared by the game thread, the shelf
@@ -1329,6 +1360,17 @@ impl ResultSkin {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn set_preload_mode(&mut self, mode: Arc<dyn ThreadMode>) {
         self.preload_mode = Some(mode);
+    }
+
+    /// The preload as the early preparation's admission charges it: a pack
+    /// running or stopping uncollected, pages in disposal, and whether a
+    /// pack could begin again.
+    pub fn pack_charge(&self) -> PackCharge {
+        PackCharge {
+            running: matches!(self.preload, Preload::Running(_) | Preload::Stopping { .. }),
+            disposing: self.disposer.as_ref().is_some_and(Disposer::disposing),
+            may_begin: matches!(self.preload, Preload::Idle(_)),
+        }
     }
 
     /// The preload's state (tests): its probe's mode while it waits, its

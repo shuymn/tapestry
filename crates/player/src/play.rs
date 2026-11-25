@@ -221,6 +221,14 @@ pub struct PlayerRig<'a> {
     /// attempt is prepared with its specialization for the attempt's
     /// facts ([`crate::imports::PendingSkin`]).
     pub pending: Option<crate::imports::PendingSkin>,
+    /// The pending play skin's preparation during the decision screen of
+    /// a decided play ([`early::EarlyPrep`]): made at the play's decision
+    /// entry, begun once its chart is read, and taken by the attempt's
+    /// preparation, or ended when the choice is left.
+    pub early: Option<early::EarlyPrep>,
+    /// The early preparation's admission reads the host's headroom here
+    /// ([`crate::priority::System`]; a test's double).
+    pub machine: &'static (dyn crate::priority::Machine + Sync),
     /// The chart's own images' worker (S10-12): the run's one owner.
     pub chart_images: crate::chart_images::ChartImageWorker,
     /// The chart's BGA pictures' worker: the run's one owner.
@@ -573,6 +581,11 @@ pub struct AttemptPrep {
     scratch_notes: Vec<game::ScratchNote>,
     /// Prepared with a pending play skin's specialization.
     specialized: bool,
+    /// The decision screen's early request this attempt adopts, until its
+    /// request is sent adopting it: dropped with the preparation, discarded
+    /// or replaced, which withdraws the early request, so no other attempt
+    /// adopts it or reads its refusal.
+    handoff: Option<early::Handoff>,
     /// When the render thread was asked.
     staging: Instant,
     stage: PrepStage,
@@ -869,21 +882,53 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::loop_probe::mark("att:send", 0);
         prep.staging = Instant::now();
-        let stage = PrepStage::Screen(self.render.begin_attempt(attempt, skin));
+        // The early request it adopts; a refusal of its staging published
+        // since the reveal ends the attempt with its reason at once (the
+        // render thread reported it).
+        let handoff = prep.handoff.take();
+        if let Some(h) = &handoff
+            && let Some(refusal) = self.render.early_refused(h.request)
+        {
+            return PrepStage::Ended(Preparation::Refused(refusal));
+        }
+        let adopts = handoff.as_ref().map(|h| h.request);
+        let pending = self.render.begin_adopting(attempt, skin, adopts);
+        let request = pending.request();
+        let stage = PrepStage::Screen(pending);
+        // Its ticket goes once the attempt's request is out: the early
+        // request's discard, if any, comes after the adoption.
+        drop(handoff);
         // After its PrepareAttempt, so play's admission comes first on the
         // render thread.
-        self.begin_pages_ticket();
+        self.begin_pages_ticket([Some(request), adopts]);
         stage
+    }
+
+    /// The render thread's refusal of the early request `prep` adopts, if
+    /// one was published: its hand-off dropped with it.
+    fn take_early_refused(&self, prep: &mut AttemptPrep) -> Option<game::PreparationRefusal> {
+        let refusal = prep
+            .handoff
+            .as_ref()
+            .and_then(|h| self.render.early_refused(h.request))?;
+        prep.handoff = None;
+        Some(refusal)
     }
 
     /// The attempt's own result pages ticket (design.md "Memory Budget",
     /// the result pages upload, §5.1's step 3): begun when the attempt's
     /// result names pages whose atlas the result status does not name as
     /// installed; an earlier ticket is withdrawn first.
-    fn begin_pages_ticket(&mut self) {
+    fn begin_pages_ticket(&mut self, requests: [Option<u64>; 2]) {
         self.pages_ticket = None;
         let status = self.render.result_status();
         if status.disabled.is_some() {
+            return;
+        }
+        // The early staging released the result for this lifetime, under
+        // the early request or, followed, the attempt's: no pages upload
+        // begins before the result's step reconciles the release.
+        if status.released.is_some_and(|r| requests.contains(&Some(r))) {
             return;
         }
         let Some(crate::result_skin::Upload::Pages(pages)) = self.result_skin.upload() else {
@@ -1727,11 +1772,26 @@ impl PlayerRig<'_> {
     /// the preparation's polls ([`poll_skin`](Self::poll_skin)). A job's
     /// wait shows the stage line on the loading state, or the preparation
     /// page without one (a retry, a round).
-    fn begin_skin(&mut self, loaded: &Loaded) -> Result<SkinStep, Preparation> {
+    /// The decision screen's early request it adopts goes to `handoff`.
+    fn begin_skin(
+        &mut self,
+        loaded: &Loaded,
+        handoff: &mut Option<early::Handoff>,
+    ) -> Result<SkinStep, Preparation> {
         let Some(mut pending) = self.pending.take() else {
             return Ok(SkinStep::Ready(AttemptSkin::InUse));
         };
         let facts = crate::imports::facts::attempt_facts(loaded, self.autoplay);
+        // What the decision screen's early preparation built is this
+        // attempt's kept specialization, reused below while its facts hold
+        // (design.md "Screen Transitions and Loading").
+        let (taken, early) = self.take_early();
+        *handoff = early;
+        if let Some((s, ran)) = taken
+            && let Some(took) = ran
+        {
+            pending.adopt(s, took);
+        }
         let rig = &*self;
         let wait = || {
             println!("skin: play: building for the chart");
@@ -2030,6 +2090,9 @@ impl PlayerRig<'_> {
         // A preparation still running settles its job before the render
         // thread and the skins go.
         self.end_prep();
+        // A decision's early preparation still held: its job cancelled and
+        // given up within the stop bound once the run ends.
+        self.end_early();
         // The images' worker, stopped within its bound; its panic is never
         // the run's.
         self.chart_images.end();
@@ -2810,6 +2873,7 @@ impl Rig for PlayerRig<'_> {
                 images: (std::path::PathBuf::new(), [String::new(), String::new()]),
                 scratch_notes: Vec::new(),
                 specialized: false,
+                handoff: None,
                 staging: Instant::now(),
                 stage: PrepStage::Ended(Preparation::Cancelled),
             });
@@ -2848,6 +2912,7 @@ impl Rig for PlayerRig<'_> {
                 Vec::new()
             },
             specialized: false,
+            handoff: None,
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
         };
@@ -2861,7 +2926,7 @@ impl Rig for PlayerRig<'_> {
         if let Some(s) = &self.selection {
             self.bga.step(Some((&s.coord, s.spawner)), &|| false);
         }
-        prep.stage = match self.begin_skin(loaded) {
+        prep.stage = match self.begin_skin(loaded, &mut prep.handoff) {
             Ok(SkinStep::Ready(skin)) => self.enter_facts(&mut prep, skin),
             Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
             Err(ended) => PrepStage::Ended(ended),
@@ -2897,6 +2962,19 @@ impl Rig for PlayerRig<'_> {
             let publisher = self.render.chart_publisher();
             self.chart_images.step(coord, &|| false, Some(&publisher));
             let _ = self.chart_images.publish(&self.render, None);
+        }
+        // A refusal of the early staging this attempt adopts, published
+        // since the reveal, ends a stage before the attempt's request at
+        // once, the image stage's job settled first.
+        if matches!(prep.stage, PrepStage::Facts(_) | PrepStage::Image(..))
+            && let Some(refusal) = self.take_early_refused(&mut prep)
+        {
+            if let PrepStage::Image(_, job) = &mut prep.stage {
+                let mut result = std::mem::take(&mut self.result_skin);
+                let _ = result.settle_image_stage(job, || self.run_ends());
+                self.result_skin = result;
+            }
+            prep.stage = PrepStage::Ended(Preparation::Refused(refusal));
         }
         let polled = loop {
             match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
@@ -4096,6 +4174,7 @@ pub(crate) fn scripted_end_over(
         && (render.end_page_drawn() || render.failed() || shown >= crate::dev::STEP_TIMEOUT)
 }
 
+pub mod early;
 mod loading;
 
 #[cfg(all(test, feature = "dev-tools"))]

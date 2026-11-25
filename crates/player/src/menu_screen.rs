@@ -504,12 +504,29 @@ impl ChosenTextState {
     /// Whether the current request's text is settled: installed in every
     /// slot, or refused. No request (no installation keeping loading text)
     /// is settled too.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn settled(&self) -> bool {
-        self.current.as_ref().is_none_or(|c| {
-            self.installed.as_ref().is_some_and(|i| i.same_request(c))
-                || self.refused.as_ref().is_some_and(|r| r.same_request(c))
-        })
+        text_settled(
+            self.current.as_ref(),
+            self.installed.as_ref(),
+            self.refused.as_ref(),
+        )
     }
+}
+
+/// Whether request `current` is settled, the slots holding `installed`'s
+/// text after `refused` was refused: installed in every slot, or refused
+/// as that very request (one refused for another installation, size,
+/// lifetime or revision is not this one's). No request is settled too.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn text_settled<K: PartialEq>(
+    current: Option<&AskedText<K>>,
+    installed: Option<&AskedText<K>>,
+    refused: Option<&AskedText<K>>,
+) -> bool {
+    current.is_none_or(|c| {
+        installed.is_some_and(|i| i.same_request(c)) || refused.is_some_and(|r| r.same_request(c))
+    })
 }
 
 /// What the chosen chart's text needs before a loading frame.
@@ -1555,6 +1572,7 @@ impl Screen for MenuScreen {
         self.chosen_text((lifetime, revision), chart, on);
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn text_settled(&self) -> bool {
         self.chosen.settled()
     }
@@ -2426,6 +2444,44 @@ impl Screen for MenuScreen {
         self.renderer.staged_ready()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn staged_any(&self) -> Option<PreparedToken> {
+        self.renderer.staged()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn staged_drawable(&self) -> Option<PreparedToken> {
+        self.renderer.staged_drawable()
+    }
+
+    fn stage_early(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Option<PreparedToken>, RenderError> {
+        self.renderer.stage_early(bundle, request)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn early_room(&self, bundle: &Arc<SkinBundle>) -> render::EarlyRoom {
+        self.renderer.early_room(bundle)
+    }
+
+    fn release_result_deferred(&mut self, bundle: &SkinBundle) -> Result<(), RenderError> {
+        self.renderer.release_result_deferred(bundle)
+    }
+
+    fn adopt_attempt(
+        &mut self,
+        early: u64,
+        request: u64,
+        a: &AttemptInput<'_>,
+    ) -> Result<bool, RenderError> {
+        // The staged loading text's record is keyed by the installation
+        // and resources, which the adoption keeps: it stays settled.
+        self.renderer.adopt_staging(early, request, a)
+    }
+
     fn discard_token(&mut self, token: PreparedToken) {
         if self.renderer.staged() == Some(token) {
             self.renderer.discard();
@@ -2826,6 +2882,47 @@ mod tests {
             text_plan(None, Some(&refused), &asked(1, full, 3, Some("y"))),
             all
         );
+    }
+
+    /// B4c: a text refused for the current request counts as current, so
+    /// the skin draws without it; one refused for another target (a
+    /// resize since), installation or revision does not.
+    // Revert: `same_request` dropped from the refusal's check -> a refusal
+    // for another target counts as current.
+    #[test]
+    fn a_refusal_counts_only_for_its_own_request() {
+        use super::{AskedText, text_settled};
+        use crate::loading_text::ChosenChart;
+
+        let chart = Arc::new(ChosenChart::default());
+        let asked = |key: u64, target: [u32; 2], revision: u64| AskedText {
+            key,
+            target,
+            lifetime: 1,
+            revision,
+            chart: Arc::clone(&chart),
+        };
+        let full = [1_920, 1_080];
+        let current = asked(1, full, 1);
+        assert!(text_settled(Some(&current), None, Some(&current.clone())));
+        assert!(!text_settled(
+            Some(&current),
+            None,
+            Some(&asked(1, [960, 540], 1))
+        ));
+        assert!(!text_settled(
+            Some(&current),
+            None,
+            Some(&asked(2, full, 1))
+        ));
+        assert!(!text_settled(
+            Some(&current),
+            None,
+            Some(&asked(1, full, 2))
+        ));
+        assert!(text_settled(Some(&current), Some(&current.clone()), None));
+        assert!(!text_settled(Some(&current), None, None));
+        assert!(text_settled::<u64>(None, None, None));
     }
 
     /// Only the fields that differ name their slots, each with the

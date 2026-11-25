@@ -320,10 +320,13 @@ impl Decision {
     /// nothing acts before it: a terminal cause or a fatal reply ends the
     /// run; a refusal is latched (and returns at once once the loading
     /// state or the wait for a late read is reached); at the deadline a
-    /// latched refusal returns, else the step runs once (practice whose
-    /// read still runs waits instead); past it, while practice waits,
-    /// the escape goes back. The step and every leaving verdict end the
-    /// screen's lifetime.
+    /// latched refusal returns, else the step is due (practice whose read
+    /// still runs waits instead); past it, while practice waits, the escape
+    /// goes back. Every leaving verdict ends the screen's lifetime. A
+    /// [`Verdict::Step`] changes nothing: the caller commits it
+    /// ([`commit_step`](Self::commit_step)) once the step's effect is
+    /// decided, or refuses it ([`refuse_step`](Self::refuse_step)); until
+    /// then every look classifies the step again.
     pub fn classify(
         &mut self,
         origin: Origin,
@@ -333,10 +336,30 @@ impl Decision {
         reply: Option<Reply>,
     ) -> Verdict {
         let seen = self.route(origin, now, terminal, escape, reply);
-        if seen == Verdict::Step || seen.leaves() {
+        if seen.leaves() {
             self.lifetime = None;
         }
         seen
+    }
+
+    /// The step [`classify`](Self::classify) returned is taken: stepped
+    /// once, no longer waiting, and the screen's lifetime over.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn commit_step(&mut self) {
+        self.stepped = true;
+        self.waiting = false;
+        self.lifetime = None;
+    }
+
+    /// The step [`classify`](Self::classify) returned is refused at its
+    /// commit (the play's preparation refused before the reveal): a
+    /// refusal latched, the decision left unstepped and its lifetime over;
+    /// [`Verdict::Return`], the verdict the look gives instead.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn refuse_step(&mut self) -> Verdict {
+        self.latched = true;
+        self.lifetime = None;
+        Verdict::Return
     }
 
     /// [`classify`](Self::classify)'s verdict, before the lifetime ends.
@@ -367,8 +390,6 @@ impl Decision {
                 if self.practice && origin == Origin::Read {
                     self.waiting = true;
                 } else {
-                    self.stepped = true;
-                    self.waiting = false;
                     return Verdict::Step;
                 }
             }
@@ -493,6 +514,7 @@ mod tests {
             d.classify(Origin::Load, at(1_500), false, false, None),
             Verdict::Step
         );
+        d.commit_step();
         assert_eq!(
             d.classify(Origin::Load, at(1_600), false, false, None),
             Verdict::Continue
@@ -537,6 +559,7 @@ mod tests {
             d.classify(Origin::Jobs, at(1_700), false, false, None),
             Verdict::Step
         );
+        d.commit_step();
         assert!(!d.waiting());
         assert_eq!(
             d.classify(
@@ -602,6 +625,12 @@ mod tests {
             d.classify(Origin::Load, at(10_000), false, false, None),
             Verdict::Step
         );
+        assert_eq!(
+            d.lifetime(),
+            Some(DecisionLifetime(3)),
+            "classified, not committed"
+        );
+        d.commit_step();
         assert_eq!(d.lifetime(), None, "the step ends the lifetime");
         let off = Decision::begin(at(7_000), DecisionLifetime(3), None, false);
         assert!(!off.on());
@@ -628,6 +657,7 @@ mod tests {
             d.classify(Origin::Jobs, at(10_000), false, false, None),
             Verdict::Step
         );
+        d.commit_step();
         assert!(!d.apply_takeover(takeover(3, 10_100), at(10_100)));
         assert_eq!(d.deadline(), Some(at(10_000)));
         let mut d = begun();
@@ -642,6 +672,40 @@ mod tests {
         assert!(
             !d.apply_takeover(takeover(3, 8_000), at(8_000)),
             "a leaving verdict ends the lifetime"
+        );
+    }
+
+    /// A step classified and not committed is classified again by the
+    /// next look and leaves the decision unstepped; committed, it is
+    /// stepped once; refused at its commit, the decision returns, latched
+    /// and unstepped, and every later look returns.
+    #[test]
+    fn a_step_is_committed_or_refused_by_its_caller() {
+        let mut d = play();
+        assert_eq!(
+            d.classify(Origin::Load, at(1_500), false, false, None),
+            Verdict::Step
+        );
+        assert!(!d.stepped());
+        assert_eq!(
+            d.classify(Origin::Load, at(1_501), false, false, None),
+            Verdict::Step,
+            "classified again until committed"
+        );
+        d.commit_step();
+        assert!(d.stepped());
+        let mut d = play();
+        assert_eq!(
+            d.classify(Origin::Load, at(1_500), false, false, None),
+            Verdict::Step
+        );
+        assert_eq!(d.refuse_step(), Verdict::Return);
+        assert!(!d.stepped(), "left unstepped");
+        assert!(d.latched());
+        assert_eq!(d.lifetime(), None);
+        assert_eq!(
+            d.classify(Origin::Ready, at(1_600), false, false, None),
+            Verdict::Return
         );
     }
 

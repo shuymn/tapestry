@@ -757,6 +757,7 @@ fn a_hold_mark_spans_its_waits() {
         lifetime,
         shown_at: TimeUs(1_000),
         ended: false,
+        after_skin: false,
         skinned: false,
         hold: None,
     };
@@ -1034,4 +1035,70 @@ fn page_text_keeps_the_span() {
     };
     assert_eq!(s.stage.state, State::Page);
     assert!(s.frames >= 5, "{s:?}");
+}
+
+/// A held lifetime of chart "T" published, nothing of it drawn, and its
+/// early request sent: the lifetime and the request's ticket.
+fn held_early(link: &super::super::RenderLink) -> (u64, super::super::PendingAttempt) {
+    link.begin_loading_held(&chosen("T"), None);
+    link.loading().show(one_line("loading"));
+    let lifetime = link.loading_lifetime();
+    (lifetime, link.early_sender().begin_early(bundle()))
+}
+
+/// B4: a held lifetime revealed with its early staging's pages written
+/// and its text settled draws that staging first: the pending
+/// presentation is never drawn, and the frame is acknowledged.
+// Revert: `presentation_of` ignores the early record -> held to the
+// bound no test reaches, nothing acknowledged.
+#[test]
+fn the_reveal_draws_the_early_staging_first() {
+    let (_chart, screens, link, _extent) = rig(NEVER);
+    let (lifetime, mut ticket) = held_early(&link);
+    let e = ticket.request();
+    let a = ticket.wait_until(None, || false).unwrap().unwrap();
+    assert_eq!(a.preparation, Preparation::Ready);
+    link.reveal_loading();
+    assert!(wait_until(|| link.loading_ack().is_some()));
+    let staged = screens.staged_frames.lock().unwrap().clone();
+    assert_eq!(staged.first(), Some(&(lifetime, e)));
+    assert_eq!(pending(&screens), 0, "the placeholder never drawn");
+    link.end_loading().unwrap();
+    link.exit();
+}
+
+/// B4b: at a reveal whose early staging is not drawable and whose text
+/// is stale (as after a resize), the pending presentation draws while the
+/// text is prepared on the staging; once the staging is answered and its
+/// text settled, the skin draws.
+// Revert: `loading_text_pass` keyed on `presentation_of` (returning on
+// `Placeholder`) -> no text asked while pending.
+#[test]
+fn text_stale_at_the_reveal_recovers_to_the_skin() {
+    let (_chart, screens, link, _extent) = rig(0);
+    screens.texts.lock().unwrap().reserve(64);
+    screens.text_unsettled.store(true, SeqCst);
+    screens.hold_next_staging(&link);
+    let (lifetime, mut ticket) = held_early(&link);
+    let e = ticket.request();
+    assert!(wait_until(|| screens.staging().is_some()));
+    link.reveal_loading();
+    assert!(wait_until(|| pending(&screens) >= 2));
+    assert!(wait_until(|| screens
+        .texts
+        .lock()
+        .unwrap()
+        .contains(&(lifetime, Some(e)))));
+    assert!(screens.staged_frames.lock().unwrap().is_empty());
+    screens.text_unsettled.store(false, SeqCst);
+    screens.release_staged();
+    let a = ticket.wait_until(None, || false).unwrap().unwrap();
+    assert_eq!(a.preparation, Preparation::Ready);
+    assert!(wait_until(|| screens
+        .staged_frames
+        .lock()
+        .unwrap()
+        .contains(&(lifetime, e))));
+    link.end_loading().unwrap();
+    link.exit();
 }

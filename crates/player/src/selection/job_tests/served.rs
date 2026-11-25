@@ -405,6 +405,7 @@ fn decision_screen_lost_within(
             reveal: Box::new(|| {}),
             failures: rig.failures.clone(),
             screen: Some(rig.render.recovery_handle()),
+            early: None,
         });
         f(rig);
         let _ = rig.controls.unwatch_decision();
@@ -709,6 +710,7 @@ fn the_opening_reports_a_saved_rebuild_failure_before_its_preparation() {
             reveal: Box::new(|| {}),
             failures: rig.failures.clone(),
             screen: Some(rig.render.recovery_handle()),
+            early: None,
         });
         until("the rebuild failed", || {
             let _ = rig.controls.look();

@@ -420,6 +420,16 @@ mod tests {
                 "{v}"
             );
         }
+        // The early request's send delayed: milliseconds.
+        assert_eq!(select(&[]).dev.early_delay_ms, None);
+        assert_eq!(
+            select(&["--dev-early-delay", "3000"]).dev.early_delay_ms,
+            Some(3_000)
+        );
+        assert_eq!(
+            parsed(&["--dev-early-delay", "3s"]).unwrap_err(),
+            UsageError::Usage("--dev-early-delay takes milliseconds".to_owned())
+        );
         // The shot pipe: a pipe name, with a window to shoot.
         assert_eq!(
             select(&[

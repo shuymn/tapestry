@@ -3089,6 +3089,7 @@ fn select_args(
             speculative_permits: None,
             shot_pipe: None,
             freeze_skin_clock: false,
+            early_delay_ms: None,
             upload_slice_us: None,
             transitions: None,
             size: None,

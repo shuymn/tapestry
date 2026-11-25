@@ -872,6 +872,7 @@ fn step_inside_a_rig_wait_ends_the_lifetime() {
             reveal: Box::new(|| {}),
             failures: rig.failures.clone(),
             screen: Some(rig.render.recovery_handle()),
+            early: None,
         });
         until_clock(rig, end);
         assert_eq!(rig.controls.look(), Some(Verdict::Step));

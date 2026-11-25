@@ -64,7 +64,7 @@ pub use ::audio::Channel;
 pub use adjust_keys::{
     AdjustBinding, AdjustKeyError, AdjustmentConfig, AdjustmentKeys, AdjustmentPlan,
 };
-pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
+pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused, StepOutcome};
 pub use attempt::{
     Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal, ScoreBasis, finish_anchor,
     song_total,

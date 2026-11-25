@@ -1860,9 +1860,12 @@ fn a_retry_after_a_preset_edit_keeps_the_charts_class() {
         lines(&stdout, "dev: drawn notice: スキンを準備しています").is_empty(),
         "{stdout}"
     );
+    // The retry builds nothing: no skin stage after the first play (the
+    // first play's specialization ran during its decision screen).
+    let first = stdout.find("play started").unwrap();
     assert_eq!(
-        lines(&stdout, "load: building the play skin").len(),
-        1,
+        lines(&stdout[first..], "load: building the play skin").len(),
+        0,
         "{stdout}"
     );
     let mut plays: Vec<_> = fs::read_dir(&frames)

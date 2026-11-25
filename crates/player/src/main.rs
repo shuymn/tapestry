@@ -990,6 +990,8 @@ fn rig<'a>(
         render,
         skin: render_side::SkinState::Ready,
         pending: None,
+        early: None,
+        machine: &crate::priority::System,
         chart_images,
         bga,
         play_chart: None,
@@ -2105,6 +2107,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     if let Some(us) = s.dev.upload_slice_us {
         dev::pin_upload_slice(us);
+    }
+    // The early request's send delayed past the decision's time, the early
+    // staging's miss forced (`--dev-early-delay`).
+    #[cfg(feature = "dev-tools")]
+    if let Some(ms) = s.dev.early_delay_ms {
+        dev::delay_early(ms);
     }
     // A windowed run's raw transition record (`--dev-transitions`): its
     // book and the game thread's marks reserved before any play. A

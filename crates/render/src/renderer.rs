@@ -1312,6 +1312,21 @@ enum Reclaim {
     Refused(u64),
 }
 
+/// What an early staging needs before it is taken
+/// ([`Renderer::early_room`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyRoom {
+    /// It fits: taken now, as one heavy operation.
+    Fits,
+    /// The boundaries destroy what it needs first: asked again later.
+    Wait,
+    /// The result's installation is released first
+    /// ([`Renderer::release_result_deferred`]).
+    Release,
+    /// It does not fit even so: refused as play's admission refuses it.
+    Refused,
+}
+
 /// The level-0 texels charged against [`SHARED_TEXELS`] now
 /// ([`Renderer::admission`]): what [`Renderer::admit`] sums.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2715,6 +2730,18 @@ impl Renderer {
         self.pending.as_ref().map(|p| p.token)
     }
 
+    /// The play installation staged and not yet committed whose pages are
+    /// written, if any: its loading presentation may draw while its
+    /// attempt's text still steps (an early staging an attempt adopted,
+    /// design.md "Screen Transitions and Loading").
+    #[must_use]
+    pub fn staged_drawable(&self) -> Option<PreparedToken> {
+        self.pending
+            .as_ref()
+            .filter(|p| p.writes.is_none() && p.skin.is_some())
+            .map(|p| p.token)
+    }
+
     /// The installation staged and not yet committed whose every step
     /// completed, if any: the one its loading frames may draw.
     #[must_use]
@@ -2875,6 +2902,180 @@ impl Renderer {
             Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => return false,
         };
         self.retire.free() >= entries || self.retire.oldest(false).is_none()
+    }
+
+    /// Stages `bundle`'s play installation for the early request
+    /// `request` (design.md "Screen Transitions and Loading", the pending
+    /// play skin's preparation): its atlas pages and its loading
+    /// presentation, no attempt and nothing of a play, in steps as
+    /// [`install_stepped`](Self::install_stepped) stages a kind. It
+    /// destroys nothing in its call, whatever the phase allows: its owner
+    /// takes it once [`early_room`](Self::early_room) answers
+    /// [`EarlyRoom::Fits`]. It never commits: an attempt adopts it
+    /// ([`adopt_staging`](Self::adopt_staging)).
+    ///
+    /// # Errors
+    ///
+    /// As [`install`](Self::install).
+    pub fn stage_early(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Option<PreparedToken>, RenderError> {
+        let allowed = std::mem::replace(&mut self.destroy_allowed, false);
+        let staged = self.stage_with(ScreenKind::Play, bundle, None, request, true);
+        self.destroy_allowed = allowed;
+        staged
+    }
+
+    /// What the early staging of `bundle` needs before it is taken, in the
+    /// reclaim order with no destruction in any call (design.md "Screen
+    /// Transitions and Loading", admission): it fits, its entry (and a
+    /// pool reduction's) free; it waits while the boundaries destroy what
+    /// it needs (filled entries, a retired pool, entries to reserve); the
+    /// result's installation is to be released first
+    /// ([`release_result_deferred`](Self::release_result_deferred)); or it
+    /// is refused as play's admission would refuse it. Reads only;
+    /// allocates nothing.
+    #[must_use]
+    pub fn early_room(&self, bundle: &Arc<SkinBundle>) -> EarlyRoom {
+        if self
+            .committed_installation(ScreenKind::Play)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return EarlyRoom::Fits;
+        }
+        let charge = self.candidate_charge(ScreenKind::Play, bundle);
+        let entries = match self.reclaim(ScreenKind::Play, charge, false) {
+            Reclaim::Fits => Some(1),
+            Reclaim::Reduce(layers) if self.pool.as_ref().is_some_and(|p| p.layers() > layers) => {
+                if self.retire.retired_pool_entry().is_some() {
+                    return EarlyRoom::Wait;
+                }
+                Some(2)
+            }
+            Reclaim::Reduce(_) => Some(1),
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => None,
+        };
+        if let Some(entries) = entries {
+            return if self.retire.free() >= entries {
+                EarlyRoom::Fits
+            } else if self.retire.oldest(false).is_some() {
+                EarlyRoom::Wait
+            } else {
+                EarlyRoom::Refused
+            };
+        }
+        match self.reclaim(ScreenKind::Play, charge, true) {
+            Reclaim::Refused(_) => EarlyRoom::Refused,
+            // Filled entries are destroyed at the boundaries first; the
+            // release comes once none is charged, and once the pool's
+            // reduction to its firm layer has its entries free.
+            Reclaim::ReleaseResult if self.retire.charged() == 0 => {
+                let reduces = self.pool.as_ref().is_some_and(|p| p.layers() > 1);
+                if reduces && (self.retire.retired_pool_entry().is_some() || self.retire.free() < 2)
+                {
+                    EarlyRoom::Wait
+                } else {
+                    EarlyRoom::Release
+                }
+            }
+            _ => EarlyRoom::Wait,
+        }
+    }
+
+    /// The result's installation released for the early staging of
+    /// `bundle` (design.md "Screen Transitions and Loading", admission):
+    /// the selection's pool reduced to its firm layer and the result's
+    /// arrays retired into their standing entries, with no destruction in
+    /// the call; the boundaries destroy them. Reported as play's
+    /// admission's release ([`take_result_release`](Self::take_result_release)).
+    ///
+    /// # Errors
+    ///
+    /// The pool's reduction's: its entry not free while destruction is
+    /// not allowed here.
+    pub fn release_result_deferred(&mut self, bundle: &SkinBundle) -> Result<(), RenderError> {
+        let allowed = std::mem::replace(&mut self.destroy_allowed, false);
+        let reduced = self.reduce_pool(1, ScreenKind::Play);
+        self.destroy_allowed = allowed;
+        reduced?;
+        let charge = self.candidate_charge(ScreenKind::Play, bundle);
+        self.release_figures = [
+            self.needed(ScreenKind::Play, charge),
+            self.charge(ScreenKind::Result),
+            SHARED_TEXELS,
+        ];
+        self.remove(ScreenKind::Result);
+        self.result_released = true;
+        Ok(())
+    }
+
+    /// The early staging of `early` adopted as the attempt `a`'s staging
+    /// for `request` (design.md "Screen Transitions and Loading",
+    /// adoption): re-keyed in place, its pages' writes and its place in
+    /// the uploader kept, with the attempt's state added as a staging of
+    /// an installed bundle adds it (the skin prepared for the attempt, its
+    /// text placed by the uploader's steps after its pages). `Ok(false)`,
+    /// nothing changed, when the staging held is not that early staging
+    /// (another request or kind, one with an attempt, or a failed step) or
+    /// `request` is not newer than every request taken.
+    ///
+    /// # Errors
+    ///
+    /// The attempt's preparation's refusal: the staging is then retired.
+    pub fn adopt_staging(
+        &mut self,
+        early: u64,
+        request: u64,
+        a: &AttemptInput<'_>,
+    ) -> Result<bool, RenderError> {
+        let held = self.pending.as_ref().is_some_and(|p| {
+            p.token.request == early
+                && p.token.kind == ScreenKind::Play
+                && p.skin.is_some()
+                && p.text_up.is_none()
+        });
+        let failed = self.stage_failed.as_ref().is_some_and(|(r, _)| *r == early);
+        if !held || failed || request <= self.requested {
+            return Ok(false);
+        }
+        let Some(mut p) = self.pending.take() else {
+            return Ok(false);
+        };
+        let Pending {
+            skin: Some(skin),
+            res,
+            ..
+        } = &mut p
+        else {
+            self.pending = Some(p);
+            return Ok(false);
+        };
+        let bundle = Arc::clone(skin.bundle());
+        self.text_report = TextReport::default();
+        match self.prepare_staged(skin, res, &bundle, a, true) {
+            Ok((text, text_up)) => {
+                p.text = text;
+                p.text_up = text_up;
+                let before = p.token;
+                p.token.request = request;
+                // Its loading text in hand goes on for the staging's new
+                // name: the same installation and resources.
+                if let Some(up) = &mut self.loading_upload
+                    && up.on == LoadingOn::Staged(before)
+                {
+                    up.on = LoadingOn::Staged(p.token);
+                }
+                self.requested = request;
+                self.pending = Some(p);
+                Ok(true)
+            }
+            Err(e) => {
+                self.retire_candidate(p);
+                Err(e)
+            }
+        }
     }
 
     /// Writes the staging of `request` to its end, waiting for each step,
