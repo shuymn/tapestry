@@ -563,6 +563,11 @@ pub struct Waiting {
 ///   published`) and freed no fewer, by writing `<file>.ready` and telling
 ///   the observer of each ([`Observer::waiting`]): a full ring seen after
 ///   the request, not one left from before it.
+/// - `TAPESTRY_DEV_PREPARATION_GATE` names a third; while it exists and the
+///   session has no worker but a launch under way or a video queued for
+///   one, it holds every screen's preparation deadline
+///   ([`PREPARATION_HELD`]), at most [`GATE_BOUND`] from the hold's start,
+///   so a launch slower than the deadline still ends in its own outcome.
 #[cfg(feature = "dev-tools")]
 #[derive(Default)]
 struct Relay {
@@ -571,6 +576,8 @@ struct Relay {
     ask: Option<PathBuf>,
     noted: Option<Vec<(u8, u64, u64)>>,
     answered: bool,
+    hold: Option<PathBuf>,
+    held_since: Option<Instant>,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -579,27 +586,48 @@ impl Relay {
         Self {
             fire: std::env::var_os("TAPESTRY_DEV_FAULT_ACK").map(PathBuf::from),
             ask: std::env::var_os("TAPESTRY_DEV_WAIT_ASK").map(PathBuf::from),
+            hold: std::env::var_os("TAPESTRY_DEV_PREPARATION_GATE").map(PathBuf::from),
             ..Self::default()
         }
     }
 }
 
+/// How long a development gate holds at most: an ended or stuck scenario
+/// leaves nothing held past it.
+#[cfg(feature = "dev-tools")]
+const GATE_BOUND: Duration = Duration::from_secs(60);
+
+/// Whether the session holds the screens' preparation deadlines
+/// (dev-tools; the preparation gate of [`Relay`]): set and cleared on the
+/// session's thread at its turn, read by [`crate::movie_frame::Movies`]
+/// before it applies a deadline. A launch's failure loses its queued
+/// videos at the turn's look, before the turn's relay clears it.
+#[cfg(feature = "dev-tools")]
+pub static PREPARATION_HELD: AtomicBool = AtomicBool::new(false);
+
 /// The launch gate (dev-tools): while the file `TAPESTRY_DEV_LAUNCH_GATE`
-/// names exists, the worker's launch waits on its own thread, at most a
-/// minute, before the launch takes anything the user's other launches
-/// share ([`super::launch::Launches`]). A scenario keeps its own game's
-/// launch past a screen's preparation deadline with it, and an ended game
-/// leaves nothing held.
+/// names exists, the worker's launch waits on its own thread, at most
+/// [`GATE_BOUND`], before the launch takes anything the user's other
+/// launches share ([`super::launch::Launches`]); `<gate>.reached` exists
+/// while it waits. A scenario keeps its own game's launch past a screen's
+/// preparation deadline with it, and an ended game leaves nothing held.
 #[cfg(feature = "dev-tools")]
 fn launch_gate() {
     let Some(gate) = std::env::var_os("TAPESTRY_DEV_LAUNCH_GATE") else {
         return;
     };
     let gate = std::path::Path::new(&gate);
+    if !gate.exists() {
+        return;
+    }
+    let mut reached = gate.as_os_str().to_owned();
+    reached.push(".reached");
+    let _ = std::fs::write(&reached, b"");
     let begun = Instant::now();
-    while gate.exists() && begun.elapsed() < Duration::from_secs(60) {
+    while gate.exists() && begun.elapsed() < GATE_BOUND {
         std::thread::sleep(Duration::from_millis(10));
     }
+    let _ = std::fs::remove_file(&reached);
 }
 
 /// Tells the observer, if any, of load stage `name` of load `load`.
@@ -1959,9 +1987,29 @@ impl Supervisor {
         }
     }
 
+    /// The preparation gate's turn ([`Relay`], [`PREPARATION_HELD`]).
+    #[cfg(feature = "dev-tools")]
+    fn hold_preparation(&mut self) {
+        let waiting = self.worker.is_none()
+            && (self.launching_now || self.players.iter().any(|p| p.stage == Stage::Queued));
+        let held = waiting && self.relay.hold.as_ref().is_some_and(|f| f.exists());
+        if !held {
+            self.relay.held_since = None;
+        }
+        let within = held
+            && self
+                .relay
+                .held_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+                < GATE_BOUND;
+        PREPARATION_HELD.store(within, Ordering::Release);
+    }
+
     /// The development relay's turn ([`Relay`]).
     #[cfg(feature = "dev-tools")]
     fn relay(&mut self) {
+        self.hold_preparation();
         if !self.relay.fired
             && self.worker.is_some()
             && self.relay.fire.as_ref().is_some_and(|f| f.exists())

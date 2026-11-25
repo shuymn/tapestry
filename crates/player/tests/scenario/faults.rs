@@ -626,13 +626,29 @@ fn healthy_fault_run(ats: &[i64]) -> PlayFields {
     play_fields(&fx)
 }
 
+/// Waits until `done`, bounded by the run's limit and failing as soon as
+/// the game `game` has ended; `what` names it.
+fn until(game: u32, what: &str, done: impl Fn() -> bool) {
+    let begun = std::time::Instant::now();
+    while !done() {
+        assert!(!ended(game), "{what}: the game ended first");
+        assert!(begun.elapsed() < RUN_LIMIT, "{what}: past the limit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The screens' preparation deadline, as the game's (the media session's
+/// `PREPARATION`).
+const PREPARATION: Duration = Duration::from_secs(3);
+
 /// A worker whose launch fails its self-check plays nothing (design.md
-/// "Threat Model" T02): the panel is drawn lost from chart time 0 (a video
-/// never handed to a worker is not a loss the session reports), the
-/// chart's BGA and the skin movie's destinations read back black, and the
-/// play completes with the record a healthy run of the same input makes,
-/// whose captures show the chart video's frame due and the skin movie
-/// playing.
+/// "Threat Model" T02): the second play's launch is held at the launch
+/// gate past its preparation's deadline, which the preparation gate holds
+/// for the launch's own outcome, so its two videos are lost for the launch
+/// (`Launch`); the panel is drawn lost from chart time 0, the chart's BGA
+/// and the skin movie's destinations read back black, and the play
+/// completes with the record a healthy run of the same input makes, whose
+/// captures show the chart video's frame due and the skin movie playing.
 // Covers: T02
 #[test]
 fn failed_launch_blacks_the_panel_from_chart_time_zero() {
@@ -641,11 +657,36 @@ fn failed_launch_blacks_the_panel_from_chart_time_zero() {
     let fx = fault_fixture("#00004:01");
     let _keep = KeepOnFailure::of(&fx, "failed_launch_blacks_the_panel_from_chart_time_zero");
     let text = fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY);
+    let gate = fx.base.join("launch.gate");
+    let reached = fx.base.join("launch.gate.reached");
+    let hold = fx.base.join("preparation.gate");
     let run = run_fault(
         &fx,
         &text,
-        &[("TAPESTRY_DEV_WORKER_CHECK", "mismatch")],
-        |_| {},
+        &[
+            ("TAPESTRY_DEV_WORKER_CHECK", "mismatch"),
+            ("TAPESTRY_DEV_PREPARATION_GATE", hold.to_str().unwrap()),
+        ],
+        |c| {
+            until(c.game, "the first launch past its gate", || {
+                !reached.exists()
+            });
+            fs::write(&hold, b"").unwrap();
+            fs::write(&gate, b"").unwrap();
+            // The second play's launch starts once its preparation has
+            // opened its videos, so its deadline passes within
+            // `PREPARATION` of the launch reaching the gate. A first launch
+            // still under way then fails them itself, and no second one
+            // comes.
+            let first = c.dir.join("c0.json");
+            until(c.game, "the second launch at its gate", || {
+                reached.exists() || first.exists()
+            });
+            if reached.exists() {
+                std::thread::sleep(PREPARATION + Duration::from_millis(500));
+            }
+            fs::remove_file(&gate).unwrap();
+        },
     );
     run.ok();
     assert_eq!(

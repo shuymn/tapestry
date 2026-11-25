@@ -540,6 +540,20 @@ pub struct Movies<S = Movie> {
     lost_marked: bool,
 }
 
+/// Whether the media session holds the preparation deadlines (dev-tools:
+/// a scenario's preparation gate,
+/// [`PREPARATION_HELD`](crate::media_host::session::PREPARATION_HELD)).
+#[cfg(feature = "dev-tools")]
+fn preparation_held() -> bool {
+    crate::media_host::session::PREPARATION_HELD.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Without the development tools, no deadline is held.
+#[cfg(not(feature = "dev-tools"))]
+const fn preparation_held() -> bool {
+    false
+}
+
 /// The chart time of the play frame that first drew the chart's panel
 /// lost, of the play whose chart videos were set last ([`Movies::set_chart`];
 /// dev-tools: a scenario's `chart_lost` capture); `i64::MIN` until one
@@ -648,11 +662,12 @@ impl<S: Source> Movies<S> {
         (settled, shows)
     }
 
-    /// Past the preparation deadline at `now`, every movie not settled is
-    /// lost; then whether every movie is settled. Never waits.
+    /// Past the preparation deadline at `now`, unless the session holds it
+    /// (dev-tools: [`preparation_held`]), every movie not settled is lost;
+    /// then whether every movie is settled. Never waits.
     pub fn settle(&self, now: Instant) -> bool {
         let movies = self.slots.iter().filter_map(|s| s.movie.as_deref());
-        if now >= self.deadline {
+        if now >= self.deadline && !preparation_held() {
             for m in movies.clone() {
                 m.expire();
             }
