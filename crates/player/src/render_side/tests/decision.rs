@@ -2979,8 +2979,8 @@ fn the_built_in_decision_keeps_the_hold() {
 /// page, the first loading frame's hold stays: the reveal lands right
 /// after the takeover's first frame, the refused one, presented, with no
 /// decision frame after it.
-// Revert: the takeover's frame recorded as `Skin` -> a loading page drawn
-// at once.
+// Revert: the refused frame recorded under the decision mode, as the
+// skin's -> a loading page drawn at once.
 #[test]
 fn a_takeover_keeps_the_hold() {
     let dir = skin_dir();

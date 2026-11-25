@@ -9668,9 +9668,6 @@ impl Run {
             // A decision frame that drew its page without a refusal (its
             // lifetime ended): the page mode takes the screen.
             let mut decision_fallback = false;
-            // The decision skin built this frame (a refused one draws the
-            // page in its place: built-in for the hold).
-            let mut decision_skin = false;
             // What a frame of the decision screen drew (dev-tools): the
             // page drawn for it is decided by its record; the skinned
             // screen's frame by its build below.
@@ -10491,7 +10488,6 @@ impl Run {
                     }
                     match built {
                         crate::decision_side::DecisionDrawn::Built => {
-                            decision_skin = true;
                             // Faults due for this frame (dev-tools): an
                             // allocation before the submission, outside the
                             // counted build, and a frame drawn lost.
@@ -10838,10 +10834,12 @@ impl Run {
             }
             if drawn.as_ref().is_ok_and(|(t, _)| t.presented()) {
                 match &mode {
-                    Mode::Decision if decision_skin => {
-                        self.decision_drawn = Some(DecisionDrawnAs::Skin);
-                    }
-                    Mode::Decision => self.decision_drawn = Some(DecisionDrawnAs::BuiltIn),
+                    // Still the decision mode here, the skin built it: a
+                    // frame that drew the page in its place (refused, or
+                    // its lifetime ended) gave the screen to the page mode
+                    // above, so it counts as the page's, built-in for the
+                    // hold.
+                    Mode::Decision => self.decision_drawn = Some(DecisionDrawnAs::Skin),
                     Mode::Menu { loading: None, .. } if self.decision.is_some() => {
                         self.decision_drawn = Some(DecisionDrawnAs::BuiltIn);
                     }
