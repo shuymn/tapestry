@@ -226,9 +226,6 @@ pub struct PlayerRig<'a> {
     /// entry, begun once its chart is read, and taken by the attempt's
     /// preparation, or ended when the choice is left.
     pub early: Option<early::EarlyPrep>,
-    /// The early request handed to the attempt's preparation, until its
-    /// request is sent adopting it.
-    pub early_handoff: Option<early::Handoff>,
     /// The early preparation's admission reads the host's headroom here
     /// ([`crate::priority::System`]; a test's double).
     pub machine: &'static (dyn crate::priority::Machine + Sync),
@@ -584,6 +581,11 @@ pub struct AttemptPrep {
     scratch_notes: Vec<game::ScratchNote>,
     /// Prepared with a pending play skin's specialization.
     specialized: bool,
+    /// The decision screen's early request this attempt adopts, until its
+    /// request is sent adopting it: dropped with the preparation, discarded
+    /// or replaced, which withdraws the early request, so no other attempt
+    /// adopts it or reads its refusal.
+    handoff: Option<early::Handoff>,
     /// When the render thread was asked.
     staging: Instant,
     stage: PrepStage,
@@ -883,7 +885,7 @@ impl PlayerRig<'_> {
         // The early request it adopts; a refusal of its staging published
         // since the reveal ends the attempt with its reason at once (the
         // render thread reported it).
-        let handoff = self.early_handoff.take();
+        let handoff = prep.handoff.take();
         if let Some(h) = &handoff
             && let Some(refusal) = self.render.early_refused(h.request)
         {
@@ -902,15 +904,14 @@ impl PlayerRig<'_> {
         stage
     }
 
-    /// The render thread's refusal of the early request the attempt
-    /// adopts, if one was published: its hand-off dropped with it, so no
-    /// later attempt adopts the request.
-    fn take_early_refused(&mut self) -> Option<game::PreparationRefusal> {
-        let refusal = self
-            .early_handoff
+    /// The render thread's refusal of the early request `prep` adopts, if
+    /// one was published: its hand-off dropped with it.
+    fn take_early_refused(&self, prep: &mut AttemptPrep) -> Option<game::PreparationRefusal> {
+        let refusal = prep
+            .handoff
             .as_ref()
             .and_then(|h| self.render.early_refused(h.request))?;
-        self.early_handoff = None;
+        prep.handoff = None;
         Some(refusal)
     }
 
@@ -1771,7 +1772,12 @@ impl PlayerRig<'_> {
     /// the preparation's polls ([`poll_skin`](Self::poll_skin)). A job's
     /// wait shows the stage line on the loading state, or the preparation
     /// page without one (a retry, a round).
-    fn begin_skin(&mut self, loaded: &Loaded) -> Result<SkinStep, Preparation> {
+    /// The decision screen's early request it adopts goes to `handoff`.
+    fn begin_skin(
+        &mut self,
+        loaded: &Loaded,
+        handoff: &mut Option<early::Handoff>,
+    ) -> Result<SkinStep, Preparation> {
         let Some(mut pending) = self.pending.take() else {
             return Ok(SkinStep::Ready(AttemptSkin::InUse));
         };
@@ -1779,7 +1785,9 @@ impl PlayerRig<'_> {
         // What the decision screen's early preparation built is this
         // attempt's kept specialization, reused below while its facts hold
         // (design.md "Screen Transitions and Loading").
-        if let Some((s, ran)) = self.take_early()
+        let (taken, early) = self.take_early();
+        *handoff = early;
+        if let Some((s, ran)) = taken
             && let Some(took) = ran
         {
             pending.adopt(s, took);
@@ -2865,6 +2873,7 @@ impl Rig for PlayerRig<'_> {
                 images: (std::path::PathBuf::new(), [String::new(), String::new()]),
                 scratch_notes: Vec::new(),
                 specialized: false,
+                handoff: None,
                 staging: Instant::now(),
                 stage: PrepStage::Ended(Preparation::Cancelled),
             });
@@ -2903,6 +2912,7 @@ impl Rig for PlayerRig<'_> {
                 Vec::new()
             },
             specialized: false,
+            handoff: None,
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
         };
@@ -2916,7 +2926,7 @@ impl Rig for PlayerRig<'_> {
         if let Some(s) = &self.selection {
             self.bga.step(Some((&s.coord, s.spawner)), &|| false);
         }
-        prep.stage = match self.begin_skin(loaded) {
+        prep.stage = match self.begin_skin(loaded, &mut prep.handoff) {
             Ok(SkinStep::Ready(skin)) => self.enter_facts(&mut prep, skin),
             Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
             Err(ended) => PrepStage::Ended(ended),
@@ -2957,7 +2967,7 @@ impl Rig for PlayerRig<'_> {
         // since the reveal, ends a stage before the attempt's request at
         // once, the image stage's job settled first.
         if matches!(prep.stage, PrepStage::Facts(_) | PrepStage::Image(..))
-            && let Some(refusal) = self.take_early_refused()
+            && let Some(refusal) = self.take_early_refused(&mut prep)
         {
             if let PrepStage::Image(_, job) = &mut prep.stage {
                 let mut result = std::mem::take(&mut self.result_skin);

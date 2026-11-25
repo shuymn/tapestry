@@ -891,18 +891,23 @@ impl super::PlayerRig<'_> {
     /// The early preparation taken by the attempt's preparation (its
     /// settle, after the reveal): the specialization it ended with, if any,
     /// and how long its job ran (none for a kept one), its job joined to
-    /// its thread's end (the run's end within the stop bound).
-    pub(crate) fn take_early(&mut self) -> Option<(Specialization, Option<Duration>)> {
-        let mut early = self.early.take()?;
+    /// its thread's end (the run's end within the stop bound); and the
+    /// early request sent, handed to the attempt's preparation.
+    pub(crate) fn take_early(
+        &mut self,
+    ) -> (Option<(Specialization, Option<Duration>)>, Option<Handoff>) {
+        let Some(mut early) = self.early.take() else {
+            return (None, None);
+        };
         let ran = early.has_job();
         let taken = early.take_specialized();
         // The early request sent goes to the attempt's request, which
         // adopts its staging when it still fits.
-        self.early_handoff = early.handoff();
+        let handoff = early.handoff();
         if early.join(|| self.run_ends()) {
             log::warn!("early: the import's thread was left to the process's exit");
         }
-        taken.map(|(s, took)| (s, ran.then_some(took)))
+        (taken.map(|(s, took)| (s, ran.then_some(took))), handoff)
     }
 
     /// The choice's early preparation ended (a refusal, a quit, a close, a

@@ -603,7 +603,10 @@ fn a_staging_refusal_ends_a_waiting_preparation() {
             rig.poll_preparation(&mut handle, slice()),
             Ok(game::PrepPoll::Done(game::Preparation::Refused(r))) if r == refused
         ));
-        assert!(rig.early_handoff.is_none(), "the hand-off dropped");
+        assert!(
+            rig.prep.as_ref().is_some_and(|p| p.handoff.is_none()),
+            "the hand-off dropped"
+        );
         assert!(
             rig.result_skin
                 .image()
@@ -617,6 +620,60 @@ fn a_staging_refusal_ends_a_waiting_preparation() {
         );
         rig.discard_attempt();
         rig.left_chart().unwrap();
+    });
+}
+
+/// An attempt adopting early request `e` discarded while it waits in the
+/// result skin's image stage, `e`'s staging refused after its last poll,
+/// then the chart left: the hand-off goes with that preparation, so a
+/// later start with no early gate (a practice Start) is prepared as its
+/// own, never refused with `e`'s reason.
+// Revert: the hand-off kept on the rig past the preparation -> the later
+// start refused with `e`'s reason.
+#[test]
+fn a_discarded_preparation_takes_its_hand_off() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let (_r, rs) = staged_result(LEVEL_RESULT);
+    let (l13, l14) = (at_level(13), at_level(14));
+    let screens = Installers::default();
+    on_rig(l13.chart(), &screens, true, |rig| {
+        rig.result_skin = rs;
+        let gate = decided(rig, skin);
+        let link = crate::play::early::EarlyLink::new(rig.render.early_sender());
+        rig.early = rig.early.take().map(|e| e.with_link(link));
+        rig.render
+            .show_decision(crate::render_side::tests::one_line("page"), None);
+        screens.early_room.store(1, SeqCst);
+        rig.chart_read(&l13);
+        until("the specialization ended", || {
+            state(&gate) == "ended specialized"
+        });
+        rig.step_early();
+        let e = gate.request().expect("the early request sent");
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        let mut first = begin(rig, &l13);
+        assert_eq!(stage(rig), "image");
+        let slice = || Instant::now() + Duration::from_millis(10);
+        assert!(matches!(
+            rig.poll_preparation(&mut first, slice()),
+            Ok(game::PrepPoll::Pending)
+        ));
+        // Refused after the attempt's last poll; the attempt discarded and
+        // the chart left.
+        screens.early_room.store(3, SeqCst);
+        until("the early staging refused", || {
+            rig.render.early_refused(e).is_some()
+        });
+        rig.discard_attempt();
+        rig.left_chart().unwrap();
+        screens.early_room.store(0, SeqCst);
+        assert!(rig.early.is_none(), "no early gate");
+        let mut later = begin(rig, &l14);
+        assert_eq!(polled(rig, &mut later).unwrap(), game::Preparation::Ready);
+        rig.discard_attempt();
     });
 }
 

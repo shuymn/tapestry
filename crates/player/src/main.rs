@@ -991,7 +991,6 @@ fn rig<'a>(
         skin: render_side::SkinState::Ready,
         pending: None,
         early: None,
-        early_handoff: None,
         machine: &crate::priority::System,
         chart_images,
         bga,
