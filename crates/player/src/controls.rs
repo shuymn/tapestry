@@ -473,10 +473,13 @@ impl Controls {
         }
         let lifetime = w.decision.lifetime();
         // The early preparation served, and a refusal it published
-        // classified with: latched here, before the deadline.
+        // classified with: latched here, before the deadline; after the
+        // reveal, the render thread's refusal of the early staging the
+        // attempt would adopt ends the load at once.
         let refused = w.early.as_ref().and_then(|e| {
             (e.step)(&e.gate);
-            e.gate.refused().map(|_| game::Reply::Refusal)
+            (e.gate.refused().is_some() || e.gate.late_refused().is_some())
+                .then_some(game::Reply::Refusal)
         });
         let mut seen = w.decision.classify(w.origin, now, terminal, false, refused);
         if seen == game::Verdict::Step {

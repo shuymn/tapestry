@@ -4295,9 +4295,12 @@ impl AppRig for PlayerRig<'_> {
         self.begin_early(loaded);
     }
 
-    /// The early preparation's refusal published before the reveal.
+    /// The early preparation's refusal published before the reveal, or
+    /// the render thread's refusal of its staging published after it.
     fn early_refusal(&self) -> Option<game::PreparationRefusal> {
-        self.early.as_ref().and_then(|e| e.gate().refused())
+        self.early
+            .as_ref()
+            .and_then(|e| e.gate().refused().or_else(|| e.gate().late_refused()))
     }
 
     /// The play's deadline: the loading state's tuning epoch, the input

@@ -319,6 +319,26 @@ impl<S> EarlyGate<S> {
         }
     }
 
+    /// The render thread's refusal of the early request sent, published
+    /// after the reveal: the attempt adopting the request would end with
+    /// it, so the load's looks and the preparation's polls end with it at
+    /// once. None before the reveal ([`refused`](Self::refused) reads that
+    /// one), and none after a job cancelled at the reveal, which sent no
+    /// request.
+    pub fn late_refused(&self) -> Option<PreparationRefusal> {
+        let inner = self.lock();
+        if !matches!(inner.state, State::Revealed(_)) {
+            return None;
+        }
+        let request = inner.request?;
+        let cell = self.render.as_ref()?;
+        let published = cell.lock().unwrap_or_else(PoisonError::into_inner);
+        published
+            .as_ref()
+            .filter(|(r, _)| *r == request)
+            .map(|(_, refusal)| refusal.clone())
+    }
+
     /// The specialization the gate ended with, taken for Preparing, before
     /// or after the reveal, whether or not anything looked at the gate
     /// after the worker published it.

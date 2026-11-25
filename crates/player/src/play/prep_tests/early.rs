@@ -473,6 +473,116 @@ fn a_staging_refusal_after_the_reveal_returns_at_once() {
     });
 }
 
+/// An early staging refused after a load wait's reveal, the chart's load
+/// still waited for: the load's next look returns with the reason, which
+/// App's route reads, before the bank's load ends and with no attempt
+/// begun.
+// Revert: the late refusal not read by the look -> the look goes on.
+#[test]
+fn a_staging_refusal_after_a_load_wait_reveal_ends_the_load() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let l = at_level(13);
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, true, |rig| {
+        let gate = decided(rig, skin);
+        let link = crate::play::early::EarlyLink::new(rig.render.early_sender());
+        rig.early = rig.early.take().map(|e| e.with_link(link));
+        rig.render
+            .show_decision(crate::render_side::tests::one_line("page"), None);
+        screens.early_room.store(1, SeqCst);
+        rig.chart_read(&l);
+        until("the specialization ended", || {
+            state(&gate) == "ended specialized"
+        });
+        rig.step_early();
+        let request = gate.request().expect("the early request sent");
+        let reveals = Arc::new(AtomicUsize::new(0));
+        watch_past(rig, &reveals);
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Step));
+        assert_eq!(reveals.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Continue));
+        assert_eq!(rig.early_refusal(), None);
+        // Refused while the load's looks go on.
+        screens.early_room.store(3, SeqCst);
+        until("the early staging refused", || {
+            rig.render.early_refused(request).is_some()
+        });
+        assert_eq!(rig.controls.look(), Some(game::Verdict::Return));
+        let d = rig.controls.unwatch_decision().unwrap();
+        assert!(d.stepped());
+        assert_eq!(rig.early_refusal(), rig.render.early_refused(request));
+        assert!(rig.prep.is_none(), "no attempt begun");
+        rig.left_chart().unwrap();
+    });
+}
+
+/// An early staging refused after the reveal while the attempt's
+/// preparation waits in the result skin's image stage (its script loops
+/// until cancelled) ends it at that poll with the reason: the image
+/// stage settled, its images handed back, and the attempt's request never
+/// sent.
+// Revert: the polls' check removed -> the preparation goes on waiting.
+#[test]
+fn a_staging_refusal_ends_a_waiting_preparation() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let _serial = imports::serial();
+    let (_dir, skin) = pending_play(LEVEL_SKIN);
+    let (_r, rs) = staged_result(LEVEL_RESULT);
+    let first = Arc::clone(rs.image().unwrap());
+    let l = at_level(13);
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, true, |rig| {
+        rig.result_skin = rs;
+        let gate = decided(rig, skin);
+        let link = crate::play::early::EarlyLink::new(rig.render.early_sender());
+        rig.early = rig.early.take().map(|e| e.with_link(link));
+        rig.render
+            .show_decision(crate::render_side::tests::one_line("page"), None);
+        screens.early_room.store(1, SeqCst);
+        rig.chart_read(&l);
+        until("the specialization ended", || {
+            state(&gate) == "ended specialized"
+        });
+        rig.step_early();
+        let request = gate.request().expect("the early request sent");
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Stepped);
+        let mut handle = begin(rig, &l);
+        assert_eq!(stage(rig), "image");
+        let slice = || Instant::now() + Duration::from_millis(10);
+        assert!(matches!(
+            rig.poll_preparation(&mut handle, slice()),
+            Ok(game::PrepPoll::Pending)
+        ));
+        screens.early_room.store(3, SeqCst);
+        until("the early staging refused", || {
+            rig.render.early_refused(request).is_some()
+        });
+        let refused = rig.render.early_refused(request).unwrap();
+        assert!(matches!(
+            rig.poll_preparation(&mut handle, slice()),
+            Ok(game::PrepPoll::Done(game::Preparation::Refused(r))) if r == refused
+        ));
+        assert!(rig.early_handoff.is_none(), "the hand-off dropped");
+        assert!(
+            rig.result_skin
+                .image()
+                .is_some_and(|i| Arc::ptr_eq(i, &first)),
+            "its images handed back"
+        );
+        assert!(
+            !screens.log().iter().any(|s| s.contains(" prepare ")),
+            "{:?}",
+            screens.log()
+        );
+        rig.discard_attempt();
+        rig.left_chart().unwrap();
+    });
+}
+
 /// B5e (player): an attempt adopting an early request whose staging
 /// released the result begins no result pages upload (the result's step
 /// reconciles the release); without the release its pages ticket begins.

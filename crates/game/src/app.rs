@@ -207,8 +207,10 @@ pub trait AppRig: LoadingRig {
     /// A refusal of the play's preparation begun at the read, published
     /// before the deadline's reveal: every look of App's reads it as a
     /// refusal ([`Reply::Refusal`]), held to the deadline, and the flow
-    /// returns with it ([`Refused::Preparation`]). None by default, and
-    /// none once the reveal was committed.
+    /// returns with it ([`Refused::Preparation`]). After the reveal, the
+    /// refusal of that preparation's staging, published while the chart's
+    /// load runs: the load's look returns ([`Verdict::Return`]) and the
+    /// flow returns with it the same way. None by default.
     fn early_refusal(&self) -> Option<PreparationRefusal> {
         None
     }

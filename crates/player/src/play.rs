@@ -902,6 +902,18 @@ impl PlayerRig<'_> {
         stage
     }
 
+    /// The render thread's refusal of the early request the attempt
+    /// adopts, if one was published: its hand-off dropped with it, so no
+    /// later attempt adopts the request.
+    fn take_early_refused(&mut self) -> Option<game::PreparationRefusal> {
+        let refusal = self
+            .early_handoff
+            .as_ref()
+            .and_then(|h| self.render.early_refused(h.request))?;
+        self.early_handoff = None;
+        Some(refusal)
+    }
+
     /// The attempt's own result pages ticket (design.md "Memory Budget",
     /// the result pages upload, §5.1's step 3): begun when the attempt's
     /// result names pages whose atlas the result status does not name as
@@ -2940,6 +2952,19 @@ impl Rig for PlayerRig<'_> {
             let publisher = self.render.chart_publisher();
             self.chart_images.step(coord, &|| false, Some(&publisher));
             let _ = self.chart_images.publish(&self.render, None);
+        }
+        // A refusal of the early staging this attempt adopts, published
+        // since the reveal, ends a stage before the attempt's request at
+        // once, the image stage's job settled first.
+        if matches!(prep.stage, PrepStage::Facts(_) | PrepStage::Image(..))
+            && let Some(refusal) = self.take_early_refused()
+        {
+            if let PrepStage::Image(_, job) = &mut prep.stage {
+                let mut result = std::mem::take(&mut self.result_skin);
+                let _ = result.settle_image_stage(job, || self.run_ends());
+                self.result_skin = result;
+            }
+            prep.stage = PrepStage::Ended(Preparation::Refused(refusal));
         }
         let polled = loop {
             match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
