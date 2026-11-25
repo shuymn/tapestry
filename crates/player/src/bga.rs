@@ -325,6 +325,34 @@ impl Drop for Manifest {
     }
 }
 
+/// The chart folder whose unresolved names were logged last, and those
+/// names: a later attempt of the same folder logs only names not logged
+/// yet.
+static UNRESOLVED_LOGGED: Mutex<Option<(PathBuf, Vec<String>)>> = Mutex::new(None);
+
+/// Logs each of `want`'s names that resolves to no file it may read
+/// (`bindings`, in its order), a picture's or a video's, with its reason:
+/// once per name while its chart's folder stays the one resolved.
+fn log_unresolved(want: &Want, bindings: &[BgaBinding]) {
+    let mut logged = UNRESOLVED_LOGGED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if logged.as_ref().is_none_or(|(dir, _)| *dir != want.dir) {
+        *logged = Some((want.dir.clone(), Vec::new()));
+    }
+    let Some((_, names)) = &mut *logged else {
+        return;
+    };
+    for (name, binding) in want.names.iter().zip(bindings) {
+        if let BgaBinding::Unresolved(why) = binding
+            && !names.contains(name)
+        {
+            log::warn!("bga: {name} is absent: {why}");
+            names.push(name.clone());
+        }
+    }
+}
+
 /// Opens the video at canonical `path` read-only and checks its handle: its
 /// final path must be the canonical path the folder check passed, so a
 /// name swapped for a link between the check and the open is refused.
@@ -723,6 +751,7 @@ fn read_and_publish(
         .iter()
         .map(|name| bga::resolve(&dir, name, identity))
         .collect();
+    log_unresolved(want, &bindings);
     if cancel() {
         return out;
     }

@@ -10,7 +10,8 @@
 //!   in order, its own extension replaced; any other existing name is used
 //!   as written; a missing name is searched for with the video extensions,
 //!   then the picture ones. Every candidate passes the chart images' name
-//!   rules and containment (T08, [`chart_image`](crate::chart_image)).
+//!   rules and containment (T08, [`chart_image`](crate::chart_image)) and
+//!   their file cap, a video's own ([`MAX_VIDEO_FILE_BYTES`]) in its place.
 //! - **Pictures** ([`probe`], [`read_cell`]: [`read_picture`] then
 //!   [`ReadPicture::cell`]): PNG, JPEG and BMP within the
 //!   chart images' caps; the decoded texels are premultiplied, a picture
@@ -47,8 +48,15 @@ use crate::chart_image::{
 };
 use crate::image::decode::{self, Mode, Site};
 use crate::image::path::{self, PathError};
-use crate::image::{MAX_IMAGE_TEXELS, MAX_PATH_BYTES, MAX_SIDE};
+use crate::image::{MAX_FILE_BYTES, MAX_IMAGE_TEXELS, MAX_PATH_BYTES, MAX_SIDE};
 use crate::place::Native;
+
+/// The largest file a name may resolve to by a video extension
+/// (provisional), in place of a picture's [`MAX_FILE_BYTES`]: the game
+/// reads none of a video, and the media worker reads it through its handle
+/// (design.md "Threat Model" T02). A video over it is absent
+/// ([`Unresolved::VideoTooLarge`]).
+pub const MAX_VIDEO_FILE_BYTES: u64 = 4 << 30;
 
 /// The side of the canvas a small picture is drawn on, and the longest
 /// side a picture drawn on it may have.
@@ -130,24 +138,51 @@ fn stem(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
+/// Whether `name`'s extension is a video's.
+fn is_video(name: &str) -> bool {
+    extension(name).is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
+}
+
 /// Resolves the `#BMPxx` name `name` in `dir` by the source's format
 /// priority (see the module) and observes the file it leads to, reading
-/// nothing.
+/// nothing: a file of at most [`MAX_FILE_BYTES`], or
+/// [`MAX_VIDEO_FILE_BYTES`] when it is found by a video extension.
 #[must_use]
 pub fn resolve(dir: &ChartDir, name: &str, identity: Identity<'_>) -> BgaBinding {
+    resolve_capped(dir, name, identity, MAX_VIDEO_FILE_BYTES)
+}
+
+/// [`resolve`] with `video_cap` as a video's file cap.
+fn resolve_capped(
+    dir: &ChartDir,
+    name: &str,
+    identity: Identity<'_>,
+    video_cap: u64,
+) -> BgaBinding {
     let name = name.trim();
     if name.len() > MAX_PATH_BYTES {
         return BgaBinding::Unresolved(Unresolved::Overlong);
     }
     let name = name.replace('\\', "/");
+    let cap = |candidate: &str| {
+        if is_video(candidate) {
+            video_cap
+        } else {
+            MAX_FILE_BYTES
+        }
+    };
+    let refused = |e: PathError, video: bool| match e {
+        PathError::TooLarge if video => Unresolved::VideoTooLarge,
+        e => e.into(),
+    };
     // The first candidate that exists, or a refusal that ends the search.
     let first =
         |candidates: &mut dyn Iterator<Item = String>| -> Option<Result<PathBuf, Unresolved>> {
             for c in candidates {
-                match path::resolve(dir.path(), &c) {
+                match path::resolve_within(dir.path(), &c, cap(&c)) {
                     Ok((canonical, _)) => return Some(Ok(canonical)),
                     Err(PathError::Missing) => {}
-                    Err(e) => return Some(Err(e.into())),
+                    Err(e) => return Some(Err(refused(e, is_video(&c)))),
                 }
             }
             None
@@ -156,7 +191,7 @@ pub fn resolve(dir: &ChartDir, name: &str, identity: Identity<'_>) -> BgaBinding
         let base = base.to_owned();
         exts.iter().map(move |e| format!("{base}.{e}"))
     };
-    let found = match path::resolve(dir.path(), &name) {
+    let found = match path::resolve_within(dir.path(), &name, cap(&name)) {
         Ok((written, _)) => match extension(&name) {
             Some(ext) if VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
                 first(&mut with(&VIDEO_EXTENSIONS, stem(&name))).or(Some(Ok(written)))
@@ -169,7 +204,7 @@ pub fn resolve(dir: &ChartDir, name: &str, identity: Identity<'_>) -> BgaBinding
             None => None,
         },
         Err(PathError::Missing) => None,
-        Err(e) => return BgaBinding::Unresolved(e.into()),
+        Err(e) => return BgaBinding::Unresolved(refused(e, is_video(&name))),
     };
     let found = found.or_else(|| {
         let base = stem(&name);
@@ -183,15 +218,15 @@ pub fn resolve(dir: &ChartDir, name: &str, identity: Identity<'_>) -> BgaBinding
     let video = canonical
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(extension)
-        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()));
-    match chart_image::observe(&canonical, identity) {
+        .is_some_and(is_video);
+    let cap = if video { video_cap } else { MAX_FILE_BYTES };
+    match chart_image::observe_within(&canonical, identity, cap) {
         Ok((_, key)) => BgaBinding::Resolved {
             path: canonical,
             key,
             video,
         },
-        Err(e) => BgaBinding::Unresolved(e.into()),
+        Err(e) => BgaBinding::Unresolved(refused(e, video)),
     }
 }
 
@@ -1010,6 +1045,30 @@ pub const SOLID: FrameUv = FrameUv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A video over its cap (a cap of 16 bytes here, standing for
+    /// [`MAX_VIDEO_FILE_BYTES`]) is refused as a video too large, found as
+    /// written or by the video extensions' search; one at the cap resolves.
+    #[test]
+    fn a_video_over_its_cap_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("at.mp4"), [0; 16]).unwrap();
+        std::fs::write(d.path().join("over.mp4"), [0; 17]).unwrap();
+        let dir = ChartDir::new(d.path()).unwrap();
+        let identity: Identity<'_> = &|_| Some(chart_image::FileIdentity(1));
+        let resolve = |name| resolve_capped(&dir, name, identity, 16);
+        assert!(matches!(
+            resolve("at.mp4"),
+            BgaBinding::Resolved { video: true, .. }
+        ));
+        for name in ["over.mp4", "over.mpg", "over"] {
+            assert_eq!(
+                resolve(name),
+                BgaBinding::Unresolved(Unresolved::VideoTooLarge),
+                "{name}"
+            );
+        }
+    }
 
     fn uv() -> FrameUv {
         FrameUv {

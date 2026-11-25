@@ -232,6 +232,15 @@ pub struct Figures {
     /// decision screen preceded the play.
     #[cfg(feature = "dev-tools")]
     pub decision: Option<DecisionRecord>,
+    /// The movie hooks' work during the play (dev-tools): each slot's
+    /// frames taken into its planes, the chart videos' restarts, and the
+    /// frames taken from a restarted run.
+    #[cfg(feature = "dev-tools")]
+    pub movies: Option<([u64; skin_model::movie::SLOTS], u64, u64)>,
+    /// How late each chart slot's picture was during the play (dev-tools:
+    /// [`crate::movie_frame::counts`]); read once the play ended.
+    #[cfg(feature = "dev-tools")]
+    pub chart_lag: Option<crate::movie_frame::counts::Lags>,
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
@@ -1027,6 +1036,9 @@ pub struct Measure {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     decision: Option<DecisionRecord>,
+    /// The movie hooks' counts when the play started (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    movies_base: ([u64; skin_model::movie::SLOTS], u64, u64),
 }
 
 impl Measure {
@@ -1083,6 +1095,8 @@ impl Measure {
             allocate_in_frames: false,
             #[cfg(feature = "dev-tools")]
             decision: None,
+            #[cfg(feature = "dev-tools")]
+            movies_base: ([0; skin_model::movie::SLOTS], 0, 0),
         }
     }
 
@@ -1112,6 +1126,11 @@ impl Measure {
         self.measured_qpc = None;
         self.alloc_base = allocations();
         self.app_base = app_allocations();
+        #[cfg(feature = "dev-tools")]
+        {
+            self.movies_base = crate::movie_frame::counts::now();
+            crate::movie_frame::counts::lag_reset();
+        }
         if let (Some(audio), Some(q)) = (self.audio.as_mut(), play.queued_periods) {
             audio.queued_periods = Some(q);
         }
@@ -1214,6 +1233,8 @@ impl Measure {
             presentation: self.presentation,
             #[cfg(feature = "dev-tools")]
             present_times: None,
+            #[cfg(feature = "dev-tools")]
+            chart_lag: None,
             span: (start, end),
             presents: self.presents.saturating_sub(after_end),
             allocations: allocations().zip(self.alloc_base).map(|(now, base)| {
@@ -1228,6 +1249,20 @@ impl Measure {
                 .map(|(now, base)| now.saturating_sub(base)),
             #[cfg(feature = "dev-tools")]
             decision: self.decision,
+            #[cfg(feature = "dev-tools")]
+            movies: {
+                let ((takes, restarts, again), (base, base_restarts, base_again)) =
+                    (crate::movie_frame::counts::now(), self.movies_base);
+                let mut since = takes;
+                for (t, b) in since.iter_mut().zip(base) {
+                    *t = t.saturating_sub(b);
+                }
+                Some((
+                    since,
+                    restarts.saturating_sub(base_restarts),
+                    again.saturating_sub(base_again),
+                ))
+            },
             steps_dropped: 0,
             ready_state: self.play.as_ref().map(|p| ReadyState {
                 setup_us: p.started.0 - p.ready_state_at.0,
@@ -1274,6 +1309,7 @@ impl Measure {
         {
             let kept = self.present_log.capacity() > 0 && !self.present_log_full;
             fig.present_times = kept.then(|| self.present_log.clone());
+            fig.chart_lag = Some(crate::movie_frame::counts::lags());
         }
         self.play = None;
         Some(fig)
@@ -1567,6 +1603,36 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
         if let Some(d) = &fig.decision {
             let _ = writeln!(out, "decision_app = {}", d.app);
         }
+    }
+    #[cfg(feature = "dev-tools")]
+    if let Some((takes, restarts, again)) = &fig.movies {
+        let takes: Vec<String> = takes.iter().map(u64::to_string).collect();
+        let _ = writeln!(
+            out,
+            "\n[movies]\ntakes = [{}]\nrestarts = {restarts}\nrestarted_takes = {again}",
+            takes.join(", ")
+        );
+    }
+    #[cfg(feature = "dev-tools")]
+    if let Some(lags) = &fig.chart_lag {
+        let largest: Vec<String> = lags
+            .largest
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.map(|(at, lag)| format!("[{i}, {at}, {lag}]")))
+            .collect();
+        let samples: Vec<String> = lags
+            .samples
+            .iter()
+            .map(|[i, at, due, stamp]| format!("[{i}, {at}, {due}, {stamp}]"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "\n[chart_lag]\nlargest = [{}]\nover = {}\nsamples = [{}]",
+            largest.join(", "),
+            lags.over,
+            samples.join(", ")
+        );
     }
     #[cfg(feature = "dev-tools")]
     if let Some(d) = &fig.decision {

@@ -3157,11 +3157,18 @@ static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
 /// last end of each, and the points, until READY ends the record; and the
 /// BGA job's time busy reading and decoding in all (`*_busy`, durations
 /// in µs), which its spans cannot tell apart where the pictures' reads
-/// and decodes alternate.
+/// and decodes alternate. The media session stamps the media worker's
+/// launch, when the load launches one, from its hand-off to its thread to
+/// the launch's result, and its chart videos' probes, from the first open
+/// handed to the worker to the last open's answer (probed, refused or
+/// rejected); a step stamps only into the load it began in, so one a
+/// later choice left behind stamps nothing into the next.
 #[derive(Debug, Default)]
 struct LoadStages {
     /// The game's clock and the choice's time on it, from the choice on.
     since: Option<(QpcClock, TimeUs)>,
+    /// The choices so far: the load the stamps belong to.
+    load: u64,
     stamps: Vec<(&'static str, i64)>,
     /// READY was stamped: nothing more until the next choice.
     done: bool,
@@ -3169,12 +3176,13 @@ struct LoadStages {
 
 static LOAD_STAGES: Mutex<LoadStages> = Mutex::new(LoadStages {
     since: None,
+    load: 0,
     stamps: Vec::new(),
     done: false,
 });
 
 /// The order `[load_stages]` lists its keys in.
-pub const LOAD_STAGE_KEYS: [&str; 21] = [
+pub const LOAD_STAGE_KEYS: [&str; 25] = [
     "chart_start",
     "chart_end",
     "sounds_start",
@@ -3193,6 +3201,10 @@ pub const LOAD_STAGE_KEYS: [&str; 21] = [
     "bga_decodes_busy",
     "bga_upload_start",
     "bga_upload_end",
+    "media_launch_start",
+    "media_launch_end",
+    "video_probes_start",
+    "video_probes_end",
     "decision_end",
     "minimum_end",
     "ready",
@@ -3206,6 +3218,7 @@ fn load_stages() -> std::sync::MutexGuard<'static, LoadStages> {
 pub fn stages_begin(clock: QpcClock, chosen: TimeUs) {
     let mut s = load_stages();
     s.since = Some((clock, chosen));
+    s.load = s.load.wrapping_add(1);
     s.stamps.clear();
     s.done = false;
 }
@@ -3215,10 +3228,34 @@ pub fn stage(name: &'static str) {
     stage_at(name, None);
 }
 
+/// The load whose stages are stamped now: a step that begins now stamps
+/// into it ([`stage_of`]).
+pub fn current_load() -> u64 {
+    load_stages().load
+}
+
+/// Stamps stage `name` now into load `load`, the one a step began in
+/// ([`current_load`]): nothing when a later choice has begun another, so
+/// a step of a load left behind stamps nothing into the next. The check
+/// and the stamp are one step under the stages' lock, so a choice that
+/// begins meanwhile waits for the stamp.
+pub fn stage_of(name: &'static str, load: u64) {
+    let mut s = load_stages();
+    if s.load == load {
+        #[cfg(test)]
+        tests::checked();
+        stamp(&mut s, name, None);
+    }
+}
+
 /// Stamps stage `name` at `at` (now when `None`): a start keeps its first
 /// stamp, anything else its last.
 pub fn stage_at(name: &'static str, at: Option<TimeUs>) {
-    let mut s = load_stages();
+    stamp(&mut load_stages(), name, at);
+}
+
+/// [`stage_at`] on the stages `s` the caller holds.
+fn stamp(s: &mut LoadStages, name: &'static str, at: Option<TimeUs>) {
     let Some((clock, chosen)) = s.since else {
         return;
     };
@@ -3247,6 +3284,27 @@ pub fn stage_busy(name: &'static str, took: Duration) {
         Some((_, v)) => *v = v.saturating_add(us),
         None => s.stamps.push((name, us)),
     }
+}
+
+/// The media session's observer ([`crate::media_host::session::OBSERVER`]):
+/// each video it loses is a transition probe mark `media:lost` whose value
+/// is the loss's reason ([`crate::media_host::session::Loss`] as a number),
+/// plus 256 for a chart video's, on the game's clock when the session saw
+/// it; the worker's launch and the chart videos' probes are load stages.
+pub fn observe_media() {
+    use crate::media_host::session::{OBSERVER, Observer};
+    let _ = OBSERVER.set(Observer {
+        now: || loop_probe::stamp().map(|t| t.0),
+        lost: |why, chart, at| {
+            let v = why as i64 + if chart { 256 } else { 0 };
+            match at {
+                Some(at) => loop_probe::mark_at("media:lost", TimeUs(at), v),
+                None => loop_probe::mark("media:lost", v),
+            }
+        },
+        stage: stage_of,
+        load: current_load,
+    });
 }
 
 /// The coordinator's jobs' stages ([`game::coord::observe_jobs`]).
@@ -3577,7 +3635,83 @@ pub fn refuse_result_staging() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Mutex, PoisonError, TryLockError};
+    use std::time::Duration;
+
     use super::{adler32, crc32, png, read_bounded, read_limited};
+
+    /// The pause [`super::stage_of`] takes once, after its load check
+    /// passed, when a test set it: it says so, then waits to go on.
+    static PAUSE: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+    pub(super) fn checked() {
+        let pause = PAUSE.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some((checked, go)) = pause {
+            let _ = checked.send(());
+            let _ = go.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
+    /// A choice begun while a stage of the load before is being stamped
+    /// takes none of it: paused between its load check and its stamp, the
+    /// stamp still holds the stages, so the choice begins after it.
+    #[test]
+    fn a_choice_begun_during_a_stamp_takes_none_of_it() {
+        use super::{QpcClock, TimeSource as _, current_load, stage_of, stages_begin};
+        let clock = QpcClock::start();
+        stages_begin(clock, clock.now());
+        let before = current_load();
+        let (checked_tx, checked_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        *PAUSE.lock().unwrap() = Some((checked_tx, go_rx));
+        let stamping = std::thread::spawn(move || stage_of("media_launch_end", before));
+        checked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the load check");
+        // Let go after the check, the stages are free: the choice begins
+        // between the check and the stamp.
+        let held = matches!(super::LOAD_STAGES.try_lock(), Err(TryLockError::WouldBlock));
+        if !held {
+            stages_begin(clock, clock.now());
+        }
+        go_tx.send(()).unwrap();
+        stamping.join().unwrap();
+        if held {
+            stages_begin(clock, clock.now());
+        }
+        stage_of("ready", current_load());
+        let names: Vec<&str> = super::take_load_stages()
+            .unwrap()
+            .iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, ["ready"]);
+    }
+
+    /// A stage stamped for a load a later choice has left behind is not
+    /// kept: a launch handed off for one choice and ended after the next
+    /// stamps nothing into the next's stages, whose own stamps are kept.
+    #[test]
+    fn a_stage_of_an_abandoned_load_is_dropped() {
+        use super::{QpcClock, TimeSource as _, current_load, stage_of, stages_begin};
+        let clock = QpcClock::start();
+        stages_begin(clock, clock.now());
+        let abandoned = current_load();
+        stage_of("media_launch_start", abandoned);
+        stages_begin(clock, clock.now());
+        let load = current_load();
+        assert_ne!(load, abandoned);
+        stage_of("media_launch_end", abandoned);
+        stage_of("video_probes_start", load);
+        stage_of("ready", load);
+        let names: Vec<&str> = super::take_load_stages()
+            .unwrap()
+            .iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, ["video_probes_start", "ready"]);
+    }
 
     /// A frame's spans count each part once: the preparation before the
     /// wait and the window up to the build less the runtime, the runtime,
