@@ -96,6 +96,34 @@ pub struct MediaHub {
     asked: std::sync::Mutex<Vec<(u64, bool, bool)>>,
 }
 
+/// The worker's development faults (dev-tools): `TAPESTRY_DEV_WORKER_ARGS`
+/// passes it arguments (whitespace-separated, such as `--dev-serve fire
+/// freeze=mjpeg:decoding`), and `TAPESTRY_DEV_WORKER_CHECK=mismatch` makes
+/// its launch's self-check expect a job without the one-process limit the
+/// recipe applies, so the check reads the job's flags back as a mismatch
+/// and the launch fails.
+#[cfg(feature = "dev-tools")]
+fn dev_setup(setup: Setup) -> Setup {
+    let args = std::env::var("TAPESTRY_DEV_WORKER_ARGS").unwrap_or_default();
+    let args: Vec<&str> = args.split_whitespace().collect();
+    let setup = if args.is_empty() {
+        setup
+    } else {
+        setup.args_of(&args)
+    };
+    if std::env::var("TAPESTRY_DEV_WORKER_CHECK").is_ok_and(|v| v == "mismatch") {
+        use crate::media_host::launch::Restrictions;
+        setup.expecting(Restrictions::RECIPE.without(Restrictions::ONE_PROCESS))
+    } else {
+        setup
+    }
+}
+
+#[cfg(not(feature = "dev-tools"))]
+const fn dev_setup(setup: Setup) -> Setup {
+    setup
+}
+
 impl MediaHub {
     /// The hub of a run whose worker is installed beside the running
     /// executable and stages its copies in the data folder `data`.
@@ -109,7 +137,7 @@ impl MediaHub {
         Self::with(installation.map(|installation| Launching {
             installation,
             data: data.to_path_buf(),
-            setup: Setup::recipe(),
+            setup: dev_setup(Setup::recipe()),
         }))
     }
 

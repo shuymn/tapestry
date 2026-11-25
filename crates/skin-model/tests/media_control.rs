@@ -34,6 +34,8 @@ fn commands() -> Vec<(u32, Command)> {
         },
         Command::Close { player: 77 },
         Command::Quit,
+        #[cfg(feature = "dev-tools")]
+        Command::Fire,
     ];
     (1..)
         .zip(all)
@@ -132,6 +134,10 @@ fn replies() -> Vec<Reply> {
             code: -12 - i32::try_from(i).unwrap(),
         });
     }
+    #[cfg(feature = "dev-tools")]
+    all.push(Reply::Fired {
+        qpc: -0x0123_4567_89ab,
+    });
     all
 }
 

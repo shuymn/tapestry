@@ -128,7 +128,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 event_handle(event);
             }
             Command::Quit => break,
-            Command::Seek { .. } | Command::Close { .. } => {}
+            Command::Seek { .. } | Command::Close { .. } | Command::Fire => {}
         }
         crate::say("probe done");
     }
