@@ -12219,7 +12219,7 @@ impl Run {
                             self.reconcile_result();
                         }
                         Err(e) if e.is_refusal() => self.refuse_early(game::Chain(&e).to_string()),
-                        Err(_) => self.lose_early_screen(),
+                        Err(e) => self.lose_early_screen(&e),
                     }
                 }
                 render::EarlyRoom::Refused => {
@@ -12260,20 +12260,24 @@ impl Run {
             }
             Ok(None) => {}
             Err(e) if e.is_refusal() => self.refuse_early(game::Chain(&e).to_string()),
-            Err(_) => self.lose_early_screen(),
+            Err(e) => self.lose_early_screen(&e),
         }
     }
 
-    /// The early staging's device failed: no refusal, its ticket left
-    /// open, the screen dropped to be built again, where it is restaged.
-    fn lose_early_screen(&mut self) {
+    /// The early staging's device failed (`e`): no refusal, its ticket
+    /// left open, the failure reported and latched, and the screen dropped
+    /// to be built again, where it is restaged.
+    fn lose_early_screen(&mut self, e: &RenderError) {
         if let Some(r) = &mut self.early {
             r.taken = false;
             r.answered = None;
             r.device = 0;
         }
+        self.shared
+            .report_failure(format_args!("render: {}", Chain(e)));
         self.drop_screen();
         self.granted = false;
+        self.shared.latch_failed();
     }
 
     /// The early staging refused for `why`, a genuine refusal: its record
@@ -22314,6 +22318,12 @@ pub(crate) mod tests {
                     reason: "early refused (test)".to_owned(),
                 }));
             }
+            let lose = self.shared.lose_early.load(Ordering::Acquire);
+            if lose > 0 {
+                self.shared.lose_early.store(lose - 1, Ordering::Release);
+                self.note(&format!("lose early {request}"));
+                return Err(RenderError::DeviceLost);
+            }
             let hold = self.shared.hold_staged.load(Ordering::Acquire) == request;
             if self.staged_token.is_none_or(|t| t.request != request) {
                 self.note(&format!("early {request}"));
@@ -22566,6 +22576,8 @@ pub(crate) mod tests {
         pub(crate) early_room: Arc<std::sync::atomic::AtomicU8>,
         /// Early stagings are refused as a skin refuses them while set.
         pub(crate) refuse_early: Arc<AtomicBool>,
+        /// This many early stagings fail as a lost device.
+        pub(crate) lose_early: Arc<AtomicU32>,
         /// Each loading text asked: its lifetime and the staging's request
         /// it is for (none: the installed skin); noted only while the
         /// vector has room (a test reserves it), so noting never

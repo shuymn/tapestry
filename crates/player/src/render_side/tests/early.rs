@@ -297,6 +297,28 @@ fn a_lost_device_before_the_answer_restages() {
     link.exit();
 }
 
+/// A device lost in the early staging's own call is no refusal: the
+/// failure is latched for the flow's recovery, the ticket left open, and
+/// the staging restaged and answered on the screen built again.
+// Revert: the latch removed -> no failure seen.
+#[test]
+fn a_loss_in_the_early_staging_is_latched() {
+    let (_chart, screens, link, _lifetime) = held();
+    screens.lose_early.store(1, SeqCst);
+    let mut ticket = early(&link, &bundle());
+    let e = ticket.request();
+    assert!(wait_until(|| link.failed()), "{:?}", screens.log());
+    assert!(noted(&screens, &format!("lose early {e}")));
+    assert!(ticket.try_answer().is_none(), "the ticket left open");
+    assert_eq!(link.early_refused(e), None);
+    link.prepare().unwrap();
+    link.show_decision(one_line("page"), None);
+    let a = answer(&mut ticket);
+    assert_eq!((a.preparation, a.screen.device), (Preparation::Ready, 2));
+    assert_eq!(steps(&screens, "early"), vec![format!("2 early {e}")]);
+    link.exit();
+}
+
 /// B11b: a device lost after the early answer restages it on the screen
 /// built again, where the attempt adopts it.
 // Revert: the restage only for unanswered requests -> no "2 early".
