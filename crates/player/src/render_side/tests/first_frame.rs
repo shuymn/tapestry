@@ -388,6 +388,66 @@ fn a_size_notice_ends_the_hold() {
     }
 }
 
+/// The slice the upload boundaries are given once two more have run.
+#[track_caller]
+fn next_slice_us(screens: &Installers) -> u64 {
+    let from = screens.slice_boundaries.load(SeqCst);
+    assert!(wait_until(
+        || screens.slice_boundaries.load(SeqCst) >= from + 2
+    ));
+    screens.slice_us.load(SeqCst)
+}
+
+/// C2a: at 240 Hz the page's passes upload for a quarter period, and the
+/// held passes of a lifetime shown over it for 4 ms.
+// Revert: `held` dropped from `pass_presents` -> "a held pass" 1041.
+#[test]
+fn a_held_pass_uploads_with_4_ms() {
+    let (_chart, screens, link, extent) = rig(NEVER);
+    extent.publish_rate(240_085);
+    assert_eq!(next_slice_us(&screens), 1_041, "a presenting pass");
+    show_held(&link);
+    let _ = next_slice_us(&screens);
+    assert_eq!(next_slice_us(&screens), 4_000, "a held pass");
+    assert_eq!(link.loading_ack(), None, "still held");
+    link.exit();
+}
+
+/// C3: a rate published at the same size, the window still, reaches the
+/// next boundaries: no size notice comes with it.
+// Revert: the rate read only where a size is applied -> the first rate
+// never reaches a boundary.
+#[test]
+fn a_same_size_rate_change_reaches_the_boundary() {
+    let (_chart, screens, link, extent) = rig(NEVER);
+    let notices = extent.notices();
+    assert_eq!(next_slice_us(&screens), 4_000, "no rate known");
+    extent.publish_rate(143_856);
+    assert!(wait_until(|| screens.slice_us.load(SeqCst) == 1_737));
+    extent.publish_rate(240_085);
+    assert!(wait_until(|| screens.slice_us.load(SeqCst) == 1_041));
+    assert_eq!(extent.notices(), notices, "no size notice");
+    link.exit();
+}
+
+/// C3e: a rate change during the hold keeps it: held iterations go on,
+/// nothing is presented, and the image stays valid.
+// Revert: the rate's publish counted as a size notice -> the hold ends
+// with the pending presentation.
+#[test]
+fn a_rate_change_keeps_the_hold() {
+    let (_chart, screens, link, extent) = rig(NEVER);
+    show_held(&link);
+    let from = waits(&link);
+    extent.publish_rate(240_085);
+    extent.publish_rate(143_856);
+    assert!(wait_until(|| waits(&link) >= from + 6));
+    assert_eq!(pending(&screens), 0, "no pending presentation");
+    assert_eq!(link.loading_ack(), None, "nothing presented");
+    assert!(stamps(&link).1, "the image still valid");
+    link.exit();
+}
+
 /// TB6: a lost device during the hold, with no frame result and no
 /// notice, ends it by the screen's failure path: the screen dropped and
 /// the failure flagged for the game, which builds it again.

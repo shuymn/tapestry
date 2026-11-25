@@ -73,6 +73,27 @@ fn a_kept_specialization_is_reused_only_after_success() {
     });
 }
 
+/// A windowed run's record marks the play's fade-out end at its end, named
+/// by its attempt's origin, and a discarded attempt as a withdrawal
+/// (development builds).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_play_s_fade_and_a_discard_are_marked() {
+    use crate::dev::transitions::{kept_game_marks, start_game_marks};
+    let _serial = imports::serial();
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), true, |rig| {
+        start_game_marks(input::QpcClock::start());
+        assert!(kept_game_marks().is_empty());
+        rig.attempt = Some(bms_model::TimeUs(4_000));
+        rig.fade_began(bms_model::TimeUs(7_000), bms_model::TimeUs(9_500));
+        rig.discard_attempt();
+        let marks: Vec<_> = kept_game_marks().iter().map(|m| (m.1, m.2)).collect();
+        assert_eq!(marks, [("play-fade-end", 4_000), ("withdrawal", 0)]);
+        assert_eq!(kept_game_marks().first().map(|m| m.0), Some(9_500));
+    });
+}
+
 /// H2: a replacement while the result skin's image stage's thread is held
 /// waits for it past the stop bound, joins it and hands its images back:
 /// the replacement's image stage takes them, and gives the very images
@@ -427,5 +448,40 @@ fn a_refused_replacement_image_stage_falls_back_and_continues() {
             "{}",
             rig.result_skin.staged_line()
         );
+    });
+}
+
+/// W3.4: no play opens before the window's first present: with the
+/// startup failed or not yet settled, a ready preparation's attempt is
+/// refused as not shown; with the first present, it is ready.
+#[test]
+fn a_failed_startup_never_opens_a_play() {
+    use crate::render_side::ScreenError;
+    use crate::window::{Readiness, StartFailure, WindowShown};
+    let l = at_level(13);
+    on_rig(l.chart(), &Installers::default(), false, |rig| {
+        let mut h = begin(rig, &l);
+        assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Ready);
+        let failed = Readiness::Failed(StartFailure::NoFrame(Duration::from_secs(30)));
+        for (readiness, opens) in [
+            (failed, false),
+            (Readiness::Pending, false),
+            (Readiness::Showing, false),
+            (Readiness::FirstPresent, true),
+        ] {
+            rig.window = Some(WindowShown::settled(readiness.clone()));
+            let r = rig.ready_attempt(1, &h);
+            if opens {
+                assert!(
+                    matches!(r, Ok(game::Readiness::Ready)),
+                    "{readiness:?}: {r:?}"
+                );
+            } else {
+                assert!(
+                    matches!(r, Err(ScreenError::NotShown(_))),
+                    "{readiness:?}: {r:?}"
+                );
+            }
+        }
     });
 }

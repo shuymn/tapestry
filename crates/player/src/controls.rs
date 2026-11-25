@@ -447,7 +447,15 @@ impl Controls {
         // The decision skin's takeover, as App's look takes it: before the
         // classification, so the deadline then in force is judged.
         if let Some(takeover) = w.screen.as_ref().and_then(|s| s.take_decision_takeover()) {
-            let _ = w.decision.apply_takeover(takeover, now);
+            let applied = w.decision.apply_takeover(takeover, now);
+            // The deadline it moved, the decision's end in force (a run
+            // record's mark).
+            #[cfg(feature = "dev-tools")]
+            if applied {
+                crate::dev::transitions::mark_decision_end(&w.decision);
+            }
+            #[cfg(not(feature = "dev-tools"))]
+            let _ = applied;
         }
         let lifetime = w.decision.lifetime();
         let seen = w.decision.classify(w.origin, now, terminal, false, None);
@@ -494,6 +502,9 @@ impl Controls {
     /// The window was asked to close, or its event loop ended: the game
     /// quits.
     pub fn close(&self) {
+        // The first close on the host counter, for a windowed run's record.
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::close_stamp();
         self.quit.store(true, Ordering::Release);
         self.wake_game();
     }
@@ -654,6 +665,19 @@ mod tests {
         c.close();
         assert!(c.quitting());
         assert_eq!(c.take(), None);
+    }
+
+    /// A close stamps a windowed run's record with the host counter
+    /// (development builds).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_close_stamps_the_run_record() {
+        let c = Controls::new(QpcClock::start());
+        assert_eq!(crate::dev::transitions::close_qpc(), None);
+        let before = render::present_tap::qpc_now();
+        c.close();
+        let stamped = crate::dev::transitions::close_qpc().expect("stamped");
+        assert!(stamped >= before, "{stamped} < {before}");
     }
 
     #[test]

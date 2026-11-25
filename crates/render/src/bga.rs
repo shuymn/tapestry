@@ -499,6 +499,55 @@ mod tests {
         assert_eq!(r.step_submits.get(), 8);
     }
 
+    /// I3: the boundary's budget is its slice on the slice clock: at
+    /// 500 µs a step, a 1 041 µs slice (a quarter of 240 Hz's period)
+    /// takes three steps, its third the first to begin past the slice's
+    /// 1 000 µs mark and none beginning at 1 500 µs.
+    #[test]
+    fn a_1041_us_slice_takes_three_steps_of_500_us() {
+        let (mut r, key) = renderer();
+        r.step_cost.set(Some(Duration::from_micros(500)));
+        r.step_seen.set(Some(true));
+        r.stage_bga_cells(key, quarters(8)).unwrap();
+        assert_eq!(
+            r.bga_boundary_within(Duration::from_micros(1_041)),
+            BgaStep::Pending
+        );
+        assert_eq!(r.step_submits.get(), 3, "three steps in the slice");
+    }
+
+    /// M2: the slice is read on the clock the renderer is given: on a
+    /// clock that does not move, a 1 µs slice takes all eight steps in one
+    /// boundary, where the renderer's own clock would have spent it at the
+    /// first.
+    #[test]
+    fn the_given_slice_clock_is_read() {
+        let (mut r, key) = renderer();
+        r.step_cost.set(None);
+        r.step_seen.set(Some(true));
+        r.set_slice_clock(std::sync::Arc::new(bms_model::VirtualClock::new(
+            bms_model::TimeUs(0),
+        )));
+        r.stage_bga_cells(key, quarters(8)).unwrap();
+        assert_eq!(
+            r.bga_boundary_within(Duration::from_micros(1)),
+            BgaStep::Done(Ok(()))
+        );
+        assert_eq!(r.step_submits.get(), 8, "every step in one boundary");
+    }
+
+    /// C5: a boundary's first step runs whatever the slice: a slice spent
+    /// before any step still takes one.
+    #[test]
+    fn the_first_step_runs_past_a_spent_slice() {
+        let (mut r, key) = renderer();
+        r.step_cost.set(Some(Duration::from_micros(500)));
+        r.step_seen.set(Some(true));
+        r.stage_bga_cells(key, quarters(4)).unwrap();
+        assert_eq!(r.bga_boundary_within(Duration::ZERO), BgaStep::Pending);
+        assert_eq!(r.step_submits.get(), 1, "the first step");
+    }
+
     /// Takes twice the time slice, inside a step's scopes before its
     /// submission.
     fn slow(_: &Gpu) {

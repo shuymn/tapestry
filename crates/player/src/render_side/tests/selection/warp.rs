@@ -1016,7 +1016,10 @@ fn a_render_failure_in_a_play_leaves_the_runtime_to_the_game_thread() {
     link.scripts()
         .retire(crate::screens::Quiet::Closed(interval.close()));
     assert!(gone.load(Ordering::Acquire));
-    assert_eq!(link.exit(), crate::render_side::RenderEnd::Panicked);
+    assert_eq!(
+        link.exit(),
+        crate::render_side::RenderEnd::Panicked("the render thread fails (a test)".to_owned())
+    );
 }
 
 /// A menu page (the loading or practice page) taken before selection's

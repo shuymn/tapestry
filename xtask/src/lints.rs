@@ -141,6 +141,11 @@ pub const IN_PLAY: &[Site] = &[
         "crates/bms-model/src/lib.rs",
         &["TimeUs::checked_add", "TimeUs::checked_sub"],
     ),
+    // The upload slice's budget, read at every frame boundary.
+    Site::Fns(
+        "crates/bms-model/src/clock.rs",
+        &["Deadline::after", "Deadline::passed", "Deadline::left"],
+    ),
     Site::Fns(
         "crates/bms-model/src/chart.rs",
         &[
@@ -320,6 +325,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::cancel_audio",
             "PlayerRig::seal_audio",
             "PlayerRig::ring_out",
+            "PlayerRig::fade_began",
             "PlayerRig::audio_done",
             "PlayerRig::hand_off",
             "PlayerRig::abort_close",
@@ -565,8 +571,12 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::Fns(
         "crates/render/src/upload.rs",
-        &["write_buffer_with_unpaced"],
+        // The slice clock's fallback, read at every frame boundary.
+        &["write_buffer_with_unpaced", "MonoClock::now", "micros"],
     ),
+    // A window frame's present stamps (dev-tools), read around each
+    // present call.
+    Site::Fns("crates/render/src/present_tap.rs", &["qpc_now"]),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
@@ -596,6 +606,9 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The render thread's report lines: a frame's refusal or failure
+    // formatted into the reporter's ring.
+    Site::File("crates/player/src/render_report.rs"),
     // The retirement worker's handoff table: the release reads and the
     // sends at each pass outside READY's cutoff, and the table's ids the
     // result's report reads.

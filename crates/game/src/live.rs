@@ -394,6 +394,13 @@ pub trait Rig {
     /// [`audio_done`](Self::audio_done) then turns true as for a sealed
     /// play, possibly before the play's time reaches `end_at`.
     fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs);
+    /// A full play's fade-out began at `from` and runs out at `to`, both
+    /// on the rig's clock (dev-tools: a run record's mark). Nothing by
+    /// default.
+    #[cfg(feature = "dev-tools")]
+    fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
+        let _ = (from, to);
+    }
     /// Before a practice round's recording opens: checks that its audio can
     /// be restored at chart time `at`, the lead-in's start ([`crate::restore`]).
     /// By default, for rigs without audio, it can.
@@ -2655,6 +2662,11 @@ fn run_tail<R: Rig>(
     let Some(fade) = stage.fadeout.and_then(|fo| FadeStage::begin(held, fo)) else {
         return TailEnd::RanOut;
     };
+    #[cfg(feature = "dev-tools")]
+    rig.fade_began(
+        TimeUs(origin.0.saturating_add(held.0)),
+        TimeUs(origin.0.saturating_add(fade.deadline.0)),
+    );
     logic.enter_fade(held);
     loop {
         if fade.over(TimeUs(rig.now().0 - origin.0)) {

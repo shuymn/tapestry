@@ -395,6 +395,31 @@ mod tests {
         // The skin's frozen clock: off unless asked for.
         assert!(!select(&["--dev-window", "1920x1080"]).dev.freeze_skin_clock);
         assert!(select(&["--dev-freeze-skin-clock"]).dev.freeze_skin_clock);
+        // A windowed run's raw transition record: a file, with a window.
+        assert_eq!(select(&[]).dev.transitions, None);
+        assert_eq!(
+            select(&["--dev-transitions", "run.txt"]).dev.transitions,
+            Some(std::path::PathBuf::from("run.txt"))
+        );
+        assert_eq!(
+            parsed(&["--dev-transitions", "run.txt", "--dev-frames", "f"]).unwrap_err(),
+            UsageError::Usage("--dev-transitions needs a window and no --dev-frames".to_owned())
+        );
+        // The uploader's slice pinned: a positive count of microseconds.
+        assert_eq!(select(&[]).dev.upload_slice_us, None);
+        assert_eq!(
+            select(&["--dev-upload-slice-us", "4000"])
+                .dev
+                .upload_slice_us,
+            Some(4_000)
+        );
+        for v in ["0", "4ms"] {
+            assert_eq!(
+                parsed(&["--dev-upload-slice-us", v]).unwrap_err(),
+                UsageError::Usage("--dev-upload-slice-us takes microseconds".to_owned()),
+                "{v}"
+            );
+        }
         // The shot pipe: a pipe name, with a window to shoot.
         assert_eq!(
             select(&[

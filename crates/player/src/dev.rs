@@ -788,6 +788,22 @@ fn start(p: &mut lexopt::Parser) -> Result<TimeUs, UsageError> {
     ms.checked_mul(1_000).map(TimeUs).ok_or_else(bad)
 }
 
+/// The uploader's slice pinned for the run, µs; 0 for none
+/// (`--dev-upload-slice-us`).
+static UPLOAD_SLICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pins the uploader's slice of every frame boundary to `us` µs for the
+/// rest of the run (`--dev-upload-slice-us`).
+pub fn pin_upload_slice(us: u64) {
+    UPLOAD_SLICE_US.store(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The uploader's slice pinned for the run, if any.
+pub fn pinned_upload_slice() -> Option<std::time::Duration> {
+    let us = UPLOAD_SLICE_US.load(std::sync::atomic::Ordering::Relaxed);
+    (us > 0).then(|| std::time::Duration::from_micros(us))
+}
+
 /// The value of `--dev-render-timeout`, in seconds.
 fn render_timeout(p: &mut lexopt::Parser) -> Result<std::time::Duration, UsageError> {
     let secs = p
@@ -839,6 +855,16 @@ pub struct SelectOptions {
     /// (`--dev-freeze-skin-clock`, [`skin_clock`]): a test device's shots
     /// of the select screen are then the same frame in every run.
     pub freeze_skin_clock: bool,
+    /// The uploader's slice every frame boundary takes, µs, in place of
+    /// the one scaled to the refresh rate (`--dev-upload-slice-us <µs>`,
+    /// [`pin_upload_slice`]): the fixed baseline the scaled slice is
+    /// measured against.
+    pub upload_slice_us: Option<u64>,
+    /// Where a windowed run writes its raw transition record at its end
+    /// (`--dev-transitions <file>`, [`transitions::RunFrames`]): its
+    /// presents with their stamps on the host counter, the game thread's
+    /// marks and the first close, for a joiner.
+    pub transitions: Option<PathBuf>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -864,6 +890,7 @@ impl SelectOptions {
                 })?);
             }
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            "dev-transitions" => self.transitions = Some(PathBuf::from(p.value()?)),
             "dev-size" => self.size = Some(size(p, "--dev-size")?),
             "dev-window" => self.window = Some(size(p, "--dev-window")?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
@@ -883,6 +910,17 @@ impl SelectOptions {
                 self.shot_pipe = Some(name);
             }
             "dev-freeze-skin-clock" => self.freeze_skin_clock = true,
+            "dev-upload-slice-us" => {
+                let us = p
+                    .value()?
+                    .to_string_lossy()
+                    .parse()
+                    .ok()
+                    .filter(|&us| us > 0);
+                self.upload_slice_us = Some(us.ok_or_else(|| {
+                    UsageError::Usage("--dev-upload-slice-us takes microseconds".to_owned())
+                })?);
+            }
             "dev-speculative-permits" => {
                 let n = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-speculative-permits takes a count".to_owned())
@@ -914,6 +952,11 @@ impl SelectOptions {
         if self.headless && self.window.is_some() {
             return Err(UsageError::Usage(
                 "--dev-window cannot be used with --dev-headless".to_owned(),
+            ));
+        }
+        if self.transitions.is_some() && (self.headless || self.frames.is_some()) {
+            return Err(UsageError::Usage(
+                "--dev-transitions needs a window and no --dev-frames".to_owned(),
             ));
         }
         Ok(())
@@ -3331,6 +3374,145 @@ pub fn read_bga_faults() {
         std::env::var_os(BGA_ALLOCATE_ENV).is_some(),
         Ordering::SeqCst,
     );
+}
+
+/// The render thread's panic: `build` while it builds its first screen,
+/// `frame:<n>` at its nth frame drawn (counted from 1).
+pub const RENDER_PANIC_ENV: &str = "TAPESTRY_DEV_RENDER_PANIC";
+/// How long, in ms, the render thread holds each startup build before it
+/// begins: a first screen past the startup's bound.
+pub const BUILD_HOLD_ENV: &str = "TAPESTRY_DEV_BUILD_HOLD_MS";
+/// How many window configures to refuse from the first on, as DXGI's
+/// refusal of the swap chain ([`render::refuse_configures`]).
+pub const CONFIGURE_FAULTS_ENV: &str = "TAPESTRY_DEV_CONFIGURE_FAULTS";
+
+static BUILD_PANIC: AtomicBool = AtomicBool::new(false);
+static FRAME_PANIC: AtomicU64 = AtomicU64::new(0);
+static FRAMES_DRAWN: AtomicU64 = AtomicU64::new(0);
+static BUILD_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Reads [`RENDER_PANIC_ENV`], [`BUILD_HOLD_ENV`] and
+/// [`CONFIGURE_FAULTS_ENV`] as the render thread starts, so a frame reads
+/// only atomics.
+pub fn read_render_faults() {
+    let panic = std::env::var(RENDER_PANIC_ENV).unwrap_or_default();
+    BUILD_PANIC.store(panic == "build", Ordering::SeqCst);
+    FRAME_PANIC.store(
+        panic
+            .strip_prefix("frame:")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0),
+        Ordering::SeqCst,
+    );
+    FRAMES_DRAWN.store(0, Ordering::SeqCst);
+    let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
+    BUILD_HOLD_MS.store(number(BUILD_HOLD_ENV).unwrap_or(0), Ordering::SeqCst);
+    if let Some(n) = number(CONFIGURE_FAULTS_ENV).and_then(|n: u64| u32::try_from(n).ok()) {
+        render::refuse_configures(n);
+    }
+}
+
+/// The startup build's faults: the hold, then the panic.
+pub fn startup_faults() {
+    let hold = BUILD_HOLD_MS.load(Ordering::SeqCst);
+    if hold > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(hold));
+    }
+    assert!(
+        !BUILD_PANIC.load(Ordering::SeqCst),
+        "dev: the render thread panics while building its first screen ({RENDER_PANIC_ENV})"
+    );
+}
+
+/// Counts a frame drawn, and panics at the one [`RENDER_PANIC_ENV`] names.
+pub fn frame_fault() {
+    let at = FRAME_PANIC.load(Ordering::Relaxed);
+    if at > 0 {
+        let n = FRAMES_DRAWN.fetch_add(1, Ordering::Relaxed) + 1;
+        assert!(
+            n != at,
+            "dev: the render thread panics at its frame {n} ({RENDER_PANIC_ENV})"
+        );
+    }
+}
+
+/// An event's time as an outside recorder can compare it: the performance
+/// counter's raw value and the system tick count in ms, the clock a
+/// WinEvent's own time (`dwmsEventTime`) is on. Allocates nothing.
+pub fn event_stamp() -> (i64, u64) {
+    let mut qpc = 0;
+    // SAFETY: writes the counter into a local.
+    let _ = unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut qpc) };
+    // SAFETY: no arguments; reads the tick count.
+    let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    (qpc, tick)
+}
+
+/// The startup cause probe's gate: a file path; each window renderer's
+/// first configure waits until the file exists (at most two minutes),
+/// then records the window's state ([`configure_probe`]).
+pub const CONFIGURE_GATE_ENV: &str = "TAPESTRY_DEV_CONFIGURE_GATE";
+/// Shows the window (`SW_SHOW`, as its show at a frame does) before each
+/// window renderer's first configure: the state the startup was in when
+/// the window was shown before its first frame (any value).
+pub const SHOW_EARLY_ENV: &str = "TAPESTRY_DEV_SHOW_EARLY";
+
+/// Sets the startup cause probe on the window `hwnd` when
+/// [`CONFIGURE_GATE_ENV`] or [`SHOW_EARLY_ENV`] asks for it: before each
+/// window renderer's first configure, the window is shown if asked, the
+/// gate waited for, and the window's state printed and logged as one
+/// `dev: configure probe:` line (visibility, minimized, foreground,
+/// client size, styles).
+pub fn configure_probe(hwnd: std::num::NonZeroIsize) {
+    let gate = std::env::var_os(CONFIGURE_GATE_ENV).map(std::path::PathBuf::from);
+    let early = std::env::var_os(SHOW_EARLY_ENV).is_some();
+    if gate.is_none() && !early {
+        return;
+    }
+    let raw = hwnd.get();
+    render::on_first_configure(Box::new(move || {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetClientRect, GetForegroundWindow, GetWindowInfo, IsIconic, IsWindowVisible, SW_SHOW,
+            ShowWindow, WINDOWINFO,
+        };
+        let h = HWND(raw as *mut std::ffi::c_void);
+        if early {
+            // SAFETY: the window outlives every renderer made on it.
+            let _ = unsafe { ShowWindow(h, SW_SHOW) };
+        }
+        if let Some(path) = &gate {
+            println!("dev: configure held until {} exists", path.display());
+            let until = Instant::now() + Duration::from_secs(120);
+            while !path.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let mut client = RECT::default();
+        let mut info = WINDOWINFO {
+            cbSize: u32::try_from(size_of::<WINDOWINFO>()).unwrap_or(u32::MAX),
+            ..WINDOWINFO::default()
+        };
+        // SAFETY: plain queries of an open window; the out values outlive
+        // the calls.
+        let (visible, iconic, foreground) = unsafe {
+            let _ = GetClientRect(h, &raw mut client);
+            let _ = GetWindowInfo(h, &raw mut info);
+            (
+                IsWindowVisible(h).as_bool(),
+                IsIconic(h).as_bool(),
+                GetForegroundWindow() == h,
+            )
+        };
+        let line = format!(
+            "dev: configure probe: visible {visible} minimized {iconic} foreground {foreground} client {}x{} style {:#x} exstyle {:#x}",
+            client.right - client.left,
+            client.bottom - client.top,
+            info.dwStyle.0,
+            info.dwExStyle.0
+        );
+        crate::render_report::report(format_args!("{line}"));
+    }));
 }
 
 /// Reads [`RESULT_FAULTS_ENV`]'s `pinned<N>` and `lostpinned<N>` before

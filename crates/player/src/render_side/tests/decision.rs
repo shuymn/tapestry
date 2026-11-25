@@ -346,8 +346,12 @@ impl Screen for Recorder {
     ) -> Option<Result<Preparation, RenderError>> {
         self.menu.prepare_attempt(a, skin, request, lifetime)
     }
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-        self.menu.upload_boundary(past)
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
+        self.menu.upload_boundary(past, slice)
     }
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
@@ -1696,7 +1700,9 @@ fn refusal_notice_stands_before_the_takeover_wakes_the_game() {
 }
 
 /// O6, O8: a label restore refused on the screen built again stores its
-/// notice before its takeover is published and the game thread woken.
+/// notice before its takeover is published and the game thread woken. (The
+/// screen's failure that starts the rebuild wakes the game too; only the
+/// wakes after it are the takeover's.)
 #[test]
 fn restore_refusal_notice_stands_before_the_takeover() {
     let dir = skin_dir();
@@ -1713,6 +1719,14 @@ fn restore_refusal_notice_stands_before_the_takeover() {
     // The rebuild asks from the test thread; a helper meets the render
     // thread at the rows and then at the notice, and notes what it finds
     // there before letting it go.
+    // The screen fails, then is built again. The failure is latched before
+    // its wake is sent, so the wakes are counted only once that wake came.
+    let before_failure = woken.load(Ordering::Acquire);
+    rig.seen.fail.store(true, Ordering::Release);
+    assert!(wait_until(|| woken.load(Ordering::Acquire) > before_failure));
+    assert!(rig.link.failed());
+    rig.seen.fail.store(false, Ordering::Release);
+    let failed_wakes = woken.load(Ordering::Acquire);
     let seen = Arc::clone(&rig.seen);
     let shared = Arc::clone(&rig.link.shared);
     let w = Arc::clone(&woken);
@@ -1728,14 +1742,16 @@ fn restore_refusal_notice_stands_before_the_takeover() {
         gate.hold(false);
         at_notice
     });
-    rig.rebuild().unwrap();
+    rig.link.prepare().unwrap();
     let (woken_at_notice, takeover_at_notice) = helper.join().unwrap();
-    assert_eq!(woken_at_notice, 0, "woken before the notice");
+    assert_eq!(woken_at_notice, failed_wakes, "woken before the notice");
     assert!(
         !takeover_at_notice,
         "the takeover published before the notice"
     );
-    assert!(wait_until(|| woken.load(Ordering::Acquire) == 1));
+    assert!(wait_until(
+        || woken.load(Ordering::Acquire) == failed_wakes + 1
+    ));
     let t = rig.link.take_decision_takeover().expect("a takeover");
     assert_eq!(t.lifetime, game::DecisionLifetime(5));
     assert!(rig.link.take_decision_refusal().is_some(), "the notice");

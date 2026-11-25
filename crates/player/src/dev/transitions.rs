@@ -19,14 +19,26 @@
 //! merges overlapping marks so no time is counted twice, and keeps what no
 //! mark covers, its largest uncovered piece with its endpoints; a count of
 //! frames not presented covers no time.
+//!
+//! A windowed run keeps the same book (`--dev-transitions <file>`,
+//! [`RunFrames`]) and writes it raw at its end ([`Transitions::run_lines`]),
+//! for a joiner to match with a system present trace: each present with
+//! the host counter read right before and after its present call and its
+//! swap chain ([`render::PresentStamps`]), the counter's frequency and the
+//! clock's origin to put the clock's µs on the same counter, the game
+//! thread's marks ([`game_mark`], a second book of the loop probe's
+//! lock-free kind, the game thread its writer) and the first close
+//! ([`close_stamp`]). Nothing is derived during the run.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use bms_model::TimeUs;
+use input::QpcClock;
 
 use crate::measure::{HoldEnd, HoldStamp, Stage, State};
 
@@ -161,11 +173,13 @@ pub enum Record {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Raw {
     /// A presented frame of `stage` at `at`, after `unpresented` frames
-    /// not presented since the last present.
+    /// not presented since the last present, and its present on the host
+    /// counter when it went to a window.
     Present {
         stage: Stage,
         at: TimeUs,
         unpresented: u32,
+        stamps: Option<render::PresentStamps>,
     },
     /// A hold or a read-back.
     Mark(Mark),
@@ -174,6 +188,9 @@ enum Raw {
     /// The render thread took a result's presentation or the built-in
     /// result's page.
     ResultTaken(TimeUs),
+    /// The render thread took a play: its origin on the clock names the
+    /// attempt, every frame after it its own until the next.
+    Attempt(TimeUs),
 }
 
 /// The raw records of a run, kept in place.
@@ -310,6 +327,7 @@ fn marks_of(raw: &[Raw]) -> Vec<(usize, Mark)> {
     for (i, r) in raw.iter().enumerate() {
         match *r {
             Raw::Mark(m) => marks.push((i, m)),
+            Raw::Attempt(_) => {}
             Raw::PlayEnded(at) => preparing = Some(at),
             Raw::Present { stage, .. } => {
                 let other_attempt = last.is_some_and(|l| l.lifetime != stage.lifetime);
@@ -349,6 +367,7 @@ fn derive(raw: &[Raw]) -> Vec<Record> {
             stage,
             at,
             unpresented,
+            ..
         } = *r
         {
             match (last, open) {
@@ -648,7 +667,20 @@ impl Recorder {
     /// A presented frame of `stage` at `at`, with its loading lifetime's
     /// hold if the render thread held it. Returns the change it ends: a
     /// transition, or a presentation change.
+    #[cfg(test)]
     pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) -> Option<Change> {
+        self.frame_stamped(stage, at, hold, None)
+    }
+
+    /// [`frame`](Self::frame), with the frame's present on the host
+    /// counter when it went to a window.
+    pub fn frame_stamped(
+        &mut self,
+        stage: Stage,
+        at: TimeUs,
+        hold: Option<HoldStamp>,
+        stamps: Option<render::PresentStamps>,
+    ) -> Option<Change> {
         if let Some(h) = hold {
             self.hold(h);
         }
@@ -657,6 +689,7 @@ impl Recorder {
             stage,
             at,
             unpresented,
+            stamps,
         });
         let ended = self.last.and_then(|(last, last_at)| {
             change(last, stage).map(|presentation| Change {
@@ -699,6 +732,12 @@ impl Recorder {
         self.book.push(Raw::Mark(m));
     }
 
+    /// The render thread took a play whose chart time 0 lies at `origin`:
+    /// the attempt every later frame belongs to, until the next.
+    pub fn play_began(&self, origin: TimeUs) {
+        self.book.push(Raw::Attempt(origin));
+    }
+
     /// The play's in-play interval ended at `at`.
     pub fn play_ended(&self, at: TimeUs) {
         self.book.push(Raw::PlayEnded(at));
@@ -708,6 +747,329 @@ impl Recorder {
     /// result's page at `at`: the result was prepared since the play ended.
     pub fn result_taken(&self, at: TimeUs) {
         self.book.push(Raw::ResultTaken(at));
+    }
+}
+
+/// What a windowed run's record says of the run: the host counter's
+/// frequency and the clock's origin on it, and the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunHeader {
+    /// The host counter's ticks a second.
+    pub qpc_frequency: i64,
+    /// The counter's value the clock reads 0 at.
+    pub qpc_origin: i64,
+    /// The process ID a present trace names the run's presents by.
+    pub pid: u32,
+}
+
+/// How a windowed run ended, the record's last line, decided once the
+/// render thread's end and the run's checks are known: `ok` when the run
+/// ended with no error, its render thread joined and its checks passed;
+/// `failed` when the game or the screen failed, or the render thread
+/// panicked or was left running (then no present is known to precede the
+/// end); `check-failed` when the select script or the scenario's checks
+/// failed. A record cut short (a crash, a write that did not complete) has
+/// no such line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunStatus {
+    /// The run ended with no error.
+    Ok,
+    /// The game, the screen or the render thread failed.
+    Failed,
+    /// The select script or the scenario's checks failed.
+    CheckFailed,
+}
+
+impl RunStatus {
+    /// The status of a run that `failed` (the game or the screen), whose
+    /// render thread was `joined` or not, and whose checks failed or not.
+    #[must_use]
+    pub const fn of(failed: bool, joined: bool, checks_failed: bool) -> Self {
+        if failed || !joined {
+            Self::Failed
+        } else if checks_failed {
+            Self::CheckFailed
+        } else {
+            Self::Ok
+        }
+    }
+
+    /// Its name on the record's last line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::CheckFailed => "check-failed",
+        }
+    }
+}
+
+/// The run's end: the host counter once the render thread has ended, and
+/// how the run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunEnd {
+    /// The host counter when the record is written, after every present.
+    pub qpc: i64,
+    /// How the run ended.
+    pub status: RunStatus,
+}
+
+impl RunHeader {
+    /// The header of this process on `clock`.
+    #[must_use]
+    pub fn of(clock: QpcClock) -> Self {
+        Self {
+            qpc_frequency: clock.frequency().hz(),
+            qpc_origin: clock.origin(),
+            pid: std::process::id(),
+        }
+    }
+}
+
+impl Transitions {
+    /// A windowed run's raw record (`--dev-transitions`), once the render
+    /// thread has ended: the header, every raw record in its order (each
+    /// present with its stamps and swap chain, `-` where it went to no
+    /// window), the game thread's marks, the first close on the host
+    /// counter, the records lost from either book (the game book's marks
+    /// past its room and those left unfilled) and, last, the run's end.
+    /// Times are the clock's µs; the stamps, the close and the end are raw
+    /// counter ticks.
+    ///
+    /// # Errors
+    ///
+    /// The book is held by another thread.
+    pub fn run_lines(&self, header: RunHeader, end: RunEnd) -> Result<Vec<String>, String> {
+        let b = match self.0.try_lock() {
+            Ok(b) => b,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err("the transition record is held by the render thread".to_owned());
+            }
+        };
+        let (marks, unfilled) = GAME_MARKS.marks();
+        Ok(run_record_lines(
+            header,
+            &b.raw,
+            &marks,
+            close_qpc(),
+            (b.lost, unfilled.saturating_add(GAME_MARKS.dropped())),
+            end,
+        ))
+    }
+}
+
+/// The lines of a windowed run's raw record ([`Transitions::run_lines`]).
+/// The windowed record's format, on its first line: 2 names each play's
+/// attempt (`attempt <origin>`) and the play's and outro's marks by it.
+const RECORD_VERSION: u32 = 2;
+
+fn run_record_lines(
+    header: RunHeader,
+    raw: &[Raw],
+    marks: &[super::loop_probe::Mark],
+    close: Option<i64>,
+    (lost, game_lost): (u64, u64),
+    end: RunEnd,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(raw.len() + marks.len() + 5);
+    lines.push(format!(
+        "run version {RECORD_VERSION} qpc-frequency {} qpc-origin {} pid {}",
+        header.qpc_frequency, header.qpc_origin, header.pid
+    ));
+    for r in raw {
+        lines.push(match *r {
+            Raw::Present {
+                stage,
+                at,
+                unpresented,
+                stamps,
+            } => {
+                let stamps = stamps.map_or_else(
+                    || "- - -".to_owned(),
+                    |s| format!("{} {} {:#x}", s.pre_qpc, s.post_qpc, s.swap_chain),
+                );
+                format!(
+                    "present {stamps} {} {} {} {} {unpresented}",
+                    at.0,
+                    stage.state.name(),
+                    stage.lifetime,
+                    stage.drew.name()
+                )
+            }
+            Raw::Mark(m) => {
+                let ended = match m.kind {
+                    MarkKind::Hold(Some(why)) | MarkKind::ResultHold(why) => why.name(),
+                    _ => "-",
+                };
+                format!("mark {} {} {} {ended}", mark_name(m.kind), m.from.0, m.to.0)
+            }
+            Raw::PlayEnded(at) => format!("play-ended {}", at.0),
+            Raw::ResultTaken(at) => format!("result-taken {}", at.0),
+            Raw::Attempt(origin) => format!("attempt {}", origin.0),
+        });
+    }
+    for &(at, tag, v) in marks {
+        lines.push(format!("game {at} {tag} {v}"));
+    }
+    lines.push(close.map_or_else(|| "close none".to_owned(), |t| format!("close {t}")));
+    lines.push(format!("lost render {lost} game {game_lost}"));
+    lines.push(format!("end {} {}", end.qpc, end.status.name()));
+    lines
+}
+
+/// The book a windowed run's record reads: the scenario's when one runs,
+/// its frame sink recording there, else one of its own.
+#[must_use]
+pub fn run_record_book(scenario: Option<&Transitions>) -> Transitions {
+    scenario.map_or_else(Transitions::default, Transitions::clone)
+}
+
+/// Writes a windowed run's raw record to `path` ([`Transitions::run_lines`]).
+/// A book still held (a render thread left running) writes the header and a
+/// `failed` end alone, so the run is still told apart.
+///
+/// # Errors
+///
+/// The file cannot be written.
+pub fn write_run_record(
+    path: &std::path::Path,
+    book: &Transitions,
+    header: RunHeader,
+    status: RunStatus,
+) -> Result<(), String> {
+    let end = RunEnd {
+        qpc: render::present_tap::qpc_now(),
+        status,
+    };
+    let lines = book.run_lines(header, end).unwrap_or_else(|_| {
+        let failed = RunEnd {
+            status: RunStatus::Failed,
+            ..end
+        };
+        let mut lines = run_record_lines(header, &[], &[], None, (0, 0), failed);
+        lines.retain(|l| l.starts_with("run ") || l.starts_with("end "));
+        lines
+    });
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(path, text)
+        .map_err(|e| format!("dev: the transition record {}: {e}", path.display()))
+}
+
+/// The game thread's marks a windowed run keeps: a run's few edges, with
+/// room to spare.
+const GAME_ROOM: usize = 4_096;
+
+/// The game thread's marks of a windowed run's record ([`game_mark`]).
+static GAME_MARKS: super::loop_probe::Recorder = super::loop_probe::Recorder::new();
+
+/// Starts keeping the game thread's marks on `clock`, their room
+/// reserved now, before any play (`--dev-transitions`).
+pub fn start_game_marks(clock: QpcClock) {
+    GAME_MARKS.turn_on(GAME_ROOM, clock);
+}
+
+/// Marks `tag` at `at` on the clock with `value`, when a windowed run
+/// keeps its record: one atomic step, no allocation, no wait.
+pub fn game_mark(tag: &'static str, at: TimeUs, value: i64) {
+    GAME_MARKS.mark_at(tag, at, value);
+}
+
+/// Marks the decision screen's effective end, its deadline, with its
+/// lifetime: at its entry and again at a takeover that moves the deadline,
+/// the last mark of a lifetime being the one in force.
+pub fn mark_decision_end(d: &game::Decision) {
+    if let Some(end) = d.deadline() {
+        let lifetime = d
+            .lifetime()
+            .map_or(0, |l| i64::try_from(l.0).unwrap_or(i64::MAX));
+        game_mark("decision-end", end, lifetime);
+    }
+}
+
+/// Marks `tag` now with `value` ([`game_mark`]).
+pub fn game_mark_now(tag: &'static str, value: i64) {
+    GAME_MARKS.mark(tag, value);
+}
+
+/// The game thread's marks kept so far, as `(at, tag, value)` (tests).
+#[cfg(test)]
+pub fn kept_game_marks() -> Vec<super::loop_probe::Mark> {
+    GAME_MARKS.marks().0
+}
+
+/// The first close's host counter, `i64::MIN` while none.
+static CLOSE_QPC: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// The window or a key asked to close: the first close's host counter is
+/// kept, a later one leaves it (one compare-and-swap, from any thread).
+pub fn close_stamp() {
+    let now = render::present_tap::qpc_now();
+    let _ = CLOSE_QPC.compare_exchange(i64::MIN, now, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// The first close's host counter, if any.
+pub(crate) fn close_qpc() -> Option<i64> {
+    let t = CLOSE_QPC.load(Ordering::Acquire);
+    (t != i64::MIN).then_some(t)
+}
+
+/// A windowed run's frame sink (`--dev-transitions`): it records each
+/// frame into the book as a scenario's sink does, with its present's
+/// stamps, and nothing else.
+#[derive(Debug)]
+pub struct RunFrames {
+    recorder: Recorder,
+}
+
+impl RunFrames {
+    /// The sink recording into `book`.
+    #[must_use]
+    pub const fn new(book: Transitions) -> Self {
+        Self {
+            recorder: Recorder::new(book),
+        }
+    }
+}
+
+impl crate::render_side::FrameSink for RunFrames {
+    fn frame(
+        &mut self,
+        screen: &dyn crate::render_side::Screen,
+        drawn: &crate::measure::Drawn<'_>,
+    ) {
+        if !drawn.timing.presented() {
+            self.recorder.unpresented();
+            return;
+        }
+        let _ = self.recorder.frame_stamped(
+            drawn.stage,
+            drawn.presented_at,
+            drawn.hold,
+            screen.present_stamps(),
+        );
+    }
+
+    fn play_began(&mut self, origin: TimeUs) {
+        self.recorder.play_began(origin);
+    }
+
+    fn play_ended(&mut self, at: TimeUs) {
+        self.recorder.play_ended(at);
+    }
+
+    fn result_taken(&mut self, at: TimeUs) {
+        self.recorder.result_taken(at);
+    }
+
+    fn hold_lost(&mut self, hold: HoldStamp) {
+        self.recorder.hold(hold);
+    }
+
+    fn result_hold(&mut self, hold: HoldStamp) {
+        self.recorder.result_hold(hold);
     }
 }
 
@@ -1050,5 +1412,336 @@ mod tests {
                 "dev: transitions: 8 records, lost 0, largest uncovered none",
             ]
         );
+    }
+
+    /// A windowed run's raw record keeps each present's stamps and swap
+    /// chain as raw ticks, `-` for one that went to no window, every
+    /// render mark, the game thread's marks, the first close and the
+    /// records each book lost, after the header that turns the clock's µs
+    /// into ticks, and ends with the run's end and how it ended.
+    #[test]
+    fn the_run_record_keeps_raw_presents_and_marks() {
+        use super::{Raw, RunEnd, RunHeader, RunStatus, run_record_lines};
+        let raw = [
+            Raw::Present {
+                stage: stage(State::Decision, 3, Drew::Skin),
+                at: TimeUs(1_000),
+                unpresented: 0,
+                stamps: Some(render::PresentStamps {
+                    pre_qpc: 50_000,
+                    post_qpc: 50_120,
+                    swap_chain: 0xabc0,
+                }),
+            },
+            Raw::Present {
+                stage: stage(State::Loading, 9, Drew::Pending),
+                at: TimeUs(5_166),
+                unpresented: 2,
+                stamps: None,
+            },
+            Raw::Mark(Mark {
+                kind: MarkKind::Hold(Some(HoldEnd::Skin)),
+                from: TimeUs(4_000),
+                to: TimeUs(5_000),
+            }),
+            Raw::Attempt(TimeUs(5_800)),
+            Raw::PlayEnded(TimeUs(6_000)),
+            Raw::ResultTaken(TimeUs(6_500)),
+        ];
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 40_000,
+            pid: 77,
+        };
+        let marks = [(900, "decision-end", 3), (5_500, "refusal", 0)];
+        let end = |status| RunEnd {
+            qpc: 70_000,
+            status,
+        };
+        assert_eq!(
+            run_record_lines(
+                header,
+                &raw,
+                &marks,
+                Some(61_000),
+                (0, 1),
+                end(RunStatus::Ok)
+            ),
+            [
+                "run version 2 qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "present 50000 50120 0xabc0 1000 decision 3 skin 0",
+                "present - - - 5166 loading 9 pending 2",
+                "mark hold 4000 5000 skin",
+                "attempt 5800",
+                "play-ended 6000",
+                "result-taken 6500",
+                "game 900 decision-end 3",
+                "game 5500 refusal 0",
+                "close 61000",
+                "lost render 0 game 1",
+                "end 70000 ok",
+            ]
+        );
+        assert_eq!(
+            run_record_lines(header, &[], &[], None, (2, 0), end(RunStatus::Failed)),
+            [
+                "run version 2 qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "close none",
+                "lost render 2 game 0",
+                "end 70000 failed",
+            ]
+        );
+        assert_eq!(RunStatus::CheckFailed.name(), "check-failed");
+    }
+
+    /// The status is decided by the run's failure, its render thread's end
+    /// and its checks: a render thread not joined fails the run whatever
+    /// else held, and a failed check alone is `check-failed`.
+    #[test]
+    fn the_status_takes_the_render_end_and_the_checks() {
+        use super::RunStatus;
+        assert_eq!(RunStatus::of(false, true, false), RunStatus::Ok);
+        assert_eq!(RunStatus::of(true, true, false), RunStatus::Failed);
+        assert_eq!(RunStatus::of(false, false, false), RunStatus::Failed);
+        assert_eq!(RunStatus::of(false, false, true), RunStatus::Failed);
+        assert_eq!(RunStatus::of(false, true, true), RunStatus::CheckFailed);
+        assert_eq!(RunStatus::of(true, false, true), RunStatus::Failed);
+    }
+
+    /// A book still held by a render thread left running writes the header
+    /// and a failed end alone.
+    #[test]
+    fn a_held_book_writes_a_failed_end() {
+        use super::{RunHeader, RunStatus, write_run_record};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.txt");
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let book = Transitions::with_capacity(4);
+        let held = book.hold();
+        write_run_record(&path, &book, header, RunStatus::Ok).unwrap();
+        drop(held);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(
+            lines[0],
+            "run version 2 qpc-frequency 10000000 qpc-origin 0 pid 1"
+        );
+        assert!(
+            lines[1].starts_with("end ") && lines[1].ends_with(" failed"),
+            "{text}"
+        );
+    }
+
+    /// The game book's marks past its room are lost marks in the record
+    /// the run writes.
+    #[test]
+    fn game_marks_past_the_room_are_lost_in_the_record() {
+        use super::{RunEnd, RunHeader, RunStatus};
+        super::start_game_marks(input::QpcClock::start());
+        for i in 0..=super::GAME_ROOM {
+            super::game_mark("decision-end", TimeUs(10), i64::try_from(i).unwrap());
+        }
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let end = RunEnd {
+            qpc: 5,
+            status: RunStatus::Ok,
+        };
+        let lines = Transitions::with_capacity(4)
+            .run_lines(header, end)
+            .unwrap();
+        let tail: Vec<_> = lines.iter().rev().take(2).rev().cloned().collect();
+        assert_eq!(tail, ["lost render 0 game 1", "end 5 ok"]);
+    }
+
+    /// With a scenario, the record reads the scenario's book, which its
+    /// frame sink records into; without one, a book of its own.
+    #[test]
+    fn the_record_reads_the_scenario_s_book() {
+        use super::{RunEnd, RunHeader, RunStatus, run_record_book};
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let end = RunEnd {
+            qpc: 5,
+            status: RunStatus::Ok,
+        };
+        let scenario = Transitions::with_capacity(4);
+        let book = run_record_book(Some(&scenario));
+        Recorder::new(scenario.clone()).frame_stamped(
+            stage(State::Selection, 1, Drew::Skin),
+            TimeUs(3),
+            None,
+            None,
+        );
+        let presents = |b: &Transitions| {
+            b.run_lines(header, end)
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("present"))
+                .count()
+        };
+        assert_eq!(presents(&book), 1);
+        assert_eq!(presents(&run_record_book(None)), 0);
+    }
+
+    /// A windowed run's sink names each play it is told of, in its place
+    /// among the frames: the frames after it are that attempt's.
+    #[test]
+    fn a_play_s_attempt_is_named_in_its_place() {
+        use super::{RunEnd, RunFrames, RunHeader, RunStatus};
+        use crate::render_side::FrameSink as _;
+        let book = Transitions::with_capacity(4);
+        let mut sink = RunFrames::new(book.clone());
+        sink.recorder
+            .frame_stamped(stage(State::Loading, 1, Drew::Skin), TimeUs(3), None, None);
+        sink.play_began(TimeUs(77));
+        sink.recorder
+            .frame_stamped(stage(State::Ready, 70, Drew::Plain), TimeUs(5), None, None);
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let end = RunEnd {
+            qpc: 9,
+            status: RunStatus::Ok,
+        };
+        let lines = book.run_lines(header, end).unwrap();
+        let body: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("present") || l.starts_with("attempt"))
+            .map(|l| {
+                l.split(' ')
+                    .nth(if l.starts_with("present") { 5 } else { 1 })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(body, ["loading", "77", "ready"]);
+    }
+
+    /// The record written to its file ends with the run's end, read after
+    /// every present, and the status.
+    #[test]
+    fn a_written_record_ends_with_the_run_s_end() {
+        use super::{RunHeader, RunStatus, write_run_record};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.txt");
+        let header = RunHeader {
+            qpc_frequency: 10_000_000,
+            qpc_origin: 0,
+            pid: 1,
+        };
+        let before = render::present_tap::qpc_now();
+        write_run_record(&path, &Transitions::with_capacity(4), header, RunStatus::Ok).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last = text.lines().last().unwrap();
+        let f: Vec<_> = last.split(' ').collect();
+        assert_eq!((f[0], f[2]), ("end", "ok"), "{last}");
+        assert!(f[1].parse::<i64>().unwrap() >= before, "{last}");
+        assert!(text.ends_with('\n'));
+    }
+
+    /// The decision's end is marked with its lifetime, and marked again
+    /// when a takeover moves its deadline.
+    #[test]
+    fn the_decision_s_end_is_marked_again_when_it_moves() {
+        super::start_game_marks(input::QpcClock::start());
+        let lifetime = game::DecisionLifetime(6);
+        let mut d = game::Decision::begin(
+            TimeUs(1_000),
+            lifetime,
+            Some(game::DecisionShown::Skin {
+                slot: 0,
+                generation: 1,
+                scene: TimeUs(2_500_000),
+                fadeout: TimeUs(500_000),
+            }),
+            false,
+        );
+        super::mark_decision_end(&d);
+        assert!(d.apply_takeover(
+            game::DecisionTakeover {
+                lifetime,
+                at: TimeUs(2_000),
+                why: "refused".to_owned(),
+            },
+            TimeUs(2_000),
+        ));
+        super::mark_decision_end(&d);
+        let marks: Vec<_> = super::kept_game_marks()
+            .iter()
+            .map(|m| (m.0, m.1, m.2))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                (3_001_000, "decision-end", 6),
+                (1_501_000, "decision-end", 6)
+            ]
+        );
+    }
+
+    /// The recorder keeps a stamped frame's stamps in its raw record.
+    #[test]
+    fn a_stamped_frame_keeps_its_stamps() {
+        let book = Transitions::with_capacity(4);
+        let mut r = Recorder::new(book.clone());
+        let stamps = render::PresentStamps {
+            pre_qpc: 7,
+            post_qpc: 9,
+            swap_chain: 0x10,
+        };
+        r.frame_stamped(
+            stage(State::Selection, 1, Drew::Skin),
+            TimeUs(3),
+            None,
+            Some(stamps),
+        );
+        let raw = book.hold().raw.clone();
+        assert!(
+            matches!(raw.as_slice(), [super::Raw::Present { stamps: Some(s), .. }] if *s == stamps),
+            "{raw:?}"
+        );
+    }
+
+    /// The first close is kept: a later one leaves it.
+    #[test]
+    fn the_first_close_is_kept() {
+        assert_eq!(super::close_qpc(), None);
+        super::close_stamp();
+        let first = super::close_qpc().expect("stamped");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        super::close_stamp();
+        assert_eq!(super::close_qpc(), Some(first));
+    }
+
+    /// The game thread's marks are kept once started, with their tags and
+    /// values, and none before.
+    #[test]
+    fn game_marks_are_kept_once_started() {
+        super::game_mark("decision-end", TimeUs(10), 1);
+        assert!(
+            super::GAME_MARKS.marks().0.is_empty(),
+            "none before the start"
+        );
+        super::start_game_marks(input::QpcClock::start());
+        super::game_mark("decision-end", TimeUs(1_250), 4);
+        super::game_mark_now("refusal", 0);
+        let (marks, lost) = super::GAME_MARKS.marks();
+        assert_eq!(lost, 0);
+        let tags: Vec<_> = marks.iter().map(|&(_, t, v)| (t, v)).collect();
+        assert_eq!(tags, [("decision-end", 4), ("refusal", 0)]);
+        assert_eq!(marks.first().map(|m| m.0), Some(1_250));
     }
 }

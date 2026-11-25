@@ -243,8 +243,12 @@ pub trait Screen: Send {
     /// ([`render::Renderer::upload_boundary_within`]), `past` answering
     /// whether the pass's hold's bound has passed; nothing in hand by
     /// default.
-    fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-        let _ = past;
+    fn upload_boundary(
+        &mut self,
+        past: &mut dyn render::UploadGate,
+        slice: Duration,
+    ) -> render::Uploaded {
+        let _ = (past, slice);
         render::Uploaded {
             bga: render::BgaStep::Idle,
             staged: None,
@@ -744,10 +748,10 @@ pub trait Screen: Send {
     /// submission (tests). Nothing by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn delay_steps(&mut self, _delay: Option<Duration>) {}
-    /// While `on`, a staging step's writes read no time passed on the
-    /// uploader's slice clock (dev-tools tests). Nothing by default.
+    /// Reads the uploader's slice on `clock` (`None`: the renderer's
+    /// own) (dev-tools tests). Nothing by default.
     #[cfg(all(test, feature = "dev-tools"))]
-    fn freeze_write_slice(&mut self, _on: bool) {}
+    fn set_slice_clock(&mut self, _clock: Option<Arc<dyn TimeSource>>) {}
     /// Has the device refuse the next staging step (tests). Nothing by
     /// default.
     #[cfg(all(test, feature = "dev-tools"))]
@@ -1244,6 +1248,13 @@ pub trait Screen: Send {
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
+    /// The last window frame's present on the host counter and its swap
+    /// chain ([`render::Renderer::present_stamps`]); none by default
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn present_stamps(&self) -> Option<render::PresentStamps> {
+        None
+    }
 
     /// The last play frame's list, for a skin that keeps one.
     #[cfg(feature = "dev-tools")]
@@ -1283,6 +1294,11 @@ pub struct Extent {
     /// counted after its size is stored, so a count read comes with its
     /// size or a newer one.
     notices: AtomicU64,
+    /// The refresh rate of the window's monitor in mHz, 0 while unknown:
+    /// kept apart from the size and its notices, so a change of rate
+    /// never invalidates the held image or ends a hold, and read by each
+    /// pass's upload boundary, not by its resize.
+    refresh_mhz: AtomicU32,
     /// Where the wake goes, once a render thread follows the slot
     /// ([`RenderLink::follow`]).
     wake: Mutex<Option<Sender<RenderMsg>>>,
@@ -1301,6 +1317,7 @@ impl Default for Extent {
             size: AtomicU64::new(UNKNOWN),
             queued: AtomicBool::new(false),
             notices: AtomicU64::new(0),
+            refresh_mhz: AtomicU32::new(0),
             wake: Mutex::new(None),
             #[cfg(test)]
             counting: TestGate::default(),
@@ -1332,6 +1349,18 @@ impl Extent {
         }
     }
 
+    /// Publishes the refresh rate of the window's monitor, mHz (0:
+    /// unknown): the rate the previous publish left.
+    pub fn publish_rate(&self, mhz: u32) -> u32 {
+        self.refresh_mhz.swap(mhz, Ordering::AcqRel)
+    }
+
+    /// The newest refresh rate published, mHz; 0 while unknown. Allocates
+    /// nothing: each pass's upload boundary reads it.
+    pub(crate) fn rate_mhz(&self) -> u32 {
+        self.refresh_mhz.load(Ordering::Acquire)
+    }
+
     /// Takes the wake on its way: the render thread calls it as it takes a
     /// [`RenderMsg::Resize`], before it reads the size.
     /// A publish after this sends again; one before it was seen through
@@ -1349,7 +1378,7 @@ impl Extent {
     /// The newest size published, if any. Reading it takes no wake, so a
     /// wake still on its way stays the only one. Allocates nothing: the
     /// render thread calls it between play frames.
-    fn latest(&self) -> Option<(u32, u32)> {
+    pub(crate) fn latest(&self) -> Option<(u32, u32)> {
         let packed = self.size.load(Ordering::Acquire);
         // The halves of a packed size.
         #[expect(
@@ -1386,6 +1415,28 @@ pub enum ScreenError {
     /// The render thread ended before its screen was built.
     #[error("the render thread ended while starting")]
     EndedWhileStarting,
+    /// The render thread panicked while it built its first screen, with
+    /// the panic's message.
+    #[error("the render thread panicked while starting: {0}")]
+    PanickedWhileStarting(String),
+    /// The render thread did not build its first screen by the startup's
+    /// deadline ([`spawn_until`]); it is left to the process's exit.
+    #[error("the render thread did not build its first screen in time")]
+    NoStart,
+    /// The window closed while the render thread built its first screen;
+    /// the thread is left to the process's exit.
+    #[error("the window closed while the render thread was starting")]
+    Cancelled,
+    /// The render thread failed its first screen with the error inside and
+    /// had not ended by the startup's deadline ([`spawn_until`]): it is
+    /// left to the process's exit, and the window it may still draw into
+    /// stays open.
+    #[error(transparent)]
+    LeftRunning(Box<ScreenError>),
+    /// The window was not shown at its first frame (design.md "Showing
+    /// the window"): no play opens.
+    #[error("the window was not shown: {0}")]
+    NotShown(String),
     /// The render thread did not answer a chart's load in time.
     #[error("the render thread did not answer")]
     NoAnswer,
@@ -1781,6 +1832,20 @@ const ACQUIRE_WAIT: Duration = Duration::from_millis(1);
 /// is left to the process's exit.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The startup's bound (design.md "Showing the window"): from the window's
+/// making, the render thread's first screen and its first presented frame
+/// come within it, or the startup fails. A ceiling for failure only: a
+/// normal start presents in seconds.
+pub const STARTUP_TIMEOUT: Duration = LOAD_TIMEOUT;
+
+/// The most builds the startup makes of its first screen while the window's
+/// surface refuses its configuration in a way a build made again may pass
+/// (provisional).
+pub(crate) const STARTUP_BUILDS: u32 = 3;
+
+/// The pause between two of the startup's builds (provisional).
+pub(crate) const STARTUP_RETRY: Duration = Duration::from_millis(250);
+
 /// How long the game thread waits for a play's figures. The render thread
 /// answers between frames, so this bounds only a stalled render thread: a
 /// slow frame, such as a software adapter drawing and the dev-tools frame
@@ -1805,6 +1870,14 @@ pub trait FrameSink: Send {
     #[cfg(feature = "dev-tools")]
     fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
         let _ = record;
+    }
+
+    /// The render thread took a play whose chart time 0 lies at `origin`,
+    /// before any frame of it (dev-tools: a windowed run's record names
+    /// each attempt by it).
+    #[cfg(feature = "dev-tools")]
+    fn play_began(&mut self, origin: TimeUs) {
+        let _ = origin;
     }
 
     /// The play's in-play interval ended at `at`, on the clock: its result
@@ -1960,6 +2033,11 @@ impl std::fmt::Debug for GameWake {
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
+    /// The report line of the first failure since [`failed`](Self::failed)
+    /// was last cleared, for the startup's outcome to say why
+    /// ([`RenderLink::failure`]): a fixed record, so a frame's failure
+    /// keeps it with nothing allocated.
+    cause: Mutex<Option<crate::render_report::Line>>,
     /// The one owner of the screen's rebuild after a loss: none, one under
     /// way, or the failure no one has reported yet. Every look, recovery
     /// and preparation goes through [`serve_recovery`]; the render thread
@@ -2248,10 +2326,11 @@ struct Shared {
     /// submission, in µs; 0 none (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     step_delay_us: AtomicU64,
-    /// While set, a staging step's writes read no time passed on the
-    /// uploader's slice clock (tests).
+    /// The clock the uploader's slice is read on from the next boundary
+    /// on, `None` for the renderer's own, numbered by each change
+    /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    write_slice_frozen: AtomicBool,
+    slice_clock: SliceClockSlot,
     /// The next result view's creation lasts this much longer, in µs, and
     /// at its end moves the hold's clock to the second value (tests).
     #[cfg(test)]
@@ -2351,6 +2430,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             failed: AtomicBool::new(false),
+            cause: Mutex::new(None),
             recovery: Mutex::new(Recovery::Idle),
             chart_generation: Arc::default(),
             bga_generation: Arc::default(),
@@ -2489,7 +2569,7 @@ impl Shared {
             #[cfg(all(test, feature = "dev-tools"))]
             step_delay_us: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
-            write_slice_frozen: AtomicBool::new(false),
+            slice_clock: SliceClockSlot::default(),
             #[cfg(test)]
             creation_hook: [AtomicI64::new(0), AtomicI64::new(i64::MIN)],
             #[cfg(test)]
@@ -2669,6 +2749,31 @@ impl Shared {
 }
 
 impl Shared {
+    /// Latches the screen's failure and wakes the game thread, so a game
+    /// waiting on the render thread (the startup's outcome, READY) sees it
+    /// at once rather than at its bound.
+    fn latch_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.game_wake.wake();
+    }
+
+    /// Reports the failure `line` ([`crate::render_report::report`]) and
+    /// keeps it as the cause, unless one is kept already; the caller then
+    /// latches the failure.
+    fn report_failure(&self, line: std::fmt::Arguments<'_>) {
+        crate::render_report::report(line);
+        let mut cause = self.cause.lock().unwrap_or_else(PoisonError::into_inner);
+        if cause.is_none() {
+            *cause = Some(crate::render_report::Line::format(line));
+        }
+    }
+
+    /// Clears the failure and its cause: a screen built again.
+    fn clear_failed(&self) {
+        *self.cause.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.failed.store(false, Ordering::Release);
+    }
+
     fn selection_slot(&self) -> std::sync::MutexGuard<'_, SelectionSlot> {
         self.selection
             .lock()
@@ -3122,14 +3227,23 @@ impl LoadingSink {
 }
 
 /// How the render thread ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderEnd {
     /// It ended and was joined.
     Joined,
-    /// It ended by a panic.
-    Panicked,
+    /// It ended by a panic, with the panic's message.
+    Panicked(String),
     /// It did not end in time and was left to the process's exit.
     Stuck,
+}
+
+impl RenderEnd {
+    /// Whether the window it drew into may close: every end but
+    /// [`RenderEnd::Stuck`], whose thread may still draw into it.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        !matches!(self, Self::Stuck)
+    }
 }
 
 /// How long a test hook waits on its other side: `TAPESTRY_TEST_WATCHDOG`
@@ -3245,6 +3359,9 @@ pub struct RenderLink {
     result_lifetimes: AtomicU64,
     /// The result's holds begun.
     result_holds: AtomicU64,
+    /// The thread that copies the render thread's report lines to the log,
+    /// if it started.
+    reporter: Option<crate::render_report::Reporter>,
 }
 
 impl RenderLink {
@@ -3935,7 +4052,9 @@ impl RenderLink {
         match rx.recv_timeout(self.answer_timeout) {
             Ok(Ok(declared)) => Ok(declared),
             Ok(Err(e)) => {
-                eprintln!("render: the attempt was not installed: {e}");
+                crate::render_report::report(format_args!(
+                    "render: the attempt was not installed: {e}"
+                ));
                 Err(ScreenError::Lost)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -4263,12 +4382,27 @@ impl RenderLink {
         self.shared.step_delay_us.store(us, Ordering::SeqCst);
     }
 
-    /// While `on`, a staging step's writes read no time passed on the
-    /// uploader's slice clock from the next boundary on, so only the
-    /// step's size and the hold's bound close it (tests).
+    /// While `on`, the uploader's slice clock does not move from the next
+    /// boundary on, so only the steps' sizes, the frame's gate and the
+    /// hold's bound close a boundary's steps and their writes (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn freeze_write_slice(&self, on: bool) {
-        self.shared.write_slice_frozen.store(on, Ordering::SeqCst);
+        self.set_slice_clock(
+            on.then(|| Arc::new(bms_model::VirtualClock::new(TimeUs(0))) as Arc<dyn TimeSource>),
+        );
+    }
+
+    /// Reads the uploader's slice on `clock` from the next boundary on
+    /// (`None`: the renderer's own clock) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_slice_clock(&self, clock: Option<Arc<dyn TimeSource>>) {
+        let mut slot = self
+            .shared
+            .slice_clock
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *slot = (slot.0 + 1, clock);
     }
 
     /// Makes the next result view's creation last `us` µs longer and, at
@@ -4775,6 +4909,25 @@ impl RenderLink {
         self.shared.failed.load(Ordering::Acquire)
     }
 
+    /// Why the screen failed, when [`failed`](Self::failed): the first
+    /// failure's report line since the screen was last built, or a line
+    /// saying only that it failed when the failure reported none (the
+    /// thread's panic or end). `None` while it has not failed.
+    pub fn failure(&self) -> Option<String> {
+        if !self.failed() {
+            return None;
+        }
+        let cause = self
+            .shared
+            .cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Some(cause.as_ref().map_or_else(
+            || "the render thread failed before its first frame".to_owned(),
+            |line| line.as_str().to_owned(),
+        ))
+    }
+
     /// A reply found disconnected: the render thread ended, which is the
     /// screen's failure, latched before the reply's error is returned.
     fn ended(&self) -> ScreenError {
@@ -4931,19 +5084,33 @@ impl RenderLink {
     /// Ends the thread and waits for it at most [`EXIT_TIMEOUT`]; when it
     /// is [`RenderEnd::Stuck`], the window it draws into must stay open.
     pub fn exit(self) -> RenderEnd {
+        let by = Instant::now() + self.exit_timeout;
+        self.exit_by(by)
+    }
+
+    /// [`exit`](Self::exit), waiting for the thread and its reporter until
+    /// `by` at the latest: a failed startup's end, due by its deadline.
+    pub fn exit_by(self, by: Instant) -> RenderEnd {
+        let by = by.min(Instant::now() + self.exit_timeout);
+        let left = || by.saturating_duration_since(Instant::now());
         self.send(RenderMsg::Exit);
-        let end = match self.ended.recv_timeout(self.exit_timeout) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Detached: a thread stuck in the screen's work must not
-                // hold up the exit. The caller keeps the window open.
-                eprintln!("render: the render thread did not end");
-                RenderEnd::Stuck
-            }
+        let end = match self.ended.recv_timeout(left()) {
+            // Detached: a thread stuck in the screen's work must not hold
+            // up the exit. The caller keeps the window open and reports
+            // it; its reporter goes on while it does.
+            Err(mpsc::RecvTimeoutError::Timeout) => RenderEnd::Stuck,
             _ => match self.handle.join() {
                 Ok(()) => RenderEnd::Joined,
-                Err(_) => RenderEnd::Panicked,
+                Err(payload) => RenderEnd::Panicked(game::coord::JobPanic::of(&*payload).0),
             },
         };
+        // The thread's lines are all in the ring once it ended: the
+        // reporter writes them and ends, within the same bound.
+        if end.released()
+            && let Some(reporter) = self.reporter
+        {
+            let _ = reporter.join(left());
+        }
         // No play runs any more: the parked runtimes are destroyed here,
         // unless an interval was left open, when they are leaked.
         if let Some(token) = self.scripts.inactive() {
@@ -5392,7 +5559,9 @@ impl SkinState {
         match answer {
             Ok(Preparation::Ready) => Self::Ready,
             Ok(Preparation::Refused(why)) => {
-                eprintln!("render: the play skin was refused: {why}");
+                crate::render_report::report(format_args!(
+                    "render: the play skin was refused: {why}"
+                ));
                 Self::Refused(
                     Message::SkinUnusable {
                         why: &why.to_string(),
@@ -5402,7 +5571,10 @@ impl SkinState {
             }
             Ok(Preparation::Cancelled) => Self::Refused(Label::SkinCancelled.text().to_owned()),
             Err(e) => {
-                eprintln!("render: the play skin cannot be installed: {}", Chain(&e));
+                crate::render_report::report(format_args!(
+                    "render: the play skin cannot be installed: {}",
+                    Chain(&e)
+                ));
                 Self::Refused(
                     Message::SkinCannotPrepare {
                         why: &Chain(&e).to_string(),
@@ -5414,16 +5586,16 @@ impl SkinState {
     }
 }
 
-/// Starts the render thread; `make` builds the screen on it, and the chart,
-/// when there is one yet, is prepared before this returns, so every upload
-/// is done before the first READY state (design.md "Display Latency and
-/// Stutter"); a chart loaded later is prepared before its READY state too.
+/// Starts the render thread as [`spawn_until`] does, its first screen
+/// waited for at most the startup's bound from now, with nothing that
+/// cancels the wait.
 ///
 /// # Errors
 ///
-/// Why the screen could not be built or could not draw the chart.
+/// As [`spawn_until`].
+#[cfg(any(test, feature = "dev-tools"))]
 pub fn spawn(
-    mut make: MakeScreen,
+    make: MakeScreen,
     chart: Option<Arc<Chart>>,
     section: Option<Section>,
     clock: QpcClock,
@@ -5431,6 +5603,78 @@ pub fn spawn(
     measure: Measure,
     frames: Box<dyn FrameSink>,
 ) -> Result<RenderLink, ScreenError> {
+    spawn_until(
+        make,
+        chart,
+        section,
+        clock,
+        view,
+        measure,
+        frames,
+        Instant::now() + startup_bound(),
+        Arc::new(|| false),
+    )
+}
+
+/// How long [`spawn`] waits for the first screen: the startup's bound, and
+/// in tests the watchdog's, which only catches a thread that never builds.
+#[cfg(any(test, feature = "dev-tools"))]
+fn startup_bound() -> Duration {
+    #[cfg(test)]
+    return hook_bound();
+    #[cfg(not(test))]
+    STARTUP_TIMEOUT
+}
+
+/// Whether the startup was cancelled (the window closed), asked on the
+/// game thread and on the render thread alike ([`spawn_until`]).
+pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Starts the render thread; `make` builds the screen on it, and the chart,
+/// when there is one yet, is prepared before this returns, so every upload
+/// is done before the first READY state (design.md "Display Latency and
+/// Stutter"); a chart loaded later is prepared before its READY state too.
+/// The first screen is waited for until `deadline`, in slices that end at
+/// once when `cancelled` (the window closed); a build the window's surface
+/// refused in a way a build made again may pass is made again
+/// ([`startup_build`]), unless `cancelled` by then. A failed build's reply
+/// that finds the window closed ends as the close. A thread that failed is
+/// waited for, with its reporter, until `deadline` at the latest. The
+/// render thread's report lines go to the log through a reporter of its
+/// own ([`crate::render_report`]).
+///
+/// # Errors
+///
+/// Why the screen could not be built or could not draw the chart; the
+/// thread's panic while building, with its message; no screen by
+/// `deadline` ([`ScreenError::NoStart`]) or a close before its reply
+/// ([`ScreenError::Cancelled`]), the thread then left detached; a failure
+/// whose thread had not ended by `deadline`, left detached
+/// ([`ScreenError::LeftRunning`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "spawn's inputs, beside the startup's deadline and its cancel"
+)]
+pub fn spawn_until(
+    mut make: MakeScreen,
+    chart: Option<Arc<Chart>>,
+    section: Option<Section>,
+    clock: QpcClock,
+    view: View,
+    measure: Measure,
+    frames: Box<dyn FrameSink>,
+    deadline: Instant,
+    cancelled: Cancel,
+) -> Result<RenderLink, ScreenError> {
+    let (producer, reporter) = match crate::render_report::start(crate::log_file::warn_sink()) {
+        Ok((p, r)) => (Some(p), Some(r)),
+        Err(e) => {
+            crate::render_report::report(format_args!(
+                "render: the report thread cannot start, render lines go to stderr only: {e}"
+            ));
+            (None, None)
+        }
+    };
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let shared = Arc::new(Shared::new());
@@ -5438,11 +5682,22 @@ pub fn spawn(
     let scripts = Scripts::new();
     let thread_scripts = scripts.clone();
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
+    // The close the wait below looks at, which the builder looks at too
+    // before each build made again: one signal for both.
+    let thread_cancelled = Arc::clone(&cancelled);
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
             // Dropped when the thread ends, however it ends.
             let _ended = ended_tx;
+            // A local, so a panic drops it before the factory, which the
+            // closure holds: the wait learns of the panic while a slow
+            // drop of the factory is still under way.
+            let ready_tx = ready_tx;
+            match producer {
+                Some(p) => crate::render_report::install(p),
+                None => crate::render_report::stderr_only(),
+            }
             let _orphan = thread_scripts.orphan_guard();
             // A panic is the screen's failure, which the game sees: this
             // guard covers the startup build, `Run`'s own field the rest.
@@ -5454,17 +5709,18 @@ pub fn spawn(
             #[cfg(feature = "dev-tools")]
             crate::dev::read_bga_faults();
             #[cfg(feature = "dev-tools")]
+            crate::dev::read_render_faults();
+            #[cfg(feature = "dev-tools")]
             crate::dev::read_script_switches();
-            let screen = match build(
+            let built = startup_build(
                 &mut make,
-                &mut None,
-                &mut Committed::default(),
                 chart.as_deref(),
                 section.as_ref(),
-                false,
-                &mut None,
-                &mut None,
-            ) {
+                deadline,
+                &*thread_cancelled,
+                &mut std::thread::sleep,
+            );
+            let screen = match built {
                 Ok(screen) => {
                     thread_shared.built(screen.as_ref());
                     let _ = ready_tx.send(Ok(()));
@@ -5514,6 +5770,10 @@ pub fn spawn(
                 wait_page: None,
                 wait_laid: false,
                 extent: None,
+                #[cfg(feature = "dev-tools")]
+                slice_used: None,
+                #[cfg(all(test, feature = "dev-tools"))]
+                slice_clock_applied: (0, 0),
                 applied: None,
                 selected: None,
                 play_selection: 0,
@@ -5603,8 +5863,45 @@ pub fn spawn(
             r.flush_screen_frames();
         })
         .map_err(ScreenError::Spawn)?;
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(RenderLink {
+    let answer = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break Err(ScreenError::NoStart);
+        }
+        match ready_rx.recv_timeout(left.min(CANCEL_POLL)) {
+            Ok(answer) => break Ok(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) if cancelled() => {
+                break Err(ScreenError::Cancelled);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(ScreenError::EndedWhileStarting);
+            }
+        }
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        // Ended without an answer: a panic, whose message the join gives,
+        // the thread waited for until the deadline (its unwinding may drop
+        // a device the driver holds).
+        Err(ScreenError::EndedWhileStarting) => {
+            return Err(match crate::join_by(handle, end_by(deadline)) {
+                Some(Err(payload)) => {
+                    ScreenError::PanickedWhileStarting(game::coord::JobPanic::of(&*payload).0)
+                }
+                Some(Ok(())) => ScreenError::EndedWhileStarting,
+                None => ScreenError::LeftRunning(Box::new(ScreenError::EndedWhileStarting)),
+            });
+        }
+        // Past the deadline or cancelled, the thread and its reporter are
+        // left detached: the build under way may still finish, and the
+        // window it may draw into stays open (the caller's); no build
+        // starts after it, the builder looking at the same deadline and
+        // close.
+        Err(e) => return Err(e),
+    };
+    match answer {
+        Ok(()) => Ok(RenderLink {
             tx,
             shared,
             handle,
@@ -5619,12 +5916,98 @@ pub fn spawn(
             scripts,
             result_lifetimes: AtomicU64::new(0),
             result_holds: AtomicU64::new(0),
+            reporter,
         }),
-        Ok(Err(e)) => {
-            let _ = handle.join();
-            Err(e.into())
+        Err(e) => {
+            // A close before this look wins over the failure it raced:
+            // the run ends as at a close, as the window's outcome does.
+            let e = if cancelled() {
+                ScreenError::Cancelled
+            } else {
+                ScreenError::Render(e)
+            };
+            let by = end_by(deadline);
+            let joined = crate::join_by(handle, by).is_some();
+            if let Some(r) = reporter {
+                let _ = r.join(by.saturating_duration_since(Instant::now()));
+            }
+            Err(match e {
+                e @ ScreenError::Cancelled => e,
+                e if !joined => ScreenError::LeftRunning(Box::new(e)),
+                e => e,
+            })
         }
-        Err(_) => Err(ScreenError::EndedWhileStarting),
+    }
+}
+
+/// The instant a failed startup's threads are waited for until: the
+/// startup's `deadline`, and never past the render thread's end bound.
+fn end_by(deadline: Instant) -> Instant {
+    deadline.min(Instant::now() + EXIT_TIMEOUT)
+}
+
+/// Builds the render thread's first screen through `make`: a build the
+/// window's surface refused in a way one made again may pass
+/// ([`RenderError::is_retryable_configure`]) is made again, the failed
+/// one's surface and device dropped first, [`STARTUP_RETRY`] later, at most
+/// [`STARTUP_BUILDS`] builds and none that would start past `deadline`;
+/// each refusal is reported. The pause between builds is `pause`'s, and
+/// right before each build made again the deadline and `cancelled` (the
+/// window closed, the same signal the startup's wait looks at) are looked
+/// at once more, so a pause or a report that ran late starts no build past
+/// them, whether or not the wait has seen them yet. While a build runs,
+/// wgpu's own error records made inside its surface's configure on this
+/// thread are copied to the report lines (design.md "Log File"), so a
+/// refused swap chain's system error is on record.
+///
+/// # Errors
+///
+/// The last build's error.
+fn startup_build(
+    make: &mut MakeScreen,
+    chart: Option<&Chart>,
+    section: Option<&Section>,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    pause: &mut dyn FnMut(Duration),
+) -> Result<Box<dyn Screen>, RenderError> {
+    let mut builds = 1;
+    loop {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::startup_faults();
+        crate::log_file::capture_gpu_errors(true);
+        let built = build(
+            make,
+            &mut None,
+            &mut Committed::default(),
+            chart,
+            section,
+            false,
+            &mut None,
+            &mut None,
+        );
+        crate::log_file::capture_gpu_errors(false);
+        let e = match built {
+            Ok(screen) => return Ok(screen),
+            Err(e) => e,
+        };
+        if !e.is_retryable_configure() {
+            return Err(e);
+        }
+        let again = builds < STARTUP_BUILDS && Instant::now() + STARTUP_RETRY < deadline;
+        crate::render_report::report(format_args!(
+            "render: the window's surface refused its configuration (build {builds} of at most {STARTUP_BUILDS}{}): {}",
+            if again { ", built again" } else { "" },
+            Chain(&e)
+        ));
+        if !again {
+            return Err(e);
+        }
+        builds += 1;
+        pause(STARTUP_RETRY);
+        if cancelled() || Instant::now() >= deadline {
+            return Err(e);
+        }
     }
 }
 
@@ -6398,10 +6781,10 @@ fn fill(
             match s.restore_pages(kind, &pages) {
                 Ok(()) => {}
                 Err(e) if e.is_refusal() => {
-                    eprintln!(
+                    crate::render_report::report(format_args!(
                         "render: the {kind} skin's atlas was not restored, its screen draws its built-in presentation: {}",
                         Chain(&e)
-                    );
+                    ));
                     committed.clear(kind);
                     if kind == ScreenKind::Result {
                         *result_refused = Some(format!(
@@ -6431,17 +6814,17 @@ fn fill(
         match restored {
             Ok(()) => {}
             Err(e) if committed.pending(kind) && e.is_refusal() => {
-                eprintln!(
+                crate::render_report::report(format_args!(
                     "render: the {kind} skin's specialization was not restored, the next attempt stages one again: {}",
                     Chain(&e)
-                );
+                ));
                 committed.pend(kind, None);
             }
             Err(e) if kind != ScreenKind::Play && e.is_refusal() => {
-                eprintln!(
+                crate::render_report::report(format_args!(
                     "render: the {kind} skin was not restored, its screen draws its built-in presentation: {}",
                     Chain(&e)
-                );
+                ));
                 committed.clear(kind);
                 if kind == ScreenKind::Result {
                     *result_refused = Some(format!(
@@ -6721,6 +7104,32 @@ impl Image {
     fn valid(&self, notices: u64) -> bool {
         self.stamp == Some(self.token(notices))
     }
+}
+
+/// The uploader's slice for a frame boundary (design.md "Memory Budget",
+/// the uploader): a quarter of the refresh period of a pass that
+/// presents at a known rate, at most [`render::UPLOAD_TIME_SLICE`];
+/// that whole slice otherwise, as no present waits on the pass.
+fn upload_slice(rate_mhz: u32, presents: bool) -> Duration {
+    if !presents || rate_mhz == 0 {
+        return render::UPLOAD_TIME_SLICE;
+    }
+    // A quarter of the period 1 000 000 000 / rate_mhz µs.
+    let quarter = Duration::from_micros(250_000_000 / u64::from(rate_mhz));
+    quarter.min(render::UPLOAD_TIME_SLICE)
+}
+
+/// Whether a pass presents a frame, as its schedule states: a held
+/// pass, an idle pass and a minimized window's present nothing.
+const fn pass_presents(held: bool, idle: bool, minimized: bool) -> bool {
+    !held && !idle && !minimized
+}
+
+/// Logs a change of the slice the boundaries use (development builds).
+#[cfg(feature = "dev-tools")]
+#[cold]
+fn log_slice(slice: Duration, rate_mhz: u32) {
+    eprintln!("dev: upload slice {} at {rate_mhz}", slice.as_micros());
 }
 
 /// The size notices `extent` published, none without one.
@@ -7269,6 +7678,14 @@ struct Run {
     wait_laid: bool,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
+    /// The uploader's slice the boundaries used last and the rate it was
+    /// chosen at, logged at each change (development builds).
+    #[cfg(feature = "dev-tools")]
+    slice_used: Option<(Duration, u32)>,
+    /// The test slice clock's change and the screen's device it was
+    /// applied to last (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    slice_clock_applied: (u64, u64),
     /// The size last applied to the screen; `None` until one is, and for
     /// a screen built again.
     applied: Option<(u32, u32)>,
@@ -7765,7 +8182,7 @@ impl Run {
                         self.chart = None;
                         self.section = None;
                         if self.prepare().is_err() {
-                            self.shared.failed.store(true, Ordering::Release);
+                            self.shared.latch_failed();
                         }
                     }
                     let _ = reply.send(ready);
@@ -8170,6 +8587,8 @@ impl Run {
                     state_origin,
                 }) => {
                     let origin = measure.origin;
+                    #[cfg(feature = "dev-tools")]
+                    self.frames.play_began(origin);
                     let screen_origin = self.resolve_screen_origin(&measure);
                     // The play's movies: held by this screen alone.
                     if let Some(s) = self.screen.as_mut() {
@@ -8514,9 +8933,12 @@ impl Run {
                         }
                     }
                     self.first_frame = Some(first);
-                    eprintln!("render: {}", Chain(&RenderError::DeviceLost));
+                    self.shared.report_failure(format_args!(
+                        "render: {}",
+                        Chain(&RenderError::DeviceLost)
+                    ));
                     self.drop_screen();
-                    self.shared.failed.store(true, Ordering::Release);
+                    self.shared.latch_failed();
                     mode = Mode::Idle;
                     continue;
                 }
@@ -9106,8 +9528,9 @@ impl Run {
                         // failure, but the screen, its device and its
                         // resources stay, for the next preparation.
                         self.measure.failed(&effects);
-                        eprintln!("render: {}", Chain(&e));
-                        self.shared.failed.store(true, Ordering::Release);
+                        self.shared
+                            .report_failure(format_args!("render: {}", Chain(&e)));
+                        self.shared.latch_failed();
                         mode = Mode::Idle;
                         continue;
                     }
@@ -9203,7 +9626,10 @@ impl Run {
                                 // granted waits for what comes next.
                                 self.loading_refused = Some((lifetime, e));
                                 self.shared.refused_loading(lifetime, e);
-                                eprintln!("render: the loading frame was refused: {}", Chain(&e));
+                                crate::render_report::report(format_args!(
+                                    "render: the loading frame was refused: {}",
+                                    Chain(&e)
+                                ));
                                 mode = Mode::Idle;
                                 continue;
                             }
@@ -9347,9 +9773,9 @@ impl Run {
                         // screen and from what a screen built again
                         // restores, and the game thread's next look shows
                         // why; this frame drew the page.
-                        eprintln!(
+                        crate::render_report::report(format_args!(
                             "render: the selection skin was refused, the built-in page draws from now on: {why}"
-                        );
+                        ));
                         // Its pool goes with it, ending its generation.
                         screen.remove(ScreenKind::Selection);
                         self.committed.clear(ScreenKind::Selection);
@@ -9856,6 +10282,12 @@ impl Run {
                 }
                 other => other,
             };
+            // The render thread's panic at its nth frame drawn (dev-tools:
+            // a panic's report and the run's exit).
+            #[cfg(feature = "dev-tools")]
+            if drawn.is_ok() {
+                crate::dev::frame_fault();
+            }
             // The entry's first result picture, once shown or deliberately
             // not shown: the game thread starts the result's sound at its
             // next look (design.md "State Model", system sounds, Result).
@@ -10205,9 +10637,10 @@ impl Run {
                     if matches!(mode, Mode::Play { .. }) {
                         self.measure.failed(&effects);
                     }
-                    eprintln!("render: {}", Chain(&e));
+                    self.shared
+                        .report_failure(format_args!("render: {}", Chain(&e)));
                     self.drop_screen();
-                    self.shared.failed.store(true, Ordering::Release);
+                    self.shared.latch_failed();
                     mode = Mode::Idle;
                 }
             }
@@ -10726,10 +11159,11 @@ impl Run {
         if let Some(s) = &mut self.screen
             && let Err(e) = s.wait_step(bound)
         {
-            eprintln!("render: {}", Chain(&e));
+            self.shared
+                .report_failure(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
         }
     }
 
@@ -10987,10 +11421,11 @@ impl Run {
             if let Some(s) = &mut self.screen
                 && let Err(e) = s.poll_completion()
             {
-                eprintln!("render: {}", Chain(&e));
+                self.shared
+                    .report_failure(format_args!("render: {}", Chain(&e)));
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 dropped = true;
             }
             while self.handoffs.has_free()
@@ -11306,6 +11741,27 @@ impl Run {
         self.pace_deadline.map_or(FrameDue::Never, FrameDue::At)
     }
 
+    /// The uploader's slice for this pass's boundary (design.md "Memory
+    /// Budget", the uploader): [`upload_slice`] of the rate the window
+    /// published last, read here at every boundary, and whether the pass
+    /// presents. Development builds take a pinned slice in its place
+    /// (`--dev-upload-slice-us`) and log each change.
+    fn boundary_slice(&mut self, mode: &Mode, held: Option<TimeUs>) -> Duration {
+        let minimized = self.screen.as_ref().is_some_and(|s| s.minimized());
+        let rate = self.extent.as_ref().map_or(0, |e| e.rate_mhz());
+        let presents = pass_presents(held.is_some(), matches!(mode, Mode::Idle), minimized);
+        let slice = upload_slice(rate, presents);
+        // A baseline run's pinned slice (development builds).
+        #[cfg(feature = "dev-tools")]
+        let slice = crate::dev::pinned_upload_slice().unwrap_or(slice);
+        #[cfg(feature = "dev-tools")]
+        if self.slice_used != Some((slice, rate)) {
+            self.slice_used = Some((slice, rate));
+            log_slice(slice, rate);
+        }
+        slice
+    }
+
     /// The creation owed to the boundary's allowance, if any: play's
     /// staging not yet taken, else a result pages begin.
     fn creation_owed(&self) -> Option<Creation> {
@@ -11403,7 +11859,7 @@ impl Run {
             self.applied = None;
             self.decision_rebuilt(decision_refused)?;
         }
-        self.shared.failed.store(false, Ordering::Release);
+        self.shared.clear_failed();
         Ok(())
     }
 
@@ -11509,10 +11965,10 @@ impl Run {
         // (design.md "Memory Budget", R5).
         let released = screen.take_result_release();
         if let Some([need, result, limit]) = released {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: play's admission released the result's installation for request {}: play needs {need} texels with the result's {result}, of {limit}",
                 p.request
-            );
+            ));
             self.released = Some(p.request);
         }
         let Some(answer) = answer else {
@@ -12050,7 +12506,17 @@ impl Run {
         if let Some(s) = self.screen.as_mut() {
             let us = self.shared.step_delay_us.load(Ordering::SeqCst);
             s.delay_steps((us > 0).then(|| Duration::from_micros(us)));
-            s.freeze_write_slice(self.shared.write_slice_frozen.load(Ordering::SeqCst));
+            let slot = self
+                .shared
+                .slice_clock
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let at = (slot.0, s.device());
+            if at != self.slice_clock_applied {
+                s.set_slice_clock(slot.1.clone());
+                self.slice_clock_applied = at;
+            }
         }
         if self.result_staging_paused() {
             return;
@@ -12068,6 +12534,7 @@ impl Run {
         );
         let mut pages_end = None;
         let frame = self.frame_due_by(mode, held);
+        let slice = self.boundary_slice(mode, held);
         let chart = self
             .chart_hand
             .as_ref()
@@ -12088,28 +12555,34 @@ impl Run {
         let step = match self.screen.as_mut() {
             Some(s) => {
                 let mut up = match held {
-                    Some(shown_at) => s.upload_boundary(&mut PassGate {
-                        frame,
-                        cut_off: self.cut_off,
-                        cutoff: Some(&self.shared.cutoff),
-                        hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
-                        chart,
-                        bga,
-                        loading,
-                        slot: Some(&self.shared.loading),
-                        granted: &mut granted,
-                    }),
-                    None => s.upload_boundary(&mut PassGate::<fn() -> bool> {
-                        frame,
-                        cut_off: self.cut_off,
-                        cutoff: Some(&self.shared.cutoff),
-                        hold: None,
-                        chart,
-                        bga,
-                        loading,
-                        slot: Some(&self.shared.loading),
-                        granted: &mut granted,
-                    }),
+                    Some(shown_at) => s.upload_boundary(
+                        &mut PassGate {
+                            frame,
+                            cut_off: self.cut_off,
+                            cutoff: Some(&self.shared.cutoff),
+                            hold: Some(Self::hold_past(self.clock, &self.shared, shown_at)),
+                            chart,
+                            bga,
+                            loading,
+                            slot: Some(&self.shared.loading),
+                            granted: &mut granted,
+                        },
+                        slice,
+                    ),
+                    None => s.upload_boundary(
+                        &mut PassGate::<fn() -> bool> {
+                            frame,
+                            cut_off: self.cut_off,
+                            cutoff: Some(&self.shared.cutoff),
+                            hold: None,
+                            chart,
+                            bga,
+                            loading,
+                            slot: Some(&self.shared.loading),
+                            granted: &mut granted,
+                        },
+                        slice,
+                    ),
                 };
                 self.staged_seen |= up.staged.is_some();
                 pages_end = up.pages.take();
@@ -12390,7 +12863,7 @@ impl Run {
             return Ok(Preparation::Ready);
         };
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let Some(screen) = &mut self.screen else {
@@ -12480,7 +12953,7 @@ impl Run {
             Err(e) => {
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 Err(e)
             }
         }
@@ -12530,7 +13003,7 @@ impl Run {
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let shared = Arc::clone(&self.shared);
@@ -12564,7 +13037,7 @@ impl Run {
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Some(Err(e));
         }
         #[cfg(feature = "dev-tools")]
@@ -12652,7 +13125,7 @@ impl Run {
     /// for a screen built again.
     fn remove(&mut self, request: u64, kind: ScreenKind) -> Result<Preparation, RenderError> {
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let Some(screen) = &mut self.screen else {
@@ -12742,7 +13215,7 @@ impl Run {
             }
         };
         if ready.is_ok() {
-            self.shared.failed.store(false, Ordering::Release);
+            self.shared.clear_failed();
         } else {
             self.keep_page_font();
             self.screen = None;
@@ -12855,10 +13328,13 @@ impl Run {
                 self.disable_decision(format!("{}", Chain(&e)));
             }
             crate::decision_side::Boundary::Failed(e) => {
-                eprintln!("render: the decision labels' device failed: {}", Chain(&e));
+                self.shared.report_failure(format_args!(
+                    "render: the decision labels' device failed: {}",
+                    Chain(&e)
+                ));
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 return true;
             }
         }
@@ -12906,12 +13382,16 @@ impl Run {
             // lifetime under: never once it ended.
             let book = render::lock(&self.shared.labels);
             if book.active() != Some(lifetime) {
-                eprintln!("render: a takeover of an ended decision lifetime was dropped: {why}");
+                crate::render_report::report(format_args!(
+                    "render: a takeover of an ended decision lifetime was dropped: {why}"
+                ));
                 return;
             }
             #[cfg(test)]
             self.shared.takeover_gate.pass();
-            eprintln!("render: the built-in decision presentation takes over: {why}");
+            crate::render_report::report(format_args!(
+                "render: the built-in decision presentation takes over: {why}"
+            ));
             *self
                 .shared
                 .decision_takeover
@@ -12944,7 +13424,9 @@ impl Run {
     /// the skin still draws, once neither holds (its end and the render
     /// leaving the screen), so the pinned presentation keeps drawing.
     fn disable_decision(&mut self, why: String) {
-        eprintln!("render: the decision skin is disabled for the run: {why}");
+        crate::render_report::report(format_args!(
+            "render: the decision skin is disabled for the run: {why}"
+        ));
         if self.decision_disabled.is_none() {
             self.decision_disabled = Some(why.clone());
             #[cfg(test)]
@@ -13151,10 +13633,10 @@ fn stage_result_chart(
         Ok(table) => Ok(table),
         Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
         Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: the result's chart images are not shown: {}",
                 Chain(&e)
-            );
+            ));
             Ok(ChartTable::ABSENT)
         }
         Err(e) => Err(e),
@@ -13176,10 +13658,10 @@ pub(crate) fn chart_absent(
         Ok(table) => Ok(table),
         Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
         Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
-            eprintln!(
+            crate::render_report::report(format_args!(
                 "render: the result's chart images are not shown: {}",
                 Chain(&e)
-            );
+            ));
             Ok(ChartTable::ABSENT)
         }
         Err(e) => Err(e),
@@ -13235,6 +13717,47 @@ pub struct StepRecord {
     pub held: bool,
     pub pass: u64,
     pub at: Instant,
+}
+
+/// The clock the uploader's slice is read on, numbered by each change
+/// (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Default)]
+struct SliceClockSlot(Mutex<(u64, Option<Arc<dyn TimeSource>>)>);
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl std::fmt::Debug for SliceClockSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SliceClockSlot")
+    }
+}
+
+/// A slice clock that moves `step` µs at each read (tests): the
+/// uploader's own checks of its slice spend it, whatever the machine's
+/// load.
+#[cfg(all(test, feature = "dev-tools"))]
+#[derive(Debug)]
+pub struct ReadStepClock {
+    now: AtomicI64,
+    step: i64,
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl ReadStepClock {
+    /// A clock reading 0 first, then `step` µs more at each read.
+    pub const fn new(step: i64) -> Self {
+        Self {
+            now: AtomicI64::new(0),
+            step,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl TimeSource for ReadStepClock {
+    fn now(&self) -> TimeUs {
+        TimeUs(self.now.fetch_add(self.step, Ordering::SeqCst))
+    }
 }
 
 /// A hook run after a frame's pacing (tests): the hold's clock to set,
@@ -13828,7 +14351,7 @@ impl Run {
                 let _ = reply.send(PagesAnswer::Lost);
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
             }
         }
     }
@@ -13933,9 +14456,9 @@ impl Run {
     /// design's D7): the screen and every screen built again refuse it,
     /// and nothing of it is kept to restore.
     fn disable_result(&mut self, why: &str) {
-        eprintln!(
+        crate::render_report::report(format_args!(
             "render: the result skin was refused, the built-in result draws from now on: {why}"
-        );
+        ));
         if self.result_disabled.is_none() {
             self.result_disabled = Some(why.to_owned());
         }
@@ -14050,7 +14573,9 @@ impl Run {
             && let Some(v) = &mut side.prepared
         {
             const WHY: &str = "the view's runtime could not be committed";
-            eprintln!("render: the result's first view was refused at its commit");
+            crate::render_report::report(format_args!(
+                "render: the result's first view was refused at its commit"
+            ));
             v.held.state = None;
             v.held.page = Some(crate::result_present::compose_page(
                 &v.held.payload.page,
@@ -14351,7 +14876,9 @@ impl Run {
                 StagingEnd::Refused(why) => {
                     // The view's staging was refused: the presenter shows
                     // the built-in result for it (scope view).
-                    eprintln!("render: the result view's staging was refused: {why}");
+                    crate::render_report::report(format_args!(
+                        "render: the result view's staging was refused: {why}"
+                    ));
                     // The view draws the built-in page with its own rows at
                     // once (scope view, the S10-09i design's D7); the
                     // presenter's built-in payload for it follows.
@@ -14441,10 +14968,11 @@ impl Run {
             }
         }
         if let Some(e) = failed {
-            eprintln!("render: {}", Chain(&e));
+            self.shared
+                .report_failure(format_args!("render: {}", Chain(&e)));
             self.drop_screen();
             self.granted = false;
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return;
         }
         if let Some(why) = refused {
@@ -14963,7 +15491,7 @@ impl Run {
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
-            self.shared.failed.store(true, Ordering::Release);
+            self.shared.latch_failed();
             return Err(e);
         }
         let Some(screen) = &mut self.screen else {
@@ -15059,7 +15587,7 @@ impl Run {
             Err(e) => {
                 self.drop_screen();
                 self.granted = false;
-                self.shared.failed.store(true, Ordering::Release);
+                self.shared.latch_failed();
                 Err(e)
             }
         }
@@ -17628,6 +18156,57 @@ pub(crate) mod tests {
         assert_eq!(crate::alloc_count::this_thread() - before, 0);
     }
 
+    /// C1: a pass that presents at a known rate uploads for a quarter of
+    /// its refresh period, the active mode's rational rate in mHz.
+    #[test]
+    fn upload_slice_is_a_quarter_period() {
+        assert_eq!(
+            super::upload_slice(143_856, true),
+            Duration::from_micros(1_737)
+        );
+        assert_eq!(
+            super::upload_slice(240_085, true),
+            Duration::from_micros(1_041)
+        );
+    }
+
+    /// C1b: the slice is at most 4 ms, a slower rate's quarter period
+    /// included.
+    #[test]
+    fn upload_slice_is_capped_at_4_ms() {
+        assert_eq!(super::upload_slice(60_000, true), Duration::from_millis(4));
+        assert_eq!(super::upload_slice(30_000, true), Duration::from_millis(4));
+    }
+
+    /// C2d: an unknown rate (0) takes 4 ms.
+    #[test]
+    fn an_unknown_rate_takes_4_ms() {
+        assert_eq!(super::upload_slice(0, true), Duration::from_millis(4));
+    }
+
+    /// C6: the slice's choice allocates nothing; a vector made inside the
+    /// same window is counted (the control).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn upload_slice_alloc() {
+        let before = crate::alloc_count::this_thread();
+        let mut sum = Duration::ZERO;
+        for (rate, held, idle, minimized) in [
+            (240_085, false, false, false),
+            (143_856, true, false, false),
+            (60_000, false, true, false),
+            (0, false, false, true),
+        ] {
+            let presents = super::pass_presents(held, idle, minimized);
+            sum += super::upload_slice(std::hint::black_box(rate), presents);
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+        assert_eq!(sum, Duration::from_micros(1_041 + 3 * 4_000));
+        let control = std::hint::black_box(vec![0_u8; 16]);
+        assert_eq!(crate::alloc_count::this_thread() - before, 1);
+        drop(control);
+    }
+
     /// V6b (design.md "Scope of No Allocation"; "State Model", system
     /// sounds, Result): the render thread's acknowledgement of a Result
     /// entry's first picture, its wake of the game thread, again for a
@@ -18159,6 +18738,22 @@ pub(crate) mod tests {
         QpcClock,
         super::RenderLink,
     ) {
+        rearmed_play_into(chart, rule, device, Box::new(NoFrames))
+    }
+
+    /// [`rearmed_play`], its frames also handed to `sink`.
+    fn rearmed_play_into<'a>(
+        chart: &'a Chart,
+        rule: &'a rules::RulePreset,
+        device: &'a DeviceProfile,
+        sink: Box<dyn super::FrameSink>,
+    ) -> (
+        Logic<'a, SourceReader>,
+        game::RenderSide,
+        Noted,
+        QpcClock,
+        super::RenderLink,
+    ) {
         let (logic, side) = Logic::<SourceReader>::new(
             chart,
             rule,
@@ -18189,7 +18784,7 @@ pub(crate) mod tests {
             clock,
             view(),
             measure(clock),
-            Box::new(NoFrames),
+            sink,
         )
         .unwrap();
         let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
@@ -18225,6 +18820,49 @@ pub(crate) mod tests {
             let expected = u32::from(now.0 < -9_000_000);
             assert_eq!(rearms, expected, "a frame at {now:?}");
         }
+    }
+
+    /// The render thread tells its frame sink the play it takes, with the
+    /// play's origin, before any frame of it, and a rearm tells it nothing
+    /// more (dev-tools: a windowed run's record names each attempt by it).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_play_s_origin_reaches_the_frame_sink_before_its_frames() {
+        struct Began(Arc<std::sync::Mutex<Vec<Option<TimeUs>>>>);
+        impl super::FrameSink for Began {
+            fn frame(&mut self, _screen: &dyn Screen, _drawn: &super::Drawn<'_>) {
+                self.0.lock().unwrap().push(None);
+            }
+            fn play_began(&mut self, origin: TimeUs) {
+                self.0.lock().unwrap().push(Some(origin));
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) =
+            rearmed_play_into(&chart, &rule, &device, Box::new(Began(Arc::clone(&seen))));
+        let origin = TimeUs(clock.now().0 + 5_000_000);
+        link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
+            side,
+            gauge: 0,
+            measure: play_measure(origin),
+        });
+        assert!(wait_until(|| frames.lock().unwrap().len() >= 2));
+        logic.rearm(&InputStart::default(), TimeUs(clock.now().0 + 10_000_000));
+        assert!(wait_until(|| frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, now, ..)| now.0 < -9_000_000)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let seen = seen.lock().unwrap();
+        let began: Vec<_> = seen.iter().flatten().collect();
+        assert_eq!(began, [&origin], "one play, named once, through the rearm");
+        let at = seen.iter().position(Option::is_some).unwrap();
+        let play_frames = frames.lock().unwrap().len();
+        assert!(seen.len() - at > play_frames, "every play frame after it");
     }
 
     /// Each play frame's state clock runs from the play state's origin,
@@ -18848,7 +19486,11 @@ pub(crate) mod tests {
         fn upload_waited(&self) -> bool {
             self.steps.load(Ordering::Acquire) > 0
         }
-        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
+        fn upload_boundary(
+            &mut self,
+            _past: &mut dyn render::UploadGate,
+            _slice: Duration,
+        ) -> render::Uploaded {
             if self
                 .steps
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -20567,7 +21209,14 @@ pub(crate) mod tests {
             b.pending = Some((key.array, cells.len(), bytes, boundaries));
             Ok(())
         }
-        fn upload_boundary(&mut self, _past: &mut dyn render::UploadGate) -> render::Uploaded {
+        fn upload_boundary(
+            &mut self,
+            _past: &mut dyn render::UploadGate,
+            slice: Duration,
+        ) -> render::Uploaded {
+            let us = u64::try_from(slice.as_micros()).unwrap();
+            self.shared.slice_us.store(us, Ordering::SeqCst);
+            self.shared.slice_boundaries.fetch_add(1, Ordering::SeqCst);
             let bga = (|| {
                 let mut b = self.shared.bga.lock().unwrap();
                 let Some((array, cells, bytes, left)) = b.pending else {
@@ -21081,6 +21730,10 @@ pub(crate) mod tests {
         /// clock and its chart time; noted only while the vector has room
         /// (a test reserves it), so noting never allocates.
         pub(crate) screen_clocks: Arc<std::sync::Mutex<Vec<(i64, i64, TimeUs)>>>,
+        /// The uploader's slice the last upload boundary was given, µs,
+        /// and the boundaries so far.
+        pub(crate) slice_us: Arc<AtomicU64>,
+        pub(crate) slice_boundaries: Arc<AtomicU64>,
     }
 
     /// One selection frame as an [`Installer`] saw it.
@@ -24249,8 +24902,12 @@ pub(crate) mod tests {
             }
             answer
         }
-        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
-            self.menu.upload_boundary(past)
+        fn upload_boundary(
+            &mut self,
+            past: &mut dyn render::UploadGate,
+            slice: Duration,
+        ) -> render::Uploaded {
+            self.menu.upload_boundary(past, slice)
         }
         fn upload_state(&self) -> render::UploadState {
             self.menu.upload_state()
@@ -24695,7 +25352,11 @@ pub(crate) mod tests {
         ) -> Option<Result<Preparation, RenderError>> {
             self.menu.prepare_attempt(a, skin, request, lifetime)
         }
-        fn upload_boundary(&mut self, past: &mut dyn render::UploadGate) -> render::Uploaded {
+        fn upload_boundary(
+            &mut self,
+            past: &mut dyn render::UploadGate,
+            slice: Duration,
+        ) -> render::Uploaded {
             if self.hold_up.load(Ordering::Acquire) {
                 return render::Uploaded {
                     bga: render::BgaStep::Idle,
@@ -24705,7 +25366,7 @@ pub(crate) mod tests {
                     pages: None,
                 };
             }
-            self.menu.upload_boundary(past)
+            self.menu.upload_boundary(past, slice)
         }
         fn upload_state(&self) -> render::UploadState {
             if self.hold_up.load(Ordering::Acquire) {
@@ -26106,6 +26767,9 @@ pub(crate) mod tests {
     mod admission_gate;
     #[cfg(feature = "dev-tools")]
     mod chart_fixture;
+    // The render thread's startup: its first screen's builds and the wait
+    // for it, and its report lines reaching the log.
+    mod startup;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,

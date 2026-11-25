@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use bms_model::{TimeSource, TimeUs};
 
 use crate::gpu::Gpu;
 
@@ -40,6 +42,34 @@ pub const UPLOAD_STEP: u64 = 8 * UPLOAD_WRITE;
 /// while the boundary's steps so far took less (design.md "Memory
 /// Budget"; a provisional limit, a quarter of a 60 Hz frame).
 pub const UPLOAD_TIME_SLICE: Duration = Duration::from_millis(4);
+
+/// The renderer's own clock for the uploader's time slice: microseconds
+/// since it was made, on the system's monotonic clock.
+#[derive(Debug)]
+pub(crate) struct MonoClock {
+    origin: Instant,
+}
+
+impl MonoClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl TimeSource for MonoClock {
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn now(&self) -> TimeUs {
+        micros(self.origin.elapsed())
+    }
+}
+
+/// `d` in whole microseconds, the timeline's end past it.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) fn micros(d: Duration) -> TimeUs {
+    TimeUs(i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
 
 /// What the uploader can do, as a pass that presents nothing reads it
 /// before it waits.

@@ -27,6 +27,18 @@ pub trait PresentTap: Send + Sync {
     fn deliver(&self, frame: Result<PresentFrame, String>);
 }
 
+/// Why a tap was not set ([`crate::Renderer::set_present_tap`]).
+#[derive(Debug, thiserror::Error)]
+pub enum TapError {
+    /// The target has no frames to copy; the renderer is unchanged.
+    #[error("{0}")]
+    Unsupported(&'static str),
+    /// The surface refused its configuration with copies allowed: the
+    /// renderer must be built again.
+    #[error(transparent)]
+    Configure(crate::RenderError),
+}
+
 /// A presented frame's pixels: RGBA8 rows from the top, whatever the swap
 /// chain's own channel order, alpha as the frame left it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +46,31 @@ pub struct PresentFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// A window frame's present on the host counter (raw QPC ticks, the
+/// clock a system present trace stamps), read right before and right
+/// after the call that presents it, and the swap chain it was presented
+/// on: a run record joins its presents with that trace's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentStamps {
+    /// The counter right before the present call.
+    pub pre_qpc: i64,
+    /// The counter right after it returned.
+    pub post_qpc: i64,
+    /// The swap chain's interface address.
+    pub swap_chain: usize,
+}
+
+/// The host counter now, raw QPC ticks.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub fn qpc_now() -> i64 {
+    let mut ticks = 0;
+    // SAFETY: writes one i64; the counter cannot fail on Windows XP and
+    // later.
+    let _ = unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut ticks) };
+    ticks
 }
 
 /// How long a copy may take to be readable once its frame was submitted.
