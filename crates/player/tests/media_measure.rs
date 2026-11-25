@@ -10,15 +10,17 @@
 //! go to `MEDIA_MEASURE_OUT` as one JSON object a line. The other
 //! measurements here: the worker's CPU bound (`media_worker_cpu_bound`), a
 //! screen's preparation and the loops' pass ends through the game's session
-//! (`media_session_entry_and_loops`), and the game's own loops under the
-//! worker's worst admitted load (`media_game_loops_under_the_worst_load`).
+//! (`media_session_entry_and_loops`), the game's own loops under the
+//! worker's worst admitted load (`media_game_loops_under_the_worst_load`),
+//! and the load a running worker meets beside a full-rate renderer, run by
+//! the real-app harness (`media_load_beside_a_running_worker`).
 
 #![cfg(all(windows, feature = "dev-tools"))]
 
 mod media_support;
 
 use std::io::Write as _;
-use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1020,4 +1022,115 @@ fn media_session_entry_and_loops() {
         }));
     }
     stop_all(movies);
+}
+
+/// The QPC count now.
+fn qpc() -> i64 {
+    let mut at = 0;
+    // SAFETY: an out value.
+    unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut at) }.unwrap();
+    at
+}
+
+/// The load a starved worker meets beside a full-rate renderer, run by the
+/// real-app harness against a running worker (design.md "Threat Model"
+/// T02): `MEDIA_LOAD_PID` names the worker, its priority class is set to
+/// `MEDIA_LOAD_PRIORITY` (`normal` or `below_normal`) when given, and after
+/// `MEDIA_LOAD_BASELINE_S` seconds busy threads at normal priority, one per
+/// CPU of the worker's affinity, run on those CPUs for
+/// `MEDIA_LOAD_SECONDS` from their start; `MEDIA_LOAD_RECOVERY_S` seconds
+/// follow. Records on QPC the threads' spawn, the load's start (every
+/// thread spinning) and its end (every thread joined), and the worker's
+/// affinity and priority class, the load's affinity and the worker's CPU
+/// time per phase.
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn media_load_beside_a_running_worker() {
+    use windows::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, GetProcessAffinityMask,
+        NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SET_INFORMATION,
+        SetPriorityClass,
+    };
+    let mut out =
+        Out(std::fs::File::create(env_or("MEDIA_MEASURE_OUT", "media-load.jsonl")).unwrap());
+    let pid: u32 = env_or("MEDIA_LOAD_PID", "").parse().unwrap();
+    let phase = |name: &str, default: &str| -> Duration {
+        Duration::from_secs_f64(env_or(name, default).parse().unwrap())
+    };
+    let baseline = phase("MEDIA_LOAD_BASELINE_S", "20");
+    let load = phase("MEDIA_LOAD_SECONDS", "20");
+    let recovery = phase("MEDIA_LOAD_RECOVERY_S", "30");
+    // SAFETY: opens the process `pid` for these rights; the handle is owned
+    // from here.
+    let worker = unsafe {
+        OwnedHandle::from_raw_handle(
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+                false,
+                pid,
+            )
+            .unwrap()
+            .0,
+        )
+    };
+    let worker = HANDLE(worker.as_raw_handle());
+    if let Ok(p) = std::env::var("MEDIA_LOAD_PRIORITY") {
+        let class = match p.as_str() {
+            "normal" => NORMAL_PRIORITY_CLASS,
+            "below_normal" => BELOW_NORMAL_PRIORITY_CLASS,
+            _ => panic!("MEDIA_LOAD_PRIORITY: {p}"),
+        };
+        // SAFETY: the worker's handle, opened with the right to set it.
+        unsafe { SetPriorityClass(worker, class) }.unwrap();
+    }
+    let affinity = |process: HANDLE| -> usize {
+        let (mut own, mut system) = (0, 0);
+        // SAFETY: a process handle with the right to query, and two out
+        // values.
+        unsafe { GetProcessAffinityMask(process, &raw mut own, &raw mut system) }.unwrap();
+        own
+    };
+    let mask = affinity(worker);
+    // SAFETY: this process's pseudo handle; the load's threads take its
+    // affinity.
+    let this = unsafe { GetCurrentProcess() };
+    pin(this, mask);
+    let mut frequency = 0;
+    // SAFETY: an out value.
+    unsafe { windows::Win32::System::Performance::QueryPerformanceFrequency(&raw mut frequency) }
+        .unwrap();
+    out.line(&serde_json::json!({
+        "kind": "setup", "pid": pid, "qpc_frequency": frequency,
+        "worker_mask": mask, "load_mask": affinity(this),
+        // SAFETY: the worker's handle, opened with the right to query.
+        "worker_priority": unsafe { GetPriorityClass(worker) },
+        "baseline_s": baseline.as_secs_f64(), "load_s": load.as_secs_f64(),
+        "recovery_s": recovery.as_secs_f64(),
+    }));
+    let mut cpu = vec![("start", qpc(), cpu_ms(worker))];
+    std::thread::sleep(baseline);
+    cpu.push(("load_spawn", qpc(), cpu_ms(worker)));
+    let threads = Load::new(usize::try_from(mask.count_ones()).unwrap());
+    cpu.push(("load_start", qpc(), cpu_ms(worker)));
+    std::thread::sleep(load);
+    drop(threads);
+    cpu.push(("load_end", qpc(), cpu_ms(worker)));
+    std::thread::sleep(recovery);
+    cpu.push(("end", qpc(), cpu_ms(worker)));
+    for (name, at, ms) in &cpu {
+        out.line(
+            &serde_json::json!({"kind": "mark", "mark": name, "qpc": at, "worker_cpu_ms": ms}),
+        );
+    }
+    let phases = ["baseline", "ramp", "load", "recovery"];
+    for (phase, w) in phases.iter().zip(cpu.windows(2)) {
+        let [(_, a, ca), (_, b, cb)] = w else {
+            unreachable!()
+        };
+        out.line(&serde_json::json!({
+            "kind": "phase", "phase": phase,
+            "seconds": (b - a) as f64 / frequency as f64,
+            "worker_cpus": (cb - ca) / ((b - a) as f64 / frequency as f64 * 1000.0),
+        }));
+    }
 }
