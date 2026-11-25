@@ -112,6 +112,14 @@ fn fixture(kind: Kind) -> Fixture {
             let b = solid_bundle(&r, &Look::left([0, 255, 0, 255]), [1_800, 1_800]);
             let input = crate::render_common::attempt(&r, &chart, &ctx);
             assert_eq!(r.stage_stepped(&b, &input, 1).unwrap(), None);
+            // Its array created off the frame: asked again until it is
+            // imported, as the render thread asks between frames.
+            let asked = std::time::Instant::now();
+            while r.creating() {
+                assert!(asked.elapsed() < Duration::from_secs(10), "never resident");
+                std::thread::sleep(Duration::from_millis(1));
+                assert_eq!(r.stage_stepped(&b, &input, 1).unwrap(), None);
+            }
             Fixture {
                 r,
                 _dirs: Vec::new(),

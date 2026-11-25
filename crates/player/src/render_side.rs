@@ -540,6 +540,39 @@ pub trait Screen: Send {
     fn filled(&self) -> u32 {
         0
     }
+    /// The deadline of the next ticket its owner takes, read on the
+    /// render thread's clock ([`render::Renderer::set_ticket_deadline`]).
+    /// Nothing by default.
+    fn set_ticket_deadline(&mut self, deadline: bms_model::Deadline) {
+        let _ = deadline;
+    }
+    /// Whether an array's creation is in flight
+    /// ([`render::Renderer::creating`]): the pass stays awake for it.
+    /// Never by default.
+    fn creating(&self) -> bool {
+        false
+    }
+    /// The render loop's holder of what a screen leaves in flight
+    /// ([`render::Renderer::set_residency_holder`]). Nothing by default.
+    fn set_residency_holder(&mut self, holder: render::ResidencyHolder) {
+        let _ = holder;
+    }
+    /// How skin arrays are created, and why
+    /// ([`render::Renderer::array_creation`]). None by default.
+    fn array_creation(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
+    /// The next residency line ([`render::Renderer::take_residency_line`]).
+    /// None by default.
+    fn take_residency_line(&mut self) -> Option<render::ResidencyLine> {
+        None
+    }
+    /// How many resources wait for their residency, and when the oldest's
+    /// ticket was taken ([`render::Renderer::residency_pending`]). None by
+    /// default.
+    fn residency_pending(&self) -> Option<(usize, TimeUs)> {
+        None
+    }
     /// Destroys every due light entry and, with `heavy`, at most one heavy
     /// part ([`render::Renderer::destroy_due`]). Nothing by default.
     fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
@@ -6068,7 +6101,10 @@ pub fn spawn_until(
                 frames_view: None,
                 #[cfg(feature = "dev-tools")]
                 present_log: crate::dev::PresentLog::for_run(),
+                residency: render::ResidencyHolder::default(),
+                residency_logged: 0,
             };
+            r.give_holder();
             r.run(&rx);
             #[cfg(feature = "dev-tools")]
             r.flush_screen_frames();
@@ -7241,6 +7277,10 @@ struct Preparing {
     /// It adopted an early staging: the loading frames draw that staging
     /// until it answers.
     adopted: bool,
+    /// Its ticket's deadline, from its receipt (design.md "Screen
+    /// Transitions and Loading"): a wait for its boundary past it is
+    /// refused, and its array's creation runs to it.
+    deadline: bms_model::Deadline,
 }
 
 /// A decided play's early request on the render thread (design.md
@@ -7264,6 +7304,8 @@ struct EarlyRecord {
     taken: bool,
     /// Its staging answered ready: its token.
     answered: Option<PreparedToken>,
+    /// Its ticket's deadline, from its receipt, as an attempt's.
+    deadline: bms_model::Deadline,
 }
 
 /// What the last presented frame of the decision screen was drawn by
@@ -7953,7 +7995,12 @@ struct Run {
     creation_answered: bool,
     /// A result pages begin owed to the boundary's allowance: its ticket,
     /// its pages and its reply.
-    pages_owed: Option<(u64, Arc<PackedPages>, mpsc::SyncSender<PagesAnswer>)>,
+    pages_owed: Option<(
+        u64,
+        Arc<PackedPages>,
+        mpsc::SyncSender<PagesAnswer>,
+        bms_model::Deadline,
+    )>,
     /// The request of the play staging whose admission released the
     /// result kind's installation last.
     released: Option<u64>,
@@ -8199,6 +8246,14 @@ struct Run {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     present_log: crate::dev::PresentLog,
+    /// What a screen leaves in flight when it is dropped on a device that
+    /// was not removed (design.md "Memory Budget", the `Residing` kind):
+    /// each array whose residency is pending, kept and counted by the
+    /// next screen until its fence completes. Declared after the screen,
+    /// so it is dropped after it.
+    residency: render::ResidencyHolder,
+    /// The residency count the report named last.
+    residency_logged: usize,
 }
 
 impl Run {
@@ -8327,6 +8382,19 @@ impl Run {
                     Some(_) if self.step_in_flight() => {
                         self.wait_step(Duration::from_micros(HELD_PACE.0.unsigned_abs()));
                         rx.try_recv()
+                    }
+                    // An array's creation in flight: its fence looked at
+                    // again after at most `HELD_PACE`, or the message if
+                    // one came first (design.md "Screen Transitions and
+                    // Loading", the frame-budgeted uploads).
+                    Some(_) if self.screen.as_ref().is_some_and(|s| s.creating()) => {
+                        #[cfg(test)]
+                        count_wait(&self.shared, WaitKind::Completion);
+                        rx.recv_timeout(Duration::from_micros(HELD_PACE.0.unsigned_abs()))
+                            .map_err(|e| match e {
+                                mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                                mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                            })
                     }
                     // READY's cutoff is marked waiting around the wait, as
                     // around a frame's pacing, so the game's request taken
@@ -9069,8 +9137,10 @@ impl Run {
                 render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
             }
             self.allow_destruction(&mode);
+            self.expire_room_waits();
             self.poll_attempt();
             self.poll_early();
+            self.report_residency();
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
@@ -11118,6 +11188,19 @@ impl Run {
             r.answered = None;
             r.device = 0;
         }
+        // The tickets still open start their deadlines afresh on this
+        // screen, whose build took the time they had: each array is
+        // created on it from the start.
+        let deadline = bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND);
+        if let Some(r) = &mut self.early {
+            r.deadline = deadline;
+        }
+        if let Some(p) = &mut self.attempt {
+            p.deadline = deadline;
+        }
+        if let Some((_, _, _, d)) = &mut self.pages_owed {
+            *d = deadline;
+        }
         if let Some(s) = &mut self.screen {
             // The page font the screen it replaces read, or was reading.
             if let Some(font) = self.page_font.take() {
@@ -11127,7 +11210,80 @@ impl Run {
             self.heavy_seen = s.heavy_ops().count;
             self.result_changes = s.result_changes();
         }
+        self.give_holder();
         self.allowance = Some(Instant::now());
+    }
+
+    /// The screen just built takes the render loop's holder of what an
+    /// earlier screen left in flight, and its way of creating arrays is
+    /// reported once.
+    fn give_holder(&mut self) {
+        if let Some(s) = &mut self.screen {
+            s.set_residency_holder(self.residency.clone());
+            if let Some((path, why)) = s.array_creation() {
+                crate::render_report::report(format_args!(
+                    "render: array creation: {path} ({why})"
+                ));
+            }
+        }
+    }
+
+    /// The tickets that wait for their boundary past their deadline,
+    /// counted from their request (design.md "Screen Transitions and
+    /// Loading", the frame-budgeted uploads): each answered once with the
+    /// room's timeout, through its own route. Outside READY's cutoff.
+    fn expire_room_waits(&mut self) {
+        if self.cut_off {
+            return;
+        }
+        let now = self.clock.now();
+        let room = || game::Chain(&render::timeout(render::TimeoutPhase::Room)).to_string();
+        if self
+            .attempt
+            .as_ref()
+            .is_some_and(|p| !p.taken && p.deadline.passed(now))
+        {
+            self.answer(Ok(refusal(room())));
+        }
+        if self
+            .early
+            .as_ref()
+            .is_some_and(|r| !r.taken && r.deadline.passed(now))
+        {
+            self.refuse_early(room());
+        }
+        if let Some((ticket, _, reply, _)) = self.pages_owed.take_if(|(_, _, _, d)| d.passed(now)) {
+            crate::render_report::report(format_args!(
+                "render: the result pages begin of ticket {ticket} was refused: {}",
+                room()
+            ));
+            let _ = reply.send(PagesAnswer::Refused(room()));
+        }
+    }
+
+    /// The residency lines since the last pass, and the count of arrays
+    /// whose residency is pending once it changes. Outside READY's cutoff.
+    fn report_residency(&mut self) {
+        if self.cut_off {
+            return;
+        }
+        let Some(s) = &mut self.screen else {
+            return;
+        };
+        while let Some(line) = s.take_residency_line() {
+            crate::render_report::report(format_args!("{line}"));
+        }
+        let pending = s.residency_pending();
+        let n = pending.map_or(0, |(n, _)| n);
+        if n != self.residency_logged {
+            self.residency_logged = n;
+            let oldest = pending.map_or(0, |(_, at)| {
+                self.clock.now().0.saturating_sub(at.0) / 1_000_000
+            });
+            crate::render_report::report(format_args!(
+                "render: residency pending {n} entries, oldest {oldest} s"
+            ));
+        }
     }
 
     /// The screen was dropped: READY's cutoff asked and not given is lost,
@@ -11593,7 +11749,9 @@ impl Run {
             || (!self.cut_off
                 && (self.handoffs.awaiting()
                     || self.screen.as_ref().is_some_and(|s| {
-                        s.filled() > 0 && (destroy_ok || s.pending_completion())
+                        s.creating()
+                            || s.residency_pending().is_some()
+                            || (s.filled() > 0 && (destroy_ok || s.pending_completion()))
                     })));
         if !work {
             return None;
@@ -11960,7 +12118,10 @@ impl Run {
                     self.poll_early();
                 }
                 Creation::Pages => {
-                    if let Some((ticket, pages, reply)) = self.pages_owed.take() {
+                    if let Some((ticket, pages, reply, deadline)) = self.pages_owed.take() {
+                        if let Some(s) = self.screen.as_mut() {
+                            s.set_ticket_deadline(deadline);
+                        }
                         self.begin_pages(ticket, &pages, reply);
                     }
                 }
@@ -12191,6 +12352,7 @@ impl Run {
             reply: Some(reply),
             taken: false,
             answered: None,
+            deadline: bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND),
         });
         self.poll_early();
     }
@@ -12239,6 +12401,7 @@ impl Run {
             r.device = screen.device();
             r.target = screen.target();
         }
+        screen.set_ticket_deadline(r.deadline);
         match screen.stage_early(&r.bundle, r.request) {
             Ok(Some(token)) => {
                 r.answered = Some(token);
@@ -12565,7 +12728,7 @@ impl Run {
             }
             AttemptSkin::InUse => self.selected.clone(),
         };
-        let p = Preparing {
+        let mut p = Preparing {
             request,
             lifetime,
             attempt,
@@ -12575,11 +12738,15 @@ impl Run {
             taken: adopted,
             adopts: adopted.then_some(adopts).flatten(),
             adopted: false,
+            deadline: bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND),
         };
         if let Err(e) = self.recover() {
             let _ = p.reply.send(Err(e));
             return;
         }
+        // A screen built here took its time from the ticket: its deadline
+        // runs from now, on that screen, as a rebuild's tickets do.
+        p.deadline = bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND);
         self.attempt = Some(p);
         self.poll_attempt();
     }
@@ -12652,6 +12819,7 @@ impl Run {
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
         screen.bga_generation(self.shared.bga_generation.load(Ordering::SeqCst));
+        screen.set_ticket_deadline(p.deadline);
         let answer = screen.prepare_attempt(&a, p.skin.as_ref(), p.request, p.lifetime);
         // Play's admission released the result's installation: recorded
         // with the staging's request and published before its answer
@@ -14976,7 +15144,8 @@ impl Run {
             let _ = reply.send(PagesAnswer::Cancelled);
             return;
         }
-        if let Some((_, _, old)) = self.pages_owed.replace((ticket, pages, reply)) {
+        let deadline = bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND);
+        if let Some((_, _, old, _)) = self.pages_owed.replace((ticket, pages, reply, deadline)) {
             let _ = old.send(PagesAnswer::Cancelled);
         }
     }
@@ -15075,7 +15244,7 @@ impl Run {
     /// steps no further and its array retires.
     fn check_pages_hand(&mut self) {
         let withdrawn = self.shared.pages().withdrawn;
-        if let Some((_, _, reply)) = self.pages_owed.take_if(|(t, _, _)| *t <= withdrawn) {
+        if let Some((_, _, reply, _)) = self.pages_owed.take_if(|(t, _, _, _)| *t <= withdrawn) {
             let _ = reply.send(PagesAnswer::Cancelled);
         }
         let Some(ticket) = self.pages_hand.as_ref().map(|(t, _)| *t) else {
@@ -15096,8 +15265,20 @@ impl Run {
     /// How the upload in hand ended at a boundary: written, it is
     /// published under the pages' lock unless withdrawn, and the result
     /// kind's record follows; refused or withdrawn by the renderer, it is
-    /// answered so.
+    /// answered so; ended by the device's loss (its array's residency
+    /// read the removal), the screen is dropped and the ticket answered
+    /// lost.
     fn pages_end(&mut self, end: render::PagesStep) {
+        if let render::PagesStep::Refused(_, e) = &end
+            && !e.is_refusal()
+        {
+            self.shared
+                .report_failure(format_args!("render: {}", Chain(e)));
+            self.drop_screen();
+            self.granted = false;
+            self.shared.latch_failed();
+            return;
+        }
         let (ticket, answer) = match end {
             render::PagesStep::Written(t) => {
                 let Some(screen) = self.screen.as_mut() else {
@@ -18380,6 +18561,41 @@ pub(crate) mod tests {
         assert!(!status.retained.contains(&id), "{status:?}");
         link.commit_attempt().unwrap();
         link.exit();
+    }
+
+    /// S-R12 (design.md "Scope of No Allocation"): a pass's poll of a
+    /// creation in flight reads its fence and allocates nothing.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn creation_poll_alloc() {
+        use crate::alloc_count::this_thread;
+        use crate::render_common::{GAUGES, attempt, context, offscreen};
+        use crate::render_decl::{Look, solid_bundle};
+        let _warp = crate::warp_turn::take();
+        let mut r = offscreen(1_920, 1_080);
+        let fake = r.use_fake_residency();
+        let b = solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]);
+        let chart = ChartBuilder::new(120_000).build().unwrap();
+        let ctx = context(&GAUGES, false);
+        assert_eq!(
+            r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).unwrap(),
+            None
+        );
+        assert!(r.creating());
+        assert!(!r.poll_creations_now(), "warm");
+
+        let control = this_thread();
+        drop(std::hint::black_box(vec![1_u8; 8]));
+        assert!(this_thread() > control, "the allocation was not counted");
+        let start = this_thread();
+        for _ in 0..16 {
+            std::hint::black_box(r.poll_creations_now());
+        }
+        let allocs = this_thread() - start;
+        assert_eq!(allocs, 0, "the poll allocated");
+        assert!(r.creating(), "still in flight");
+        fake.complete(1);
+        assert!(r.stage_stepped(&b, &attempt(&r, &chart, &ctx), 1).is_ok());
     }
 
     /// A refused shared admission allocates nothing (design.md "Memory
@@ -25765,6 +25981,9 @@ pub(crate) mod tests {
         ) -> render::Uploaded {
             self.menu.upload_boundary(past, slice)
         }
+        fn creating(&self) -> bool {
+            self.menu.creating()
+        }
         fn upload_state(&self) -> render::UploadState {
             self.menu.upload_state()
         }
@@ -26223,6 +26442,9 @@ pub(crate) mod tests {
                 };
             }
             self.menu.upload_boundary(past, slice)
+        }
+        fn creating(&self) -> bool {
+            self.menu.creating()
         }
         fn upload_state(&self) -> render::UploadState {
             if self.hold_up.load(Ordering::Acquire) {

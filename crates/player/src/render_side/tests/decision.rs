@@ -356,6 +356,9 @@ impl Screen for Recorder {
     ) -> render::Uploaded {
         self.menu.upload_boundary(past, slice)
     }
+    fn creating(&self) -> bool {
+        self.menu.creating()
+    }
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
     }

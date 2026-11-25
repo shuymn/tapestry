@@ -547,6 +547,21 @@ impl Screen for Recorded {
     fn filled(&self) -> u32 {
         self.menu.filled()
     }
+    fn set_ticket_deadline(&mut self, deadline: bms_model::Deadline) {
+        self.menu.set_ticket_deadline(deadline);
+    }
+    fn creating(&self) -> bool {
+        self.menu.creating()
+    }
+    fn set_residency_holder(&mut self, holder: render::ResidencyHolder) {
+        self.menu.set_residency_holder(holder);
+    }
+    fn take_residency_line(&mut self) -> Option<render::ResidencyLine> {
+        self.menu.take_residency_line()
+    }
+    fn residency_pending(&self) -> Option<(usize, TimeUs)> {
+        self.menu.residency_pending()
+    }
     fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
         self.menu.destroy_due(heavy)
     }
@@ -5538,5 +5553,77 @@ fn a_first_view_whose_commit_is_refused_falls_back_to_its_page() {
         seen[..page].iter().all(|(p, _)| *p == ResultPath::Pending),
         "a frame other than pending before the view's page: {seen:?}"
     );
+    rig.link.exit();
+}
+
+/// The rig's renderer on the fake residency path, its fence held until
+/// the test completes it.
+fn fake_residency(rig: &Rig) -> render::FakeResidency {
+    let slot: Arc<Mutex<Option<render::FakeResidency>>> = Arc::default();
+    let s2 = Arc::clone(&slot);
+    rig.faults
+        .on_renderer
+        .lock()
+        .unwrap()
+        .push(Box::new(move |r| {
+            *s2.lock().unwrap() = Some(r.use_fake_residency());
+        }));
+    assert!(wait_until(|| slot.lock().unwrap().is_some()));
+    slot.lock().unwrap().take().unwrap()
+}
+
+/// S-R5 (design.md "Screen Transitions and Loading", the frame-budgeted
+/// uploads): a pages ticket whose array's fence never completes, on an
+/// idle render thread with no frame to present, is answered once with the
+/// residency's timeout, about `CREATE_BOUND` after its ticket: the pass
+/// stays awake for the creation in flight.
+// Revert: the creation no longer keeps an idle pass awake -> no answer.
+#[test]
+fn an_idle_pass_times_out_a_pending_creation() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let _fake = fake_residency(&rig);
+    let asked = Instant::now();
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    let answer = pages_answer(&mut t);
+    let took = asked.elapsed();
+    let crate::render_side::PagesAnswer::Refused(why) = &answer else {
+        panic!("{answer:?}");
+    };
+    let bound = Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
+    assert!(why.contains("residency"), "{why}");
+    assert!(took >= bound, "answered after {took:?}");
+    assert!(took < bound * 4, "answered after {took:?}");
+    assert_eq!(rig.link.result_status().installed, None);
+    rig.link.exit();
+}
+
+/// S-R6: the device removed while a pages array's residency is in flight
+/// answers the ticket lost once, the screen dropped, and the screen is
+/// built again: a later ticket installs its pages on it.
+#[test]
+fn a_device_lost_during_a_creation_recovers() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let fake = fake_residency(&rig);
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    assert!(wait_until(|| fake.calls() >= 2), "no creation");
+    fake.remove();
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Lost);
+    // Built again by the next load.
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    let _ = rig.link.load(chart, None);
+    let mut again = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    assert_eq!(
+        pages_answer(&mut again),
+        crate::render_side::PagesAnswer::Ready
+    );
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
     rig.link.exit();
 }

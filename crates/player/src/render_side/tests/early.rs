@@ -446,3 +446,32 @@ fn the_cutoff_counts_the_entry_the_withdrawal_fills() {
     drop(ticket);
     link.exit();
 }
+
+/// S-R5 (design.md "Screen Transitions and Loading", the frame-budgeted
+/// uploads): an early request whose room never comes is refused once with
+/// the room's timeout, about `CREATE_BOUND` after its receipt, and staged
+/// nothing.
+// Revert: the room wait's deadline removed -> no answer.
+#[test]
+fn a_room_wait_times_out_with_no_resource() {
+    let (_chart, screens, link, _lifetime) = held();
+    screens.early_room.store(1, SeqCst);
+    let skin = bundle();
+    let asked = std::time::Instant::now();
+    let mut ticket = early(&link, &skin);
+    let r = ticket.request();
+    let a = answer(&mut ticket);
+    let took = asked.elapsed();
+    let Preparation::Refused(refused) = &a.preparation else {
+        panic!("{:?}", a.preparation);
+    };
+    assert!(refused.reason.contains("room"), "{}", refused.reason);
+    let bound = std::time::Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
+    assert!(took >= bound, "answered after {took:?}");
+    assert!(
+        !noted(&screens, &format!("early {r}")),
+        "staged: {:?}",
+        screens.log()
+    );
+    link.exit();
+}

@@ -71,6 +71,7 @@ pub mod presentation;
 pub mod probe;
 mod projection;
 mod renderer;
+mod residency;
 mod simple;
 mod skin;
 mod skin_atlas;
@@ -123,6 +124,12 @@ pub use renderer::{
 };
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::{DestroyRecord, RECORD_LEN};
+#[cfg(feature = "dev-tools")]
+pub use residency::fake::Fake as FakeResidency;
+pub use residency::{
+    Budget, CREATE_BOUND, ResidencyError, ResidencyEvent, ResidencyHolder, ResidencyLine,
+    TimeoutPhase, timeout,
+};
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,

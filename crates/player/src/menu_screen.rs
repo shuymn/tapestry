@@ -1814,6 +1814,32 @@ impl Screen for MenuScreen {
         self.renderer.filled()
     }
 
+    fn set_ticket_deadline(&mut self, deadline: bms_model::Deadline) {
+        self.renderer.set_ticket_deadline(deadline);
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn creating(&self) -> bool {
+        self.renderer.creating()
+    }
+
+    fn set_residency_holder(&mut self, holder: render::ResidencyHolder) {
+        self.renderer.set_residency_holder(holder);
+    }
+
+    fn array_creation(&self) -> Option<(&'static str, &'static str)> {
+        Some(self.renderer.array_creation())
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_residency_line(&mut self) -> Option<render::ResidencyLine> {
+        self.renderer.take_residency_line()
+    }
+
+    fn residency_pending(&self) -> Option<(usize, bms_model::TimeUs)> {
+        self.renderer.residency_pending()
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
         self.renderer.destroy_due(heavy)
