@@ -1005,6 +1005,7 @@ fn movies_shown(r: &mut Renderer) {
             size: [64, 64],
             bt601: false,
             full: false,
+            chroma: skin_model::media::ChromaLocation::Centre,
         },
         MovieShow::Lost,
         MovieShow::Nothing,

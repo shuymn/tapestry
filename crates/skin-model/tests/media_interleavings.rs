@@ -312,6 +312,7 @@ impl WorkerModel {
                             at: stamp,
                             duration: 33_333,
                         },
+                        skin_model::media::ChromaLocation::Left,
                     )
                     .unwrap();
                 assert_publication_order(&view.log.borrow(), g, index);

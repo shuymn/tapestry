@@ -58,12 +58,12 @@ fn bga_images_seeds_read_or_fail_as_built() {
 
 /// The frame ring seeds stage a due frame, then the next a second later,
 /// wait for one not due, stage the newest of a full ring, free an earlier
-/// run's frame unread, stage a frame whatever its reserved word holds, and
-/// fail the player for each broken slot they were built with.
+/// run's frame unread, and fail the player for each broken slot they were
+/// built with, an unknown or unspecified chroma location among them.
 #[test]
 fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
     use crate::{RingOutcome, ring_bytes};
-    use skin_model::media::{Fault, Frame};
+    use skin_model::media::{ChromaLocation, Fault, Frame};
     let seeds = seeds::rings();
     assert_names(
         &seeds,
@@ -82,7 +82,8 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
             "shared_seq",
             "stamp_order",
             "stamp_outside",
-            "reserved",
+            "chroma_unknown",
+            "chroma_unspecified",
             "duration_zero",
             "duration_long",
             "duration_end",
@@ -97,6 +98,7 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
             seq,
             stamp,
             duration: seeds::RING_FRAME_US,
+            chroma: ChromaLocation::Left,
         })
     };
     assert_eq!(outcome("empty"), RingOutcome::Nothing);
@@ -135,9 +137,15 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
         })
     );
     assert_eq!(
-        outcome("reserved"),
-        staged(1, 1_000),
-        "the reserved word not read"
+        outcome("chroma_unknown"),
+        fault(Fault::Chroma {
+            slot: 0,
+            value: u64::MAX
+        })
+    );
+    assert_eq!(
+        outcome("chroma_unspecified"),
+        fault(Fault::Chroma { slot: 0, value: 0 })
     );
     assert_eq!(
         outcome("duration_zero"),

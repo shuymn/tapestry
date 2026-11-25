@@ -14,7 +14,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use skin_model::media::{Fault, Geometry, Reader, SLOT_HEADER_WORDS, Stamp, Window, Writer};
+use skin_model::media::{
+    ChromaLocation, Fault, Geometry, Reader, SLOT_HEADER_WORDS, Stamp, Window, Writer,
+};
 
 struct Counting;
 
@@ -101,6 +103,7 @@ fn ring_reads_do_not_allocate() {
                     at: stamp,
                     duration: 33_333,
                 },
+                ChromaLocation::Left,
             )
             .unwrap();
     };

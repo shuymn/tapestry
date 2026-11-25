@@ -37,14 +37,15 @@ pub enum MovieShow {
     #[default]
     Nothing,
     /// Its newest frame, at `uv` in its `layer` of the movies' planes,
-    /// `size` pixels, converted by its matrix (BT.601, else BT.709) and
-    /// range (full, else limited).
+    /// `size` pixels, its chroma sited at `chroma`, converted by its matrix
+    /// (BT.601, else BT.709) and range (full, else limited).
     Frame {
         uv: [f32; 4],
         layer: u16,
         size: [u32; 2],
         bt601: bool,
         full: bool,
+        chroma: crate::media::ChromaLocation,
     },
     /// Lost: opaque black over each destination, whatever its blend and
     /// colour, for the rest of the screen.

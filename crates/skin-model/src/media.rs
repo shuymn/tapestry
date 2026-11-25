@@ -16,8 +16,8 @@
 //! size, a run already started, a sequence above every frame taken before
 //! it, and in the current run a stamp inside the run's window that rises
 //! with the sequence, a duration of at least 1 µs and at most
-//! [`MAX_FRAME_US`] whose end does not overflow, and those words, read
-//! again once its frame is
+//! [`MAX_FRAME_US`] whose end does not overflow, a [`ChromaLocation`], and
+//! those words, read again once its frame is
 //! copied, must be what they were before the copy (a change undone before
 //! that second read goes unseen). Anything else is a [`Fault`], which fails
 //! the video's player: the reader keeps it and reads nothing more. A copy
@@ -72,9 +72,8 @@
 //! [`STATE_WORD`], which the game reads only to supervise the worker
 //! ([`supervision`]), then two words reserved, written zero and not
 //! read), then the slots, each [`SLOT_HEADER_WORDS`] (its state, sequence,
-//! run, stamp, its own index, its frame's bytes, its duration and one word
-//! reserved, written zero and not read) followed by its frame: the
-//! luma plane, then
+//! run, stamp, its own index, its frame's bytes, its duration and its
+//! frame's [`ChromaLocation`]) followed by its frame: the luma plane, then
 //! the two chroma planes, each half the width and height rounded up (I420),
 //! packed little-endian into words, the last word's spare bytes zero.
 
@@ -109,7 +108,7 @@ pub const SLOT_HEADER_WORDS: usize = 8;
 pub const CHUNK_WORDS: usize = 8_192;
 
 /// The layout's version, in the header.
-pub const VERSION: u64 = 6;
+pub const VERSION: u64 = 7;
 
 /// The header's first word.
 const MAGIC: u64 = u64::from_le_bytes(*b"TAPRING1");
@@ -202,8 +201,75 @@ const S_STAMP: usize = 3;
 const S_INDEX: usize = 4;
 const S_BYTES: usize = 5;
 const S_DURATION: usize = 6;
-// Word 7 is reserved: written zero, not read.
-const S_RESERVED: usize = 7;
+const S_CHROMA: usize = 7;
+
+/// Where a frame's chroma samples sit against its luma samples along the
+/// axes 4:2:0 subsamples (design.md "Rendering and Skins", video frames):
+/// the six locations FFmpeg's `AVChromaLocation` names, each frame's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChromaLocation {
+    /// Co-sited with the even luma columns, between the luma rows (H.264,
+    /// HEVC and MPEG-2 when the stream says nothing).
+    Left,
+    /// At the centre of each 2 × 2 luma block (MPEG-1 and JPEG).
+    #[default]
+    Centre,
+    /// Co-sited with the even luma columns and rows.
+    TopLeft,
+    /// Between the luma columns, co-sited with the even luma rows.
+    Top,
+    /// Co-sited with the even luma columns and the odd luma rows.
+    BottomLeft,
+    /// Between the luma columns, co-sited with the odd luma rows.
+    Bottom,
+}
+
+impl ChromaLocation {
+    /// The location's value in its slot word: `AVChromaLocation`'s.
+    #[must_use]
+    pub const fn word(self) -> u64 {
+        match self {
+            Self::Left => 1,
+            Self::Centre => 2,
+            Self::TopLeft => 3,
+            Self::Top => 4,
+            Self::BottomLeft => 5,
+            Self::Bottom => 6,
+        }
+    }
+
+    /// The location `word` holds; `None` for a value no location has
+    /// (`AVCHROMA_LOC_UNSPECIFIED` included).
+    #[must_use]
+    pub const fn of(word: u64) -> Option<Self> {
+        match word {
+            1 => Some(Self::Left),
+            2 => Some(Self::Centre),
+            3 => Some(Self::TopLeft),
+            4 => Some(Self::Top),
+            5 => Some(Self::BottomLeft),
+            6 => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+
+    /// Where its chroma samples sit from the centred ones, in quarters of
+    /// a chroma sample, x to the right and y down: a sampler that reads the
+    /// chroma at a luma position as if centred adds the negation. Left
+    /// sits a quarter to the left (−1), top a quarter up (−1) and bottom a
+    /// quarter down (+1).
+    #[must_use]
+    pub const fn quarters(self) -> (i8, i8) {
+        match self {
+            Self::Left => (-1, 0),
+            Self::Centre => (0, 0),
+            Self::TopLeft => (-1, -1),
+            Self::Top => (0, -1),
+            Self::BottomLeft => (-1, 1),
+            Self::Bottom => (0, 1),
+        }
+    }
+}
 
 /// A slot holding no frame, which the worker may claim.
 const FREE: u64 = 0;
@@ -321,12 +387,14 @@ impl Window {
     }
 }
 
-/// A frame the reader took: its sequence, its stamp and its duration.
+/// A frame the reader took: its sequence, its stamp, its duration and its
+/// chroma location, as its slot held them when the take found it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub seq: u64,
     pub stamp: i64,
     pub duration: i64,
+    pub chroma: ChromaLocation,
 }
 
 /// A frame's media time, as the worker publishes it: its stamp and how
@@ -378,6 +446,12 @@ impl Due {
     pub const fn duration(&self) -> i64 {
         self.chosen.duration
     }
+
+    /// The frame's chroma location.
+    #[must_use]
+    pub const fn chroma(&self) -> ChromaLocation {
+        self.chosen.chroma
+    }
 }
 
 /// What failed a video's player: a slot that breaks the protocol, named by
@@ -413,6 +487,9 @@ pub enum Fault {
     /// A slot that changed while its frame was copied.
     #[error("slot {slot}: changed while it was read")]
     Changed { slot: u8 },
+    /// A chroma location no [`ChromaLocation`] has.
+    #[error("slot {slot}: chroma location {value}")]
+    Chroma { slot: u8, value: u64 },
 }
 
 /// Why a ring could not be set up.
@@ -431,6 +508,7 @@ struct Found {
     run: u64,
     stamp: i64,
     duration: i64,
+    chroma: ChromaLocation,
 }
 
 impl Found {
@@ -677,10 +755,13 @@ impl Reader {
             self.free(ring, a)?;
         }
         self.last_stamp = Some(c.stamp);
+        // From what the peek found, which the copy checked the slot still
+        // held: the slot is freed now, and the worker may be writing it.
         Ok(Frame {
             seq: c.seq,
             stamp: c.stamp,
             duration: c.duration,
+            chroma: c.chroma,
         })
     }
 
@@ -788,19 +869,23 @@ impl Reader {
         if !(1..=MAX_FRAME_US).contains(&duration) || stamp.checked_add(duration).is_none() {
             return Err(Fault::Duration { slot: index, value });
         }
+        let value = load(S_CHROMA)?;
+        let chroma = ChromaLocation::of(value).ok_or(Fault::Chroma { slot: index, value })?;
         Ok(Some(Found {
             slot,
             seq: load(S_SEQ)?,
             run,
             stamp,
             duration,
+            chroma,
         }))
     }
 
     /// Copies `c`'s frame into `sink` at `pitch`, word by word through a
     /// stack buffer, then reads its slot's words again and checks they still
     /// name that frame: the same state, sequence, run, stamp, duration,
-    /// index and frame size. A change undone before this second read goes unseen.
+    /// chroma location, index and frame size. A change undone before this
+    /// second read goes unseen.
     fn copy<W: Words + ?Sized>(
         &self,
         ring: &W,
@@ -873,6 +958,7 @@ impl Reader {
             && load(S_RUN) == Some(c.run)
             && load(S_STAMP) == Some(c.stamp.cast_unsigned())
             && load(S_DURATION) == Some(c.duration.cast_unsigned())
+            && load(S_CHROMA) == Some(c.chroma.word())
             && load(S_INDEX) == Some(wide(c.slot))
             && load(S_BYTES) == Some(wide(self.geometry.frame_bytes()));
         if same {
@@ -1017,8 +1103,9 @@ impl Writer {
     }
 
     /// Publishes `frame` in `slot` as sequence `seq` of run `run`, at
-    /// `stamp` (its stamp and duration): writes its bytes and then the slot's words, marks it ready
-    /// once all are written, and then raises the watermark to `seq`. Frames
+    /// `stamp` (its stamp and duration), its chroma sited at `chroma`:
+    /// writes its bytes and then the slot's words, marks it ready once all
+    /// are written, and then raises the watermark to `seq`. Frames
     /// are published in sequence order, a run's after the command that
     /// starts it and never one of an earlier run after it (the module's
     /// handover of runs); a publication never moves the watermark back.
@@ -1027,6 +1114,7 @@ impl Writer {
     ///
     /// When `frame` is not the ring's frame size, or the section does not
     /// hold the slot; the slot stays claimed.
+    #[expect(clippy::too_many_arguments, reason = "each a word the slot holds")]
     pub fn publish<W: Words + ?Sized>(
         self,
         ring: &W,
@@ -1035,6 +1123,7 @@ impl Writer {
         seq: u64,
         run: u64,
         stamp: Stamp,
+        chroma: ChromaLocation,
     ) -> Result<(), Refused> {
         if frame.len() != self.geometry.frame_bytes() {
             return Err(Refused::Frame(frame.len()));
@@ -1067,7 +1156,7 @@ impl Writer {
             (S_INDEX, wide(slot.0)),
             (S_BYTES, wide(frame.len())),
             (S_DURATION, stamp.duration.cast_unsigned()),
-            (S_RESERVED, 0),
+            (S_CHROMA, chroma.word()),
         ];
         for (i, v) in fields {
             word(ring, base + i)

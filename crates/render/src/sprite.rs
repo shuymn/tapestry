@@ -68,7 +68,7 @@ pub struct Instance {
     /// The layer (low 15 bits) with [`FLAG_POOL`] for a pool quad,
     /// [`FLAG_NEAREST`] or [`FLAG_BASE`], [`FLAG_BGA`] with
     /// [`FLAG_KEY`] for a BGA quad, and [`crate::FLAG_VIDEO`] with the
-    /// movie's matrix and range bits for a movie quad.
+    /// movie's matrix, range and chroma location bits for a movie quad.
     pub flags: u32,
 }
 
@@ -88,10 +88,19 @@ impl Instance {
             Filter::Linear => 0,
             Filter::Bga => FLAG_BGA,
             Filter::BgaLayer => FLAG_BGA | FLAG_NEAREST | FLAG_KEY,
-            Filter::Movie { bt601, full } => {
+            Filter::Movie { sampling } => {
                 crate::FLAG_VIDEO
-                    | if bt601 { crate::FLAG_VIDEO_BT601 } else { 0 }
-                    | if full { crate::FLAG_VIDEO_FULL } else { 0 }
+                    | if sampling.bt601() {
+                        crate::FLAG_VIDEO_BT601
+                    } else {
+                        0
+                    }
+                    | if sampling.full() {
+                        crate::FLAG_VIDEO_FULL
+                    } else {
+                        0
+                    }
+                    | crate::chroma_flags(sampling.chroma())
             }
         };
         Self {

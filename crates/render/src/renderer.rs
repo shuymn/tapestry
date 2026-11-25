@@ -284,9 +284,10 @@ fn tinted(v: VOut) -> vec4f {
     return c * v.color;
 }
 
-// A movie's raw Y, U and V at luma `uv` from its planes `y`, `u` and `v`.
-fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f) -> vec3f {
-    let cuv = uv * vec2f(textureDimensions(y)) / (2.0 * vec2f(textureDimensions(u)));
+// A movie's raw Y, U and V at luma `uv` from its planes `y`, `u` and `v`,
+// its chroma samples sited `shift` chroma samples from the centred ones.
+fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f, shift: vec2f) -> vec3f {
+    let cuv = (uv * vec2f(textureDimensions(y)) / 2.0 - shift) / vec2f(textureDimensions(u));
     return vec3f(
         textureSampleLevel(y, smooth_samp, uv, 0.0).r,
         textureSampleLevel(u, smooth_samp, cuv, 0.0).r,
@@ -296,13 +297,23 @@ fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f) ->
 
 // A movie's texel: Y'CbCr by its matrix and range to opaque R'G'B'.
 fn movie(uv: vec2f, layer: i32, flags: u32) -> vec4f {
-    var s = yuv(video_y0, video_u0, video_v0, uv);
+    // The frame's chroma location: a quarter sample left, up or down.
+    var shift = vec2f(0.0);
+    if (flags & 0x800000u) != 0u {
+        shift.x = -0.25;
+    }
+    if (flags & 0x1000000u) != 0u {
+        shift.y = -0.25;
+    } else if (flags & 0x2000000u) != 0u {
+        shift.y = 0.25;
+    }
+    var s = yuv(video_y0, video_u0, video_v0, uv, shift);
     if layer == 1 {
-        s = yuv(video_y1, video_u1, video_v1, uv);
+        s = yuv(video_y1, video_u1, video_v1, uv, shift);
     } else if layer == 2 {
-        s = yuv(video_y2, video_u2, video_v2, uv);
+        s = yuv(video_y2, video_u2, video_v2, uv, shift);
     } else if layer == 3 {
-        s = yuv(video_y3, video_u3, video_v3, uv);
+        s = yuv(video_y3, video_u3, video_v3, uv, shift);
     }
     let y0 = s.x;
     let u0 = s.y;

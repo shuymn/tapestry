@@ -172,6 +172,7 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
         }
         "--dev-gen-clip" => gen_clip(rest),
         "--dev-secondary-open" => secondary_open(rest),
+        "--dev-chroma" => chroma(rest),
         "--dev-no-codec-list" => {
             return Some(match rest {
                 [] => {
@@ -405,6 +406,33 @@ fn paint(i: u32, w: u32, h: u32, frame: &mut [u8]) {
     for (k, p) in v.iter_mut().enumerate() {
         *p = u8::try_from(112 + (k / cw + i as usize) % 32).unwrap_or(128);
     }
+}
+
+/// `--dev-chroma <file>`: opens the file as a player opens a video and
+/// prints the chroma locations FFmpeg reports before the worker applies any
+/// default (design.md "Rendering and Skins", video frames): the decoder's
+/// after the open and each of the first frames', with the build's identity.
+fn chroma(args: &[String]) -> Result<(), String> {
+    let [file] = args else {
+        return Err("--dev-chroma <file>".to_owned());
+    };
+    let opened = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
+    let (mut input, _) = Input::open(Source::opened(opened), IoOpen::Default)
+        .map_err(|(why, code)| format!("refused: {why:?} {code}"))?;
+    println!(
+        "chroma: build {} {}",
+        ffmpeg::version().0,
+        ffmpeg::library_versions()
+    );
+    println!("chroma: decoder {}", input.reported_locations().0);
+    for k in 0..4 {
+        match input.next() {
+            Ok(Some(_)) => println!("chroma: frame {k} {}", input.reported_locations().1),
+            Ok(None) => break,
+            Err((why, code)) => return Err(format!("frame {k}: {why:?} {code}")),
+        }
+    }
+    Ok(())
 }
 
 /// `--dev-secondary-open`.
