@@ -1334,6 +1334,8 @@ fn each_frame_carries_its_chroma_location() {
         assert_eq!(watched.take_log(), [], "{value}: nothing more read");
     }
     let mem = section(g);
+    let _reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    assert!(Writer::attach(&*mem).is_ok(), "this layout");
     mem[1].store(6, Ordering::Relaxed);
     assert_eq!(
         Writer::attach(&*mem).err(),
