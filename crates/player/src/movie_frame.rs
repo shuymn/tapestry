@@ -538,9 +538,14 @@ pub struct Movies<S = Movie> {
     /// A play frame has shown the chart's panel lost (dev-tools).
     #[cfg(feature = "dev-tools")]
     lost_marked: bool,
-    /// A frame has shown a skin movie lost (dev-tools).
+    /// A play frame has shown a skin movie lost (dev-tools).
     #[cfg(feature = "dev-tools")]
     skin_lost_marked: bool,
+    /// A frame off play (a preparation's, a menu screen's) has shown a
+    /// skin movie lost (dev-tools): a latch of its own, so it never keeps
+    /// the first play frame from being marked.
+    #[cfg(feature = "dev-tools")]
+    skin_lost_off_play: bool,
 }
 
 /// Whether the media session holds the preparation deadlines (dev-tools:
@@ -611,6 +616,8 @@ impl<S: Source> Movies<S> {
             lost_marked: false,
             #[cfg(feature = "dev-tools")]
             skin_lost_marked: false,
+            #[cfg(feature = "dev-tools")]
+            skin_lost_off_play: false,
         }
     }
 
@@ -839,10 +846,11 @@ impl<S: Source> Movies<S> {
 
     /// Marks the frames from which lost movies draw black (dev-tools): the
     /// first play frame that shows the chart's panel lost, its chart time
-    /// `now` (µs), as the transition probe's `movies:chart_lost`; the first
-    /// frame that shows a skin movie lost as `movies:skin_lost`, with a
-    /// play frame's chart time, else -1. A play frame's chart time is kept
-    /// for a scenario's `chart_lost` and `skin_lost` captures.
+    /// `now` (µs), as the transition probe's `movies:chart_lost`, and the
+    /// first that shows a skin movie lost as `movies:skin_lost`, each chart
+    /// time kept for a scenario's `chart_lost` and `skin_lost` capture; the
+    /// first frame off play that shows a skin movie lost as
+    /// `movies:skin_lost_screen` (0), on a latch of its own.
     #[cfg(feature = "dev-tools")]
     fn mark_lost(&mut self, shows: &MovieShows, now: Option<i64>) {
         let lost = |i: usize| matches!(shows.get(i), Some(MovieShow::Lost));
@@ -854,12 +862,20 @@ impl<S: Source> Movies<S> {
             crate::dev::loop_probe::mark("movies:chart_lost", now);
             CHART_LOST_AT.store(now, std::sync::atomic::Ordering::Release);
         }
-        if !self.skin_lost_marked && (0..SLOTS).any(|i| !CHART_SLOTS.contains(&i) && lost(i)) {
-            self.skin_lost_marked = true;
-            crate::dev::loop_probe::mark("movies:skin_lost", now.unwrap_or(-1));
-            if let Some(now) = now {
+        if !(0..SLOTS).any(|i| !CHART_SLOTS.contains(&i) && lost(i)) {
+            return;
+        }
+        match now {
+            Some(now) if !self.skin_lost_marked => {
+                self.skin_lost_marked = true;
+                crate::dev::loop_probe::mark("movies:skin_lost", now);
                 SKIN_LOST_AT.store(now, std::sync::atomic::Ordering::Release);
             }
+            None if !self.skin_lost_off_play => {
+                self.skin_lost_off_play = true;
+                crate::dev::loop_probe::mark("movies:skin_lost_screen", 0);
+            }
+            _ => {}
         }
     }
 

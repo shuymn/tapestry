@@ -172,13 +172,22 @@ impl FaultRun {
         m
     }
 
-    /// The first frame that drew a skin movie lost: its time on the game's
-    /// clock and its chart time (-1 off play).
+    /// The first play frame that drew a skin movie lost: its time on the
+    /// game's clock and its chart time.
     fn skin_lost(&self) -> (i64, i64) {
         *self
             .marks("movies:skin_lost")
             .first()
             .unwrap_or_else(|| panic!("a skin movie loss drawn: {}", self.stdout))
+    }
+
+    /// The first frame off play that drew a skin movie lost, on the game's
+    /// clock.
+    fn skin_lost_off_play(&self) -> i64 {
+        self.marks("movies:skin_lost_screen")
+            .first()
+            .unwrap_or_else(|| panic!("a skin movie loss drawn: {}", self.stdout))
+            .0
     }
 
     /// Checks the first play frame that drew the panel lost (the
@@ -775,7 +784,7 @@ fn failed_launch_blacks_the_panel_from_chart_time_zero() {
     let healthy = healthy_fault_run(&ats);
     let fx = fault_fixture("#00004:01");
     let _keep = KeepOnFailure::of(&fx, "failed_launch_blacks_the_panel_from_chart_time_zero");
-    let text = fault_text(&ats, &[], FAULT_SELECT, FAULT_PLAY);
+    let text = fault_text(&ats, &[LOST, LOST_SKIN], FAULT_SELECT, FAULT_PLAY);
     let gate = fx.base.join("launch.gate");
     let reached = fx.base.join("launch.gate.reached");
     let hold = fx.base.join("preparation.gate");
@@ -814,8 +823,16 @@ fn failed_launch_blacks_the_panel_from_chart_time_zero() {
         "{}",
         run.stdout
     );
-    let (_, lost) = run.panel_lost();
+    // Lost while the play was prepared, both are drawn lost from its first
+    // play frame, captured black, whatever drew them lost before it.
+    let seen = run.seen();
+    let lost = run.check_lost_frame(seen);
     assert!(lost <= 0, "drawn lost from {lost}, after chart time 0");
+    let skin = run.check_skin_lost_frame(seen);
+    assert!(
+        skin <= 0,
+        "the skin movie drawn lost from {skin}, after chart time 0"
+    );
     for at in &ats {
         assert!(
             all_black(&run.px(&format!("c{at}"))),
@@ -1638,7 +1655,7 @@ fn starved_worker_after_a_frame_blacks_its_panels() {
     // is built, after the frame before it was presented: every capture
     // presented from that mark on is of that frame or a later one.
     let seen = run.seen();
-    let (drawn, _) = run.skin_lost();
+    let drawn = run.skin_lost_off_play();
     assert!(seen <= drawn, "drawn lost at {drawn}, before {seen}");
     let mut after = 0;
     for k in first_shown.unwrap()..=48 {
