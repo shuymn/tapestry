@@ -801,6 +801,25 @@ impl Rig {
 
     /// [`new`](Self::new) with `frames` as its frame sink.
     pub(crate) fn with_sink(frames: Box<dyn FrameSink>) -> Self {
+        Self::build(frames, None)
+    }
+
+    /// [`new`](Self::new) with its first renderer on the fake residency
+    /// path, its fence held until the test completes it. The fake is set
+    /// on the render thread as that renderer is made, before any request
+    /// reaches it; a renderer built again takes the device's path.
+    pub(crate) fn with_fake_residency() -> (Self, render::FakeResidency) {
+        let slot: Arc<Mutex<Option<render::FakeResidency>>> = Arc::default();
+        let rig = Self::build(Box::new(NoFrames), Some(Arc::clone(&slot)));
+        assert!(wait_until(|| slot.lock().unwrap().is_some()));
+        let fake = slot.lock().unwrap().take().unwrap();
+        (rig, fake)
+    }
+
+    fn build(
+        frames: Box<dyn FrameSink>,
+        mut fake: Option<Arc<Mutex<Option<render::FakeResidency>>>>,
+    ) -> Self {
         let gate = Arc::new(Gate::default());
         let faults = Arc::new(Faults::default());
         let drawn = Arc::new(Mutex::new(Vec::new()));
@@ -819,6 +838,9 @@ impl Rig {
             // acknowledge nothing, which a loaded machine would decide.
             // Faults inject the outcomes a test needs.
             r.set_offscreen_frame_wait(None);
+            if let Some(slot) = fake.take() {
+                *slot.lock().unwrap() = Some(r.use_fake_residency());
+            }
             Ok(Box::new(Recorded {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
                 gate: Arc::clone(&g),
@@ -5556,22 +5578,6 @@ fn a_first_view_whose_commit_is_refused_falls_back_to_its_page() {
     rig.link.exit();
 }
 
-/// The rig's renderer on the fake residency path, its fence held until
-/// the test completes it.
-fn fake_residency(rig: &Rig) -> render::FakeResidency {
-    let slot: Arc<Mutex<Option<render::FakeResidency>>> = Arc::default();
-    let s2 = Arc::clone(&slot);
-    rig.faults
-        .on_renderer
-        .lock()
-        .unwrap()
-        .push(Box::new(move |r| {
-            *s2.lock().unwrap() = Some(r.use_fake_residency());
-        }));
-    assert!(wait_until(|| slot.lock().unwrap().is_some()));
-    slot.lock().unwrap().take().unwrap()
-}
-
 /// S-R5 (design.md "Screen Transitions and Loading", the frame-budgeted
 /// uploads): a pages ticket whose array's fence never completes, on an
 /// idle render thread with no frame to present, is answered once with the
@@ -5584,8 +5590,7 @@ fn an_idle_pass_times_out_a_pending_creation() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, skin) = fixed_skin();
-    let rig = Rig::new();
-    let _fake = fake_residency(&rig);
+    let (rig, _fake) = Rig::with_fake_residency();
     let asked = Instant::now();
     let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
     let answer = pages_answer(&mut t);
@@ -5612,8 +5617,7 @@ fn a_device_lost_during_a_creation_recovers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, skin) = fixed_skin();
-    let rig = Rig::new();
-    let fake = fake_residency(&rig);
+    let (rig, fake) = Rig::with_fake_residency();
     let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
     assert!(wait_until(|| fake.calls() >= 2), "no creation");
     fake.remove();
