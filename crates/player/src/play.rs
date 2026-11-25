@@ -333,6 +333,11 @@ pub struct PlayerRig<'a> {
     pub ready_state_at: Option<TimeUs>,
     /// Where the current play's chart time 0 lies on the clock.
     pub origin: Option<TimeUs>,
+    /// The current attempt's origin as its play message gave it, a rearm
+    /// leaving it: a windowed run's record names the attempt by it, and the
+    /// play's and outro's marks name theirs (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub attempt: Option<TimeUs>,
     /// What the play skin declares, from the current attempt's commit
     /// receipt ([`commit_ready`]); none declared before it.
     pub declared: Declared,
@@ -2606,6 +2611,15 @@ impl Rig for PlayerRig<'_> {
         self.result_outro = Some(at);
         #[cfg(feature = "dev-tools")]
         println!("dev: result outro began, view {pinned:?} pinned");
+        // The outro's effective end: its start and the skin's fade-out,
+        // at once for the built-in presentation (a run record's mark),
+        // named by the attempt whose result it leaves (-1 for none).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::game_mark(
+            "outro-end",
+            TimeUs(at.0.saturating_add(timing.map_or(0, |t| t.outro.0))),
+            self.attempt.map_or(-1, |o| o.0),
+        );
         #[cfg(not(feature = "dev-tools"))]
         let _ = pinned;
         // The fade-out's start: a skin's (its timing given) swaps the
@@ -2688,6 +2702,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn discard_attempt(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::transitions::game_mark_now("withdrawal", 0);
         let _ = self.drop_prep();
         self.render.discard_attempt();
     }
@@ -3337,6 +3353,10 @@ impl Rig for PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_at("ready", Some(ready_state_at));
         self.origin = Some(origin);
+        #[cfg(feature = "dev-tools")]
+        {
+            self.attempt = Some(origin);
+        }
         println!("play started");
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("ready");
@@ -3531,6 +3551,15 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
         self.audio.control.ring_out(fade_at, end_at);
+    }
+
+    #[cfg(feature = "dev-tools")]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
+        // The fade's end, named by its attempt (-1 for none).
+        let _ = from;
+        let attempt = self.attempt.map_or(-1, |o| o.0);
+        crate::dev::transitions::game_mark("play-fade-end", to, attempt);
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

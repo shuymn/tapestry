@@ -1026,6 +1026,8 @@ fn rig<'a>(
         times: LoadTimes::default(),
         ready_state_at: None,
         origin: None,
+        #[cfg(feature = "dev-tools")]
+        attempt: None,
         declared: crate::render_side::Declared::default(),
         committed: None,
         steps,
@@ -2100,6 +2102,16 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some(us) = s.dev.upload_slice_us {
         dev::pin_upload_slice(us);
     }
+    // A windowed run's raw transition record (`--dev-transitions`): its
+    // book and the game thread's marks reserved before any play. A
+    // scenario's frame sink records into the scenario's book, which the
+    // record then reads.
+    #[cfg(feature = "dev-tools")]
+    let run_record = s.dev.transitions.clone().map(|path| {
+        dev::transitions::start_game_marks(clock);
+        let book = dev::transitions::run_record_book(scenario.as_ref().map(|sc| &sc.transitions));
+        (path, book)
+    });
     #[cfg(feature = "dev-tools")]
     let shot_tap = s.dev.shot_pipe.clone().map(|name| {
         let tap = dev::present_shot::Tap::new();
@@ -2172,7 +2184,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             clock,
         )),
         (None, Some(dir)) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
-        (None, None) => Box::new(NoFrames),
+        (None, None) => match &run_record {
+            Some((_, book)) => Box::new(dev::transitions::RunFrames::new(book.clone())),
+            None => Box::new(NoFrames),
+        },
     };
     #[cfg(not(feature = "dev-tools"))]
     let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
@@ -2403,37 +2418,76 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let ran = ran.and(ended.page.map_err(game::LiveError::Load));
     // As in `play`: not joined.
     inputs.detach();
+    // The scenario's conclusion, before the windowed run's record says how
+    // the run ended.
+    #[cfg(feature = "dev-tools")]
+    let ran_failed = ran.is_err();
+    // How the render thread ended, read before the scenario's conclusion
+    // takes the end: joined, for the record, and whether it panicked.
+    #[cfg(feature = "dev-tools")]
+    let render_joined = rendered == RenderEnd::Joined;
+    let render_ok = panicked(&rendered);
+    #[cfg(feature = "dev-tools")]
+    let (ran, concluded) = match (failed.is_none(), scenario) {
+        (true, Some((sc, script))) => {
+            // The transition record, printed off the render thread now that
+            // it has ended (design.md "Shortening Launch-Based Checks").
+            // The transition probe's marks first (`TAPESTRY_LOOP_PROBE`).
+            crate::dev::loop_probe::dump();
+            let record = sc.transitions.lines();
+            if let Ok((lines, _)) = &record {
+                for l in lines {
+                    println!("{l}");
+                }
+            }
+            let concluded = dev::scenario::conclude(
+                ran,
+                script.as_ref(),
+                sc.pending,
+                rendered,
+                &sc.captures,
+                record.map(|(_, lost)| lost),
+                sc.shots.as_ref(),
+            );
+            (Ok(()), Some(concluded))
+        }
+        _ => (ran, None),
+    };
+    // The windowed run's raw record, written off the render thread now
+    // that it has ended, a failed run's too, its last line saying how the
+    // run ended: the game's and the screen's failures, the render thread's
+    // end and the run's checks all known.
+    #[cfg(feature = "dev-tools")]
+    if let Some((path, book)) = run_record {
+        let status = dev::transitions::RunStatus::of(
+            failed.is_some() || ran_failed,
+            render_joined,
+            script_failed.is_some() || concluded.as_ref().is_some_and(Result::is_err),
+        );
+        let header = dev::transitions::RunHeader::of(clock);
+        match dev::transitions::write_run_record(&path, &book, header, status) {
+            Ok(()) => println!(
+                "dev: transition record written to {} ({})",
+                path.display(),
+                status.name()
+            ),
+            Err(e) if failed.is_some() => eprintln!("{e}"),
+            Err(e) => return Err(anyhow::Error::msg(e)),
+        }
+    }
     if let Some(e) = failed {
         return Err(e);
     }
     #[cfg(feature = "dev-tools")]
-    if let Some((sc, script)) = scenario {
-        // The transition record, printed off the render thread now that
-        // it has ended (design.md "Shortening Launch-Based Checks").
-        // The transition probe's marks first (`TAPESTRY_LOOP_PROBE`).
-        crate::dev::loop_probe::dump();
-        let record = sc.transitions.lines();
-        if let Ok((lines, _)) = &record {
-            for l in lines {
-                println!("{l}");
-            }
-        }
-        return dev::scenario::conclude(
-            ran,
-            script.as_ref(),
-            sc.pending,
-            rendered,
-            &sc.captures,
-            record.map(|(_, lost)| lost),
-            sc.shots.as_ref(),
-        );
+    if let Some(concluded) = concluded {
+        return concluded;
     }
     ran?;
     #[cfg(feature = "dev-tools")]
     if let Some(why) = script_failed {
         anyhow::bail!("dev: the select script failed: {why}");
     }
-    panicked(&rendered)
+    render_ok
 }
 
 /// A headless run (dev-tools): an input log replayed as a script, or
@@ -3350,6 +3404,9 @@ mod tests {
                 let origin = bms_model::TimeSource::now(&rig.clock);
                 let (_sink, sounds) = game::audio_link_at(8, origin);
                 rig.start(origin, sounds, side);
+                // The attempt a windowed run's record names: its play's
+                // origin, the one the render thread is handed.
+                assert_eq!(rig.attempt, Some(origin));
                 assert!(crate::render_side::tests::wait_until(|| seen
                     .lock()
                     .unwrap()

@@ -325,6 +325,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::cancel_audio",
             "PlayerRig::seal_audio",
             "PlayerRig::ring_out",
+            "PlayerRig::fade_began",
             "PlayerRig::audio_done",
             "PlayerRig::hand_off",
             "PlayerRig::abort_close",
@@ -573,6 +574,9 @@ pub const IN_PLAY: &[Site] = &[
         // The slice clock's fallback, read at every frame boundary.
         &["write_buffer_with_unpaced", "MonoClock::now", "micros"],
     ),
+    // A window frame's present stamps (dev-tools), read around each
+    // present call.
+    Site::Fns("crates/render/src/present_tap.rs", &["qpc_now"]),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],

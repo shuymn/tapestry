@@ -169,6 +169,12 @@ pub trait AppRig: LoadingRig {
     fn take_decision_takeover(&mut self) -> Option<DecisionTakeover> {
         None
     }
+    /// A takeover taken at a look of App's moved the decision's deadline
+    /// to `d`'s (dev-tools: a run record's mark). Nothing by default.
+    #[cfg(feature = "dev-tools")]
+    fn decision_revised(&mut self, d: &Decision) {
+        let _ = d;
+    }
     /// Each look of the decision screen from `origin`, before its
     /// classification: what needs no wait (the page's jobs in
     /// [`Origin::Jobs`]). Nothing by default.
@@ -1034,7 +1040,13 @@ fn look<R: AppRig>(
 ) -> Result<Verdict, LiveError<R::ScreenError>> {
     rig.decision_tick(origin)?;
     if let Some(takeover) = rig.take_decision_takeover() {
-        let _ = d.apply_takeover(takeover, rig.now());
+        let applied = d.apply_takeover(takeover, rig.now());
+        #[cfg(feature = "dev-tools")]
+        if applied {
+            rig.decision_revised(d);
+        }
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = applied;
     }
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));

@@ -2624,6 +2624,11 @@ impl Screen for MenuScreen {
     }
 
     #[cfg(feature = "dev-tools")]
+    fn present_stamps(&self) -> Option<render::PresentStamps> {
+        self.renderer.present_stamps()
+    }
+
+    #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = self.renderer.size();
         let pixels = self.renderer.read_back();

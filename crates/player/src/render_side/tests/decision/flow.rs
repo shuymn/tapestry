@@ -812,6 +812,50 @@ fn page_entry_and_leave_end_the_lifetime() {
     }
 }
 
+/// A windowed run's record marks the decision screen's end at its
+/// deadline, with its lifetime, when the screen is entered and again when
+/// App's look takes a takeover that moves it, and a refused load when the
+/// selection shows the refusal (development builds).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_decision_s_end_and_a_refusal_are_marked() {
+    use crate::dev::transitions::{kept_game_marks, start_game_marks};
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        start_game_marks(input::QpcClock::start());
+        f.prepared();
+        let mut d = choose(rig, &f.pick(false), 3);
+        let end = d.deadline().unwrap();
+        let marks: Vec<_> = kept_game_marks().iter().map(|m| (m.0, m.1, m.2)).collect();
+        assert_eq!(marks, [(u64::try_from(end.0).unwrap(), "decision-end", 3)]);
+        let now = rig.now();
+        let takeover = game::DecisionTakeover {
+            lifetime: d.lifetime().unwrap(),
+            at: now,
+            why: "refused".to_owned(),
+        };
+        assert!(d.apply_takeover(takeover, now));
+        let moved = d.deadline().unwrap();
+        assert_ne!(moved, end);
+        game::AppRig::decision_revised(rig, &d);
+        let last = kept_game_marks().last().map(|m| (m.0, m.1, m.2));
+        assert_eq!(
+            last,
+            Some((u64::try_from(moved.0).unwrap(), "decision-end", 3))
+        );
+        rig.closed_epoch();
+        rig.show_refusal(&game::LoadRefusal {
+            chart: f.chart.clone(),
+            reason: game::Refused::Chart(game::SessionError::UnsupportedChart(f.chart.clone())),
+        });
+        let tags: Vec<_> = kept_game_marks().iter().map(|m| (m.1, m.2)).collect();
+        assert_eq!(
+            tags,
+            [("decision-end", 3), ("decision-end", 3), ("refusal", 0)]
+        );
+    });
+}
+
 /// O7 inside a rig's wait: the play's deadline step taken by a look of
 /// the controls (the step latched there, so App's own look runs no step)
 /// ends the lifetime in the label book, and its slot is retired.

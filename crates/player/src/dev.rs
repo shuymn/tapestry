@@ -860,6 +860,11 @@ pub struct SelectOptions {
     /// [`pin_upload_slice`]): the fixed baseline the scaled slice is
     /// measured against.
     pub upload_slice_us: Option<u64>,
+    /// Where a windowed run writes its raw transition record at its end
+    /// (`--dev-transitions <file>`, [`transitions::RunFrames`]): its
+    /// presents with their stamps on the host counter, the game thread's
+    /// marks and the first close, for a joiner.
+    pub transitions: Option<PathBuf>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -885,6 +890,7 @@ impl SelectOptions {
                 })?);
             }
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            "dev-transitions" => self.transitions = Some(PathBuf::from(p.value()?)),
             "dev-size" => self.size = Some(size(p, "--dev-size")?),
             "dev-window" => self.window = Some(size(p, "--dev-window")?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
@@ -946,6 +952,11 @@ impl SelectOptions {
         if self.headless && self.window.is_some() {
             return Err(UsageError::Usage(
                 "--dev-window cannot be used with --dev-headless".to_owned(),
+            ));
+        }
+        if self.transitions.is_some() && (self.headless || self.frames.is_some()) {
+            return Err(UsageError::Usage(
+                "--dev-transitions needs a window and no --dev-frames".to_owned(),
             ));
         }
         Ok(())
