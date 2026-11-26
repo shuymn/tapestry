@@ -514,18 +514,20 @@ impl Controls {
                 match (w.reveal)() {
                     crate::render_side::AtStep::Pending => seen = game::Verdict::Continue,
                     crate::render_side::AtStep::Refused => {
-                        if let Some(e) = &w.early {
-                            let _ = e.gate.commit_reveal();
-                        }
-                        seen = w.decision.refuse_step();
+                        let committed = w.early.as_ref().map(|e| e.gate.commit_reveal());
+                        let why = match committed {
+                            Some(crate::play::early::Committed::Refused(r)) => r,
+                            _ => crate::selection::refused_before_reveal(),
+                        };
+                        seen = w.decision.refuse_step(why);
                     }
                     crate::render_side::AtStep::Revealed => {
                         let committed = match &w.early {
                             Some(e) => e.gate.commit_reveal(),
                             None => crate::play::early::Committed::Revealed,
                         };
-                        if let crate::play::early::Committed::Refused(_) = committed {
-                            seen = w.decision.refuse_step();
+                        if let crate::play::early::Committed::Refused(why) = committed {
+                            seen = w.decision.refuse_step(why);
                         } else {
                             // The play's deadline step: the loading
                             // state's tuning epoch, the input epoch's end,
