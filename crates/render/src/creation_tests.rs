@@ -187,6 +187,26 @@ fn a_real_request_returns_before_residency() {
     assert_eq!(colour(&mut r), [255, 0, 0]);
 }
 
+/// The device's own fence: a value signalled ends the final owner's wait
+/// met, and a reading of the removal value on a device that is not removed
+/// ends it unmet, as the fake's does: only the explicit removal check lets
+/// a resource go without its fence.
+#[test]
+fn a_native_wait_takes_no_removal_reading_as_done() {
+    let r = offscreen(W, H);
+    let (raw, fence) = crate::residency::test_fence(r.gpu.device()).expect("a D3D12 device");
+    // SAFETY: a CPU signal of a fence made for this test.
+    unsafe { raw.Signal(1) }.unwrap();
+    assert!(fence.wait(1, Duration::ZERO), "a signalled value");
+    // SAFETY: as above; the value a removed device's fences read.
+    unsafe { raw.Signal(u64::MAX) }.unwrap();
+    assert!(!fence.removed(), "the device is not removed");
+    assert!(
+        !fence.wait(2, Duration::from_millis(50)),
+        "a removal reading"
+    );
+}
+
 /// On the device's path, a request in flight when its renderer is dropped
 /// is handed to the holder, and the holder released after the renderer and
 /// its `wgpu` instance releases the array, the fence and the device with no

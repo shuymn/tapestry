@@ -218,8 +218,10 @@ pub(crate) trait FenceRead: Send + Sync {
     /// (`GetDeviceRemovedReason`).
     fn removed(&self) -> bool;
     /// Waits at most `timeout` for `value` to complete: whether it did.
-    /// Only the holder's final owner waits ([`ResidencyHolder`]), never a
-    /// frame.
+    /// A reading of [`REMOVED`] is no completion: it ends the wait unmet,
+    /// and only the explicit removal check lets a resource go without its
+    /// fence. Only the holder's final owner waits ([`ResidencyHolder`]),
+    /// never a frame.
     fn wait(&self, value: u64, timeout: Duration) -> bool;
 }
 
@@ -490,6 +492,21 @@ impl Path {
     }
 }
 
+/// A fence of its own on `device`'s D3D12 device, as the path reads one,
+/// and the raw fence to signal it with.
+#[cfg(test)]
+pub(crate) fn test_fence(device: &wgpu::Device) -> Option<(ID3D12Fence, Fence)> {
+    // SAFETY: as in `path`.
+    let raw = unsafe { device.as_hal::<wgpu_hal::api::Dx12>() }.map(|d| d.raw_device().clone())?;
+    // SAFETY: a fence made on the live device.
+    let fence = unsafe { raw.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok()?;
+    let read: Fence = Arc::new(D3d12Fence {
+        fence: fence.clone(),
+        device: raw,
+    });
+    Some((fence, read))
+}
+
 /// The D3D12 path of `device` (with `adapter` for DXGI's budget), or the
 /// `Sync` path and why.
 pub(crate) fn path(device: &wgpu::Device, adapter: Option<IDXGIAdapter3>) -> Path {
@@ -577,8 +594,10 @@ impl FenceRead for D3d12Fence {
     }
 
     fn wait(&self, value: u64, timeout: Duration) -> bool {
-        if completion(self.completed(), value) != Completion::Pending {
-            return true;
+        match completion(self.completed(), value) {
+            Completion::Done => return true,
+            Completion::Removed => return false,
+            Completion::Pending => {}
         }
         // SAFETY: an unnamed auto-reset event, closed below.
         let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
@@ -753,7 +772,9 @@ impl Drop for Held {
         let end = Instant::now() + FINAL_WAIT;
         for r in self.0.drain(..) {
             let left = end.saturating_duration_since(Instant::now());
-            if r.done() || r.device_removed() || r.fence.wait(r.value, left) {
+            // The wait ends unmet on a removal reading; the explicit
+            // check then decides whether the device is gone.
+            if r.fence.wait(r.value, left) || r.device_removed() {
                 drop(r);
             } else {
                 std::mem::forget(r);
