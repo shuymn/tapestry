@@ -3626,11 +3626,14 @@ impl PlayerRig<'_> {
                 // The deadline step taken inside the rig's wait (a load
                 // still running at the deadline), as `deadline_step` takes
                 // it outside one.
-                reveal: Box::new(move || {
-                    #[cfg(feature = "dev-tools")]
-                    crate::dev::stage("decision_end");
-                    println!("load: the play screen loads {name}");
-                    reveal();
+                reveal: Box::new(move |late| {
+                    let claim = reveal(late);
+                    if claim == crate::render_side::Claim::Revealed {
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::stage("decision_end");
+                        println!("load: the play screen loads {name}");
+                    }
+                    claim
                 }),
                 failures: self.failures.clone(),
                 screen: Some(self.render.recovery_handle()),
@@ -4214,6 +4217,10 @@ impl AppRig for PlayerRig<'_> {
             // "Screen Transitions and Loading", the decision's end).
             if let Some(at) = d.deadline() {
                 self.render.arm_reveal(at, d.takeover_deadline());
+                // A close withdraws it, whether or not this thread looks
+                // again before the shutdown's waits.
+                self.controls
+                    .set_reveal_withdraw(self.render.reveal_withdrawer());
             }
             show_stage(&self.render, Some(&page), Stage::Chart);
             sel.loading = Some(page);
@@ -4317,16 +4324,34 @@ impl AppRig for PlayerRig<'_> {
     /// The play's deadline: the loading state's tuning epoch, the input
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
-    fn deadline_step(&mut self) -> game::StepOutcome {
-        // The reveal committed against the gate's one state first: a
-        // refusal published before it reveals nothing. A job still running
-        // is cancelled there, never waited for.
+    fn deadline_step(&mut self, late: bool) -> game::StepOutcome {
+        // The reveal claimed on the reveal word first (design.md "Screen
+        // Transitions and Loading", the decision's end): a refusal that won
+        // it shows nothing and returns with its reason, read through the
+        // gate's commit; a takeover on the render thread not taken yet
+        // steps nothing.
+        match self.render.claim_reveal(late) {
+            crate::render_side::Claim::Revised => return game::StepOutcome::Revised,
+            crate::render_side::Claim::Refused => {
+                let committed = self.early.as_ref().map(|e| e.gate().commit_reveal());
+                let r = match committed {
+                    Some(crate::play::early::Committed::Refused(r)) => r,
+                    _ => game::PreparationRefusal {
+                        location: None,
+                        reason: "the loading state was withdrawn before the deadline".to_owned(),
+                    },
+                };
+                return game::StepOutcome::Refused(r);
+            }
+            crate::render_side::Claim::Revealed => {}
+        }
+        // Then committed against the gate's one state, which the reveal
+        // froze: a job still running is cancelled there, never waited for.
+        // A refusal the word did not order leaves the loading state shown
+        // with it.
         if let Some(e) = &self.early
             && let crate::play::early::Committed::Refused(r) = e.gate().commit_reveal()
         {
-            // Withdrawn unless the render thread revealed first: then the
-            // loading state shown leaves with the refusal.
-            self.render.refuse_reveal();
             return game::StepOutcome::Refused(r);
         }
         #[cfg(feature = "dev-tools")]
@@ -4335,7 +4360,6 @@ impl AppRig for PlayerRig<'_> {
         if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
             println!("load: the play screen loads {name}");
         }
-        self.render.reveal_loading();
         self.begin_loading_epoch();
         self.controls.open_epoch();
         self.controls.next_scene();

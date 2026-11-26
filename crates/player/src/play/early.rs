@@ -122,10 +122,6 @@ pub struct EarlyGate<S = Specialization> {
     /// withdraws the render thread's armed reveal through it, under the
     /// lock, and a reveal through it freezes what the gate keeps.
     order: std::sync::OnceLock<RevealOrder>,
-    /// Called at the commit's start, before its lock (tests: a refusal
-    /// published between a look's classification and its commit).
-    #[cfg(test)]
-    before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Called under the start's lock once the job's thread is spawned and
     /// before its state is set (tests: the worker held at the lock).
     #[cfg(test)]
@@ -166,8 +162,6 @@ impl<S> EarlyGate<S> {
             }),
             render,
             order: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            before_commit: Mutex::new(None),
             #[cfg(test)]
             after_spawn: Mutex::new(None),
             #[cfg(test)]
@@ -237,22 +231,28 @@ impl<S> EarlyGate<S> {
     }
 
     /// Begins the job from [`Idle`](State::Idle) with `spawn`, under the
-    /// lock: the job's thread spawned and its cancel set as the state
-    /// before the lock is released, so the worker's completion, which
-    /// takes the same lock, always finds the job running (or cancelled at
-    /// the reveal). A thread that cannot start is a refusal at once.
+    /// lock: the job's thread spawned with the gate's cancel and that
+    /// cancel set as the state before the lock is released, so the worker's
+    /// completion, which takes the same lock, always finds the job running
+    /// (or cancelled at the reveal). A thread that cannot start is a
+    /// refusal at once.
     ///
-    /// Nothing begins once the reveal word says revealed, and a job
-    /// spawned as the reveal comes is cancelled by it: its cancel is given
-    /// to the word before the word is read again.
-    pub fn start(&self, spawn: impl FnOnce() -> Result<Cancel, String>) -> Start {
+    /// Nothing begins once the reveal word says revealed. The cancel is
+    /// given to the word before `spawn` runs, so a reveal from then on
+    /// cancels the job before its first check, whenever the spawning thread
+    /// resumes.
+    pub fn start(&self, spawn: impl FnOnce(&Cancel) -> Result<(), String>) -> Start {
         let mut inner = self.lock();
         self.sync(&mut inner);
         if !matches!(inner.state, State::Idle) {
             return Start::Late;
         }
-        match spawn() {
-            Ok(cancel) => {
+        let cancel = Cancel::new();
+        if let Some(o) = self.order.get() {
+            o.cancel_at_reveal(&cancel);
+        }
+        match spawn(&cancel) {
+            Ok(()) => {
                 #[cfg(test)]
                 if let Some(hook) = self
                     .after_spawn
@@ -261,9 +261,6 @@ impl<S> EarlyGate<S> {
                     .take()
                 {
                     hook();
-                }
-                if let Some(o) = self.order.get() {
-                    o.cancel_at_reveal(&cancel);
                 }
                 inner.state = State::Running(cancel);
                 self.sync(&mut inner);
@@ -370,15 +367,6 @@ impl<S> EarlyGate<S> {
     /// thread's reveal it decides nothing again: the state the reveal froze
     /// (`sync`) answers [`Committed::Revealed`].
     pub fn commit_reveal(&self) -> Committed {
-        #[cfg(test)]
-        if let Some(hook) = self
-            .before_commit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            hook();
-        }
         let mut inner = self.lock();
         self.sync(&mut inner);
         self.absorb(&mut inner);
@@ -480,15 +468,6 @@ impl<S> EarlyGate<S> {
             State::Revealed(Some(EarlyOutcome::Refused(_))) => "revealed refused",
             State::Revealed(Some(EarlyOutcome::Declined)) => "revealed declined",
         }
-    }
-
-    /// `hook` runs at the next commit's start, before its lock (tests).
-    #[cfg(all(test, feature = "dev-tools"))]
-    pub fn before_commit(&self, hook: impl FnOnce() + Send + 'static) {
-        *self
-            .before_commit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// The completions begun, counted before their lock (tests).
@@ -796,8 +775,9 @@ impl EarlyPrep {
         let gate = Arc::clone(&self.gate);
         let job = &mut self.job;
         let mut unspawned = None;
-        let started = self.gate.start(|| {
-            let spawned = imports::spawn_job_completing(
+        let started = self.gate.start(|gates| {
+            let spawned = imports::spawn_job_cancelled_by(
+                gates.clone(),
                 move |cancel: &Cancel| imports::specialize(&play, &facts, cancel),
                 move |sent| {
                     let refused = match sent {
@@ -816,9 +796,8 @@ impl EarlyPrep {
                 || {},
             )
             .inspect_err(|why| unspawned = Some(why.clone()))?;
-            let cancel = spawned.canceller();
             *job = Some(spawned);
-            Ok(cancel)
+            Ok(())
         });
         match started {
             Start::Running => log::info!("early: the specialization began"),

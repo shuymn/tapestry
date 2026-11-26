@@ -52,9 +52,11 @@ pub struct DecisionWatch {
     /// ([`game::Origin::Read`], so its deadline sets the screen waiting
     /// for the read and never steps inside a rig's wait).
     pub origin: game::Origin,
-    /// The held loading lifetime revealed: the deadline step's first
-    /// part, before the input epoch ends.
-    pub reveal: Box<dyn Fn() + Send + Sync>,
+    /// The held loading lifetime revealed, claimed on the reveal word with
+    /// the deadline judged (`true`: the built-in presentation's): the
+    /// deadline step's first part, before the input epoch ends
+    /// ([`crate::render_side::RenderLink::claim_reveal`]).
+    pub reveal: Box<dyn Fn(bool) -> crate::render_side::Claim + Send + Sync>,
     /// The rig's thread failures, as the rig itself reads them.
     pub failures: crate::failures::Failures,
     /// The screen, built again from the wait's looks when it was lost
@@ -93,6 +95,16 @@ impl std::fmt::Debug for ImageService {
     }
 }
 
+/// What a close withdraws the decision's armed reveal with
+/// ([`Controls::set_reveal_withdraw`]).
+struct RevealWithdraw(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for RevealWithdraw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RevealWithdraw")
+    }
+}
+
 /// The shared state between the window thread, the power notification and
 /// the game thread.
 #[derive(Debug)]
@@ -106,6 +118,9 @@ pub struct Controls {
     /// observed, on the clock; `i64::MIN` for none.
     quit_in_epoch: AtomicI64,
     quit: AtomicBool,
+    /// What a close withdraws the decision's armed reveal with
+    /// ([`set_reveal_withdraw`](Self::set_reveal_withdraw)).
+    reveal_withdraw: OnceLock<RevealWithdraw>,
     /// The quit key leaves the chart rather than latching [`quit`](Self::quit).
     leaves: AtomicBool,
     focused: AtomicBool,
@@ -160,6 +175,7 @@ impl Controls {
             retry_at: AtomicI64::new(i64::MIN),
             quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
+            reveal_withdraw: OnceLock::new(),
             leaves: AtomicBool::new(false),
             focused: AtomicBool::new(true),
             presentation: input::PresentationFocus::new(),
@@ -457,6 +473,11 @@ impl Controls {
             return Some(left);
         }
         let terminal = self.quitting() || w.failures.any();
+        // A close or a thread's failure keeps the deadline from revealing:
+        // the render thread's armed reveal is withdrawn here too.
+        if terminal && !w.decision.practice() {
+            self.withdraw_reveal();
+        }
         let now = self.clock.now();
         // The decision skin's takeover, as App's look takes it: before the
         // classification, so the deadline then in force is judged.
@@ -483,26 +504,41 @@ impl Controls {
         });
         let mut seen = w.decision.classify(w.origin, now, terminal, false, refused);
         if seen == game::Verdict::Step {
-            // The reveal committed against the gate's one state first: a
-            // refusal published before it reveals nothing and returns.
-            let committed = match &w.early {
-                Some(e) if !w.decision.practice() => e.gate.commit_reveal(),
-                _ => crate::play::early::Committed::Revealed,
-            };
-            if let crate::play::early::Committed::Refused(_) = committed {
-                seen = w.decision.refuse_step();
-            } else {
-                if !w.decision.practice() {
-                    // The play's deadline step: the lifetime shown, the
-                    // loading state's tuning epoch, the input epoch's end,
-                    // and a new scene. Each a lock-held update or a queued
-                    // message.
-                    (w.reveal)();
-                    self.tuning.enter_loading(now);
-                    self.open_epoch();
-                    self.next_scene();
-                }
+            if w.decision.practice() {
                 w.decision.commit_step();
+            } else {
+                // The reveal claimed on the reveal word first, then
+                // committed against the gate's one state: a refusal that
+                // won the word shows nothing and returns, and a takeover
+                // not taken yet steps nothing.
+                let late = w.decision.deadline() == Some(w.decision.takeover_deadline());
+                match (w.reveal)(late) {
+                    crate::render_side::Claim::Revised => seen = game::Verdict::Continue,
+                    crate::render_side::Claim::Refused => {
+                        if let Some(e) = &w.early {
+                            let _ = e.gate.commit_reveal();
+                        }
+                        seen = w.decision.refuse_step();
+                    }
+                    crate::render_side::Claim::Revealed => {
+                        let committed = match &w.early {
+                            Some(e) => e.gate.commit_reveal(),
+                            None => crate::play::early::Committed::Revealed,
+                        };
+                        if let crate::play::early::Committed::Refused(_) = committed {
+                            seen = w.decision.refuse_step();
+                        } else {
+                            // The play's deadline step: the loading
+                            // state's tuning epoch, the input epoch's end,
+                            // and a new scene. Each a lock-held update or a
+                            // queued message.
+                            self.tuning.enter_loading(now);
+                            self.open_epoch();
+                            self.next_scene();
+                            w.decision.commit_step();
+                        }
+                    }
+                }
             }
         }
         if seen.leaves() {
@@ -536,9 +572,25 @@ impl Controls {
         (t != i64::MIN).then_some(TimeUs(t))
     }
 
+    /// A close withdraws the decision's armed reveal through `withdraw`
+    /// ([`crate::render_side::RenderLink::reveal_withdrawer`]; once, a
+    /// second is ignored).
+    pub fn set_reveal_withdraw(&self, withdraw: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.reveal_withdraw.set(RevealWithdraw(withdraw));
+    }
+
+    /// The decision's armed reveal withdrawn, if one is set.
+    fn withdraw_reveal(&self) {
+        if let Some(RevealWithdraw(w)) = self.reveal_withdraw.get() {
+            w();
+        }
+    }
+
     /// The window was asked to close, or its event loop ended: the game
-    /// quits.
+    /// quits. A reveal armed for the decision screen is withdrawn first, so
+    /// the shutdown's waits draw no loading state past its deadline.
     pub fn close(&self) {
+        self.withdraw_reveal();
         // The first close on the host counter, for a windowed run's record.
         #[cfg(feature = "dev-tools")]
         crate::dev::transitions::close_stamp();
@@ -869,8 +921,9 @@ mod tests {
                 super::DecisionWatch {
                     decision,
                     origin: game::Origin::Load,
-                    reveal: Box::new(move || {
+                    reveal: Box::new(move |_| {
                         reveals.fetch_add(1, Ordering::SeqCst);
+                        crate::render_side::Claim::Revealed
                     }),
                     failures: failures.clone(),
                     screen: None,

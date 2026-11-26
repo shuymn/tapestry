@@ -190,9 +190,14 @@ pub trait AppRig: LoadingRig {
     /// and [`StepOutcome::Stepped`]; or, when the play's preparation begun
     /// at the read ([`chart_read`](Self::chart_read)) was refused before
     /// the reveal, nothing shown and [`StepOutcome::Refused`], which App
-    /// routes as that refusal with the decision unstepped. Waits for no
-    /// acknowledgement. By default stepped, showing nothing.
-    fn deadline_step(&mut self) -> StepOutcome {
+    /// routes as that refusal with the decision unstepped; or, when a
+    /// takeover the look has not taken moved the deadline past the one it
+    /// judged, nothing shown and [`StepOutcome::Revised`]. `late`: the
+    /// deadline judged is the built-in presentation's
+    /// ([`Decision::takeover_deadline`]). Waits for no acknowledgement. By
+    /// default stepped, showing nothing.
+    fn deadline_step(&mut self, late: bool) -> StepOutcome {
+        let _ = late;
         StepOutcome::Stepped
     }
     /// The play's deadline will not reveal its loading state: a refusal or
@@ -348,6 +353,11 @@ pub enum StepOutcome {
     /// The play's preparation was refused before the reveal: nothing was
     /// revealed, and the flow returns with this refusal.
     Refused(PreparationRefusal),
+    /// A takeover the look had not taken moved the deadline in force past
+    /// the one it judged (design.md "Screen Transitions and Loading", the
+    /// decision's end): nothing was revealed or stepped, and the screen
+    /// goes on to its next look, which takes the takeover.
+    Revised,
 }
 
 /// Why a chosen chart was refused.
@@ -1107,9 +1117,10 @@ fn look<R: AppRig>(
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
     let reply = reply.or_else(|| rig.early_refusal().map(|_| Reply::Refusal));
-    // A reply in hand keeps the deadline from revealing the loading state:
-    // the render thread's own reveal is withdrawn as soon as it is known.
-    if reply.is_some() && !d.practice() {
+    // A reply in hand, a close or a thread's failure keeps the deadline
+    // from revealing the loading state: the render thread's own reveal is
+    // withdrawn as soon as it is known, before any wait that ends the run.
+    if (reply.is_some() || terminal) && !d.practice() {
         rig.refuse_reveal();
     }
     let mut seen = d.classify(origin, rig.now(), terminal, escape, reply);
@@ -1117,9 +1128,11 @@ fn look<R: AppRig>(
         if d.practice() {
             d.commit_step();
         } else {
-            match rig.deadline_step() {
+            let late = d.deadline() == Some(d.takeover_deadline());
+            match rig.deadline_step(late) {
                 StepOutcome::Stepped => d.commit_step(),
                 StepOutcome::Refused(_) => seen = d.refuse_step(),
+                StepOutcome::Revised => seen = Verdict::Continue,
             }
         }
     }

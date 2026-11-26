@@ -597,6 +597,10 @@ struct Headless {
     closed_epochs: usize,
     /// When the armed reveal was withdrawn ([`AppRig::refuse_reveal`]).
     reveal_refused_at: Vec<i64>,
+    /// How many deadline steps answer revised before one steps, and when
+    /// each did ([`StepOutcome::Revised`]).
+    revise_steps: usize,
+    revised_at: Vec<i64>,
     /// Each decision look's origin and clock.
     decision_looks: Vec<(game::Origin, i64)>,
     /// Told at the first look of the wait for a late read.
@@ -864,6 +868,8 @@ impl Headless {
             step_refused: false,
             closed_epochs: 0,
             reveal_refused_at: Vec::new(),
+            revise_steps: 0,
+            revised_at: Vec::new(),
             decision_looks: Vec::new(),
             waiting_seen: None,
             escape_when_waiting: false,
@@ -1482,12 +1488,13 @@ impl AppRig for Headless {
                     false,
                     reply,
                 ) {
-                    game::Verdict::Step => match game::AppRig::deadline_step(self) {
+                    game::Verdict::Step => match game::AppRig::deadline_step(self, false) {
                         StepOutcome::Stepped => {
                             decision.commit_step();
                             game::Verdict::Step
                         }
                         StepOutcome::Refused(_) => decision.refuse_step(),
+                        StepOutcome::Revised => game::Verdict::Continue,
                     },
                     other => other,
                 };
@@ -1807,7 +1814,12 @@ impl AppRig for Headless {
         Ok(())
     }
 
-    fn deadline_step(&mut self) -> StepOutcome {
+    fn deadline_step(&mut self, _late: bool) -> StepOutcome {
+        if self.revise_steps > 0 {
+            self.revise_steps -= 1;
+            self.revised_at.push(self.at());
+            return StepOutcome::Revised;
+        }
         if self.refuse_at_step {
             self.step_refused = true;
             return StepOutcome::Refused(game::PreparationRefusal {
@@ -6737,6 +6749,60 @@ fn an_early_refusal_before_the_deadline_returns_with_its_reason() {
             );
         }
     }
+}
+
+/// The decision's end: App's look that reads a close, or a thread's
+/// failure, before the deadline withdraws the render thread's armed reveal
+/// there, before the waits of the run's end, so no loading state is drawn
+/// past the deadline while they run.
+#[test]
+fn a_terminal_look_withdraws_the_armed_reveal() {
+    for fails in [false, true] {
+        let close = if fails { 6_000 } else { 700 };
+        let acts = vec![(0, Act::Choose(0)), (close, Act::Close)];
+        let (rig, _events, _ran) = run(Refusal::Missing, acts, |rig| {
+            decided_read_in_time(rig);
+            if fails {
+                rig.input_fails_at = CLOCK_START + 700 * MS;
+            }
+        });
+        let choice = chosen_at(&rig, 0);
+        assert!(rig.deadline_steps.is_empty(), "{fails}: stepped");
+        assert!(rig.loading_pages.is_empty(), "{fails}: loading shown");
+        assert!(
+            rig.reveal_refused_at
+                .first()
+                .is_some_and(|&at| at < choice + 1_500 * MS),
+            "{fails}: withdrawn at {:?}, the deadline from {choice}",
+            rig.reveal_refused_at
+        );
+    }
+}
+
+/// The decision's end: a deadline step answering revised (a takeover the
+/// look had not taken moved the deadline) steps nothing and shows nothing:
+/// the screen goes on, and a later look steps it.
+#[test]
+fn a_revised_step_steps_at_a_later_look() {
+    let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided_read_in_time(rig);
+        rig.revise_steps = 1;
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 0);
+    let [revised] = rig.revised_at[..] else {
+        panic!("{:?}", rig.revised_at);
+    };
+    assert!(revised >= choice + 1_500 * MS, "revised at {revised}");
+    let [stepped] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    assert!(
+        stepped >= revised,
+        "stepped at {stepped}, revised at {revised}"
+    );
 }
 
 /// B9b: the deadline's step itself answers refused: nothing revealed, the
