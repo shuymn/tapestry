@@ -631,6 +631,8 @@ struct Headless {
     /// Every load with its plays' reports.
     loads: Vec<(usize, Vec<PlayReport>)>,
     refusals: Vec<String>,
+    /// The reasons of the preparation refusals shown.
+    refusal_reasons: Vec<String>,
     /// Openings refused before the play was handed over, by chart.
     refused_opens: Vec<usize>,
     starts: usize,
@@ -820,6 +822,7 @@ impl Headless {
             violations: Vec::new(),
             loads: Vec::new(),
             refusals: Vec::new(),
+            refusal_reasons: Vec::new(),
             refused_opens: Vec::new(),
             starts: 0,
             chooses: 0,
@@ -1493,7 +1496,7 @@ impl AppRig for Headless {
                             decision.commit_step();
                             game::Verdict::Step
                         }
-                        StepOutcome::Refused(_) => decision.refuse_step(),
+                        StepOutcome::Refused(why) => decision.refuse_step(why),
                         StepOutcome::Pending => game::Verdict::Continue,
                     },
                     other => other,
@@ -1599,7 +1602,10 @@ impl AppRig for Headless {
             Refused::Play(e) => panic!("{e:?}"),
             Refused::Practice(game::PracticeError::Autoplay) => "autoplay",
             Refused::Practice(e) => panic!("{e:?}"),
-            Refused::Preparation(_) => "preparation",
+            Refused::Preparation(r) => {
+                self.refusal_reasons.push(r.reason.clone());
+                "preparation"
+            }
         };
         self.refusals.push(kind.to_owned());
         // The player fixes the preset file once its refusal is shown.
@@ -1842,7 +1848,7 @@ impl AppRig for Headless {
 
     fn early_refusal(&self) -> Option<game::PreparationRefusal> {
         let published = self.early_refused_from.is_some_and(|t| self.at() >= t);
-        (published || self.step_refused).then(|| game::PreparationRefusal {
+        published.then(|| game::PreparationRefusal {
             location: None,
             reason: "refused early".to_owned(),
         })
@@ -6824,6 +6830,8 @@ fn a_refusal_at_the_step_is_not_revealed() {
             rig.violations
         );
         assert_eq!(rig.refusals, ["preparation"], "{served:?}");
+        // The step's own reason, with no early refusal to read.
+        assert_eq!(rig.refusal_reasons, ["refused at the step"], "{served:?}");
         assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
         assert!(rig.loading_pages.is_empty(), "{served:?}: loading shown");
         assert!(rig.opened_at.is_empty(), "{served:?}: opened");

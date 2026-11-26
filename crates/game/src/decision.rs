@@ -18,6 +18,8 @@
 
 use bms_model::{Deadline, TimeUs};
 
+use crate::PreparationRefusal;
+
 /// The built-in presentation's time from the choice (design.md "Play
 /// Lifecycle", the decision screen).
 pub const DECISION_TIME: TimeUs = TimeUs(1_500_000);
@@ -173,6 +175,9 @@ pub struct Decision {
     /// How the screen was left inside a wait the rig owns, for the caller
     /// to route once the wait returns.
     left: Option<Verdict>,
+    /// Why the deadline's step was refused, for the caller to return with
+    /// ([`refuse_step`](Self::refuse_step)).
+    refusal: Option<PreparationRefusal>,
 }
 
 impl Decision {
@@ -188,6 +193,7 @@ impl Decision {
             latched: false,
             waiting: false,
             left: None,
+            refusal: None,
         }
     }
 
@@ -362,14 +368,23 @@ impl Decision {
     }
 
     /// The step [`classify`](Self::classify) returned is refused at its
-    /// commit (the play's preparation refused before the reveal): a
-    /// refusal latched, the decision left unstepped and its lifetime over;
+    /// commit (the play's preparation refused, or the loading state
+    /// refused, before the reveal) for `why`: a refusal latched, the
+    /// decision left unstepped and its lifetime over, `why` kept for the
+    /// return ([`take_refusal`](Self::take_refusal));
     /// [`Verdict::Return`], the verdict the look gives instead.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub const fn refuse_step(&mut self) -> Verdict {
+    pub fn refuse_step(&mut self, why: PreparationRefusal) -> Verdict {
         self.latched = true;
         self.lifetime = None;
+        self.refusal = Some(why);
         Verdict::Return
+    }
+
+    /// Why the deadline's step was refused, taken once.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn take_refusal(&mut self) -> Option<PreparationRefusal> {
+        self.refusal.take()
     }
 
     /// [`classify`](Self::classify)'s verdict, before the lifetime ends.
@@ -713,7 +728,13 @@ mod tests {
             d.classify(Origin::Load, at(1_500), false, false, None),
             Verdict::Step
         );
-        assert_eq!(d.refuse_step(), Verdict::Return);
+        let why = PreparationRefusal {
+            location: None,
+            reason: "refused at the step".to_owned(),
+        };
+        assert_eq!(d.refuse_step(why.clone()), Verdict::Return);
+        assert_eq!(d.take_refusal(), Some(why));
+        assert_eq!(d.take_refusal(), None);
         assert!(!d.stepped(), "left unstepped");
         assert!(d.latched());
         assert_eq!(d.lifetime(), None);

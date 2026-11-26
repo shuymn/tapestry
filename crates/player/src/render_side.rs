@@ -2398,6 +2398,14 @@ struct Shared {
     /// takes the slot (tests).
     #[cfg(test)]
     after_reveal_cas: RevealHook,
+    /// Called on the game thread at the end of an arm, after its word and
+    /// its message are published (tests: the entry paused there).
+    #[cfg(test)]
+    after_arm: RevealHook,
+    /// Called in the game's step past the bound, before and after its
+    /// compare-and-swap (tests: a close there).
+    #[cfg(test)]
+    bound_cas: [RevealHook; 2],
     /// The armed reveal's evaluations at or past its deadline (tests: the
     /// first one reveals).
     #[cfg(test)]
@@ -2727,6 +2735,10 @@ impl Shared {
             reveal_paused: AtomicBool::new(false),
             #[cfg(test)]
             after_reveal_cas: RevealHook::default(),
+            #[cfg(test)]
+            after_arm: RevealHook::default(),
+            #[cfg(test)]
+            bound_cas: [RevealHook::default(), RevealHook::default()],
             #[cfg(test)]
             reveal_eligible: AtomicU64::new(0),
             #[cfg(test)]
@@ -4976,6 +4988,31 @@ impl RenderLink {
             at,
             built_in,
         });
+        #[cfg(test)]
+        {
+            let hook = self
+                .shared
+                .after_arm
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// `hook` runs on the game thread at the end of the next arm, after its
+    /// word and its message are published (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn after_arm(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .shared
+            .after_arm
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// The armed reveal will not run: a refusal or a leave came first.
@@ -5652,9 +5689,6 @@ fn at_step(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>, bound: Dura
     }
     let lifetime = slot.lifetime;
     let mut w = shared.reveal.load(Ordering::SeqCst);
-    if w & reveal::CLOSED != 0 {
-        return AtStep::Refused;
-    }
     if w == reveal::word(lifetime, reveal::ARMED) {
         let now = clock.now();
         #[cfg(test)]
@@ -5673,16 +5707,22 @@ fn at_step(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>, bound: Dura
             "render: no frame revealed the loading state within {} ms of its deadline",
             bound / 1_000
         ));
+        #[cfg(test)]
+        run_hook(&shared.bound_cas[0]);
         let _ = refuse_armed(shared, lifetime);
+        #[cfg(test)]
+        run_hook(&shared.bound_cas[1]);
         w = shared.reveal.load(Ordering::SeqCst);
+    }
+    // The word as read last, its closed bit first. ARMED(L) returned or was
+    // refused above, so only a word that is neither closed nor of this
+    // lifetime reveals it here, as with no word.
+    if w & reveal::CLOSED != 0 || w == reveal::word(lifetime, reveal::REFUSED) {
+        return AtStep::Refused;
     }
     if w == reveal::word(lifetime, reveal::REVEALED) {
         return AtStep::Revealed;
     }
-    if w == reveal::word(lifetime, reveal::REFUSED) {
-        return AtStep::Refused;
-    }
-    // Nothing of it armed: shown here, as with no word.
     slot.held = false;
     if let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) {
         let update = state.restart(clock.now());
@@ -5694,6 +5734,15 @@ fn at_step(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>, bound: Dura
         let _ = tx.send(RenderMsg::Loading(lifetime));
     }
     AtStep::Revealed
+}
+
+/// The hook `hook` holds run once, taken from it (tests).
+#[cfg(test)]
+fn run_hook(hook: &RevealHook) {
+    let hook = hook.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// The early job's cancel of held loading lifetime `lifetime` cancelled,
@@ -19877,6 +19926,57 @@ pub(crate) mod tests {
         assert!(wait_until(|| link.loading_ack_held()), "drawn once granted");
         link.hold_loading_ack(false);
         link.exit();
+    }
+
+    /// The reveal word's bound against a close: a close just before the
+    /// step's compare-and-swap at the bound (which then loses), or just
+    /// after it won, leaves the step refused and the lifetime held, the
+    /// word read with its closed bit first, never as one not armed.
+    #[test]
+    fn a_close_at_the_bounds_refusal_leaves_the_step_refused() {
+        for after in [false, true] {
+            let (mut link, seen) = held_loading();
+            link.set_timeouts(Duration::from_secs(2), Duration::from_secs(60));
+            link.show_decision(one_line("decision"), None);
+            link.begin_loading_held(&chosen("One"), None);
+            let lifetime = link.loading_lifetime();
+            link.shared.reveal_paused.store(true, Ordering::SeqCst);
+            let at = TimeUs(link.clock.now().0 + 60_000_000);
+            link.arm_reveal(at, at);
+            assert!(link.fence(Duration::from_secs(60)), "armed");
+            let shared = Arc::clone(&link.shared);
+            *link.shared.bound_cas[usize::from(after)]
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Box::new(move || super::close_word(&shared)));
+            link.set_reveal_clock(Some(TimeUs(at.0 + 2_000_000)));
+            assert_eq!(
+                link.reveal_at_step(),
+                super::AtStep::Refused,
+                "after: {after}"
+            );
+            assert!(
+                link.shared.loading_slot().held,
+                "after: {after}: revealed by the step"
+            );
+            let state = if after {
+                super::reveal::REFUSED
+            } else {
+                super::reveal::ARMED
+            };
+            assert_eq!(
+                link.shared.reveal.load(Ordering::SeqCst),
+                super::reveal::word(lifetime, state) | super::reveal::CLOSED,
+                "after: {after}"
+            );
+            link.shared.reveal_paused.store(false, Ordering::SeqCst);
+            assert!(link.fence(Duration::from_secs(60)));
+            assert!(!link.loading_ack_held(), "after: {after}: a loading frame");
+            assert!(seen.lock().unwrap().is_empty());
+            link.hold_loading_ack(false);
+            link.exit();
+        }
     }
 
     /// The reveal word's bound: a render thread that takes no armed reveal

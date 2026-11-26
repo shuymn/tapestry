@@ -531,8 +531,10 @@ fn a_refusal_before_the_games_step_refuses_it() {
 }
 
 /// The reveal word: a close before the choice (the window's withdrawal not
-/// installed yet) is read on the quit latch after the decision's arm, which
-/// closes the word, so no loading frame follows the deadline.
+/// installed yet) is read on the quit latch before the decision's arm,
+/// which closes the word, so nothing is armed: an entry paused after an
+/// arm, with the reveal due at once, would let the render thread reveal
+/// first. No loading frame follows the deadline.
 #[test]
 fn a_close_before_the_choice_withdraws_its_reveal() {
     use crate::render_side::reveal;
@@ -540,16 +542,70 @@ fn a_close_before_the_choice_withdraws_its_reveal() {
     flow(&dir, |rig, f| {
         f.prepared();
         rig.controls.close();
+        // An arm that publishes: the entry paused after it, the reveal due.
+        let shared = std::sync::Arc::clone(&rig.render.shared);
+        rig.render.after_arm(move || {
+            shared.reveal_clock.store(i64::MAX / 4, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
         let d = choose(rig, &f.pick(false), 3);
         let origin = d.origin();
         let lifetime = rig.render.loading_lifetime();
-        assert_eq!(
-            rig.render.shared.reveal.load(Ordering::SeqCst),
-            reveal::word(lifetime, reveal::ARMED) | reveal::CLOSED
+        let w = rig.render.shared.reveal.load(Ordering::SeqCst);
+        assert_ne!(w & reveal::CLOSED, 0, "not closed");
+        assert_ne!(
+            w & !reveal::CLOSED,
+            reveal::word(lifetime, reveal::REVEALED),
+            "revealed before the close"
+        );
+        assert_ne!(
+            w & !reveal::CLOSED,
+            reveal::word(lifetime, reveal::ARMED),
+            "armed after the close"
         );
         until_clock(rig, TimeUs(origin.0 + 400 * MS));
         assert!(rig.render.fence(std::time::Duration::from_secs(60)));
         assert!(rig.render.shared.loading_slot().held);
+        assert!(!rig.render.loading_ack_held(), "a loading frame drawn");
+    });
+}
+
+/// The reveal word's bound through the player's step: a render thread
+/// that takes no armed reveal, with no refusal of the early preparation,
+/// leaves the step refused at the render link's answer bound with the
+/// step's own reason, which the App returns to selection with; no loading
+/// frame follows.
+#[test]
+fn a_step_past_the_bound_is_refused_with_its_reason() {
+    use crate::render_side::reveal;
+    let dir = timed(100, 0, 100);
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let _d = choose(rig, &f.pick(false), 3);
+        let lifetime = rig.render.loading_lifetime();
+        rig.render
+            .shared
+            .reveal_paused
+            .store(true, Ordering::SeqCst);
+        let bound = i64::try_from(rig.render.answer_timeout.as_micros()).unwrap();
+        let latest = rig.render.shared.reveal_latest.load(Ordering::SeqCst);
+        rig.render
+            .set_reveal_clock(Some(TimeUs(latest + bound - 1)));
+        assert_eq!(rig.deadline_step(), game::StepOutcome::Pending);
+        rig.render.set_reveal_clock(Some(TimeUs(latest + bound)));
+        assert_eq!(
+            rig.deadline_step(),
+            game::StepOutcome::Refused(crate::selection::refused_before_reveal())
+        );
+        assert_eq!(
+            rig.render.shared.reveal.load(Ordering::SeqCst),
+            reveal::word(lifetime, reveal::REFUSED)
+        );
+        rig.render
+            .shared
+            .reveal_paused
+            .store(false, Ordering::SeqCst);
+        assert!(rig.render.fence(std::time::Duration::from_secs(60)));
         assert!(!rig.render.loading_ack_held(), "a loading frame drawn");
     });
 }
@@ -624,10 +680,11 @@ fn takeover_unparks_the_idle_wait() {
     });
 }
 
-/// R1.5: a render thread that takes the choice's presentation only after
-/// a short screen's step, with the target changed meanwhile, keeps the
-/// choice: no refusal at its entry, the kind not disabled, and the slot
-/// retired by its lifetime at a later boundary.
+/// R1.5: a render thread that takes the choice's presentation late, past a
+/// short screen's deadline, with the target changed meanwhile, keeps the
+/// choice: it takes the presentation, then reveals the loading state, and
+/// the step follows its reveal; no refusal at its entry, the kind not
+/// disabled, and the slot retired by its lifetime at a later boundary.
 #[test]
 fn delayed_render_short_screen_keeps_its_choice() {
     let dir = timed(200, 0, 0);

@@ -1672,6 +1672,17 @@ const fn cover_index(kind: game::CoverKind) -> usize {
     }
 }
 
+/// The refusal a deadline step answers when the reveal word refused the
+/// loading state with no early preparation's refusal to give: a refuser
+/// or the step's own bound (design.md "Screen Transitions and Loading", the
+/// reveal word).
+pub(crate) fn refused_before_reveal() -> game::PreparationRefusal {
+    game::PreparationRefusal {
+        location: None,
+        reason: "the loading state was refused before its reveal".to_owned(),
+    }
+}
+
 /// What the select screen shows of the shelf: the chosen preset's name, and
 /// the error to show, if any, as the screen draws it (by file name) and
 /// with its full chain for the console and the log. The error is the
@@ -4213,19 +4224,20 @@ impl AppRig for PlayerRig<'_> {
                 .and_then(|p| crate::play::loading_gauge(p, self.gauge));
             self.render.begin_loading_held(&page, gauge);
             // A close withdraws an armed reveal whether or not this thread
-            // looks again before the shutdown's waits: installed before the
-            // arm, and the quit latch read after it, so a close either
-            // finds the withdrawal or is read here (design.md "Screen
-            // Transitions and Loading", the reveal word).
+            // looks again before the shutdown's waits: installed first, then
+            // the quit latch read before the arm, so a close either finds
+            // the withdrawal or is read here, the word closed before it is
+            // armed (design.md "Screen Transitions and Loading", the reveal
+            // word).
             self.controls
                 .set_reveal_withdraw(self.render.reveal_withdrawer());
             // The render thread reveals it at the decision's deadline by
             // itself, the game's step then reading it shown.
             if let Some(at) = d.deadline() {
-                self.render.arm_reveal(at, d.takeover_deadline());
                 if self.controls.quitting() {
                     self.render.close_reveal();
                 }
+                self.render.arm_reveal(at, d.takeover_deadline());
             }
             show_stage(&self.render, Some(&page), Stage::Chart);
             sel.loading = Some(page);
@@ -4340,10 +4352,7 @@ impl AppRig for PlayerRig<'_> {
                 let committed = self.early.as_ref().map(|e| e.gate().commit_reveal());
                 let r = match committed {
                     Some(crate::play::early::Committed::Refused(r)) => r,
-                    _ => game::PreparationRefusal {
-                        location: None,
-                        reason: "the loading state was refused before its reveal".to_owned(),
-                    },
+                    _ => refused_before_reveal(),
                 };
                 return game::StepOutcome::Refused(r);
             }

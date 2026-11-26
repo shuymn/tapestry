@@ -878,9 +878,13 @@ impl App {
                     Some(lost) => Err(LiveError::Screen(lost)),
                     None => Ok(Chosen::Refused(Refused::Bank(e))),
                 },
-                Ok(Loading::Cancelled) => match (d.take_left(), rig.early_refusal()) {
-                    // A return the early preparation's refusal caused
-                    // (never a close: that leaves as [`Verdict::End`]).
+                Ok(Loading::Cancelled) => match (
+                    d.take_left(),
+                    d.take_refusal().or_else(|| rig.early_refusal()),
+                ) {
+                    // A return the step's refusal or the early
+                    // preparation's caused (never a close: that leaves as
+                    // [`Verdict::End`]).
                     (Some(Verdict::Return), Some(r)) => {
                         Ok(Chosen::Refused(Refused::Preparation(r)))
                     }
@@ -1132,7 +1136,7 @@ fn look<R: AppRig>(
         } else {
             match rig.deadline_step() {
                 StepOutcome::Stepped => d.commit_step(),
-                StepOutcome::Refused(_) => seen = d.refuse_step(),
+                StepOutcome::Refused(why) => seen = d.refuse_step(why),
                 StepOutcome::Pending => seen = Verdict::Continue,
             }
         }
@@ -1271,15 +1275,17 @@ fn hold_refusal<R: AppRig>(
 enum AtDeadline {
     /// The step ran: the play opens.
     Stepped,
-    /// The early preparation's refusal returned: back to selection with it.
+    /// The step's refusal or the early preparation's returned: back to
+    /// selection with it.
     Refused(PreparationRefusal),
     /// The run ends, or the window closes.
     Ended,
 }
 
-/// A loaded play held to its deadline's step. A return there is the early
-/// preparation's refusal when one is published ([`AppRig::early_refusal`]);
-/// any other leave ends the hold as the run's end or a close.
+/// A loaded play held to its deadline's step. A return there is the
+/// step's refusal ([`Decision::take_refusal`]), else the early
+/// preparation's when one is published ([`AppRig::early_refusal`]); any
+/// other leave ends the hold as the run's end or a close.
 fn ready_at_deadline<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
@@ -1289,8 +1295,9 @@ fn ready_at_deadline<R: AppRig>(
     }
     Ok(match hold(d, rig, Origin::Ready)? {
         Next::Stepped | Next::Go | Next::Page => AtDeadline::Stepped,
-        Next::Return => rig
-            .early_refusal()
+        Next::Return => d
+            .take_refusal()
+            .or_else(|| rig.early_refusal())
             .map_or(AtDeadline::Ended, AtDeadline::Refused),
         Next::End | Next::Back => AtDeadline::Ended,
     })
