@@ -1762,8 +1762,12 @@ impl Input {
                 continue;
             }
             return match (landing, after) {
-                // Past the last frame's end: nothing to land on.
-                (Some(l), None) if l.stamp.saturating_add(l.duration) <= stamped => Ok(None),
+                // Past the last frame's end: nothing to land on. A last
+                // frame whose length was found from nothing, even at the
+                // furthest back-off, proves no end: it is landed on.
+                (Some(l), None) if !lone && l.stamp.saturating_add(l.duration) <= stamped => {
+                    Ok(None)
+                }
                 (Some(l), after) => {
                     // The landing into `frame`, the frame after it into
                     // `kept`, kept for `next`.

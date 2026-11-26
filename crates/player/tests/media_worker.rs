@@ -4507,53 +4507,67 @@ fn a_landing_carries_its_own_chroma_location() {
 /// known, lasts the interval from the frame before it, as in a play from
 /// the start, never a seek's jump nor an interval measured before the
 /// seek (design.md "Rendering and Skins", video frames): the worker takes
-/// every frame's duration and the stream's rate as unknown. Run 1 plays
-/// 40 ms frames of motion JPEG in Matroska from 0; the demuxer lands
-/// directly on the last frame, so the landing backs off for the frame
-/// before it. In the constant-rate clip the last frame (frame 25 at 1 s)
-/// lasts 40 ms; in the variable-rate one it comes 120 ms after frame 24
-/// (at 1.08 s) and lasts 120 ms, not the 40 ms run 1 measured. A target
-/// inside the last frame's interval lands on it, then the run ends; one
-/// past that interval has nothing.
+/// every frame's duration and the stream's rate as unknown, and the
+/// demuxer lands directly on each motion JPEG clip's last frame, so the
+/// landing backs off for the frame before it. After run 1 has measured
+/// 40 ms frames, the constant-rate clip's last frame (frame 25 at 1 s)
+/// lasts 40 ms, and the variable-rate one's, 120 ms after frame 24 (at
+/// 1.08 s), lasts 120 ms; a target inside that interval lands on it, then
+/// the run ends, and one past it has nothing. In the sparse clip, frames at
+/// 0 and 10 s, even the furthest back-off (3 s) finds no frame before the
+/// last one: its length found from nothing (one tick of the 1 ms base),
+/// it proves no end, and a target at 14 s lands on it.
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
+    type Case = (i64, Option<(i64, i64)>);
     let dir = tempfile::tempdir().unwrap();
-    for (name, spec, last, interval) in [
-        ("c.mkv", "mjpeg matroska 176x96 25 26 1", 1_000_000, 40_000),
+    let run_1 = [0, 40_000, 80_000, 120_000];
+    let (c, v) = ((1_000_000, 40_000), (1_080_000, 120_000));
+    let clips: [(&str, &str, &[i64], &[Case]); 3] = [
+        (
+            "c.mkv",
+            "mjpeg matroska 176x96 25 26 1",
+            &run_1,
+            &[(c.0 + c.1 / 2, Some(c)), (c.0 + c.1 + 10_000, None)],
+        ),
         (
             "v.mkv",
             "mjpeg matroska 176x96 25 26 1 gap=25:2",
-            1_080_000,
-            120_000,
+            &run_1,
+            &[(v.0 + v.1 / 2, Some(v)), (v.0 + v.1 + 10_000, None)],
         ),
-    ] {
+        (
+            "s.mkv",
+            "mjpeg matroska 176x96 1 2 1 gap=1:9",
+            &[0],
+            &[(14_000_000, Some((10_000_000, 1_000)))],
+        ),
+    ];
+    for (name, spec, played, cases) in clips {
         let path = gen_clip(dir.path(), name, spec);
-        for (target, want) in [
-            (last + interval / 2, Some(last)),
-            (last + interval + 10_000, None),
-        ] {
+        for &(target, want) in cases {
             let mut worker = Worker::start(&["--dev-serve", "unstated"]);
             let probe = worker.open(1, &path);
             assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
             let mut ring = Ring::new(176, 96);
             assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
-            for i in 0..4 {
-                assert_eq!(take_one(&worker, &mut ring, i * 40_000).stamp, i * 40_000);
+            for &at in played {
+                assert_eq!(take_one(&worker, &mut ring, at).stamp, at, "{name}");
             }
             let run = ring.start_run(0);
             assert_eq!(
                 land_at(&mut worker, 1, run, target).map(|(l, _)| l),
-                want,
+                want.map(|(last, _)| last),
                 "{name} {target}: the worker's log:\n{}",
                 worker.log()
             );
-            if want.is_some() {
+            if let Some(last) = want {
                 let taken = take_one(&worker, &mut ring, target);
                 assert_eq!(
                     (taken.stamp, taken.duration),
-                    (last, interval),
+                    last,
                     "{name}: the worker's log:\n{}",
                     worker.log()
                 );
