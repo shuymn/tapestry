@@ -4050,7 +4050,7 @@ impl PlayerRig<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-tools"))]
 impl PlayerRig<'_> {
     /// The play's deadline step after the render thread's armed reveal
     /// (tests): the reveal taken first
