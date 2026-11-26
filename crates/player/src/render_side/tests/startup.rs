@@ -144,6 +144,7 @@ fn refused_configures_fail_the_startup() {
         deadline,
         &|| false,
         &mut std::thread::sleep,
+        &residency(),
     )
     .err()
     .unwrap();
@@ -171,6 +172,7 @@ fn a_permanent_refusal_is_not_retried() {
         far(),
         &|| false,
         &mut std::thread::sleep,
+        &residency(),
     )
     .err()
     .unwrap();
@@ -199,6 +201,7 @@ fn other_build_errors_are_not_retried() {
         far(),
         &|| false,
         &mut std::thread::sleep,
+        &residency(),
     )
     .err()
     .unwrap();
@@ -219,6 +222,7 @@ fn retries_stop_at_the_deadline() {
         deadline,
         &|| false,
         &mut std::thread::sleep,
+        &residency(),
     )
     .err()
     .unwrap();
@@ -319,9 +323,17 @@ fn a_retry_held_past_the_deadline_is_not_built() {
     // Far enough for the retry to be planned before the pause.
     let deadline = Instant::now() + super::super::STARTUP_RETRY * 4;
     let mut held = |_| std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-    let e = startup_build(&mut make, None, None, deadline, &|| false, &mut held)
-        .err()
-        .unwrap();
+    let e = startup_build(
+        &mut make,
+        None,
+        None,
+        deadline,
+        &|| false,
+        &mut held,
+        &residency(),
+    )
+    .err()
+    .unwrap();
     assert!(e.is_retryable_configure(), "{e:?}");
     assert_eq!(builds.load(Ordering::SeqCst), 1);
 }
@@ -685,6 +697,7 @@ fn wgpu_errors_are_taken_only_inside_the_configure() {
             Instant::now(),
             &|| false,
             &mut std::thread::sleep,
+            &residency(),
         )
         .err()
         .unwrap();
@@ -703,4 +716,12 @@ fn wgpu_errors_are_taken_only_inside_the_configure() {
         lines.iter().any(|l| l.starts_with("render: wgpu_hal")),
         "{lines:?}"
     );
+}
+
+/// A loop's holder and clock, as the startup build gives them.
+fn residency() -> crate::render_side::Residency {
+    crate::render_side::Residency {
+        holder: render::ResidencyHolder::default(),
+        clock: input::QpcClock::start(),
+    }
 }

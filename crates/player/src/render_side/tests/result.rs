@@ -195,6 +195,9 @@ pub(super) struct Faults {
     /// Run on the menu screen's renderer at the next upload boundary, in
     /// order (a test's setup of charges and pools on the render thread).
     pub(crate) on_renderer: Mutex<Vec<OnRenderer>>,
+    /// Every creation's room is held, as arrays whose residency is in
+    /// flight hold it ([`render::Renderer::room_waits`]).
+    pub(crate) room_waits: AtomicBool,
     /// The next selection installation's chart-image pool arrays refused
     /// this many times, as the device refuses one.
     pub(crate) refuse_pools: AtomicU32,
@@ -553,8 +556,18 @@ impl Screen for Recorded {
     fn creating(&self) -> bool {
         self.menu.creating()
     }
-    fn set_residency_holder(&mut self, holder: render::ResidencyHolder) {
-        self.menu.set_residency_holder(holder);
+    fn set_residency(
+        &mut self,
+        holder: render::ResidencyHolder,
+        clock: Arc<dyn bms_model::TimeSource>,
+    ) {
+        self.menu.set_residency(holder, clock);
+    }
+    fn room_waits(&self, kind: ScreenKind, bundle: &Arc<render::SkinBundle>) -> bool {
+        self.faults.room_waits.load(Ordering::Acquire) || self.menu.room_waits(kind, bundle)
+    }
+    fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
+        self.faults.room_waits.load(Ordering::Acquire) || self.menu.pages_room_waits(pages)
     }
     fn take_residency_line(&mut self) -> Option<render::ResidencyLine> {
         self.menu.take_residency_line()
@@ -5581,8 +5594,8 @@ fn a_first_view_whose_commit_is_refused_falls_back_to_its_page() {
 /// S-R5 (design.md "Screen Transitions and Loading", the frame-budgeted
 /// uploads): a pages ticket whose array's fence never completes, on an
 /// idle render thread with no frame to present, is answered once with the
-/// residency's timeout, no sooner than `CREATE_BOUND` after its ticket:
-/// the pass stays awake for the creation in flight.
+/// residency's timeout, about `CREATE_BOUND` after its ticket: the pass
+/// stays awake for the creation in flight.
 // Revert: the creation no longer keeps an idle pass awake -> no answer.
 #[test]
 fn an_idle_pass_times_out_a_pending_creation() {
@@ -5600,10 +5613,8 @@ fn an_idle_pass_times_out_a_pending_creation() {
     };
     let bound = Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
     assert!(why.contains("residency"), "{why}");
-    // No upper bound from the ask: the screen's build restarts the
-    // ticket's deadline, and under load it can take seconds.
-    // `pages_answer`'s own limit fails a ticket never answered.
     assert!(took >= bound, "answered after {took:?}");
+    assert!(took < bound * 4, "answered after {took:?}");
     assert_eq!(rig.link.result_status().installed, None);
     rig.link.exit();
 }
@@ -5631,5 +5642,51 @@ fn a_device_lost_during_a_creation_recovers() {
         crate::render_side::PagesAnswer::Ready
     );
     assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    rig.link.exit();
+}
+
+/// A pages begin whose room an array's residency in flight holds waits for
+/// its boundary, its ticket open and nothing begun, and is begun once the
+/// room comes before its deadline.
+#[test]
+fn a_pages_begin_waits_for_its_room() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    rig.faults.room_waits.store(true, Ordering::Release);
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(t.poll(Duration::ZERO).is_none(), "answered while it waits");
+    assert_eq!(rig.link.result_status().installed, None);
+    rig.faults.room_waits.store(false, Ordering::Release);
+    assert_eq!(pages_answer(&mut t), crate::render_side::PagesAnswer::Ready);
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    rig.link.exit();
+}
+
+/// A pages begin still waiting for its room past its deadline is refused
+/// with the room's timeout, nothing begun.
+#[test]
+fn a_pages_room_wait_past_its_deadline_is_refused() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    rig.faults.room_waits.store(true, Ordering::Release);
+    let asked = Instant::now();
+    let mut t = rig.link.begin_result_pages(Arc::clone(skin.atlas_pages()));
+    let answer = pages_answer(&mut t);
+    let took = asked.elapsed();
+    let crate::render_side::PagesAnswer::Refused(why) = &answer else {
+        panic!("{answer:?}");
+    };
+    let room = game::Chain(&render::timeout(render::TimeoutPhase::Room)).to_string();
+    assert_eq!(why, &room);
+    let bound = Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
+    assert!(took >= bound, "answered after {took:?}");
+    assert_eq!(rig.link.result_status().installed, None);
     rig.link.exit();
 }

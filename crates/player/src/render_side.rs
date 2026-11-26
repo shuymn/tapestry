@@ -553,9 +553,25 @@ pub trait Screen: Send {
         false
     }
     /// The render loop's holder of what a screen leaves in flight
-    /// ([`render::Renderer::set_residency_holder`]). Nothing by default.
-    fn set_residency_holder(&mut self, holder: render::ResidencyHolder) {
-        let _ = holder;
+    /// ([`render::Renderer::set_residency_holder`]) and the clock its
+    /// ticket deadlines are read on
+    /// ([`render::Renderer::set_deadline_clock`]), given as the screen is
+    /// made, before anything is restored on it. Nothing by default.
+    fn set_residency(&mut self, holder: render::ResidencyHolder, clock: Arc<dyn TimeSource>) {
+        let _ = (holder, clock);
+    }
+    /// Whether staging `bundle` as `kind`'s waits for room an array's
+    /// residency in flight holds ([`render::Renderer::room_waits`]): its
+    /// owner keeps it waiting for its boundary. Never by default.
+    fn room_waits(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        let _ = (kind, bundle);
+        false
+    }
+    /// [`room_waits`](Self::room_waits) for a result pages begin
+    /// ([`render::Renderer::pages_room_waits`]). Never by default.
+    fn pages_room_waits(&self, pages: &Arc<PackedPages>) -> bool {
+        let _ = pages;
+        false
     }
     /// How skin arrays are created, and why
     /// ([`render::Renderer::array_creation`]). None by default.
@@ -5953,6 +5969,12 @@ pub fn spawn_until(
             crate::dev::read_render_faults();
             #[cfg(feature = "dev-tools")]
             crate::dev::read_script_switches();
+            // The loop's holder of what a screen leaves in flight, from
+            // the first build on, and the clock its deadlines are read on.
+            let residency = Residency {
+                holder: render::ResidencyHolder::default(),
+                clock,
+            };
             let built = startup_build(
                 &mut make,
                 chart.as_deref(),
@@ -5960,6 +5982,7 @@ pub fn spawn_until(
                 deadline,
                 &*thread_cancelled,
                 &mut std::thread::sleep,
+                &residency,
             );
             let screen = match built {
                 Ok(screen) => {
@@ -6101,10 +6124,10 @@ pub fn spawn_until(
                 frames_view: None,
                 #[cfg(feature = "dev-tools")]
                 present_log: crate::dev::PresentLog::for_run(),
-                residency: render::ResidencyHolder::default(),
+                residency,
                 residency_logged: 0,
             };
-            r.give_holder();
+            r.report_array_creation();
             r.run(&rx);
             #[cfg(feature = "dev-tools")]
             r.flush_screen_frames();
@@ -6217,6 +6240,7 @@ fn startup_build(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
     pause: &mut dyn FnMut(Duration),
+    residency: &Residency,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut builds = 1;
     loop {
@@ -6232,6 +6256,7 @@ fn startup_build(
             false,
             &mut None,
             &mut None,
+            residency,
         );
         crate::log_file::capture_gpu_errors(false);
         let e = match built {
@@ -7031,8 +7056,13 @@ fn build(
     disabled: bool,
     result_refused: &mut Option<String>,
     decision_refused: &mut Option<String>,
+    residency: &Residency,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make(font)?;
+    // The loop's holder and clock first: every restore's admission counts
+    // what an earlier screen left in flight, and reads its deadlines on the
+    // loop's clock.
+    s.set_residency(residency.holder.clone(), residency.clock());
     match fill(
         s.as_mut(),
         committed,
@@ -7050,6 +7080,21 @@ fn build(
             }
             Err(e)
         }
+    }
+}
+
+/// What every screen the render loop builds takes as it is made: the
+/// loop's holder of arrays an earlier screen left in flight, and the clock
+/// the loop reads ticket deadlines on.
+pub(crate) struct Residency {
+    pub(crate) holder: render::ResidencyHolder,
+    pub(crate) clock: QpcClock,
+}
+
+impl Residency {
+    /// The loop's clock, as a renderer reads deadlines on it.
+    fn clock(&self) -> Arc<dyn TimeSource> {
+        Arc::new(self.clock)
     }
 }
 
@@ -8248,10 +8293,11 @@ struct Run {
     present_log: crate::dev::PresentLog,
     /// What a screen leaves in flight when it is dropped on a device that
     /// was not removed (design.md "Memory Budget", the `Residing` kind):
-    /// each array whose residency is pending, kept and counted by the
-    /// next screen until its fence completes. Declared after the screen,
-    /// so it is dropped after it.
-    residency: render::ResidencyHolder,
+    /// each array whose residency is pending, kept and counted by every
+    /// later screen, from its build, until its fence completes; and the
+    /// clock ticket deadlines are read on. Declared after the screen, so
+    /// it is dropped after it: its final owner.
+    residency: Residency,
     /// The residency count the report named last.
     residency_logged: usize,
 }
@@ -11183,23 +11229,11 @@ impl Run {
         // The early staging went with the screen: restaged under the same
         // request on this one, through its room as any early staging, its
         // ticket left open.
+        // Its ticket keeps its deadline: a rebuild renews no ticket.
         if let Some(r) = &mut self.early {
             r.taken = false;
             r.answered = None;
             r.device = 0;
-        }
-        // The tickets still open start their deadlines afresh on this
-        // screen, whose build took the time they had: each array is
-        // created on it from the start.
-        let deadline = bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND);
-        if let Some(r) = &mut self.early {
-            r.deadline = deadline;
-        }
-        if let Some(p) = &mut self.attempt {
-            p.deadline = deadline;
-        }
-        if let Some((_, _, _, d)) = &mut self.pages_owed {
-            *d = deadline;
         }
         if let Some(s) = &mut self.screen {
             // The page font the screen it replaces read, or was reading.
@@ -11210,21 +11244,15 @@ impl Run {
             self.heavy_seen = s.heavy_ops().count;
             self.result_changes = s.result_changes();
         }
-        self.give_holder();
+        self.report_array_creation();
         self.allowance = Some(Instant::now());
     }
 
-    /// The screen just built takes the render loop's holder of what an
-    /// earlier screen left in flight, and its way of creating arrays is
-    /// reported once.
-    fn give_holder(&mut self) {
-        if let Some(s) = &mut self.screen {
-            s.set_residency_holder(self.residency.clone());
-            if let Some((path, why)) = s.array_creation() {
-                crate::render_report::report(format_args!(
-                    "render: array creation: {path} ({why})"
-                ));
-            }
+    /// The screen just built reports its way of creating arrays once; it
+    /// took the loop's holder as it was made ([`build`]).
+    fn report_array_creation(&self) {
+        if let Some((path, why)) = self.screen.as_ref().and_then(|s| s.array_creation()) {
+            crate::render_report::report(format_args!("render: array creation: {path} ({why})"));
         }
     }
 
@@ -11739,7 +11767,10 @@ impl Run {
         if upload == render::UploadState::Ready {
             return Some(Duration::ZERO);
         }
+        // An early request waiting for its room is looked at again, so its
+        // deadline is seen with no frame to present.
         let work = self.attempt.is_some()
+            || self.early.as_ref().is_some_and(|r| !r.taken)
             || self.pages_owed.is_some()
             || self.select_hand.is_some()
             || upload == render::UploadState::InFlight
@@ -12572,7 +12603,19 @@ impl Run {
     }
 
     fn creation_owed(&self) -> Option<Creation> {
-        if self.attempt.as_ref().is_some_and(|p| !p.taken) {
+        // A creation whose room an array's residency in flight holds waits
+        // for its boundary, under its ticket's deadline (design.md "Memory
+        // Budget"; `expire_room_waits`).
+        let waits = |kind: ScreenKind, bundle: Option<&Arc<SkinBundle>>| {
+            bundle.is_some_and(|b| {
+                self.screen
+                    .as_ref()
+                    .is_some_and(|sc| sc.room_waits(kind, b))
+            })
+        };
+        if self.attempt.as_ref().is_some_and(|p| {
+            !p.taken && (p.adopts.is_some() || !waits(ScreenKind::Play, p.skin.as_ref()))
+        }) {
             Some(Creation::Play)
         } else if self.early.as_ref().is_some_and(|r| {
             // Owed once it fits with no destruction in its call: until then
@@ -12584,7 +12627,12 @@ impl Run {
                     .is_some_and(|sc| sc.early_room(&r.bundle) == render::EarlyRoom::Fits)
         }) {
             Some(Creation::Early)
-        } else if self.pages_owed.is_some() {
+        } else if self.pages_owed.as_ref().is_some_and(|(_, pages, _, _)| {
+            !self
+                .screen
+                .as_ref()
+                .is_some_and(|sc| sc.pages_room_waits(pages))
+        }) {
             Some(Creation::Pages)
         } else if self.select_hand.as_ref().is_some_and(|h| !h.taken) {
             Some(Creation::Select)
@@ -12658,6 +12706,7 @@ impl Run {
                 disabled,
                 &mut refused,
                 &mut decision_refused,
+                &self.residency,
             );
             // A restore refused stands for the run, whatever the build.
             if let Some(why) = refused {
@@ -12744,8 +12793,8 @@ impl Run {
             let _ = p.reply.send(Err(e));
             return;
         }
-        // A screen built here took its time from the ticket: its deadline
-        // runs from now, on that screen, as a rebuild's tickets do.
+        // Its ticket opens once a screen can take it: the build its receipt
+        // made is no wait for its room. No later build renews it.
         p.deadline = bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND);
         self.attempt = Some(p);
         self.poll_attempt();
@@ -14066,6 +14115,7 @@ impl Run {
                     self.result_disabled.is_some(),
                     &mut refused,
                     &mut decision_refused,
+                    &self.residency,
                 );
                 // A restore refused stands for the run, whatever the build.
                 if let Some(why) = refused.take() {
@@ -22559,6 +22609,17 @@ pub(crate) mod tests {
             self.held = None;
             Ok(self.staged_token)
         }
+        fn room_waits(&self, _kind: ScreenKind, _bundle: &Arc<render::SkinBundle>) -> bool {
+            self.shared.room_waits.load(Ordering::Acquire)
+        }
+        fn set_residency(
+            &mut self,
+            _holder: render::ResidencyHolder,
+            _clock: Arc<dyn bms_model::TimeSource>,
+        ) {
+            let at = self.shared.log.lock().unwrap().len();
+            self.shared.residency_at.lock().unwrap().push(at);
+        }
         fn early_room(&self, _bundle: &Arc<render::SkinBundle>) -> render::EarlyRoom {
             match self.shared.early_room.load(Ordering::Acquire) {
                 1 => render::EarlyRoom::Wait,
@@ -22788,6 +22849,12 @@ pub(crate) mod tests {
         /// What an early staging's room answers: 0 fits, 1 waits, 2 the
         /// result's release first (then it waits), 3 refused.
         pub(crate) early_room: Arc<std::sync::atomic::AtomicU8>,
+        /// Every staging's room is held while set, as arrays whose
+        /// residency is in flight hold it
+        /// ([`render::Renderer::room_waits`]).
+        pub(crate) room_waits: Arc<AtomicBool>,
+        /// The log's length each time a screen took the loop's holder.
+        pub(crate) residency_at: Arc<std::sync::Mutex<Vec<usize>>>,
         /// Early stagings are refused as a skin refuses them while set.
         pub(crate) refuse_early: Arc<AtomicBool>,
         /// This many early stagings fail as a lost device.
@@ -24499,6 +24566,34 @@ pub(crate) mod tests {
         link.prepare().unwrap();
     }
 
+    /// A screen built again takes the loop's holder and clock as it is
+    /// made, before anything is restored on it (design.md "Memory
+    /// Budget"): every restore's admission counts what an earlier screen
+    /// left in flight.
+    #[test]
+    fn a_screen_takes_the_holder_before_its_restores() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle());
+        let from = screens.log().len();
+        rebuild_screen(&link, &screens);
+        link.exit();
+        let log = screens.log();
+        let given = screens
+            .residency_at
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|&at| at >= from);
+        let restored = (from..log.len()).find(|&i| log[i].contains("restore"));
+        assert!(
+            given.is_some_and(|g| restored.is_some_and(|r| g <= r)),
+            "given at {given:?}: {:?}",
+            &log[from..]
+        );
+    }
+
     /// Stalls `link`'s render thread in a loading frame.
     fn stall_render(link: &super::RenderLink, screens: &Installers) {
         let frames = || screens.loading.load(Ordering::Acquire);
@@ -25984,6 +26079,19 @@ pub(crate) mod tests {
         fn creating(&self) -> bool {
             self.menu.creating()
         }
+        fn set_residency(
+            &mut self,
+            holder: render::ResidencyHolder,
+            clock: Arc<dyn bms_model::TimeSource>,
+        ) {
+            self.menu.set_residency(holder, clock);
+        }
+        fn room_waits(&self, kind: ScreenKind, bundle: &Arc<render::SkinBundle>) -> bool {
+            self.menu.room_waits(kind, bundle)
+        }
+        fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
+            self.menu.pages_room_waits(pages)
+        }
         fn upload_state(&self) -> render::UploadState {
             self.menu.upload_state()
         }
@@ -26445,6 +26553,19 @@ pub(crate) mod tests {
         }
         fn creating(&self) -> bool {
             self.menu.creating()
+        }
+        fn set_residency(
+            &mut self,
+            holder: render::ResidencyHolder,
+            clock: Arc<dyn bms_model::TimeSource>,
+        ) {
+            self.menu.set_residency(holder, clock);
+        }
+        fn room_waits(&self, kind: ScreenKind, bundle: &Arc<render::SkinBundle>) -> bool {
+            self.menu.room_waits(kind, bundle)
+        }
+        fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
+            self.menu.pages_room_waits(pages)
         }
         fn upload_state(&self) -> render::UploadState {
             if self.hold_up.load(Ordering::Acquire) {
