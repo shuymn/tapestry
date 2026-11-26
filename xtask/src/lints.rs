@@ -569,10 +569,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/bga.rs", &["BgaArray::key"]),
     // The skin movie hook's write path: a due frame taken into its
     // movie's mapped upload buffer, and each frame's copies into the
-    // planes.
+    // planes; each movie quad's chroma flags (`Instance::of`).
     Site::Fns(
         "crates/render/src/video.rs",
-        &["Video::write_with", "Video::record"],
+        &["Video::write_with", "Video::record", "chroma_flags"],
     ),
     Site::Fns(
         "crates/render/src/upload.rs",

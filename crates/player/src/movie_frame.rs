@@ -85,7 +85,7 @@ use std::time::Instant;
 
 use skin_model::bga::ChartVideos;
 use skin_model::media::control::{Matrix, Range};
-use skin_model::media::{Reader, Window};
+use skin_model::media::{ChromaLocation, Reader, Window};
 use skin_model::movie::{CHART_SLOTS, MovieShow, MovieShows, SLOTS};
 
 use crate::media_host::session::{Loss, Movie, Status, Waker, preparation_deadline};
@@ -475,6 +475,9 @@ struct Slot<S> {
     size: [u32; 2],
     bt601: bool,
     full: bool,
+    /// The chroma location of the frame its planes hold: latched with each
+    /// upload accepted, kept while none is.
+    chroma: ChromaLocation,
     /// A frame was taken into the planes on this screen (and the planes
     /// have not been replaced since).
     shown: bool,
@@ -502,6 +505,7 @@ impl<S: Source> Slot<S> {
             size: [0, 0],
             bt601: false,
             full: false,
+            chroma: ChromaLocation::Centre,
             shown: false,
             clock: Clock::Unstaged,
             waited: false,
@@ -579,6 +583,7 @@ fn mark_fault(i: usize, fault: skin_model::media::Fault) {
         Fault::Stamp { .. } => 7,
         Fault::Duration { .. } => 8,
         Fault::Changed { .. } => 9,
+        Fault::Chroma { .. } => 10,
     };
     let slot = i64::try_from(i).unwrap_or(i64::MAX >> 8);
     crate::dev::loop_probe::mark("movies:ring_fault", (slot << 8) | kind);
@@ -999,7 +1004,7 @@ impl<S: Source> Movies<S> {
                     let _region = crate::alloc_count::AppRegion::enter();
                     let taken = reader.take(words, d, pitch, sink);
                     let ok = taken.is_ok();
-                    took = Some(taken.map(|f| f.stamp).ok());
+                    took = Some(taken.ok());
                     ok
                 });
                 match took {
@@ -1007,10 +1012,12 @@ impl<S: Source> Movies<S> {
                         movie.lose(Loss::Fault);
                         return MovieShow::Lost;
                     }
-                    Some(Some(stamp)) => {
+                    Some(Some(frame)) => {
+                        let stamp = frame.stamp;
                         movie.freed(reader.freed());
                         if written {
                             slot.shown = true;
+                            slot.chroma = frame.chroma;
                             #[cfg(feature = "dev-tools")]
                             counts::took(i);
                             #[cfg(all(test, feature = "dev-tools"))]
@@ -1042,6 +1049,7 @@ impl<S: Source> Movies<S> {
                 size: [width, height],
                 bt601: slot.bt601,
                 full: slot.full,
+                chroma: slot.chroma,
             }
         } else {
             MovieShow::Nothing
@@ -1225,7 +1233,7 @@ impl<S: Source> Movies<S> {
                 let _region = crate::alloc_count::AppRegion::enter();
                 let taken = reader.take(words, d, pitch, sink);
                 let ok = taken.is_ok();
-                took = Some(taken.map(|f| (f.stamp, f.duration)));
+                took = Some(taken.map(|f| (f.stamp, f.duration, f.chroma)));
                 ok
             });
             match took {
@@ -1237,11 +1245,12 @@ impl<S: Source> Movies<S> {
                     movie.lose(Loss::Fault);
                     return MovieShow::Lost;
                 }
-                Some(Ok((stamp, duration))) => {
+                Some(Ok((stamp, duration, chroma))) => {
                     left = peek.left;
                     movie.freed(reader.freed());
                     if written {
                         slot.shown = true;
+                        slot.chroma = chroma;
                         #[cfg(feature = "dev-tools")]
                         counts::took(i);
                         let run = reader.run();
@@ -1323,6 +1332,7 @@ impl<S: Source> Movies<S> {
                 size: [width, height],
                 bt601: slot.bt601,
                 full: slot.full,
+                chroma: slot.chroma,
             }
         } else {
             MovieShow::Nothing

@@ -5224,12 +5224,14 @@ impl Skin {
                             size,
                             bt601,
                             full,
+                            chroma,
                         }) => {
                             let f = crate::FrameUv { uv, layer };
                             let (r, f, native) = stretch.place(rect, size, f, canvas.scale());
                             let b = Brush { native, ..brush };
                             out.push_movie(usize::from(slot), |out| {
-                                b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+                                let sampling = crate::quad::MovieSampling::new(bt601, full, chroma);
+                                b.push_clipped(out, r, f, Filter::Movie { sampling }, trim);
                             });
                         }
                         // Opaque black over the destination, whatever its

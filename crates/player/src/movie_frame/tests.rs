@@ -58,8 +58,21 @@ impl Fake {
     }
 
     /// Publishes a frame of run `run` stamped `stamp` lasting `duration`
-    /// whose every byte is `id`.
+    /// whose every byte is `id`, its chroma left-sited.
     fn publish_run(&self, seq: u64, run: u64, stamp: i64, duration: i64, id: u8) {
+        self.publish_sited(seq, run, (stamp, duration), id, ChromaLocation::Left);
+    }
+
+    /// Publishes a frame of run `run` at `(stamp, duration)` whose every
+    /// byte is `id`, its chroma sited at `chroma`.
+    fn publish_sited(
+        &self,
+        seq: u64,
+        run: u64,
+        (stamp, duration): (i64, i64),
+        id: u8,
+        chroma: ChromaLocation,
+    ) {
         let writer = Writer::attach(self.words.as_slice()).unwrap();
         let slot = writer.claim(self.words.as_slice()).unwrap();
         let frame = vec![id; self.geometry.frame_bytes()];
@@ -74,6 +87,7 @@ impl Fake {
                     at: stamp,
                     duration,
                 },
+                chroma,
             )
             .unwrap();
     }
@@ -144,13 +158,15 @@ impl Source for Fake {
 
 /// Planes that keep the luma rows each write took, by slot; a slot's
 /// reservation or release empties that slot's. With `slow`, each take
-/// sleeps that long inside the write.
+/// sleeps that long inside the write; with `discard`, a write takes its
+/// frame from the ring and then refuses the upload.
 #[derive(Default)]
 struct Kept {
     reserved: Vec<[u32; 3]>,
     released: Vec<u32>,
     luma: [Vec<u8>; SLOTS],
     refuse: bool,
+    discard: bool,
     slow: Option<Duration>,
 }
 
@@ -182,6 +198,9 @@ impl Planes for Kept {
             },
             pitch,
         );
+        if self.discard {
+            return false;
+        }
         if whole {
             self.luma[layer as usize] = bytes[..pitch[0] * height as usize].to_vec();
         }
@@ -243,6 +262,7 @@ fn each_state_shows_what_it_should() {
             size: [16, 8],
             bt601: true,
             full: false,
+            chroma: ChromaLocation::Left,
         }
     );
     assert!(b.staged.load(Ordering::SeqCst));
@@ -295,6 +315,115 @@ fn a_live_movie_shows_nothing_before_its_first_frame() {
         holds(&planes, 0, 4),
         "due at its stamp on the movie's clock"
     );
+}
+
+/// The chroma location a movie's destinations draw with (design.md
+/// "Rendering and Skins", skin movies) is that of the frame its planes
+/// hold: latched with each upload accepted, kept while no frame is due and
+/// when an upload is refused after its take, and changed with the next
+/// frame accepted.
+#[test]
+fn the_chroma_location_follows_the_frame_its_planes_hold() {
+    let chroma = |s: MovieShow| match s {
+        MovieShow::Frame { chroma, .. } => Some(chroma),
+        _ => None,
+    };
+    let start = Instant::now();
+    let a = Fake::new(16, 8);
+    a.set(Status::Live);
+    let mut m = movies(Some(&a), None, start);
+    let mut planes = Kept::default();
+    a.publish_sited(1, 1, (1_000, 33_333), 1, ChromaLocation::Left);
+    let shows = tick(&mut m, &mut planes, 0, start);
+    assert_eq!(chroma(shows[0]), Some(ChromaLocation::Left));
+    // None due: kept.
+    a.publish_sited(2, 1, (1_600, 33_333), 2, ChromaLocation::TopLeft);
+    let shows = tick(&mut m, &mut planes, 500, start);
+    assert_eq!(chroma(shows[0]), Some(ChromaLocation::Left), "none due");
+    // Taken from the ring, its upload refused: the planes keep frame 1.
+    planes.discard = true;
+    let shows = tick(&mut m, &mut planes, 700, start);
+    assert!(holds(&planes, 0, 1), "the planes keep the first frame");
+    assert_eq!(
+        chroma(shows[0]),
+        Some(ChromaLocation::Left),
+        "an upload refused"
+    );
+    // The next frame accepted: its location.
+    planes.discard = false;
+    a.publish_sited(3, 1, (2_000, 33_333), 3, ChromaLocation::Bottom);
+    let shows = tick(&mut m, &mut planes, 1_100, start);
+    assert!(holds(&planes, 0, 3));
+    assert_eq!(chroma(shows[0]), Some(ChromaLocation::Bottom), "accepted");
+}
+
+/// A chart video's frames are drawn with the chroma location of the frame
+/// its planes hold (design.md "Rendering and Skins", video frames), as a
+/// skin movie's are: latched with each upload accepted, kept while no
+/// frame is due and when an upload is refused after its take, and changed
+/// with the next frame accepted.
+#[test]
+fn a_chart_video_s_chroma_location_follows_the_frame_its_planes_hold() {
+    use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga, TimeUs};
+    let chroma = |s: MovieShow| match s {
+        MovieShow::Frame { chroma, .. } => Some(chroma),
+        _ => None,
+    };
+    let start = Instant::now();
+    let fakes: [Arc<Fake>; 4] = std::array::from_fn(|_| Fake::new(16, 8));
+    let video = &fakes[2];
+    video.set(Status::Live);
+    video.publish_sited(1, 1, (0, 16_667), 1, ChromaLocation::Left);
+    // Slot 2's file starts at 0.
+    let bga = ChartBga::new(
+        vec![BgaImage {
+            id: 1,
+            name: "1.mp4".to_owned(),
+        }],
+        vec![BgaEvent {
+            time: TimeUs(0),
+            image: Some(BgaImageId(0)),
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut m = Movies::new(fakes.clone().map(Some), start);
+    m.set_chart(Arc::new(ChartVideos::of(&bga, &[Some(2)])), i64::MIN);
+    let mut planes = Kept::default();
+    m.admit(&mut planes, start);
+    let _ = m.prepare(&mut planes, start);
+    let mut frame = |planes: &mut Kept, at: i64| {
+        let shows = m.play_frame(planes, at, ChartAt { now: at, k: 20 }, start);
+        m.presented(true, drawn(shows));
+        shows[2]
+    };
+    assert_eq!(
+        chroma(frame(&mut planes, 1_000)),
+        Some(ChromaLocation::Left)
+    );
+    // None due: kept.
+    video.publish_sited(2, 1, (20_000, 16_667), 2, ChromaLocation::TopLeft);
+    assert_eq!(
+        chroma(frame(&mut planes, 10_000)),
+        Some(ChromaLocation::Left),
+        "none due"
+    );
+    // Taken from the ring, its upload refused: the planes keep frame 1.
+    planes.discard = true;
+    let shown = frame(&mut planes, 21_000);
+    assert!(holds(&planes, 2, 1), "the planes keep the first frame");
+    assert_eq!(
+        chroma(shown),
+        Some(ChromaLocation::Left),
+        "an upload refused"
+    );
+    // The next frame accepted: its location.
+    planes.discard = false;
+    video.publish_sited(3, 1, (30_000, 16_667), 3, ChromaLocation::Bottom);
+    let shown = frame(&mut planes, 31_000);
+    assert!(holds(&planes, 2, 3));
+    assert_eq!(chroma(shown), Some(ChromaLocation::Bottom), "accepted");
 }
 
 #[test]

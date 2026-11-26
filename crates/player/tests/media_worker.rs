@@ -25,6 +25,8 @@
 
 #![cfg(windows)]
 
+#[path = "support/chroma.rs"]
+mod chroma;
 mod media_support;
 
 use std::collections::BTreeMap;
@@ -37,6 +39,9 @@ use std::process::Command;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
+use chroma::{Bits, Vui, avi, h264_sets_with, h264_sited, nal};
+#[cfg(feature = "dev-tools")]
+use chroma::{h264_pcm, rise_centre};
 #[cfg(feature = "dev-tools")]
 use media_support::WORKER;
 use media_support::media_host::strikes::{FileId, Strikes};
@@ -44,7 +49,7 @@ use media_support::media_host::verdict;
 use media_support::media_host::watch::{self, End, Event, LINE};
 use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe, root};
 use skin_model::media::control::{Command as Order, Matrix, Range, Reply};
-use skin_model::media::{Frame, Geometry, Reader, Window};
+use skin_model::media::{ChromaLocation, Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
     FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
@@ -327,6 +332,8 @@ struct Taken {
         )
     )]
     duration: i64,
+    /// Where the frame's chroma sits, as its slot said.
+    chroma: ChromaLocation,
     bytes: Vec<u8>,
 }
 
@@ -377,6 +384,7 @@ fn take_to_last(
             taken.push(Taken {
                 stamp: frame.stamp,
                 duration: frame.duration,
+                chroma: frame.chroma,
                 bytes: ring.staged(),
             });
             due = frame.stamp + interval * 3 / 2;
@@ -405,6 +413,7 @@ fn take_one(worker: &Worker, ring: &mut Ring, due: i64) -> Taken {
             return Taken {
                 stamp: frame.stamp,
                 duration: frame.duration,
+                chroma: frame.chroma,
                 bytes: ring.staged(),
             };
         }
@@ -2062,117 +2071,10 @@ fn worker_decodes_zlib_compressed_containers() {
     }
 }
 
-/// Bits written most significant first, as H.264's syntax writes them.
-#[derive(Default)]
-struct Bits {
-    bytes: Vec<u8>,
-    used: u32,
-}
-
-impl Bits {
-    fn bit(&mut self, one: bool) -> &mut Self {
-        if self.used == 0 {
-            self.bytes.push(0);
-        }
-        if one {
-            *self.bytes.last_mut().unwrap() |= 0x80 >> self.used;
-        }
-        self.used = (self.used + 1) % 8;
-        self
-    }
-
-    fn u(&mut self, n: u32, v: u64) -> &mut Self {
-        for i in (0..n).rev() {
-            self.bit(v >> i & 1 == 1);
-        }
-        self
-    }
-
-    /// An unsigned Exp-Golomb code.
-    fn ue(&mut self, v: u64) -> &mut Self {
-        let x = v + 1;
-        let n = 64 - x.leading_zeros();
-        self.u(n - 1, 0).u(n, x)
-    }
-
-    /// A signed Exp-Golomb code.
-    fn se(&mut self, v: i64) -> &mut Self {
-        let m = v.unsigned_abs() * 2;
-        self.ue(if v > 0 { m - 1 } else { m })
-    }
-
-    /// The payload: the bits, a stop bit, and zeros to the byte.
-    fn rbsp(&mut self) -> Vec<u8> {
-        self.bit(true);
-        while self.used != 0 {
-            self.bit(false);
-        }
-        std::mem::take(&mut self.bytes)
-    }
-}
-
-/// A NAL unit with `header` and `rbsp`, after a start code, with H.264's
-/// emulation prevention.
-fn nal(header: u8, rbsp: &[u8]) -> Vec<u8> {
-    let mut out = vec![0, 0, 0, 1, header];
-    let mut zeros = 0;
-    for &b in rbsp {
-        if zeros >= 2 && b <= 3 {
-            out.push(3);
-            zeros = 0;
-        }
-        out.push(b);
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-    }
-    out
-}
-
 /// The parameter sets (their payloads) of an H.264 sequence that codes
 /// `coded` pixels and crops them to `shown`.
 fn h264_sets(coded: (u32, u32), shown: (u32, u32)) -> (Vec<u8>, Vec<u8>) {
-    // Baseline, level 5.1; frame numbers of 4 bits, picture order type 2,
-    // one reference; frames only, cropped on the right and at the bottom
-    // in units of two pixels; no VUI.
-    let sps = Bits::default()
-        .u(8, 66)
-        .u(8, 0)
-        .u(8, 51)
-        .ue(0)
-        .ue(0)
-        .ue(2)
-        .ue(1)
-        .bit(false)
-        .ue(u64::from(coded.0 / 16 - 1))
-        .ue(u64::from(coded.1 / 16 - 1))
-        .bit(true)
-        .bit(true)
-        .bit(true)
-        .ue(0)
-        .ue(u64::from((coded.0 - shown.0) / 2))
-        .ue(0)
-        .ue(u64::from((coded.1 - shown.1) / 2))
-        .bit(false)
-        .rbsp();
-    // CAVLC, one slice group, one reference, no weighting, QP 26, the
-    // deblocking control present.
-    let pps = Bits::default()
-        .ue(0)
-        .ue(0)
-        .bit(false)
-        .bit(false)
-        .ue(0)
-        .ue(0)
-        .ue(0)
-        .bit(false)
-        .u(2, 0)
-        .se(0)
-        .se(0)
-        .se(0)
-        .bit(true)
-        .bit(false)
-        .bit(false)
-        .rbsp();
-    (sps, pps)
+    h264_sets_with(coded, shown, Vui::None)
 }
 
 /// The payload of IDR slice `i`: an I slice of the whole picture,
@@ -2257,65 +2159,6 @@ fn h264_parts(parts: &[Part]) -> Vec<Vec<u8>> {
         }
     }
     units
-}
-
-/// An AVI file of one video stream of `fourcc` at `size` and `rate`
-/// frames a second, its frames `frames`, without an index.
-fn avi(size: (u32, u32), rate: u32, fourcc: &[u8; 4], frames: &[Vec<u8>]) -> Vec<u8> {
-    fn chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut c = id.to_vec();
-        c.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
-        c.extend(data);
-        if data.len() % 2 == 1 {
-            c.push(0);
-        }
-        c
-    }
-    fn list(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        chunk(b"LIST", &[kind.as_slice(), body].concat())
-    }
-    let count = u32::try_from(frames.len()).unwrap();
-    let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
-    let avih = words(&[
-        1_000_000 / rate,
-        0,
-        0,
-        0,
-        count,
-        0,
-        1,
-        1 << 20,
-        size.0,
-        size.1,
-        0,
-        0,
-        0,
-        0,
-    ]);
-    let strh = [
-        b"vids".as_slice(),
-        fourcc,
-        &words(&[0, 0, 0, 1, rate, 0, count, 1 << 20, u32::MAX, 0]),
-        &[0; 8],
-    ]
-    .concat();
-    let strf = [
-        words(&[40, size.0, size.1]),
-        vec![1, 0, 24, 0],
-        fourcc.to_vec(),
-        words(&[size.0 * size.1 * 3, 0, 0, 0, 0]),
-    ]
-    .concat();
-    let strl = list(
-        b"strl",
-        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
-    );
-    let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
-    let movi: Vec<u8> = frames.iter().flat_map(|f| chunk(b"00dc", f)).collect();
-    chunk(
-        b"RIFF",
-        &[b"AVI ".as_slice(), &hdrl, &list(b"movi", &movi)].concat(),
-    )
 }
 
 /// A chunk of a [`mov`] file: the parameter sets of its sample
@@ -4117,4 +3960,300 @@ fn a_seek_landing_carries_its_own_duration() {
         (1_000_000, stamp_of(25, 24) - 1_000_000, 24)
     );
     worker.close(2);
+}
+
+/// The samples of the sited fixtures' frame `i`: luma 128 but for frame
+/// `i`'s mark, a step in Cb between chroma columns 3 and 4 and one in Cr
+/// between chroma rows 3 and 4.
+fn sited_sample(i: u64, plane: usize, x: u32, y: u32) -> u8 {
+    match plane {
+        0 => {
+            if y < 2 && x == u32::try_from(i).unwrap() {
+                220
+            } else {
+                128
+            }
+        }
+        1 => {
+            if x < 4 {
+                60
+            } else {
+                200
+            }
+        }
+        _ => {
+            if y < 4 {
+                90
+            } else {
+                170
+            }
+        }
+    }
+}
+
+/// The I420 bytes of the sited fixtures' frame `i` at `w` × `h`.
+fn sited_frame(i: u64, w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (plane, pw, ph) in [(0, w, h), (1, w / 2, h / 2), (2, w / 2, h / 2)] {
+        for y in 0..ph {
+            for x in 0..pw {
+                out.push(sited_sample(i, plane, x, y));
+            }
+        }
+    }
+    out
+}
+
+/// Plays the H.264 stream `units` (an AVI file of `size` at 24 frames a
+/// second) through the worker: every frame it publishes.
+fn play_h264(name: &str, size: (u32, u32), units: &[Vec<u8>]) -> Vec<Taken> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    std::fs::write(&path, avi(size, 24, b"H264", units)).unwrap();
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}; the worker's log:\n{}",
+        worker.log()
+    );
+    let mut ring = Ring::new(size.0, size.1);
+    assert!(matches!(
+        worker.play(1, &ring),
+        Reply::Playing { player: 1, .. }
+    ));
+    let taken = take_all(&worker, &mut ring, 1, 0, 41_667);
+    worker.close(1);
+    taken
+}
+
+/// Each frame the worker publishes carries the chroma location its decoder
+/// reports (design.md "Rendering and Skins", video frames): an H.264
+/// stream whose VUI declares location type 1 (centre) or 2 (top-left)
+/// gives that, one declaring type 0 gives left, and one with a VUI that
+/// declares none or with no VUI gives left, the decoder's report or the
+/// codec's default; each frame's samples come through as they were coded.
+// Covers: T02
+#[test]
+fn a_stream_s_declared_chroma_location_reaches_the_ring() {
+    for (vui, want) in [
+        (Vui::Sited(1), ChromaLocation::Centre),
+        (Vui::Sited(2), ChromaLocation::TopLeft),
+        (Vui::Sited(0), ChromaLocation::Left),
+        (Vui::Unsited, ChromaLocation::Left),
+        (Vui::None, ChromaLocation::Left),
+    ] {
+        let units = h264_sited((32, 32), (32, 32), &[(vui, 3)], &sited_sample);
+        let taken = play_h264("sited.avi", (32, 32), &units);
+        assert_eq!(taken.len(), 3, "{vui:?}");
+        for (i, t) in (0..).zip(&taken) {
+            assert_eq!(t.chroma, want, "{vui:?}: frame {i}");
+            assert_eq!(
+                t.bytes,
+                sited_frame(i, 32, 32),
+                "{vui:?}: frame {i}'s samples"
+            );
+        }
+    }
+}
+
+/// The schedule of the mid-stream change: three frames left-sited, an IDR
+/// with a new sequence declaring top-left and three frames so, then one
+/// declaring centre and two frames so.
+const CHANGES: [(Vui, u64); 3] = [(Vui::Sited(0), 3), (Vui::Sited(2), 3), (Vui::Sited(1), 2)];
+
+/// Each frame's location in [`CHANGES`].
+fn changes_schedule() -> Vec<ChromaLocation> {
+    CHANGES
+        .iter()
+        .flat_map(|&(vui, n)| {
+            let c = match vui {
+                Vui::Sited(1) => ChromaLocation::Centre,
+                Vui::Sited(2) => ChromaLocation::TopLeft,
+                _ => ChromaLocation::Left,
+            };
+            std::iter::repeat_n(c, usize::try_from(n).unwrap())
+        })
+        .collect()
+}
+
+/// A stream whose chroma location changes mid-stream (design.md "Rendering
+/// and Skins", video frames): every frame the worker publishes carries its
+/// own location in the authored schedule, from the changed frame on, and
+/// its authored samples.
+// Covers: T02
+#[test]
+fn each_frame_carries_its_location_across_a_mid_stream_change() {
+    let units = h264_sited((32, 32), (32, 32), &CHANGES, &sited_sample);
+    let taken = play_h264("changes.avi", (32, 32), &units);
+    let schedule = changes_schedule();
+    assert_eq!(taken.len(), schedule.len());
+    for ((i, t), want) in (0..).zip(&taken).zip(&schedule) {
+        assert_eq!(t.chroma, *want, "frame {i}");
+        assert_eq!(t.bytes, sited_frame(i, 32, 32), "frame {i}'s samples");
+    }
+}
+
+/// A frame swscale converts keeps its chroma location (design.md
+/// "Rendering and Skins", video frames): an H.264 stream probed at 64 ×
+/// 48 whose sequence after the probe codes 128 × 96 left-sited pictures
+/// with a step in Cb between chroma columns 31 and 32 has those frames
+/// scaled to the probed size (the worker's count of scaled frames rises by
+/// their number), and in each, the step's rise is centred where left-
+/// sited samples on both sides put it: destination chroma column `j` sits on
+/// source chroma column `2j + 0.25`, so the step at 31.5 lands at 15.625 of
+/// 32 (a destination sited centre would put it at 15.375, a source read as
+/// centred at 15.75, and both centred at 15.5); each carries left.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_scaled_frame_keeps_its_chroma_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scaled.avi");
+    // Ten seconds at 64 × 48, which the probe reads, then four frames of
+    // 128 × 96.
+    let mut units = h264_parts(&[((64, 48), (64, 48), 240)]);
+    let (sps, pps) = h264_sets((128, 96), (128, 96));
+    for k in 0..4 {
+        let i = u64::try_from(units.len()).unwrap();
+        let mut unit = Vec::new();
+        if k == 0 {
+            unit.extend(nal(0x67, &sps));
+            unit.extend(nal(0x68, &pps));
+        }
+        let step = |p: usize, x: u32, _: u32| match p {
+            1 => {
+                if x < 32 {
+                    60
+                } else {
+                    200
+                }
+            }
+            _ => 128,
+        };
+        unit.extend(nal(0x65, &h264_pcm(i, (128, 96), &step)));
+        units.push(unit);
+    }
+    std::fs::write(&path, avi((64, 48), 24, b"H264", &units)).unwrap();
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(
+            probe,
+            Reply::Probed {
+                player: 1,
+                width: 64,
+                height: 48,
+                ..
+            }
+        ),
+        "{probe:?}; the worker's log:\n{}",
+        worker.log()
+    );
+    let mut ring = Ring::new(64, 48);
+    assert!(matches!(
+        worker.play(1, &ring),
+        Reply::Playing { player: 1, .. }
+    ));
+    let taken = take_all(&worker, &mut ring, 1, 0, 41_667);
+    worker.close(1);
+    assert_eq!(taken.len(), 244, "the worker's log:\n{}", worker.log());
+    let scaled = worker.log().lines().find_map(|l| {
+        l.strip_suffix(" frames scaled")?
+            .rsplit(' ')
+            .next()?
+            .parse::<u64>()
+            .ok()
+    });
+    assert_eq!(scaled, Some(4), "the worker's log:\n{}", worker.log());
+    for (k, t) in taken[240..].iter().enumerate() {
+        assert_eq!(t.chroma, ChromaLocation::Left, "frame {k}");
+        // The first Cb row of the 64 × 48 frame: 32 samples.
+        let u = &t.bytes[64 * 48..64 * 48 + 32];
+        let centre = rise_centre(u);
+        assert!(
+            (centre - 15.625).abs() <= 0.05,
+            "frame {k}: the step's rise centred at {centre}, not 15.625: {u:?}"
+        );
+    }
+}
+
+/// What the pinned build reports of each fixture codec's chroma location
+/// before the worker applies a default (`--dev-chroma`; design.md
+/// "Rendering and Skins", video frames): where it reports one, it is the
+/// stream's declared or specified location, and where it reports none,
+/// the codec's default the worker then applies is that location. The
+/// report is printed with the build's identity.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_pinned_build_reports_each_codec_s_chroma_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, PathBuf, ChromaLocation)> = Vec::new();
+    for (name, vui, want) in [
+        ("h264-centre.avi", Vui::Sited(1), ChromaLocation::Centre),
+        ("h264-topleft.avi", Vui::Sited(2), ChromaLocation::TopLeft),
+        ("h264-left.avi", Vui::Sited(0), ChromaLocation::Left),
+        ("h264-unsited.avi", Vui::Unsited, ChromaLocation::Left),
+        ("h264-novui.avi", Vui::None, ChromaLocation::Left),
+    ] {
+        let path = dir.path().join(name);
+        let units = h264_sited((32, 32), (32, 32), &[(vui, 2)], &sited_sample);
+        std::fs::write(&path, avi((32, 32), 24, b"H264", &units)).unwrap();
+        files.push((name.to_owned(), path, want));
+    }
+    for (name, spec, want) in [
+        (
+            "mpeg1.mpg",
+            "mpeg1video mpeg 64x48 24 4 4",
+            ChromaLocation::Centre,
+        ),
+        (
+            "mpeg2.mpg",
+            "mpeg2video mpeg 64x48 24 4 4",
+            ChromaLocation::Left,
+        ),
+        (
+            "mjpeg.avi",
+            "mjpeg avi 64x48 24 4 1",
+            ChromaLocation::Centre,
+        ),
+    ] {
+        files.push((name.to_owned(), gen_clip(dir.path(), name, spec), want));
+    }
+    let pin: toml::Table =
+        toml::from_str(&std::fs::read_to_string(root().join("ffmpeg.toml")).unwrap()).unwrap();
+    println!("pinned: {}", pin["source"]["describe"]);
+    for (name, path, want) in files {
+        let out = Command::new(WORKER)
+            .arg("--dev-chroma")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{name}: {text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        println!("{name}:\n{text}");
+        let value = |l: &str| l.rsplit(' ').next().unwrap().parse::<u64>().unwrap();
+        let decoder = text
+            .lines()
+            .find(|l| l.starts_with("chroma: decoder "))
+            .map(value)
+            .unwrap();
+        let frames: Vec<u64> = text
+            .lines()
+            .filter(|l| l.starts_with("chroma: frame "))
+            .map(value)
+            .collect();
+        assert!(!frames.is_empty(), "{name}: no frame");
+        for f in frames {
+            // The frame's, else the decoder's, else the default.
+            if let Some(v) = [f, decoder].into_iter().find(|v| (1..=6).contains(v)) {
+                assert_eq!(v, want.word(), "{name}: the location reported");
+            }
+        }
+    }
 }

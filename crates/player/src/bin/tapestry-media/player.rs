@@ -31,7 +31,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use skin_model::media::control::{Failure, NO_COMMAND, Reply};
-use skin_model::media::{PROGRESS_WORD, Stamp, State, Writer};
+use skin_model::media::{ChromaLocation, PROGRESS_WORD, Stamp, State, Writer};
 
 use crate::ffmpeg::{Input, IoOpen};
 use crate::os::{Event, Source, View};
@@ -339,7 +339,14 @@ pub fn run(player: u8, open: u32, file: Source, rx: &Receiver<ToPlayer>, out: &O
             fail(player, out, why, code);
             idle(player, rx, out);
         }
-        Stopped::Closed(id) => out.send(&Reply::Closed { id, player }),
+        Stopped::Closed(id) => {
+            #[cfg(feature = "dev-tools")]
+            crate::say(&format!(
+                "tapestry-media: {} frames scaled",
+                crate::ffmpeg::scales()
+            ));
+            out.send(&Reply::Closed { id, player });
+        }
     }
 }
 
@@ -363,8 +370,9 @@ struct Playing {
     last: Option<i64>,
     /// The sequence of the last frame published in the ring.
     seq: u64,
-    /// The stamp of the frame in `frame`, converted and not published yet.
-    held: Option<Stamp>,
+    /// The stamp and chroma location of the frame in `frame`, converted and
+    /// not published yet.
+    held: Option<(Stamp, ChromaLocation)>,
     /// The run's video has ended.
     ended: bool,
 }
@@ -419,10 +427,13 @@ impl Playing {
         self.writer.state(self.view.words(), State::Decoding);
         match self.input.seek(at, &mut self.frame)? {
             Some(landed) => {
-                self.held = Some(Stamp {
-                    at: landed.stamp,
-                    duration: self.input.duration(),
-                });
+                self.held = Some((
+                    Stamp {
+                        at: landed.stamp,
+                        duration: self.input.duration(),
+                    },
+                    self.input.chroma(),
+                ));
                 out.send(&Reply::Sought {
                     id,
                     player: self.player,
@@ -489,7 +500,7 @@ impl Playing {
     /// publishes the frame held, or waits a while for a free slot.
     fn step(&mut self, out: &Out) -> Result<(), (Failure, i32)> {
         let words = self.view.words();
-        let Some(stamp) = self.held else {
+        let Some((stamp, chroma)) = self.held else {
             #[cfg(feature = "dev-tools")]
             if faults::refused(self.player) {
                 // The seam: the decode below finds the refusal recorded for
@@ -504,7 +515,7 @@ impl Playing {
             match self.decode(self.last)? {
                 Decoded::Frame(stamp) => {
                     self.input.convert(&mut self.frame)?;
-                    self.held = Some(stamp);
+                    self.held = Some((stamp, self.input.chroma()));
                 }
                 Decoded::Skipped => {}
                 Decoded::End => self.end(out),
@@ -535,7 +546,7 @@ impl Playing {
         let run = self.run;
         let seq = self.seq.saturating_add(1);
         self.writer
-            .publish(words, slot, &self.frame, seq, run, stamp)
+            .publish(words, slot, &self.frame, seq, run, stamp, chroma)
             .map_err(|_| (Failure::Ring, 0))?;
         self.seq = seq;
         self.last = Some(stamp.at);

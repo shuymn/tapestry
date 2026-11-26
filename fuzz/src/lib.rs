@@ -4090,6 +4090,9 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
         let polled = peeked.and_then(|peek| {
             peek.due
                 .map(|d| {
+                    // What the peek found in the slot: the frame taken
+                    // carries it, whatever the slot holds after the take.
+                    let chroma = d.chroma();
                     let mut sink = |at: usize, bytes: &[u8]| {
                         let end = at + bytes.len();
                         for w in &mut written[at..end] {
@@ -4099,7 +4102,9 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
                         out[at..end].copy_from_slice(bytes);
                         true
                     };
-                    reader.take(&logged, d, [width, width.div_ceil(2)], &mut sink)
+                    reader
+                        .take(&logged, d, [width, width.div_ceil(2)], &mut sink)
+                        .inspect(|f| assert_eq!(f.chroma, chroma, "the location the peek found"))
                 })
                 .transpose()
         });

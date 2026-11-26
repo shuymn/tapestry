@@ -383,6 +383,7 @@ fn movie(r: &mut render::Renderer, slot: u32, left: [u8; 3], right: [u8; 3]) -> 
         size: [64, 64],
         bt601: false,
         full: false,
+        chroma: skin_model::media::ChromaLocation::Centre,
     }
 }
 

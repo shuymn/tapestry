@@ -210,7 +210,7 @@ pub use pointer::{
     ActionDef, Button, ClickType, HoverRect, MAX_SEARCH_BOXES, PointerDef, PointerError,
     PointerHit, PressHit, RowRef, RowRefKind, SearchBoxes,
 };
-pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
+pub use quad::{Blend, ClipId, ClipRect, Filter, MovieSampling, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{
     CLEAR_MAX, GRADE_MAX, HIDDEN, RESULT, VALUE_MAX as RESULT_VALUE_MAX, field as result_field,
     timer as result_timer,

@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ffmpeg_sys_next as ff;
 use skin_model::media::control::{Failure, Matrix, Range, Refusal};
-use skin_model::media::{MAX_PIXELS, MAX_SIDE};
+use skin_model::media::{ChromaLocation, MAX_PIXELS, MAX_SIDE};
 
 use crate::loop_clock::{LoopClock, rescale_us};
 use crate::os::Source;
@@ -127,6 +127,17 @@ pub fn slow_convert(ms: u64) {
 /// The conversions made so far in the process, counted from 0 (dev-tools).
 #[cfg(feature = "dev-tools")]
 static CONVERSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The frames swscale converted so far in the process (dev-tools): apart
+/// from [`CONVERSIONS`], which counts every conversion, copies included.
+#[cfg(feature = "dev-tools")]
+static SCALES: AtomicU64 = AtomicU64::new(0);
+
+/// The frames swscale converted so far in the process (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn scales() -> u64 {
+    SCALES.load(Ordering::Relaxed)
+}
 
 /// The conversion that stalls ([`stall_convert`]), and for how long.
 #[cfg(feature = "dev-tools")]
@@ -769,6 +780,23 @@ mod hooks {
     }
 }
 
+/// FFmpeg's libraries' versions (dev-tools): avcodec's, avformat's,
+/// avutil's and swscale's, each as `major.minor.micro`.
+#[cfg(feature = "dev-tools")]
+pub fn library_versions() -> String {
+    let v = |n: u32| format!("{}.{}.{}", n >> 16, n >> 8 & 0xff, n & 0xff);
+    // SAFETY: each returns its library's version.
+    unsafe {
+        format!(
+            "avcodec {} avformat {} avutil {} swscale {}",
+            v(ff::avcodec_version()),
+            v(ff::avformat_version()),
+            v(ff::avutil_version()),
+            v(ff::swscale_version())
+        )
+    }
+}
+
 /// FFmpeg's version string and configure line.
 pub fn version() -> (String, String) {
     // SAFETY: both return static NUL-terminated strings.
@@ -1091,7 +1119,55 @@ unsafe fn scale(
             (**sws).flags = ff::SwsFlags::SWS_BILINEAR as u32;
         }
         let r = ff::sws_scale_frame(*sws, dst, src);
+        #[cfg(feature = "dev-tools")]
+        SCALES.fetch_add(1, Ordering::Relaxed);
         if r < 0 { Err(r) } else { Ok(()) }
+    }
+}
+
+/// The chroma location FFmpeg's `loc` names, or `None` when it names none
+/// (unspecified, or a value past the six).
+pub fn location(loc: ff::AVChromaLocation) -> Option<ChromaLocation> {
+    use ff::AVChromaLocation as L;
+    match loc {
+        L::AVCHROMA_LOC_LEFT => Some(ChromaLocation::Left),
+        L::AVCHROMA_LOC_CENTER => Some(ChromaLocation::Centre),
+        L::AVCHROMA_LOC_TOPLEFT => Some(ChromaLocation::TopLeft),
+        L::AVCHROMA_LOC_TOP => Some(ChromaLocation::Top),
+        L::AVCHROMA_LOC_BOTTOMLEFT => Some(ChromaLocation::BottomLeft),
+        L::AVCHROMA_LOC_BOTTOM => Some(ChromaLocation::Bottom),
+        _ => None,
+    }
+}
+
+/// FFmpeg's value for the chroma location `chroma`.
+const fn av_location(chroma: ChromaLocation) -> ff::AVChromaLocation {
+    use ff::AVChromaLocation as L;
+    match chroma {
+        ChromaLocation::Left => L::AVCHROMA_LOC_LEFT,
+        ChromaLocation::Centre => L::AVCHROMA_LOC_CENTER,
+        ChromaLocation::TopLeft => L::AVCHROMA_LOC_TOPLEFT,
+        ChromaLocation::Top => L::AVCHROMA_LOC_TOP,
+        ChromaLocation::BottomLeft => L::AVCHROMA_LOC_BOTTOMLEFT,
+        ChromaLocation::Bottom => L::AVCHROMA_LOC_BOTTOM,
+    }
+}
+
+/// Where a codec's 4:2:0 chroma sits when neither the frame nor its
+/// decoder reports a location (design.md "Rendering and Skins", video
+/// frames): left for H.264 and HEVC (their VUI's location types inferred
+/// as 0 when absent, ITU-T H.264 and H.265 Annex E) and MPEG-2 (its 4:2:0
+/// layout, ITU-T H.262 6.1.1.8, which no syntax changes); centre for
+/// MPEG-1 (ISO/IEC 11172-2's 4:2:0 layout) and JPEG (ITU-T T.871), and
+/// centre as the fallback for every other codec, whose decoder's own report
+/// (MPEG-4 Part 2's reports left) comes first.
+pub const fn default_location(codec: ff::AVCodecID) -> ChromaLocation {
+    use ff::AVCodecID as C;
+    match codec {
+        C::AV_CODEC_ID_H264 | C::AV_CODEC_ID_HEVC | C::AV_CODEC_ID_MPEG2VIDEO => {
+            ChromaLocation::Left
+        }
+        _ => ChromaLocation::Centre,
     }
 }
 
@@ -1491,6 +1567,17 @@ impl Input {
         }
     }
 
+    /// The chroma location of the frame decoded last: its own, else its
+    /// decoder's, else its codec's default ([`default_location`]).
+    pub fn chroma(&self) -> ChromaLocation {
+        // SAFETY: this input's frame and decoder, both made at its open.
+        unsafe {
+            location((*self.frame).chroma_location)
+                .or_else(|| location((*self.dec).chroma_sample_location))
+                .unwrap_or_else(|| default_location((*self.dec).codec_id))
+        }
+    }
+
     /// Converts the frame [`Input::next`] or [`Input::restart`] last
     /// decoded into `out`, I420 at the probed size.
     ///
@@ -1765,6 +1852,8 @@ impl Input {
             // matrix converted in place below.
             let rematrix = own.matrix != self.colour.matrix;
             let size = (self.width.unsigned_abs(), self.height.unsigned_abs());
+            // Where its chroma sits, which no conversion moves.
+            let chroma = self.chroma();
             // A deeper 4:2:0 frame at the probed size whose matrix differs:
             // converted from its own samples, quantized once.
             if rematrix
@@ -1801,8 +1890,11 @@ impl Input {
                 // Its format, its size or its range alone differs: swscale
                 // converts into `into`, each side's colour set. Both sides
                 // keep the frame's primaries and transfer (BT.709's where
-                // it names none), so it maps no gamut.
+                // it names none), so it maps no gamut, and its chroma
+                // location, so it moves no chroma.
                 ((*f).colorspace, (*f).color_range) = own.tags();
+                (*f).chroma_location = av_location(chroma);
+                (*self.scaled).chroma_location = av_location(chroma);
                 ((*self.scaled).colorspace, (*self.scaled).color_range) = into.tags();
                 if (*f).color_primaries == ff::AVColorPrimaries::AVCOL_PRI_UNSPECIFIED {
                     (*f).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
@@ -1823,6 +1915,20 @@ impl Input {
                 convert_matrix(out, size, own, self.colour);
             }
             Ok(())
+        }
+    }
+
+    /// The chroma locations FFmpeg reports, before any default: the
+    /// decoder's and the frame decoded last's, as `AVChromaLocation`'s
+    /// values (0 for unspecified) (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn reported_locations(&self) -> (c_int, c_int) {
+        // SAFETY: this input's decoder and frame, both made at its open.
+        unsafe {
+            (
+                (*self.dec).chroma_sample_location as c_int,
+                (*self.frame).chroma_location as c_int,
+            )
         }
     }
 
@@ -2023,7 +2129,9 @@ impl Deep<'_> {
 /// Converts the I420 frame `out` of `size` (its planes tightly packed) from
 /// the colour `from` to `to`, in place: each pixel's Y' from its own and its
 /// block's Cb and Cr, each block's Cb and Cr from its pixels' mean Y' and
-/// its own; linear throughout, quantized once at the end.
+/// its own; linear throughout, quantized once at the end. The map takes
+/// grey to grey, so a block's Cb and Cr do not depend on that Y', and no
+/// chroma location changes the result.
 fn convert_matrix(out: &mut [u8], size: (u32, u32), from: Colour, to: Colour) {
     rematrix(out, size, from, to, None);
 }
@@ -2593,6 +2701,39 @@ mod tests {
                     assert!(got.abs_diff(want) <= 1, "{range:?} {yuv:?}: {frame:?}");
                 }
             }
+        }
+    }
+
+    /// The chroma location a codec's stream has when neither its frames
+    /// nor its decoder report one (design.md "Rendering and Skins", video
+    /// frames): its specification's 4:2:0 layout.
+    #[test]
+    fn a_codec_s_default_location_is_its_specification_s() {
+        use ff::AVCodecID as C;
+        for (codec, want) in [
+            (C::AV_CODEC_ID_H264, ChromaLocation::Left),
+            (C::AV_CODEC_ID_HEVC, ChromaLocation::Left),
+            (C::AV_CODEC_ID_MPEG2VIDEO, ChromaLocation::Left),
+            (C::AV_CODEC_ID_MPEG1VIDEO, ChromaLocation::Centre),
+            (C::AV_CODEC_ID_MJPEG, ChromaLocation::Centre),
+            (C::AV_CODEC_ID_MPEG4, ChromaLocation::Centre),
+            (C::AV_CODEC_ID_VP9, ChromaLocation::Centre),
+        ] {
+            assert_eq!(default_location(codec), want, "{codec:?}");
+        }
+        // FFmpeg's six locations map one to one; unspecified names none.
+        use ff::AVChromaLocation as L;
+        assert_eq!(location(L::AVCHROMA_LOC_UNSPECIFIED), None);
+        for c in [
+            ChromaLocation::Left,
+            ChromaLocation::Centre,
+            ChromaLocation::TopLeft,
+            ChromaLocation::Top,
+            ChromaLocation::BottomLeft,
+            ChromaLocation::Bottom,
+        ] {
+            assert_eq!(location(av_location(c)), Some(c));
+            assert_eq!(av_location(c) as u64, c.word(), "AVChromaLocation's value");
         }
     }
 }

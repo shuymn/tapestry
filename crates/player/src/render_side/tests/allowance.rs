@@ -2220,7 +2220,10 @@ fn clip() -> Arc<Movie> {
         at: 0,
         duration: 33_333,
     };
-    writer.publish(words, slot, &frame, 1, 1, at).unwrap();
+    let chroma = skin_model::media::ChromaLocation::Left;
+    writer
+        .publish(words, slot, &frame, 1, 1, at, chroma)
+        .unwrap();
     movie
 }
 

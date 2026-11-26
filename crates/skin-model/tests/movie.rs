@@ -12,9 +12,11 @@ mod widget_support;
 
 use skin_model::bga::{BgaStretch, SOLID};
 use skin_model::chart_image::ChartStretch;
+use skin_model::media::ChromaLocation;
 use skin_model::movie::{MovieShow, MovieShows};
 use skin_model::{
-    Blend, ElementDef, Filter, LoadError, Place, Quad, ScreenKind, Skin, Source, TimerRef, timer,
+    Blend, ElementDef, Filter, LoadError, MovieSampling, Place, Quad, ScreenKind, Skin, Source,
+    TimerRef, timer,
 };
 
 use lanes_support::rect;
@@ -51,6 +53,12 @@ const FRAME: MovieShow = MovieShow::Frame {
     size: [1920, 1080],
     bt601: false,
     full: true,
+    chroma: ChromaLocation::Left,
+};
+
+/// The filter [`FRAME`] draws with.
+const FRAME_FILTER: Filter = Filter::Movie {
+    sampling: MovieSampling::new(false, true, ChromaLocation::Left),
 };
 
 fn shows(first: MovieShow, second: MovieShow) -> MovieShows {
@@ -70,13 +78,7 @@ fn a_live_movie_draws_its_frame_from_its_layer_by_its_colour() {
     let q = quads(&mut h, shows(FRAME, MovieShow::Nothing));
     assert_eq!(q.len(), 1);
     let q = q[0];
-    assert_eq!(
-        q.filter,
-        Filter::Movie {
-            bt601: false,
-            full: true
-        }
-    );
+    assert_eq!(q.filter, FRAME_FILTER);
     assert_eq!((q.uv, q.layer), ([0.0, 0.0, 0.5, 0.25], 1));
     assert_eq!(
         q.rect,
@@ -156,17 +158,7 @@ fn a_movie_keeps_its_place_in_the_draw_order() {
     ]);
     let q = quads(&mut h, shows(FRAME, MovieShow::Nothing));
     let filters: Vec<Filter> = q.iter().map(|q| q.filter).collect();
-    assert_eq!(
-        filters,
-        [
-            Filter::Linear,
-            Filter::Movie {
-                bt601: false,
-                full: true
-            },
-            Filter::Linear
-        ]
-    );
+    assert_eq!(filters, [Filter::Linear, FRAME_FILTER, Filter::Linear]);
 }
 
 #[test]
@@ -263,13 +255,7 @@ fn a_loading_frame_draws_a_ready_movie_and_a_lost_one_black() {
     ];
     let q = loading_quads(elements.clone(), shows(FRAME, MovieShow::Lost));
     assert_eq!(q.len(), 2, "{q:?}");
-    assert_eq!(
-        q[0].filter,
-        Filter::Movie {
-            bt601: false,
-            full: true
-        }
-    );
+    assert_eq!(q[0].filter, FRAME_FILTER);
     assert_eq!((q[0].uv, q[0].layer), ([0.0, 0.0, 0.5, 0.25], 1));
     assert_eq!((q[1].uv, q[1].layer), (SOLID.uv, SOLID.layer));
     assert_eq!(q[1].color, [0.0, 0.0, 0.0, 1.0]);

@@ -54,7 +54,17 @@ fn publish(movie: &Movie, seq: u64, stamp: i64, id: u8) {
         at: stamp,
         duration: 33_333,
     };
-    writer.publish(words, slot, &frame, seq, 1, stamp).unwrap();
+    writer
+        .publish(
+            words,
+            slot,
+            &frame,
+            seq,
+            1,
+            stamp,
+            skin_model::media::ChromaLocation::Left,
+        )
+        .unwrap();
 }
 
 /// A live 64 × 32 movie with a frame at each of `stamps` (µs).
@@ -826,7 +836,17 @@ fn publish_grey(movie: &Movie, seq: u64, stamp: i64, luma: u8) {
         at: stamp,
         duration: 500_000,
     };
-    writer.publish(words, slot, &frame, seq, 1, stamp).unwrap();
+    writer
+        .publish(
+            words,
+            slot,
+            &frame,
+            seq,
+            1,
+            stamp,
+            skin_model::media::ChromaLocation::Left,
+        )
+        .unwrap();
 }
 
 /// The colour a read-back of `luma` with neutral chroma gives, limited

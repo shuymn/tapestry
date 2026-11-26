@@ -373,12 +373,12 @@ fn video_frame(slot: u16, size: [u32; 2]) -> MovieShow {
         size,
         bt601: true,
         full: true,
+        chroma: skin_model::media::ChromaLocation::Left,
     }
 }
 
 const MOVIE: Filter = Filter::Movie {
-    bt601: true,
-    full: true,
+    sampling: skin_model::MovieSampling::new(true, true, skin_model::media::ChromaLocation::Left),
 };
 const fn video(slot: u16) -> (Option<u16>, Filter) {
     (Some(slot), MOVIE)

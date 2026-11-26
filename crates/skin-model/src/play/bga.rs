@@ -178,6 +178,7 @@ impl Parts<'_> {
                 size,
                 bt601,
                 full,
+                chroma,
             },
         )) = self.media.show(id)
         else {
@@ -187,7 +188,8 @@ impl Parts<'_> {
         let (r, f, native) = self.stretch.place(rect, size, f, self.scale);
         let b = Brush { native, ..*brush };
         out.push_movie(slot, |out| {
-            b.push_clipped(out, r, f, Filter::Movie { bt601, full }, trim);
+            let sampling = crate::quad::MovieSampling::new(bt601, full, chroma);
+            b.push_clipped(out, r, f, Filter::Movie { sampling }, trim);
         });
         true
     }

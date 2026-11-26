@@ -150,7 +150,8 @@ pub use upload::{
     UploadGate, UploadState, Uploaded,
 };
 pub use video::{
-    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES, VIDEO_UV,
+    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_CHROMA_DOWN, FLAG_VIDEO_CHROMA_LEFT,
+    FLAG_VIDEO_CHROMA_UP, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES, VIDEO_UV, chroma_flags,
 };
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).

@@ -357,6 +357,8 @@ fn log_unresolved(want: &Want, bindings: &[BgaBinding]) {
 /// final path must be the canonical path the folder check passed, so a
 /// name swapped for a link between the check and the open is refused.
 fn open_video(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(feature = "dev-tools")]
+    crate::media_host::session::file_gate("TAPESTRY_DEV_OPEN_GATE");
     let file = std::fs::File::open(path)?;
     let at = crate::movie_screen::final_path(&file)?;
     if at == path {

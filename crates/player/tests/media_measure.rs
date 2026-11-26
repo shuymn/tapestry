@@ -10,18 +10,20 @@
 //! go to `MEDIA_MEASURE_OUT` as one JSON object a line. The other
 //! measurements here: the worker's CPU bound (`media_worker_cpu_bound`), a
 //! screen's preparation and the loops' pass ends through the game's session
-//! (`media_session_entry_and_loops`), and the game's own loops under the
-//! worker's worst admitted load (`media_game_loops_under_the_worst_load`).
+//! (`media_session_entry_and_loops`), the game's own loops under the
+//! worker's worst admitted load (`media_game_loops_under_the_worst_load`),
+//! and the load a running worker meets beside a full-rate renderer, run by
+//! the real-app harness (`media_load_beside_a_running_worker`).
 
 #![cfg(all(windows, feature = "dev-tools"))]
 
 mod media_support;
 
 use std::io::Write as _;
-use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe};
@@ -57,16 +59,46 @@ impl Out {
 /// Busy threads at normal priority, until dropped.
 struct Load {
     stop: Arc<AtomicBool>,
+    /// The threads that have entered their loop.
+    spinning: Arc<AtomicUsize>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// How long a load's threads have to enter their loop.
+const SPIN_UP: Duration = Duration::from_secs(10);
+
 impl Load {
+    /// `n` busy threads, every one spinning, then half a second more.
     fn new(n: usize) -> Self {
+        let load = Self::spinning(n, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(500));
+        load
+    }
+
+    /// `n` busy threads, returned once each has acknowledged entering its
+    /// loop, within [`SPIN_UP`] (a panic otherwise, naming how many did);
+    /// the first waits `late` before it starts (a test's late thread).
+    fn spinning(n: usize, late: Duration) -> Self {
+        Self::spinning_within(n, late, SPIN_UP).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// As [`Self::spinning`], within `within`: on a timeout, the threads
+    /// are told to stop and left to end on their own, unjoined, so the
+    /// failure returns at the deadline whatever a thread still waits for.
+    fn spinning_within(n: usize, late: Duration, within: Duration) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
+        let spinning = Arc::new(AtomicUsize::new(0));
+        let (ready_tx, ready) = std::sync::mpsc::channel();
         let threads = (0..n)
-            .map(|_| {
-                let stop = Arc::clone(&stop);
+            .map(|k| {
+                let (stop, spinning) = (Arc::clone(&stop), Arc::clone(&spinning));
+                let ready_tx = ready_tx.clone();
                 std::thread::spawn(move || {
+                    if k == 0 {
+                        std::thread::sleep(late);
+                    }
+                    spinning.fetch_add(1, Ordering::AcqRel);
+                    let _ = ready_tx.send(());
                     let mut x = 0_u64;
                     while !stop.load(Ordering::Relaxed) {
                         x = std::hint::black_box(
@@ -76,9 +108,60 @@ impl Load {
                 })
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(500));
-        Self { stop, threads }
+        drop(ready_tx);
+        let mut load = Self {
+            stop,
+            spinning,
+            threads,
+        };
+        let deadline = Instant::now() + within;
+        for k in 0..n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if ready.recv_timeout(left).is_err() {
+                load.stop.store(true, Ordering::Relaxed);
+                // Dropping a handle detaches its thread: the drop below
+                // joins none.
+                load.threads.clear();
+                return Err(format!("{k} of {n} load threads spinning after {within:?}"));
+            }
+        }
+        Ok(load)
     }
+
+    /// The threads that have entered their loop.
+    fn spinning_now(&self) -> usize {
+        self.spinning.load(Ordering::Acquire)
+    }
+}
+
+/// A load starts once every thread spins (Part D's load start mark): with
+/// its first thread 700 ms late, longer than the settling the load used to
+/// wait instead, it returns only after that thread too has entered its
+/// loop.
+#[test]
+fn a_load_starts_once_every_thread_spins() {
+    let late = Duration::from_millis(700);
+    let started = Instant::now();
+    let load = Load::spinning(3, late);
+    assert_eq!(load.spinning_now(), 3, "every thread spinning");
+    assert!(started.elapsed() >= late, "{:?}", started.elapsed());
+}
+
+/// A load whose thread does not start in time fails at its deadline: with
+/// its one thread held 20 s and a deadline of 300 ms, the failure names
+/// no thread spinning and returns well before the held thread starts, the
+/// thread told to stop and left unjoined. One thread, so the count does
+/// not depend on how soon an unheld thread is scheduled.
+#[test]
+fn a_load_that_does_not_start_fails_at_its_deadline() {
+    let started = Instant::now();
+    let Err(e) = Load::spinning_within(1, Duration::from_secs(20), Duration::from_millis(300))
+    else {
+        panic!("the load started");
+    };
+    let took = started.elapsed();
+    assert!(e.starts_with("0 of 1 load threads spinning"), "{e}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
 }
 
 impl Drop for Load {
@@ -1020,4 +1103,115 @@ fn media_session_entry_and_loops() {
         }));
     }
     stop_all(movies);
+}
+
+/// The QPC count now.
+fn qpc() -> i64 {
+    let mut at = 0;
+    // SAFETY: an out value.
+    unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&raw mut at) }.unwrap();
+    at
+}
+
+/// The load a starved worker meets beside a full-rate renderer, run by the
+/// real-app harness against a running worker (design.md "Threat Model"
+/// T02): `MEDIA_LOAD_PID` names the worker, its priority class is set to
+/// `MEDIA_LOAD_PRIORITY` (`normal` or `below_normal`) when given, and after
+/// `MEDIA_LOAD_BASELINE_S` seconds busy threads at normal priority, one per
+/// CPU of the worker's affinity, run on those CPUs for
+/// `MEDIA_LOAD_SECONDS` from their start; `MEDIA_LOAD_RECOVERY_S` seconds
+/// follow. Records on QPC the threads' spawn, the load's start (every
+/// thread spinning) and its end (every thread joined), and the worker's
+/// affinity and priority class, the load's affinity and the worker's CPU
+/// time per phase.
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn media_load_beside_a_running_worker() {
+    use windows::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, GetProcessAffinityMask,
+        NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SET_INFORMATION,
+        SetPriorityClass,
+    };
+    let mut out =
+        Out(std::fs::File::create(env_or("MEDIA_MEASURE_OUT", "media-load.jsonl")).unwrap());
+    let pid: u32 = env_or("MEDIA_LOAD_PID", "").parse().unwrap();
+    let phase = |name: &str, default: &str| -> Duration {
+        Duration::from_secs_f64(env_or(name, default).parse().unwrap())
+    };
+    let baseline = phase("MEDIA_LOAD_BASELINE_S", "20");
+    let load = phase("MEDIA_LOAD_SECONDS", "20");
+    let recovery = phase("MEDIA_LOAD_RECOVERY_S", "30");
+    // SAFETY: opens the process `pid` for these rights; the handle is owned
+    // from here.
+    let worker = unsafe {
+        OwnedHandle::from_raw_handle(
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+                false,
+                pid,
+            )
+            .unwrap()
+            .0,
+        )
+    };
+    let worker = HANDLE(worker.as_raw_handle());
+    if let Ok(p) = std::env::var("MEDIA_LOAD_PRIORITY") {
+        let class = match p.as_str() {
+            "normal" => NORMAL_PRIORITY_CLASS,
+            "below_normal" => BELOW_NORMAL_PRIORITY_CLASS,
+            _ => panic!("MEDIA_LOAD_PRIORITY: {p}"),
+        };
+        // SAFETY: the worker's handle, opened with the right to set it.
+        unsafe { SetPriorityClass(worker, class) }.unwrap();
+    }
+    let affinity = |process: HANDLE| -> usize {
+        let (mut own, mut system) = (0, 0);
+        // SAFETY: a process handle with the right to query, and two out
+        // values.
+        unsafe { GetProcessAffinityMask(process, &raw mut own, &raw mut system) }.unwrap();
+        own
+    };
+    let mask = affinity(worker);
+    // SAFETY: this process's pseudo handle; the load's threads take its
+    // affinity.
+    let this = unsafe { GetCurrentProcess() };
+    pin(this, mask);
+    let mut frequency = 0;
+    // SAFETY: an out value.
+    unsafe { windows::Win32::System::Performance::QueryPerformanceFrequency(&raw mut frequency) }
+        .unwrap();
+    out.line(&serde_json::json!({
+        "kind": "setup", "pid": pid, "qpc_frequency": frequency,
+        "worker_mask": mask, "load_mask": affinity(this),
+        // SAFETY: the worker's handle, opened with the right to query.
+        "worker_priority": unsafe { GetPriorityClass(worker) },
+        "baseline_s": baseline.as_secs_f64(), "load_s": load.as_secs_f64(),
+        "recovery_s": recovery.as_secs_f64(),
+    }));
+    let mut cpu = vec![("start", qpc(), cpu_ms(worker))];
+    std::thread::sleep(baseline);
+    cpu.push(("load_spawn", qpc(), cpu_ms(worker)));
+    let threads = Load::spinning(usize::try_from(mask.count_ones()).unwrap(), Duration::ZERO);
+    cpu.push(("load_start", qpc(), cpu_ms(worker)));
+    std::thread::sleep(load);
+    drop(threads);
+    cpu.push(("load_end", qpc(), cpu_ms(worker)));
+    std::thread::sleep(recovery);
+    cpu.push(("end", qpc(), cpu_ms(worker)));
+    for (name, at, ms) in &cpu {
+        out.line(
+            &serde_json::json!({"kind": "mark", "mark": name, "qpc": at, "worker_cpu_ms": ms}),
+        );
+    }
+    let phases = ["baseline", "ramp", "load", "recovery"];
+    for (phase, w) in phases.iter().zip(cpu.windows(2)) {
+        let [(_, a, ca), (_, b, cb)] = w else {
+            unreachable!()
+        };
+        out.line(&serde_json::json!({
+            "kind": "phase", "phase": phase,
+            "seconds": (b - a) as f64 / frequency as f64,
+            "worker_cpus": (cb - ca) / ((b - a) as f64 / frequency as f64 * 1000.0),
+        }));
+    }
 }
