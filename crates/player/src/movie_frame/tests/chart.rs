@@ -263,8 +263,9 @@ fn a_start_at_zero_counts_on_a_late_first_frame() {
 /// "Rendering and Skins", BGA): with the start at 2 s, the boundary at 8 s
 /// and the speed 1/2, the run is sought to `first + 3 s`, the movie ready
 /// only once that landing is staged, and the boundary shows it. A start
-/// exactly at the boundary is a start, the clip from its beginning, the
-/// landing held until its first frame.
+/// exactly at the boundary, on either channel when both name the file, is
+/// a start: nothing is landed, and the boundary shows run 1's staged first
+/// frame at once.
 #[test]
 fn a_start_before_the_round_lands_at_its_boundary() {
     let (e, b) = (2_000_000, 8_000_000);
@@ -282,14 +283,18 @@ fn a_start_before_the_round_lands_at_its_boundary() {
     assert_eq!(p.stamp(), Some(target - 10_000));
     assert!(frame(p.at_k(b + 2 * P - 20_000, 10)));
     assert_eq!(p.stamp(), Some(target + P - 10_000));
-    // A start at the boundary: the clip from its start.
-    let mut p = Play::round(&[e, b], b, 20, Instant::now());
-    assert!(p.land(&[FIRST + 6_000_000]));
-    assert!(frame(p.at(b)), "the landing held");
-    assert_eq!(p.a.want.load(Ordering::SeqCst), 3, "restarted at b");
-    p.publish(3, FIRST, 30);
-    assert!(frame(p.at(b + 10_000)));
-    assert_eq!(p.stamp(), Some(FIRST));
+    // A start at the boundary: the clip from its start, on one channel or
+    // on the other channel's alias of the file.
+    let at_b: [(&[i64], &[i64]); 3] = [(&[e, b], &[]), (&[e], &[b]), (&[b], &[e])];
+    for (base, layer) in at_b {
+        let mut p = Play::with(videos(base, layer, 2), b, None, None);
+        assert_eq!(p.landing(), None, "{base:?} {layer:?}");
+        let want = p.a.want.load(Ordering::SeqCst);
+        assert!(!frame(p.at(b - 1)), "nothing before the boundary");
+        assert!(frame(p.at(b)), "{base:?} {layer:?}");
+        assert_eq!(p.stamp(), Some(FIRST), "the staged first frame");
+        assert_eq!((p.a.want.load(Ordering::SeqCst), p.m.wakes()), (want, 0));
+    }
 }
 
 /// Before the boundary (READY opens 200 ms earlier) a landed file shows

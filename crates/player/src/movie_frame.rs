@@ -1150,9 +1150,14 @@ impl<S: Source> Movies<S> {
         };
         let [width, height] = slot.size;
         let starts = videos.as_deref().map_or(&[][..], |v| v.starts(i));
-        // The start a round lands at its boundary: the slot's latest before
-        // it (none in a full play, whose boundary no start precedes).
-        let landed = starts.partition_point(|s| s.0 < boundary).checked_sub(1);
+        // The start a round lands at its boundary: the slot's latest at or
+        // before it, when that is before it; a start at the boundary counts
+        // as after it and plays its staged first frame (none in a full
+        // play, whose boundary no start precedes).
+        let landed = starts
+            .partition_point(|s| s.0 <= boundary)
+            .checked_sub(1)
+            .filter(|j| starts.get(*j).is_some_and(|s| s.0 < boundary));
         // The worker publishes every frame of a run before it reports the
         // run's end: read first, so the peek below sees them all.
         let ended = movie.ended();
