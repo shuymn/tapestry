@@ -446,3 +446,88 @@ fn the_cutoff_counts_the_entry_the_withdrawal_fills() {
     drop(ticket);
     link.exit();
 }
+
+/// S-R5 (design.md "Screen Transitions and Loading", the frame-budgeted
+/// uploads): an early request whose room never comes is refused once with
+/// the room's timeout, about `CREATE_BOUND` after its receipt, and staged
+/// nothing.
+// Revert: the room wait's deadline removed -> no answer.
+#[test]
+fn a_room_wait_times_out_with_no_resource() {
+    let (_chart, screens, link, _lifetime) = held();
+    screens.early_room.store(1, SeqCst);
+    let skin = bundle();
+    let asked = std::time::Instant::now();
+    let mut ticket = early(&link, &skin);
+    let r = ticket.request();
+    let a = answer(&mut ticket);
+    let took = asked.elapsed();
+    let Preparation::Refused(refused) = &a.preparation else {
+        panic!("{:?}", a.preparation);
+    };
+    assert!(refused.reason.contains("room"), "{}", refused.reason);
+    let bound = std::time::Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
+    assert!(took >= bound, "answered after {took:?}");
+    assert!(
+        !noted(&screens, &format!("early {r}")),
+        "staged: {:?}",
+        screens.log()
+    );
+    link.exit();
+}
+
+/// A ticket keeps its deadline across screens built again (design.md
+/// "Screen Transitions and Loading", the frame-budgeted uploads): an early
+/// request waiting for its room through repeated rebuilds is refused with
+/// the room's timeout counted from its receipt, never from a later build.
+#[test]
+fn rebuilds_renew_no_ticket() {
+    let (_chart, screens, link, _lifetime) = held();
+    screens.early_room.store(1, SeqCst);
+    let skin = bundle();
+    let bound = std::time::Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
+    let asked = std::time::Instant::now();
+    let mut ticket = early(&link, &skin);
+    let mut last = asked;
+    for at in [500, 1_000, 1_500] {
+        std::thread::sleep(std::time::Duration::from_millis(at).saturating_sub(asked.elapsed()));
+        last = std::time::Instant::now();
+        rebuild_screen(&link, &screens);
+    }
+    let a = answer(&mut ticket);
+    let answered = std::time::Instant::now();
+    let Preparation::Refused(refused) = &a.preparation else {
+        panic!("{:?}", a.preparation);
+    };
+    assert!(refused.reason.contains("room"), "{}", refused.reason);
+    assert!(answered.duration_since(asked) >= bound);
+    assert!(
+        answered < last + bound,
+        "its deadline restarted at a rebuild: answered {:?} after the last",
+        answered.duration_since(last)
+    );
+    link.exit();
+}
+
+/// An attempt whose room an array's residency in flight holds waits for
+/// its boundary, never taken, and past its deadline is refused with the
+/// room's timeout.
+#[test]
+fn an_attempt_waits_for_its_room() {
+    let (chart, screens, link) = pending_link();
+    screens.room_waits.store(true, SeqCst);
+    let skin = bundle();
+    let bound = std::time::Duration::from_micros(render::CREATE_BOUND.0.unsigned_abs());
+    let asked = std::time::Instant::now();
+    let got = specialized(&link, &chart, &skin).unwrap();
+    let Preparation::Refused(refused) = &got else {
+        panic!("{got:?}");
+    };
+    assert!(refused.reason.contains("room"), "{}", refused.reason);
+    assert!(
+        asked.elapsed() >= bound,
+        "answered after {:?}",
+        asked.elapsed()
+    );
+    link.exit();
+}

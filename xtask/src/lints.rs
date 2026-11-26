@@ -441,6 +441,11 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/render/src/presentation.rs"),
     Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
+    // An array's creation off the frame: each pass outside READY's cutoff
+    // reads its fence once, and a `Residing` entry's settling is read at
+    // the boundaries.
+    Site::File("crates/render/src/creation.rs"),
+    Site::File("crates/render/src/residency.rs"),
     // The retirement list: filled, destroyed and handed on at frame
     // boundaries.
     Site::File("crates/render/src/retire.rs"),
