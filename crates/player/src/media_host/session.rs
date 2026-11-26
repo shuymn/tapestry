@@ -466,6 +466,9 @@ struct Shared {
     /// The worker's writer's account of its writes (tests).
     #[cfg(test)]
     transport: Mutex<Option<Arc<super::writer::Transport>>>,
+    /// The worker's count of close answers queued ([`Worker::closes`]).
+    #[cfg(test)]
+    closes: Mutex<Option<Arc<AtomicU64>>>,
     #[cfg(test)]
     events: Mutex<Vec<(Duration, Event)>>,
     #[cfg(test)]
@@ -747,6 +750,8 @@ impl Session {
             #[cfg(test)]
             transport: Mutex::new(None),
             #[cfg(test)]
+            closes: Mutex::new(None),
+            #[cfg(test)]
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             origin: Instant::now(),
@@ -812,6 +817,18 @@ impl Session {
         let transport = self.shared.transport.lock().ok()?.clone()?;
         let at = transport.written(id).ok()??;
         Some(at.saturating_duration_since(self.shared.origin))
+    }
+
+    /// How many close answers the current worker's replies' thread has
+    /// queued (tests): one counted is taken at the next look's first drain.
+    #[cfg(test)]
+    pub fn closes_queued(&self) -> u64 {
+        self.shared
+            .closes
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.load(Ordering::SeqCst)))
+            .unwrap_or(0)
     }
 
     /// The time on the clock of [`Self::events`] (tests).
@@ -1179,7 +1196,7 @@ impl Supervisor {
         self.reap();
         let generation = self.shared.generation.load(Ordering::Acquire);
         // Queued players of another screen, or lost, are dropped.
-        self.players.retain(|p| {
+        self.drop_players(|p| {
             !(p.stage == Stage::Queued
                 && (p.movie.generation() != generation || p.movie.status() == Status::Lost))
         });
@@ -1318,6 +1335,10 @@ impl Supervisor {
                 if let Ok(mut transport) = self.shared.transport.lock() {
                     *transport = worker.transport().cloned();
                 }
+                #[cfg(test)]
+                if let Ok(mut closes) = self.shared.closes.lock() {
+                    *closes = Some(worker.closes());
+                }
                 self.notes.note(format!("worker {} launched", worker.pid()));
                 self.worker = Some(worker);
                 self.marked = false;
@@ -1338,7 +1359,7 @@ impl Supervisor {
             }
         }
         self.note_losses();
-        self.players.retain(|p| p.stage != Stage::Queued);
+        self.drop_players(|p| p.stage != Stage::Queued);
     }
 
     /// Why the whole worker fails, if it does (L1, L4, its end).
@@ -1388,7 +1409,7 @@ impl Supervisor {
         }
         self.marked = false;
         self.note_losses();
-        self.players.retain(|p| p.stage == Stage::Queued);
+        self.drop_players(|p| p.stage == Stage::Queued);
         if let Some(pid) = pid {
             self.notes.note(format!("worker {pid} fails ({why:?})"));
         }
@@ -1457,8 +1478,7 @@ impl Supervisor {
         }
         // Players that never reached the worker go, logged.
         self.note_losses();
-        self.players
-            .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
+        self.drop_players(|p| !(p.stage == Stage::Idle && p.id == 0));
         if let Some(why) = failure {
             self.fail_worker(why);
         }
@@ -1697,13 +1717,18 @@ impl Supervisor {
         }
         if any {
             self.note_losses();
-            // A chart video lost after the look's peer check (the game's
-            // loss arriving before the judgement closed it) is dropped here:
-            // its peers are lost first, while it is still a player.
-            self.lose_peers();
-            self.players
-                .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
+            self.drop_players(|p| !(p.stage == Stage::Idle && p.id == 0));
         }
+    }
+
+    /// Drops the players `keep` refuses, after losing the peers of every
+    /// chart video lost ([`Self::lose_peers`]): a player dropped is out of
+    /// every later peer check, so a chart video lost since the look's own
+    /// check (the game's loss before the judgement closed it, a struck or
+    /// failed open, a queued video the game lost) still loses its peers.
+    fn drop_players(&mut self, keep: impl FnMut(&Player) -> bool) {
+        self.lose_peers();
+        self.players.retain(keep);
     }
 
     /// Applies the screen's pixel total to player `i`'s `probe` before any
@@ -2230,6 +2255,7 @@ mod tests {
             queue_lost: AtomicU32::new(0),
             quit: AtomicBool::new(false),
             transport: Mutex::new(None),
+            closes: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             origin: Instant::now(),
             beats: Mutex::new(Vec::new()),
