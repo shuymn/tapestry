@@ -1039,6 +1039,9 @@ struct Supervisor {
 pub enum Held {
     /// The requests are taken; the session has not read its end.
     Taken,
+    /// The look has lost the peers of the chart videos lost so far and not
+    /// yet judged the players.
+    Peered,
     /// The look has judged the players' deadlines and not yet ended a
     /// marked worker with nothing live.
     Judged,
@@ -1218,6 +1221,10 @@ impl Supervisor {
             return;
         }
         self.lose_peers();
+        #[cfg(test)]
+        if let Some(turn) = &mut self.turn {
+            turn(Held::Peered);
+        }
         self.judge(generation, now, settled);
         #[cfg(test)]
         if let Some(turn) = &mut self.turn {
@@ -1684,6 +1691,10 @@ impl Supervisor {
         }
         if any {
             self.note_losses();
+            // A chart video lost after the look's peer check (the game's
+            // loss arriving before the judgement closed it) is dropped here:
+            // its peers are lost first, while it is still a player.
+            self.lose_peers();
             self.players
                 .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
         }

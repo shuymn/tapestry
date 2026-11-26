@@ -1489,6 +1489,57 @@ impl Gate {
     }
 }
 
+/// A chart video the game loses after the session's peer check and before
+/// its judgement still loses its peer (design.md "Threat Model" T02): the
+/// chart's videos are one panel. The session is held after its peer check
+/// while the game loses the base for a fault; the judgement then closes
+/// the base, and the worker's answer drops it before the next look checks
+/// the peers again. The layer is lost for its peer all the same, the skin's
+/// movie plays on, and no worker is ended.
+// Covers: T02
+#[test]
+fn a_chart_loss_after_the_peer_check_loses_its_peer() {
+    let armed = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Gate::default());
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let rig = {
+        let (armed, gate) = (Arc::clone(&armed), Arc::clone(&gate));
+        Rig::starting(&["--dev-serve"], move |l| {
+            Session::start_held(l, Deadlines::GAME, move |at| {
+                if at == Held::Peered && armed.swap(false, Ordering::AcqRel) {
+                    let _ = held_tx.send(());
+                    gate.pass();
+                }
+            })
+            .unwrap()
+        })
+    };
+    rig.session.enter(1);
+    let (base, layer, skin) = (Movie::chart(1), Movie::chart(1), Movie::new(1));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    rig.open_as(&skin, "s.mpg", true);
+    for m in [&base, &layer, &skin] {
+        until(LAUNCH, || m.status() == Status::Live)
+            .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+    }
+    // Held after a peer check that found nothing lost.
+    armed.store(true, Ordering::Release);
+    held.recv_timeout(Duration::from_secs(5))
+        .expect("the session never checked its peers");
+    assert!(base.lose(Loss::Fault));
+    gate.open();
+    until(Duration::from_secs(5), || {
+        rig.count(|e| matches!(e, Event::Closed)) >= 1
+    })
+    .unwrap_or_else(|| panic!("the base never closed: {:?}", rig.session.events()));
+    lost(&layer, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+    assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    assert_eq!(rig.count(|e| matches!(e, Event::Terminated { .. })), 0);
+}
+
 /// A peer the game loses after the session has judged its players and
 /// before it ends their marked worker is closed before the termination,
 /// and so not struck. As in the test above, player 1's seek is never
