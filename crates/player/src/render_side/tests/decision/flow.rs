@@ -380,6 +380,48 @@ fn takeover_restarts_no_clock_and_plays_no_tone() {
     }
 }
 
+/// The decision's end (design.md "Screen Transitions and Loading"): the
+/// skin's build refused at 1,000 ms on a screen whose skin lasts 3,000 ms
+/// moves the armed reveal to the built-in deadline, 1,500 ms from the
+/// choice, on the render thread: with no look of the game's, the held
+/// lifetime is revealed there, its loading clock restarting at or after
+/// 1,500 ms and well before the skin's 3,000 ms.
+#[test]
+fn a_takeover_moves_the_armed_reveal_to_the_built_in_deadline() {
+    use crate::render_side::reveal;
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let d = choose(rig, &f.pick(false), 3);
+        let origin = d.origin();
+        assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 3_000 * MS)));
+        assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
+        until_clock(rig, TimeUs(origin.0 + 1_000 * MS));
+        f.seen.refuse_frame.store(true, Ordering::Release);
+        let lifetime = rig.render.loading_lifetime();
+        let revealed = reveal::word(lifetime, reveal::REVEALED);
+        assert!(wait_until(|| {
+            rig.render.shared.reveal.load(Ordering::Acquire) == revealed
+        }));
+        let at = rig
+            .render
+            .shared
+            .producer()
+            .as_ref()
+            .filter(|s| s.lifetime() == lifetime)
+            .map(crate::loading_state::LifetimeState::origin)
+            .expect("the held lifetime's state");
+        assert!(
+            at.0 >= origin.0 + 1_500 * MS,
+            "revealed at {at:?} from {origin:?}"
+        );
+        assert!(
+            at.0 < origin.0 + 3_000 * MS,
+            "revealed at {at:?}: the skin's deadline"
+        );
+    });
+}
+
 /// O6: the idle wait the game thread parks in is unparked by the takeover's
 /// producer: the skin's build refused on the render thread, after the
 /// test thread parked for 60 s, wakes it long before then, and the
