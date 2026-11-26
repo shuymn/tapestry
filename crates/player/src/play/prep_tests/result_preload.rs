@@ -69,8 +69,8 @@ fn at_adopted(rig: &mut PlayerRig<'_>, h: &mut game::PrepHandle) {
 
 /// A choice to play while the pack runs: the attempt adopts it, runs no
 /// import job of its own, and the pack's pages are the ones its own
-/// ticket uploads after its PrepareAttempt, once; the atlas is built once
-/// in the session.
+/// ticket uploads after its PrepareAttempt, once, counted after the commit
+/// that waits for it; the atlas is built once in the session.
 #[test]
 fn a_chosen_attempt_uploads_the_adopted_packs_pages() {
     let _serial = imports::serial();
@@ -87,12 +87,12 @@ fn a_chosen_attempt_uploads_the_adopted_packs_pages() {
         gate(0);
         readied(rig, &mut h);
         assert!(rig.pages_ticket.is_some(), "its own ticket");
-        assert_eq!(crate::dev::result_uploads() - u0, 1, "uploaded once");
         assert_eq!(builds() - b0, 1, "built once");
         assert_eq!(imports::jobs_counted(), jobs, "no import job");
         let pages = rig.result_skin.image().unwrap().pages().id();
         assert_eq!(uploaded(rig).0, pages, "the pack's pages");
         rig.commit_attempt().unwrap();
+        assert_eq!(crate::dev::result_uploads() - u0, 1, "uploaded once");
         assert_eq!(rig.render.result_status().installed, Some(pages));
     });
 }

@@ -1032,9 +1032,11 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
 }
 
 /// §5.1's step 3 (design.md "Memory Budget", the result pages upload):
-/// the attempt's own pages ticket is begun after its PrepareAttempt, its
-/// array uploaded before the commit, and the commit waits for its
-/// publication instead of selecting the pages; the result draws on them.
+/// the attempt's own pages ticket is begun after its PrepareAttempt, and
+/// the commit waits for its publication instead of selecting the pages, so
+/// its array is uploaded once the commit returns; the result draws on them.
+/// The render thread begins the upload at a later boundary of its own, so
+/// nothing before the commit waits for the count.
 /// A retry whose pages are installed begins no ticket and uploads
 /// nothing (step 5, V10g).
 #[test]
@@ -1055,13 +1057,13 @@ fn the_attempts_pages_are_its_own_ticket_and_a_retry_sends_nothing() {
         let mut h = begin(rig, &l);
         readied(rig, &mut h);
         assert!(rig.pages_ticket.is_some(), "begun with the preparation");
+        rig.commit_attempt().unwrap();
+        assert!(rig.pages_ticket.is_none(), "settled at the commit");
         assert_eq!(
             crate::dev::result_uploads() - u0,
             1,
-            "its array uploaded before the commit"
+            "its array uploaded by the commit's wait"
         );
-        rig.commit_attempt().unwrap();
-        assert!(rig.pages_ticket.is_none(), "settled at the commit");
         let (atlas, _) = uploaded(rig);
         assert_eq!(rig.render.result_status().installed, Some(atlas));
         let first = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
