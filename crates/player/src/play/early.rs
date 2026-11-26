@@ -12,6 +12,13 @@
 //!   reveal, and the reveal's commit ([`EarlyGate::commit_reveal`]), which
 //!   cancels an import still running (Preparing imports afresh) and answers
 //!   a refusal published before it instead of revealing.
+//! - **The reveal word** ([`RevealWord`]): the render thread reveals the
+//!   held loading lifetime at the deadline by itself, so the gate follows
+//!   the word that orders that reveal against every refusal. Once it says
+//!   revealed, every transition first takes the reveal in as the commit
+//!   would have (`EarlyGate::sync`): what ended before stays adoptable,
+//!   a running import is cancelled and whatever it ends with later is
+//!   dropped, and nothing begins after it.
 //! - **Admission** ([`admit`]): until the host memory ledger exists, the
 //!   peak growth still to come (the candidate, the bank's remaining decode,
 //!   a result skin's pack) against the host's headroom read fresh
@@ -32,6 +39,24 @@ use crate::priority::Machine;
 /// A refusal of the early staging the render thread publishes for the game
 /// thread: the early request it refused and why (`Shared::early_refusal`).
 pub type RenderRefusal = Arc<Mutex<Option<(u64, PreparationRefusal)>>>;
+
+/// The reveal word of the decision's held loading lifetime, as the gate
+/// orders itself against the render thread's reveal at the deadline
+/// ([`crate::render_side::RenderLink::reveal_order`]; design.md "Screen
+/// Transitions and Loading", reveal and adoption).
+pub trait RevealWord: Send + Sync {
+    /// Withdraws the armed reveal (a refusal): false only when the reveal
+    /// ran first, so the refusal lost.
+    fn refuse(&self) -> bool;
+    /// Whether the lifetime was revealed through the word.
+    fn revealed(&self) -> bool;
+    /// `cancel` is cancelled when the render thread reveals; one that
+    /// revealed already is read with [`revealed`](Self::revealed) after.
+    fn cancel_at_reveal(&self, cancel: &Cancel);
+}
+
+/// The gate's reveal word, shared with the render link.
+pub type RevealOrder = Arc<dyn RevealWord>;
 
 /// How the early specialization ended, as the gate keeps it.
 #[derive(Debug)]
@@ -93,6 +118,10 @@ pub struct EarlyGate<S = Specialization> {
     /// The render thread's refusal of the early staging, read under the
     /// lock before each decision that depends on it.
     render: Option<RenderRefusal>,
+    /// The reveal word the gate follows ([`RevealWord`]): a refusal
+    /// withdraws the render thread's armed reveal through it, under the
+    /// lock, and a reveal through it freezes what the gate keeps.
+    order: std::sync::OnceLock<RevealOrder>,
     /// Called at the commit's start, before its lock (tests: a refusal
     /// published between a look's classification and its commit).
     #[cfg(test)]
@@ -136,6 +165,7 @@ impl<S> EarlyGate<S> {
                 ended_at: None,
             }),
             render,
+            order: std::sync::OnceLock::new(),
             #[cfg(test)]
             before_commit: Mutex::new(None),
             #[cfg(test)]
@@ -170,13 +200,54 @@ impl<S> EarlyGate<S> {
         }
     }
 
+    /// The gate follows reveal word `order` (once; a second is ignored).
+    pub fn set_order(&self, order: RevealOrder) {
+        let _ = self.order.set(order);
+    }
+
+    /// A refusal withdraws the armed reveal: false when the reveal ran
+    /// first (the refusal lost). True with no word set.
+    fn refuse(&self) -> bool {
+        self.order.get().is_none_or(|o| o.refuse())
+    }
+
+    /// The reveal through the word taken into the state, as the commit
+    /// takes it (design.md "Screen Transitions and Loading", reveal and
+    /// adoption): eligibility frozen at that instant. A running job is
+    /// cancelled and whatever it ends with later is dropped
+    /// ([`State::CancelledAtReveal`]); what ended before is revealed with
+    /// it; an idle gate reveals with nothing begun. A refusal kept here
+    /// won the word, so it is never revealed. Every transition runs it
+    /// first, under the lock.
+    fn sync(&self, inner: &mut Inner<S>) {
+        if !self.order.get().is_some_and(|o| o.revealed()) {
+            return;
+        }
+        inner.state = match std::mem::replace(&mut inner.state, State::Idle) {
+            State::Running(cancel) => {
+                cancel.cancel();
+                log::info!("early: the import was still running at the reveal: cancelled");
+                State::CancelledAtReveal
+            }
+            State::Idle => State::Revealed(None),
+            refused @ State::Ended(EarlyOutcome::Refused(_)) => refused,
+            State::Ended(o) => State::Revealed(Some(o)),
+            done @ (State::CancelledAtReveal | State::Revealed(_)) => done,
+        };
+    }
+
     /// Begins the job from [`Idle`](State::Idle) with `spawn`, under the
     /// lock: the job's thread spawned and its cancel set as the state
     /// before the lock is released, so the worker's completion, which
     /// takes the same lock, always finds the job running (or cancelled at
     /// the reveal). A thread that cannot start is a refusal at once.
+    ///
+    /// Nothing begins once the reveal word says revealed, and a job
+    /// spawned as the reveal comes is cancelled by it: its cancel is given
+    /// to the word before the word is read again.
     pub fn start(&self, spawn: impl FnOnce() -> Result<Cancel, String>) -> Start {
         let mut inner = self.lock();
+        self.sync(&mut inner);
         if !matches!(inner.state, State::Idle) {
             return Start::Late;
         }
@@ -191,10 +262,19 @@ impl<S> EarlyGate<S> {
                 {
                     hook();
                 }
+                if let Some(o) = self.order.get() {
+                    o.cancel_at_reveal(&cancel);
+                }
                 inner.state = State::Running(cancel);
+                self.sync(&mut inner);
                 Start::Running
             }
             Err(why) => {
+                if !self.refuse() {
+                    // The reveal came first: Preparing begins as today.
+                    inner.state = State::Revealed(None);
+                    return Start::Late;
+                }
                 inner.state = State::Ended(EarlyOutcome::Refused(refusal(&why)));
                 Start::Ended
             }
@@ -206,6 +286,7 @@ impl<S> EarlyGate<S> {
     /// was idle.
     pub fn end(&self, outcome: EarlyOutcome<S>) -> bool {
         let mut inner = self.lock();
+        self.sync(&mut inner);
         if !matches!(inner.state, State::Idle) {
             return false;
         }
@@ -227,15 +308,24 @@ impl<S> EarlyGate<S> {
     }
 
     /// The worker's completion with `outcome`: kept only while the job
-    /// runs; cancelled at the reveal (or anything else), dropped here.
-    /// Whether it was kept.
+    /// runs; cancelled at the reveal (or anything else), dropped here. A
+    /// refusal withdraws the armed reveal; one the reveal beat is dropped
+    /// as a completion after the reveal is. Whether it was kept.
     pub fn complete(&self, outcome: EarlyOutcome<S>) -> bool {
         #[cfg(test)]
         self.completing
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut inner = self.lock();
+        self.sync(&mut inner);
         match inner.state {
             State::Running(_) => {
+                if matches!(outcome, EarlyOutcome::Refused(_)) && !self.refuse() {
+                    // Revealed since the sync: the reveal's freeze.
+                    self.sync(&mut inner);
+                    drop(inner);
+                    drop(outcome);
+                    return false;
+                }
                 #[cfg(feature = "dev-tools")]
                 {
                     inner.ended_at = Some(Instant::now());
@@ -262,6 +352,7 @@ impl<S> EarlyGate<S> {
     /// the lock, so no reveal comes between the state read and the send.
     pub fn step(&self, send: impl FnOnce(&S) -> Option<u64>) {
         let mut inner = self.lock();
+        self.sync(&mut inner);
         self.absorb(&mut inner);
         if inner.request.is_some() {
             return;
@@ -275,7 +366,9 @@ impl<S> EarlyGate<S> {
     /// the render thread's refusal read first: a refusal ended before it
     /// answers [`Committed::Refused`] and nothing changes; a running job is
     /// cancelled ([`State::CancelledAtReveal`]); whatever ended is revealed
-    /// with it; an idle gate reveals with nothing begun.
+    /// with it; an idle gate reveals with nothing begun. After the render
+    /// thread's reveal it decides nothing again: the state the reveal froze
+    /// (`sync`) answers [`Committed::Revealed`].
     pub fn commit_reveal(&self) -> Committed {
         #[cfg(test)]
         if let Some(hook) = self
@@ -287,6 +380,7 @@ impl<S> EarlyGate<S> {
             hook();
         }
         let mut inner = self.lock();
+        self.sync(&mut inner);
         self.absorb(&mut inner);
         let state = std::mem::replace(&mut inner.state, State::Idle);
         let (next, committed) = match state {
@@ -312,6 +406,7 @@ impl<S> EarlyGate<S> {
     /// reveal (the render thread's included); none once revealed.
     pub fn refused(&self) -> Option<PreparationRefusal> {
         let mut inner = self.lock();
+        self.sync(&mut inner);
         self.absorb(&mut inner);
         match &inner.state {
             State::Ended(EarlyOutcome::Refused(r)) => Some(r.clone()),
@@ -326,7 +421,8 @@ impl<S> EarlyGate<S> {
     /// one), and none after a job cancelled at the reveal, which sent no
     /// request.
     pub fn late_refused(&self) -> Option<PreparationRefusal> {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        self.sync(&mut inner);
         if !matches!(inner.state, State::Revealed(_)) {
             return None;
         }
@@ -344,6 +440,7 @@ impl<S> EarlyGate<S> {
     /// after the worker published it.
     pub fn take_specialized(&self) -> Option<S> {
         let mut inner = self.lock();
+        self.sync(&mut inner);
         match std::mem::replace(&mut inner.state, State::Idle) {
             State::Ended(EarlyOutcome::Specialized(s)) => {
                 inner.state = State::Ended(EarlyOutcome::Declined);
@@ -362,15 +459,16 @@ impl<S> EarlyGate<S> {
 
     /// Whether the reveal was committed.
     pub fn revealed(&self) -> bool {
-        matches!(
-            self.lock().state,
-            State::Revealed(_) | State::CancelledAtReveal
-        )
+        let mut inner = self.lock();
+        self.sync(&mut inner);
+        matches!(inner.state, State::Revealed(_) | State::CancelledAtReveal)
     }
 
     /// The state's name (logs and tests).
     pub fn state_name(&self) -> &'static str {
-        match &self.lock().state {
+        let mut inner = self.lock();
+        self.sync(&mut inner);
+        match &inner.state {
             State::Idle => "idle",
             State::Running(_) => "running",
             State::Ended(EarlyOutcome::Specialized(_)) => "ended specialized",

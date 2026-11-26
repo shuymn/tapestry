@@ -595,6 +595,8 @@ struct Headless {
     step_refused: bool,
     /// The decision screen's epochs closed.
     closed_epochs: usize,
+    /// When the armed reveal was withdrawn ([`AppRig::refuse_reveal`]).
+    reveal_refused_at: Vec<i64>,
     /// Each decision look's origin and clock.
     decision_looks: Vec<(game::Origin, i64)>,
     /// Told at the first look of the wait for a late read.
@@ -861,6 +863,7 @@ impl Headless {
             refuse_at_step: false,
             step_refused: false,
             closed_epochs: 0,
+            reveal_refused_at: Vec::new(),
             decision_looks: Vec::new(),
             waiting_seen: None,
             escape_when_waiting: false,
@@ -1835,6 +1838,10 @@ impl AppRig for Headless {
 
     fn closed_epoch(&mut self) {
         self.closed_epochs += 1;
+    }
+
+    fn refuse_reveal(&mut self) {
+        self.reveal_refused_at.push(self.at());
     }
 
     fn decision_escape(&mut self, deadline: TimeUs) -> bool {
@@ -6716,6 +6723,19 @@ fn an_early_refusal_before_the_deadline_returns_with_its_reason() {
         assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
         assert!(rig.loading_pages.is_empty(), "{served:?}: loading shown");
         assert!(rig.opened_at.is_empty(), "{served:?}: opened");
+        // App's look that reads the refusal withdraws the render thread's
+        // armed reveal, before the deadline it would reveal at. A load's own
+        // wait reads it through the early gate, which withdraws it on the
+        // worker as the refusal is published (the player's gate tests).
+        if served.is_none() {
+            assert!(
+                rig.reveal_refused_at
+                    .first()
+                    .is_some_and(|&at| at < choice + 1_500 * MS),
+                "withdrawn at {:?}, the deadline from {choice}",
+                rig.reveal_refused_at
+            );
+        }
     }
 }
 

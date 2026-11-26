@@ -231,6 +231,16 @@ impl Decision {
         self.origin
     }
 
+    /// The deadline a takeover would give the screen
+    /// ([`apply_takeover`](Self::apply_takeover)): the choice plus
+    /// [`DECISION_TIME`], whatever is shown now. The render thread, where a
+    /// takeover begins, moves an armed reveal there itself (design.md
+    /// "Screen Transitions and Loading", the decision's end).
+    #[must_use]
+    pub const fn takeover_deadline(&self) -> TimeUs {
+        Deadline::after(self.origin, DECISION_TIME).at()
+    }
+
     /// The presentation shown, when on.
     #[must_use]
     pub const fn shown(&self) -> Option<DecisionShown> {
@@ -648,8 +658,12 @@ mod tests {
         let mut d = begun();
         assert!(!d.apply_takeover(takeover(4, 8_000), at(8_000)));
         assert_eq!(d.deadline(), Some(at(10_000)));
+        // The deadline the render thread's armed reveal moves to at its own
+        // takeover is the one the game's takeover gives.
+        let armed = d.takeover_deadline();
         assert!(d.apply_takeover(takeover(3, 8_000), at(8_000)));
         assert_eq!(d.deadline(), Some(at(8_500)));
+        assert_eq!(d.deadline(), Some(armed));
         assert_eq!(d.shown(), Some(DecisionShown::BuiltIn));
         assert_eq!(d.origin(), at(7_000));
         let mut d = begun();

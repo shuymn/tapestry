@@ -195,6 +195,12 @@ pub trait AppRig: LoadingRig {
     fn deadline_step(&mut self) -> StepOutcome {
         StepOutcome::Stepped
     }
+    /// The play's deadline will not reveal its loading state: a refusal or
+    /// a fatal reply is in hand (held to the deadline, or returning now).
+    /// A rig whose render thread reveals at the deadline by itself withdraws
+    /// that reveal, unless it already ran (design.md "Screen Transitions
+    /// and Loading", the decision's end). Nothing by default.
+    fn refuse_reveal(&mut self) {}
     /// The chart chosen to play with a decision screen was read
     /// (`loaded`), before its load ([`load_chart`](Self::load_chart)): the
     /// rig may begin the play's preparation that needs only the chart's
@@ -1101,6 +1107,11 @@ fn look<R: AppRig>(
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
     let reply = reply.or_else(|| rig.early_refusal().map(|_| Reply::Refusal));
+    // A reply in hand keeps the deadline from revealing the loading state:
+    // the render thread's own reveal is withdrawn as soon as it is known.
+    if reply.is_some() && !d.practice() {
+        rig.refuse_reveal();
+    }
     let mut seen = d.classify(origin, rig.now(), terminal, escape, reply);
     if seen == Verdict::Step {
         if d.practice() {

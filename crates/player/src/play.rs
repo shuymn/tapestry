@@ -3424,7 +3424,13 @@ impl Rig for PlayerRig<'_> {
         let ready_state_at = TimeUs(origin.0 - self.lead_in.0);
         self.ready_state_at = Some(ready_state_at);
         #[cfg(feature = "dev-tools")]
-        if let Some((_, ack)) = self.render.loading_ack() {
+        if let Some((lifetime, ack)) = self.render.loading_ack() {
+            // The decision screen ended where its held lifetime was
+            // revealed, whichever thread revealed it: the render thread's
+            // armed reveal comes before the game thread's own stamp.
+            if let Some(at) = self.render.revealed_at(lifetime) {
+                crate::dev::stage_at("decision_end", Some(at));
+            }
             let end = game::minimum_ends(ack, self.render.loading_loadend());
             crate::dev::stage_at("minimum_end", Some(end));
         }

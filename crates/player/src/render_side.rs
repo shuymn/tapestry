@@ -1814,6 +1814,14 @@ pub enum RenderMsg {
     /// and a preparation until something else is drawn; nothing when the
     /// lifetime has ended ([`RenderLink::clear_loading`]).
     Loading(u64),
+    /// The decision screen shown reveals held loading lifetime `lifetime`
+    /// by itself at `at`, or at `built_in` once the built-in presentation
+    /// takes over ([`RenderLink::arm_reveal`]).
+    ArmReveal {
+        lifetime: u64,
+        at: TimeUs,
+        built_in: TimeUs,
+    },
     /// Loading lifetime `lifetime` has ended: stop drawing the loading
     /// state, and answer once no loading frame can be drawn any more, with
     /// whether the screen is still there and the skin drew every loading
@@ -2139,6 +2147,43 @@ mod cutoff {
     }
 }
 
+/// The decision's armed reveal ([`Shared::reveal`]): the held loading
+/// lifetime above [`reveal::SHIFT`], its state below. The one point of
+/// order between the render thread's reveal at the armed deadline and the
+/// game's refusal (design.md "Screen Transitions and Loading", the
+/// decision's end): whichever compare-and-swap comes first holds.
+mod reveal {
+    /// Nothing armed.
+    pub const NONE: u64 = 0;
+    /// Armed: the render thread reveals at the deadline.
+    pub const ARMED: u64 = 1;
+    /// Revealed, by the render thread at the deadline or by the game.
+    pub const REVEALED: u64 = 2;
+    /// Refused or withdrawn before the reveal: no loading frame.
+    pub const REFUSED: u64 = 3;
+    /// The state's bits.
+    pub const STATE: u64 = 3;
+    /// Where the lifetime begins.
+    pub const SHIFT: u32 = 2;
+
+    /// Lifetime `lifetime` in `state`.
+    pub const fn word(lifetime: u64, state: u64) -> u64 {
+        (lifetime << SHIFT) | state
+    }
+}
+
+/// The armed reveal the render thread holds for the decision screen shown
+/// ([`RenderMsg::ArmReveal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RevealArm {
+    /// The held loading lifetime it reveals.
+    lifetime: u64,
+    /// The deadline in force on the render clock.
+    at: TimeUs,
+    /// The deadline once the built-in presentation takes over.
+    built_in: TimeUs,
+}
+
 /// Where READY's cutoff stands, as the game thread reads it
 /// ([`RenderLink::cutoff_phase`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2311,6 +2356,11 @@ struct Shared {
     /// READY's cutoff ([`cutoff`]): the render thread writes its phase and
     /// the filled count while it runs, the game thread asks.
     cutoff: AtomicU32,
+    /// The decision's armed reveal ([`reveal`]).
+    reveal: AtomicU64,
+    /// The early import's cancel, by the held lifetime it runs for: the
+    /// render thread's reveal cancels it ([`RevealOrder`]).
+    reveal_cancel: Mutex<Option<(u64, skin_beatoraja::Cancel)>>,
     /// The wakes READY's cutoff gave, cut off or lost (tests).
     #[cfg(test)]
     cutoffs_woken: AtomicU64,
@@ -2625,6 +2675,8 @@ impl Shared {
             #[cfg(test)]
             takeovers_woken: AtomicU64::new(0),
             cutoff: AtomicU32::new(cutoff::RUNNING),
+            reveal: AtomicU64::new(reveal::NONE),
+            reveal_cancel: Mutex::new(None),
             #[cfg(test)]
             cutoffs_woken: AtomicU64::new(0),
             #[cfg(test)]
@@ -4439,6 +4491,22 @@ impl RenderLink {
         self.shared.loading_ack().first
     }
 
+    /// When held loading lifetime `lifetime` was revealed on the loading
+    /// clock, by the render thread's armed reveal or the game thread's own;
+    /// `None` for a lifetime no reveal of the decision's ran for
+    /// (dev-tools stage records).
+    #[cfg(feature = "dev-tools")]
+    pub fn revealed_at(&self, lifetime: u64) -> Option<TimeUs> {
+        if self.shared.reveal.load(Ordering::Acquire) != reveal::word(lifetime, reveal::REVEALED) {
+            return None;
+        }
+        self.shared
+            .producer()
+            .as_ref()
+            .filter(|s| s.lifetime() == lifetime)
+            .map(LifetimeState::origin)
+    }
+
     /// The loading time the play skin declares, as the last presented
     /// loading frame drew with it ([`LoadingAck`]).
     pub fn loading_loadend(&self) -> Option<TimeUs> {
@@ -4770,6 +4838,50 @@ impl RenderLink {
     /// for a lifetime not held.
     pub fn reveal_loading(&self) {
         reveal(&self.shared, self.clock, &self.tx);
+    }
+
+    /// The decision screen shown reveals the held loading lifetime by
+    /// itself: the render thread's first frame at or after `at` (or
+    /// `built_in` once the built-in presentation takes over) draws the
+    /// loading state, whenever the game thread's own reveal comes (design.md
+    /// "Screen Transitions and Loading", the decision's end). Nothing for a
+    /// lifetime not held.
+    pub fn arm_reveal(&self, at: TimeUs, built_in: TimeUs) {
+        let slot = self.shared.loading_slot();
+        if !slot.held {
+            return;
+        }
+        let lifetime = slot.lifetime;
+        self.shared
+            .reveal
+            .store(reveal::word(lifetime, reveal::ARMED), Ordering::Release);
+        drop(slot);
+        self.send(RenderMsg::ArmReveal {
+            lifetime,
+            at,
+            built_in,
+        });
+    }
+
+    /// The armed reveal will not run: a refusal or a leave came first.
+    /// Whether it was withdrawn here; false when it already ran, or none
+    /// was armed.
+    pub fn refuse_reveal(&self) -> bool {
+        let word = self.shared.reveal.load(Ordering::Acquire);
+        word & reveal::STATE == reveal::ARMED && refuse_armed(&self.shared, word >> reveal::SHIFT)
+    }
+
+    /// The reveal word of held loading lifetime `lifetime` for the early
+    /// gate ([`crate::play::early::RevealWord`]): a refusal published on
+    /// the early job's worker withdraws the armed reveal, so one published
+    /// before the render thread's reveal wins whenever the game thread
+    /// looks; the render thread's reveal freezes the gate and cancels its
+    /// running import. One of another lifetime's word does nothing.
+    pub fn reveal_order(&self, lifetime: u64) -> crate::play::early::RevealOrder {
+        Arc::new(RevealOrder {
+            shared: Arc::clone(&self.shared),
+            lifetime,
+        })
     }
 
     /// [`reveal_loading`](Self::reveal_loading), from any thread: what a
@@ -5401,6 +5513,13 @@ fn reveal(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>) {
         return;
     }
     let lifetime = slot.lifetime;
+    // An armed reveal of it ran here, on the game's side.
+    let _ = shared.reveal.compare_exchange(
+        reveal::word(lifetime, reveal::ARMED),
+        reveal::word(lifetime, reveal::REVEALED),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     if let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) {
         let update = state.restart(clock.now());
         slot.offer(lifetime, None, Some(Box::new(update)));
@@ -5410,6 +5529,87 @@ fn reveal(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>) {
         // A thread that already ended ignores it.
         let _ = tx.send(RenderMsg::Loading(lifetime));
     }
+}
+
+/// The reveal word of one held loading lifetime, as the early gate reads
+/// it ([`RenderLink::reveal_order`]).
+struct RevealOrder {
+    shared: Arc<Shared>,
+    lifetime: u64,
+}
+
+impl crate::play::early::RevealWord for RevealOrder {
+    fn refuse(&self) -> bool {
+        refuse_armed(&self.shared, self.lifetime) || !self.revealed()
+    }
+
+    fn revealed(&self) -> bool {
+        self.shared.reveal.load(Ordering::Acquire) == reveal::word(self.lifetime, reveal::REVEALED)
+    }
+
+    fn cancel_at_reveal(&self, cancel: &skin_beatoraja::Cancel) {
+        *self
+            .shared
+            .reveal_cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((self.lifetime, cancel.clone()));
+    }
+}
+
+/// The armed reveal of held loading lifetime `lifetime` withdrawn: won
+/// against the render thread's reveal on the reveal word. Whether it was.
+fn refuse_armed(shared: &Shared, lifetime: u64) -> bool {
+    shared
+        .reveal
+        .compare_exchange(
+            reveal::word(lifetime, reveal::ARMED),
+            reveal::word(lifetime, reveal::REFUSED),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// The render thread's reveal of armed lifetime `lifetime` at `now`, its
+/// deadline: won against a refusal on the reveal word, then today's reveal
+/// in place (the lifetime unheld, its state restarted at `now`, signalled
+/// so no message follows). Whether the caller takes the loading state now.
+fn reveal_armed(shared: &Shared, lifetime: u64, now: TimeUs) -> bool {
+    if shared
+        .reveal
+        .compare_exchange(
+            reveal::word(lifetime, reveal::ARMED),
+            reveal::word(lifetime, reveal::REVEALED),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    // Eligibility for an early start ends here: the import still running
+    // stops at its next check, and the gate drops what it ends with.
+    let cancel = shared
+        .reveal_cancel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some((l, cancel)) = cancel
+        && l == lifetime
+    {
+        cancel.cancel();
+    }
+    let mut producer = shared.producer();
+    let mut slot = shared.loading_slot();
+    if slot.lifetime != lifetime || !std::mem::take(&mut slot.held) {
+        return false;
+    }
+    if let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) {
+        let update = state.restart(now);
+        slot.offer(lifetime, None, Some(Box::new(update)));
+    }
+    slot.signaled = true;
+    true
 }
 
 /// Sends attempt requests of the render link's sequence from any thread
@@ -6068,6 +6268,7 @@ pub fn spawn_until(
                 page_turns: false,
                 decision: None,
                 decision_shown: None,
+                reveal_arm: None,
                 decision_screen: None,
                 decision_side: None,
                 #[cfg(feature = "dev-tools")]
@@ -8161,6 +8362,9 @@ struct Run {
     /// its lifetime, choice, timing and pinned slot, `None` for the slot
     /// once the built-in presentation took over.
     decision_shown: Option<crate::decision_side::ShownDecision>,
+    /// The armed reveal of the decision screen shown ([`RevealArm`]),
+    /// until it runs or the screen is left.
+    reveal_arm: Option<RevealArm>,
     /// The decision skin's state for the screen shown, made at its
     /// message.
     decision_screen: Option<skin_model::DecisionScreen>,
@@ -8734,28 +8938,23 @@ impl Run {
                 Ok(RenderMsg::Loading(lifetime)) => {
                     #[cfg(test)]
                     std::thread::sleep(Duration::from_millis(deschedule()));
-                    self.clear_decision();
-                    self.turntable.begin_presentation();
-                    // Lines the slot no longer holds (taken, or their
-                    // lifetime ended) change nothing, and neither do the
-                    // lines of a lifetime whose loading frame was refused.
-                    if let Some((page, update)) = self.shared.take_loading(lifetime)
-                        && self.loading_refused.is_none_or(|(l, _)| l != lifetime)
-                    {
-                        // A paused lifetime's are kept for its resumption.
-                        match self.paused.take() {
-                            Some(
-                                kept @ Mode::Menu {
-                                    loading: Some(l), ..
-                                },
-                            ) if l == lifetime => {
-                                self.paused = Some(take_loading(kept, lifetime, page, update));
-                            }
-                            other => {
-                                self.paused = other;
-                                mode = take_loading(mode, lifetime, page, update);
-                            }
-                        }
+                    mode = self.enter_loading(mode, lifetime);
+                }
+                Ok(RenderMsg::ArmReveal {
+                    lifetime,
+                    at,
+                    built_in,
+                }) => {
+                    // Only over the decision screen it was armed for: one
+                    // left already, or a lifetime no longer held, arms
+                    // nothing.
+                    if self.decision.is_some() {
+                        let taken_over = self.decision_shown.is_some_and(|s| s.slot.is_none());
+                        self.reveal_arm = Some(RevealArm {
+                            lifetime,
+                            at: if taken_over { built_in } else { at },
+                            built_in,
+                        });
                     }
                 }
                 Ok(RenderMsg::PauseLoading {
@@ -9631,6 +9830,11 @@ impl Run {
                 crate::dev::loop_probe::mark("wait1", 0);
                 self.granted = true;
                 self.stalled = false;
+            }
+            // The decision's armed deadline reached: this frame draws the
+            // loading state.
+            if let Some(lifetime) = self.reveal_due() {
+                mode = self.enter_loading(mode, lifetime);
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -12499,6 +12703,11 @@ impl Run {
             .early_refusal
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((r.request, refused.clone()));
+        // Before the reveal, the refusal wins: no loading frame of its
+        // lifetime is drawn at the deadline.
+        if let Some(lifetime) = r.lifetime {
+            let _ = refuse_armed(&self.shared, lifetime);
+        }
         self.early_tombstone = Some((r.request, refused));
     }
 
@@ -14164,6 +14373,51 @@ impl Run {
                 .is_some_and(|s| s.slot.is_some())
     }
 
+    /// Loading lifetime `lifetime` is drawn from `mode` on
+    /// ([`RenderMsg::Loading`], or the armed reveal at its deadline): the
+    /// decision screen left, the lines the slot holds taken.
+    fn enter_loading(&mut self, mode: Mode, lifetime: u64) -> Mode {
+        self.clear_decision();
+        self.turntable.begin_presentation();
+        // Lines the slot no longer holds (taken, or their lifetime ended)
+        // change nothing, and neither do the lines of a lifetime whose
+        // loading frame was refused.
+        if let Some((page, update)) = self.shared.take_loading(lifetime)
+            && self.loading_refused.is_none_or(|(l, _)| l != lifetime)
+        {
+            // A paused lifetime's are kept for its resumption.
+            match self.paused.take() {
+                Some(
+                    kept @ Mode::Menu {
+                        loading: Some(l), ..
+                    },
+                ) if l == lifetime => {
+                    self.paused = Some(take_loading(kept, lifetime, page, update));
+                }
+                other => {
+                    self.paused = other;
+                    return take_loading(mode, lifetime, page, update);
+                }
+            }
+        }
+        mode
+    }
+
+    /// The armed reveal due at this frame (design.md "Screen Transitions and
+    /// Loading", the decision's end): after the pass's pacing, before what
+    /// the frame draws is chosen, a frame at or past the armed deadline
+    /// reveals the held lifetime here, whatever the game thread is doing,
+    /// unless a refusal came first. The lifetime to take, once.
+    fn reveal_due(&mut self) -> Option<u64> {
+        let arm = self.reveal_arm?;
+        let now = self.clock.now();
+        if now < arm.at {
+            return None;
+        }
+        self.reveal_arm = None;
+        reveal_armed(&self.shared, arm.lifetime, now).then_some(arm.lifetime)
+    }
+
     /// A later mode drops the decision screen: its page, what it shows
     /// and its skin's state. Its slot is retired once the game ends its
     /// lifetime.
@@ -14172,6 +14426,7 @@ impl Run {
         self.leave_decision();
         self.decision = None;
         self.decision_shown = None;
+        self.reveal_arm = None;
         self.decision_screen = None;
     }
 
@@ -14296,6 +14551,11 @@ impl Run {
         };
         shown.slot = None;
         self.decision_screen = None;
+        // The built-in presentation's deadline from here, as the game's
+        // `apply_takeover` gives it: the reveal waits for no look.
+        if let Some(arm) = self.reveal_arm.as_mut() {
+            arm.at = arm.built_in;
+        }
         let lifetime = shown.lifetime;
         #[cfg(feature = "dev-tools")]
         self.fell_back(crate::measure::DecisionFallback::TakenOver);
@@ -19013,6 +19273,200 @@ pub(crate) mod tests {
                 "{origin:?} {revealed:?}"
             );
         }
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The decision's end (design.md "Screen Transitions and Loading"): an
+    /// armed reveal draws the held lifetime from the render thread's first
+    /// frame at or after its deadline with no reveal from the game thread,
+    /// whose wake may come later, its loading clock restarting there, so
+    /// no loading frame carries an origin before the deadline; the game's
+    /// reveal afterwards finds it shown and changes nothing.
+    #[test]
+    fn an_armed_reveal_draws_the_held_lifetime_at_its_deadline() {
+        let (link, seen) = held_loading();
+        link.show_decision(one_line("decision"), None);
+        link.begin_loading_held(&chosen("One"), None);
+        let lifetime = link.loading_lifetime();
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        let at = TimeUs(link.clock.now().0 + 50_000);
+        link.arm_reveal(at, TimeUs(at.0 + 1_000_000));
+        // The game thread never reveals: the render thread does.
+        assert!(wait_until(|| link.loading_ack_held()));
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 1));
+        assert_eq!(link.loading_ack().map(|(l, _)| l), Some(lifetime));
+        let frames = seen.lock().unwrap().clone();
+        assert!(!frames.is_empty());
+        for (_, update, _) in &frames {
+            let origin = update.as_ref().map(|u| u.origin);
+            assert!(origin.is_some_and(|o| o >= at), "{origin:?} {at:?}");
+        }
+        // Revealed already: neither the game's reveal nor its refusal moves
+        // the word back.
+        link.reveal_loading();
+        assert!(!link.refuse_reveal(), "a refusal after the reveal lost");
+        assert_eq!(
+            link.shared.reveal.load(Ordering::Acquire),
+            super::reveal::word(lifetime, super::reveal::REVEALED)
+        );
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The decision's end: a refusal before the armed deadline withdraws the
+    /// reveal, so no loading frame is drawn past it.
+    #[test]
+    fn a_refusal_before_the_deadline_withdraws_the_armed_reveal() {
+        let (link, seen) = held_loading();
+        link.show_decision(one_line("decision"), None);
+        link.begin_loading_held(&chosen("One"), None);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        let at = TimeUs(link.clock.now().0 + 30_000);
+        link.arm_reveal(at, TimeUs(at.0 + 1_000_000));
+        assert!(link.refuse_reveal(), "armed, so withdrawn here");
+        // Well past the deadline: still nothing of the lifetime.
+        while link.clock.now().0 < at.0 + 100_000 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(link.fence(Duration::from_secs(60)));
+        assert!(!link.loading_ack_held(), "no loading frame after a refusal");
+        assert!(seen.lock().unwrap().is_empty());
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The decision's end: a refusal published on another thread (the early
+    /// job's worker) withdraws only its own lifetime's armed reveal, so a
+    /// late refusal of an earlier choice never withdraws this one's.
+    #[test]
+    fn a_refuser_withdraws_only_its_own_lifetimes_reveal() {
+        let (link, _seen) = held_loading();
+        link.show_decision(one_line("decision"), None);
+        link.begin_loading_held(&chosen("One"), None);
+        let lifetime = link.loading_lifetime();
+        link.arm_reveal(TimeUs(link.clock.now().0 + 60_000_000), link.clock.now());
+        assert!(link.reveal_order(lifetime + 1).refuse());
+        assert_eq!(
+            link.shared.reveal.load(Ordering::Acquire),
+            super::reveal::word(lifetime, super::reveal::ARMED),
+            "another lifetime's refusal"
+        );
+        assert!(link.reveal_order(lifetime).refuse());
+        assert_eq!(
+            link.shared.reveal.load(Ordering::Acquire),
+            super::reveal::word(lifetime, super::reveal::REFUSED)
+        );
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The decision's end: a reveal is armed only for a held lifetime (a
+    /// practice choice holds none) and only over a decision screen.
+    #[test]
+    fn nothing_is_armed_without_a_held_lifetime() {
+        let (link, _seen) = held_loading();
+        link.show_decision(one_line("decision"), None);
+        link.begin_loading(&chosen("One"), None);
+        link.arm_reveal(link.clock.now(), link.clock.now());
+        assert_eq!(
+            link.shared.reveal.load(Ordering::Acquire),
+            super::reveal::NONE
+        );
+        assert!(!link.refuse_reveal(), "nothing armed");
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The decision's end with the early gate on the render link's word
+    /// (design.md "Screen Transitions and Loading", reveal and adoption):
+    /// the render thread's reveal at the deadline cancels the import still
+    /// running and freezes the gate, so its completion before the game
+    /// thread's commit is dropped, the commit answering the reveal; one
+    /// ended before the deadline stays adoptable; and a game thread that
+    /// reveals before the render thread's revealing frame does so through
+    /// the same word, once, the armed reveal then changing nothing.
+    #[test]
+    fn the_render_threads_reveal_freezes_the_early_gate() {
+        use crate::play::early::{Committed, EarlyGate, EarlyOutcome, Start};
+        let armed = |link: &super::RenderLink| {
+            let gate = EarlyGate::<u32>::new(None);
+            link.show_decision(one_line("decision"), None);
+            link.begin_loading_held(&chosen("One"), None);
+            gate.set_order(link.reveal_order(link.loading_lifetime()));
+            gate
+        };
+        let soon = |link: &super::RenderLink| {
+            let at = TimeUs(link.clock.now().0 + 30_000);
+            link.arm_reveal(at, TimeUs(at.0 + 1_000_000));
+        };
+
+        // Running at the reveal.
+        let (link, _seen) = held_loading();
+        let gate = armed(&link);
+        let cancel = skin_beatoraja::Cancel::new();
+        let theirs = cancel.clone();
+        assert_eq!(gate.start(|| Ok(theirs)), Start::Running);
+        soon(&link);
+        assert!(
+            wait_until(|| cancel.is_cancelled()),
+            "cancelled by the render thread's reveal"
+        );
+        assert!(!gate.complete(EarlyOutcome::Specialized(7)), "dropped");
+        assert_eq!(gate.commit_reveal(), Committed::Revealed);
+        assert_eq!(gate.take_specialized(), None);
+        assert!(wait_until(|| link.loading_ack_held()));
+        link.hold_loading_ack(false);
+        link.exit();
+
+        // Ended before it.
+        let (link, _seen) = held_loading();
+        let gate = armed(&link);
+        assert_eq!(
+            gate.start(|| Ok(skin_beatoraja::Cancel::new())),
+            Start::Running
+        );
+        assert!(gate.complete(EarlyOutcome::Specialized(3)));
+        soon(&link);
+        assert!(wait_until(|| gate.revealed()));
+        assert_eq!(gate.state_name(), "revealed specialized");
+        assert_eq!(gate.commit_reveal(), Committed::Revealed);
+        assert_eq!(gate.take_specialized(), Some(3));
+        link.hold_loading_ack(false);
+        link.exit();
+
+        // The game's reveal first, the armed deadline still ahead.
+        let (link, _seen) = held_loading();
+        let gate = armed(&link);
+        let lifetime = link.loading_lifetime();
+        let cancel = skin_beatoraja::Cancel::new();
+        let theirs = cancel.clone();
+        assert_eq!(gate.start(|| Ok(theirs)), Start::Running);
+        let at = TimeUs(link.clock.now().0 + 60_000_000);
+        link.arm_reveal(at, at);
+        assert!(link.fence(Duration::from_secs(60)), "armed");
+        assert_eq!(gate.commit_reveal(), Committed::Revealed);
+        assert!(cancel.is_cancelled());
+        let revealed = link.clock.now();
+        link.reveal_loading();
+        assert_eq!(
+            link.shared.reveal.load(Ordering::Acquire),
+            super::reveal::word(lifetime, super::reveal::REVEALED)
+        );
+        assert!(wait_until(|| link.loading_ack_held()));
+        let origin = link
+            .shared
+            .producer()
+            .as_ref()
+            .map(crate::loading_state::LifetimeState::origin);
+        assert!(
+            origin.is_some_and(|o| o >= revealed),
+            "{origin:?} {revealed:?}"
+        );
+        assert!(!gate.complete(EarlyOutcome::Specialized(1)));
         link.hold_loading_ack(false);
         link.exit();
     }

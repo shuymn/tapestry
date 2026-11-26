@@ -4209,6 +4209,12 @@ impl AppRig for PlayerRig<'_> {
                 .bests_preset()
                 .and_then(|p| crate::play::loading_gauge(p, self.gauge));
             self.render.begin_loading_held(&page, gauge);
+            // The render thread reveals it at the decision's deadline by
+            // itself, the game's reveal then finding it shown (design.md
+            // "Screen Transitions and Loading", the decision's end).
+            if let Some(at) = d.deadline() {
+                self.render.arm_reveal(at, d.takeover_deadline());
+            }
             show_stage(&self.render, Some(&page), Stage::Chart);
             sel.loading = Some(page);
         }
@@ -4222,13 +4228,12 @@ impl AppRig for PlayerRig<'_> {
             && let Some(lifetime) = d.lifetime()
         {
             let link = crate::play::early::EarlyLink::new(self.render.early_sender());
-            self.early = Some(
-                crate::play::early::EarlyPrep::new(
-                    crate::play::early::EarlyGate::new(self.render.early_refusal()),
-                    lifetime.0,
-                )
-                .with_link(link),
-            );
+            let gate = crate::play::early::EarlyGate::new(self.render.early_refusal());
+            // The gate follows the reveal word of this choice's held loading
+            // lifetime: a refusal of the job withdraws the render thread's
+            // armed reveal, and that reveal freezes what the gate keeps.
+            gate.set_order(self.render.reveal_order(self.render.loading_lifetime()));
+            self.early = Some(crate::play::early::EarlyPrep::new(gate, lifetime.0).with_link(link));
         }
         // The attempt's entry last: its fence waits on the input thread with
         // the screen and its sound already out, serving the decision screen
@@ -4295,6 +4300,12 @@ impl AppRig for PlayerRig<'_> {
         self.begin_early(loaded);
     }
 
+    /// A reply in hand keeps the deadline from revealing: the render
+    /// thread's armed reveal is withdrawn, unless it already ran.
+    fn refuse_reveal(&mut self) {
+        self.render.refuse_reveal();
+    }
+
     /// The early preparation's refusal published before the reveal, or
     /// the render thread's refusal of its staging published after it.
     fn early_refusal(&self) -> Option<game::PreparationRefusal> {
@@ -4313,6 +4324,9 @@ impl AppRig for PlayerRig<'_> {
         if let Some(e) = &self.early
             && let crate::play::early::Committed::Refused(r) = e.gate().commit_reveal()
         {
+            // Withdrawn unless the render thread revealed first: then the
+            // loading state shown leaves with the refusal.
+            self.render.refuse_reveal();
             return game::StepOutcome::Refused(r);
         }
         #[cfg(feature = "dev-tools")]
@@ -4331,6 +4345,7 @@ impl AppRig for PlayerRig<'_> {
     /// The decision screen is left for the practice page or selection: the
     /// input epoch ends, and the page's jobs are the page's from here.
     fn closed_epoch(&mut self) {
+        self.render.refuse_reveal();
         self.end_decision();
         self.controls.open_epoch();
         if let Some(sel) = &mut self.selection {
