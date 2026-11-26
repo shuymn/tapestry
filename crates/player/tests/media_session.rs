@@ -416,18 +416,18 @@ fn handed_off(what: &str, took: Duration) {
 // Covers: T02
 #[test]
 fn hello_with_another_protocol_is_refused_before_any_handle() {
-    // The version before this one's: the protocol before chroma locations.
-    let rig = Rig::serving(&["protocol=3"]);
+    // The version before this one's: the protocol before seek modes.
+    let rig = Rig::serving(&["protocol=4"]);
     // The launch itself refuses it at the handshake, and the process ends.
     let Err(e) = rig
         .stage
-        .launch(&recipe().args_of(&["--dev-serve", "protocol=3"]))
+        .launch(&recipe().args_of(&["--dev-serve", "protocol=4"]))
     else {
         panic!("a worker of another protocol launched");
     };
     // ERROR_REVISION_MISMATCH.
     assert_eq!((e.step, e.code), (Step::Handshake, 1306), "{e}");
-    assert!(e.what.contains("protocol 3"), "{e}");
+    assert!(e.what.contains("protocol 4"), "{e}");
     // The process ends with the refusal's code, on the handle the launch
     // kept when it stopped watching first.
     media_support::ends_refused(&e);
@@ -1153,6 +1153,36 @@ impl Runs {
         waker.wake();
         run
     }
+
+    /// Starts the next run as a practice round's landing at media time
+    /// `at`, as the render side does, and wants it sought: the run.
+    fn land(&mut self, waker: &Waker, at: i64) -> u64 {
+        let run = self.reader.start_run(Window {
+            first: 0,
+            last: i64::MAX,
+        });
+        self.movie.runs.land(run, at);
+        self.movie.want(run);
+        waker.wake();
+        run
+    }
+
+    /// The current run's next frame, waiting for it.
+    fn next(&mut self) -> Frame {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let (Some(f), _) = self.look(false) {
+                return f;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no next frame of run {}: {:?}",
+                self.reader.run(),
+                self.movie.loss()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 /// A want reaches the worker as a seek at once: the session looks when
@@ -1328,6 +1358,44 @@ fn a_play_s_chart_videos_run_through_the_real_worker() {
     assert!(render.advances_over(Duration::from_millis(300)));
     assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
     assert_eq!(rig.count(|e| matches!(e, Event::Terminated { .. })), 0);
+}
+
+/// A practice round's chart video lands through the real worker (design.md
+/// "Rendering and Skins", BGA): at half speed, its start 3 s before the
+/// round's lead-in start, the run is sought to land at the clip's first
+/// stamp plus 1.5 s; the first frame taken is the newest at or before that
+/// time, not one from the clip's start, and the frame after it comes next.
+/// No player fails.
+// Covers: T02
+#[test]
+fn a_round_s_chart_video_lands_through_the_real_worker() {
+    let rig = Rig::serving(&[]);
+    rig.session.enter(1);
+    let base = Movie::chart(1);
+    rig.open_as(&base, "a.mpg", false);
+    let waker = rig.session.waker();
+    let mut a = Runs::of(&base);
+    let first = a.first().stamp;
+    let target = first + 3_000_000 * 10 / 20;
+    let run = a.land(&waker, target);
+    let landed = a.first();
+    // One frame of the 30 fps clip at most before the target.
+    assert!(
+        landed.stamp <= target && target - landed.stamp < 33_334,
+        "landed at {} for {target}: {:?}",
+        landed.stamp,
+        rig.session.events()
+    );
+    let next = a.next();
+    assert!(next.stamp > target, "{} after {}", next.stamp, landed.stamp);
+    assert!(
+        rig.event(
+            Duration::from_secs(1),
+            |e| matches!(e, Event::Sought { run: r, .. } if *r == run)
+        )
+        .is_some()
+    );
+    assert_eq!((base.status(), base.loss()), (Status::Live, None));
 }
 
 /// A video lost with its peer is closed, not struck: the chart's videos

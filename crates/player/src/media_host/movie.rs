@@ -23,7 +23,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::thread::Thread;
 
 /// Where a video stands.
@@ -203,7 +203,8 @@ impl Cell {
         !matches!(self.word() & STATE, PENDING | LIVE)
     }
 
-    /// The render side staged a frame of run 1: a live video is ready.
+    /// The render side staged the frame the attempt starts with, or found
+    /// its landing empty: a live video is ready.
     pub fn staged_first(&self) -> bool {
         self.change(|s| (s == LIVE).then_some(READY))
     }
@@ -228,12 +229,15 @@ impl Cell {
 /// A video's runs as the render side and the session share them, one
 /// word each: the newest run the render side wants sought, the newest run
 /// whose end the worker reported, and the newest run whose seek the worker
-/// answered with no frame (an empty run); 0 for none.
+/// answered with no frame (an empty run); 0 for none. And a practice
+/// round's landing: its run and the media time it lands at.
 #[derive(Debug, Default)]
 pub struct Runs {
     want: AtomicU64,
     ended: AtomicU64,
     empty: AtomicU64,
+    landing: AtomicU64,
+    landing_at: AtomicI64,
 }
 
 impl Runs {
@@ -270,6 +274,22 @@ impl Runs {
     /// Run `run`'s seek was answered with no frame.
     pub fn found_empty(&self, run: u64) {
         self.empty.store(run, Ordering::Release);
+    }
+
+    /// Run `run` lands on the newest frame at or before media time `at`
+    /// (a practice round's landing, design.md "Rendering and Skins", BGA):
+    /// written before the run is wanted ([`Runs::want`]), which publishes
+    /// it.
+    pub fn land(&self, run: u64, at: i64) {
+        self.landing_at.store(at, Ordering::Relaxed);
+        self.landing.store(run, Ordering::Release);
+    }
+
+    /// Where run `run` is sought from: its landing's time when it is the
+    /// landing's run, else none (a seek from the clip's start).
+    pub fn landing(&self, run: u64) -> Option<i64> {
+        (self.landing.load(Ordering::Acquire) == run && run != 0)
+            .then(|| self.landing_at.load(Ordering::Relaxed))
     }
 }
 

@@ -28,7 +28,7 @@
 
 /// The protocol's version, the first field of [`Reply::Hello`]: the game
 /// refuses a worker that names another before it hands it anything.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// The most bytes a frame holds after its length.
 pub const MAX_FRAME: usize = 8_192;
@@ -69,8 +69,14 @@ pub enum Command {
         event: u64,
         looping: bool,
     },
-    /// Start run `run` of `player` at media time `at`, in µs.
-    Seek { player: u8, run: u64, at: i64 },
+    /// Start run `run` of `player` at media time `at`, in µs, landing as
+    /// `to` says.
+    Seek {
+        player: u8,
+        run: u64,
+        at: i64,
+        to: SeekTo,
+    },
     /// Stop `player` and close its handles.
     Close { player: u8 },
     /// End the worker.
@@ -79,6 +85,27 @@ pub enum Command {
     /// now (dev-tools): a test sends it once its positive capture is in.
     #[cfg(feature = "dev-tools")]
     Fire,
+}
+
+/// Where a seek lands (design.md "Rendering and Skins", Video frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekTo {
+    /// On the first frame at or after the seek's time: a restart's, a
+    /// rearm's.
+    From,
+    /// On the newest frame at or before the seek's time, the frame after it
+    /// kept and published next: a practice round's landing.
+    Landing,
+}
+
+impl SeekTo {
+    /// Its byte in a seek.
+    const fn byte(self) -> u8 {
+        match self {
+            Self::From => 0,
+            Self::Landing => 1,
+        }
+    }
 }
 
 /// The id of a reply that answers no command of the game's (a player's
@@ -312,7 +339,12 @@ impl Command {
                 .u64(section)
                 .u64(event)
                 .u8(u8::from(looping)),
-            Self::Seek { player, run, at } => b.u8(SEEK).u32(id).u8(player).u64(run).i64(at),
+            Self::Seek {
+                player,
+                run,
+                at,
+                to,
+            } => b.u8(SEEK).u32(id).u8(player).u64(run).i64(at).u8(to.byte()),
             Self::Close { player } => b.u8(CLOSE).u32(id).u8(player),
             Self::Quit => b.u8(QUIT).u32(id),
             #[cfg(feature = "dev-tools")]
@@ -349,6 +381,11 @@ impl Command {
                 player: r.u8()?,
                 run: r.u64()?,
                 at: r.i64()?,
+                to: if r.flag()? {
+                    SeekTo::Landing
+                } else {
+                    SeekTo::From
+                },
             },
             CLOSE => Self::Close { player: r.u8()? },
             QUIT => Self::Quit,

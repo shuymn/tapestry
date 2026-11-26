@@ -788,7 +788,8 @@ impl MenuScreen {
     /// its own whatever was held before (a practice round and a retry
     /// included): the chart's videos from the manifest of the current BGA
     /// generation, once it is there, and then the movies of `skin` staged,
-    /// else of the play skin in use; a start before `boundary` not counted.
+    /// else of the play skin in use; a start before `boundary` landed
+    /// there or not counted.
     /// The attempt draws no chart video until its set takes the manifest
     /// ([`offer_manifest`](Self::offer_manifest)).
     fn open_play_movies(
@@ -796,7 +797,7 @@ impl MenuScreen {
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
         lifetime: Option<u64>,
-        boundary: i64,
+        boundary: crate::movie_frame::Boundary,
     ) {
         let hub = self.media.clone();
         let bundle = skin
@@ -1450,8 +1451,14 @@ impl Screen for MenuScreen {
                 }
                 Err(e) => return Some(Err(e)),
             }
-            // A practice round counts no video start before its lead-in.
-            let boundary = a.section().map_or(i64::MIN, |s| s.start.0 - s.lead_in.0);
+            // A practice round's videos land at its lead-in's start, at the
+            // attempt's speed.
+            let boundary = crate::movie_frame::Boundary {
+                at: a
+                    .section()
+                    .map_or(i64::MIN, |s| s.start.0.saturating_sub(s.lead_in.0)),
+                k: a.chart.timeline.meta().speed.twentieths(),
+            };
             self.open_play_movies(skin, request, lifetime, boundary);
             self.movie_wait = Some(request);
         }

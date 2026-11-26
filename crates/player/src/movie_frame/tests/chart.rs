@@ -65,7 +65,13 @@ impl Play {
             [skin.cloned(), None, Some(Arc::clone(&a)), peer.cloned()],
             start,
         );
-        m.set_chart(videos, boundary);
+        m.set_chart(
+            videos,
+            Boundary {
+                at: boundary,
+                k: 20,
+            },
+        );
         let mut planes = Kept::default();
         m.admit(&mut planes, start);
         let (_, shows) = m.prepare(&mut planes, start);
@@ -114,6 +120,60 @@ impl Play {
 
     fn at(&mut self, now: i64) -> MovieShows {
         self.at_k(now, 20)
+    }
+
+    /// A practice round at boundary `b` and speed `k / 20`, its
+    /// preparation started at `start`, whose slot-2 file starts at
+    /// `starts`: run 1's first frame staged by a preparation's poll and
+    /// its landing wanted, the movie not ready yet.
+    fn round(starts: &[i64], b: i64, k: u32, start: Instant) -> Self {
+        Self::round_with(starts, b, k, start, None)
+    }
+
+    /// [`Play::round`] with `skin` as the skin's movie in slot 0, taken
+    /// before slot 2 in each poll.
+    fn round_with(
+        starts: &[i64],
+        b: i64,
+        k: u32,
+        start: Instant,
+        skin: Option<&Arc<Fake>>,
+    ) -> Self {
+        let a = Fake::new(16, 8);
+        a.set(Status::Live);
+        a.publish_run(1, 1, FIRST, P, 1);
+        let mut m = Movies::new([skin.cloned(), None, Some(Arc::clone(&a)), None], start);
+        m.set_chart(videos(starts, &[], 3), Boundary { at: b, k });
+        let mut planes = Kept::default();
+        m.admit(&mut planes, start);
+        let (settled, shows) = m.prepare(&mut planes, start);
+        assert_eq!(shows[2], MovieShow::Nothing, "staged, not shown");
+        assert!(!settled, "waiting for the landing");
+        assert!(
+            !a.staged.load(Ordering::SeqCst),
+            "run 1's frame is not the landing"
+        );
+        Self {
+            a,
+            m,
+            planes,
+            start,
+            seq: 1,
+        }
+    }
+
+    /// The landing written: its run and media time.
+    fn landing(&self) -> Option<(u64, i64)> {
+        *self.a.landing.lock().unwrap()
+    }
+
+    /// Run 2, the landing's, publishes frames at `stamps` (ids 20 on), and
+    /// a preparation's poll follows: whether every movie is settled.
+    fn land(&mut self, stamps: &[i64]) -> bool {
+        for (n, s) in stamps.iter().enumerate() {
+            self.publish(2, *s, 20 + u8::try_from(n).unwrap());
+        }
+        self.m.prepare(&mut self.planes, Instant::now()).0
     }
 
     /// The stamp of the frame slot 2's planes hold.
@@ -199,19 +259,190 @@ fn a_start_at_zero_counts_on_a_late_first_frame() {
     assert_eq!(p.stamp(), Some(FIRST));
 }
 
-/// A practice round counts no start before its boundary: the file stays
-/// unstarted; a start at the boundary starts it.
+/// A practice round lands a start before its boundary there (design.md
+/// "Rendering and Skins", BGA): with the start at 2 s, the boundary at 8 s
+/// and the speed 1/2, the run is sought to `first + 3 s`, the movie ready
+/// only once that landing is staged, and the boundary shows it. A start
+/// exactly at the boundary is a start, the clip from its beginning, the
+/// landing held until its first frame.
 #[test]
-fn starts_before_the_round_s_boundary_wait() {
-    let b = 10_000_000;
-    let mut p = Play::new(&[9_000_000], b);
-    assert!(!frame(p.at(9_500_000)));
-    assert!(!frame(p.at(12_000_000)), "never started");
-    assert_eq!(p.m.wakes(), 0);
-    let mut p = Play::new(&[9_000_000, b], b);
-    assert!(!frame(p.at(9_500_000)));
-    assert!(frame(p.at(b)));
+fn a_start_before_the_round_lands_at_its_boundary() {
+    let (e, b) = (2_000_000, 8_000_000);
+    let target = FIRST + 3_000_000;
+    let mut p = Play::round(&[e], b, 10, Instant::now());
+    assert_eq!(p.landing(), Some((2, target)));
+    assert_eq!((p.a.want.load(Ordering::SeqCst), p.m.wakes()), (2, 1));
+    assert!(p.land(&[target - 10_000, target + P - 10_000]), "ready");
+    assert!(p.a.staged.load(Ordering::SeqCst));
+    assert!(frame(p.at_k(b, 10)));
+    assert_eq!(p.stamp(), Some(target - 10_000));
+    // At half speed the next frame, `P − 10 ms` of media later, is due
+    // `2P − 20 ms` of chart time after the boundary.
+    assert!(frame(p.at_k(b + 2 * P - 20_002, 10)));
+    assert_eq!(p.stamp(), Some(target - 10_000));
+    assert!(frame(p.at_k(b + 2 * P - 20_000, 10)));
+    assert_eq!(p.stamp(), Some(target + P - 10_000));
+    // A start at the boundary: the clip from its start.
+    let mut p = Play::round(&[e, b], b, 20, Instant::now());
+    assert!(p.land(&[FIRST + 6_000_000]));
+    assert!(frame(p.at(b)), "the landing held");
+    assert_eq!(p.a.want.load(Ordering::SeqCst), 3, "restarted at b");
+    p.publish(3, FIRST, 30);
+    assert!(frame(p.at(b + 10_000)));
     assert_eq!(p.stamp(), Some(FIRST));
+}
+
+/// Before the boundary (READY opens 200 ms earlier) a landed file shows
+/// nothing: its start counts from the boundary on.
+#[test]
+fn a_landed_slot_shows_nothing_before_the_boundary() {
+    let (e, b) = (2_000_000, 8_000_000);
+    let mut p = Play::round(&[e], b, 20, Instant::now());
+    assert!(p.land(&[FIRST + 6_000_000 - P, FIRST + 6_000_000]));
+    assert!(!frame(p.at(b - 200_000)));
+    assert!(!frame(p.at(b - 1)));
+    assert!(frame(p.at(b)));
+    assert_eq!(p.stamp(), Some(FIRST + 6_000_000));
+}
+
+/// A landing found after its target (no earlier frame within the back-off
+/// search) is staged, the movie ready within the deadline, and shows only
+/// once due: nothing at the boundary, the frame 400 ms of media later.
+#[test]
+fn an_overshooting_landing_shows_once_due() {
+    let (e, b) = (2_000_000, 8_000_000);
+    let late = FIRST + 6_400_000;
+    let mut p = Play::round(&[e], b, 20, Instant::now());
+    assert!(p.land(&[late]), "ready within the deadline");
+    assert_eq!(p.a.loss(), None);
+    assert!(!frame(p.at(b)), "not due at the boundary");
+    assert!(!frame(p.at(b + 399_999)));
+    assert!(frame(p.at(b + 400_000)));
+    assert_eq!(p.stamp(), Some(late));
+}
+
+/// A restart before a late landing is due holds nothing: the run before
+/// showed no frame, so the panel stays absent until the new run's first
+/// frame.
+#[test]
+fn a_restart_before_the_fallback_is_due_holds_nothing() {
+    let (e, b) = (2_000_000, 8_000_000);
+    let mut p = Play::round(&[e, b + 100_000], b, 20, Instant::now());
+    assert!(p.land(&[FIRST + 6_400_000]));
+    assert!(!frame(p.at(b)));
+    assert!(!frame(p.at(b + 100_000)), "restarted, nothing held");
+    assert_eq!(p.a.want.load(Ordering::SeqCst), 3);
+    assert!(!frame(p.at(b + 150_000)), "no frame of the new run yet");
+    p.publish(3, FIRST, 30);
+    assert!(frame(p.at(b + 160_000)));
+    assert_eq!(p.stamp(), Some(FIRST));
+}
+
+/// After a landing, the due time counts from the clip's first frame (run
+/// 1's), never the landing's: at `b + 1 s` the frame due is the newest at
+/// or before `first + 7 s`, not `landing + 7 s`.
+#[test]
+fn the_due_time_after_a_landing_counts_from_the_clip_s_first_frame() {
+    let (e, b) = (2_000_000, 8_000_000);
+    let mut p = Play::round(&[e], b, 20, Instant::now());
+    assert!(p.land(&[FIRST + 6_000_000, FIRST + 7_000_000, FIRST + 12_000_000]));
+    assert!(frame(p.at(b)));
+    assert!(frame(p.at(b + 1_000_000)));
+    assert_eq!(p.stamp(), Some(FIRST + 7_000_000));
+}
+
+/// A landing that found no frame (its target past the clip's end) leaves
+/// the file ended from the boundary, the movie ready, and the next start
+/// after the boundary is cued as an ended file's is.
+#[test]
+fn an_empty_landing_ends_the_file_and_cues_the_next_start() {
+    let (e, b, next) = (2_000_000, 8_000_000, 12_000_000);
+    let mut p = Play::round(&[e, next], b, 20, Instant::now());
+    p.a.empty.store(2, Ordering::SeqCst);
+    p.a.ended.store(2, Ordering::SeqCst);
+    assert!(p.land(&[]), "ready");
+    assert!(p.a.staged.load(Ordering::SeqCst));
+    assert!(!frame(p.at(b)));
+    assert_eq!(p.a.want.load(Ordering::SeqCst), 3, "the next start cued");
+    p.publish(3, FIRST, 30);
+    assert!(!frame(p.at(next - 1)));
+    assert!(frame(p.at(next)));
+    assert_eq!(p.stamp(), Some(FIRST));
+}
+
+/// A full play lands nothing: its first frame makes it ready, and no run
+/// is wanted.
+#[test]
+fn a_full_play_lands_nothing() {
+    let p = Play::new(&[2_000_000], i64::MIN);
+    assert_eq!(p.landing(), None);
+    assert_eq!((p.a.want.load(Ordering::SeqCst), p.m.wakes()), (0, 0));
+}
+
+/// The preparation deadline (L5) holds for the landing: run 1 staged in
+/// time and the landing only after the deadline loses the movie, never
+/// ready.
+#[test]
+fn a_late_landing_misses_the_preparation_deadline() {
+    let now = Instant::now();
+    let start = now - (preparation_deadline(now) - now) + Duration::from_millis(150);
+    let mut p = Play::round(&[2_000_000], 8_000_000, 20, start);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(p.land(&[FIRST + 6_000_000]), "settled, lost");
+    assert_eq!(p.a.loss(), Some(Loss::Preparation));
+    assert!(!p.a.staged.load(Ordering::SeqCst));
+}
+
+/// L5 at the landing's acceptance: a landing whose take begins before the
+/// deadline and ends after it loses the movie, never ready; the control,
+/// the same take ending before it, is ready.
+#[test]
+fn a_landing_upload_crossing_the_deadline_is_lost() {
+    for crosses in [true, false] {
+        let left = Duration::from_millis(200);
+        let now = Instant::now();
+        let start = now - (preparation_deadline(now) - now) + left;
+        let mut p = Play::round(&[2_000_000], 8_000_000, 20, start);
+        p.planes.slow = Some(if crosses { left * 2 } else { Duration::ZERO });
+        assert!(p.land(&[FIRST + 6_000_000]), "{crosses}");
+        if crosses {
+            assert_eq!(p.a.loss(), Some(Loss::Preparation), "crossing");
+            assert!(!p.a.staged.load(Ordering::SeqCst), "never ready");
+        } else {
+            assert_eq!(p.a.loss(), None, "control");
+            assert!(p.a.staged.load(Ordering::SeqCst));
+        }
+    }
+}
+
+/// L5 on the empty landing's path, which has no upload of its own: the
+/// clock is sampled again when the empty answer is seen. The skin's movie
+/// in slot 0 takes its first frame in the same poll, before slot 2, its
+/// upload ending past the deadline; the empty landing seen after it loses
+/// the chart video, never ready. The control, the same upload ending
+/// before the deadline, is ready.
+#[test]
+fn an_empty_landing_past_the_deadline_is_lost() {
+    for crosses in [true, false] {
+        let left = Duration::from_millis(200);
+        let now = Instant::now();
+        let start = now - (preparation_deadline(now) - now) + left;
+        let skin = Fake::new(16, 8);
+        skin.set(Status::Live);
+        let mut p = Play::round_with(&[2_000_000], 8_000_000, 20, start, Some(&skin));
+        skin.publish(1, 0, 5);
+        p.planes.slow = Some(if crosses { left * 2 } else { Duration::ZERO });
+        p.a.empty.store(2, Ordering::SeqCst);
+        p.a.ended.store(2, Ordering::SeqCst);
+        assert!(p.land(&[]), "{crosses}");
+        if crosses {
+            assert_eq!(p.a.loss(), Some(Loss::Preparation), "crossing");
+            assert!(!p.a.staged.load(Ordering::SeqCst), "never ready");
+        } else {
+            assert_eq!(p.a.loss(), None, "control");
+            assert!(p.a.staged.load(Ordering::SeqCst));
+        }
+    }
 }
 
 /// Of two starts crossed between frames, one restart is made, anchored at

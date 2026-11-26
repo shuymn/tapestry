@@ -562,7 +562,7 @@ fn chart_files_are_ranked_by_their_first_start_and_capped_at_two() {
         }],
     )
     .unwrap();
-    let (slots, files) = ChartVideos::choose(&bga, &file_of);
+    let (slots, files) = ChartVideos::choose(&bga, &file_of, FULL);
     assert_eq!(slots, [Some(2), Some(2), None, Some(3), None, None]);
     assert_eq!(files, [Some(0), Some(2)]);
     let videos = ChartVideos::of(&bga, &slots);
@@ -578,6 +578,61 @@ fn chart_files_are_ranked_by_their_first_start_and_capped_at_two() {
         vec![],
     )
     .unwrap();
-    let (slots, files) = ChartVideos::choose(&tie, &[Some(7), Some(8)]);
+    let (slots, files) = ChartVideos::choose(&tie, &[Some(7), Some(8)], FULL);
     assert_eq!((slots, files), (vec![Some(2), Some(3)], [Some(7), Some(8)]));
+}
+
+/// A full play's boundary: every start counted.
+const FULL: TimeUs = TimeUs(i64::MIN);
+
+/// A round ranks its files from its boundary (design.md "Rendering and
+/// Skins", BGA): A, B and C start at 0, 1 and 10 s on the base; a round
+/// from 8 s opens B, shown there, and C, where a full play opens A and B.
+#[test]
+fn a_round_ranks_its_files_from_its_boundary() {
+    // Ids 0, 1 and 2 name files 0, 1 and 2.
+    let bga = ChartBga::new(
+        (1..=3).map(image).collect(),
+        vec![
+            event(0, Some(0)),
+            event(1_000, Some(1)),
+            event(10_000, Some(2)),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let file_of = [Some(0), Some(1), Some(2)];
+    let (_, round) = ChartVideos::choose(&bga, &file_of, TimeUs(8_000 * MS));
+    assert_eq!(round, [Some(1), Some(2)]);
+    let (_, full) = ChartVideos::choose(&bga, &file_of, FULL);
+    assert_eq!(full, [Some(0), Some(1)]);
+}
+
+/// Each channel's latest event at or before the boundary is the one in
+/// effect there: base A from 2 s, replaced at the boundary (8 s) by base
+/// B, beside layer C at 8 s and D at 12 s, opens B and C, not A; A
+/// replaced at 8 s by a picture opens C and D.
+#[test]
+fn a_replacement_at_the_boundary_takes_the_channel() {
+    // Ids 0 to 3 name files 0 to 3 (A to D); id 4 is a picture.
+    let file_of = [Some(0), Some(1), Some(2), Some(3), None];
+    let b = TimeUs(8_000 * MS);
+    let chart = |base_at_b: u16| {
+        ChartBga::new(
+            (1..=5).map(image).collect(),
+            vec![
+                event(2_000, Some(0)),
+                event(8_000, Some(base_at_b)),
+                event(12_000, Some(3)),
+            ],
+            vec![event(8_000, Some(2))],
+            vec![],
+        )
+        .unwrap()
+    };
+    let (_, video) = ChartVideos::choose(&chart(1), &file_of, b);
+    assert_eq!(video, [Some(1), Some(2)], "B, then C on the layer");
+    let (_, picture) = ChartVideos::choose(&chart(4), &file_of, b);
+    assert_eq!(picture, [Some(2), Some(3)], "C, then D");
 }

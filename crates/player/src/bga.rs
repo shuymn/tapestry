@@ -200,20 +200,31 @@ fn hold(cancel: &dyn Fn() -> bool) {
 }
 
 /// What an attempt's BGA reads: the chart's folder and each `#BMPxx`
-/// name by its id's index, and the chart's BGA events its videos start by
-/// (none for a chart without BGA, or for a play that does not show it).
+/// name by its id's index, the chart's BGA events its videos start by
+/// (none for a chart without BGA, or for a play that does not show it),
+/// and the attempt's boundary its videos are ranked from (a round's
+/// lead-in start; `None` for a full play). Each is part of its equality:
+/// another boundary is another want, its videos ranked again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Want {
     pub dir: PathBuf,
     pub names: Vec<String>,
     pub bga: Option<bms_model::ChartBga>,
+    pub boundary: Option<bms_model::TimeUs>,
 }
 
 impl Want {
     /// The BGA of `chart`, read from `path`'s folder when `shown` (the
-    /// session's answer, [`game::BgaSession::shown`]); nothing when not.
+    /// session's answer, [`game::BgaSession::shown`]), its videos ranked
+    /// from `boundary` ([`game::Loaded::restore_at`]); nothing when not
+    /// shown.
     #[must_use]
-    pub fn of(path: &Path, chart: &bms_model::Chart, shown: bool) -> Self {
+    pub fn of(
+        path: &Path,
+        chart: &bms_model::Chart,
+        shown: bool,
+        boundary: Option<bms_model::TimeUs>,
+    ) -> Self {
         Self {
             dir: crate::chart_images::folder(path),
             names: chart
@@ -224,6 +235,7 @@ impl Want {
                     b.images().iter().map(|i| i.name.clone()).collect()
                 }),
             bga: chart.bga.clone().filter(|_| shown),
+            boundary,
         }
     }
 }
@@ -265,8 +277,9 @@ impl Manifest {
     }
 
     /// `want`'s manifest from its names' `bindings`: the files ranked by
-    /// their first start ([`ChartVideos::choose`]), each one chosen opened
-    /// and checked; a file that cannot be is absent, its ids with no slot.
+    /// their first start after its boundary ([`ChartVideos::choose`]), each
+    /// one chosen opened and checked; a file that cannot be is absent, its
+    /// ids with no slot.
     fn of(want: &Want, bindings: &[BgaBinding]) -> Self {
         let Some(chart) = &want.bga else {
             return Self::empty();
@@ -291,7 +304,8 @@ impl Manifest {
                 _ => None,
             })
             .collect();
-        let (mut slots, chosen) = ChartVideos::choose(chart, &file_of);
+        let boundary = want.boundary.unwrap_or(bms_model::TimeUs(i64::MIN));
+        let (mut slots, chosen) = ChartVideos::choose(chart, &file_of, boundary);
         let mut files: [Option<std::fs::File>; MAX_CHART_FILES] = [None, None];
         for ((out, file), slot) in files
             .iter_mut()

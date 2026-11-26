@@ -5,7 +5,7 @@
 
 use skin_model::media::control::{
     Command, Failure, MAX_FRAME, MAX_TEXT, Malformed, Matrix, PROTOCOL, Range, Refusal, Reply,
-    frame, frame_len,
+    SeekTo, frame, frame_len,
 };
 
 /// Commands, each with an id of its own.
@@ -31,6 +31,13 @@ fn commands() -> Vec<(u32, Command)> {
             player: 1,
             run: 9,
             at: -1_500_000,
+            to: SeekTo::From,
+        },
+        Command::Seek {
+            player: 2,
+            run: 3,
+            at: 6_000_000,
+            to: SeekTo::Landing,
         },
         Command::Close { player: 77 },
         Command::Quit,

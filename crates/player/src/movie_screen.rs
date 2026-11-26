@@ -62,7 +62,7 @@ use skin_model::movie::{CHART_SLOTS, MAX_MOVIES};
 
 use crate::media_host::launch::Setup;
 use crate::media_host::session::{Deadlines, Launching, Loss, Movie, Session};
-use crate::movie_frame::Movies;
+use crate::movie_frame::{Boundary, Movies};
 
 /// How long a play's set waits for the attempt's video manifest from its
 /// preparation's start: half the preparation deadline
@@ -255,9 +255,9 @@ struct Awaiting {
     bga: u64,
     /// The skin whose movies open after the chart's videos.
     bundle: Option<Arc<SkinBundle>>,
-    /// The attempt's boundary: a start before it is not counted
-    /// ([`Movies::set_chart`]).
-    boundary: i64,
+    /// The attempt's boundary: a start before it is landed there or not
+    /// counted ([`Movies::set_chart`]).
+    boundary: Boundary,
     /// Until when the manifest is waited for ([`MANIFEST_WAIT`]).
     by: Instant,
 }
@@ -289,12 +289,12 @@ impl MovieSet {
     /// waiting for the video manifest of BGA generation `bga`: its movies,
     /// the chart's then the skin's, are opened once that manifest is there
     /// ([`chart`](Self::chart)); a practice round's starts before
-    /// `boundary` are not counted.
+    /// `boundary` are landed there or not counted.
     pub fn play(
         hub: &Arc<MediaHub>,
         bundle: Option<Arc<SkinBundle>>,
         bga: u64,
-        boundary: i64,
+        boundary: Boundary,
         start: Instant,
     ) -> Self {
         let mut set = Self::entered(hub, ScreenKind::Play, start);

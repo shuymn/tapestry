@@ -48,7 +48,7 @@ use media_support::media_host::strikes::{FileId, Strikes};
 use media_support::media_host::verdict;
 use media_support::media_host::watch::{self, End, Event, LINE};
 use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe, root};
-use skin_model::media::control::{Command as Order, Matrix, Range, Reply};
+use skin_model::media::control::{Command as Order, Matrix, Range, Reply, SeekTo};
 use skin_model::media::{ChromaLocation, Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -324,13 +324,6 @@ const READY: u64 = 2;
 /// A frame taken from a ring.
 struct Taken {
     stamp: i64,
-    #[cfg_attr(
-        not(feature = "dev-tools"),
-        expect(
-            dead_code,
-            reason = "the duration tests generate their clips with dev-tools"
-        )
-    )]
     duration: i64,
     /// Where the frame's chroma sits, as its slot said.
     chroma: ChromaLocation,
@@ -500,6 +493,7 @@ fn worker_operations_succeed_under_the_recipe() {
         player: 1,
         run,
         at: 2_000_000,
+        to: SeekTo::From,
     });
     let landed = match worker.reply() {
         Reply::Sought {
@@ -664,6 +658,7 @@ fn worker_seek_lands_on_target_after_back_off() {
         player: 3,
         run,
         at: 1_500_000,
+        to: SeekTo::From,
     });
     // The first attempt's first frame is already past the target, so the
     // seek starts again a second earlier and decodes up to the target.
@@ -989,7 +984,12 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     assert_eq!(shown.2, 120);
     let at = stamp_of(24, 24);
     let run = ring.start_run(at);
-    worker.send(&Order::Seek { player: 1, run, at });
+    worker.send(&Order::Seek {
+        player: 1,
+        run,
+        at,
+        to: SeekTo::From,
+    });
     let landed = match worker.reply() {
         Reply::Sought {
             landed: Some(landed),
@@ -1037,6 +1037,7 @@ fn every_seek_is_answered() {
             player: 1,
             run,
             at: 10_000_000,
+            to: SeekTo::From,
         });
         let sought = Reply::Sought {
             id: worker.last,
@@ -1054,7 +1055,12 @@ fn every_seek_is_answered() {
     // Inside the clip, after that run ended: a landing.
     let at = stamp_of(24, 24);
     let run = ring.start_run(at);
-    worker.send(&Order::Seek { player: 1, run, at });
+    worker.send(&Order::Seek {
+        player: 1,
+        run,
+        at,
+        to: SeekTo::From,
+    });
     assert!(
         matches!(
             worker.reply(),
@@ -1559,6 +1565,7 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
             player: 2,
             run,
             at: 10_000_000,
+            to: SeekTo::From,
         });
         if seam {
             assert_eq!(
@@ -2036,6 +2043,7 @@ fn worker_decodes_zlib_compressed_containers() {
             player,
             run,
             at: 2_000_000,
+            to: SeekTo::From,
         });
         let landed = match worker.reply() {
             Reply::Sought {
@@ -3941,6 +3949,7 @@ fn a_seek_landing_carries_its_own_duration() {
         player: 2,
         run,
         at: 1_000_000,
+        to: SeekTo::From,
     });
     assert!(
         matches!(
@@ -4256,4 +4265,184 @@ fn the_pinned_build_reports_each_codec_s_chroma_location() {
             }
         }
     }
+}
+
+/// Seeks run `run` of player `player` to land at `at` (a practice round's
+/// landing): the landing's stamp and the seek's attempts, or `None` with
+/// no landing. An earlier run's end, reported before the seek, is passed
+/// over.
+fn land_at(worker: &mut Worker, player: u8, run: u64, at: i64) -> Option<(i64, u8)> {
+    worker.send(&Order::Seek {
+        player,
+        run,
+        at,
+        to: SeekTo::Landing,
+    });
+    loop {
+        match worker.reply() {
+            Reply::Sought {
+                player: p,
+                run: r,
+                landed,
+                attempts,
+                ..
+            } if p == player && r == run => return landed.map(|l| (l, attempts)),
+            // An earlier run's end, reported before the seek arrived.
+            Reply::Ended { player: p, run: r } if p == player && r < run => {}
+            other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+        }
+    }
+}
+
+/// The clip the landings use: 30 fps MPEG-1 in a program stream, a key
+/// frame every 500 ms, on which a seek's first attempt overshoots
+/// ([`worker_seek_lands_on_target_after_back_off`]).
+#[cfg(feature = "dev-tools")]
+const GOPS: &str = "mpeg1video mpeg 320x240 30 150 15";
+
+/// Plays [`GOPS`] as player 3 and takes run 1's first frame.
+#[cfg(feature = "dev-tools")]
+fn gops(dir: &Path) -> (Worker, Ring) {
+    let path = gen_clip(dir, "s.mpg", GOPS);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(3, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 3, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert!(matches!(
+        worker.play(3, &ring),
+        Reply::Playing { player: 3, .. }
+    ));
+    let first = take_one(&worker, &mut ring, 0);
+    assert_eq!(first.stamp, 0);
+    (worker, ring)
+}
+
+/// A landing is the newest frame at or before its target (design.md
+/// "Rendering and Skins", BGA): at 1.51 s, between frames 45 (1.5 s) and
+/// 46, it is frame 45, found by backing off where the demuxer overshoots
+/// (two attempts); then frame 46, kept while the landing was found,
+/// comes once, and frame 47 after it.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_is_the_newest_frame_at_or_before_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut worker, mut ring) = gops(dir.path());
+    let run = ring.start_run(0);
+    assert_eq!(
+        land_at(&mut worker, 3, run, 1_510_000),
+        Some((1_500_000, 2)),
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    for i in [45, 46, 47] {
+        let due = stamp_of(i, 30);
+        let taken = take_one(&worker, &mut ring, due);
+        assert_eq!(
+            (taken.stamp, painted(&taken.bytes, 320)),
+            (due, u32::try_from(i).unwrap())
+        );
+    }
+    worker.close(3);
+}
+
+/// A target inside the last frame's interval lands on that frame, and the
+/// run's end follows it.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_inside_the_last_frame_stages_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut worker, mut ring) = gops(dir.path());
+    let run = ring.start_run(0);
+    let last = stamp_of(149, 30);
+    assert_eq!(
+        land_at(&mut worker, 3, run, 4_990_000).map(|(l, _)| l),
+        Some(last)
+    );
+    let taken = take_one(&worker, &mut ring, 4_990_000);
+    assert_eq!(
+        (
+            taken.stamp,
+            taken.stamp + taken.duration,
+            painted(&taken.bytes, 320)
+        ),
+        (last, 5_000_000, 149)
+    );
+    assert_eq!(worker.reply(), Reply::Ended { player: 3, run });
+    worker.close(3);
+}
+
+/// A target at the last frame's end has nothing to land on: the seek is
+/// answered with no landing, then the run's end.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_past_the_end_is_answered_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut worker, mut ring) = gops(dir.path());
+    let run = ring.start_run(0);
+    assert_eq!(land_at(&mut worker, 3, run, 5_000_000), None);
+    assert_eq!(worker.reply(), Reply::Ended { player: 3, run });
+    worker.close(3);
+}
+
+/// A landing and the frame kept after it each carry the stamp and
+/// duration they were decoded with, and the frame kept its own chroma
+/// location (design.md "Rendering and Skins", Video frames): in the
+/// mid-stream change at 24 fps, frame 2 lands before frame 3, the first of
+/// a new sequence (top-left), and frame 4 (41 666 µs) before frame 5
+/// (41 667 µs). A landing's own location is not checked: after a seek
+/// back into an earlier sequence the decoder may label its first frames
+/// with the location it saw last, whichever mode the seek has.
+// Covers: T02
+#[test]
+fn a_landing_keeps_each_frame_s_own_duration_and_chroma() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("changes.avi");
+    let units = h264_sited((32, 32), (32, 32), &CHANGES, &sited_sample);
+    std::fs::write(&path, avi((32, 32), 24, b"H264", &units)).unwrap();
+    let schedule = changes_schedule();
+    let stamp = |i: i64| (i * 1_000_000 + 12) / 24;
+    let mut worker = Worker::start(&[]);
+    assert!(matches!(
+        worker.open(1, &path),
+        Reply::Probed { player: 1, .. }
+    ));
+    let mut ring = Ring::new(32, 32);
+    assert!(matches!(
+        worker.play(1, &ring),
+        Reply::Playing { player: 1, .. }
+    ));
+    take_one(&worker, &mut ring, 0);
+    for (landing, target) in [(2, 100_000), (4, 180_000)] {
+        let run = ring.start_run(0);
+        assert_eq!(
+            land_at(&mut worker, 1, run, target).map(|(l, _)| l),
+            Some(stamp(landing)),
+            "the worker's log:
+{}",
+            worker.log()
+        );
+        for i in [landing, landing + 1] {
+            let taken = take_one(&worker, &mut ring, stamp(i));
+            assert_eq!(
+                (taken.stamp, taken.duration),
+                (stamp(i), stamp(i + 1) - stamp(i)),
+                "frame {i}"
+            );
+            if i == 3 {
+                assert_eq!(
+                    taken.chroma,
+                    schedule[usize::try_from(i).unwrap()],
+                    "frame {i}"
+                );
+            }
+            assert_eq!(taken.bytes, sited_frame(u64::try_from(i).unwrap(), 32, 32));
+        }
+    }
+    worker.close(1);
 }

@@ -1207,6 +1207,16 @@ pub struct Landed {
     pub attempts: u8,
 }
 
+/// A decoded frame's stamp, duration and resolved chroma location, as
+/// they were when it was decoded: a frame kept while later ones decode
+/// keeps its own (design.md "Rendering and Skins", Video frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Kept {
+    stamp: i64,
+    duration: i64,
+    chroma: ChromaLocation,
+}
+
 /// A video file opened and probed, its decoder ready.
 pub struct Input {
     fc: *mut ff::AVFormatContext,
@@ -1214,6 +1224,16 @@ pub struct Input {
     dec: *mut ff::AVCodecContext,
     packet: *mut ff::AVPacket,
     frame: *mut ff::AVFrame,
+    /// A second frame, which a landing keeps a decoded frame in by
+    /// reference while it decodes on ([`Input::land`]); unreferenced
+    /// before each fill and at each seek.
+    kept: *mut ff::AVFrame,
+    /// A landing's next frame, held in `kept`: what [`Input::next`]
+    /// returns first, once.
+    pending: Option<Kept>,
+    /// The chroma location of the frame decoded last, resolved when it was
+    /// decoded ([`Input::chroma`]).
+    located: ChromaLocation,
     scaled: *mut ff::AVFrame,
     sws: *mut ff::SwsContext,
     /// What FFmpeg reads through `pb`: a box of this input's, which the
@@ -1272,6 +1292,9 @@ impl Input {
             dec: ptr::null_mut(),
             packet: ptr::null_mut(),
             frame: ptr::null_mut(),
+            kept: ptr::null_mut(),
+            pending: None,
+            located: ChromaLocation::Centre,
             scaled: ptr::null_mut(),
             sws: ptr::null_mut(),
             source: Box::into_raw(source),
@@ -1439,8 +1462,13 @@ impl Input {
             }
             self.packet = ff::av_packet_alloc();
             self.frame = ff::av_frame_alloc();
+            self.kept = ff::av_frame_alloc();
             self.scaled = ff::av_frame_alloc();
-            if self.packet.is_null() || self.frame.is_null() || self.scaled.is_null() {
+            if self.packet.is_null()
+                || self.frame.is_null()
+                || self.kept.is_null()
+                || self.scaled.is_null()
+            {
                 return Err(no_memory);
             }
             (*self.scaled).format = I420;
@@ -1545,6 +1573,13 @@ impl Input {
     /// well), or the decoder fails; a damaged packet FFmpeg skips is not an
     /// error.
     pub fn next(&mut self) -> Result<Option<i64>, (Failure, c_int)> {
+        // A landing's next frame, decoded already: returned once, as it was
+        // decoded, the clock not stepped again.
+        if let Some(p) = self.pending.take() {
+            self.swap_kept();
+            self.made_current(p);
+            return Ok(Some(p.stamp));
+        }
         let next = self.next_unchecked();
         if matches!(next, Ok(None)) {
             self.park();
@@ -1568,8 +1603,14 @@ impl Input {
     }
 
     /// The chroma location of the frame decoded last: its own, else its
-    /// decoder's, else its codec's default ([`default_location`]).
-    pub fn chroma(&self) -> ChromaLocation {
+    /// decoder's, else its codec's default ([`default_location`]),
+    /// resolved when it was decoded.
+    pub const fn chroma(&self) -> ChromaLocation {
+        self.located
+    }
+
+    /// [`Input::chroma`] of the frame in `frame`, resolved now.
+    fn resolve_chroma(&self) -> ChromaLocation {
         // SAFETY: this input's frame and decoder, both made at its open.
         unsafe {
             location((*self.frame).chroma_location)
@@ -1613,6 +1654,138 @@ impl Input {
         self.seek_stamped(target, target.saturating_add(pass), Some(out))
     }
 
+    /// Positions the video on the newest frame at or before `target` µs of
+    /// the clip, converted into `out`, and keeps the frame after it for
+    /// [`Input::next`] (a practice round's landing, design.md "Rendering
+    /// and Skins", BGA): seeks back from the target as [`Input::seek`]
+    /// does, backing off too when an attempt decodes no frame at all, and
+    /// decodes forward. A target inside the last frame's interval
+    /// lands on that frame; one at or past its end has no landing (`None`).
+    /// When even the furthest back-off decodes its first frame after the
+    /// target, no earlier frame was found: that frame is the landing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Input::seek`].
+    pub fn land(
+        &mut self,
+        target: i64,
+        out: &mut [u8],
+    ) -> Result<Option<Landed>, (Failure, c_int)> {
+        let tb = self.time_base;
+        let stamped = target.saturating_add(rescale_us(self.clock.pass_start(), tb.num, tb.den));
+        self.sought = true;
+        self.drop_kept();
+        self.budget(Some(BUDGET));
+        let landed = self.land_within_budget(target, stamped, out);
+        if matches!(landed, Ok(None)) {
+            self.drop_kept();
+            self.park();
+        }
+        let checked = self.check();
+        self.budget(None);
+        checked?;
+        landed
+    }
+
+    /// [`Input::land`]'s seeks and decoding.
+    fn land_within_budget(
+        &mut self,
+        target: i64,
+        stamped: i64,
+        out: &mut [u8],
+    ) -> Result<Option<Landed>, (Failure, c_int)> {
+        for (attempts, back) in (1..).zip(BACK_OFF) {
+            self.drop_kept();
+            self.seek_back(target.saturating_sub(back))?;
+            let mut first = None;
+            // The newest frame at or before the target, kept in `kept`; the
+            // first after it, left in `frame`.
+            let mut landing = None;
+            let mut after = None;
+            loop {
+                if !self.decode()? {
+                    break;
+                }
+                let Some(stamp) = self.stamp() else {
+                    continue;
+                };
+                first.get_or_insert(stamp);
+                let d = self.decoded(stamp);
+                if stamp <= stamped {
+                    // The landing before dropped, this frame kept in its
+                    // place, `frame` left empty for the next decode.
+                    // SAFETY: this input's frame, made at its open.
+                    unsafe { ff::av_frame_unref(self.kept) };
+                    std::mem::swap(&mut self.frame, &mut self.kept);
+                    landing = Some(d);
+                } else {
+                    after = Some(d);
+                    break;
+                }
+            }
+            // Backed off further while the attempt found no frame at or
+            // before the target: none after its keyframe (a demuxer that
+            // lands past the last decodable frame near the end), or only
+            // later ones (one that overshoots).
+            let exact = first.is_some_and(|f| f <= stamped);
+            if !(exact || back == MAX_BACK_OFF) {
+                continue;
+            }
+            return match (landing, after) {
+                // Past the last frame's end: nothing to land on.
+                (Some(l), None) if l.stamp.saturating_add(l.duration) <= stamped => Ok(None),
+                (Some(l), after) => {
+                    // The landing into `frame`, the frame after it into
+                    // `kept`, kept for `next`.
+                    std::mem::swap(&mut self.frame, &mut self.kept);
+                    self.made_current(l);
+                    self.convert_frame(out)?;
+                    self.pending = after;
+                    if after.is_none() {
+                        // SAFETY: this input's frame, made at its open.
+                        unsafe { ff::av_frame_unref(self.kept) };
+                    }
+                    Ok(Some(Landed {
+                        stamp: l.stamp,
+                        attempts,
+                    }))
+                }
+                // No earlier frame found within the back-off: the first
+                // after the target.
+                (None, Some(a)) => {
+                    self.made_current(a);
+                    self.convert_frame(out)?;
+                    Ok(Some(Landed {
+                        stamp: a.stamp,
+                        attempts,
+                    }))
+                }
+                (None, None) => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
+    /// Seeks the demuxer to the keyframe at or before `to` µs of the clip
+    /// and flushes the decoder.
+    fn seek_back(&mut self, to: i64) -> Result<(), (Failure, c_int)> {
+        // SAFETY: this input's contexts.
+        let r = unsafe {
+            let ts =
+                ff::av_rescale_q(to, ff::AV_TIME_BASE_Q, self.time_base).saturating_add(self.start);
+            let r = ff::avformat_seek_file(self.fc, self.stream, i64::MIN, ts, ts, 0);
+            ff::avcodec_flush_buffers(self.dec);
+            r
+        };
+        self.check()?;
+        if r < 0 {
+            return Err((Failure::Seek, r));
+        }
+        self.drained = false;
+        Ok(())
+    }
+
     /// [`Input::seek`] to `target` µs of the clip, whose frame's stamp is
     /// `stamped`, the landing converted into `out` when one is given.
     fn seek_stamped(
@@ -1622,6 +1795,7 @@ impl Input {
         out: Option<&mut [u8]>,
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         self.sought = true;
+        self.drop_kept();
         self.budget(Some(BUDGET));
         let landed = self.seek_within_budget(target, stamped, out);
         if matches!(landed, Ok(None)) {
@@ -1643,20 +1817,7 @@ impl Input {
         mut out: Option<&mut [u8]>,
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         for (attempts, back) in (1..).zip(BACK_OFF) {
-            let to = target.saturating_sub(back);
-            // SAFETY: this input's contexts.
-            let r = unsafe {
-                let ts = ff::av_rescale_q(to, ff::AV_TIME_BASE_Q, self.time_base)
-                    .saturating_add(self.start);
-                let r = ff::avformat_seek_file(self.fc, self.stream, i64::MIN, ts, ts, 0);
-                ff::avcodec_flush_buffers(self.dec);
-                r
-            };
-            self.check()?;
-            if r < 0 {
-                return Err((Failure::Seek, r));
-            }
-            self.drained = false;
+            self.seek_back(target.saturating_sub(back))?;
             let mut first = None;
             let landed = loop {
                 if !self.decode()? {
@@ -1814,7 +1975,41 @@ impl Input {
         let ticks = self.clock.ticks(pts, Some(duration))?;
         let tb = self.time_base;
         self.duration = self.clock.frame_us(ticks, duration, tb.num, tb.den);
+        self.located = self.resolve_chroma();
         Some(rescale_us(ticks, tb.num, tb.den))
+    }
+
+    /// The frame in `frame` as it was decoded: its stamp, duration and
+    /// chroma location.
+    const fn decoded(&self, stamp: i64) -> Kept {
+        Kept {
+            stamp,
+            duration: self.duration,
+            chroma: self.located,
+        }
+    }
+
+    /// Makes `d` the frame decoded last, for its conversion and its
+    /// publication.
+    const fn made_current(&mut self, d: Kept) {
+        self.duration = d.duration;
+        self.located = d.chroma;
+    }
+
+    /// Swaps `frame` and `kept`, then drops the reference `kept` now holds.
+    fn swap_kept(&mut self) {
+        std::mem::swap(&mut self.frame, &mut self.kept);
+        // SAFETY: this input's frame, made at its open.
+        unsafe { ff::av_frame_unref(self.kept) };
+    }
+
+    /// Drops a landing's kept frame and its record: at each seek, either
+    /// mode, and each attempt of one.
+    fn drop_kept(&mut self) {
+        self.pending = None;
+        // SAFETY: this input's frame, made at its open; unreferencing an
+        // empty frame does nothing.
+        unsafe { ff::av_frame_unref(self.kept) };
     }
 
     /// How long the frame decoded last lasts, in µs, from its own duration,
@@ -1970,6 +2165,7 @@ impl Drop for Input {
             ff::sws_free_context(&raw mut self.sws);
             ff::av_frame_free(&raw mut self.scaled);
             ff::av_frame_free(&raw mut self.frame);
+            ff::av_frame_free(&raw mut self.kept);
             ff::av_packet_free(&raw mut self.packet);
             ff::avcodec_free_context(&raw mut self.dec);
             ff::avformat_close_input(&raw mut self.fc);

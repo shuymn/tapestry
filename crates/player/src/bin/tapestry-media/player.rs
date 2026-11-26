@@ -30,7 +30,7 @@
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use skin_model::media::control::{Failure, NO_COMMAND, Reply};
+use skin_model::media::control::{Failure, NO_COMMAND, Reply, SeekTo};
 use skin_model::media::{ChromaLocation, PROGRESS_WORD, Stamp, State, Writer};
 
 use crate::ffmpeg::{Input, IoOpen};
@@ -400,8 +400,8 @@ impl Playing {
                     crate::reject(out, id, self.player, 0);
                     continue;
                 }
-                Some(ToPlayer::Seek { id, run, at }) => {
-                    if let Err((why, code)) = self.seek(id, run, at, out) {
+                Some(ToPlayer::Seek { id, run, at, to }) => {
+                    if let Err((why, code)) = self.seek(id, run, (at, to), out) {
                         return Stopped::Failed(why, code);
                     }
                     continue;
@@ -415,18 +415,32 @@ impl Playing {
         }
     }
 
-    /// Positions the video at `at` µs for run `run` and answers seek `id`
-    /// with where it landed, or, when nothing is at or after it, with no
-    /// landing and then the run's end: every seek is answered.
-    fn seek(&mut self, id: u32, run: u64, at: i64, out: &Out) -> Result<(), (Failure, i32)> {
+    /// Positions the video at `at` µs for run `run`, landing as `to`
+    /// says, and answers seek `id` with where it landed, or, when it found
+    /// no frame, with no landing and then the run's end: every seek is
+    /// answered. A landing's frames are published from it on, the frame
+    /// after it next.
+    fn seek(
+        &mut self,
+        id: u32,
+        run: u64,
+        (at, to): (i64, SeekTo),
+        out: &Out,
+    ) -> Result<(), (Failure, i32)> {
         self.run = run;
         self.floor = at;
         self.last = None;
         self.held = None;
         self.ended = false;
         self.writer.state(self.view.words(), State::Decoding);
-        match self.input.seek(at, &mut self.frame)? {
+        let landed = match to {
+            SeekTo::From => self.input.seek(at, &mut self.frame)?,
+            SeekTo::Landing => self.input.land(at, &mut self.frame)?,
+        };
+        match landed {
             Some(landed) => {
+                // A landing may lie before `at`: the run starts at it.
+                self.floor = self.floor.min(landed.stamp);
                 self.held = Some((
                     Stamp {
                         at: landed.stamp,
