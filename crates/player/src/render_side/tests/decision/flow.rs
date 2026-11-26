@@ -229,7 +229,7 @@ fn skin_decision_timeline_through_the_player() {
             d.classify(Origin::Ready, at(3_000 * MS), false, false, None),
             Verdict::Step
         );
-        rig.deadline_step(false);
+        rig.step_at_deadline();
         assert_eq!(lock(&f.book).active(), None, "the step ended the lifetime");
         assert!(wait_until(|| f.pinned().is_none()), "never retired");
     });
@@ -287,7 +287,7 @@ fn fresh_press_needed_after_skin_decision_epoch() {
             d.classify(Origin::Ready, end, false, false, None),
             Verdict::Step
         );
-        rig.deadline_step(false);
+        rig.step_at_deadline();
         assert!(rig.controls.ingress().is_open());
         assert_eq!(rig.controls.take(), None, "a press in the epoch acted");
         rig.controls
@@ -422,55 +422,83 @@ fn a_takeover_moves_the_armed_reveal_to_the_built_in_deadline() {
     });
 }
 
-/// The decision's end: a takeover the render thread applies between
-/// the game thread's read of its takeovers (none yet) and its step at the
-/// skin's deadline, 200 ms on a 100 / 0 / 100 ms skin, makes that step a
-/// revision: no loading frame is drawn and the lifetime stays held, and the
-/// render thread reveals at the built-in deadline, 1,500 ms from the
-/// choice.
+/// The reveal word at a takeover: a takeover the render thread applies
+/// before the game thread's step at the skin's deadline, 200 ms on a
+/// 100 / 0 / 100 ms skin, moves only the render thread's arm: the word and
+/// the lifetime's cancel stay as they are, the step reads the word still
+/// armed (pending: nothing drawn, the lifetime still held), and the render
+/// thread reveals at the built-in deadline, 1,500 ms from the choice,
+/// cancelling that same cancel. A close before the takeover keeps its
+/// closed bit through it: the step is refused and nothing is revealed.
 #[test]
-fn a_takeover_before_the_games_step_revises_it() {
+fn a_takeover_keeps_the_word_its_cancel_and_its_close() {
     use crate::render_side::reveal;
-    let dir = timed(100, 0, 100);
-    flow(&dir, |rig, f| {
-        f.prepared();
-        let d = choose(rig, &f.pick(false), 3);
-        let origin = d.origin();
-        assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 200 * MS)));
-        let lifetime = rig.render.loading_lifetime();
-        assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
-        f.seen.refuse_frame.store(true, Ordering::Release);
-        let late = reveal::word(lifetime, reveal::ARMED_LATE);
-        assert!(wait_until(|| {
-            rig.render.shared.reveal.load(Ordering::Acquire) == late
-        }));
-        // The game's look read no takeover and classifies against 200 ms.
-        until_clock(rig, TimeUs(origin.0 + 200 * MS));
-        assert!(rig.now().0 < origin.0 + 1_500 * MS, "too slow to test");
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Revised);
-        assert!(rig.render.shared.loading_slot().held, "shown at 200 ms");
-        assert!(
-            rig.render
+    for closed in [false, true] {
+        let dir = timed(100, 0, 100);
+        flow(&dir, |rig, f| {
+            f.prepared();
+            let d = choose(rig, &f.pick(false), 3);
+            let origin = d.origin();
+            assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 200 * MS)));
+            let lifetime = rig.render.loading_lifetime();
+            let cancel = rig.render.reveal_order(lifetime).cancel();
+            let armed = reveal::word(lifetime, reveal::ARMED);
+            let word = if closed {
+                rig.render.close_reveal();
+                armed | reveal::CLOSED
+            } else {
+                armed
+            };
+            assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
+            f.seen.refuse_frame.store(true, Ordering::Release);
+            assert!(wait_until(|| {
+                rig.render
+                    .shared
+                    .decision_takeover
+                    .lock()
+                    .unwrap()
+                    .is_some()
+            }));
+            assert_eq!(rig.render.shared.reveal.load(Ordering::SeqCst), word);
+            assert_eq!(cancel.is_cancelled(), closed, "closed: {closed}");
+            until_clock(rig, TimeUs(origin.0 + 200 * MS));
+            assert!(rig.now().0 < origin.0 + 1_500 * MS, "too slow to test");
+            let step = rig.deadline_step();
+            if closed {
+                assert!(matches!(step, game::StepOutcome::Refused(_)), "{step:?}");
+                until_clock(rig, TimeUs(origin.0 + 1_700 * MS));
+                assert!(rig.render.fence(std::time::Duration::from_secs(60)));
+                assert_eq!(rig.render.shared.reveal.load(Ordering::SeqCst), word);
+                assert!(!rig.render.loading_ack_held(), "a loading frame drawn");
+                return;
+            }
+            assert_eq!(step, game::StepOutcome::Pending);
+            assert!(rig.render.shared.loading_slot().held, "shown at 200 ms");
+            assert!(
+                rig.render
+                    .shared
+                    .producer()
+                    .as_ref()
+                    .is_none_or(|s| s.lifetime() != lifetime || s.origin().0 < origin.0 + 200 * MS),
+                "restarted by a pending step"
+            );
+            assert!(!cancel.is_cancelled(), "cancelled before the reveal");
+            let revealed = reveal::word(lifetime, reveal::REVEALED);
+            assert!(wait_until(|| {
+                rig.render.shared.reveal.load(Ordering::Acquire) == revealed
+            }));
+            assert!(cancel.is_cancelled(), "the reveal left the cancel running");
+            let at = rig
+                .render
                 .shared
                 .producer()
                 .as_ref()
-                .is_none_or(|s| s.lifetime() != lifetime || s.origin().0 < origin.0 + 200 * MS),
-            "restarted by a revised step"
-        );
-        let revealed = reveal::word(lifetime, reveal::REVEALED);
-        assert!(wait_until(|| {
-            rig.render.shared.reveal.load(Ordering::Acquire) == revealed
-        }));
-        let at = rig
-            .render
-            .shared
-            .producer()
-            .as_ref()
-            .filter(|s| s.lifetime() == lifetime)
-            .map(crate::loading_state::LifetimeState::origin)
-            .expect("the held lifetime's state");
-        assert!(at.0 >= origin.0 + 1_500 * MS, "revealed at {at:?}");
-    });
+                .filter(|s| s.lifetime() == lifetime)
+                .map(crate::loading_state::LifetimeState::origin)
+                .expect("the held lifetime's state");
+            assert!(at.0 >= origin.0 + 1_500 * MS, "revealed at {at:?}");
+        });
+    }
 }
 
 /// The decision's end, on the game side: a refusal winning the reveal
@@ -489,7 +517,7 @@ fn a_refusal_before_the_games_step_refuses_it() {
         assert!(rig.render.reveal_order(lifetime).refuse());
         until_clock(rig, TimeUs(origin.0 + 200 * MS));
         assert!(matches!(
-            rig.deadline_step(false),
+            rig.step_at_deadline(),
             game::StepOutcome::Refused(_)
         ));
         until_clock(rig, TimeUs(origin.0 + 400 * MS));
@@ -502,10 +530,33 @@ fn a_refusal_before_the_games_step_refuses_it() {
     });
 }
 
-/// The decision's end: a close before the deadline withdraws the armed
-/// reveal on the window's thread, so a shutdown whose cleanup waits past
-/// the deadline, the game thread never looking again, draws no loading
-/// state.
+/// The reveal word: a close before the choice (the window's withdrawal not
+/// installed yet) is read on the quit latch after the decision's arm, which
+/// closes the word, so no loading frame follows the deadline.
+#[test]
+fn a_close_before_the_choice_withdraws_its_reveal() {
+    use crate::render_side::reveal;
+    let dir = timed(100, 0, 100);
+    flow(&dir, |rig, f| {
+        f.prepared();
+        rig.controls.close();
+        let d = choose(rig, &f.pick(false), 3);
+        let origin = d.origin();
+        let lifetime = rig.render.loading_lifetime();
+        assert_eq!(
+            rig.render.shared.reveal.load(Ordering::SeqCst),
+            reveal::word(lifetime, reveal::ARMED) | reveal::CLOSED
+        );
+        until_clock(rig, TimeUs(origin.0 + 400 * MS));
+        assert!(rig.render.fence(std::time::Duration::from_secs(60)));
+        assert!(rig.render.shared.loading_slot().held);
+        assert!(!rig.render.loading_ack_held(), "a loading frame drawn");
+    });
+}
+
+/// The decision's end: a close before the deadline closes the reveal
+/// word on the window's thread, so a shutdown whose cleanup waits past the
+/// deadline, the game thread never looking again, draws no loading state.
 #[test]
 fn a_close_before_the_deadline_withdraws_the_armed_reveal() {
     use crate::render_side::reveal;
@@ -529,7 +580,7 @@ fn a_close_before_the_deadline_withdraws_the_armed_reveal() {
         assert!(rig.render.fence(std::time::Duration::from_secs(60)));
         assert_eq!(
             rig.render.shared.reveal.load(Ordering::Acquire),
-            reveal::word(lifetime, reveal::REFUSED)
+            reveal::word(lifetime, reveal::ARMED) | reveal::CLOSED
         );
         assert!(rig.render.shared.loading_slot().held);
         assert!(!rig.render.loading_ack_held(), "a loading frame drawn");
@@ -593,9 +644,10 @@ fn delayed_render_short_screen_keeps_its_choice() {
             d.classify(Origin::Ready, end, false, false, None),
             Verdict::Step
         );
-        rig.deadline_step(false);
+        // The render thread, held, takes no reveal: the step follows it.
         lock(&f.book).invalidate([1_280, 720]);
         gate.hold(false);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         assert!(wait_until(|| f.pinned().is_none()), "never retired");
         assert!(rig.render.fence(std::time::Duration::from_secs(60)));
         assert_eq!(rig.render.take_decision_refusal(), None, "refused at entry");
@@ -690,7 +742,7 @@ fn same_chart_chosen_again_without_cursor_move_draws_skin() {
             d.classify(Origin::Ready, end, false, false, None),
             Verdict::Step
         );
-        rig.deadline_step(false);
+        rig.step_at_deadline();
         rig.entered_selection();
         assert!(wait_until(|| f.ready() == Some((first.0, first.1))));
         let from = f.seen.len();
@@ -773,7 +825,7 @@ fn chart_ready_before_and_after_scene_both_reach_loading() {
                 d.classify(Origin::Ready, end, false, false, None),
                 Verdict::Step
             );
-            rig.deadline_step(false);
+            rig.step_at_deadline();
             if !before {
                 crate::selection::show_stage(&rig.render, Some(&page), Stage::Screen);
             }
@@ -1025,7 +1077,7 @@ fn step_inside_a_rig_wait_ends_the_lifetime() {
         rig.controls.watch_decision(crate::controls::DecisionWatch {
             decision: d,
             origin: Origin::Load,
-            reveal: Box::new(|_| crate::render_side::Claim::Revealed),
+            reveal: Box::new(|| crate::render_side::AtStep::Revealed),
             failures: rig.failures.clone(),
             screen: Some(rig.render.recovery_handle()),
             early: None,

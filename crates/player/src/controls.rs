@@ -52,11 +52,10 @@ pub struct DecisionWatch {
     /// ([`game::Origin::Read`], so its deadline sets the screen waiting
     /// for the read and never steps inside a rig's wait).
     pub origin: game::Origin,
-    /// The held loading lifetime revealed, claimed on the reveal word with
-    /// the deadline judged (`true`: the built-in presentation's): the
-    /// deadline step's first part, before the input epoch ends
-    /// ([`crate::render_side::RenderLink::claim_reveal`]).
-    pub reveal: Box<dyn Fn(bool) -> crate::render_side::Claim + Send + Sync>,
+    /// The reveal word read at the deadline step: its first part, before
+    /// the input epoch ends
+    /// ([`crate::render_side::RenderLink::reveal_at_step`]).
+    pub reveal: Box<dyn Fn() -> crate::render_side::AtStep + Send + Sync>,
     /// The rig's thread failures, as the rig itself reads them.
     pub failures: crate::failures::Failures,
     /// The screen, built again from the wait's looks when it was lost
@@ -119,8 +118,9 @@ pub struct Controls {
     quit_in_epoch: AtomicI64,
     quit: AtomicBool,
     /// What a close withdraws the decision's armed reveal with
-    /// ([`set_reveal_withdraw`](Self::set_reveal_withdraw)).
-    reveal_withdraw: OnceLock<RevealWithdraw>,
+    /// ([`set_reveal_withdraw`](Self::set_reveal_withdraw)), under a lock
+    /// a close takes after latching [`quit`](Self::quit).
+    reveal_withdraw: std::sync::Mutex<Option<RevealWithdraw>>,
     /// The quit key leaves the chart rather than latching [`quit`](Self::quit).
     leaves: AtomicBool,
     focused: AtomicBool,
@@ -175,7 +175,7 @@ impl Controls {
             retry_at: AtomicI64::new(i64::MIN),
             quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
-            reveal_withdraw: OnceLock::new(),
+            reveal_withdraw: std::sync::Mutex::new(None),
             leaves: AtomicBool::new(false),
             focused: AtomicBool::new(true),
             presentation: input::PresentationFocus::new(),
@@ -507,20 +507,19 @@ impl Controls {
             if w.decision.practice() {
                 w.decision.commit_step();
             } else {
-                // The reveal claimed on the reveal word first, then
-                // committed against the gate's one state: a refusal that
-                // won the word shows nothing and returns, and a takeover
+                // The reveal word read first, then committed against the
+                // gate's one state: a refusal that won the word shows
+                // nothing and returns, and a reveal the render thread has
                 // not taken yet steps nothing.
-                let late = w.decision.deadline() == Some(w.decision.takeover_deadline());
-                match (w.reveal)(late) {
-                    crate::render_side::Claim::Revised => seen = game::Verdict::Continue,
-                    crate::render_side::Claim::Refused => {
+                match (w.reveal)() {
+                    crate::render_side::AtStep::Pending => seen = game::Verdict::Continue,
+                    crate::render_side::AtStep::Refused => {
                         if let Some(e) = &w.early {
                             let _ = e.gate.commit_reveal();
                         }
                         seen = w.decision.refuse_step();
                     }
-                    crate::render_side::Claim::Revealed => {
+                    crate::render_side::AtStep::Revealed => {
                         let committed = match &w.early {
                             Some(e) => e.gate.commit_reveal(),
                             None => crate::play::early::Committed::Revealed,
@@ -574,14 +573,26 @@ impl Controls {
 
     /// A close withdraws the decision's armed reveal through `withdraw`
     /// ([`crate::render_side::RenderLink::reveal_withdrawer`]; once, a
-    /// second is ignored).
+    /// second is ignored), installed before the first arm. A close that
+    /// takes the lock before the installation latched
+    /// [`quit`](Self::quit) before it, which the arm after it reads
+    /// (design.md "Screen Transitions and Loading", the reveal word).
     pub fn set_reveal_withdraw(&self, withdraw: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        let _ = self.reveal_withdraw.set(RevealWithdraw(withdraw));
+        self.reveal_withdraw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(RevealWithdraw(withdraw));
     }
 
     /// The decision's armed reveal withdrawn, if one is set.
     fn withdraw_reveal(&self) {
-        if let Some(RevealWithdraw(w)) = self.reveal_withdraw.get() {
+        let withdraw = self
+            .reveal_withdraw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|RevealWithdraw(w)| std::sync::Arc::clone(w));
+        if let Some(w) = withdraw {
             w();
         }
     }
@@ -590,18 +601,18 @@ impl Controls {
     /// quits. A reveal armed for the decision screen is withdrawn first, so
     /// the shutdown's waits draw no loading state past its deadline.
     pub fn close(&self) {
+        self.quit.store(true, Ordering::SeqCst);
         self.withdraw_reveal();
         // The first close on the host counter, for a windowed run's record.
         #[cfg(feature = "dev-tools")]
         crate::dev::transitions::close_stamp();
-        self.quit.store(true, Ordering::Release);
         self.wake_game();
     }
 
     /// Whether the player quit or the window is closing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn quitting(&self) -> bool {
-        self.quit.load(Ordering::Acquire)
+        self.quit.load(Ordering::SeqCst)
     }
 
     /// The window gained or lost focus; a loss sets the input side's latch
@@ -683,6 +694,34 @@ mod tests {
     use input::QpcClock;
 
     use super::Controls;
+
+    /// The reveal word's close: one after the withdrawal is installed runs
+    /// it, once; one before it (the first decision's) leaves the quit latch
+    /// the arm after the installation reads.
+    #[test]
+    fn a_close_reaches_the_reveal_withdrawal_or_the_arm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for close_first in [true, false] {
+            let c = Controls::new(QpcClock::start());
+            let ran = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&ran);
+            let withdraw: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            if close_first {
+                c.close();
+                c.set_reveal_withdraw(withdraw);
+                assert!(c.quitting());
+            } else {
+                c.set_reveal_withdraw(withdraw);
+                assert_eq!(ran.load(Ordering::SeqCst), 0, "run before a close");
+                c.close();
+                assert_eq!(ran.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
 
     /// A retry and a suspend are kept apart whichever is published first:
     /// the suspend is taken first, so it still decides a play's drain, and
@@ -921,9 +960,9 @@ mod tests {
                 super::DecisionWatch {
                     decision,
                     origin: game::Origin::Load,
-                    reveal: Box::new(move |_| {
+                    reveal: Box::new(move || {
                         reveals.fetch_add(1, Ordering::SeqCst);
-                        crate::render_side::Claim::Revealed
+                        crate::render_side::AtStep::Revealed
                     }),
                     failures: failures.clone(),
                     screen: None,

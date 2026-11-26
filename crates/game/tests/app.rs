@@ -597,10 +597,10 @@ struct Headless {
     closed_epochs: usize,
     /// When the armed reveal was withdrawn ([`AppRig::refuse_reveal`]).
     reveal_refused_at: Vec<i64>,
-    /// How many deadline steps answer revised before one steps, and when
-    /// each did ([`StepOutcome::Revised`]).
-    revise_steps: usize,
-    revised_at: Vec<i64>,
+    /// How many deadline steps answer pending before one steps, and when
+    /// each did ([`StepOutcome::Pending`]).
+    pending_steps: usize,
+    pending_at: Vec<i64>,
     /// Each decision look's origin and clock.
     decision_looks: Vec<(game::Origin, i64)>,
     /// Told at the first look of the wait for a late read.
@@ -868,8 +868,8 @@ impl Headless {
             step_refused: false,
             closed_epochs: 0,
             reveal_refused_at: Vec::new(),
-            revise_steps: 0,
-            revised_at: Vec::new(),
+            pending_steps: 0,
+            pending_at: Vec::new(),
             decision_looks: Vec::new(),
             waiting_seen: None,
             escape_when_waiting: false,
@@ -1488,13 +1488,13 @@ impl AppRig for Headless {
                     false,
                     reply,
                 ) {
-                    game::Verdict::Step => match game::AppRig::deadline_step(self, false) {
+                    game::Verdict::Step => match game::AppRig::deadline_step(self) {
                         StepOutcome::Stepped => {
                             decision.commit_step();
                             game::Verdict::Step
                         }
                         StepOutcome::Refused(_) => decision.refuse_step(),
-                        StepOutcome::Revised => game::Verdict::Continue,
+                        StepOutcome::Pending => game::Verdict::Continue,
                     },
                     other => other,
                 };
@@ -1814,11 +1814,11 @@ impl AppRig for Headless {
         Ok(())
     }
 
-    fn deadline_step(&mut self, _late: bool) -> StepOutcome {
-        if self.revise_steps > 0 {
-            self.revise_steps -= 1;
-            self.revised_at.push(self.at());
-            return StepOutcome::Revised;
+    fn deadline_step(&mut self) -> StepOutcome {
+        if self.pending_steps > 0 {
+            self.pending_steps -= 1;
+            self.pending_at.push(self.at());
+            return StepOutcome::Pending;
         }
         if self.refuse_at_step {
             self.step_refused = true;
@@ -6779,29 +6779,29 @@ fn a_terminal_look_withdraws_the_armed_reveal() {
     }
 }
 
-/// The decision's end: a deadline step answering revised (a takeover the
-/// look had not taken moved the deadline) steps nothing and shows nothing:
-/// the screen goes on, and a later look steps it.
+/// The reveal word: a deadline step answering pending (the render thread
+/// reveals by itself and has not yet) steps nothing and shows nothing: the
+/// screen goes on, its next look a short wait later, which steps it.
 #[test]
-fn a_revised_step_steps_at_a_later_look() {
+fn a_pending_step_steps_at_a_later_look() {
     let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided_read_in_time(rig);
-        rig.revise_steps = 1;
+        rig.pending_steps = 1;
     });
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
     let choice = chosen_at(&rig, 0);
-    let [revised] = rig.revised_at[..] else {
-        panic!("{:?}", rig.revised_at);
+    let [pending] = rig.pending_at[..] else {
+        panic!("{:?}", rig.pending_at);
     };
-    assert!(revised >= choice + 1_500 * MS, "revised at {revised}");
+    assert!(pending >= choice + 1_500 * MS, "pending at {pending}");
     let [stepped] = rig.deadline_steps[..] else {
         panic!("{:?}", rig.deadline_steps);
     };
     assert!(
-        stepped >= revised,
-        "stepped at {stepped}, revised at {revised}"
+        stepped > pending && stepped <= pending + 2 * MS,
+        "stepped at {stepped}, pending at {pending}"
     );
 }
 

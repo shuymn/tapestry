@@ -51,6 +51,11 @@ use crate::settings::{DataRoot, PlayerSettings};
 /// clock: the flow looks again at least this often.
 pub const IDLE_WAIT: TimeUs = TimeUs(250_000);
 
+/// The decision screen's wait past its deadline while the step is
+/// pending ([`StepOutcome::Pending`]), on the rig's clock: the render
+/// thread's reveal wakes the game thread before it ends.
+const PENDING_WAIT: TimeUs = TimeUs(1_000);
+
 /// How often a game thread waiting for a load's job asks whether to stop
 /// it.
 pub const LOAD_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
@@ -190,14 +195,11 @@ pub trait AppRig: LoadingRig {
     /// and [`StepOutcome::Stepped`]; or, when the play's preparation begun
     /// at the read ([`chart_read`](Self::chart_read)) was refused before
     /// the reveal, nothing shown and [`StepOutcome::Refused`], which App
-    /// routes as that refusal with the decision unstepped; or, when a
-    /// takeover the look has not taken moved the deadline past the one it
-    /// judged, nothing shown and [`StepOutcome::Revised`]. `late`: the
-    /// deadline judged is the built-in presentation's
-    /// ([`Decision::takeover_deadline`]). Waits for no acknowledgement. By
-    /// default stepped, showing nothing.
-    fn deadline_step(&mut self, late: bool) -> StepOutcome {
-        let _ = late;
+    /// routes as that refusal with the decision unstepped; or, when the
+    /// rig's render thread reveals the loading state by itself and has not
+    /// yet, nothing shown and [`StepOutcome::Pending`]. Waits for no
+    /// acknowledgement. By default stepped, showing nothing.
+    fn deadline_step(&mut self) -> StepOutcome {
         StepOutcome::Stepped
     }
     /// The play's deadline will not reveal its loading state: a refusal or
@@ -353,11 +355,11 @@ pub enum StepOutcome {
     /// The play's preparation was refused before the reveal: nothing was
     /// revealed, and the flow returns with this refusal.
     Refused(PreparationRefusal),
-    /// A takeover the look had not taken moved the deadline in force past
-    /// the one it judged (design.md "Screen Transitions and Loading", the
-    /// decision's end): nothing was revealed or stepped, and the screen
-    /// goes on to its next look, which takes the takeover.
-    Revised,
+    /// The render thread reveals the loading state at its own deadline
+    /// and has not yet (design.md "Screen Transitions and Loading", the
+    /// reveal word): nothing was revealed or stepped, and the screen goes
+    /// on to its next look, which the reveal wakes.
+    Pending,
 }
 
 /// Why a chosen chart was refused.
@@ -1128,11 +1130,10 @@ fn look<R: AppRig>(
         if d.practice() {
             d.commit_step();
         } else {
-            let late = d.deadline() == Some(d.takeover_deadline());
-            match rig.deadline_step(late) {
+            match rig.deadline_step() {
                 StepOutcome::Stepped => d.commit_step(),
                 StepOutcome::Refused(_) => seen = d.refuse_step(),
-                StepOutcome::Revised => seen = Verdict::Continue,
+                StepOutcome::Pending => seen = Verdict::Continue,
             }
         }
     }
@@ -1244,7 +1245,12 @@ fn hold<R: AppRig>(
             return Ok(next);
         }
         let now = rig.now();
-        let until = d.deadline().map_or(now.0, |at| at.0).max(now.0 + 1);
+        // Past the deadline the step is pending on the render thread's
+        // reveal, which wakes this wait.
+        let until = d
+            .deadline()
+            .filter(|at| at.0 > now.0)
+            .map_or(now.0.saturating_add(PENDING_WAIT.0), |at| at.0);
         rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(until)));
     }
 }

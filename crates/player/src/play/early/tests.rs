@@ -136,7 +136,8 @@ struct Word {
     refused: std::sync::atomic::AtomicBool,
     reveal_at_refuse: std::sync::atomic::AtomicBool,
     refusals: AtomicUsize,
-    cancel: Mutex<Option<Cancel>>,
+    /// The lifetime's cancel, made with the word.
+    cancel: Cancel,
 }
 
 impl Word {
@@ -147,9 +148,7 @@ impl Word {
             return false;
         }
         self.revealed.store(true, Ordering::SeqCst);
-        if let Some(c) = self.cancel.lock().unwrap().take() {
-            c.cancel();
-        }
+        self.cancel.cancel();
         true
     }
 }
@@ -171,8 +170,8 @@ impl RevealWord for Word {
         self.revealed.load(Ordering::SeqCst)
     }
 
-    fn cancel_at_reveal(&self, cancel: &Cancel) {
-        *self.cancel.lock().unwrap() = Some(cancel.clone());
+    fn cancel(&self) -> Cancel {
+        self.cancel.clone()
     }
 }
 
@@ -347,6 +346,33 @@ fn a_reveal_while_the_spawner_is_blocked_cancels_the_job() {
             Ok(())
         }),
         Start::Running
+    );
+    assert_eq!(gate.state_name(), "cancelled at the reveal");
+}
+
+/// The reveal word: a reveal after the gate read the word idle and before
+/// it spawns the job leaves nothing to register: the job is given the
+/// lifetime's cancel, which the reveal cancelled, so it starts cancelled,
+/// and the gate is cancelled at the reveal.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_reveal_before_the_spawn_starts_the_job_cancelled() {
+    let (gate, word) = ordered();
+    let revealing = Arc::clone(&word);
+    gate.before_spawn(move || {
+        assert!(revealing.reveal());
+    });
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        gate.start(|c| {
+            cancelled.store(c.is_cancelled(), Ordering::SeqCst);
+            Ok(())
+        }),
+        Start::Running
+    );
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the job began uncancelled"
     );
     assert_eq!(gate.state_name(), "cancelled at the reveal");
 }

@@ -3626,14 +3626,14 @@ impl PlayerRig<'_> {
                 // The deadline step taken inside the rig's wait (a load
                 // still running at the deadline), as `deadline_step` takes
                 // it outside one.
-                reveal: Box::new(move |late| {
-                    let claim = reveal(late);
-                    if claim == crate::render_side::Claim::Revealed {
+                reveal: Box::new(move || {
+                    let at_step = reveal();
+                    if at_step == crate::render_side::AtStep::Revealed {
                         #[cfg(feature = "dev-tools")]
                         crate::dev::stage("decision_end");
                         println!("load: the play screen loads {name}");
                     }
-                    claim
+                    at_step
                 }),
                 failures: self.failures.clone(),
                 screen: Some(self.render.recovery_handle()),
@@ -4212,15 +4212,20 @@ impl AppRig for PlayerRig<'_> {
                 .bests_preset()
                 .and_then(|p| crate::play::loading_gauge(p, self.gauge));
             self.render.begin_loading_held(&page, gauge);
+            // A close withdraws an armed reveal whether or not this thread
+            // looks again before the shutdown's waits: installed before the
+            // arm, and the quit latch read after it, so a close either
+            // finds the withdrawal or is read here (design.md "Screen
+            // Transitions and Loading", the reveal word).
+            self.controls
+                .set_reveal_withdraw(self.render.reveal_withdrawer());
             // The render thread reveals it at the decision's deadline by
-            // itself, the game's reveal then finding it shown (design.md
-            // "Screen Transitions and Loading", the decision's end).
+            // itself, the game's step then reading it shown.
             if let Some(at) = d.deadline() {
                 self.render.arm_reveal(at, d.takeover_deadline());
-                // A close withdraws it, whether or not this thread looks
-                // again before the shutdown's waits.
-                self.controls
-                    .set_reveal_withdraw(self.render.reveal_withdrawer());
+                if self.controls.quitting() {
+                    self.render.close_reveal();
+                }
             }
             show_stage(&self.render, Some(&page), Stage::Chart);
             sel.loading = Some(page);
@@ -4324,26 +4329,25 @@ impl AppRig for PlayerRig<'_> {
     /// The play's deadline: the loading state's tuning epoch, the input
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
-    fn deadline_step(&mut self, late: bool) -> game::StepOutcome {
-        // The reveal claimed on the reveal word first (design.md "Screen
-        // Transitions and Loading", the decision's end): a refusal that won
-        // it shows nothing and returns with its reason, read through the
-        // gate's commit; a takeover on the render thread not taken yet
-        // steps nothing.
-        match self.render.claim_reveal(late) {
-            crate::render_side::Claim::Revised => return game::StepOutcome::Revised,
-            crate::render_side::Claim::Refused => {
+    fn deadline_step(&mut self) -> game::StepOutcome {
+        // The reveal word read first (design.md "Screen Transitions and
+        // Loading", the reveal word): a refusal that won it shows nothing
+        // and returns with its reason, read through the gate's commit; a
+        // reveal the render thread has not taken yet steps nothing.
+        match self.render.reveal_at_step() {
+            crate::render_side::AtStep::Pending => return game::StepOutcome::Pending,
+            crate::render_side::AtStep::Refused => {
                 let committed = self.early.as_ref().map(|e| e.gate().commit_reveal());
                 let r = match committed {
                     Some(crate::play::early::Committed::Refused(r)) => r,
                     _ => game::PreparationRefusal {
                         location: None,
-                        reason: "the loading state was withdrawn before the deadline".to_owned(),
+                        reason: "the loading state was refused before its reveal".to_owned(),
                     },
                 };
                 return game::StepOutcome::Refused(r);
             }
-            crate::render_side::Claim::Revealed => {}
+            crate::render_side::AtStep::Revealed => {}
         }
         // Then committed against the gate's one state, which the reveal
         // froze: a job still running is cancelled there, never waited for.

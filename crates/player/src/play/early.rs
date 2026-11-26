@@ -45,14 +45,15 @@ pub type RenderRefusal = Arc<Mutex<Option<(u64, PreparationRefusal)>>>;
 /// ([`crate::render_side::RenderLink::reveal_order`]; design.md "Screen
 /// Transitions and Loading", reveal and adoption).
 pub trait RevealWord: Send + Sync {
-    /// Withdraws the armed reveal (a refusal): false only when the reveal
+    /// Refuses the armed reveal (a refusal): false only when the reveal
     /// ran first, so the refusal lost.
     fn refuse(&self) -> bool;
     /// Whether the lifetime was revealed through the word.
     fn revealed(&self) -> bool;
-    /// `cancel` is cancelled when the render thread reveals; one that
-    /// revealed already is read with [`revealed`](Self::revealed) after.
-    fn cancel_at_reveal(&self, cancel: &Cancel);
+    /// The lifetime's cancel, made with its arm before the word was armed:
+    /// the render thread's reveal cancels it, so a job started with it
+    /// after the reveal starts cancelled.
+    fn cancel(&self) -> Cancel;
 }
 
 /// The gate's reveal word, shared with the render link.
@@ -126,6 +127,10 @@ pub struct EarlyGate<S = Specialization> {
     /// before its state is set (tests: the worker held at the lock).
     #[cfg(test)]
     after_spawn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Called under the start's lock after the word was read idle and
+    /// before the job's thread is spawned (tests: a reveal there).
+    #[cfg(test)]
+    before_spawn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The completions begun, counted before their lock (tests: a worker
     /// waiting at the lock).
     #[cfg(test)]
@@ -164,6 +169,8 @@ impl<S> EarlyGate<S> {
             order: std::sync::OnceLock::new(),
             #[cfg(test)]
             after_spawn: Mutex::new(None),
+            #[cfg(test)]
+            before_spawn: Mutex::new(None),
             #[cfg(test)]
             completing: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -237,19 +244,26 @@ impl<S> EarlyGate<S> {
     /// (or cancelled at the reveal). A thread that cannot start is a
     /// refusal at once.
     ///
-    /// Nothing begins once the reveal word says revealed. The cancel is
-    /// given to the word before `spawn` runs, so a reveal from then on
-    /// cancels the job before its first check, whenever the spawning thread
-    /// resumes.
+    /// Nothing begins once the reveal word says revealed. The job runs
+    /// with the lifetime's cancel, which the render thread's reveal cancels
+    /// whenever it comes, so a reveal after the word was read here cancels
+    /// the job before its first check (design.md "Screen Transitions and
+    /// Loading", the reveal word).
     pub fn start(&self, spawn: impl FnOnce(&Cancel) -> Result<(), String>) -> Start {
         let mut inner = self.lock();
         self.sync(&mut inner);
         if !matches!(inner.state, State::Idle) {
             return Start::Late;
         }
-        let cancel = Cancel::new();
-        if let Some(o) = self.order.get() {
-            o.cancel_at_reveal(&cancel);
+        let cancel = self.order.get().map_or_else(Cancel::new, |o| o.cancel());
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_spawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            hook();
         }
         match spawn(&cancel) {
             Ok(()) => {
@@ -474,6 +488,16 @@ impl<S> EarlyGate<S> {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn completing(&self) -> usize {
         self.completing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `hook` runs at the next start, under its lock, after the word was
+    /// read idle and before the job's thread is spawned (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn before_spawn(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_spawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// `hook` runs at the next start, under its lock, once the job's

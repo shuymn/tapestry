@@ -2615,10 +2615,9 @@ fn a_departure_fails_only_its_own_screen_s_capture() {
 }
 
 /// The deadline reached while the game thread waits for the chart's load
-/// (the render thread held inside it): the wait's own look steps the
-/// screen and reveals the loading state, and the render thread's
-/// departure, when it takes that message after the load, fails the
-/// capture; before it, the capture stands.
+/// (the render thread held inside it): the render thread takes the reveal
+/// only once out of the load, so nothing steps before it and the capture
+/// stands; its departure then fails the capture.
 #[test]
 fn a_deadline_inside_a_watched_wait_departs() {
     let dir = tempfile::tempdir().unwrap();
@@ -2640,11 +2639,13 @@ fn a_deadline_inside_a_watched_wait_departs() {
         );
         let left = side.decided_count();
         side.clock.set(TimeUs(chosen.0 + 4_000 * MS));
+        // The wait's looks meanwhile find the reveal pending.
+        std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
-            wait_until(|| side
+            !side
                 .controls
-                .with_watched(|d| d.is_some_and(game::Decision::stepped))),
-            "the deadline not stepped inside the load's wait"
+                .with_watched(|d| d.is_some_and(game::Decision::stepped)),
+            "stepped with the render thread inside the load"
         );
         assert!(
             matches!(

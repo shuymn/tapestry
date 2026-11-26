@@ -83,7 +83,7 @@ fn an_import_in_flight_at_the_reveal_is_cancelled() {
         let base = vm_hooks::live();
         rig.chart_read(&l);
         imports::executing(base);
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         assert_eq!(state(&gate), "cancelled at the reveal");
         assert_eq!(jobs_since(from), (1, 0), "the reveal did not wait for it");
         let _attempt = begin(rig, &l);
@@ -141,9 +141,9 @@ fn watch(rig: &PlayerRig<'_>, d: game::Decision, reveals: &Arc<AtomicUsize>) {
     rig.controls.watch_decision(crate::controls::DecisionWatch {
         decision: d,
         origin: game::Origin::Load,
-        reveal: Box::new(move |_| {
+        reveal: Box::new(move || {
             counted.fetch_add(1, Ordering::SeqCst);
-            crate::render_side::Claim::Revealed
+            crate::render_side::AtStep::Revealed
         }),
         failures: rig.failures.clone(),
         screen: None,
@@ -167,7 +167,7 @@ fn a_completion_before_the_commit_is_kept() {
         until("the job held after its send", || {
             imports::exit_waiting() == 1
         });
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         assert_eq!(state(&gate), "revealed specialized");
         imports::hold_exit(false);
         let mut attempt = begin(rig, &l);
@@ -226,7 +226,7 @@ fn a_reveal_before_the_read_starts_nothing() {
     on_rig(l.chart(), &Installers::default(), true, |rig| {
         let gate = decided(rig, skin);
         let from = imports::jobs_counted();
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         rig.chart_read(&l);
         assert_eq!(jobs_since(from), (0, 0), "nothing begun");
         assert_eq!(state(&gate), "revealed");
@@ -264,7 +264,7 @@ fn the_entry_makes_the_gate_the_reveal_commits_on() {
         let gate = Arc::clone(rig.early.as_ref().expect("the entry's gate").gate());
         assert_eq!(state(&gate), "idle");
         let from = imports::jobs_counted();
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         assert_eq!(state(&gate), "revealed");
         rig.chart_read(&l);
         assert_eq!(jobs_since(from), (0, 0), "nothing begun");
@@ -285,7 +285,7 @@ fn a_refusal_after_the_commit_takes_the_loading_route() {
         let base = vm_hooks::live();
         rig.chart_read(&l);
         imports::executing(base);
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         until("the cancelled job's thread ended", || {
             imports::workers() == 0
         });
@@ -333,7 +333,7 @@ fn the_join_is_never_in_the_deadline_step() {
         let base = vm_hooks::live();
         rig.chart_read(&l);
         imports::executing(base);
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         assert_eq!(jobs_since(from), (1, 0), "not joined in the step");
         rig.left_chart().unwrap();
         assert_eq!(jobs_since(from), (1, 1), "joined in left_chart");
@@ -375,7 +375,7 @@ fn a_retry_specializes_in_preparing() {
         until("the specialization ended", || {
             state(&gate) == "ended specialized"
         });
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         let mut attempt = begin(rig, &first);
         assert_ne!(stage(rig), "skin");
         assert_eq!(polled(rig, &mut attempt).unwrap(), game::Preparation::Ready);
@@ -451,9 +451,9 @@ fn a_refusal_between_classify_and_commit_is_not_revealed() {
                 false,
             ),
             origin: game::Origin::Load,
-            // The claim, as the reveal word answers it: the refusal
+            // The step's read, as the reveal word answers it: the refusal
             // published first, after the classification, won the word.
-            reveal: Box::new(move |_| {
+            reveal: Box::new(move || {
                 assert!(published.end(crate::play::early::EarlyOutcome::Refused(
                     game::PreparationRefusal {
                         location: None,
@@ -461,10 +461,10 @@ fn a_refusal_between_classify_and_commit_is_not_revealed() {
                     }
                 )));
                 if published.refused().is_some() {
-                    return crate::render_side::Claim::Refused;
+                    return crate::render_side::AtStep::Refused;
                 }
                 counted.fetch_add(1, Ordering::SeqCst);
-                crate::render_side::Claim::Revealed
+                crate::render_side::AtStep::Revealed
             }),
             failures: rig.failures.clone(),
             screen: None,
@@ -512,7 +512,7 @@ fn a_staging_refusal_after_the_reveal_returns_at_once() {
         });
         rig.step_early();
         let request = gate.request().expect("the early request sent");
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         // Refused after the reveal's commit.
         screens.early_room.store(3, SeqCst);
         until("the early staging refused", || {
@@ -610,7 +610,7 @@ fn a_staging_refusal_ends_a_waiting_preparation() {
         });
         rig.step_early();
         let request = gate.request().expect("the early request sent");
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         let mut handle = begin(rig, &l);
         assert_eq!(stage(rig), "image");
         let slice = || Instant::now() + Duration::from_millis(10);
@@ -677,7 +677,7 @@ fn a_discarded_preparation_takes_its_hand_off() {
         });
         rig.step_early();
         let e = gate.request().expect("the early request sent");
-        assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+        assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
         let mut first = begin(rig, &l13);
         assert_eq!(stage(rig), "image");
         let slice = || Instant::now() + Duration::from_millis(10);
@@ -744,7 +744,7 @@ fn a_released_result_begins_no_pages_upload() {
                     rig.render.result_status().released == Some(e)
                 });
             }
-            assert_eq!(rig.deadline_step(false), game::StepOutcome::Stepped);
+            assert_eq!(rig.step_at_deadline(), game::StepOutcome::Stepped);
             let mut handle = begin(rig, &l);
             assert_eq!(polled(rig, &mut handle).unwrap(), game::Preparation::Ready);
             assert_eq!(rig.pages_ticket.is_some(), !release, "release {release}");
