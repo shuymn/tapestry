@@ -79,6 +79,13 @@ impl Load {
     /// loop, within [`SPIN_UP`] (a panic otherwise, naming how many did);
     /// the first waits `late` before it starts (a test's late thread).
     fn spinning(n: usize, late: Duration) -> Self {
+        Self::spinning_within(n, late, SPIN_UP).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// As [`Self::spinning`], within `within`: on a timeout, the threads
+    /// are told to stop and left to end on their own, unjoined, so the
+    /// failure returns at the deadline whatever a thread still waits for.
+    fn spinning_within(n: usize, late: Duration, within: Duration) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let spinning = Arc::new(AtomicUsize::new(0));
         let (ready_tx, ready) = std::sync::mpsc::channel();
@@ -102,20 +109,23 @@ impl Load {
             })
             .collect();
         drop(ready_tx);
-        let load = Self {
+        let mut load = Self {
             stop,
             spinning,
             threads,
         };
-        let deadline = Instant::now() + SPIN_UP;
+        let deadline = Instant::now() + within;
         for k in 0..n {
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                ready.recv_timeout(left).is_ok(),
-                "{k} of {n} load threads spinning after {SPIN_UP:?}"
-            );
+            if ready.recv_timeout(left).is_err() {
+                load.stop.store(true, Ordering::Relaxed);
+                // Dropping a handle detaches its thread: the drop below
+                // joins none.
+                load.threads.clear();
+                return Err(format!("{k} of {n} load threads spinning after {within:?}"));
+            }
         }
-        load
+        Ok(load)
     }
 
     /// The threads that have entered their loop.
@@ -135,6 +145,22 @@ fn a_load_starts_once_every_thread_spins() {
     let load = Load::spinning(3, late);
     assert_eq!(load.spinning_now(), 3, "every thread spinning");
     assert!(started.elapsed() >= late, "{:?}", started.elapsed());
+}
+
+/// A load whose thread does not start in time fails at its deadline: with
+/// its first thread held 20 s and a deadline of 300 ms, the failure names
+/// the one thread of two that spun and returns well before the held thread
+/// starts, its threads told to stop and left unjoined.
+#[test]
+fn a_load_that_does_not_start_fails_at_its_deadline() {
+    let started = Instant::now();
+    let Err(e) = Load::spinning_within(2, Duration::from_secs(20), Duration::from_millis(300))
+    else {
+        panic!("the load started");
+    };
+    let took = started.elapsed();
+    assert!(e.starts_with("1 of 2 load threads spinning"), "{e}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
 }
 
 impl Drop for Load {
