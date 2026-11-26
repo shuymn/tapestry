@@ -148,18 +148,19 @@ fn a_load_starts_once_every_thread_spins() {
 }
 
 /// A load whose thread does not start in time fails at its deadline: with
-/// its first thread held 20 s and a deadline of 300 ms, the failure names
-/// the one thread of two that spun and returns well before the held thread
-/// starts, its threads told to stop and left unjoined.
+/// its one thread held 20 s and a deadline of 300 ms, the failure names
+/// no thread spinning and returns well before the held thread starts, the
+/// thread told to stop and left unjoined. One thread, so the count does
+/// not depend on how soon an unheld thread is scheduled.
 #[test]
 fn a_load_that_does_not_start_fails_at_its_deadline() {
     let started = Instant::now();
-    let Err(e) = Load::spinning_within(2, Duration::from_secs(20), Duration::from_millis(300))
+    let Err(e) = Load::spinning_within(1, Duration::from_secs(20), Duration::from_millis(300))
     else {
         panic!("the load started");
     };
     let took = started.elapsed();
-    assert!(e.starts_with("1 of 2 load threads spinning"), "{e}");
+    assert!(e.starts_with("0 of 1 load threads spinning"), "{e}");
     assert!(took < Duration::from_secs(5), "{took:?}");
 }
 
