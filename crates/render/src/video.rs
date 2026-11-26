@@ -42,6 +42,7 @@ pub const FLAG_VIDEO_CHROMA_DOWN: u32 = 1 << 25;
 
 /// The flags that site a frame's chroma at `chroma` (none for centred).
 #[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub const fn chroma_flags(chroma: skin_model::media::ChromaLocation) -> u32 {
     let (x, y) = chroma.quarters();
     let left = if x < 0 { FLAG_VIDEO_CHROMA_LEFT } else { 0 };

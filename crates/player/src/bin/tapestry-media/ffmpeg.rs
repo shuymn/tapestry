@@ -1158,8 +1158,9 @@ const fn av_location(chroma: ChromaLocation) -> ff::AVChromaLocation {
 /// frames): left for H.264 and HEVC (their VUI's location types inferred
 /// as 0 when absent, ITU-T H.264 and H.265 Annex E) and MPEG-2 (its 4:2:0
 /// layout, ITU-T H.262 6.1.1.8, which no syntax changes); centre for
-/// MPEG-1 (ISO/IEC 11172-2's 4:2:0 layout), JPEG (ITU-T T.871) and every
-/// other codec.
+/// MPEG-1 (ISO/IEC 11172-2's 4:2:0 layout) and JPEG (ITU-T T.871), and
+/// centre as the fallback for every other codec, whose decoder's own report
+/// (MPEG-4 Part 2's reports left) comes first.
 pub const fn default_location(codec: ff::AVCodecID) -> ChromaLocation {
     use ff::AVCodecID as C;
     match codec {

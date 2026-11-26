@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe};
@@ -59,16 +59,39 @@ impl Out {
 /// Busy threads at normal priority, until dropped.
 struct Load {
     stop: Arc<AtomicBool>,
+    /// The threads that have entered their loop.
+    spinning: Arc<AtomicUsize>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// How long a load's threads have to enter their loop.
+const SPIN_UP: Duration = Duration::from_secs(10);
+
 impl Load {
+    /// `n` busy threads, every one spinning, then half a second more.
     fn new(n: usize) -> Self {
+        let load = Self::spinning(n, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(500));
+        load
+    }
+
+    /// `n` busy threads, returned once each has acknowledged entering its
+    /// loop, within [`SPIN_UP`] (a panic otherwise, naming how many did);
+    /// the first waits `late` before it starts (a test's late thread).
+    fn spinning(n: usize, late: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let spinning = Arc::new(AtomicUsize::new(0));
+        let (ready_tx, ready) = std::sync::mpsc::channel();
         let threads = (0..n)
-            .map(|_| {
-                let stop = Arc::clone(&stop);
+            .map(|k| {
+                let (stop, spinning) = (Arc::clone(&stop), Arc::clone(&spinning));
+                let ready_tx = ready_tx.clone();
                 std::thread::spawn(move || {
+                    if k == 0 {
+                        std::thread::sleep(late);
+                    }
+                    spinning.fetch_add(1, Ordering::AcqRel);
+                    let _ = ready_tx.send(());
                     let mut x = 0_u64;
                     while !stop.load(Ordering::Relaxed) {
                         x = std::hint::black_box(
@@ -78,9 +101,40 @@ impl Load {
                 })
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(500));
-        Self { stop, threads }
+        drop(ready_tx);
+        let load = Self {
+            stop,
+            spinning,
+            threads,
+        };
+        let deadline = Instant::now() + SPIN_UP;
+        for k in 0..n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                ready.recv_timeout(left).is_ok(),
+                "{k} of {n} load threads spinning after {SPIN_UP:?}"
+            );
+        }
+        load
     }
+
+    /// The threads that have entered their loop.
+    fn spinning_now(&self) -> usize {
+        self.spinning.load(Ordering::Acquire)
+    }
+}
+
+/// A load starts once every thread spins (Part D's load start mark): with
+/// its first thread 700 ms late, longer than the settling the load used to
+/// wait instead, it returns only after that thread too has entered its
+/// loop.
+#[test]
+fn a_load_starts_once_every_thread_spins() {
+    let late = Duration::from_millis(700);
+    let started = Instant::now();
+    let load = Load::spinning(3, late);
+    assert_eq!(load.spinning_now(), 3, "every thread spinning");
+    assert!(started.elapsed() >= late, "{:?}", started.elapsed());
 }
 
 impl Drop for Load {
@@ -1110,7 +1164,7 @@ fn media_load_beside_a_running_worker() {
     let mut cpu = vec![("start", qpc(), cpu_ms(worker))];
     std::thread::sleep(baseline);
     cpu.push(("load_spawn", qpc(), cpu_ms(worker)));
-    let threads = Load::new(usize::try_from(mask.count_ones()).unwrap());
+    let threads = Load::spinning(usize::try_from(mask.count_ones()).unwrap(), Duration::ZERO);
     cpu.push(("load_start", qpc(), cpu_ms(worker)));
     std::thread::sleep(load);
     drop(threads);
