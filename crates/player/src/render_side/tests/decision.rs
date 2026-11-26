@@ -356,6 +356,22 @@ impl Screen for Recorder {
     ) -> render::Uploaded {
         self.menu.upload_boundary(past, slice)
     }
+    fn creating(&self) -> bool {
+        self.menu.creating()
+    }
+    fn set_residency(
+        &mut self,
+        holder: render::ResidencyHolder,
+        clock: Arc<dyn bms_model::TimeSource>,
+    ) {
+        self.menu.set_residency(holder, clock);
+    }
+    fn room_waits(&self, kind: ScreenKind, bundle: &Arc<render::SkinBundle>) -> bool {
+        self.menu.room_waits(kind, bundle)
+    }
+    fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
+        self.menu.pages_room_waits(pages)
+    }
     fn upload_state(&self) -> render::UploadState {
         self.menu.upload_state()
     }

@@ -45,8 +45,7 @@ const RING_STAMP: usize = 3;
 const RING_INDEX: usize = 4;
 const RING_BYTES: usize = 5;
 const RING_DURATION: usize = 6;
-/// A slot header's reserved word.
-const RING_RESERVED: usize = 7;
+const RING_CHROMA: usize = 7;
 /// How long the seeds' frames last, in µs.
 pub const RING_FRAME_US: i64 = 33_333;
 
@@ -62,7 +61,7 @@ fn ring_seed(
     frames: &[(u64, u64, i64)],
     words: &[(usize, usize, u64)],
 ) -> Vec<u8> {
-    use skin_model::media::{Geometry, Reader, SLOT_HEADER_WORDS, Stamp, Writer};
+    use skin_model::media::{ChromaLocation, Geometry, Reader, SLOT_HEADER_WORDS, Stamp, Writer};
     use std::sync::atomic::{AtomicU64, Ordering};
     let [w, h] = crate::RING_SIZES[usize::from(size % 4)];
     let g = Geometry::new(w, h).expect("a ring's size");
@@ -88,6 +87,7 @@ fn ring_seed(
                     at: stamp,
                     duration: RING_FRAME_US,
                 },
+                ChromaLocation::Left,
             )
             .expect("a frame of the ring's size");
     }
@@ -156,8 +156,12 @@ pub fn rings() -> Vec<Seed> {
             ring_seed(3, 1_000, &two, &[(1, RING_STAMP, 1 << 21)]),
         ),
         (
-            "reserved",
-            ring_seed(1, 1_500, &[(1, 1, 1_000)], &[(0, RING_RESERVED, u64::MAX)]),
+            "chroma_unknown",
+            ring_seed(1, 1_500, &[(1, 1, 1_000)], &[(0, RING_CHROMA, u64::MAX)]),
+        ),
+        (
+            "chroma_unspecified",
+            ring_seed(1, 1_500, &[(1, 1, 1_000)], &[(0, RING_CHROMA, 0)]),
         ),
         (
             "duration_zero",

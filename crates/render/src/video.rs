@@ -33,6 +33,26 @@ pub const FLAG_VIDEO: u32 = 1 << 20;
 pub const FLAG_VIDEO_BT601: u32 = 1 << 21;
 /// The movie's range is full (else limited).
 pub const FLAG_VIDEO_FULL: u32 = 1 << 22;
+/// The frame's chroma sits a quarter chroma sample left of centre.
+pub const FLAG_VIDEO_CHROMA_LEFT: u32 = 1 << 23;
+/// The frame's chroma sits a quarter chroma sample above centre.
+pub const FLAG_VIDEO_CHROMA_UP: u32 = 1 << 24;
+/// The frame's chroma sits a quarter chroma sample below centre.
+pub const FLAG_VIDEO_CHROMA_DOWN: u32 = 1 << 25;
+
+/// The flags that site a frame's chroma at `chroma` (none for centred).
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn chroma_flags(chroma: skin_model::media::ChromaLocation) -> u32 {
+    let (x, y) = chroma.quarters();
+    let left = if x < 0 { FLAG_VIDEO_CHROMA_LEFT } else { 0 };
+    let vertical = match y {
+        ..0 => FLAG_VIDEO_CHROMA_UP,
+        0 => 0,
+        1.. => FLAG_VIDEO_CHROMA_DOWN,
+    };
+    left | vertical
+}
 
 /// The movie slots of a screen (design.md "Rendering and Skins", skin
 /// movies): the first two for the skin's movies, the other two for the

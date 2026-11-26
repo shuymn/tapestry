@@ -172,6 +172,11 @@ impl Gpu {
         }
     }
 
+    /// Latches the loss: a fence read the device's removal.
+    pub(crate) fn mark_lost(&self) {
+        self.lost.store(true, Ordering::Release);
+    }
+
     /// Whether the device was lost or destroyed since it was created.
     #[must_use]
     pub fn lost(&self) -> bool {

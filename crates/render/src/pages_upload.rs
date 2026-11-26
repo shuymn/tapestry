@@ -80,6 +80,9 @@ impl Renderer {
         ticket: u64,
     ) -> Result<PagesBegun, RenderError> {
         let kind = ScreenKind::Result;
+        // The deadline its owner set, taken whether it starts a ticket or
+        // not.
+        let deadline = self.ticket_deadline.take();
         if self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
@@ -89,10 +92,25 @@ impl Renderer {
         if self.committed_atlas(kind) == Some(pages.id()) {
             return Ok(PagesBegun::Installed);
         }
+        // Its room held by arrays whose residency is in flight: nothing
+        // made, its owner waiting for the room.
+        if self.pages_room_waits(pages) {
+            return Err(RenderError::RoomPending { kind });
+        }
         #[cfg(any(test, feature = "dev-tools"))]
         let began = Instant::now();
         let entry = self.reserve_room(Hold::Staging(kind), kind)?;
         self.release(kind);
+        // Its array created off the frame first: its steps follow once
+        // its residency completes.
+        match self.start_pages_creation(pages, ticket, entry, deadline) {
+            Ok(true) => return Ok(PagesBegun::Begun),
+            Ok(false) => {}
+            Err(e) => {
+                self.retire.release(entry);
+                return Err(e);
+            }
+        }
         self.staging_entry = Some(entry);
         let res = self.pages_array(pages);
         self.staging_entry = None;
@@ -122,6 +140,75 @@ impl Renderer {
         }
     }
 
+    /// Admits `pages` as the result kind's, charged from now, and starts
+    /// their array's creation off the frame for `ticket` in `entry`:
+    /// whether it started (false: the `Sync` path creates it now).
+    fn start_pages_creation(
+        &mut self,
+        pages: &Arc<PackedPages>,
+        ticket: u64,
+        entry: usize,
+        deadline: Option<bms_model::Deadline>,
+    ) -> Result<bool, RenderError> {
+        if !matches!(self.creation_path, crate::residency::Path::Async(_)) {
+            return Ok(false);
+        }
+        let Some(key) = self.native_key(pages) else {
+            return Ok(false);
+        };
+        let charge = pages_texels(pages);
+        self.staging_entry = Some(entry);
+        let admitted = self.admit_reclaiming(ScreenKind::Result, charge);
+        self.staging_entry = None;
+        admitted?;
+        match self.start_creation(key, ticket, charge, deadline)? {
+            super::creation::Started::Async(t) => {
+                self.pages_creation = Some(super::creation::PagesCreation {
+                    pages: Arc::clone(pages),
+                    entry,
+                    t,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    began: Instant::now(),
+                });
+                Ok(true)
+            }
+            super::creation::Started::Sync => Ok(false),
+        }
+    }
+
+    /// The pages creation whose residency completed: its array imported
+    /// and its steps begun, or its refusal reported at the boundary.
+    pub(super) fn finish_pages_creation(&mut self) {
+        let Some(c) = self.pages_creation.take() else {
+            return;
+        };
+        let ticket = c.t.id;
+        self.import(c.t);
+        self.staging_entry = Some(c.entry);
+        let res = self.pages_array(&c.pages);
+        self.staging_entry = None;
+        // Imported and not taken by an admission refused first.
+        self.import_texture = None;
+        match res {
+            Ok(res) => {
+                let writes = skin_atlas::AtlasWrites::new(Arc::clone(&c.pages), &res.atlas);
+                self.pages_upload = Some(PagesUpload {
+                    ticket,
+                    res,
+                    writes,
+                    entry: Some(c.entry),
+                    written: false,
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    timing: (c.began, c.began),
+                });
+            }
+            Err(e) => {
+                self.retire.release(c.entry);
+                self.pages_report = Some(PagesStep::Refused(ticket, e));
+            }
+        }
+    }
+
     /// `pages` admitted as the result kind's and their array created,
     /// nothing written.
     fn pages_array(&mut self, pages: &Arc<PackedPages>) -> Result<PagesRes, RenderError> {
@@ -138,7 +225,10 @@ impl Renderer {
     /// The ticket of the result pages upload in hand, if any.
     #[must_use]
     pub fn pages_in_hand(&self) -> Option<u64> {
-        self.pages_upload.as_ref().map(|u| u.ticket)
+        self.pages_upload
+            .as_ref()
+            .map(|u| u.ticket)
+            .or_else(|| self.pages_creation.as_ref().map(|c| c.t.id))
     }
 
     /// Makes the written result pages upload the result kind's pages-only
@@ -157,8 +247,13 @@ impl Renderer {
     }
 
     /// Withdraws the result pages upload in hand, if any: its array,
-    /// written or partial, retires into the entry it reserved. Its ticket.
+    /// written or partial, retires into the entry it reserved; one whose
+    /// residency is in flight is kept there, charged, until its fence
+    /// completes. Its ticket.
     pub fn withdraw_pages(&mut self) -> Option<u64> {
+        if let Some(t) = self.withdraw_pages_creation() {
+            return Some(t);
+        }
         let up = self.pages_upload.take()?;
         let ticket = up.ticket;
         self.retire_pages(up);

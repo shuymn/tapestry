@@ -1814,6 +1814,45 @@ impl Screen for MenuScreen {
         self.renderer.filled()
     }
 
+    fn set_ticket_deadline(&mut self, deadline: bms_model::Deadline) {
+        self.renderer.set_ticket_deadline(deadline);
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn creating(&self) -> bool {
+        self.renderer.creating()
+    }
+
+    fn set_residency(
+        &mut self,
+        holder: render::ResidencyHolder,
+        clock: std::sync::Arc<dyn bms_model::TimeSource>,
+    ) {
+        self.renderer.set_residency_holder(holder);
+        self.renderer.set_deadline_clock(clock);
+    }
+
+    fn room_waits(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        self.renderer.room_waits(kind, bundle)
+    }
+
+    fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
+        self.renderer.pages_room_waits(pages)
+    }
+
+    fn array_creation(&self) -> Option<(&'static str, &'static str)> {
+        Some(self.renderer.array_creation())
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_residency_line(&mut self) -> Option<render::ResidencyLine> {
+        self.renderer.take_residency_line()
+    }
+
+    fn residency_pending(&self) -> Option<(usize, bms_model::TimeUs)> {
+        self.renderer.residency_pending()
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
         self.renderer.destroy_due(heavy)
@@ -2821,6 +2860,44 @@ pub(crate) mod movie_tests;
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// The ticket deadlines the render loop sets are read on the clock it
+    /// gives the screen as it is made, whatever the renderer's own slice
+    /// clock reads: a screen made long into a run times a ticket out at
+    /// its deadline.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_ticket_deadline_is_read_on_the_loops_clock() {
+        use bms_model::{Deadline, TimeSource, TimeUs, VirtualClock};
+
+        use crate::render_side::Screen as _;
+
+        let bundle = crate::render_side::tests::bundle();
+        let r = render::Renderer::new(
+            render::Target::Offscreen {
+                width: 64,
+                height: 64,
+            },
+            render::AdapterChoice::Warp,
+        )
+        .unwrap();
+        let mut s = super::MenuScreen::new(r, None);
+        let _fake = s.renderer.use_fake_residency();
+        let clock = Arc::new(VirtualClock::new(TimeUs(600_000_000)));
+        s.set_residency(
+            render::ResidencyHolder::default(),
+            Arc::clone(&clock) as Arc<dyn TimeSource>,
+        );
+        s.set_ticket_deadline(Deadline::after(clock.now(), render::CREATE_BOUND));
+        assert!(matches!(
+            s.begin_pages(bundle.atlas_pages(), 1),
+            Ok(Some(render::PagesBegun::Begun))
+        ));
+        assert_eq!(s.renderer.pages_in_hand(), Some(1));
+        clock.advance(TimeUs(render::CREATE_BOUND.0 + 1));
+        let _ = s.renderer.poll_creations_now();
+        assert_eq!(s.renderer.pages_in_hand(), None, "past its deadline");
+    }
 
     /// A request installed or refused needs nothing; in the place its
     /// text was installed for, only the changed fields are cleared and

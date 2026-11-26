@@ -86,6 +86,9 @@ pub enum UploadError {
         /// The bytes its side needs.
         expected: u64,
     },
+    /// The array's creation off the frame refused or timed out.
+    #[error(transparent)]
+    Residency(#[from] crate::residency::ResidencyError),
     /// The device refused the atlas's texture, its upload or its binding
     /// (out of memory, or a validation the checks above did not foresee).
     #[error("the device refused the atlas")]
@@ -242,8 +245,13 @@ impl AtlasTexture {
     /// kept layer) and its pages are [`AtlasWrites`]' writes, made in
     /// steps through the uploader. What the device refuses is reported to
     /// its error scopes ([`scoped`]).
-    pub(crate) fn create(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
-        Self::make(gpu, pages, layers, false)
+    pub(crate) fn create(
+        gpu: &Gpu,
+        pages: &AtlasPages<'_>,
+        layers: u32,
+        texture: Option<wgpu::Texture>,
+    ) -> Self {
+        Self::make(gpu, pages, layers, false, texture)
     }
 
     /// [`create`](Self::create) with its initialization and every page
@@ -251,16 +259,24 @@ impl AtlasTexture {
     /// upload not made in steps (a renderer built again restoring its
     /// installations inline).
     pub(crate) fn upload(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
-        Self::make(gpu, pages, layers, true)
+        Self::make(gpu, pages, layers, true, None)
     }
 
-    fn make(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32, whole: bool) -> Self {
+    /// With `texture`, the array its creation made off the frame and
+    /// imported (`crate::residency`); without, one created now.
+    fn make(
+        gpu: &Gpu,
+        pages: &AtlasPages<'_>,
+        layers: u32,
+        whole: bool,
+        texture: Option<wgpu::Texture>,
+    ) -> Self {
         let device = gpu.device();
         let side = pages.side;
         let levels = u32::try_from(MIP_LEVELS).unwrap_or(1);
         #[cfg(feature = "dev-tools")]
         let creating = crate::probe::Span::start();
-        let texture = create(device, side, layers, levels);
+        let texture = texture.unwrap_or_else(|| create(device, side, layers, levels));
         #[cfg(feature = "dev-tools")]
         let writing = {
             crate::probe::CREATE_US.store(
@@ -631,7 +647,14 @@ const READ_BACK: wgpu::TextureUsages = if cfg!(test) {
 };
 
 fn create(device: &wgpu::Device, side: u32, layers: u32, levels: u32) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
+    device.create_texture(&descriptor(side, layers, levels))
+}
+
+/// The descriptor of an atlas array of `side` texels, `layers` layers and
+/// `levels` levels, which the native creation matches
+/// (`crate::residency::NativeCreate`).
+pub(crate) fn descriptor(side: u32, layers: u32, levels: u32) -> wgpu::TextureDescriptor<'static> {
+    wgpu::TextureDescriptor {
         label: Some("atlas"),
         size: wgpu::Extent3d {
             width: side,
@@ -644,7 +667,7 @@ fn create(device: &wgpu::Device, side: u32, layers: u32, levels: u32) -> wgpu::T
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | READ_BACK,
         view_formats: &[],
-    })
+    }
 }
 
 /// A write of `side`-texel-square `bytes` at the top left of `layer`'s

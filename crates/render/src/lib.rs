@@ -71,6 +71,7 @@ pub mod presentation;
 pub mod probe;
 mod projection;
 mod renderer;
+mod residency;
 mod simple;
 mod skin;
 mod skin_atlas;
@@ -123,6 +124,12 @@ pub use renderer::{
 };
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::{DestroyRecord, RECORD_LEN};
+#[cfg(feature = "dev-tools")]
+pub use residency::fake::Fake as FakeResidency;
+pub use residency::{
+    Budget, CREATE_BOUND, ResidencyError, ResidencyEvent, ResidencyHolder, ResidencyLine,
+    TimeoutPhase, timeout,
+};
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,
@@ -143,7 +150,8 @@ pub use upload::{
     UploadGate, UploadState, Uploaded,
 };
 pub use video::{
-    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES, VIDEO_UV,
+    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_CHROMA_DOWN, FLAG_VIDEO_CHROMA_LEFT,
+    FLAG_VIDEO_CHROMA_UP, FLAG_VIDEO_FULL, MAX_MOVIES as VIDEO_MAX_MOVIES, VIDEO_UV, chroma_flags,
 };
 /// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
 /// (dev-tools: a scenario's adapter line and admission).

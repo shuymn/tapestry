@@ -131,9 +131,11 @@ impl Filled {
         self.pool.is_some() || self.array.heavy()
     }
 
-    /// Whether its last use is covered by the completion `seen`.
-    const fn due(&self, seen: u64) -> bool {
-        self.last_use <= seen
+    /// Whether its last use is covered by the completion `seen`, and a
+    /// residency it holds completed.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn due(&self, seen: u64) -> bool {
+        self.last_use <= seen && self.array.settled()
     }
 
     /// Its device resources' bytes, the pool beside it included.
@@ -207,6 +209,10 @@ pub(super) enum Array {
         )]
         bind: Option<wgpu::BindGroup>,
     },
+    /// A skin array whose residency was asked for and is not yet seen
+    /// complete (a withdrawn or timed-out creation): destroyed only once
+    /// its fence completes.
+    Residing(crate::residency::Residing),
     /// Nothing beside the pool part.
     None,
     /// Unit tests: a part with no device resource, heavy or not.
@@ -218,7 +224,11 @@ impl Array {
     /// Whether its destruction is a heavy operation: a texture's.
     const fn heavy(&self) -> bool {
         match self {
-            Self::Resources(_) | Self::Own(_) | Self::Pages { .. } | Self::Refused { .. } => true,
+            Self::Resources(_)
+            | Self::Own(_)
+            | Self::Pages { .. }
+            | Self::Refused { .. }
+            | Self::Residing(_) => true,
             Self::Layout { .. } | Self::None => false,
             #[cfg(test)]
             Self::Fake { heavy } => *heavy,
@@ -236,6 +246,7 @@ impl Array {
             Self::Own(_) => (4, "dr:own_us"),
             Self::Refused { .. } => (5, "dr:refused_us"),
             Self::None => (6, "dr:cpu_us"),
+            Self::Residing(_) => (7, "dr:residing_us"),
             #[cfg(test)]
             Self::Fake { .. } => (-1, "dr:fake_us"),
         }
@@ -247,9 +258,18 @@ impl Array {
             Self::Resources(r) => Some(&r.atlas),
             Self::Own(r) => Some(&r.atlas),
             Self::Pages { atlas, .. } | Self::Refused { atlas, .. } => Some(atlas),
-            Self::Layout { .. } | Self::None => None,
+            Self::Layout { .. } | Self::None | Self::Residing(_) => None,
             #[cfg(test)]
             Self::Fake { .. } => None,
+        }
+    }
+
+    /// Whether nothing of it waits for a residency still in flight.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn settled(&self) -> bool {
+        match self {
+            Self::Residing(r) => r.done(),
+            _ => true,
         }
     }
 
@@ -273,6 +293,7 @@ impl Array {
             Self::Refused { atlas, .. } => atlas.bytes(),
             Self::Layout { staging, .. } => staging.bytes(),
             Self::None => 0,
+            Self::Residing(r) => r.bytes,
             #[cfg(test)]
             Self::Fake { .. } => 0,
         }
@@ -593,12 +614,6 @@ impl Retirements {
             })
     }
 
-    /// How many entries are filled, retired pools included.
-    pub(super) fn filled(&self) -> u32 {
-        let n = self.filled_entries().count();
-        u32::try_from(n).unwrap_or(u32::MAX)
-    }
-
     /// What admission counts for the filled entries: every one's charge
     /// but a retired pool's.
     pub(super) fn charged(&self) -> u64 {
@@ -632,13 +647,85 @@ impl Retirements {
             .any(|(_, f)| f.class == Class::RetiredPool || f.pool.is_some())
     }
 
-    /// The oldest filled entry, of those admission charges when
-    /// `charged` (a retired pool left out), of any otherwise.
+    /// The oldest filled entry that may be destroyed now, of those
+    /// admission charges when `charged` (a retired pool left out), of any
+    /// otherwise: never one whose residency is still in flight.
     pub(super) fn oldest(&self, charged: bool) -> Option<usize> {
         self.filled_entries()
+            .filter(|(_, f)| f.array.settled())
             .filter(|(_, f)| !charged || f.class != Class::RetiredPool)
             .min_by_key(|(_, f)| f.seq)
             .map(|(i, _)| i)
+    }
+
+    /// How many filled entries hold a residency still in flight, and when
+    /// the oldest's ticket was taken.
+    pub(super) fn residing(&self) -> Option<(usize, bms_model::TimeUs)> {
+        let mut n = 0_usize;
+        let mut oldest: Option<bms_model::TimeUs> = None;
+        for (_, f) in self.filled_entries() {
+            if let Array::Residing(r) = &f.array
+                && !r.done()
+            {
+                n += 1;
+                oldest =
+                    Some(oldest.map_or(r.requested, |o| bms_model::TimeUs(o.0.min(r.requested.0))));
+            }
+        }
+        oldest.map(|o| (n, o))
+    }
+
+    /// Whether a filled entry holds a residency still in flight: room
+    /// that its fence's completion will let the boundaries free.
+    pub(super) fn residing_pending(&self) -> bool {
+        self.filled_entries().any(|(_, f)| !f.array.settled())
+    }
+
+    /// Tests: how many entries are filled, retired pools included.
+    #[cfg(test)]
+    pub(super) fn filled(&self) -> u32 {
+        let n = self.filled_entries().count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// How many entries are filled, as READY's cutoff waits for them: a
+    /// residency still in flight past its ticket's deadline is left out and
+    /// latched so ([`Residing::deferred_at`]), kept, charged and untouched
+    /// through play, its fence no longer read to count it.
+    ///
+    /// [`Residing::deferred_at`]: crate::residency::Residing::deferred_at
+    pub(super) fn filled_for_cutoff(&self, now: bms_model::TimeUs) -> u32 {
+        let n = self
+            .filled_entries()
+            .filter(|(_, f)| match &f.array {
+                Array::Residing(r) => !r.deferred_at(now),
+                _ => true,
+            })
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// What admission counts for the entries no boundary may destroy yet:
+    /// those whose residency is still in flight.
+    pub(super) fn unsettled_charge(&self) -> u64 {
+        self.filled_entries()
+            .filter(|(_, f)| !f.array.settled())
+            .fold(0, |sum, (_, f)| sum.saturating_add(f.charge))
+    }
+
+    /// Every residency still held, taken out of its entry, which frees: a
+    /// renderer dropped hands them to the render loop's holder.
+    pub(super) fn take_residing(&mut self) -> Vec<crate::residency::Residing> {
+        let mut out = Vec::new();
+        for e in self.entries.iter_mut() {
+            if matches!(e, Entry::Filled(f) if matches!(f.array, Array::Residing(_)))
+                && let Entry::Filled(f) = std::mem::replace(e, Entry::Free)
+                && let Array::Residing(r) = f.array
+            {
+                out.push(r);
+            }
+        }
+        out
     }
 
     /// Entry `i`'s last use, when it is filled.
@@ -712,6 +799,10 @@ impl Retirements {
         let Entry::Filled(f) = e else {
             return None;
         };
+        // A residency still in flight is never released.
+        if !f.array.settled() {
+            return None;
+        }
         // The probe on: the part's destruction between memory readings
         // (`dr:*`), none of them in its time.
         #[cfg(feature = "dev-tools")]

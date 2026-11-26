@@ -726,6 +726,18 @@ fn an_attempt_text_is_written_in_the_uploaders_steps() {
         target: r.target(),
     };
     assert_eq!(r.stage_stepped(&b, &a, 1).unwrap(), None);
+    // Where the device creates the array off the frame, the staging goes
+    // on once asked again after its residency completed, as its owner
+    // asks between frames.
+    let asked = std::time::Instant::now();
+    while r.creating() {
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(10),
+            "never resident"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert_eq!(r.stage_stepped(&b, &a, 1).unwrap(), None);
+    }
     assert_eq!(
         counting.rasters.load(Ordering::SeqCst),
         0,

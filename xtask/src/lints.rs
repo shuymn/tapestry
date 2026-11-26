@@ -441,6 +441,11 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/render/src/presentation.rs"),
     Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
+    // An array's creation off the frame: each pass outside READY's cutoff
+    // reads its fence once, and a `Residing` entry's settling is read at
+    // the boundaries.
+    Site::File("crates/render/src/creation.rs"),
+    Site::File("crates/render/src/residency.rs"),
     // The retirement list: filled, destroyed and handed on at frame
     // boundaries.
     Site::File("crates/render/src/retire.rs"),
@@ -564,10 +569,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/bga.rs", &["BgaArray::key"]),
     // The skin movie hook's write path: a due frame taken into its
     // movie's mapped upload buffer, and each frame's copies into the
-    // planes.
+    // planes; each movie quad's chroma flags (`Instance::of`).
     Site::Fns(
         "crates/render/src/video.rs",
-        &["Video::write_with", "Video::record"],
+        &["Video::write_with", "Video::record", "chroma_flags"],
     ),
     Site::Fns(
         "crates/render/src/upload.rs",

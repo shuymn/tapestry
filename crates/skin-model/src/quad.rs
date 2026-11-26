@@ -55,9 +55,58 @@ pub enum Filter {
     /// array, a pure black texel keyed transparent.
     BgaLayer,
     /// A skin movie's frame: bilinear at level 0 of the movies' plane
-    /// arrays, its layer the movie's, converted from Y'CbCr by the matrix
-    /// (BT.601, else BT.709) and range (full, else limited).
-    Movie { bt601: bool, full: bool },
+    /// arrays, its layer the movie's, its chroma sampled at the frame's
+    /// chroma location and converted from Y'CbCr by the matrix (BT.601,
+    /// else BT.709) and range (full, else limited).
+    Movie { sampling: MovieSampling },
+}
+
+/// How a movie frame's samples are read: its matrix, its range and its
+/// chroma location, in one byte, so a [`Quad`] stays 64 bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MovieSampling(u8);
+
+impl MovieSampling {
+    /// Matrix BT.601 (else BT.709), range full (else limited), and the
+    /// chroma at `chroma`.
+    #[must_use]
+    pub const fn new(bt601: bool, full: bool, chroma: crate::media::ChromaLocation) -> Self {
+        // A location's word is at most 6: three bits.
+        #[expect(clippy::cast_possible_truncation, reason = "at most 6")]
+        let site = chroma.word() as u8;
+        Self(bt601 as u8 | (full as u8) << 1 | site << 2)
+    }
+
+    /// The matrix is BT.601 (else BT.709).
+    #[must_use]
+    pub const fn bt601(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// The range is full (else limited).
+    #[must_use]
+    pub const fn full(self) -> bool {
+        self.0 & 2 != 0
+    }
+
+    /// Where the frame's chroma sits.
+    #[must_use]
+    pub const fn chroma(self) -> crate::media::ChromaLocation {
+        match crate::media::ChromaLocation::of((self.0 >> 2) as u64) {
+            Some(c) => c,
+            None => crate::media::ChromaLocation::Centre,
+        }
+    }
+}
+
+impl std::fmt::Debug for MovieSampling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MovieSampling")
+            .field("bt601", &self.bt601())
+            .field("full", &self.full())
+            .field("chroma", &self.chroma())
+            .finish()
+    }
 }
 
 /// How a quad is blended over what is under it.

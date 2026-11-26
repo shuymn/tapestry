@@ -284,9 +284,10 @@ fn tinted(v: VOut) -> vec4f {
     return c * v.color;
 }
 
-// A movie's raw Y, U and V at luma `uv` from its planes `y`, `u` and `v`.
-fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f) -> vec3f {
-    let cuv = uv * vec2f(textureDimensions(y)) / (2.0 * vec2f(textureDimensions(u)));
+// A movie's raw Y, U and V at luma `uv` from its planes `y`, `u` and `v`,
+// its chroma samples sited `shift` chroma samples from the centred ones.
+fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f, shift: vec2f) -> vec3f {
+    let cuv = (uv * vec2f(textureDimensions(y)) / 2.0 - shift) / vec2f(textureDimensions(u));
     return vec3f(
         textureSampleLevel(y, smooth_samp, uv, 0.0).r,
         textureSampleLevel(u, smooth_samp, cuv, 0.0).r,
@@ -296,13 +297,23 @@ fn yuv(y: texture_2d<f32>, u: texture_2d<f32>, v: texture_2d<f32>, uv: vec2f) ->
 
 // A movie's texel: Y'CbCr by its matrix and range to opaque R'G'B'.
 fn movie(uv: vec2f, layer: i32, flags: u32) -> vec4f {
-    var s = yuv(video_y0, video_u0, video_v0, uv);
+    // The frame's chroma location: a quarter sample left, up or down.
+    var shift = vec2f(0.0);
+    if (flags & 0x800000u) != 0u {
+        shift.x = -0.25;
+    }
+    if (flags & 0x1000000u) != 0u {
+        shift.y = -0.25;
+    } else if (flags & 0x2000000u) != 0u {
+        shift.y = 0.25;
+    }
+    var s = yuv(video_y0, video_u0, video_v0, uv, shift);
     if layer == 1 {
-        s = yuv(video_y1, video_u1, video_v1, uv);
+        s = yuv(video_y1, video_u1, video_v1, uv, shift);
     } else if layer == 2 {
-        s = yuv(video_y2, video_u2, video_v2, uv);
+        s = yuv(video_y2, video_u2, video_v2, uv, shift);
     } else if layer == 3 {
-        s = yuv(video_y3, video_u3, video_v3, uv);
+        s = yuv(video_y3, video_u3, video_v3, uv, shift);
     }
     let y0 = s.x;
     let u0 = s.y;
@@ -633,6 +644,16 @@ pub enum RenderError {
         /// The kind asked for.
         kind: ScreenKind,
     },
+    /// A staging or a pages begin would fit only once arrays whose
+    /// residency is in flight are released, which no boundary may do
+    /// before their fences complete ([`Renderer::room_waits`]): nothing of
+    /// it was made and its request was not taken. Its owner waits for the
+    /// room before asking (design.md "Memory Budget").
+    #[error("the {kind} staging waits for room an array's residency in flight holds")]
+    RoomPending {
+        /// The kind asked for.
+        kind: ScreenKind,
+    },
 }
 
 impl RenderError {
@@ -678,6 +699,7 @@ impl RenderError {
             | Self::ResultDisabled
             | Self::PagesKind { .. }
             | Self::ListFull { .. }
+            | Self::RoomPending { .. }
             | Self::NotStaged
             | Self::LabelRegion { .. }
             | Self::ChartImage { .. } => true,
@@ -1310,6 +1332,11 @@ enum Reclaim {
     /// It does not fit: the level-0 texels it needs with the pool at its
     /// firm layer.
     Refused(u64),
+    /// It does not fit now, and would once the arrays whose residency is
+    /// in flight (in a `Residing` entry or the holder) are released, each
+    /// once its fence completes: no boundary may destroy them before, so
+    /// the request waits for its room.
+    Wait,
 }
 
 /// What an early staging needs before it is taken
@@ -1350,6 +1377,9 @@ pub struct Admission {
     /// The pools a reduction or a regrowth retired, undestroyed: reported
     /// apart, outside the sum.
     pub retired_pool: u64,
+    /// What the render loop's holder keeps from an earlier renderer, each
+    /// array until its fence completes.
+    pub held: u64,
 }
 
 impl Admission {
@@ -1375,13 +1405,14 @@ impl Admission {
     }
 
     /// Everything charged now: every kind's committed charge, the pool's
-    /// optional layers and the filled retirement entries; a retired pool
-    /// is not.
+    /// optional layers, the filled retirement entries and what the holder
+    /// keeps; a retired pool is not.
     #[must_use]
     pub const fn total(&self) -> u64 {
         self.committed_total()
             .saturating_add(self.pool)
             .saturating_add(self.filled)
+            .saturating_add(self.held)
     }
 }
 
@@ -1500,6 +1531,9 @@ pub struct MemoryWitness {
     /// The decision labels' levels staged and not yet written: the
     /// worker's, the waiting output's and the filling slot's remainder.
     pub decision_staged: u64,
+    /// The arrays an earlier renderer left with the render loop's holder,
+    /// their residency in flight, until each is released.
+    pub held: u64,
     /// The decision worker's A8 buffer and its producer's glyph mask
     /// bound, apart from the renderer's own ([`text_mask`](Self::text_mask)).
     pub decision_text_mask: u64,
@@ -1545,6 +1579,7 @@ impl MemoryWitness {
             .saturating_add(self.decision_staged)
             .saturating_add(self.decision_text_mask)
             .saturating_add(self.decision_upload)
+            .saturating_add(self.held)
     }
 
     /// The witness with the decision labels' bytes, which their owner
@@ -2015,6 +2050,32 @@ pub struct Renderer {
     /// How the result pages upload ended on the renderer's own account
     /// since the last boundary (a refused step, or a withdrawal).
     pages_report: Option<PagesStep>,
+    /// How skin arrays are created: off the frame, or synchronously
+    /// (`crate::residency`).
+    creation_path: crate::residency::Path,
+    /// The values the residency fence is signalled with.
+    fence_values: crate::residency::FenceValues,
+    /// The play staging's array whose residency is in flight.
+    staging_creation: Option<creation::StagingCreation>,
+    /// The result pages upload's array whose residency is in flight.
+    pages_creation: Option<creation::PagesCreation>,
+    /// The array imported for the next upload, its creation's.
+    import_texture: Option<(crate::residency::NativeCreate, wgpu::Texture)>,
+    /// The deadline its owner gave the next ticket, from the ticket's
+    /// own request.
+    ticket_deadline: Option<Deadline>,
+    /// What a renderer before this one left in flight on a healthy
+    /// rebuild, and what this one leaves (`crate::ResidencyHolder`).
+    holder: crate::residency::ResidencyHolder,
+    /// The residency lines for the render report, newest last.
+    residency_lines: [Option<crate::residency::ResidencyLine>; 4],
+    /// Unit tests: arrays the `Sync` path created.
+    #[cfg(test)]
+    sync_creations: u32,
+    /// The clock ticket deadlines are read on, their owner's
+    /// ([`set_deadline_clock`](Self::set_deadline_clock)); the slice clock
+    /// without one.
+    creation_clock: Option<Arc<dyn TimeSource>>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -2186,6 +2247,16 @@ impl Renderer {
         };
         let adapter = gpu::adapter(&instance, adapter, surface.as_ref())?;
         let gpu = gpu::device(&adapter)?;
+        // Unit tests choose their path (the fake, or the device's).
+        #[cfg(not(test))]
+        let creation_path = {
+            // SAFETY: the adapter outlives this call; the raw adapter is
+            // cloned (AddRef).
+            let a3 = unsafe { adapter.as_hal::<wgpu_hal::api::Dx12>() }.map(|a| a.as_raw().clone());
+            crate::residency::path(gpu.device(), a3)
+        };
+        #[cfg(test)]
+        let creation_path = crate::residency::Path::Sync("unit tests");
         let device = gpu.device();
         let (output, format) = match surface {
             Some(surface) => {
@@ -2324,6 +2395,17 @@ impl Renderer {
             loading_report: None,
             pages_upload: None,
             pages_report: None,
+            creation_path,
+            fence_values: crate::residency::FenceValues::new(),
+            staging_creation: None,
+            pages_creation: None,
+            import_texture: None,
+            ticket_deadline: None,
+            holder: crate::residency::ResidencyHolder::default(),
+            residency_lines: [None, None, None, None],
+            #[cfg(test)]
+            sync_creations: 0,
+            creation_clock: None,
             pacer: Pacer::default(),
             #[cfg(feature = "dev-tools")]
             present_stamps: None,
@@ -2864,6 +2946,47 @@ impl Renderer {
             && self.committed_atlas(kind) != Some(bundle.atlas_id())
     }
 
+    /// Whether staging `bundle` as `kind`'s waits for room that arrays
+    /// whose residency is in flight hold (design.md "Memory Budget"): its
+    /// admission, or its own retirement entry, would come only once their
+    /// fences complete, so its owner keeps the request waiting for its
+    /// room, under its ticket's deadline, rather than asking (which
+    /// answers [`RenderError::RoomPending`]). Reads only.
+    #[must_use]
+    pub fn room_waits(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        if self
+            .committed_installation(kind)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return false;
+        }
+        let own = self.committed_atlas(kind) != Some(bundle.atlas_id());
+        self.waits_for_residency(kind, self.candidate_charge(kind, bundle), own)
+    }
+
+    /// [`room_waits`](Self::room_waits) for a result pages begin of
+    /// `pages` ([`begin_pages`](Self::begin_pages)). Reads only.
+    #[must_use]
+    pub fn pages_room_waits(&self, pages: &Arc<PackedPages>) -> bool {
+        if self.result_disabled || self.committed_atlas(ScreenKind::Result) == Some(pages.id()) {
+            return false;
+        }
+        self.waits_for_residency(ScreenKind::Result, pages_texels(pages), true)
+    }
+
+    /// Whether `charge` as `kind`'s, with a retirement entry of its own
+    /// when `entry`, fits only once residencies in flight complete.
+    fn waits_for_residency(&self, kind: ScreenKind, charge: u64, entry: bool) -> bool {
+        let no_entry = entry
+            && self.retire.free() == 0
+            && !(self.destroy_allowed && self.retire.oldest(false).is_some());
+        (no_entry && self.retire.residing_pending())
+            || matches!(
+                self.reclaim(kind, charge, self.destroy_allowed),
+                Reclaim::Wait
+            )
+    }
+
     /// Whether staging `bundle` as `kind`'s now needs no destruction in its
     /// call: its admission with no filled entry destroyed (the pool's
     /// optional layers yielding, and a reduction's retired pool needing
@@ -2885,8 +3008,10 @@ impl Renderer {
             return true;
         }
         let charge = self.candidate_charge(kind, bundle);
-        if matches!(self.reclaim(kind, charge, true), Reclaim::Refused(_)) {
-            return true;
+        match self.reclaim(kind, charge, true) {
+            Reclaim::Refused(_) => return true,
+            Reclaim::Wait => return false,
+            _ => {}
         }
         // Its own entry, and a reduction's when the live pool has more
         // layers than it keeps.
@@ -2899,9 +3024,14 @@ impl Renderer {
                 2
             }
             Reclaim::Reduce(_) => 1,
-            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => return false,
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) | Reclaim::Wait => {
+                return false;
+            }
         };
-        self.retire.free() >= entries || self.retire.oldest(false).is_none()
+        // An array whose residency is in flight frees its entry once its
+        // fence completes: waited for, as a filled entry is.
+        self.retire.free() >= entries
+            || (self.retire.oldest(false).is_none() && !self.retire.residing_pending())
     }
 
     /// Stages `bundle`'s play installation for the early request
@@ -2955,12 +3085,12 @@ impl Renderer {
                 Some(2)
             }
             Reclaim::Reduce(_) => Some(1),
-            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => None,
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) | Reclaim::Wait => None,
         };
         if let Some(entries) = entries {
             return if self.retire.free() >= entries {
                 EarlyRoom::Fits
-            } else if self.retire.oldest(false).is_some() {
+            } else if self.retire.oldest(false).is_some() || self.retire.residing_pending() {
                 EarlyRoom::Wait
             } else {
                 EarlyRoom::Refused
@@ -3131,6 +3261,7 @@ impl Renderer {
         let charge = self.candidate_charge(kind, bundle);
         match self.reclaim(kind, charge, false) {
             Reclaim::Fits | Reclaim::Destroy | Reclaim::Reduce(_) => Ok(()),
+            Reclaim::Wait => Err(RenderError::RoomPending { kind }),
             Reclaim::ReleaseResult | Reclaim::Refused(_) => Err(RenderError::Admission {
                 kind,
                 needed: self.needed(kind, charge),
@@ -3149,12 +3280,37 @@ impl Renderer {
     /// `destroy`, once the pool keeps its firm layer alone and the result's
     /// installation is released and destroyed; or it is refused. A
     /// selection candidate replaces the pool, so its optional layers go
-    /// with the kind. A retired pool is outside the sum.
+    /// with the kind. A retired pool is outside the sum. The holder's
+    /// arrays and the entries whose residency is in flight stay in every
+    /// sum, since no boundary may release them before their fences
+    /// complete; where only they stand in the way, it waits for them.
     fn reclaim(&self, kind: ScreenKind, charge: u64, destroy: bool) -> Reclaim {
         let entries = self.retire.charged();
-        let base = self.committed_needed(kind, charge);
+        let held = self.held_charge();
+        let stuck = self.retire.unsettled_charge();
+        let base = self.committed_needed(kind, charge).saturating_add(held);
         let all = base.saturating_add(entries);
-        let least = if destroy { base } else { all };
+        let least = if destroy {
+            base.saturating_add(stuck)
+        } else {
+            all
+        };
+        match self.reclaim_from(kind, all, least, destroy) {
+            Reclaim::Refused(needed) if held.saturating_add(stuck) > 0 => {
+                let freed = least.saturating_sub(held).saturating_sub(stuck);
+                match self.reclaim_from(kind, freed, freed, destroy) {
+                    Reclaim::Refused(_) => Reclaim::Refused(needed),
+                    _ => Reclaim::Wait,
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// [`reclaim`](Self::reclaim)'s order on the sums it reads: `all`, with
+    /// every filled entry, and `least`, with only what no destruction
+    /// frees.
+    fn reclaim_from(&self, kind: ScreenKind, all: u64, least: u64, destroy: bool) -> Reclaim {
         let (layer, optional) = if kind == ScreenKind::Selection {
             (0, 0)
         } else {
@@ -3185,10 +3341,12 @@ impl Renderer {
 
     /// The level-0 texels `charge` as `kind`'s needs beside every other
     /// kind's committed charge and the filled retirement entries as they
-    /// stand, the pool's optional layers left out.
+    /// stand, with what the holder keeps from an earlier renderer, the
+    /// pool's optional layers left out.
     fn needed(&self, kind: ScreenKind, charge: u64) -> u64 {
         self.committed_needed(kind, charge)
             .saturating_add(self.retire.charged())
+            .saturating_add(self.held_charge())
     }
 
     /// [`needed`](Self::needed) without the filled entries. Another
@@ -3206,16 +3364,18 @@ impl Renderer {
             })
     }
 
-    /// The staging's kind and the charge it is admitted at, if any.
+    /// The staging's kind and the charge it is admitted at, if any: a
+    /// staging whose array is being created is charged from its ticket.
     fn pending_charge(&self) -> Option<(ScreenKind, u64)> {
-        self.pending.as_ref().map(|p| {
-            let charge = match (&p.skin, &p.pages) {
-                (Some(s), _) => self.candidate_charge(p.token.kind, s.bundle()),
-                (None, Some(pages)) => pages_texels(pages),
-                (None, None) => 0,
-            };
-            (p.token.kind, charge)
-        })
+        let Some(p) = &self.pending else {
+            return self.creation_charge();
+        };
+        let charge = match (&p.skin, &p.pages) {
+            (Some(s), _) => self.candidate_charge(p.token.kind, s.bundle()),
+            (None, Some(pages)) => pages_texels(pages),
+            (None, None) => 0,
+        };
+        Some((p.token.kind, charge))
     }
 
     /// Whether `charge` as `kind`'s fits now, filled entries and the
@@ -3255,8 +3415,21 @@ impl Renderer {
                     };
                     self.destroy_now(i)?;
                 }
-                Ok(())
+                // Nothing is admitted past the limit: an entry no boundary
+                // may destroy yet makes it wait.
+                if self.fits_now(kind, charge) {
+                    Ok(())
+                } else if self.retire.residing_pending() || self.held_charge() > 0 {
+                    Err(RenderError::RoomPending { kind })
+                } else {
+                    Err(RenderError::Admission {
+                        kind,
+                        needed: self.needed(kind, charge),
+                        limit: SHARED_TEXELS,
+                    })
+                }
             }
+            Reclaim::Wait => Err(RenderError::RoomPending { kind }),
             Reclaim::Reduce(layers) => {
                 self.destroy_charged()?;
                 self.reduce_pool(layers, kind)
@@ -3343,6 +3516,11 @@ impl Renderer {
             }
             match self.retire.oldest(false) {
                 Some(i) if self.destroy_allowed => self.destroy_now(i)?,
+                // Only entries whose residency is in flight hold the list:
+                // one frees once its fence completes.
+                None if self.retire.residing_pending() => {
+                    return Err(RenderError::RoomPending { kind });
+                }
                 _ => return Err(RenderError::ListFull { kind }),
             }
         }
@@ -3431,11 +3609,13 @@ impl Renderer {
         }
     }
 
-    /// The result pages upload in hand's charge, from its begin.
+    /// The result pages upload in hand's charge, from its begin, its
+    /// array's creation included.
     fn pages_charge(&self) -> u64 {
         self.pages_upload
             .as_ref()
             .map_or(0, |u| pages_texels(&u.res.pages))
+            .saturating_add(self.pages_creation_charge())
     }
 
     /// The pages `kind`'s committed atlas array holds, if any: its
@@ -3522,6 +3702,7 @@ impl Renderer {
             pool: self.pool_optional(),
             filled: self.retire.charged(),
             retired_pool: self.retire.retired_pool(),
+            held: self.held_charge(),
         }
     }
 
@@ -3699,7 +3880,9 @@ impl Renderer {
             };
             sum.saturating_add(charge)
         });
-        let used = used.saturating_add(self.retire.charged());
+        let used = used
+            .saturating_add(self.retire.charged())
+            .saturating_add(self.held_charge());
         if used > SHARED_TEXELS {
             return self.pool();
         }
@@ -3901,11 +4084,23 @@ impl Renderer {
         request: u64,
         stepped: bool,
     ) -> Result<Option<PreparedToken>, RenderError> {
+        // Each call takes the deadline its owner set, whether it starts a
+        // ticket or not.
+        let deadline = self.ticket_deadline.take();
         if kind == ScreenKind::Result && self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
         if kind == ScreenKind::Result {
             self.end_pages_upload();
+        }
+        // Asked again while its array's residency is in flight: staged on
+        // the array once its fence completes.
+        if self
+            .staging_creation
+            .as_ref()
+            .is_some_and(|c| c.t.id == request && c.kind == kind)
+        {
+            return self.resume_staging(kind, bundle, a, request, stepped);
         }
         // Asked again: the staging in progress answers, taking no request.
         if self
@@ -3919,6 +4114,11 @@ impl Renderer {
         {
             return self.staging_answer(request);
         }
+        // Its room held by arrays whose residency is in flight: nothing
+        // made and its request not taken, its owner waiting for the room.
+        if self.room_waits(kind, bundle) {
+            return Err(RenderError::RoomPending { kind });
+        }
         // The committed bundle keeps its resources: nothing of its own,
         // and no entry.
         let own = !self
@@ -3926,6 +4126,28 @@ impl Renderer {
             .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle));
         let entry = self.begin_staging(request, kind, own)?;
         self.stage_failed = None;
+        // Play's own array, in steps: created off the frame first, the
+        // boundary's heavy operation, and staged once its residency
+        // completes.
+        if own
+            && stepped
+            && kind == ScreenKind::Play
+            && self.committed_atlas(kind) != Some(bundle.atlas_id())
+        {
+            self.staging_entry = entry;
+            let started = self.start_staging_creation(kind, bundle, request, entry, deadline);
+            self.staging_entry = None;
+            match started {
+                Ok(true) => return Ok(None),
+                Ok(false) => {}
+                Err(e) => {
+                    if let Some(i) = entry {
+                        self.retire.release(i);
+                    }
+                    return Err(e);
+                }
+            }
+        }
         self.staging_entry = entry;
         let staged = self.stage_on(kind, bundle, a, request, entry, stepped);
         self.staging_entry = None;
@@ -3938,6 +4160,95 @@ impl Renderer {
         }
         staged?;
         self.staging_answer(request)
+    }
+
+    /// Admits `bundle` as `kind`'s, charged from now, and starts its
+    /// array's creation off the frame for `request`: whether it started
+    /// (false: the `Sync` path stages it in this call).
+    fn start_staging_creation(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+        entry: Option<usize>,
+        deadline: Option<Deadline>,
+    ) -> Result<bool, RenderError> {
+        if !matches!(self.creation_path, crate::residency::Path::Async(_)) {
+            return Ok(false);
+        }
+        let Some(key) = self.native_key(bundle.atlas_pages()) else {
+            return Ok(false);
+        };
+        self.admit_bundle(kind, bundle)?;
+        let charge = self.candidate_charge(kind, bundle);
+        match self.start_creation(key, request, charge, deadline)? {
+            creation::Started::Async(t) => {
+                self.staging_creation = Some(creation::StagingCreation {
+                    kind,
+                    bundle: Arc::clone(bundle),
+                    entry,
+                    t,
+                });
+                Ok(true)
+            }
+            creation::Started::Sync => Ok(false),
+        }
+    }
+
+    /// The staging of `request`, asked again while its array's creation is
+    /// in flight: `None` while its residency is; staged on the imported
+    /// array once it completed; its timeout or the device's removal,
+    /// answered once.
+    fn resume_staging(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+        a: Option<&AttemptInput<'_>>,
+        request: u64,
+        stepped: bool,
+    ) -> Result<Option<PreparedToken>, RenderError> {
+        let now = self.creation_now();
+        let Some(seen) = self.staging_creation.as_ref().map(|c| self.seen(&c.t, now)) else {
+            return Ok(None);
+        };
+        if let Some(e) = self.creation_end(seen, self.gpu.lost()) {
+            self.end_staging_creation(e);
+            return self.staging_answer(request);
+        }
+        match seen {
+            creation::Seen::Pending | creation::Seen::TimedOut | creation::Seen::Removed => {
+                Ok(None)
+            }
+            creation::Seen::Ready => {
+                let Some(c) = self.staging_creation.take() else {
+                    return Ok(None);
+                };
+                // Another bundle asked under the same request: its array
+                // is not this one's.
+                if !Arc::ptr_eq(&c.bundle, bundle) {
+                    let entry = c.entry;
+                    self.retire_ticket(c.t, entry, c.kind);
+                    return Err(RenderError::Superseded {
+                        request,
+                        newer: self.requested,
+                    });
+                }
+                let entry = c.entry;
+                self.import(c.t);
+                self.staging_entry = entry;
+                let staged = self.stage_on(kind, bundle, a, request, entry, stepped);
+                self.staging_entry = None;
+                // Imported and not taken by a staging that failed first.
+                self.import_texture = None;
+                if staged.is_err()
+                    && let Some(i) = entry
+                {
+                    self.retire.release(i);
+                }
+                staged?;
+                self.staging_answer(request)
+            }
+        }
     }
 
     /// The staging of `request` as it stands: its token once its last
@@ -4338,6 +4649,18 @@ impl Renderer {
         };
         let layers =
             skin_atlas::check_pages(&upload, &device.limits()).map_err(RenderError::Atlas)?;
+        // The array its creation made off the frame, of this shape; none: one
+        // created here.
+        let imported = self
+            .import_texture
+            .take()
+            .filter(|(k, _)| k.side == upload.side && k.layers == layers)
+            .map(|(_, t)| t);
+        let was_imported = imported.is_some();
+        #[cfg(test)]
+        if stepped && !was_imported {
+            self.sync_creations += 1;
+        }
         #[cfg(feature = "dev-tools")]
         let mut p_bind = Duration::ZERO;
         #[cfg(feature = "dev-tools")]
@@ -4346,7 +4669,7 @@ impl Renderer {
         let p_scope0 = crate::probe::Span::start();
         let ((atlas, atlas_bind, buffer), refused) = skin_atlas::scoped(device, || {
             let atlas = if stepped {
-                AtlasTexture::create(&self.gpu, &upload, layers)
+                AtlasTexture::create(&self.gpu, &upload, layers, imported)
             } else {
                 AtlasTexture::upload(&self.gpu, &upload, layers)
             };
@@ -4433,7 +4756,11 @@ impl Renderer {
             cmark!("up", "scoped_total_us", us(p_scoped));
             cmark!("up", "refused", i64::from(refused));
         };
-        self.note_heavy();
+        // An imported array's creation was its request's heavy operation;
+        // its import and binding are not one.
+        if !was_imported {
+            self.note_heavy();
+        }
         if let Some(e) = refused {
             #[cfg(feature = "dev-tools")]
             p_summary(true);
@@ -5362,6 +5689,9 @@ impl Renderer {
         if let Some(p) = self.pending.take() {
             self.retire_candidate(p);
         }
+        // A staging whose array is still being created: kept charged until
+        // its fence completes.
+        self.withdraw_staging_creation();
         self.drop_loading_upload(true);
     }
 
@@ -6639,6 +6969,10 @@ impl Renderer {
         // the last boundary.
         if !staging_only {
             out.text = self.loading_report.take();
+            // The creations in flight, each fence read once.
+            if self.poll_creations(&mut out) {
+                self.finish_pages_creation();
+            }
         }
         let clock = self.slice_source();
         let budget = Deadline::after(clock.now(), crate::upload::micros(slice));
@@ -6956,6 +7290,7 @@ impl Renderer {
         self.staging_steps()
             || self.bga_upload.is_some()
             || self.pages_steps()
+            || self.pages_creation.is_some()
             || self.result_text_steps()
     }
 
@@ -7467,7 +7802,7 @@ impl Renderer {
     /// what READY waits to see at zero.
     #[must_use]
     pub fn filled(&self) -> u32 {
-        self.retire.filled()
+        self.retire.filled_for_cutoff(self.creation_now())
     }
 
     /// At a boundary where destruction is allowed: destroys every filled
@@ -7483,14 +7818,19 @@ impl Renderer {
         let (out, ran) = self.retire.destroy_due(self.gpu.seen(), heavy);
         if ran {
             self.note_heavy();
+        } else if heavy {
+            // What an earlier renderer left in flight, once its fence
+            // completed.
+            self.release_held();
         }
         out
     }
 
-    /// Whether a filled entry with a heavy part to destroy is due now.
+    /// Whether a filled entry with a heavy part to destroy is due now, or
+    /// a resource the holder keeps may be released.
     #[must_use]
     pub fn due_heavy(&self) -> bool {
-        self.retire.due_heavy(self.gpu.seen())
+        self.retire.due_heavy(self.gpu.seen()) || self.holder.releasable()
     }
 
     /// Whether a filled entry waits for a completion not yet seen.
@@ -7757,6 +8097,13 @@ impl Renderer {
                 PendingRes::Layout { staging, .. } => (0, 0, staging.bytes(), 0),
                 PendingRes::Installed | PendingRes::Pages(None) => (0, 0, 0, 0),
             });
+        // A play staging's array in creation, its residency in flight, is
+        // the staging's: imported, it is the one `pending` holds.
+        let staged_atlas = staged_atlas.saturating_add(
+            self.staging_creation
+                .as_ref()
+                .map_or(0, |c| c.t.key.bytes()),
+        );
         // Each committed bundle's own bytes are counted with it: the staged
         // one's only when it is none of them.
         let committed = [installed, result_installation];
@@ -7888,19 +8235,24 @@ impl Renderer {
                 )
                 .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
             result_loading,
-            pages_upload: self.pages_upload.as_ref().map_or(0, |u| {
-                // The queue's staging: its step in flight, while its
-                // completion is unseen.
-                let staged = self
-                    .step
-                    .as_ref()
-                    .map_or(0, |s| s.staged_for(crate::Payload::Pages));
-                u.res
-                    .atlas
-                    .bytes()
-                    .saturating_add(staged)
-                    .saturating_add(u.res.text_cache.bytes())
-            }),
+            pages_upload: self
+                .pages_upload
+                .as_ref()
+                .map_or(0, |u| {
+                    // The queue's staging: its step in flight, while its
+                    // completion is unseen.
+                    let staged = self
+                        .step
+                        .as_ref()
+                        .map_or(0, |s| s.staged_for(crate::Payload::Pages));
+                    u.res
+                        .atlas
+                        .bytes()
+                        .saturating_add(staged)
+                        .saturating_add(u.res.text_cache.bytes())
+                })
+                // Its array in creation, before the upload holds it.
+                .saturating_add(self.pages_creation.as_ref().map_or(0, |c| c.t.key.bytes())),
             retired,
             retired_pool,
             // Kept apart from the renderer: `with_decision` adds them.
@@ -7908,6 +8260,7 @@ impl Renderer {
             decision_staged: 0,
             decision_text_mask: 0,
             decision_upload: 0,
+            held: self.holder.bytes(),
         }
     }
 
@@ -11399,6 +11752,8 @@ mod configure_tests;
 #[path = "chart_upload_tests.rs"]
 mod chart_upload_tests;
 
+#[path = "creation.rs"]
+mod creation;
 #[path = "pages_upload.rs"]
 mod pages_upload;
 pub use pages_upload::{PagesBegun, PagesStep};
@@ -11406,6 +11761,10 @@ pub use pages_upload::{PagesBegun, PagesStep};
 #[cfg(test)]
 #[path = "pages_upload_tests.rs"]
 mod pages_upload_tests;
+
+#[cfg(test)]
+#[path = "creation_tests.rs"]
+mod creation_tests;
 
 #[cfg(test)]
 mod tests {

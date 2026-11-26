@@ -28,7 +28,7 @@
 
 /// The protocol's version, the first field of [`Reply::Hello`]: the game
 /// refuses a worker that names another before it hands it anything.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// The most bytes a frame holds after its length.
 pub const MAX_FRAME: usize = 8_192;

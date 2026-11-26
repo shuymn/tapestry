@@ -605,15 +605,21 @@ const GATE_BOUND: Duration = Duration::from_secs(60);
 #[cfg(feature = "dev-tools")]
 pub static PREPARATION_HELD: AtomicBool = AtomicBool::new(false);
 
-/// The launch gate (dev-tools): while the file `TAPESTRY_DEV_LAUNCH_GATE`
-/// names exists, the worker's launch waits on its own thread, at most
-/// [`GATE_BOUND`], before the launch takes anything the user's other
-/// launches share ([`super::launch::Launches`]); `<gate>.reached` exists
-/// while it waits. A scenario keeps its own game's launch past a screen's
-/// preparation deadline with it, and an ended game leaves nothing held.
+/// A file gate (dev-tools): while the file the environment variable `var`
+/// names exists, the calling thread waits, at most [`GATE_BOUND`];
+/// `<gate>.reached` exists while it waits. The gate is a file of the
+/// scenario's own, so an ended game leaves nothing held.
+///
+/// - The launch gate, `TAPESTRY_DEV_LAUNCH_GATE`: the worker's launch waits
+///   on its own thread before it takes anything the user's other launches
+///   share ([`super::launch::Launches`]). A scenario keeps its own game's
+///   launch past a screen's preparation deadline with it.
+/// - The open gate, `TAPESTRY_DEV_OPEN_GATE`: the BGA job waits before it
+///   opens a chart video it resolved (`bga::open_video`), so a scenario can
+///   swap the name's folder between the resolution and the open.
 #[cfg(feature = "dev-tools")]
-fn launch_gate() {
-    let Some(gate) = std::env::var_os("TAPESTRY_DEV_LAUNCH_GATE") else {
+pub(crate) fn file_gate(var: &str) {
+    let Some(gate) = std::env::var_os(var) else {
         return;
     };
     let gate = std::path::Path::new(&gate);
@@ -1282,7 +1288,7 @@ impl Supervisor {
             .name("media worker launch".to_owned())
             .spawn(move || {
                 #[cfg(feature = "dev-tools")]
-                launch_gate();
+                file_gate("TAPESTRY_DEV_LAUNCH_GATE");
                 let launched =
                     Worker::launch(&launching.installation, &launching.data, &launching.setup);
                 let _ = tx.send(Inner::Launched(launched));

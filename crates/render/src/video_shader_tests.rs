@@ -11,8 +11,10 @@
 use super::pool_shader_tests::{FORMAT, H, W, atlas_of, draw, image};
 use super::{Instance, pipelines};
 use crate::video::{
-    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES, VIDEO_UV, Video, movie_bytes,
+    FLAG_VIDEO, FLAG_VIDEO_BT601, FLAG_VIDEO_FULL, MAX_MOVIES, VIDEO_UV, Video, chroma_flags,
+    movie_bytes,
 };
+use skin_model::media::ChromaLocation;
 
 /// An odd frame: the chroma planes round up, the luma rows are not a
 /// multiple of the copy's 256-byte pitch.
@@ -434,4 +436,120 @@ fn the_pipeline_s_texture_bindings_fit_the_device_limit() {
     assert!(sampled <= limit, "{sampled} sampled textures over {limit}");
     let (_, refused) = crate::skin_atlas::scoped(gpu.device(), || pipelines(gpu, FORMAT));
     assert!(refused.is_none(), "{refused:?}");
+}
+
+/// The value at chroma sample coordinate `c` (sample `i` at `i`) of a row
+/// of `n` samples that read `lo` below sample `k` and `hi` from it on,
+/// bilinear and clamped at its ends, as the sampler reads it.
+fn step_at(c: f64, k: u32, n: u32, (lo, hi): (u8, u8)) -> f64 {
+    let last = f64::from(n - 1);
+    let c = c.clamp(0.0, last);
+    let i = c.floor();
+    let f = c - i;
+    let at = |j: f64| f64::from(if j < f64::from(k) { lo } else { hi });
+    at(i) * (1.0 - f) + at((i + 1.0).min(last)) * f
+}
+
+/// Each chroma location's samples are read where the frame sited them
+/// (design.md "Rendering and Skins", video frames): for every location,
+/// a U plane with a step between two columns, and one with a step between
+/// two rows, at an even and an odd size, read at the luma samples around
+/// the step and at the plane's first and last, give the interpolation of
+/// the chroma samples at their sited places, a quarter chroma sample from
+/// the centred ones along each axis the location moves.
+#[test]
+fn a_movie_s_chroma_is_read_at_its_frame_s_location() {
+    let mut rig = Rig::new();
+    let (y, v) = (128_u8, 128_u8);
+    let step = (40_u8, 220_u8);
+    let sites = [
+        ChromaLocation::Left,
+        ChromaLocation::Centre,
+        ChromaLocation::TopLeft,
+        ChromaLocation::Top,
+        ChromaLocation::BottomLeft,
+        ChromaLocation::Bottom,
+    ];
+    for (w, h) in [(32_u32, 24_u32), (33, 25)] {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        for rows in [false, true] {
+            // The step: between samples k - 1 and k of the axis.
+            let (n, cn) = if rows { (h, ch) } else { (w, cw) };
+            let k = cn / 2;
+            let u: Vec<Vec<u8>> = (0..ch)
+                .map(|r| {
+                    (0..cw)
+                        .map(|c| {
+                            let i = if rows { r } else { c };
+                            if i < k { step.0 } else { step.1 }
+                        })
+                        .collect()
+                })
+                .collect();
+            let frame = [
+                vec![vec![y; w as usize]; h as usize],
+                u,
+                vec![vec![v; cw as usize]; ch as usize],
+            ];
+            rig.reserve(0, w, h);
+            rig.write(0, w, h, &frame);
+            // Luma sample centres: the first, the four around the step,
+            // the last.
+            let k2 = f64::from(2 * k);
+            let along = [
+                0.5,
+                k2 - 1.5,
+                k2 - 0.5,
+                k2 + 0.5,
+                k2 + 1.5,
+                f64::from(n) - 0.5,
+            ];
+            let mut quads = Vec::new();
+            let mut want = Vec::new();
+            for (si, &site) in sites.iter().enumerate() {
+                let (qx, qy) = site.quarters();
+                let shift = f64::from(if rows { qy } else { qx }) / 4.0;
+                for (pi, &p) in along.iter().enumerate() {
+                    let t = (p / f64::from(n)) as f32;
+                    let uv = if rows {
+                        [0.5, t, 0.5, t]
+                    } else {
+                        [t, 0.5, t, 0.5]
+                    };
+                    let x = 4.0 + 12.0 * (si * along.len() + pi) as f32;
+                    quads.push((
+                        0,
+                        Instance {
+                            rect: [x, 4.0, 8.0, 8.0],
+                            uv,
+                            color: [1.0; 4],
+                            pivot: [0.0, 0.0],
+                            angle: 0.0,
+                            flags: FLAG_VIDEO | chroma_flags(site),
+                        },
+                    ));
+                    // The sited samples' coordinate at this luma sample.
+                    let c = p / 2.0 - 0.5 - shift;
+                    let u = step_at(c, k, cn, step);
+                    want.push((
+                        x as usize + 4,
+                        site,
+                        p,
+                        reference(y.into(), u, v.into(), false, false),
+                    ));
+                }
+            }
+            let pixels = rig.draw(&quads);
+            for (x, site, p, colour) in want {
+                near(
+                    at(&pixels, x, 8),
+                    colour,
+                    &format!(
+                        "{w}x{h}, {}, {site:?} at {p}",
+                        if rows { "rows" } else { "columns" }
+                    ),
+                );
+            }
+        }
+    }
 }

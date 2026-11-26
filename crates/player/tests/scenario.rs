@@ -17,6 +17,7 @@ use replay::{
     BuildProvenance, ChartRecord, DecodeLimits, DeviceRecord, EndStatus, PlayRecord, PlayType,
     PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
 };
+use skin_model::media::ChromaLocation;
 
 /// The exit scenario, as committed.
 const EXIT: &str = include_str!("scenarios/exit.toml");
@@ -987,6 +988,10 @@ impl Drop for KeepOnFailure {
             for e in fs::read_dir(from)? {
                 let e = e?;
                 let (path, into) = (e.path(), to.join(e.file_name()));
+                // A link (a scenario's junction) is not followed.
+                if e.file_type()?.is_symlink() {
+                    continue;
+                }
                 if e.file_type()?.is_dir() {
                     copy(&path, &into)?;
                 } else {
@@ -5686,6 +5691,245 @@ fn chart_video_frames_follow_chart_time_in_a_scenario() {
     );
 }
 
+/// The chroma column a chroma-step frame's Cb steps at (`--dev-gen-clip`'s
+/// `paint=chroma-step` at 320 × 180): Cb 96 left of it and 160 from it.
+const STEP_COLUMN: u32 = 80;
+
+/// The chroma row a chroma-step frame's Cr steps at: Cr 96 above it and
+/// 160 from it.
+const STEP_ROW: u32 = 40;
+
+/// The sample of plane `plane` (0 the luma, 1 Cb, 2 Cr) at `x`, `y` of the
+/// H.264 chroma-step pictures, painted as `paint=chroma-step` paints.
+fn chroma_step_sample(plane: usize, x: u32, y: u32) -> u8 {
+    match plane {
+        0 => 128,
+        1 if x < STEP_COLUMN => 96,
+        2 if y < STEP_ROW => 96,
+        _ => 160,
+    }
+}
+
+/// The schedule of the H.264 chroma-step fixture, at 2 frames a second:
+/// four frames left-sited, then at each change an IDR with a new sequence
+/// whose VUI declares the next location type (ITU-T H.264 E.2.1: 0 left, 2
+/// top-left, 1 centre, 5 bottom) and four frames so.
+const STEP_CHANGES: [(chroma::Vui, ChromaLocation, u64); 4] = [
+    (chroma::Vui::Sited(0), ChromaLocation::Left, 4),
+    (chroma::Vui::Sited(2), ChromaLocation::TopLeft, 4),
+    (chroma::Vui::Sited(1), ChromaLocation::Centre, 4),
+    (chroma::Vui::Sited(5), ChromaLocation::Bottom, 4),
+];
+
+/// Where the steps of a chroma-step frame sited at `location` rise when it
+/// is drawn 1:1, in luma pixels from the frame's left and top edges: the
+/// Cb column step's along a row, and the Cr row step's along a column.
+///
+/// The shader reads the chroma at luma `uv` at `cuv = (uv · dims(Y) / 2 −
+/// shift) / dims(U)`, `shift` a quarter chroma sample against the centred
+/// one: −¼ in x for the left-sited locations, −¼ in y for the top ones and
+/// +¼ for the bottom ones (design.md "Rendering and Skins", video frames).
+/// At a 1:1 draw, pixel `x`'s `uv · dims(Y)` is `x + ½`, so it reads the
+/// plane at sample position `p = x / 2 − ¼ − shift` (sample `j` at `p =
+/// j`), and bilinear sampling ramps a step between samples `J − 1` and `J`
+/// linearly over `p` in `[J − 1, J]`: over `x` from `2J − 1.5 + 2 shift` to
+/// `2J + 0.5 + 2 shift`. A ramp sampled at whole pixels has its rise centre
+/// ([`chroma::rise_centre`]) at the ramp's centre, `2J − 0.5 + 2 shift`:
+/// centred samples at `2J − 0.5`, left or top ones half a pixel before it
+/// and bottom ones half a pixel after it.
+fn step_rises(location: ChromaLocation) -> [f64; 2] {
+    let (x, y) = match location {
+        ChromaLocation::Left => (-0.25, 0.0),
+        ChromaLocation::Centre => (0.0, 0.0),
+        ChromaLocation::TopLeft => (-0.25, -0.25),
+        ChromaLocation::Top => (0.0, -0.25),
+        ChromaLocation::BottomLeft => (-0.25, 0.25),
+        ChromaLocation::Bottom => (0.0, 0.25),
+    };
+    [
+        2.0 * f64::from(STEP_COLUMN) - 0.5 + 2.0 * x,
+        2.0 * f64::from(STEP_ROW) - 0.5 + 2.0 * y,
+    ]
+}
+
+/// How far a measured rise centre may lie from [`step_rises`]: well under
+/// the half pixel between two locations.
+const RISE_TOLERANCE: f64 = 0.15;
+
+/// The rise centres a capture `px` of a chroma-step frame drawn 1:1 shows:
+/// the Cb step's along rows 30 and 150 in the blue channel, which the Cb
+/// alone moves over flat luma, from column 150 to 169, and the Cr step's
+/// along columns 40 and 280 in the red, which the Cr alone moves, from row
+/// 70 to 89; each with the line it was read on, its axis (0 for x, 1 for
+/// y) and its whole rise in levels.
+fn measured_rises(px: &[[u8; 3]]) -> Vec<(String, usize, f64, f64)> {
+    let w = VIDEO_SIZE[0];
+    let mut out = Vec::new();
+    for y in [30, 150] {
+        let line: Vec<u8> = (150..170).map(|x| px[y * w + x][2]).collect();
+        let rise = f64::from(line[19]) - f64::from(line[0]);
+        let centre = 150.0 + chroma::rise_centre(&line);
+        out.push((format!("row {y}"), 0, centre, rise));
+    }
+    for x in [40, 280] {
+        let line: Vec<u8> = (70..90).map(|y| px[y * w + x][0]).collect();
+        let rise = f64::from(line[19]) - f64::from(line[0]);
+        let centre = 70.0 + chroma::rise_centre(&line);
+        out.push((format!("column {x}"), 1, centre, rise));
+    }
+    out
+}
+
+/// Each chart-video frame's chroma is drawn at its chroma location through
+/// the real media worker, the game's per-frame latch and the renderer
+/// (design.md "Rendering and Skins", video frames): two charts, played
+/// after a first play of the first launches the worker, show 320 × 180
+/// clips drawn 1:1 into 320 × 180 captures, every frame luma 128 with a
+/// step in Cb between chroma columns 79 and 80 and one in Cr between chroma
+/// rows 39 and 40. The first chart shows an MPEG-1 clip from 2 s and an
+/// MPEG-2 clip from 8 s, the second a full-range MJPEG clip from 2 s and,
+/// from 8 s, an H.264 stream whose sequence changes location mid-stream
+/// (left, top-left, centre, bottom, four 500 ms frames each). Each
+/// capture's location is the one its frame was authored with, never what
+/// the game latched: the codec's specification for the generated clips,
+/// which report none (centre for MPEG-1, ISO/IEC 11172-2, and JPEG, ITU-T
+/// T.871; left for MPEG-2, ITU-T H.262 6.1.1.8), and for the H.264 stream
+/// the schedule's location of the frame due at the capture's chart time.
+/// Each step's rise centre, read in the blue channel for Cb and the red for
+/// Cr, lies within 0.15 pixel of where the shader's sampling puts that
+/// location's step ([`step_rises`]), half a pixel from a neighbouring
+/// location's.
+// Covers: T02
+#[test]
+fn chart_video_chroma_is_drawn_at_each_frame_s_location() {
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "chart_video_chroma_is_drawn_at_each_frame_s_location");
+    // Chart `a`: m1.mpg on the base at 2 s, m2.mpg at 8 s; chart `b`:
+    // mj.avi at 2 s, h.avi at 8 s; each with four notes from 16 s.
+    for (name, first, second) in [("a", "m1.mpg", "m2.mpg"), ("b", "mj.avi", "h.avi")] {
+        let dir = fx.library().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        write_wav(&dir.join("key.wav"));
+        let text = format!(
+            "#PLAYER 1\n#TITLE chroma {name}\n#BPM 120\n#WAV01 key.wav\n\
+             #BMP01 {first}\n#BMP02 {second}\n\
+             #00138:01\n#00104:01\n#00404:02\n#00811:01010101\n"
+        );
+        fs::write(dir.join(format!("{name}.bms")), text).unwrap();
+    }
+    let a = fx.library().join("a");
+    gen_clip(
+        &a.join("m1.mpg"),
+        "mpeg1video mpeg 320x180 24 192 1 paint=chroma-step",
+    );
+    gen_clip(
+        &a.join("m2.mpg"),
+        "mpeg2video mpeg 320x180 24 192 1 paint=chroma-step",
+    );
+    let b = fx.library().join("b");
+    gen_clip(
+        &b.join("mj.avi"),
+        "mjpeg avi 320x180 10 80 1 paint=chroma-step",
+    );
+    // Coded 320 × 192 in I_PCM macroblocks, cropped to 320 × 180.
+    let parts: Vec<(chroma::Vui, u64)> = STEP_CHANGES.iter().map(|&(v, _, n)| (v, n)).collect();
+    let units = chroma::h264_sited((320, 192), (320, 180), &parts, &|_, p, x, y| {
+        chroma_step_sample(p, x, y)
+    });
+    fs::write(b.join("h.avi"), chroma::avi((320, 180), 2, b"H264", &units)).unwrap();
+    let schedule: Vec<ChromaLocation> = STEP_CHANGES
+        .iter()
+        .flat_map(|&(_, c, n)| std::iter::repeat_n(c, usize::try_from(n).unwrap()))
+        .collect();
+    install_video_skin(&fx);
+    // Chart `a`: inside each clip's span. Chart `b`: the MJPEG clip's span,
+    // then twice inside each of the H.264 stream's 500 ms frames.
+    let a_ats: Vec<i64> = (0..14).map(|k| 2_500 + 1_000 * k).collect();
+    let mut b_ats: Vec<i64> = (0..6).map(|k| 2_500 + 1_000 * k).collect();
+    b_ats.extend((0..16).flat_map(|k| [8_100 + 500 * k, 8_300 + 500 * k]));
+    let captures = |prefix: &str, ats: &[i64]| -> Vec<String> {
+        ats.iter()
+            .map(|at| format!("capture = {{ at = {at}, file = \"{prefix}{at}.png\" }}"))
+            .collect()
+    };
+    let (a_caps, b_caps) = (captures("a", &a_ats), captures("b", &b_ats));
+    let play = "play = { input = { miss = \"all\" }, until = \"end\" }";
+    let select_a = "select = { path = \"library/a/a.bms\" }";
+    let select_b = "select = { path = \"library/b/b.bms\" }";
+    // The first play of `a` launches the worker, which the session keeps
+    // for the run; the second play of `a` and the play of `b` are captured.
+    let mut steps = vec![select_a, play, "result = \"back\""];
+    steps.extend(a_caps.iter().map(String::as_str));
+    steps.extend([select_a, play, "result = \"back\""]);
+    steps.extend(b_caps.iter().map(String::as_str));
+    steps.extend([select_b, play, "result = \"back\"", "quit = {}"]);
+    let text = scenario(&steps).replacen(
+        "output = \"out\"\n",
+        "output = \"out\"\nsize = [320, 180]\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run_drained(&mut fx.command(&text), RUN_LIMIT);
+    fs::write(fx.base.join("run.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out_dir = fx.base.join("out");
+    // Each capture's clip and its frame's authored location, by its chart
+    // time; none outside the clips' spans.
+    let expected = |chart: &str, t: i64| -> Option<(&'static str, ChromaLocation)> {
+        match (chart, t) {
+            (_, ..2_000_000 | 16_000_000..) => None,
+            ("a", ..8_000_000) => Some(("MPEG-1", ChromaLocation::Centre)),
+            ("a", _) => Some(("MPEG-2", ChromaLocation::Left)),
+            (_, ..8_000_000) => Some(("MJPEG", ChromaLocation::Centre)),
+            _ => {
+                let due = due_frame(t - 8_000_000, 2).unwrap();
+                Some(("H.264", schedule[usize::try_from(due).unwrap()]))
+            }
+        }
+    };
+    let mut checked: Vec<String> = Vec::new();
+    for (chart, ats) in [("a", &a_ats), ("b", &b_ats)] {
+        for at in ats {
+            let name = format!("{chart}{at}");
+            let t = chart_us(&out_dir, &name);
+            let Some((clip, location)) = expected(chart, t) else {
+                continue;
+            };
+            let px = rgb(&out_dir.join(format!("{name}.png")));
+            let want = step_rises(location);
+            for (line, axis, centre, rise) in measured_rises(&px) {
+                println!(
+                    "{name} at {t}: {clip} {location:?}, {line}: a rise of {rise} centred at \
+                     {centre:.3}, expected {}",
+                    want[axis]
+                );
+                assert!(
+                    rise >= 48.0,
+                    "{name} at {t}: {clip}'s step along {line} rises {rise} levels"
+                );
+                assert!(
+                    (centre - want[axis]).abs() <= RISE_TOLERANCE,
+                    "{name} at {t}: {clip} {location:?}, the step along {line} centred at \
+                     {centre}, not {}",
+                    want[axis]
+                );
+            }
+            checked.push(format!("{clip} {location:?}"));
+        }
+    }
+    for (clip, least) in [
+        ("MPEG-1 Centre", 3),
+        ("MPEG-2 Left", 3),
+        ("MJPEG Centre", 3),
+        ("H.264 Left", 2),
+        ("H.264 TopLeft", 2),
+        ("H.264 Centre", 2),
+        ("H.264 Bottom", 2),
+    ] {
+        let n = checked.iter().filter(|c| *c == clip).count();
+        assert!(n >= least, "{clip}: {n} captures checked: {checked:?}");
+    }
+}
+
 /// The render thread's app region allocates nothing in any frame of a play
 /// whose movie hook runs all four movie slots (design.md "Scope of No
 /// Allocation"): a chart video on the base, started again inside its clip,
@@ -5849,5 +6093,7 @@ fn render_app_zero_with_video_bga() {
     );
 }
 
+#[path = "support/chroma.rs"]
+mod chroma;
 #[path = "scenario/faults.rs"]
 mod faults;

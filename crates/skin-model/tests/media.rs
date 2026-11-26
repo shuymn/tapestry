@@ -18,9 +18,9 @@ use std::thread;
 use std::time::Duration;
 
 use skin_model::media::{
-    CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Reader, Refused,
-    SLOT_HEADER_WORDS, SLOTS, STATE_WORD, Stamp, State, VERSION, WATERMARK_WORD, Window, Words,
-    Writer, supervision, watermark,
+    CHUNK_WORDS, ChromaLocation, Fault, Frame, Geometry, HEADER_WORDS, PROGRESS_WORD, Reader,
+    Refused, SLOT_HEADER_WORDS, SLOTS, STATE_WORD, Stamp, State, VERSION, WATERMARK_WORD, Window,
+    Words, Writer, supervision, watermark,
 };
 
 /// Run 1's window: the first minute.
@@ -130,6 +130,9 @@ fn assert_whole(read: &Read, g: Geometry, seq: u64) {
 /// How long the test frames last.
 const DURATION: i64 = 33_333;
 
+/// Where the test frames' chroma sits.
+const SITED: ChromaLocation = ChromaLocation::Left;
+
 /// A frame at `at` lasting [`DURATION`].
 const fn timed(at: i64) -> Stamp {
     Stamp {
@@ -144,8 +147,16 @@ fn publish(ring: &[AtomicU64], seq: u64, run: u64, at: i64) -> usize {
     let w = Writer::attach(ring).unwrap();
     let slot = w.claim(ring).expect("a free slot");
     let index = slot.index();
-    w.publish(ring, slot, &frame(w.geometry(), seq), seq, run, timed(at))
-        .unwrap();
+    w.publish(
+        ring,
+        slot,
+        &frame(w.geometry(), seq),
+        seq,
+        run,
+        timed(at),
+        SITED,
+    )
+    .unwrap();
     index
 }
 
@@ -161,6 +172,7 @@ const RUN: usize = 2;
 const STAMP: usize = 3;
 const INDEX: usize = 4;
 const BYTES: usize = 5;
+const CHROMA: usize = 7;
 
 /// How long a thread waits at a meeting point before the test fails: far
 /// beyond any wait of a run that passes, so it ends only a thread that is
@@ -421,6 +433,7 @@ fn ring_round_trip_writer_to_reader() {
                 seq: 2,
                 stamp: stamp(2),
                 duration: DURATION,
+                chroma: SITED,
             }),
             true
         )
@@ -456,7 +469,7 @@ fn ring_round_trip_writer_to_reader() {
         })
     );
     writer
-        .publish(ring, free, &frame(g, 7), 7, 2, timed(5_000_000))
+        .publish(ring, free, &frame(g, 7), 7, 2, timed(5_000_000), SITED)
         .unwrap();
     let at_seven = read(&mut reader, ring, 5_000_000).unwrap();
     assert_eq!(
@@ -465,6 +478,7 @@ fn ring_round_trip_writer_to_reader() {
             seq: 7,
             stamp: 5_000_000,
             duration: DURATION,
+            chroma: SITED,
         })
     );
     assert_whole(&at_seven, g, 7);
@@ -474,7 +488,7 @@ fn ring_round_trip_writer_to_reader() {
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     let claimed = writer.claim(ring).unwrap();
     assert_eq!(
-        writer.publish(ring, claimed, &[0; 10], 1, 1, timed(0)),
+        writer.publish(ring, claimed, &[0; 10], 1, 1, timed(0), SITED),
         Err(Refused::Frame(10)),
         "a frame of another size is not published"
     );
@@ -732,6 +746,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         ("its index", INDEX, 3),
         ("its frame size", BYTES, 8),
         ("its duration", DURATION_WORD, 20_000),
+        ("its chroma location", CHROMA, 3),
     ] {
         let mem = section(g);
         let ring = &*mem;
@@ -792,6 +807,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
                 (SEQ, 1 + (r >> 3 & 7)),
                 (STAMP, r >> 6 & 0xffff),
                 (DURATION_WORD, 1 + (r >> 22 & 0xffff)),
+                (CHROMA, 1 + (r >> 38) % 6),
             ];
             for (i, near) in fields {
                 let v = if rng.next().is_multiple_of(8) {
@@ -879,6 +895,7 @@ fn ring_take_into_writes_the_due_frame_at_the_pitch() {
             seq: 2,
             stamp: stamp(2),
             duration: DURATION,
+            chroma: SITED,
         }
     );
     assert!(longest_row <= w, "no write runs past a row");
@@ -1135,7 +1152,7 @@ fn publish_lasting(ring: &[AtomicU64], seq: u64, at: i64, duration: i64) -> usiz
     let slot = w.claim(ring).expect("a free slot");
     let index = slot.index();
     let frame = frame(w.geometry(), seq);
-    w.publish(ring, slot, &frame, seq, 1, Stamp { at, duration })
+    w.publish(ring, slot, &frame, seq, 1, Stamp { at, duration }, SITED)
         .unwrap();
     index
 }
@@ -1158,7 +1175,8 @@ fn a_taken_frame_carries_its_duration() {
         Frame {
             seq: 1,
             stamp: 1_000,
-            duration: 41_667
+            duration: 41_667,
+            chroma: SITED,
         }
     );
     mem[1].store(5, Ordering::Relaxed);
@@ -1259,4 +1277,143 @@ fn left_tells_whether_frames_of_the_run_remain() {
     let peek = reader.peek(ring, 0).unwrap();
     assert_eq!(peek.due.map(|d| d.seq()), None);
     assert!(peek.left, "run 2's frame, none due");
+}
+
+/// Publishes frame `seq` of run 1 at `at`, its chroma sited at `chroma`.
+#[track_caller]
+fn publish_sited(ring: &[AtomicU64], seq: u64, at: i64, chroma: ChromaLocation) -> usize {
+    let w = Writer::attach(ring).unwrap();
+    let slot = w.claim(ring).expect("a free slot");
+    let index = slot.index();
+    let frame = frame(w.geometry(), seq);
+    w.publish(ring, slot, &frame, seq, 1, timed(at), chroma)
+        .unwrap();
+    index
+}
+
+/// Each frame carries its own chroma location (design.md "Rendering and
+/// Skins", video frames): the peek's choice and the frame taken hold the
+/// one its slot held, every location FFmpeg names passes, and a slot word
+/// that names none (unspecified, or past the six) fails the player as a
+/// ring fault, which then reads nothing more. A ring of version 6, whose
+/// slots hold no location, is not this layout.
+// Covers: T02
+#[test]
+fn each_frame_carries_its_chroma_location() {
+    let g = Geometry::new(16, 9).unwrap();
+    let all = [
+        ChromaLocation::Left,
+        ChromaLocation::Centre,
+        ChromaLocation::TopLeft,
+        ChromaLocation::Top,
+        ChromaLocation::BottomLeft,
+        ChromaLocation::Bottom,
+    ];
+    for (k, chroma) in all.into_iter().enumerate() {
+        let mem = section(g);
+        let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+        let slot = publish_sited(&mem, 1, 1_000, chroma);
+        assert_eq!(
+            slot_word(&mem, g, slot, CHROMA).load(Ordering::Relaxed),
+            k as u64 + 1,
+            "{chroma:?}: AVChromaLocation's value"
+        );
+        let due = reader.peek(&*mem, 1_000).unwrap().due.unwrap();
+        assert_eq!(due.chroma(), chroma, "the peek's choice");
+        let f = reader.take(&*mem, due, tight(g), &mut |_, _| true).unwrap();
+        assert_eq!(f.chroma, chroma, "the frame taken");
+    }
+    for value in [0, 7, u64::MAX] {
+        let (mem, mut reader) = taken_one(g);
+        slot_word(&mem, g, 1, CHROMA).store(value, Ordering::Relaxed);
+        let fault = Fault::Chroma { slot: 1, value };
+        assert_eq!(reader.peek(&*mem, 5_000), Err(fault), "{value}");
+        assert_eq!(reader.fault(), Some(fault), "{value}: the player failed");
+        let watched = Watched::new(&mem);
+        assert_eq!(reader.peek(&watched, 6_000), Err(fault), "{value}: kept");
+        assert_eq!(watched.take_log(), [], "{value}: nothing more read");
+    }
+    let mem = section(g);
+    let _reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    assert!(Writer::attach(&*mem).is_ok(), "this layout");
+    mem[1].store(6, Ordering::Relaxed);
+    assert_eq!(
+        Writer::attach(&*mem).err(),
+        Some(Refused::Layout),
+        "a version 6 ring"
+    );
+}
+
+/// A chroma location that changes to another valid one while its frame is
+/// copied fails the take as a torn read: the words read again after the
+/// copy name another frame.
+// Covers: T02
+#[test]
+fn a_chroma_location_changed_during_the_copy_fails_the_take() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let ring = &*mem;
+    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+    assert_eq!(publish_sited(ring, 1, 1_000, ChromaLocation::Left), 0);
+    let due = reader.peek(ring, 1_000).unwrap().due.unwrap();
+    let word = slot_word(ring, g, 0, CHROMA);
+    let mut sink = |_: usize, _: &[u8]| {
+        word.store(ChromaLocation::TopLeft.word(), Ordering::Relaxed);
+        true
+    };
+    assert_eq!(
+        reader.take(ring, due, tight(g), &mut sink),
+        Err(Fault::Changed { slot: 0 })
+    );
+    assert_eq!(reader.fault(), Some(Fault::Changed { slot: 0 }));
+}
+
+/// A ring whose worker reuses a slot the moment the reader frees it: at
+/// each access, every free slot already holds the next frame's chroma
+/// location, as a worker that claimed it and wrote its words would.
+struct Reusing<'a> {
+    ring: &'a [AtomicU64],
+    g: Geometry,
+    next: ChromaLocation,
+}
+
+impl Words for Reusing<'_> {
+    fn words(&self, start: usize, len: usize) -> Option<&[AtomicU64]> {
+        for slot in 0..SLOTS {
+            if slot_word(self.ring, self.g, slot, STATE).load(Ordering::Relaxed) == 0 {
+                slot_word(self.ring, self.g, slot, CHROMA)
+                    .store(self.next.word(), Ordering::Relaxed);
+            }
+        }
+        self.ring.words(start, len)
+    }
+}
+
+/// The frame a take returns carries the location its slot held when the
+/// take found it, never one read from the slot after the take freed it,
+/// which the worker may already be writing for its next frame.
+// Covers: T02
+#[test]
+fn a_taken_frame_keeps_its_location_when_its_slot_is_reused_at_once() {
+    let g = Geometry::new(16, 9).unwrap();
+    let mem = section(g);
+    let mut reader = Reader::new(&*mem, g, WINDOW).unwrap();
+    assert_eq!(publish_sited(&mem, 1, 1_000, ChromaLocation::Left), 0);
+    let reusing = Reusing {
+        ring: &mem,
+        g,
+        next: ChromaLocation::Bottom,
+    };
+    let due = reader.peek(&reusing, 1_000).unwrap().due.unwrap();
+    let f = reader
+        .take(&reusing, due, tight(g), &mut |_, _| true)
+        .unwrap();
+    assert_eq!(f.chroma, ChromaLocation::Left);
+    // The worker's next access finds the slot free and reuses it.
+    let _ = reusing.words(0, 1);
+    assert_eq!(
+        slot_word(&mem, g, 0, CHROMA).load(Ordering::Relaxed),
+        ChromaLocation::Bottom.word(),
+        "the slot was reused"
+    );
 }

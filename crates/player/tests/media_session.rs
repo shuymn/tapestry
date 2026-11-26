@@ -416,17 +416,18 @@ fn handed_off(what: &str, took: Duration) {
 // Covers: T02
 #[test]
 fn hello_with_another_protocol_is_refused_before_any_handle() {
-    let rig = Rig::serving(&["protocol=2"]);
+    // The version before this one's: the protocol before chroma locations.
+    let rig = Rig::serving(&["protocol=3"]);
     // The launch itself refuses it at the handshake, and the process ends.
     let Err(e) = rig
         .stage
-        .launch(&recipe().args_of(&["--dev-serve", "protocol=2"]))
+        .launch(&recipe().args_of(&["--dev-serve", "protocol=3"]))
     else {
         panic!("a worker of another protocol launched");
     };
     // ERROR_REVISION_MISMATCH.
     assert_eq!((e.step, e.code), (Step::Handshake, 1306), "{e}");
-    assert!(e.what.contains("protocol 2"), "{e}");
+    assert!(e.what.contains("protocol 3"), "{e}");
     // The process ends with the refusal's code, on the handle the launch
     // kept when it stopped watching first.
     media_support::ends_refused(&e);
