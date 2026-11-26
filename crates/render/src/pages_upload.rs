@@ -92,6 +92,11 @@ impl Renderer {
         if self.committed_atlas(kind) == Some(pages.id()) {
             return Ok(PagesBegun::Installed);
         }
+        // Its room held by arrays whose residency is in flight: nothing
+        // made, its owner waiting for the room.
+        if self.pages_room_waits(pages) {
+            return Err(RenderError::RoomPending { kind });
+        }
         #[cfg(any(test, feature = "dev-tools"))]
         let began = Instant::now();
         let entry = self.reserve_room(Hold::Staging(kind), kind)?;

@@ -207,8 +207,34 @@ fn the_device_path_outlives_its_renderer() {
     if asynchronous {
         assert_eq!(first, None);
         assert_eq!(holder.pending(), 1, "the request handed to the holder");
+        // Released after the renderer, once its fence completes.
+        let asked = Instant::now();
+        while holder.pending() > 0 {
+            assert!(asked.elapsed() < Duration::from_secs(10), "never resident");
+            let _ = holder.release_one();
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     drop(holder);
+}
+
+/// A renderer dropped with no render loop is its holder's final owner: an
+/// array whose residency is in flight is kept unreleased, never released
+/// before its fence completes.
+#[test]
+fn a_renderer_with_no_loop_keeps_a_pending_array() {
+    let (mut r, f, _clock) = fixture();
+    let b = tiny(&r, RED);
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    r.discard();
+    drop(r);
+    assert!(f.released().is_empty(), "released before its fence");
+    let (mut r, f, _clock) = fixture();
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    r.discard();
+    f.complete(1);
+    drop(r);
+    assert_eq!(f.released(), vec![1], "released once its fence completed");
 }
 
 /// S-R2: while a creation's fence is held, frames are presented and each
@@ -392,7 +418,11 @@ fn saturation_answers_each_ticket_once_and_destroys_nothing_unfenced() {
             Err(e) => break e,
         }
     };
-    assert!(refused.is_refusal(), "{refused:?}");
+    assert!(
+        matches!(refused, RenderError::RoomPending { .. }),
+        "{refused:?}"
+    );
+    assert!(r.pages_room_waits(p.atlas_pages()), "it waits for its room");
     let entries = r.retire.residing().unwrap().0;
     assert!(entries > 1, "{entries} entries");
     let charged = r.admission().filled;
@@ -414,6 +444,11 @@ fn saturation_answers_each_ticket_once_and_destroys_nothing_unfenced() {
         assert_eq!(r.retire.filled(), filled - gone, "one a boundary");
     }
     assert_eq!(r.admission().filled, 0);
+    assert!(!r.pages_room_waits(p.atlas_pages()), "its room came");
+    assert_eq!(
+        r.begin_pages(p.atlas_pages(), ticket).unwrap(),
+        PagesBegun::Begun
+    );
 }
 
 /// S-R5b: a renderer dropped on a healthy device leaves its pending
@@ -611,6 +646,28 @@ fn a_cutoff_with_a_residing_entry_waits_then_proceeds() {
     assert_eq!(r.admission().filled, charge, "kept charged");
 }
 
+/// S-R9: an entry READY's cutoff left out stays out through the play: its
+/// fence completing changes no count, and no count or frame reads its
+/// fence; after the play a boundary destroys it.
+#[test]
+fn a_deferred_entry_stays_out_through_the_play() {
+    let (mut r, f, clock) = fixture();
+    let b = tiny(&r, RED);
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    r.discard();
+    clock.advance(PAST);
+    assert_eq!(r.filled(), 0, "acknowledged with it left out");
+    let reads = f.reads();
+    f.complete(1);
+    for _ in 0..3 {
+        assert_eq!(r.filled(), 0, "counted again during the play");
+        let _ = r.upload_boundary_within(Duration::from_millis(4), &mut || false, None);
+    }
+    assert_eq!(f.reads(), reads, "a fence read during the play");
+    let _ = r.destroy_due(true);
+    assert_eq!(r.admission().filled, 0, "destroyed after the play");
+}
+
 /// S-R10: a request the runtime refuses as unsupported takes the `Sync`
 /// path.
 #[test]
@@ -771,4 +828,157 @@ fn unwritten_texels_read_zero_after_dirty_memory() {
             );
         }
     }
+}
+
+/// A stepped staging whose admission fits only once a withdrawn array
+/// whose residency is in flight is gone waits for its room: its creation
+/// call makes nothing and takes no request, the shared limit holds, and it
+/// is staged once the fence completed and the entry was destroyed.
+#[test]
+fn a_creation_call_waits_for_room_a_residency_holds() {
+    let (mut r, f, _clock) = fixture();
+    let b = tiny(&r, RED);
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    let (_, charge) = r.admission().candidate.unwrap();
+    r.discard();
+    let next = tiny(&r, GREEN);
+    r.state_candidate_charge(&next, SHARED_TEXELS - charge / 2);
+    assert!(r.room_waits(ScreenKind::Play, &next));
+    let e = stage(&mut r, &next, 2).unwrap_err();
+    assert!(matches!(e, RenderError::RoomPending { .. }), "{e:?}");
+    assert_eq!(f.creates().len(), 1, "a creation past the limit");
+    assert!(r.admission().total() <= SHARED_TEXELS);
+    f.complete(1);
+    let _ = r.destroy_due(true);
+    assert!(!r.room_waits(ScreenKind::Play, &next));
+    assert_eq!(stage(&mut r, &next, 2).unwrap(), None, "its request kept");
+    assert_eq!(f.creates().len(), 2);
+}
+
+/// A pages begin that fits only once a withdrawn array whose residency is
+/// in flight is gone waits for its room, making nothing.
+#[test]
+fn a_pages_begin_waits_for_room_a_residency_holds() {
+    let (mut r, f, _clock) = fixture();
+    let p = tiny(&r, BLUE);
+    let b = tiny(&r, RED);
+    let pages = pages_texels(p.atlas_pages());
+    r.state_candidate_charge(&b, SHARED_TEXELS - pages / 2);
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    r.discard();
+    assert!(r.pages_room_waits(p.atlas_pages()));
+    let e = r.begin_pages(p.atlas_pages(), 2).unwrap_err();
+    assert!(matches!(e, RenderError::RoomPending { .. }), "{e:?}");
+    assert_eq!(f.creates().len(), 1, "a creation past the limit");
+    f.complete(1);
+    let _ = r.destroy_due(true);
+    assert_eq!(
+        r.begin_pages(p.atlas_pages(), 2).unwrap(),
+        PagesBegun::Begun
+    );
+}
+
+/// A renderer built again counts the holder's arrays in every admission:
+/// a staging that fits only once the earlier renderer's pending array is
+/// released waits for its room rather than passing the limit.
+#[test]
+fn an_admission_across_a_rebuild_counts_the_holder() {
+    let holder = ResidencyHolder::default();
+    let (mut r, f, _clock) = fixture();
+    r.set_residency_holder(holder.clone());
+    let b = tiny(&r, RED);
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    let (_, charge) = r.admission().candidate.unwrap();
+    drop(r);
+    assert_eq!(holder.pending(), 1);
+    let mut next = offscreen(W, H);
+    next.set_residency_holder(holder.clone());
+    let n = tiny(&next, GREEN);
+    next.state_candidate_charge(&n, SHARED_TEXELS - charge / 2);
+    assert!(next.room_waits(ScreenKind::Play, &n));
+    let e = next.install(ScreenKind::Play, &n, 1).unwrap_err();
+    assert!(matches!(e, RenderError::RoomPending { .. }), "{e:?}");
+    f.complete(1);
+    let _ = next.destroy_due(true);
+    assert_eq!(holder.pending(), 0);
+    assert!(!next.room_waits(ScreenKind::Play, &n));
+}
+
+/// A native call that fails on a device whose removal is confirmed is the
+/// device's loss, latched: at the creation and at the residency request,
+/// for a staging and for a pages begin.
+#[test]
+fn a_native_failure_on_a_removed_device_is_the_loss() {
+    for enqueue in [false, true] {
+        let (mut r, f, _clock) = fixture();
+        {
+            let mut s = f.state();
+            s.removed = true;
+            if enqueue {
+                s.refuse_enqueue = Some(Refusal::Removed);
+            } else {
+                s.refuse_create = Some(Refusal::Removed);
+            }
+        }
+        let b = tiny(&r, RED);
+        let e = stage(&mut r, &b, 1).unwrap_err();
+        assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+        assert!(r.device_lost());
+        assert!(!e.is_refusal());
+        let (mut r, f, _clock) = fixture();
+        {
+            let mut s = f.state();
+            s.removed = true;
+            if enqueue {
+                s.refuse_enqueue = Some(Refusal::Removed);
+            } else {
+                s.refuse_create = Some(Refusal::Removed);
+            }
+        }
+        let p = tiny(&r, BLUE);
+        let e = r.begin_pages(p.atlas_pages(), 1).unwrap_err();
+        assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+        assert!(r.device_lost());
+    }
+}
+
+/// The memory witness counts an array through its creation, its
+/// retirement and its handover to the holder, once each: the staging's
+/// while its residency is in flight and once imported, the pages
+/// upload's from its begin, a withdrawn one in `retired`, a dropped
+/// renderer's in `held`.
+#[test]
+fn the_witness_counts_an_array_in_creation_once() {
+    let holder = ResidencyHolder::default();
+    let (mut r, f, _clock) = fixture();
+    r.set_residency_holder(holder.clone());
+    let b = tiny(&r, RED);
+    let bytes = r.native_key(b.atlas_pages()).unwrap().bytes();
+    let before = r.memory();
+    assert_eq!(stage(&mut r, &b, 1).unwrap(), None);
+    let m = r.memory();
+    assert_eq!(m.staged_atlas, bytes, "in creation");
+    assert_eq!(m.total() - before.total(), bytes);
+    f.complete(1);
+    let token = finish(&mut r, &b, 1);
+    assert_eq!(r.memory().staged_atlas, bytes, "imported, counted once");
+    r.commit(token).unwrap();
+    let p = tiny(&r, BLUE);
+    let pages = r.native_key(p.atlas_pages()).unwrap().bytes();
+    let before = r.memory();
+    assert_eq!(
+        r.begin_pages(p.atlas_pages(), 1).unwrap(),
+        PagesBegun::Begun
+    );
+    assert_eq!(r.memory().pages_upload - before.pages_upload, pages);
+    let _ = r.withdraw_pages();
+    let m = r.memory();
+    assert_eq!(m.pages_upload, 0);
+    assert!(m.retired >= pages, "withdrawn: {m:?}");
+    drop(r);
+    assert_eq!(holder.pending(), 1);
+    let next = offscreen(W, H);
+    let mut next = next;
+    next.set_residency_holder(holder.clone());
+    assert_eq!(next.memory().held, pages, "handed over");
 }

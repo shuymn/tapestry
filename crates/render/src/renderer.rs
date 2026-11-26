@@ -633,6 +633,16 @@ pub enum RenderError {
         /// The kind asked for.
         kind: ScreenKind,
     },
+    /// A staging or a pages begin would fit only once arrays whose
+    /// residency is in flight are released, which no boundary may do
+    /// before their fences complete ([`Renderer::room_waits`]): nothing of
+    /// it was made and its request was not taken. Its owner waits for the
+    /// room before asking (design.md "Memory Budget").
+    #[error("the {kind} staging waits for room an array's residency in flight holds")]
+    RoomPending {
+        /// The kind asked for.
+        kind: ScreenKind,
+    },
 }
 
 impl RenderError {
@@ -678,6 +688,7 @@ impl RenderError {
             | Self::ResultDisabled
             | Self::PagesKind { .. }
             | Self::ListFull { .. }
+            | Self::RoomPending { .. }
             | Self::NotStaged
             | Self::LabelRegion { .. }
             | Self::ChartImage { .. } => true,
@@ -1310,6 +1321,11 @@ enum Reclaim {
     /// It does not fit: the level-0 texels it needs with the pool at its
     /// firm layer.
     Refused(u64),
+    /// It does not fit now, and would once the arrays whose residency is
+    /// in flight (in a `Residing` entry or the holder) are released, each
+    /// once its fence completes: no boundary may destroy them before, so
+    /// the request waits for its room.
+    Wait,
 }
 
 /// What an early staging needs before it is taken
@@ -1504,6 +1520,9 @@ pub struct MemoryWitness {
     /// The decision labels' levels staged and not yet written: the
     /// worker's, the waiting output's and the filling slot's remainder.
     pub decision_staged: u64,
+    /// The arrays an earlier renderer left with the render loop's holder,
+    /// their residency in flight, until each is released.
+    pub held: u64,
     /// The decision worker's A8 buffer and its producer's glyph mask
     /// bound, apart from the renderer's own ([`text_mask`](Self::text_mask)).
     pub decision_text_mask: u64,
@@ -1549,6 +1568,7 @@ impl MemoryWitness {
             .saturating_add(self.decision_staged)
             .saturating_add(self.decision_text_mask)
             .saturating_add(self.decision_upload)
+            .saturating_add(self.held)
     }
 
     /// The witness with the decision labels' bytes, which their owner
@@ -2041,9 +2061,10 @@ pub struct Renderer {
     /// Unit tests: arrays the `Sync` path created.
     #[cfg(test)]
     sync_creations: u32,
-    /// Unit tests: the clock deadlines are read on.
-    #[cfg(test)]
-    creation_clock: Option<Arc<bms_model::VirtualClock>>,
+    /// The clock ticket deadlines are read on, their owner's
+    /// ([`set_deadline_clock`](Self::set_deadline_clock)); the slice clock
+    /// without one.
+    creation_clock: Option<Arc<dyn TimeSource>>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -2373,7 +2394,6 @@ impl Renderer {
             residency_lines: [None, None, None, None],
             #[cfg(test)]
             sync_creations: 0,
-            #[cfg(test)]
             creation_clock: None,
             pacer: Pacer::default(),
             #[cfg(feature = "dev-tools")]
@@ -2915,6 +2935,47 @@ impl Renderer {
             && self.committed_atlas(kind) != Some(bundle.atlas_id())
     }
 
+    /// Whether staging `bundle` as `kind`'s waits for room that arrays
+    /// whose residency is in flight hold (design.md "Memory Budget"): its
+    /// admission, or its own retirement entry, would come only once their
+    /// fences complete, so its owner keeps the request waiting for its
+    /// room, under its ticket's deadline, rather than asking (which
+    /// answers [`RenderError::RoomPending`]). Reads only.
+    #[must_use]
+    pub fn room_waits(&self, kind: ScreenKind, bundle: &Arc<SkinBundle>) -> bool {
+        if self
+            .committed_installation(kind)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return false;
+        }
+        let own = self.committed_atlas(kind) != Some(bundle.atlas_id());
+        self.waits_for_residency(kind, self.candidate_charge(kind, bundle), own)
+    }
+
+    /// [`room_waits`](Self::room_waits) for a result pages begin of
+    /// `pages` ([`begin_pages`](Self::begin_pages)). Reads only.
+    #[must_use]
+    pub fn pages_room_waits(&self, pages: &Arc<PackedPages>) -> bool {
+        if self.result_disabled || self.committed_atlas(ScreenKind::Result) == Some(pages.id()) {
+            return false;
+        }
+        self.waits_for_residency(ScreenKind::Result, pages_texels(pages), true)
+    }
+
+    /// Whether `charge` as `kind`'s, with a retirement entry of its own
+    /// when `entry`, fits only once residencies in flight complete.
+    fn waits_for_residency(&self, kind: ScreenKind, charge: u64, entry: bool) -> bool {
+        let no_entry = entry
+            && self.retire.free() == 0
+            && !(self.destroy_allowed && self.retire.oldest(false).is_some());
+        (no_entry && self.retire.residing_pending())
+            || matches!(
+                self.reclaim(kind, charge, self.destroy_allowed),
+                Reclaim::Wait
+            )
+    }
+
     /// Whether staging `bundle` as `kind`'s now needs no destruction in its
     /// call: its admission with no filled entry destroyed (the pool's
     /// optional layers yielding, and a reduction's retired pool needing
@@ -2936,8 +2997,10 @@ impl Renderer {
             return true;
         }
         let charge = self.candidate_charge(kind, bundle);
-        if matches!(self.reclaim(kind, charge, true), Reclaim::Refused(_)) {
-            return true;
+        match self.reclaim(kind, charge, true) {
+            Reclaim::Refused(_) => return true,
+            Reclaim::Wait => return false,
+            _ => {}
         }
         // Its own entry, and a reduction's when the live pool has more
         // layers than it keeps.
@@ -2950,7 +3013,9 @@ impl Renderer {
                 2
             }
             Reclaim::Reduce(_) => 1,
-            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => return false,
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) | Reclaim::Wait => {
+                return false;
+            }
         };
         // An array whose residency is in flight frees its entry once its
         // fence completes: waited for, as a filled entry is.
@@ -3009,7 +3074,7 @@ impl Renderer {
                 Some(2)
             }
             Reclaim::Reduce(_) => Some(1),
-            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) => None,
+            Reclaim::Destroy | Reclaim::ReleaseResult | Reclaim::Refused(_) | Reclaim::Wait => None,
         };
         if let Some(entries) = entries {
             return if self.retire.free() >= entries {
@@ -3185,6 +3250,7 @@ impl Renderer {
         let charge = self.candidate_charge(kind, bundle);
         match self.reclaim(kind, charge, false) {
             Reclaim::Fits | Reclaim::Destroy | Reclaim::Reduce(_) => Ok(()),
+            Reclaim::Wait => Err(RenderError::RoomPending { kind }),
             Reclaim::ReleaseResult | Reclaim::Refused(_) => Err(RenderError::Admission {
                 kind,
                 needed: self.needed(kind, charge),
@@ -3203,12 +3269,37 @@ impl Renderer {
     /// `destroy`, once the pool keeps its firm layer alone and the result's
     /// installation is released and destroyed; or it is refused. A
     /// selection candidate replaces the pool, so its optional layers go
-    /// with the kind. A retired pool is outside the sum.
+    /// with the kind. A retired pool is outside the sum. The holder's
+    /// arrays and the entries whose residency is in flight stay in every
+    /// sum, since no boundary may release them before their fences
+    /// complete; where only they stand in the way, it waits for them.
     fn reclaim(&self, kind: ScreenKind, charge: u64, destroy: bool) -> Reclaim {
         let entries = self.retire.charged();
-        let base = self.committed_needed(kind, charge);
+        let held = self.held_charge();
+        let stuck = self.retire.unsettled_charge();
+        let base = self.committed_needed(kind, charge).saturating_add(held);
         let all = base.saturating_add(entries);
-        let least = if destroy { base } else { all };
+        let least = if destroy {
+            base.saturating_add(stuck)
+        } else {
+            all
+        };
+        match self.reclaim_from(kind, all, least, destroy) {
+            Reclaim::Refused(needed) if held.saturating_add(stuck) > 0 => {
+                let freed = least.saturating_sub(held).saturating_sub(stuck);
+                match self.reclaim_from(kind, freed, freed, destroy) {
+                    Reclaim::Refused(_) => Reclaim::Refused(needed),
+                    _ => Reclaim::Wait,
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// [`reclaim`](Self::reclaim)'s order on the sums it reads: `all`, with
+    /// every filled entry, and `least`, with only what no destruction
+    /// frees.
+    fn reclaim_from(&self, kind: ScreenKind, all: u64, least: u64, destroy: bool) -> Reclaim {
         let (layer, optional) = if kind == ScreenKind::Selection {
             (0, 0)
         } else {
@@ -3313,8 +3404,21 @@ impl Renderer {
                     };
                     self.destroy_now(i)?;
                 }
-                Ok(())
+                // Nothing is admitted past the limit: an entry no boundary
+                // may destroy yet makes it wait.
+                if self.fits_now(kind, charge) {
+                    Ok(())
+                } else if self.retire.residing_pending() || self.held_charge() > 0 {
+                    Err(RenderError::RoomPending { kind })
+                } else {
+                    Err(RenderError::Admission {
+                        kind,
+                        needed: self.needed(kind, charge),
+                        limit: SHARED_TEXELS,
+                    })
+                }
             }
+            Reclaim::Wait => Err(RenderError::RoomPending { kind }),
             Reclaim::Reduce(layers) => {
                 self.destroy_charged()?;
                 self.reduce_pool(layers, kind)
@@ -3401,6 +3505,11 @@ impl Renderer {
             }
             match self.retire.oldest(false) {
                 Some(i) if self.destroy_allowed => self.destroy_now(i)?,
+                // Only entries whose residency is in flight hold the list:
+                // one frees once its fence completes.
+                None if self.retire.residing_pending() => {
+                    return Err(RenderError::RoomPending { kind });
+                }
                 _ => return Err(RenderError::ListFull { kind }),
             }
         }
@@ -3760,7 +3869,9 @@ impl Renderer {
             };
             sum.saturating_add(charge)
         });
-        let used = used.saturating_add(self.retire.charged());
+        let used = used
+            .saturating_add(self.retire.charged())
+            .saturating_add(self.held_charge());
         if used > SHARED_TEXELS {
             return self.pool();
         }
@@ -3991,6 +4102,11 @@ impl Renderer {
                 .is_some_and(|p| p.token.request == request && p.token.kind == kind)
         {
             return self.staging_answer(request);
+        }
+        // Its room held by arrays whose residency is in flight: nothing
+        // made and its request not taken, its owner waiting for the room.
+        if self.room_waits(kind, bundle) {
+            return Err(RenderError::RoomPending { kind });
         }
         // The committed bundle keeps its resources: nothing of its own,
         // and no entry.
@@ -7970,6 +8086,13 @@ impl Renderer {
                 PendingRes::Layout { staging, .. } => (0, 0, staging.bytes(), 0),
                 PendingRes::Installed | PendingRes::Pages(None) => (0, 0, 0, 0),
             });
+        // A play staging's array in creation, its residency in flight, is
+        // the staging's: imported, it is the one `pending` holds.
+        let staged_atlas = staged_atlas.saturating_add(
+            self.staging_creation
+                .as_ref()
+                .map_or(0, |c| c.t.key.bytes()),
+        );
         // Each committed bundle's own bytes are counted with it: the staged
         // one's only when it is none of them.
         let committed = [installed, result_installation];
@@ -8101,19 +8224,24 @@ impl Renderer {
                 )
                 .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
             result_loading,
-            pages_upload: self.pages_upload.as_ref().map_or(0, |u| {
-                // The queue's staging: its step in flight, while its
-                // completion is unseen.
-                let staged = self
-                    .step
-                    .as_ref()
-                    .map_or(0, |s| s.staged_for(crate::Payload::Pages));
-                u.res
-                    .atlas
-                    .bytes()
-                    .saturating_add(staged)
-                    .saturating_add(u.res.text_cache.bytes())
-            }),
+            pages_upload: self
+                .pages_upload
+                .as_ref()
+                .map_or(0, |u| {
+                    // The queue's staging: its step in flight, while its
+                    // completion is unseen.
+                    let staged = self
+                        .step
+                        .as_ref()
+                        .map_or(0, |s| s.staged_for(crate::Payload::Pages));
+                    u.res
+                        .atlas
+                        .bytes()
+                        .saturating_add(staged)
+                        .saturating_add(u.res.text_cache.bytes())
+                })
+                // Its array in creation, before the upload holds it.
+                .saturating_add(self.pages_creation.as_ref().map_or(0, |c| c.t.key.bytes())),
             retired,
             retired_pool,
             // Kept apart from the renderer: `with_decision` adds them.
@@ -8121,6 +8249,7 @@ impl Renderer {
             decision_staged: 0,
             decision_text_mask: 0,
             decision_upload: 0,
+            held: self.holder.bytes(),
         }
     }
 

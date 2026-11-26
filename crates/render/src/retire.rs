@@ -689,17 +689,28 @@ impl Retirements {
     }
 
     /// How many entries are filled, as READY's cutoff waits for them: a
-    /// residency still in flight past its ticket's deadline is left out,
-    /// kept, charged and untouched through play.
+    /// residency still in flight past its ticket's deadline is left out and
+    /// latched so ([`Residing::deferred_at`]), kept, charged and untouched
+    /// through play, its fence no longer read to count it.
+    ///
+    /// [`Residing::deferred_at`]: crate::residency::Residing::deferred_at
     pub(super) fn filled_for_cutoff(&self, now: bms_model::TimeUs) -> u32 {
         let n = self
             .filled_entries()
             .filter(|(_, f)| match &f.array {
-                Array::Residing(r) => r.done() || !r.deadline.passed(now),
+                Array::Residing(r) => !r.deferred_at(now),
                 _ => true,
             })
             .count();
         u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// What admission counts for the entries no boundary may destroy yet:
+    /// those whose residency is still in flight.
+    pub(super) fn unsettled_charge(&self) -> u64 {
+        self.filled_entries()
+            .filter(|(_, f)| !f.array.settled())
+            .fold(0, |sum, (_, f)| sum.saturating_add(f.charge))
     }
 
     /// Every residency still held, taken out of its entry, which frees: a

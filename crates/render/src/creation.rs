@@ -76,13 +76,21 @@ pub(super) enum Started {
 }
 
 impl Renderer {
-    /// The clock deadlines are read on: the slice clock, or a unit test's.
+    /// The clock deadlines are read on: the one their owner reads them on
+    /// ([`set_deadline_clock`](Self::set_deadline_clock)), else the slice
+    /// clock.
     pub(super) fn creation_now(&self) -> TimeUs {
-        #[cfg(test)]
         if let Some(c) = &self.creation_clock {
-            return bms_model::TimeSource::now(c.as_ref());
+            return c.now();
         }
         self.slice_clock.now()
+    }
+
+    /// The clock its owner reads ticket deadlines on
+    /// ([`set_ticket_deadline`](Self::set_ticket_deadline)): every deadline
+    /// is compared on it, whatever clock the uploader's slice reads.
+    pub fn set_deadline_clock(&mut self, clock: Arc<dyn bms_model::TimeSource>) {
+        self.creation_clock = Some(clock);
     }
 
     /// The deadline the next ticket (a play staging's first call or a
@@ -155,7 +163,7 @@ impl Renderer {
     /// Tests: deadlines read on `clock`.
     #[cfg(test)]
     pub(crate) fn set_creation_clock(&mut self, clock: Arc<bms_model::VirtualClock>) {
-        self.creation_clock = Some(clock);
+        self.creation_clock = Some(clock as Arc<dyn bms_model::TimeSource>);
     }
 
     /// Tests: the fence values from `next`.
@@ -217,7 +225,8 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// The device's refusal of either call.
+    /// The device's refusal of either call; [`RenderError::DeviceLost`],
+    /// latched, when either fails on a device whose removal is confirmed.
     pub(super) fn start_creation(
         &mut self,
         key: NativeCreate,
@@ -247,6 +256,10 @@ impl Renderer {
                     ResidencyError::Refused,
                 )));
             }
+            Err(Refusal::Removed) => {
+                self.gpu.mark_lost();
+                return Err(RenderError::DeviceLost);
+            }
         };
         let Some(value) = self.fence_values.take() else {
             return Ok(Started::Sync);
@@ -259,6 +272,11 @@ impl Renderer {
                 return Err(RenderError::Atlas(UploadError::Residency(
                     ResidencyError::Refused,
                 )));
+            }
+            // Its resource goes with the removed device.
+            Err(Refusal::Removed) => {
+                self.gpu.mark_lost();
+                return Err(RenderError::DeviceLost);
             }
         }
         #[cfg(feature = "dev-tools")]
@@ -333,6 +351,7 @@ impl Renderer {
             charge: t.charge,
             requested: t.requested,
             deadline: t.deadline,
+            deferred: std::sync::atomic::AtomicBool::new(false),
         };
         let mut f = Filled::new(Array::Residing(held), kind, Class::Other);
         f.charge = t.charge;
@@ -526,6 +545,7 @@ fn ticket_residing(t: Ticket, fence: &residency::Fence) -> Residing {
         charge: t.charge,
         requested: t.requested,
         deadline: t.deadline,
+        deferred: std::sync::atomic::AtomicBool::new(false),
     }
 }
 

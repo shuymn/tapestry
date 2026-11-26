@@ -16,10 +16,12 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use bms_model::TimeUs;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, HMODULE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7, D3D12_FENCE_FLAG_NONE,
     D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, D3D12_HEAP_FLAGS,
@@ -34,6 +36,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
 };
 use windows::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExW};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, w};
 
 /// How long a ticket may take from its request to its array's import
@@ -214,6 +217,10 @@ pub(crate) trait FenceRead: Send + Sync {
     /// Whether its device reports itself removed
     /// (`GetDeviceRemovedReason`).
     fn removed(&self) -> bool;
+    /// Waits at most `timeout` for `value` to complete: whether it did.
+    /// Only the holder's final owner waits ([`ResidencyHolder`]), never a
+    /// frame.
+    fn wait(&self, value: u64, timeout: Duration) -> bool;
 }
 
 /// A fence shared by every resource whose residency it signals.
@@ -224,7 +231,7 @@ pub(crate) enum Native {
     D3d12(ID3D12Resource),
     /// Tests and development builds: a resource the fake numbers.
     #[cfg(any(test, feature = "dev-tools"))]
-    Fake(u64),
+    Fake(fake::FakeNative),
 }
 
 impl Native {
@@ -264,6 +271,10 @@ pub(crate) struct Residing {
     /// When its ticket's deadline passes: past it, READY's cutoff no
     /// longer waits for it.
     pub(crate) deadline: bms_model::Deadline,
+    /// Latched once READY's cutoff found it pending past its deadline: no
+    /// cutoff waits for it again, and its fence is not read to count it,
+    /// so a completion during play changes no count.
+    pub(crate) deferred: AtomicBool,
 }
 
 impl Residing {
@@ -283,6 +294,20 @@ impl Residing {
     pub(crate) fn device_removed(&self) -> bool {
         self.completion() == Completion::Removed && self.fence.removed()
     }
+
+    /// Whether READY's cutoff, at `now`, leaves it out of the entries it
+    /// waits for: latched before, without reading its fence; else pending
+    /// past its deadline, which latches it.
+    pub(crate) fn deferred_at(&self, now: TimeUs) -> bool {
+        if self.deferred.load(Ordering::Relaxed) {
+            return true;
+        }
+        let deferred = !self.done() && self.deadline.passed(now);
+        if deferred {
+            self.deferred.store(true, Ordering::Relaxed);
+        }
+        deferred
+    }
 }
 
 /// Why a native call did not run.
@@ -291,8 +316,11 @@ pub(crate) enum Refusal {
     /// The runtime does not support it for this resource
     /// (`E_NOTIMPL`, `E_INVALIDARG`): the request takes the `Sync` path.
     Unsupported,
-    /// The device refused it otherwise (out of memory, removal).
+    /// The device refused it otherwise (out of memory).
     Failed,
+    /// It failed on a device whose removal `GetDeviceRemovedReason`
+    /// confirms: the renderer's device loss.
+    Removed,
 }
 
 /// DXGI's local segment as the process stands: its budget and its
@@ -547,6 +575,25 @@ impl FenceRead for D3d12Fence {
         // SAFETY: a read of the device's removal reason.
         unsafe { self.device.GetDeviceRemovedReason() }.is_err()
     }
+
+    fn wait(&self, value: u64, timeout: Duration) -> bool {
+        if completion(self.completed(), value) != Completion::Pending {
+            return true;
+        }
+        // SAFETY: an unnamed auto-reset event, closed below.
+        let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+            return false;
+        };
+        let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: the event outlives the wait; the fence signals it once
+        // `value` completes.
+        let armed = unsafe { self.fence.SetEventOnCompletion(value, event) }.is_ok();
+        // SAFETY: a bounded wait on the event made above.
+        let signalled = armed && unsafe { WaitForSingleObject(event, ms) } == WAIT_OBJECT_0;
+        // SAFETY: the event made above, closed once.
+        let _ = unsafe { CloseHandle(event) };
+        signalled && completion(self.completed(), value) == Completion::Done
+    }
 }
 
 /// The production path.
@@ -556,6 +603,18 @@ struct D3d12 {
     raw_fence: ID3D12Fence,
     fence: Fence,
     adapter: Option<IDXGIAdapter3>,
+}
+
+impl D3d12 {
+    /// A native call's failure: the device's removal when
+    /// `GetDeviceRemovedReason` confirms it, else a refusal.
+    fn failed(&self) -> Refusal {
+        if self.fence.removed() {
+            Refusal::Removed
+        } else {
+            Refusal::Failed
+        }
+    }
 }
 
 /// Whether an `HRESULT` means the call is not supported here.
@@ -584,7 +643,7 @@ impl Residency for D3d12 {
         match (made, res) {
             (Ok(()), Some(r)) => Ok(Native::D3d12(r)),
             (Err(e), _) if unsupported(&e) => Err(Refusal::Unsupported),
-            _ => Err(Refusal::Failed),
+            _ => Err(self.failed()),
         }
     }
 
@@ -608,7 +667,7 @@ impl Residency for D3d12 {
         match queued {
             Ok(()) => Ok(()),
             Err(e) if unsupported(&e) => Err(Refusal::Unsupported),
-            Err(_) => Err(Refusal::Failed),
+            Err(_) => Err(self.failed()),
         }
     }
 
@@ -673,7 +732,34 @@ impl Residency for D3d12 {
 /// boundary once its fence completes.
 #[derive(Clone, Default)]
 pub struct ResidencyHolder {
-    held: Arc<Mutex<Vec<Residing>>>,
+    held: Arc<Mutex<Held>>,
+}
+
+/// How long the holder's final owner waits, in all, for the residencies
+/// still in flight before it lets the rest go unreleased.
+const FINAL_WAIT: Duration = Duration::from_secs(1);
+
+/// The holder's resources. Its final owner (the render loop's end, or a
+/// renderer dropped with no loop) releases each whose fence completed or
+/// whose device's removal is confirmed, waits for the others at most
+/// [`FINAL_WAIT`] in all, and keeps any still in flight unreleased until
+/// the process ends: a resource is never released before its fence
+/// completes on a device that was not removed.
+#[derive(Default)]
+struct Held(Vec<Residing>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let end = Instant::now() + FINAL_WAIT;
+        for r in self.0.drain(..) {
+            let left = end.saturating_duration_since(Instant::now());
+            if r.done() || r.device_removed() || r.fence.wait(r.value, left) {
+                drop(r);
+            } else {
+                std::mem::forget(r);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ResidencyHolder {
@@ -685,42 +771,51 @@ impl std::fmt::Debug for ResidencyHolder {
 }
 
 impl ResidencyHolder {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Residing>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Takes `r` until its fence completes.
     pub(crate) fn hold(&self, r: Residing) {
-        self.lock().push(r);
+        self.lock().0.push(r);
     }
 
     /// How many resources it holds.
     #[must_use]
     pub fn pending(&self) -> usize {
-        self.lock().len()
+        self.lock().0.len()
     }
 
     /// The texels admission counts for them.
     pub(crate) fn charge(&self) -> u64 {
         self.lock()
+            .0
             .iter()
             .fold(0, |sum, r| sum.saturating_add(r.charge))
+    }
+
+    /// Their bytes, as the memory witness counts them.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.lock()
+            .0
+            .iter()
+            .fold(0, |sum, r| sum.saturating_add(r.bytes))
     }
 
     /// Whether a resource it holds may be released: its fence completed,
     /// or its device's removal is confirmed.
     pub(crate) fn releasable(&self) -> bool {
-        self.lock().iter().any(|r| r.done() || r.device_removed())
+        self.lock().0.iter().any(|r| r.done() || r.device_removed())
     }
 
     /// Releases one resource whose fence completed, or whose device's
     /// removal is confirmed: whether one was.
     pub(crate) fn release_one(&self) -> bool {
         let mut held = self.lock();
-        let Some(i) = held.iter().position(|r| r.done() || r.device_removed()) else {
+        let Some(i) = held.0.iter().position(|r| r.done() || r.device_removed()) else {
             return false;
         };
-        drop(held.swap_remove(i));
+        drop(held.0.swap_remove(i));
         true
     }
 
@@ -728,8 +823,8 @@ impl ResidencyHolder {
     #[must_use]
     pub fn oldest(&self) -> Option<(usize, TimeUs)> {
         let held = self.lock();
-        let oldest = held.iter().map(|r| r.requested).min()?;
-        Some((held.len(), oldest))
+        let oldest = held.0.iter().map(|r| r.requested).min()?;
+        Some((held.0.len(), oldest))
     }
 }
 
@@ -766,7 +861,36 @@ pub mod fake {
         pub(crate) refuse_enqueue: Option<Refusal>,
         pub(crate) budget: Option<Budget>,
         pub(crate) calls: Vec<Call>,
+        /// The resources released, by number, in order.
+        pub(crate) released: Vec<u64>,
+        /// How many times its fence was read.
+        pub(crate) reads: u64,
         next_id: u64,
+    }
+
+    /// A resource the fake made: its release recorded, unless an import
+    /// took it.
+    pub(crate) struct FakeNative {
+        pub(crate) id: u64,
+        state: Fake,
+        armed: bool,
+    }
+
+    impl FakeNative {
+        /// Its number, taken by an import: no release recorded.
+        fn into_id(mut self) -> u64 {
+            self.armed = false;
+            self.id
+        }
+    }
+
+    impl Drop for FakeNative {
+        fn drop(&mut self) {
+            if self.armed {
+                let id = self.id;
+                self.state.state().released.push(id);
+            }
+        }
     }
 
     /// The caller's handle on the fake: its fence held at 0 until
@@ -826,6 +950,29 @@ pub mod fake {
                 .collect()
         }
 
+        /// Tests: a numbered resource of its own, made without a native
+        /// call, whose release it records.
+        #[cfg(test)]
+        pub(crate) fn native(&self, id: u64) -> Native {
+            Native::Fake(FakeNative {
+                id,
+                state: self.clone(),
+                armed: true,
+            })
+        }
+
+        /// The resources released, by number, in order.
+        #[cfg(test)]
+        pub(crate) fn released(&self) -> Vec<u64> {
+            self.state().released.clone()
+        }
+
+        /// How many times its fence was read.
+        #[cfg(test)]
+        pub(crate) fn reads(&self) -> u64 {
+            self.state().reads
+        }
+
         /// The imports it made.
         #[cfg(test)]
         pub(crate) fn imports(&self) -> usize {
@@ -849,11 +996,18 @@ pub mod fake {
 
     impl FenceRead for FakeFence {
         fn completed(&self) -> u64 {
-            self.0.state().completed
+            let mut s = self.0.state();
+            s.reads += 1;
+            s.completed
         }
 
         fn removed(&self) -> bool {
             self.0.state().removed
+        }
+
+        /// Never blocks: a test moves the fence itself.
+        fn wait(&self, value: u64, _timeout: std::time::Duration) -> bool {
+            super::completion(self.completed(), value) == super::Completion::Done
         }
     }
 
@@ -870,7 +1024,13 @@ pub mod fake {
                 return Err(r);
             }
             s.next_id += 1;
-            Ok(Native::Fake(s.next_id))
+            let id = s.next_id;
+            drop(s);
+            Ok(Native::Fake(FakeNative {
+                id,
+                state: self.state.clone(),
+                armed: true,
+            }))
         }
 
         fn enqueue(
@@ -879,11 +1039,11 @@ pub mod fake {
             value: u64,
             flags: D3D12_RESIDENCY_FLAGS,
         ) -> Result<(), Refusal> {
-            let mut s = self.state.state();
             let id = match native {
-                Native::Fake(id) => *id,
+                Native::Fake(f) => f.id,
                 Native::D3d12(_) => 0,
             };
+            let mut s = self.state.state();
             s.calls.push(Call::Enqueue { id, value, flags });
             if let Some(r) = s.refuse_enqueue {
                 return Err(r);
@@ -916,7 +1076,7 @@ pub mod fake {
             desc: &wgpu::TextureDescriptor<'_>,
         ) -> wgpu::Texture {
             let id = match native {
-                Native::Fake(id) => id,
+                Native::Fake(f) => f.into_id(),
                 Native::D3d12(_) => 0,
             };
             self.state.state().calls.push(Call::Import(id));
@@ -936,8 +1096,9 @@ mod tests {
         D3D12_HEAP_TYPE_DEFAULT, D3D12_RESIDENCY_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
     };
 
+    use super::fake::Fake;
     use super::{
-        CREATE_BOUND, Completion, Fence, FenceRead, FenceValues, Native, NativeCreate, REMOVED,
+        CREATE_BOUND, Completion, Fence, FenceRead, FenceValues, NativeCreate, REMOVED,
         ResidencyHolder, Residing, capable, completion,
     };
 
@@ -947,34 +1108,48 @@ mod tests {
         levels: 4,
     };
 
-    /// A fence the test moves.
+    /// A fence the test moves, counting its reads.
     #[derive(Default)]
     struct Moved {
         completed: AtomicU64,
         removed: AtomicBool,
+        reads: AtomicU64,
     }
 
     impl FenceRead for Moved {
         fn completed(&self) -> u64 {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.completed.load(Ordering::SeqCst)
         }
 
         fn removed(&self) -> bool {
             self.removed.load(Ordering::SeqCst)
         }
+
+        /// Never blocks: the test moves the fence itself.
+        fn wait(&self, value: u64, _timeout: std::time::Duration) -> bool {
+            completion(self.completed(), value) == Completion::Done
+        }
     }
 
-    fn residing(fence: &Arc<Moved>, value: u64, charge: u64) -> Residing {
+    /// A resource numbered `value` on `fence`, its release recorded by
+    /// `fake`.
+    fn residing_of(fake: &Fake, fence: &Arc<Moved>, value: u64, charge: u64) -> Residing {
         let f: Fence = Arc::clone(fence) as Fence;
         Residing {
-            native: Native::Fake(value),
+            native: fake.native(value),
             fence: f,
             value,
             bytes: KEY.bytes(),
             charge,
             requested: TimeUs(0),
             deadline: Deadline::after(TimeUs(0), CREATE_BOUND),
+            deferred: AtomicBool::new(false),
         }
+    }
+
+    fn residing(fence: &Arc<Moved>, value: u64, charge: u64) -> Residing {
+        residing_of(&Fake::default(), fence, value, charge)
     }
 
     /// S-R1: the native creation is not resident.
@@ -1112,5 +1287,56 @@ mod tests {
         fence.completed.store(2, Ordering::SeqCst);
         assert!(h.release_one());
         assert_eq!(h.oldest(), None);
+    }
+
+    /// The holder's final owner releases what completed and keeps what is
+    /// still in flight on a healthy device unreleased; a clone dropped
+    /// before it releases nothing.
+    #[test]
+    fn the_final_owner_keeps_what_is_in_flight() {
+        let fake = Fake::default();
+        let fence = Arc::new(Moved::default());
+        let h = ResidencyHolder::default();
+        h.hold(residing_of(&fake, &fence, 1, 10));
+        h.hold(residing_of(&fake, &fence, 2, 20));
+        fence.completed.store(1, Ordering::SeqCst);
+        drop(h.clone());
+        assert!(fake.released().is_empty(), "a clone is no final owner");
+        drop(h);
+        assert_eq!(fake.released(), vec![1], "value 2 is still in flight");
+    }
+
+    /// With its device's removal confirmed, the final owner releases every
+    /// resource without its fence.
+    #[test]
+    fn the_final_owner_releases_on_a_confirmed_removal() {
+        let fake = Fake::default();
+        let fence = Arc::new(Moved::default());
+        let h = ResidencyHolder::default();
+        h.hold(residing_of(&fake, &fence, 1, 10));
+        h.hold(residing_of(&fake, &fence, 2, 20));
+        fence.completed.store(REMOVED, Ordering::SeqCst);
+        fence.removed.store(true, Ordering::SeqCst);
+        drop(h);
+        assert_eq!(fake.released(), vec![1, 2]);
+    }
+
+    /// READY's cutoff latches a residency pending past its deadline: left
+    /// out from then on with no read of its fence, its completion during
+    /// play changing nothing.
+    #[test]
+    fn a_deferred_residency_is_latched_without_fence_reads() {
+        let fence = Arc::new(Moved::default());
+        let r = residing(&fence, 1, 10);
+        let before = TimeUs(CREATE_BOUND.0 - 1);
+        let past = TimeUs(CREATE_BOUND.0 + 1);
+        assert!(!r.deferred_at(before), "within its deadline");
+        assert!(r.deferred_at(past));
+        let reads = fence.reads.load(Ordering::SeqCst);
+        fence.completed.store(1, Ordering::SeqCst);
+        for _ in 0..4 {
+            assert!(r.deferred_at(past), "latched");
+        }
+        assert_eq!(fence.reads.load(Ordering::SeqCst), reads, "no fence read");
     }
 }
