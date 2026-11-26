@@ -446,6 +446,8 @@ pub enum Event {
     Opened,
     /// A player's close answered.
     Closed,
+    /// A video's loss, for `why`, written to the session's log.
+    Noted { why: Loss },
     /// A beat reached the reply queue.
     QueuedBeat,
     /// Load stage `name` stamped, of load `load`.
@@ -1068,6 +1070,9 @@ pub enum Held {
     /// The look has judged the players' deadlines and not yet ended a
     /// marked worker with nothing live.
     Judged,
+    /// A drop has chosen its players, lost the peers of the chart videos
+    /// lost and noted the losses, and not removed the players chosen yet.
+    Dropping,
     /// The session has looked and not slept yet.
     Looked,
 }
@@ -1288,6 +1293,7 @@ impl Supervisor {
             {
                 p.noted = true;
                 self.notes.note(why.line());
+                event!(self.shared, Event::Noted { why });
             }
         }
     }
@@ -1358,7 +1364,6 @@ impl Supervisor {
                 lose!(self.shared, p.movie, why);
             }
         }
-        self.note_losses();
         self.drop_players(|p| p.stage != Stage::Queued);
     }
 
@@ -1408,7 +1413,6 @@ impl Supervisor {
             self.dying.push(worker);
         }
         self.marked = false;
-        self.note_losses();
         self.drop_players(|p| p.stage == Stage::Queued);
         if let Some(pid) = pid {
             self.notes.note(format!("worker {pid} fails ({why:?})"));
@@ -1437,7 +1441,9 @@ impl Supervisor {
         let mut failure = None;
         for i in 0..self.players.len() {
             let Some(p) = self.players.get(i) else { break };
-            if p.stage != Stage::Queued {
+            // A queued video lost since the look's drop chose its players
+            // (its peers lost with it) is dropped at the next, never opened.
+            if p.stage != Stage::Queued || p.movie.status() == Status::Lost {
                 continue;
             }
             let Some(id) = self.free_id() else { break };
@@ -1477,7 +1483,6 @@ impl Supervisor {
             }
         }
         // Players that never reached the worker go, logged.
-        self.note_losses();
         self.drop_players(|p| !(p.stage == Stage::Idle && p.id == 0));
         if let Some(why) = failure {
             self.fail_worker(why);
@@ -1716,19 +1721,29 @@ impl Supervisor {
             p.id = 0;
         }
         if any {
-            self.note_losses();
             self.drop_players(|p| !(p.stage == Stage::Idle && p.id == 0));
         }
     }
 
-    /// Drops the players `keep` refuses, after losing the peers of every
-    /// chart video lost ([`Self::lose_peers`]): a player dropped is out of
-    /// every later peer check, so a chart video lost since the look's own
+    /// Drops the players `keep` refuses. They are chosen first; then,
+    /// while they are still held, the peers of every chart video lost are
+    /// lost ([`Self::lose_peers`]) and the losses noted; then the players
+    /// chosen are removed. A player dropped is out of every later peer
+    /// check and of the log, so a chart video lost since the look's own
     /// check (the game's loss before the judgement closed it, a struck or
-    /// failed open, a queued video the game lost) still loses its peers.
-    fn drop_players(&mut self, keep: impl FnMut(&Player) -> bool) {
+    /// failed open, a queued video the game lost) still loses its peers,
+    /// and both losses are logged. A loss that comes after the choice
+    /// leaves its player for the next drop.
+    fn drop_players(&mut self, mut keep: impl FnMut(&Player) -> bool) {
+        let chosen: Vec<bool> = self.players.iter().map(|p| !keep(p)).collect();
         self.lose_peers();
-        self.players.retain(keep);
+        self.note_losses();
+        #[cfg(test)]
+        if let Some(turn) = &mut self.turn {
+            turn(Held::Dropping);
+        }
+        let mut chosen = chosen.into_iter();
+        self.players.retain(|_| !chosen.next().unwrap_or(false));
     }
 
     /// Applies the screen's pixel total to player `i`'s `probe` before any

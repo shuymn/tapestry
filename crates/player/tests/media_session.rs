@@ -1608,8 +1608,9 @@ fn a_chart_loss_after_the_peer_check_loses_its_peer() {
 /// (design.md "Rendering and Skins", BGA): both of a chart's videos are
 /// taken in one turn and held there, queued, while the game loses the base
 /// at its preparation's deadline. The look drops the base before it opens
-/// anything, and the layer is lost for its peer, never opened; the skin's
-/// movie plays on.
+/// anything, and the layer is lost for its peer, never opened; each loss
+/// is logged once, though both players are gone; the skin's movie plays
+/// on.
 // Covers: T02
 #[test]
 fn a_queued_chart_video_lost_loses_its_peer() {
@@ -1645,6 +1646,67 @@ fn a_queued_chart_video_lost_loses_its_peer() {
         "only the skin's"
     );
     assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    noted_once(rig, &[Loss::Preparation, Loss::Peer]);
+}
+
+/// Each of `losses` logged exactly once, and no other loss.
+fn noted_once(rig: &Rig, losses: &[Loss]) {
+    until(Duration::from_secs(1), || {
+        rig.count(|e| matches!(e, Event::Noted { .. })) >= losses.len()
+    });
+    let noted: Vec<Loss> = rig
+        .session
+        .events()
+        .into_iter()
+        .filter_map(|(_, e)| match e {
+            Event::Noted { why } => Some(why),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(noted, losses, "{:?}", rig.session.events());
+}
+
+/// A queued chart video the game loses after a drop has chosen its players
+/// still loses its peer (design.md "Rendering and Skins", BGA): both of a
+/// chart's videos are taken in one turn, queued, and the look's first drop
+/// is held after it has chosen nothing and checked the peers, while the
+/// game loses the base at its preparation's deadline. The base stays for
+/// the next drop, which loses the layer for its peer; both losses are
+/// logged once, and the skin's movie plays on.
+// Covers: T02
+#[test]
+fn a_queued_chart_video_lost_after_the_drop_s_choice_loses_its_peer() {
+    let h = Holding::start(&["--dev-serve"]);
+    let rig = &h.rig;
+    rig.session.enter(1);
+    let skin = Movie::new(1);
+    rig.open_as(&skin, "s.mpg", true);
+    until(LAUNCH, || skin.status() == Status::Live)
+        .unwrap_or_else(|| panic!("never live: {:?}", skin.loss()));
+    h.arm(Held::Looked);
+    h.wait("the session never looked");
+    let (base, layer) = (Movie::chart(1), Movie::chart(1));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    h.arm(Held::Taken);
+    h.release();
+    h.wait("the session never took the opens");
+    assert_eq!(
+        (base.status(), layer.status()),
+        (Status::Pending, Status::Pending)
+    );
+    // Held in the look's first drop, its choice and peer check made.
+    h.arm(Held::Dropping);
+    h.release();
+    h.wait("the session never dropped");
+    base.expire();
+    assert_eq!(base.loss(), Some(Loss::Preparation));
+    h.release();
+    lost(&layer, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+    assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    noted_once(rig, &[Loss::Preparation, Loss::Peer]);
 }
 
 /// A chart video still queued when its worker fails loses its peer, lost
