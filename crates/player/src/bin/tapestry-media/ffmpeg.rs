@@ -1259,6 +1259,9 @@ pub struct Input {
     clock: LoopClock,
     /// How long the frame stamped last lasts, in µs ([`Input::duration`]).
     duration: i64,
+    /// Whether that length was found ([`LoopClock::measures`]), not the
+    /// one-tick fallback.
+    measured: bool,
     /// A seek has positioned the video: the next frame decoded is no longer
     /// the clip's first usable one.
     sought: bool,
@@ -1316,6 +1319,7 @@ impl Input {
             start: 0,
             clock: LoopClock::new(0, None),
             duration: 1,
+            measured: false,
             sought: false,
             colour: Colour {
                 matrix: Matrix::Bt709,
@@ -1719,6 +1723,9 @@ impl Input {
             // first after it, left in `frame`.
             let mut landing = None;
             let mut after = None;
+            // The landing is the attempt's first frame and its length was
+            // found from nothing: no frame of the attempt came before it.
+            let mut lone = false;
             loop {
                 if !self.decode()? {
                     break;
@@ -1726,6 +1733,7 @@ impl Input {
                 let Some(stamp) = self.stamp() else {
                     continue;
                 };
+                let alone = first.is_none() && !self.measured;
                 first.get_or_insert(stamp);
                 let d = self.decoded(stamp);
                 if stamp <= stamped {
@@ -1735,6 +1743,7 @@ impl Input {
                     unsafe { ff::av_frame_unref(self.kept) };
                     std::mem::swap(&mut self.frame, &mut self.kept);
                     landing = Some(d);
+                    lone = alone;
                 } else {
                     after = Some(d);
                     break;
@@ -1743,8 +1752,12 @@ impl Input {
             // Backed off further while the attempt found no frame at or
             // before the target: none after its keyframe (a demuxer that
             // lands past the last decodable frame near the end), or only
-            // later ones (one that overshoots).
-            let exact = first.is_some_and(|f| f <= stamped);
+            // later ones (one that overshoots); and while the landing is
+            // the attempt's first frame with no length found, so that the
+            // frame before it is decoded and the landing lasts the interval
+            // measured from it, as in a play from the start (a frame that
+            // states no duration in a stream with no average rate).
+            let exact = first.is_some_and(|f| f <= stamped) && !lone;
             if !(exact || back == MAX_BACK_OFF) {
                 continue;
             }
@@ -1998,6 +2011,7 @@ impl Input {
         let ticks = self.clock.ticks(pts, Some(duration))?;
         let tb = self.time_base;
         self.duration = self.clock.frame_us(ticks, duration, tb.num, tb.den);
+        self.measured = self.clock.measures(duration);
         self.located = self.resolve_chroma();
         Some(rescale_us(ticks, tb.num, tb.den))
     }

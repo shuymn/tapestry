@@ -4504,47 +4504,63 @@ fn a_landing_carries_its_own_chroma_location() {
 }
 
 /// A frame stating no duration, in a stream whose average rate is not
-/// known, lasts the interval between the frames before it, never a seek's
-/// jump (design.md "Rendering and Skins", video frames): the worker takes
+/// known, lasts the interval from the frame before it, as in a play from
+/// the start, never a seek's jump nor an interval measured before the
+/// seek (design.md "Rendering and Skins", video frames): the worker takes
 /// every frame's duration and the stream's rate as unknown. Run 1 plays
-/// the 40 ms frames of motion JPEG in Matroska from 0; a landing inside the
-/// last frame's interval (frame 25, 1 s to 1.04 s), which the demuxer
-/// lands on directly, lasts 40 ms, then the run ends, and one past that
-/// interval has nothing.
+/// 40 ms frames of motion JPEG in Matroska from 0; the demuxer lands
+/// directly on the last frame, so the landing backs off for the frame
+/// before it. In the constant-rate clip the last frame (frame 25 at 1 s)
+/// lasts 40 ms; in the variable-rate one it comes 120 ms after frame 24
+/// (at 1.08 s) and lasts 120 ms, not the 40 ms run 1 measured. A target
+/// inside the last frame's interval lands on it, then the run ends; one
+/// past that interval has nothing.
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
     let dir = tempfile::tempdir().unwrap();
-    let path = gen_clip(dir.path(), "u.mkv", "mjpeg matroska 176x96 25 26 1");
-    let last = 25 * 40_000;
-    for (target, want) in [(last + 20_000, Some(last)), (last + 50_000, None)] {
-        let mut worker = Worker::start(&["--dev-serve", "unstated"]);
-        let probe = worker.open(1, &path);
-        assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
-        let mut ring = Ring::new(176, 96);
-        assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
-        for i in 0..4 {
-            assert_eq!(take_one(&worker, &mut ring, i * 40_000).stamp, i * 40_000);
-        }
-        let run = ring.start_run(0);
-        assert_eq!(
-            land_at(&mut worker, 1, run, target).map(|(l, _)| l),
-            want,
-            "{target}: the worker's log:\n{}",
-            worker.log()
-        );
-        if want.is_some() {
-            let taken = take_one(&worker, &mut ring, target);
+    for (name, spec, last, interval) in [
+        ("c.mkv", "mjpeg matroska 176x96 25 26 1", 1_000_000, 40_000),
+        (
+            "v.mkv",
+            "mjpeg matroska 176x96 25 26 1 gap=25:2",
+            1_080_000,
+            120_000,
+        ),
+    ] {
+        let path = gen_clip(dir.path(), name, spec);
+        for (target, want) in [
+            (last + interval / 2, Some(last)),
+            (last + interval + 10_000, None),
+        ] {
+            let mut worker = Worker::start(&["--dev-serve", "unstated"]);
+            let probe = worker.open(1, &path);
+            assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+            let mut ring = Ring::new(176, 96);
+            assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
+            for i in 0..4 {
+                assert_eq!(take_one(&worker, &mut ring, i * 40_000).stamp, i * 40_000);
+            }
+            let run = ring.start_run(0);
             assert_eq!(
-                (taken.stamp, taken.duration),
-                (last, 40_000),
-                "the worker's log:\n{}",
+                land_at(&mut worker, 1, run, target).map(|(l, _)| l),
+                want,
+                "{name} {target}: the worker's log:\n{}",
                 worker.log()
             );
+            if want.is_some() {
+                let taken = take_one(&worker, &mut ring, target);
+                assert_eq!(
+                    (taken.stamp, taken.duration),
+                    (last, interval),
+                    "{name}: the worker's log:\n{}",
+                    worker.log()
+                );
+            }
+            assert_eq!(worker.reply(), Reply::Ended { player: 1, run });
+            worker.close(1);
         }
-        assert_eq!(worker.reply(), Reply::Ended { player: 1, run });
-        worker.close(1);
     }
 }
 
