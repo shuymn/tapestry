@@ -213,6 +213,9 @@ pub struct Worker {
     _desktop: Option<launch::Desktop>,
     #[cfg(test)]
     log: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The close answers its replies' thread has queued.
+    #[cfg(test)]
+    closes: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     suspended: Vec<handles::Entry>,
     #[cfg(test)]
@@ -568,6 +571,12 @@ pub enum OpenError {
 
 #[cfg(test)]
 impl Worker {
+    /// The count of close answers its replies' thread has queued, shared:
+    /// an answer counted is in the queue the next drain takes.
+    pub fn closes(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.closes)
+    }
+
     /// Duplicates `handle` into the worker with `access`, which a test's
     /// control widens.
     pub fn hand_in_with(&self, handle: HANDLE, access: u32) -> windows::core::Result<u64> {
