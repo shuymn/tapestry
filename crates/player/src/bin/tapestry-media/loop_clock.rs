@@ -71,6 +71,14 @@ impl LoopClock {
         pts.checked_sub(self.start)?.checked_add(self.offset)
     }
 
+    /// A seek: the next frame decoded follows none of the frames before it,
+    /// so the jump is never taken as an interval between frames; the
+    /// interval measured before the seek stays until frames after it
+    /// measure one.
+    pub const fn sever(&mut self) {
+        self.last = None;
+    }
+
     /// The ticks a frame lasting `duration` (0 or less when unknown) lasts:
     /// its own duration, else the stream's average frame interval, else the
     /// interval between the last two frames, else one tick.
@@ -243,6 +251,25 @@ mod tests {
         pass(&mut clock, &[0, 1000, 2500], &[None, None, None]);
         assert!(clock.wrap());
         assert_eq!(clock.ticks(0, None), Some(4000));
+    }
+
+    /// A seek is never a frame's interval (design.md "Rendering and
+    /// Skins", video frames): with no duration and no average rate, frames
+    /// 40 ms apart to 120 ms, then a seek to the frame at 1 s; that frame
+    /// lasts the 40 ms measured before the seek, not the 880 ms jump, and
+    /// the frames after it measure their own interval.
+    // Covers: T02
+    #[test]
+    fn a_seek_is_never_a_frame_s_interval() {
+        let us = |clock: &mut LoopClock, pts| {
+            let ticks = clock.ticks(pts, None).unwrap();
+            clock.frame_us(ticks, 0, TB.0, TB.1)
+        };
+        let mut clock = LoopClock::new(0, None);
+        pass(&mut clock, &[0, 3600, 7200, 10_800], &[None; 4]);
+        clock.sever();
+        assert_eq!(us(&mut clock, 90_000), 40_000);
+        assert_eq!(us(&mut clock, 94_500), 50_000);
     }
 
     // Covers: T02

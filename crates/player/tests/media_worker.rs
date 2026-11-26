@@ -4390,6 +4390,164 @@ fn a_landing_past_the_end_is_answered_empty() {
     worker.close(3);
 }
 
+/// A seek while a landing's kept frame is unread drops that frame
+/// (design.md "Rendering and Skins", video frames): with every slot full,
+/// run 2 lands at 1.51 s (frame 45, frame 46 kept) and waits for a slot;
+/// a seek of run 3 to 0.5 s, in either mode, then plays frames 15, 16 and
+/// 17, never the kept frame.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_seek_drops_a_landing_s_unread_kept_frame() {
+    use skin_model::media::{SLOTS, State};
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "s.mpg", GOPS);
+    let slots = u64::try_from(SLOTS).unwrap();
+    for to in [SeekTo::From, SeekTo::Landing] {
+        let mut worker = Worker::start(&[]);
+        let probe = worker.open(3, &path);
+        assert!(
+            matches!(probe, Reply::Probed { player: 3, .. }),
+            "{probe:?}"
+        );
+        let mut ring = Ring::new(320, 240);
+        assert!(matches!(
+            worker.play(3, &ring),
+            Reply::Playing { player: 3, .. }
+        ));
+        let deadline = Instant::now() + REPLY;
+        while ring.published() < slots || ring.state() != Some(State::Waiting) {
+            assert!(Instant::now() < deadline, "the ring never filled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let run = ring.start_run(0);
+        assert_eq!(
+            land_at(&mut worker, 3, run, 1_510_000).map(|(l, _)| l),
+            Some(1_500_000)
+        );
+        assert_eq!(ring.published(), slots, "the landing waits for a slot");
+        let run = ring.start_run(500_000);
+        worker.send(&Order::Seek {
+            player: 3,
+            run,
+            at: 500_000,
+            to,
+        });
+        match worker.reply() {
+            Reply::Sought {
+                run: r,
+                landed: Some(500_000),
+                ..
+            } if r == run => {}
+            other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+        }
+        for i in [15, 16, 17] {
+            let due = stamp_of(i, 30);
+            let taken = take_one(&worker, &mut ring, due);
+            assert_eq!(
+                (taken.stamp, painted(&taken.bytes, 320)),
+                (due, u32::try_from(i).unwrap()),
+                "{to:?}"
+            );
+        }
+        worker.close(3);
+    }
+}
+
+/// A landing carries its own chroma location, not the frame's after it
+/// (design.md "Rendering and Skins", video frames): each frame of this
+/// clip is a sequence of its own, its parameter sets with it, so the
+/// decoder labels each from its own whatever the seek; at 24 fps frame 2
+/// (centre) lands before frame 3 (left), the two lasting alike.
+// Covers: T02
+#[test]
+fn a_landing_carries_its_own_chroma_location() {
+    const EACH: [(Vui, u64); 4] = [
+        (Vui::Sited(0), 1),
+        (Vui::Sited(2), 1),
+        (Vui::Sited(1), 1),
+        (Vui::Sited(0), 1),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("each.avi");
+    let units = h264_sited((32, 32), (32, 32), &EACH, &sited_sample);
+    std::fs::write(&path, avi((32, 32), 24, b"H264", &units)).unwrap();
+    let stamp = |i: i64| (i * 1_000_000 + 12) / 24;
+    let mut worker = Worker::start(&[]);
+    assert!(matches!(
+        worker.open(1, &path),
+        Reply::Probed { player: 1, .. }
+    ));
+    let mut ring = Ring::new(32, 32);
+    assert!(matches!(
+        worker.play(1, &ring),
+        Reply::Playing { player: 1, .. }
+    ));
+    take_one(&worker, &mut ring, 0);
+    let run = ring.start_run(0);
+    assert_eq!(
+        land_at(&mut worker, 1, run, 100_000).map(|(l, _)| l),
+        Some(stamp(2)),
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    for (i, want) in [(2, ChromaLocation::Centre), (3, ChromaLocation::Left)] {
+        let taken = take_one(&worker, &mut ring, stamp(i));
+        assert_eq!(
+            (taken.stamp, taken.chroma),
+            (stamp(i), want),
+            "frame {i}; the worker's log:\n{}",
+            worker.log()
+        );
+    }
+    worker.close(1);
+}
+
+/// A frame stating no duration, in a stream whose average rate is not
+/// known, lasts the interval between the frames before it, never a seek's
+/// jump (design.md "Rendering and Skins", video frames): the worker takes
+/// every frame's duration and the stream's rate as unknown. Run 1 plays
+/// the 40 ms frames of motion JPEG in Matroska from 0; a landing inside the
+/// last frame's interval (frame 25, 1 s to 1.04 s), which the demuxer
+/// lands on directly, lasts 40 ms, then the run ends, and one past that
+/// interval has nothing.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "u.mkv", "mjpeg matroska 176x96 25 26 1");
+    let last = 25 * 40_000;
+    for (target, want) in [(last + 20_000, Some(last)), (last + 50_000, None)] {
+        let mut worker = Worker::start(&["--dev-serve", "unstated"]);
+        let probe = worker.open(1, &path);
+        assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+        let mut ring = Ring::new(176, 96);
+        assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
+        for i in 0..4 {
+            assert_eq!(take_one(&worker, &mut ring, i * 40_000).stamp, i * 40_000);
+        }
+        let run = ring.start_run(0);
+        assert_eq!(
+            land_at(&mut worker, 1, run, target).map(|(l, _)| l),
+            want,
+            "{target}: the worker's log:\n{}",
+            worker.log()
+        );
+        if want.is_some() {
+            let taken = take_one(&worker, &mut ring, target);
+            assert_eq!(
+                (taken.stamp, taken.duration),
+                (last, 40_000),
+                "the worker's log:\n{}",
+                worker.log()
+            );
+        }
+        assert_eq!(worker.reply(), Reply::Ended { player: 1, run });
+        worker.close(1);
+    }
+}
+
 /// A landing and the frame kept after it each carry the stamp and
 /// duration they were decoded with, and the frame kept its own chroma
 /// location (design.md "Rendering and Skins", Video frames): in the

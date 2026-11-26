@@ -45,7 +45,9 @@
 //!   while it says it decodes, or while it says it waits for a free slot;
 //!   `slow-convert=<ms>` sleeps `ms` before each frame's conversion;
 //!   `stall-convert=<n>:<ms>` sleeps `ms` before the process's conversion
-//!   number `n`, counted from 0; `refuse-alloc=<player>` has the worker's
+//!   number `n`, counted from 0; `unstated` takes every frame's own
+//!   duration and every stream's average frame rate as unknown;
+//!   `refuse-alloc=<player>` has the worker's
 //!   allocator refuse that player's next decode an allocation, which the
 //!   decode's check finds as a decoder's refusal; `garbage=<player>` writes
 //!   its next frame in a run not started; `balloon=<step>:<total>` commits
@@ -128,6 +130,7 @@ fn serve_options(options: &[String]) -> Result<(), String> {
                 };
                 crate::player::freeze(player, at);
             }
+            "unstated" => ffmpeg::leave_timing_unstated(),
             "slow-convert" => {
                 let ms = value.parse().map_err(|e| format!("{option}: {e}"))?;
                 ffmpeg::slow_convert(ms);

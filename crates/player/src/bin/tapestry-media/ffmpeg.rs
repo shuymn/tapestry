@@ -154,6 +154,19 @@ pub fn stall_convert(at: u64, ms: u64) {
     STALL_AT.store(at, Ordering::Relaxed);
 }
 
+/// Every frame's own duration and every stream's average frame rate are
+/// taken as unknown (dev-tools): each frame then lasts the interval between
+/// the frames before it.
+#[cfg(feature = "dev-tools")]
+static UNSTATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Takes every frame's own duration and every stream's average frame rate
+/// as unknown from now on (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn leave_timing_unstated() {
+    UNSTATED.store(true, Ordering::Relaxed);
+}
+
 /// The codec whitelist, as the option an open sets.
 fn codec_list() -> &'static [(&'static CStr, &'static CStr)] {
     #[cfg(feature = "dev-tools")]
@@ -1487,7 +1500,10 @@ impl Input {
             };
             self.width = width;
             self.height = height;
-            self.clock = LoopClock::new(self.start, interval(self.time_base, (*st).avg_frame_rate));
+            let rate = interval(self.time_base, (*st).avg_frame_rate);
+            #[cfg(feature = "dev-tools")]
+            let rate = rate.filter(|_| !UNSTATED.load(Ordering::Relaxed));
+            self.clock = LoopClock::new(self.start, rate);
             self.colour = Colour::of_stream(
                 width,
                 height,
@@ -1783,6 +1799,7 @@ impl Input {
             return Err((Failure::Seek, r));
         }
         self.drained = false;
+        self.clock.sever();
         Ok(())
     }
 
@@ -1969,6 +1986,12 @@ impl Input {
         if pts == ff::AV_NOPTS_VALUE {
             return None;
         }
+        #[cfg(feature = "dev-tools")]
+        let duration = if UNSTATED.load(Ordering::Relaxed) {
+            0
+        } else {
+            duration
+        };
         if !self.sought && self.clock.first().is_none() {
             self.clock.set_first(pts);
         }
