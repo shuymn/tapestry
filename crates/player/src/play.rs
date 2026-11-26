@@ -4051,6 +4051,18 @@ impl PlayerRig<'_> {
 }
 
 #[cfg(test)]
+impl PlayerRig<'_> {
+    /// The play's deadline step after the render thread's armed reveal
+    /// (tests): the reveal taken first
+    /// ([`RenderLink::reveal_armed_now`]), as at the deadline, then the
+    /// step, which reads it.
+    pub(crate) fn step_at_deadline(&mut self) -> game::StepOutcome {
+        self.render.reveal_armed_now();
+        game::AppRig::deadline_step(self)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn prepare_render(
     end_page: &mut Option<EndPage>,
     render: &RenderLink,
