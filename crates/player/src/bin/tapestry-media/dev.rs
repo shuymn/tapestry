@@ -2,12 +2,18 @@
 //!
 //! - `--dev-tools-probe`: prints the dev-tools marker.
 //! - `--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>
-//!   [gap=<frame>:<periods>]`: encodes a synthesized clip through the
-//!   build's encoder and muxer of those FFmpeg names. Frame `i` shows `i`
-//!   in its top row of 16 × 16 blocks, bit `b` of `i` in block `b` (luma
-//!   235 for a one, 16 for a zero), over a pattern that moves with `i`.
-//!   With a gap, frame `frame` and every one after it come `periods` frame
-//!   periods later: a clip of variable rate.
+//!   [gap=<frame>:<periods>] [paint=chroma-step]`: encodes a synthesized
+//!   clip through the build's encoder and muxer of those FFmpeg names.
+//!   Frame `i` shows `i` in its top row of 16 × 16 blocks, bit `b` of `i`
+//!   in block `b` (luma 235 for a one, 16 for a zero), over a pattern that
+//!   moves with `i`. With a gap, frame `frame` and every one after it come
+//!   `periods` frame periods later: a clip of variable rate. With
+//!   `paint=chroma-step`, every frame is instead luma 128 throughout, its Cb
+//!   96 left of a column step and 160 from it and its Cr 96 above a row
+//!   step and 160 from it, each step at the multiple of 8 at or below half
+//!   its chroma plane (chroma column 80 and row 40 at 320 × 180), so it lies
+//!   on the encoders' 8 × 8 chroma block edges and no block holds a step to
+//!   ring: a step whose drawn place shows where the frame's chroma is sited.
 //! - `--dev-secondary-open <file> <refuse|default>`: opens `file` as the
 //!   worker opens a video, with its own `io_open` or FFmpeg's, and prints
 //!   what a secondary open through the opened file's context gives, as a
@@ -341,26 +347,27 @@ fn usage(message: &str) -> ExitCode {
 
 /// `--dev-gen-clip`.
 fn gen_clip(args: &[String]) -> Result<(), String> {
-    let usage = "--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>                  [gap=<frame>:<periods>]";
-    let (fixed, gap) = match args {
-        [fixed @ .., last] if last.starts_with("gap=") => (fixed, Some(last.as_str())),
-        _ => (args, None),
-    };
+    let usage = "--dev-gen-clip <out> <codec> <format> <W>x<H> <rate> <frames> <gop>                  [gap=<frame>:<periods>] [paint=chroma-step]";
+    let (fixed, options) = args.split_at(args.len().min(7));
     let [out, codec, format, size, rate, frames, gop] = fixed else {
         return Err(usage.to_owned());
     };
     let number = |s: &str| s.parse::<i32>().map_err(|e| format!("{s}: {e}"));
-    let gap = match gap.and_then(|g| g.strip_prefix("gap=")) {
-        None => None,
-        Some(g) => {
-            let (at, periods) = g.split_once(':').ok_or_else(|| usage.to_owned())?;
-            let at = at.parse::<u32>().map_err(|e| format!("{at}: {e}"))?;
-            let periods = periods
-                .parse::<u32>()
-                .map_err(|e| format!("{periods}: {e}"))?;
-            Some((at, periods))
+    let (mut gap, mut step) = (None, false);
+    for option in options {
+        match option.split_once('=') {
+            Some(("gap", g)) => {
+                let (at, periods) = g.split_once(':').ok_or_else(|| usage.to_owned())?;
+                let at = at.parse::<u32>().map_err(|e| format!("{at}: {e}"))?;
+                let periods = periods
+                    .parse::<u32>()
+                    .map_err(|e| format!("{periods}: {e}"))?;
+                gap = Some((at, periods));
+            }
+            Some(("paint", "chroma-step")) => step = true,
+            _ => return Err(format!("{option}: {usage}")),
         }
-    };
+    }
     let (w, h) = size
         .split_once('x')
         .ok_or_else(|| format!("{size}: not <W>x<H>"))?;
@@ -379,7 +386,11 @@ fn gen_clip(args: &[String]) -> Result<(), String> {
     }
     let (w, h) = (clip.width.unsigned_abs(), clip.height.unsigned_abs());
     ffmpeg::encode_clip(std::path::Path::new(out), &clip, &mut |i, frame| {
-        paint(i, w, h, frame);
+        if step {
+            paint_chroma_step(w, h, frame);
+        } else {
+            paint(i, w, h, frame);
+        }
     })
 }
 
@@ -405,6 +416,25 @@ fn paint(i: u32, w: u32, h: u32, frame: &mut [u8]) {
     }
     for (k, p) in v.iter_mut().enumerate() {
         *p = u8::try_from(112 + (k / cw + i as usize) % 32).unwrap_or(128);
+    }
+}
+
+/// Paints a `w` × `h` frame of `paint=chroma-step` into `frame`, tight
+/// I420: luma 128, Cb 96 left of its step and 160 from it, Cr 96 above its
+/// step and 160 from it, each step at the multiple of 8 at or below half
+/// its chroma plane.
+fn paint_chroma_step(w: u32, h: u32, frame: &mut [u8]) {
+    let (w, h) = (w as usize, h as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (column, row) = (cw / 2 / 8 * 8, ch / 2 / 8 * 8);
+    let (luma, chroma) = frame.split_at_mut(w * h);
+    luma.fill(128);
+    let (u, v) = chroma.split_at_mut(cw * ch);
+    for (k, p) in u.iter_mut().enumerate() {
+        *p = if k % cw < column { 96 } else { 160 };
+    }
+    for (k, p) in v.iter_mut().enumerate() {
+        *p = if k / cw < row { 96 } else { 160 };
     }
 }
 
