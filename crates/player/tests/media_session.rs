@@ -1490,32 +1490,275 @@ impl Gate {
     }
 }
 
-/// A peer the game loses after the session has judged its players and
-/// before it ends their marked worker is closed before the termination,
-/// and so not struck. As in the test above, player 1's seek is never
-/// answered and player 1 is lost for it, the worker marked; the session is
-/// then held at its next judgement, its peer still live, while the game
-/// loses the peer, so that the same look finds nothing live and ends the
-/// worker. Twice over, the frozen player's file is struck and its peer's
-/// is not: the third attempt refuses the first and plays the second.
+/// A session whose turns a test holds: once at the turn armed, until the
+/// test releases it.
+struct Holding {
+    rig: Rig,
+    armed: Arc<Mutex<Option<Held>>>,
+    gate: Arc<Gate>,
+    held: std::sync::mpsc::Receiver<()>,
+}
+
+impl Holding {
+    /// A rig of a worker with `args`, its session held as armed.
+    fn start(args: &[&str]) -> Self {
+        let armed = Arc::new(Mutex::new(None));
+        let gate = Arc::new(Gate::default());
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let rig = {
+            let (armed, gate) = (Arc::clone(&armed), Arc::clone(&gate));
+            Rig::starting(args, move |l| {
+                Session::start_held(l, Deadlines::GAME, move |at| {
+                    let hold = {
+                        let mut armed = armed.lock().unwrap();
+                        let hold = *armed == Some(at);
+                        if hold {
+                            *armed = None;
+                        }
+                        hold
+                    };
+                    if hold {
+                        let _ = held_tx.send(());
+                        gate.pass();
+                    }
+                })
+                .unwrap()
+            })
+        };
+        Self {
+            rig,
+            armed,
+            gate,
+            held,
+        }
+    }
+
+    /// Holds the session at its next turn `at`.
+    fn arm(&self, at: Held) {
+        *self.armed.lock().unwrap() = Some(at);
+    }
+
+    /// Waits up to 5 s for the session to be held.
+    fn wait(&self, what: &str) {
+        self.held
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{what}: {:?}", self.rig.session.events()));
+    }
+
+    /// Lets the session held go on.
+    fn release(&self) {
+        self.gate.open();
+    }
+}
+
+/// A chart video the game loses after the session's peer check and before
+/// its judgement still loses its peer (design.md "Threat Model" T02): the
+/// chart's videos are one panel. The session is held after its peer check
+/// while the game loses the base for a fault; the judgement then closes
+/// the base, and the session is held again until the worker's answer to
+/// that close is queued, so the next look drops the base before its own
+/// peer check. The layer is lost for its peer all the same, the skin's
+/// movie plays on, and no worker is ended.
 // Covers: T02
 #[test]
-fn a_peer_lost_as_its_worker_is_ended_is_not_struck() {
-    let armed = Arc::new(AtomicBool::new(false));
-    let gate = Arc::new(Gate::default());
-    let (held_tx, held) = std::sync::mpsc::channel();
-    let rig = {
-        let (armed, gate) = (Arc::clone(&armed), Arc::clone(&gate));
-        Rig::starting(&["--dev-serve", "freeze=1:waiting", "deaf=5"], move |l| {
-            Session::start_held(l, Deadlines::GAME, move |at| {
-                if at == Held::Judged && armed.swap(false, Ordering::AcqRel) {
-                    let _ = held_tx.send(());
-                    gate.pass();
-                }
-            })
-            .unwrap()
+fn a_chart_loss_after_the_peer_check_loses_its_peer() {
+    let h = Holding::start(&["--dev-serve"]);
+    let rig = &h.rig;
+    rig.session.enter(1);
+    let (base, layer, skin) = (Movie::chart(1), Movie::chart(1), Movie::new(1));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    rig.open_as(&skin, "s.mpg", true);
+    for m in [&base, &layer, &skin] {
+        until(LAUNCH, || m.status() == Status::Live)
+            .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+    }
+    // Held after a peer check that found nothing lost.
+    h.arm(Held::Peered);
+    h.wait("the session never checked its peers");
+    let closes = rig.session.closes_queued();
+    assert!(base.lose(Loss::Fault));
+    h.arm(Held::Judged);
+    h.release();
+    // Held after the judgement that closed the base, until its answer is
+    // queued for the next look's first drain.
+    h.wait("the session never judged");
+    until(Duration::from_secs(5), || {
+        rig.session.closes_queued() > closes
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "the base's close never answered: {:?}",
+            rig.session.events()
+        )
+    });
+    h.release();
+    until(Duration::from_secs(5), || {
+        rig.count(|e| matches!(e, Event::Closed)) >= 1
+    })
+    .unwrap_or_else(|| panic!("the base never closed: {:?}", rig.session.events()));
+    lost(&layer, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+    assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    assert_eq!(rig.count(|e| matches!(e, Event::Terminated { .. })), 0);
+}
+
+/// A chart video the game loses while it is queued loses its peer
+/// (design.md "Rendering and Skins", BGA): both of a chart's videos are
+/// taken in one turn and held there, queued, while the game loses the base
+/// at its preparation's deadline. The look drops the base before it opens
+/// anything, and the layer is lost for its peer, never opened; each loss
+/// is logged once, though both players are gone; the skin's movie plays
+/// on.
+// Covers: T02
+#[test]
+fn a_queued_chart_video_lost_loses_its_peer() {
+    let h = Holding::start(&["--dev-serve"]);
+    let rig = &h.rig;
+    rig.session.enter(1);
+    let skin = Movie::new(1);
+    rig.open_as(&skin, "s.mpg", true);
+    until(LAUNCH, || skin.status() == Status::Live)
+        .unwrap_or_else(|| panic!("never live: {:?}", skin.loss()));
+    // Both opens sent while the session is held, so one turn takes both.
+    h.arm(Held::Looked);
+    h.wait("the session never looked");
+    let (base, layer) = (Movie::chart(1), Movie::chart(1));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    h.arm(Held::Taken);
+    h.release();
+    h.wait("the session never took the opens");
+    assert_eq!(
+        (base.status(), layer.status()),
+        (Status::Pending, Status::Pending)
+    );
+    base.expire();
+    assert_eq!(base.loss(), Some(Loss::Preparation));
+    h.release();
+    lost(&layer, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+    assert_eq!(
+        rig.count(|e| matches!(e, Event::Opened)),
+        1,
+        "only the skin's"
+    );
+    assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    noted_once(rig, &[Loss::Preparation, Loss::Peer]);
+}
+
+/// Each of `losses` logged exactly once, and no other loss.
+fn noted_once(rig: &Rig, losses: &[Loss]) {
+    until(Duration::from_secs(1), || {
+        rig.count(|e| matches!(e, Event::Noted { .. })) >= losses.len()
+    });
+    let noted: Vec<Loss> = rig
+        .session
+        .events()
+        .into_iter()
+        .filter_map(|(_, e)| match e {
+            Event::Noted { why } => Some(why),
+            _ => None,
         })
-    };
+        .collect();
+    assert_eq!(noted, losses, "{:?}", rig.session.events());
+}
+
+/// A queued chart video the game loses after a drop has chosen its players
+/// still loses its peer (design.md "Rendering and Skins", BGA): both of a
+/// chart's videos are taken in one turn, queued, and the look's first drop
+/// is held after it has chosen nothing and checked the peers, while the
+/// game loses the base at its preparation's deadline. The base stays for
+/// the next drop, which loses the layer for its peer; both losses are
+/// logged once, and the skin's movie plays on.
+// Covers: T02
+#[test]
+fn a_queued_chart_video_lost_after_the_drop_s_choice_loses_its_peer() {
+    let h = Holding::start(&["--dev-serve"]);
+    let rig = &h.rig;
+    rig.session.enter(1);
+    let skin = Movie::new(1);
+    rig.open_as(&skin, "s.mpg", true);
+    until(LAUNCH, || skin.status() == Status::Live)
+        .unwrap_or_else(|| panic!("never live: {:?}", skin.loss()));
+    h.arm(Held::Looked);
+    h.wait("the session never looked");
+    let (base, layer) = (Movie::chart(1), Movie::chart(1));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    h.arm(Held::Taken);
+    h.release();
+    h.wait("the session never took the opens");
+    assert_eq!(
+        (base.status(), layer.status()),
+        (Status::Pending, Status::Pending)
+    );
+    // Held in the look's first drop, its choice and peer check made.
+    h.arm(Held::Dropping);
+    h.release();
+    h.wait("the session never dropped");
+    base.expire();
+    assert_eq!(base.loss(), Some(Loss::Preparation));
+    h.release();
+    lost(&layer, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+    assert_eq!((skin.status(), skin.loss()), (Status::Live, None));
+    noted_once(rig, &[Loss::Preparation, Loss::Peer]);
+}
+
+/// A chart video still queued when its worker fails loses its peer, lost
+/// with the worker (design.md "Rendering and Skins", BGA): seven skin
+/// movies and the base take every player id, so the layer waits queued
+/// whenever the failure is seen; the worker is ended, every player it
+/// held is lost with it, and the layer is lost for its peer instead of
+/// opened on the next worker.
+// Covers: T02
+#[test]
+fn a_chart_video_queued_as_its_worker_fails_loses_its_peer() {
+    let h = Holding::start(&["--dev-serve"]);
+    let rig = &h.rig;
+    rig.session.enter(1);
+    let skins: Vec<_> = (0..7).map(|_| Movie::new(1)).collect();
+    for (k, m) in skins.iter().enumerate() {
+        rig.open_as(m, &format!("s{k}.mpg"), true);
+    }
+    let base = Movie::chart(1);
+    rig.open_as(&base, "a.mpg", false);
+    for m in skins.iter().chain([&base]) {
+        until(LAUNCH, || m.status() == Status::Live)
+            .unwrap_or_else(|| panic!("never live: {:?}", m.loss()));
+    }
+    // The layer's open sent while the session is held, so the next turn
+    // takes it, with no id free.
+    h.arm(Held::Looked);
+    h.wait("the session never looked");
+    let layer = Movie::chart(1);
+    rig.open_as(&layer, "b.mpg", false);
+    h.arm(Held::Taken);
+    h.release();
+    h.wait("the session never took the open");
+    assert_eq!(layer.status(), Status::Pending);
+    let worker = rig.worker(Duration::ZERO);
+    worker.terminate_with(1);
+    assert_eq!(worker.exit(Duration::from_secs(5)), Some(1));
+    h.release();
+    lost(&base, LAUNCH).unwrap_or_else(|| panic!("the base kept: {:?}", rig.session.events()));
+    lost(&layer, LAUNCH).unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
+}
+
+/// A session whose worker is ended twice while it freezes on `a.mpg`, its
+/// peer `b.mpg` lost as the worker is ended: `a.mpg` is struck twice and
+/// `b.mpg` not. Player 1's seek is never answered and player 1 is lost
+/// for it, the worker marked; the session is then
+/// held at its next judgement, its peer still live, while the game loses
+/// the peer, so that the same look finds nothing live and ends the worker.
+fn struck_twice() -> Holding {
+    let h = Holding::start(&["--dev-serve", "freeze=1:waiting", "deaf=5"]);
+    let rig = &h.rig;
     let waker = rig.session.waker();
     let reaped = || rig.count(|e| matches!(e, Event::Reaped { .. }));
     for generation in 1..=2 {
@@ -1538,16 +1781,27 @@ fn a_peer_lost_as_its_worker_is_ended_is_not_struck() {
         lost(&frozen, Duration::from_secs(5)).expect("no loss within 5 s");
         assert_eq!(frozen.loss(), Some(Loss::Answer));
         // Held at the next judgement, the peer live through it.
-        armed.store(true, Ordering::Release);
-        held.recv_timeout(Duration::from_secs(5))
-            .expect("the session never judged");
+        h.arm(Held::Judged);
+        h.wait("the session never judged");
         assert_eq!(peer.status(), Status::Live);
         peer.lose(Loss::Peer);
-        gate.open();
+        h.release();
         let n = usize::try_from(generation).unwrap();
         until(Duration::from_secs(5), || reaped() >= n)
             .unwrap_or_else(|| panic!("not reaped: {:?}", rig.session.events()));
     }
+    h
+}
+
+/// A peer the game loses after the session has judged its players and
+/// before it ends their marked worker is closed before the termination,
+/// and so not struck ([`struck_twice`]): the third attempt refuses the
+/// first file and plays the second.
+// Covers: T02
+#[test]
+fn a_peer_lost_as_its_worker_is_ended_is_not_struck() {
+    let h = struck_twice();
+    let rig = &h.rig;
     rig.session.enter(3);
     let again = [Movie::new(3), Movie::new(3)];
     rig.open_as(&again[0], "a.mpg", true);
@@ -1560,6 +1814,31 @@ fn a_peer_lost_as_its_worker_is_ended_is_not_struck() {
         (Status::Live, None),
         "struck?"
     );
+}
+
+/// A chart video whose file is struck loses its peer at its refused open
+/// (design.md "Rendering and Skins", BGA: two strikes are an own-player
+/// loss): after [`struck_twice`], a chart whose base is the struck file and
+/// whose layer is not, both taken in one turn, has its base refused and
+/// its layer lost for its peer, though the layer's file plays as a skin's
+/// movie in the test above.
+// Covers: T02
+#[test]
+fn a_struck_chart_video_loses_its_peer() {
+    let h = struck_twice();
+    let rig = &h.rig;
+    rig.session.enter(3);
+    h.arm(Held::Looked);
+    h.wait("the session never looked");
+    let (base, layer) = (Movie::chart(3), Movie::chart(3));
+    rig.open_as(&base, "a.mpg", false);
+    rig.open_as(&layer, "b.mpg", false);
+    h.release();
+    assert!(lost(&base, LAUNCH).is_some(), "{:?}", base.status());
+    assert_eq!(base.loss(), Some(Loss::Struck));
+    lost(&layer, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("the peer kept: {:?}", rig.session.events()));
+    assert_eq!(layer.loss(), Some(Loss::Peer));
 }
 
 /// A peer closed while its worker ends on its own, with the very code the

@@ -693,9 +693,13 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
     let overflowed = Arc::new(AtomicBool::new(false));
     let in_hand = Arc::new(AtomicBool::new(false));
     let beats = Arc::new(super::Beats::new());
+    #[cfg(test)]
+    let closes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let reading = {
         #[cfg(test)]
         let log = std::sync::Arc::clone(&log);
+        #[cfg(test)]
+        let closes = Arc::clone(&closes);
         let overflowed = Arc::clone(&overflowed);
         let in_hand = Arc::clone(&in_hand);
         let beats = Arc::clone(&beats);
@@ -709,7 +713,7 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
                     &in_hand,
                     &beats,
                     #[cfg(test)]
-                    &log,
+                    (&log, &closes),
                 );
                 // The replies' end is published before its line is logged:
                 // a log that stalls never delays it.
@@ -765,6 +769,8 @@ pub fn launch(installation: &Path, data: &Path, setup: &Setup) -> Result<Worker,
         _desktop: desktop,
         #[cfg(test)]
         log,
+        #[cfg(test)]
+        closes,
         #[cfg(test)]
         suspended: table,
         #[cfg(test)]
@@ -2274,14 +2280,18 @@ fn token(process: HANDLE, sid: &Sid) -> Result<(), Failure> {
 /// it is queued, so the session can tell that every reply stamped before
 /// an instant is queued ([`super::Worker::in_hand`]). Returns the line the
 /// end of an unexpected end logs, which the caller logs once the sender is
-/// dropped.
+/// dropped. A test's worker also keeps its log lines and counts the close
+/// answers queued ([`super::Worker::closes`]).
 fn read_replies(
     replies: Owned,
     tx: &SyncSender<(std::time::Instant, Reply)>,
     overflowed: &AtomicBool,
     in_hand: &AtomicBool,
     beats: &super::Beats,
-    #[cfg(test)] log: &std::sync::Arc<Mutex<String>>,
+    #[cfg(test)] (log, closes): (
+        &std::sync::Arc<Mutex<String>>,
+        &std::sync::atomic::AtomicU64,
+    ),
 ) -> Option<String> {
     use std::io::Read as _;
     // SAFETY: the game's end of the pipe from the worker, owned by the file
@@ -2322,9 +2332,15 @@ fn read_replies(
             }
             Ok(Reply::Beat) => beats.beat(),
             Ok(reply) => {
+                #[cfg(test)]
+                let closed = matches!(reply, Reply::Closed { .. });
                 in_hand.store(true, Ordering::SeqCst);
                 let sent = tx.try_send((std::time::Instant::now(), reply));
                 in_hand.store(false, Ordering::SeqCst);
+                #[cfg(test)]
+                if closed && sent.is_ok() {
+                    closes.fetch_add(1, Ordering::SeqCst);
+                }
                 match sent {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
