@@ -1218,6 +1218,9 @@ pub struct Landed {
     /// buffer.
     pub stamp: i64,
     pub attempts: u8,
+    /// The landing is the clip's last frame and its length was found from
+    /// nothing: its duration proves no end ([`Input::land`]).
+    pub open_end: bool,
 }
 
 /// A decoded frame's stamp, duration and resolved chroma location, as
@@ -1764,7 +1767,8 @@ impl Input {
             return match (landing, after) {
                 // Past the last frame's end: nothing to land on. A last
                 // frame whose length was found from nothing, even at the
-                // furthest back-off, proves no end: it is landed on.
+                // furthest back-off, proves no end: it is landed on, and
+                // the answer says so (`open_end`).
                 (Some(l), None) if !lone && l.stamp.saturating_add(l.duration) <= stamped => {
                     Ok(None)
                 }
@@ -1782,6 +1786,7 @@ impl Input {
                     Ok(Some(Landed {
                         stamp: l.stamp,
                         attempts,
+                        open_end: lone && after.is_none(),
                     }))
                 }
                 // No earlier frame found within the back-off: the first
@@ -1792,6 +1797,7 @@ impl Input {
                     Ok(Some(Landed {
                         stamp: a.stamp,
                         attempts,
+                        open_end: false,
                     }))
                 }
                 (None, None) => Ok(None),
@@ -1872,7 +1878,11 @@ impl Input {
                         if let Some(out) = out.as_deref_mut() {
                             self.convert_frame(out)?;
                         }
-                        Ok(Some(Landed { stamp, attempts }))
+                        Ok(Some(Landed {
+                            stamp,
+                            attempts,
+                            open_end: false,
+                        }))
                     }
                     None => Ok(None),
                 };

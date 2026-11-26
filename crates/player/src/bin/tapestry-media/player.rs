@@ -454,6 +454,7 @@ impl Playing {
                     run,
                     landed: Some(landed.stamp),
                     attempts: landed.attempts,
+                    open_end: landed.open_end,
                 });
             }
             None => {
@@ -463,6 +464,7 @@ impl Playing {
                     run,
                     landed: None,
                     attempts: 0,
+                    open_end: false,
                 });
                 self.ended = true;
                 self.writer.state(self.view.words(), State::Ended);

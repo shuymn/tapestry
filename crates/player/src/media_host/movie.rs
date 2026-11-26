@@ -229,13 +229,15 @@ impl Cell {
 /// A video's runs as the render side and the session share them, one
 /// word each: the newest run the render side wants sought, the newest run
 /// whose end the worker reported, and the newest run whose seek the worker
-/// answered with no frame (an empty run); 0 for none. And a practice
-/// round's landing: its run and the media time it lands at.
+/// answered with no frame (an empty run), and the newest run whose landing
+/// is a last frame whose end nothing proves (an open run); 0 for none. And
+/// a practice round's landing: its run and the media time it lands at.
 #[derive(Debug, Default)]
 pub struct Runs {
     want: AtomicU64,
     ended: AtomicU64,
     empty: AtomicU64,
+    open: AtomicU64,
     landing: AtomicU64,
     landing_at: AtomicI64,
 }
@@ -274,6 +276,19 @@ impl Runs {
     /// Run `run`'s seek was answered with no frame.
     pub fn found_empty(&self, run: u64) {
         self.empty.store(run, Ordering::Release);
+    }
+
+    /// The newest run whose landing is the clip's last frame with no end
+    /// proven: that run's end, once reported, does not end its last frame
+    /// at its duration.
+    pub fn open(&self) -> u64 {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// Run `run`'s landing is the clip's last frame and nothing proves its
+    /// end ([`Reply::Sought`]'s `open_end`).
+    pub fn found_open(&self, run: u64) {
+        self.open.store(run, Ordering::Release);
     }
 
     /// Run `run` lands on the newest frame at or before media time `at`

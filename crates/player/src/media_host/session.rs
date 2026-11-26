@@ -192,6 +192,13 @@ impl Movie {
         self.runs.empty()
     }
 
+    /// The newest run whose landing is the clip's last frame with no end
+    /// proven, 0 for none: that run's end, once reported, leaves its last
+    /// frame shown.
+    pub fn open_end(&self) -> u64 {
+        self.runs.open()
+    }
+
     /// Run `run` ended, `empty` when its seek found no frame, as the
     /// session records the worker's answers (tests).
     #[cfg(test)]
@@ -1612,8 +1619,15 @@ impl Supervisor {
             p.sought = run;
             // An answer with no frame: the run is empty, and its end, which
             // follows, needs no frame of it.
-            if let Reply::Sought { landed: None, .. } = reply {
-                p.movie.runs.found_empty(run);
+            match reply {
+                Reply::Sought { landed: None, .. } => p.movie.runs.found_empty(run),
+                // A landing on a last frame whose end nothing proves.
+                Reply::Sought {
+                    landed: Some(_),
+                    open_end: true,
+                    ..
+                } => p.movie.runs.found_open(run),
+                _ => {}
             }
         }
         p.stage = stage;
@@ -2338,6 +2352,7 @@ mod tests {
             run,
             landed,
             attempts: u8::from(landed.is_some()),
+            open_end: false,
         }
     }
 
@@ -2518,6 +2533,33 @@ mod tests {
         // A seek that lands records nothing empty.
         let (_, landed) = sought_to(5);
         assert_eq!(landed.empty(), 0);
+    }
+
+    /// A landing whose end the worker says is open (a last frame whose
+    /// length was found from nothing) records its run open, and a landing
+    /// that says nothing records none (design.md "Rendering and Skins",
+    /// Video frames).
+    // Covers: T02
+    #[test]
+    fn an_open_ended_landing_records_its_run() {
+        for (open_end, want) in [(true, 4), (false, 0)] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(4);
+            s.seek_wanted(1).unwrap();
+            let answer = Reply::Sought {
+                id: 1,
+                player: 1,
+                run: 4,
+                landed: Some(10_000_000),
+                attempts: 4,
+                open_end,
+            };
+            s.take(Instant::now(), &answer).unwrap();
+            assert_eq!(s.players[0].stage, Stage::Live);
+            assert_eq!((movie.open_end(), movie.empty()), (want, 0), "{answer:?}");
+        }
     }
 
     /// A chart video lost for its own reason loses the screen's other

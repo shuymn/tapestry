@@ -165,6 +165,9 @@ pub trait Source {
     fn ended(&self) -> u64;
     /// The newest run whose seek found no frame ([`Movie::empty`]).
     fn empty(&self) -> u64;
+    /// The newest run whose landing is a last frame with no end proven
+    /// ([`Movie::open_end`]).
+    fn open_end(&self) -> u64;
 }
 
 impl Source for Movie {
@@ -225,6 +228,10 @@ impl Source for Movie {
 
     fn empty(&self) -> u64 {
         self.runs.empty()
+    }
+
+    fn open_end(&self) -> u64 {
+        self.runs.open()
     }
 }
 
@@ -1162,6 +1169,7 @@ impl<S: Source> Movies<S> {
         // run's end: read first, so the peek below sees them all.
         let ended = movie.ended();
         let empty = movie.empty();
+        let open_end = movie.open_end();
         let first = slot.first.unwrap_or(0);
         let mut freed = false;
         let (due, peeked) = 'read: {
@@ -1423,8 +1431,12 @@ impl<S: Source> Movies<S> {
             && ended == run
             && !left
         {
+            // A last frame whose end nothing proves stays until the
+            // file's next start or the round's end.
             let done = match slot.held {
-                Some(h) if h.run == run => due >= h.stamp.saturating_add(h.duration),
+                Some(h) if h.run == run => {
+                    open_end != run && due >= h.stamp.saturating_add(h.duration)
+                }
                 _ => empty == run,
             };
             if done {

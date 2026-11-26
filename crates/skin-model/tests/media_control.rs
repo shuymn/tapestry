@@ -87,6 +87,16 @@ fn replies() -> Vec<Reply> {
             run: 4,
             landed: Some(1_500_000),
             attempts: 2,
+            open_end: false,
+        },
+        // A landing on a last frame whose end nothing proves.
+        Reply::Sought {
+            id: 11,
+            player: 6,
+            run: 6,
+            landed: Some(10_000_000),
+            attempts: 4,
+            open_end: true,
         },
         // An empty seek's answer: no landing.
         Reply::Sought {
@@ -95,6 +105,7 @@ fn replies() -> Vec<Reply> {
             run: 5,
             landed: None,
             attempts: 0,
+            open_end: false,
         },
         Reply::Ended { player: 7, run: 12 },
         Reply::Closed { id: 8, player: 8 },
@@ -331,6 +342,7 @@ fn control_refuses_malformed_messages() {
         run: 2,
         landed: None,
         attempts: 0,
+        open_end: false,
     }
     .encode();
     assert_eq!(sought[14], 0);

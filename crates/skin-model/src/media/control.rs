@@ -158,13 +158,17 @@ pub enum Reply {
     /// `player` starts at the frame stamped `landed`, found after
     /// `attempts` seeks; or, `landed` being `None` (and `attempts` 0), no
     /// frame lies at or after the seek's time, and [`Reply::Ended`] for the
-    /// run follows.
+    /// run follows. `open_end`: the landing is the clip's last frame and its
+    /// length was found from nothing (no duration of its own, no average
+    /// rate, no frame before it within the seek's back-off), so its
+    /// duration proves no end of the clip.
     Sought {
         id: u32,
         player: u8,
         run: u64,
         landed: Option<i64>,
         attempts: u8,
+        open_end: bool,
     },
     /// `player` published the last frame of run `run`.
     Ended { player: u8, run: u64 },
@@ -454,13 +458,15 @@ impl Reply {
                 run,
                 landed,
                 attempts,
+                open_end,
             } => b
                 .u8(SOUGHT)
                 .u32(*id)
                 .u8(*player)
                 .u64(*run)
                 .landing(*landed)
-                .u8(*attempts),
+                .u8(*attempts)
+                .u8(u8::from(*open_end)),
             Self::Ended { player, run } => b.u8(ENDED).u8(*player).u64(*run),
             Self::Failed {
                 player,
@@ -521,6 +527,7 @@ impl Reply {
                 run: r.u64()?,
                 landed: r.landing()?,
                 attempts: r.u8()?,
+                open_end: r.flag()?,
             },
             ENDED => Self::Ended {
                 player: r.u8()?,

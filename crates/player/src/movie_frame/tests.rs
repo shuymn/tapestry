@@ -23,6 +23,7 @@ struct Fake {
     want: AtomicU64,
     ended: AtomicU64,
     empty: AtomicU64,
+    open_end: AtomicU64,
     /// The landing written: its run and media time.
     landing: Mutex<Option<(u64, i64)>>,
 }
@@ -47,6 +48,7 @@ impl Fake {
             want: AtomicU64::new(0),
             ended: AtomicU64::new(0),
             empty: AtomicU64::new(0),
+            open_end: AtomicU64::new(0),
             landing: Mutex::new(None),
         })
     }
@@ -160,6 +162,10 @@ impl Source for Fake {
 
     fn empty(&self) -> u64 {
         self.empty.load(Ordering::SeqCst)
+    }
+
+    fn open_end(&self) -> u64 {
+        self.open_end.load(Ordering::SeqCst)
     }
 }
 

@@ -670,6 +670,7 @@ fn worker_seek_lands_on_target_after_back_off() {
             run,
             landed: Some(1_500_000),
             attempts: 2,
+            open_end: false,
         },
         "the worker's log:\n{}",
         worker.log()
@@ -1045,6 +1046,7 @@ fn every_seek_is_answered() {
             run,
             landed: None,
             attempts: 0,
+            open_end: false,
         };
         for want in [sought, Reply::Ended { player: 1, run }] {
             assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
@@ -1581,6 +1583,7 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
                 run,
                 landed: None,
                 attempts: 0,
+                open_end: false,
             };
             for want in [sought, Reply::Ended { player: 2, run }] {
                 assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
@@ -4272,6 +4275,12 @@ fn the_pinned_build_reports_each_codec_s_chroma_location() {
 /// no landing. An earlier run's end, reported before the seek, is passed
 /// over.
 fn land_at(worker: &mut Worker, player: u8, run: u64, at: i64) -> Option<(i64, u8)> {
+    land_open(worker, player, run, at).map(|(l, a, _)| (l, a))
+}
+
+/// [`land_at`], with whether the landing's end is open (a last frame whose
+/// length was found from nothing).
+fn land_open(worker: &mut Worker, player: u8, run: u64, at: i64) -> Option<(i64, u8, bool)> {
     worker.send(&Order::Seek {
         player,
         run,
@@ -4285,8 +4294,9 @@ fn land_at(worker: &mut Worker, player: u8, run: u64, at: i64) -> Option<(i64, u
                 run: r,
                 landed,
                 attempts,
+                open_end,
                 ..
-            } if p == player && r == run => return landed.map(|l| (l, attempts)),
+            } if p == player && r == run => return landed.map(|l| (l, attempts, open_end)),
             // An earlier run's end, reported before the seek arrived.
             Reply::Ended { player: p, run: r } if p == player && r < run => {}
             other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
@@ -4516,15 +4526,16 @@ fn a_landing_carries_its_own_chroma_location() {
 /// the run ends, and one past it has nothing. In the sparse clip, frames at
 /// 0 and 10 s, even the furthest back-off (3 s) finds no frame before the
 /// last one: its length found from nothing (one tick of the 1 ms base),
-/// it proves no end, and a target at 14 s lands on it.
+/// it proves no end, and a target at 14 s lands on it, the answer saying
+/// its end is open; the other landings' ends are not.
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
-    type Case = (i64, Option<(i64, i64)>);
+    type Case = (i64, Option<(i64, i64, bool)>);
     let dir = tempfile::tempdir().unwrap();
     let run_1 = [0, 40_000, 80_000, 120_000];
-    let (c, v) = ((1_000_000, 40_000), (1_080_000, 120_000));
+    let (c, v) = ((1_000_000, 40_000, false), (1_080_000, 120_000, false));
     let clips: [(&str, &str, &[i64], &[Case]); 3] = [
         (
             "c.mkv",
@@ -4542,7 +4553,7 @@ fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
             "s.mkv",
             "mjpeg matroska 176x96 1 2 1 gap=1:9",
             &[0],
-            &[(14_000_000, Some((10_000_000, 1_000)))],
+            &[(14_000_000, Some((10_000_000, 1_000, true)))],
         ),
     ];
     for (name, spec, played, cases) in clips {
@@ -4558,16 +4569,16 @@ fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
             }
             let run = ring.start_run(0);
             assert_eq!(
-                land_at(&mut worker, 1, run, target).map(|(l, _)| l),
-                want.map(|(last, _)| last),
+                land_open(&mut worker, 1, run, target).map(|(l, _, open)| (l, open)),
+                want.map(|(last, _, open)| (last, open)),
                 "{name} {target}: the worker's log:\n{}",
                 worker.log()
             );
-            if let Some(last) = want {
+            if let Some((last, duration, _)) = want {
                 let taken = take_one(&worker, &mut ring, target);
                 assert_eq!(
                     (taken.stamp, taken.duration),
-                    last,
+                    (last, duration),
                     "{name}: the worker's log:\n{}",
                     worker.log()
                 );

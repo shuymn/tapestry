@@ -375,6 +375,29 @@ fn an_empty_landing_ends_the_file_and_cues_the_next_start() {
     assert_eq!(p.stamp(), Some(FIRST));
 }
 
+/// A landing on the clip's last frame whose end nothing proves stays
+/// shown (design.md "Rendering and Skins", Video frames): the worker lands
+/// 4 s before the target on a frame lasting one tick and reports the run's
+/// end during READY; the frame shows at the boundary and seconds after it,
+/// up to the file's next start, never ended by its one-tick duration.
+#[test]
+fn an_open_ended_landing_stays_until_the_next_start() {
+    let (e, b, next) = (2_000_000, 8_000_000, 20_000_000);
+    let target = FIRST + (b - e);
+    let last = target - 4_000_000;
+    let mut p = Play::round(&[e, next], b, 20, Instant::now());
+    assert_eq!(p.landing(), Some((2, target)));
+    p.seq += 1;
+    p.a.publish_run(p.seq, 2, last, 1, 20);
+    p.a.open_end.store(2, Ordering::SeqCst);
+    p.a.ended.store(2, Ordering::SeqCst);
+    assert!(p.m.prepare(&mut p.planes, Instant::now()).0, "ready");
+    for at in [b, b + 5_000_000, next - 1] {
+        assert!(frame(p.at(at)), "shown at {at}");
+        assert!(holds(&p.planes, 2, 20), "the landing at {at}");
+    }
+}
+
 /// A full play lands nothing: its first frame makes it ready, and no run
 /// is wanted.
 #[test]
