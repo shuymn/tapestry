@@ -36,8 +36,8 @@ use common::{MS, PERIOD, RATE, lane, tapestry_settings};
 use eval::{ControlId, InputFacts, LaneInput, Tally};
 use game::{
     AbortCause, AudioControl, AudioProbe, AudioQueue, AudioWorker, ChartIngest, Closing, Command,
-    DataRoot, DeviceSettings, IngestError, Ingested, InputWaitError, Loaded, Opening, Parts,
-    PlayEnd, PlayEnding, PlayReport, Practice, RenderSide, ResultScreen, Rig, SessionConfig,
+    DataRoot, DeviceSettings, FadeEnd, IngestError, Ingested, InputWaitError, Loaded, Opening,
+    Parts, PlayEnd, PlayEnding, PlayReport, Practice, RenderSide, ResultScreen, Rig, SessionConfig,
     ViewStatus, ViewSummary, audio_control,
 };
 use input::{
@@ -121,6 +121,27 @@ fn loaded(dir: &Path) -> Loaded {
 
 /// A session of `chart`, autoplayed with `autoplay`.
 fn loaded_with(dir: &Path, chart: Chart, autoplay: Option<game::AutoKeySounds>) -> Loaded {
+    loaded_on(dir, chart, autoplay, None)
+}
+
+/// A session of [`chart`] whose records go to [`NotingSink`], noting in
+/// `order`.
+fn loaded_noting(dir: &Path, order: &Order) -> Loaded {
+    loaded_sinking(dir, NotingSink::new(dir, order))
+}
+
+/// A session of [`chart`] whose records go to `sink`.
+fn loaded_sinking(dir: &Path, sink: NotingSink) -> Loaded {
+    loaded_on(dir, chart(), None, Some(Box::new(sink)))
+}
+
+/// [`loaded_with`], its records going to `records` when given.
+fn loaded_on(
+    dir: &Path,
+    chart: Chart,
+    autoplay: Option<game::AutoKeySounds>,
+    records: Option<Box<dyn game::RecordSink>>,
+) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
     let mut settings = tapestry_settings(&root);
     settings.device.input_offset_us = OFFSET;
@@ -134,6 +155,7 @@ fn loaded_with(dir: &Path, chart: Chart, autoplay: Option<game::AutoKeySounds>) 
     };
     let parts = Parts {
         ingest: Box::new(Built(chart)),
+        records: records.or(base.records),
         ..base
     };
     let config = SessionConfig {
@@ -149,6 +171,74 @@ fn loaded_with(dir: &Path, chart: Chart, autoplay: Option<game::AutoKeySounds>) 
         autoplay,
     };
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
+}
+
+/// Where a rig and its record sink note the lifecycle's steps, in order.
+type Order = std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+/// A record sink that saves locally, noting in `order` when it saves, when
+/// it counts a play and when it is asked for the totals. Its save takes
+/// `save_for` on `clock`, if given, and fails when `save_fails`; it counts
+/// each play into its totals' plays and answers `count` for it, and the
+/// totals unless `no_totals`.
+struct NotingSink {
+    local: game::LocalRecords,
+    order: Order,
+    clock: Option<std::sync::Arc<VirtualClock>>,
+    save_for: TimeUs,
+    save_fails: bool,
+    count: Option<game::BestView>,
+    no_totals: bool,
+    plays: u64,
+}
+
+impl NotingSink {
+    /// A sink saving under `dir`, noting in `order`, that saves at once,
+    /// counts each play as its first and answers the totals.
+    fn new(dir: &Path, order: &Order) -> Self {
+        Self {
+            local: game::LocalRecords::new(DataRoot::new(dir.to_owned()).records()),
+            order: std::sync::Arc::clone(order),
+            clock: None,
+            save_for: TimeUs(0),
+            save_fails: false,
+            count: Some(game::BestView::Counted {
+                play: (1, 0),
+                previous: None,
+                current: game::BestScore::default(),
+                ineligible: None,
+            }),
+            no_totals: false,
+            plays: 0,
+        }
+    }
+}
+
+impl game::RecordSink for NotingSink {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.order.lock().unwrap().push("saved");
+        if let Some(clock) = &self.clock {
+            clock.advance(self.save_for);
+        }
+        if self.save_fails {
+            return Err(game::SaveError::from(std::io::Error::other("held")));
+        }
+        self.local.save(rec)
+    }
+
+    fn after_result(&mut self, _: &game::SavedPlay<'_>) -> Option<game::BestView> {
+        self.order.lock().unwrap().push("counted");
+        self.plays += 1;
+        self.count.clone()
+    }
+
+    fn totals(&mut self) -> Option<game::PlayerTotals> {
+        self.order.lock().unwrap().push("totals");
+        (!self.no_totals).then_some(game::PlayerTotals {
+            plays: self.plays,
+            ..game::PlayerTotals::default()
+        })
+    }
 }
 
 /// The control the default key config binds to lane `n`.
@@ -209,7 +299,7 @@ struct Seen {
 /// the script's batches up to the play's time, and runs the audio
 /// thread's steps that fall due.
 struct Tail {
-    clock: VirtualClock,
+    clock: std::sync::Arc<VirtualClock>,
     sources: SourceSet,
     script: ScriptedInput,
     /// Commands at play times.
@@ -243,7 +333,22 @@ struct Tail {
     /// Plays opened.
     plays: usize,
     /// Each end screen shown: its play time, the report and the summary.
+    /// One made ready in a fade phase shows at the phase's end.
     shown: Vec<(i64, PlayReport, Option<ViewSummary>)>,
+    /// A fade phase is on ([`Rig::fade_phase`] to [`Rig::fade_ended`]).
+    in_fade: bool,
+    /// The end screen made ready in the fade phase, shown at its end.
+    held_show: Option<(PlayReport, Option<ViewSummary>)>,
+    /// How each play's fade phase ended ([`Rig::fade_ended`]), by play.
+    fade_ends: Vec<(usize, FadeEnd)>,
+    /// The fade phase's, the play's and the result's steps, in order.
+    order: Order,
+    /// The play times each fade phase's deadline moved to.
+    skipped: Vec<i64>,
+    /// The play time of each fade phase's end ([`Rig::fade_ended`]).
+    fade_ended_at: Vec<i64>,
+    /// The totals each result's own view read, as its layout is asked for.
+    totals: Vec<Option<Option<game::PlayerTotals>>>,
     /// An autoplay session's input side, polled on the play's timeline in
     /// place of the script, with the controls it records.
     feeder: Option<(AutoplayInput, Vec<ControlId>)>,
@@ -322,7 +427,7 @@ impl Tail {
         let (tx, probes) = rtrb::RingBuffer::new(1_024);
         worker.set_probe(tx);
         Self {
-            clock: VirtualClock::new(TimeUs(CLOCK_START)),
+            clock: std::sync::Arc::new(VirtualClock::new(TimeUs(CLOCK_START))),
             sources: SourceSet::new(sources).unwrap(),
             script,
             commands: commands.to_vec(),
@@ -352,6 +457,13 @@ impl Tail {
             close: None,
             plays: 0,
             shown: Vec::new(),
+            in_fade: false,
+            held_show: None,
+            fade_ends: Vec::new(),
+            order: Order::default(),
+            skipped: Vec::new(),
+            fade_ended_at: Vec::new(),
+            totals: Vec::new(),
             feeder: None,
             audio_done_at: None,
             readies: 0,
@@ -374,6 +486,25 @@ impl Tail {
         }
     }
 
+    /// The play's view as the screen reads it now, kept.
+    fn sample(&mut self) {
+        let at = self.play_time().unwrap();
+        if let Some(side) = &mut self.side {
+            let v = side.view();
+            self.seen.push(Seen {
+                play: self.plays,
+                at,
+                complete: v.complete,
+                fading: v.fading,
+                input: v.input,
+                tally: v.tally,
+                finalized: v.finalized,
+                events: v.events,
+                bins: (v.judge_bins.bins[1], v.judge_bins.available),
+            });
+        }
+    }
+
     /// The first play's tail views, from the completion on.
     fn tail(&self) -> impl Iterator<Item = &Seen> {
         self.seen.iter().filter(|s| s.play == 1 && s.complete)
@@ -385,6 +516,14 @@ impl Tail {
             .iter()
             .filter(|s| s.play == 1)
             .find_map(|s| s.fading)
+    }
+
+    /// How the first play's fade phase ended, if it had one.
+    fn fade_end(&self) -> Option<FadeEnd> {
+        self.fade_ends
+            .iter()
+            .find(|&&(play, _)| play == 1)
+            .map(|&(_, how)| how)
     }
 
     /// The play time the first play's result showed at, if it did.
@@ -435,6 +574,25 @@ impl Rig for Tail {
         let now = self.play_time()?;
         let i = self.commands.iter().position(|&(at, _)| at <= now)?;
         Some(self.commands.remove(i).1)
+    }
+
+    /// A command keeps its receipt, its scripted time, however late it is
+    /// taken.
+    fn take_received(&mut self) -> Option<(Command, TimeUs)> {
+        let (origin, now) = (self.origin?, self.play_time()?);
+        let i = self.commands.iter().position(|&(at, _)| at <= now)?;
+        let (at, c) = self.commands.remove(i);
+        Some((c, TimeUs(origin.0 + at)))
+    }
+
+    fn fade_skipped(&mut self, at: TimeUs) {
+        let origin = self.origin.unwrap();
+        self.skipped.push(at.0 - origin.0);
+    }
+
+    fn result_compared(&mut self, _report: &PlayReport, screen: &ResultScreen) {
+        self.order.lock().unwrap().push("compared");
+        self.totals.push(screen.totals());
     }
 
     /// The window closes at `quit_at`, or once a result has shown: the
@@ -501,21 +659,7 @@ impl Rig for Tail {
     }
 
     fn stepped(&mut self, _aborted: bool) {
-        let at = self.play_time().unwrap();
-        if let Some(side) = &mut self.side {
-            let v = side.view();
-            self.seen.push(Seen {
-                play: self.plays,
-                at,
-                complete: v.complete,
-                fading: v.fading,
-                input: v.input,
-                tally: v.tally,
-                finalized: v.finalized,
-                events: v.events,
-                bins: (v.judge_bins.bins[1], v.judge_bins.available),
-            });
-        }
+        self.sample();
     }
 
     fn focus_lost(&self) -> bool {
@@ -581,7 +725,12 @@ impl Rig for Tail {
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        self.order.lock().unwrap().push("ended");
         self.reports.push(report.clone());
+    }
+
+    fn play_over(&mut self) {
+        self.order.lock().unwrap().push("play over");
     }
 
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
@@ -589,8 +738,37 @@ impl Rig for Tail {
             ViewStatus::Ready(s) => Some(s.clone()),
             _ => None,
         };
+        if self.in_fade {
+            self.held_show = Some((report.clone(), summary));
+            return;
+        }
         self.shown
             .push((self.play_time().unwrap(), report.clone(), summary));
+    }
+
+    /// The fade-out's view, published as the phase begins, is what the
+    /// screen draws from here: no step follows it.
+    fn fade_phase(&mut self, _start: TimeUs, _deadline: TimeUs) {
+        self.order.lock().unwrap().push("fade phase");
+        self.in_fade = true;
+        self.sample();
+    }
+
+    /// The result made ready in the phase shows at its end, unless a
+    /// retry or a close withdrew it.
+    fn fade_ended(&mut self, how: FadeEnd) {
+        self.order.lock().unwrap().push("fade ended");
+        self.fade_ended_at.push(self.play_time().unwrap());
+        self.in_fade = false;
+        self.fade_ends.push((self.plays, how));
+        let held = self.held_show.take();
+        if matches!(how, FadeEnd::Cut(AbortCause::Retry | AbortCause::Quit)) {
+            return;
+        }
+        if let Some((report, summary)) = held {
+            self.shown
+                .push((self.play_time().unwrap(), report, summary));
+        }
     }
 }
 
@@ -863,7 +1041,8 @@ fn every_ending_exit_ends_the_feedback_first() {
             assert_eq!(report.result, natural.result, "{what}");
             let finalized = |r: &Tail| r.tail().last().map(|s| s.finalized);
             assert_eq!(finalized(&rig), finalized(&reference), "{what}");
-            // Its own diagnostics.
+            // Its own diagnostics: the hold's in the report; the fade
+            // phase's at its end, the play saved before it.
             let cut = match name {
                 "retry" => Some(AbortCause::Retry),
                 "close" => Some(AbortCause::Quit),
@@ -875,10 +1054,26 @@ fn every_ending_exit_ends_the_feedback_first() {
                 "screen" => Some(AbortCause::ScreenFailed),
                 _ => None,
             };
-            assert_eq!(report.tail_cut, cut, "{what}");
-            assert_eq!(report.tail_skipped, name == "skip", "{what}");
-            assert_eq!(report.input_error.is_some(), name == "input", "{what}");
-            assert_eq!(report.output_error.is_some(), name == "audio", "{what}");
+            let in_hold = phase == "hold";
+            let skipped = name == "skip";
+            assert_eq!(report.tail_cut, cut.filter(|_| in_hold), "{what}");
+            assert_eq!(report.tail_skipped, skipped && in_hold, "{what}");
+            let fade_end = if skipped {
+                Some(FadeEnd::Skipped)
+            } else {
+                cut.map(FadeEnd::Cut)
+            };
+            assert_eq!(rig.fade_end(), fade_end.filter(|_| !in_hold), "{what}");
+            assert_eq!(
+                report.input_error.is_some(),
+                name == "input" && in_hold,
+                "{what}"
+            );
+            assert_eq!(
+                report.output_error.is_some(),
+                name == "audio" && in_hold,
+                "{what}"
+            );
             assert_eq!(report.closing, None, "{what}");
             // Its result shows at the exit, the same as the natural one's,
             // but for a retry, which plays again, and a close.
@@ -953,6 +1148,36 @@ fn the_result_waits_for_the_finish_margin_and_the_fade_out() {
     assert_eq!(rig.cancels, 0);
 }
 
+/// A full play's fade phase saves and counts the play and reads its
+/// result's totals at the phase's start, before its own view's layout is
+/// asked for; the play is over and reported at the phase's end, after the
+/// save (design.md "State Model", ResultPreparing).
+#[test]
+fn the_fade_phase_saves_at_its_start_and_ends_the_play_at_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let order = Order::default();
+    let mut loaded = loaded_noting(dir.path(), &order);
+    let mut rig = Tail::with_bgm(all_hits(), &[], i64::MAX, 500);
+    rig.ending = declared(3_000, 1_000);
+    rig.order = std::sync::Arc::clone(&order);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "fade phase",
+            "saved",
+            "counted",
+            "totals",
+            "compared",
+            "play over",
+            "ended",
+            "fade ended"
+        ]
+    );
+    assert_eq!(rig.fade_end(), Some(FadeEnd::RanOut));
+    assert_eq!(rig.shown_at(), Some(T + 9_000 * MS));
+}
+
 /// The fade-out's start and its end, the start plus the skin's fadeout,
 /// reach the rig on its clock when the fade-out begins (development
 /// builds: a run record's mark).
@@ -1013,15 +1238,19 @@ fn a_full_play_without_a_declaration_holds_five_seconds() {
     assert_eq!(rig.shown_at(), Some(T + 5_000 * MS));
 }
 
-/// A negative fadeout is read as 0: the play holds its finish margin and
-/// shows the result at the hold's end, with no fade-out.
+/// A negative fadeout is read as 0, and a fadeout of 0 has no fade-out:
+/// the play holds its finish margin and shows the result at the hold's
+/// end, with no fade phase.
 #[test]
 fn a_negative_fadeout_keeps_the_finish_margin() {
-    let (mut rig, _) = ending(all_hits(), 500, declared(3_000, -1));
-    assert!(rig.seen.iter().all(|s| s.fading.is_none()));
-    // Nor the view kept after the tail: no fade-out was ever published.
-    assert_eq!(rig.side.as_mut().unwrap().view().fading, None);
-    assert_eq!(rig.shown_at(), Some(T + 8_000 * MS));
+    for fadeout in [-1, 0] {
+        let (mut rig, _) = ending(all_hits(), 500, declared(3_000, fadeout));
+        assert!(rig.seen.iter().all(|s| s.fading.is_none()), "{fadeout}");
+        // Nor the view kept after the tail: no fade-out was ever published.
+        assert_eq!(rig.side.as_mut().unwrap().view().fading, None, "{fadeout}");
+        assert_eq!(rig.shown_at(), Some(T + 8_000 * MS), "{fadeout}");
+        assert_eq!(rig.fade_end(), None, "{fadeout}");
+    }
 }
 
 /// A negative finish margin is read as 0: the fade-out starts 5 s past
@@ -1046,7 +1275,8 @@ fn a_long_declaration_is_honoured() {
         Tail::with_bgm(all_hits(), &[(quit, Command::Quit)], i64::MAX, 500),
         |rig| rig.ending = long,
     );
-    assert!(report.tail_skipped);
+    assert_eq!(rig.fade_end(), Some(FadeEnd::Skipped));
+    assert!(!report.tail_skipped);
     assert_eq!(rig.shown_at(), Some(quit));
 }
 
@@ -1078,10 +1308,191 @@ fn a_quit_during_the_fade_out_shows_the_result_at_once() {
     );
     assert_eq!(rig.fading(), Some(TimeUs(T + 8_000 * MS)));
     assert_eq!(rig.shown_at(), Some(quit));
-    assert!(report.tail_skipped);
+    // Skipped in the fade phase, the play saved before it.
+    assert_eq!(rig.fade_end(), Some(FadeEnd::Skipped));
+    assert!(!report.tail_skipped);
     assert_eq!(rig.cancels, 1);
     // C26-2: nor is the fade-out.
     assert_eq!((rig.readies, rig.closings), (1, 0));
+}
+
+/// The chart played with every note hit, the skin declaring `ending`, with
+/// `commands`, its records going to a [`NotingSink`] on the rig's clock
+/// that `setup` changes first, until the window closes: the rig and the
+/// steps noted.
+fn sunk(
+    ending: PlayEnding,
+    commands: &[(i64, Command)],
+    setup: impl FnOnce(&mut NotingSink),
+) -> (Tail, Order) {
+    let dir = tempfile::tempdir().unwrap();
+    let order = Order::default();
+    let mut rig = Tail::with_bgm(all_hits(), commands, i64::MAX, 500);
+    rig.ending = ending;
+    rig.order = std::sync::Arc::clone(&order);
+    let mut sink = NotingSink::new(dir.path(), &order);
+    sink.clock = Some(std::sync::Arc::clone(&rig.clock));
+    setup(&mut sink);
+    let mut loaded = loaded_sinking(dir.path(), sink);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    (rig, order)
+}
+
+/// A save that outlasts its fade phase (design.md "State Model",
+/// ResultPreparing): a quit received before the fade's deadline and one
+/// received after it, both while the play is saved, belong to the ending
+/// play. Each skips to the result, shown once the save has ended, never
+/// leaving it; the first moves the deadline to its receipt. The result
+/// takes the input over at the save's end, the later of the two ends.
+#[test]
+fn a_save_past_the_fade_takes_its_commands_as_the_plays() {
+    let save_end = T + 8_600 * MS;
+    for (quit, moved) in [
+        (T + 8_490 * MS, vec![T + 8_490 * MS]),
+        (T + 8_510 * MS, vec![]),
+    ] {
+        let (rig, _) = sunk(declared(3_000, 500), &[(quit, Command::Quit)], |s| {
+            s.save_for = TimeUs(600 * MS);
+        });
+        assert_eq!(rig.fading(), Some(TimeUs(T + 8_000 * MS)), "{quit}");
+        assert_eq!(rig.fade_end(), Some(FadeEnd::Skipped), "{quit}");
+        assert_eq!(rig.skipped, moved, "{quit}");
+        assert_eq!(rig.plays, 1, "{quit}");
+        let shown = rig.shown_at().expect("the result shown");
+        assert!(shown >= save_end, "{quit}: shown at {shown}");
+        assert!(
+            rig.fade_ended_at.first().is_some_and(|&at| at >= save_end),
+            "{quit}: the takeover at {:?}",
+            rig.fade_ended_at
+        );
+    }
+}
+
+/// A retry received while a save outlasts its fade phase retries once the
+/// save has ended, the play saved and counted once, without showing its
+/// result (design.md "State Model", ResultPreparing).
+#[test]
+fn a_retry_during_a_save_past_the_fade_retries_without_the_result() {
+    let (rig, order) = sunk(
+        declared(3_000, 500),
+        &[(T + 8_300 * MS, Command::Retry)],
+        |s| {
+            s.save_for = TimeUs(600 * MS);
+        },
+    );
+    assert_eq!(rig.fade_end(), Some(FadeEnd::Cut(AbortCause::Retry)));
+    assert_eq!(rig.shown_at(), None);
+    assert_eq!(rig.plays, 2);
+    assert!(rig.reports[0].saved.as_ref().is_some_and(Result::is_ok));
+    let order = order.lock().unwrap();
+    assert_eq!(
+        order.get(..6),
+        Some(
+            &[
+                "fade phase",
+                "saved",
+                "counted",
+                "play over",
+                "ended",
+                "fade ended"
+            ][..]
+        ),
+        "{order:?}"
+    );
+}
+
+/// The result a fade phase activates shows the facts its play's save
+/// gave, as a result without a fade phase does (design.md "State Model",
+/// ResultPreparing): a failed save, a failed count, a previous best another
+/// writer changed, unavailable totals, and a retry in the fade phase (its
+/// next play's result counting the play once), each the same with the fade
+/// and without it.
+#[test]
+fn a_fade_phases_result_shows_its_saves_facts() {
+    let previous = game::BestScore {
+        plays: 9,
+        ex: Some(1),
+        bp: Some(99),
+        max_combo: None,
+        clear: Some(game::BestLamp::Failed),
+    };
+    let written = game::BestView::Counted {
+        play: (1, 0),
+        previous: Some(previous.clone()),
+        current: previous,
+        ineligible: None,
+    };
+    type Setup = Box<dyn Fn(&mut NotingSink)>;
+    // A case: its name, its sink's setup, and its retry's time in the fade
+    // and in the hold, if it retries.
+    type Case = (&'static str, Setup, Option<(i64, i64)>);
+    let cases: [Case; 5] = [
+        ("save fails", Box::new(|s| s.save_fails = true), None),
+        ("count fails", Box::new(|s| s.count = None), None),
+        (
+            "another writer",
+            Box::new(move |s| s.count = Some(written.clone())),
+            None,
+        ),
+        ("no totals", Box::new(|s| s.no_totals = true), None),
+        // A retry in the fade, and its counterpart in the hold.
+        (
+            "retry",
+            Box::new(|_| {}),
+            Some((T + 8_500 * MS, T + 7_500 * MS)),
+        ),
+    ];
+    for (case, setup, retry) in cases {
+        // The last result's attempt, save, count and best, and totals, and
+        // how its play's fade phase ended.
+        let facts = |fadeout: i64, retry: Option<i64>| {
+            let commands: Vec<_> = retry.map(|at| (at, Command::Retry)).into_iter().collect();
+            let (rig, _) = sunk(declared(3_000, fadeout), &commands, &setup);
+            let (_, report, summary) = rig.shown.last().cloned().expect("a result shown");
+            let shown = (
+                report.attempt,
+                report.saved.as_ref().map(Result::is_ok),
+                report.best,
+                summary.and_then(|s| s.best),
+                rig.totals.last().copied().flatten().flatten(),
+            );
+            (shown, rig.fade_end())
+        };
+        let (faded, end) = facts(1_000, retry.map(|r| r.0));
+        let (held, none) = facts(0, retry.map(|r| r.1));
+        assert!(end.is_some() && none.is_none(), "{case}: {end:?} {none:?}");
+        assert_eq!(faded, held, "{case}");
+        // Each case's own fact.
+        let (attempt, saved, best, _, totals) = &faded;
+        match case {
+            "save fails" => assert_eq!(*saved, Some(false)),
+            "count fails" => assert_eq!(*best, None),
+            "another writer" => assert!(
+                matches!(best, Some(game::BestView::Counted { previous: Some(p), .. }) if p.plays == 9),
+                "{best:?}"
+            ),
+            "no totals" => assert_eq!(*totals, None),
+            _ => {
+                assert_eq!(*attempt, 2);
+                assert_eq!(totals.map(|t| t.plays), Some(2));
+            }
+        }
+    }
+}
+
+/// A retry received at the fade phase's deadline withdraws the result,
+/// which never shows, and plays again: the phase's command, read before
+/// its end (design.md "State Model", ResultPreparing).
+#[test]
+fn a_retry_at_the_fade_deadline_never_shows_the_result() {
+    let deadline = T + 9_000 * MS;
+    let (rig, _) = played_on(
+        Tail::with_bgm(all_hits(), &[(deadline, Command::Retry)], i64::MAX, 500),
+        |rig| rig.ending = declared(3_000, 1_000),
+    );
+    assert_eq!(rig.fade_end(), Some(FadeEnd::Cut(AbortCause::Retry)));
+    assert_eq!(rig.shown_at(), None);
+    assert_eq!(rig.plays, 2);
 }
 
 /// A quit once every note is judged but before the final deadline (the

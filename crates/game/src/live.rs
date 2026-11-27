@@ -185,11 +185,20 @@ pub trait Rig {
     }
     /// The play is over (evaluation and the audio tail ended, or it was
     /// aborted), before it is saved and re-evaluated: what measures the
-    /// play stops here.
+    /// play stops here. A play with a fade phase is over at the phase's
+    /// end, after its save ([`fade_ended`](Self::fade_ended)).
     fn play_over(&mut self) {}
     /// A pending retry or suspend (or quit, for rigs without a latch),
     /// taken.
     fn take(&mut self) -> Option<Command>;
+    /// [`take`](Self::take) with the command's receipt on the rig's clock:
+    /// the fade phase moves its deadline to a skip's receipt, never to when
+    /// it is taken (design.md "State Model", ResultPreparing). A rig that
+    /// keeps no receipt received it now, by default.
+    fn take_received(&mut self) -> Option<(Command, TimeUs)> {
+        let c = self.take()?;
+        Some((c, self.now()))
+    }
     /// A pending command taken during Closing (design.md "Play
     /// Lifecycle", Closing), where a quit does nothing: a rig whose
     /// controls let a pending quit drop a pending retry keeps the retry
@@ -400,6 +409,28 @@ pub trait Rig {
     #[cfg(feature = "dev-tools")]
     fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
         let _ = (from, to);
+    }
+    /// A full play's fade phase begins (design.md "State Model",
+    /// ResultPreparing): its fade-out started at `start` and runs out at
+    /// `deadline`, both on the rig's clock, before the play is saved. The
+    /// screen holds the deadline from here, READY's cutoff ended, and shows
+    /// the result from the first frame at or past it, whenever the game
+    /// looks. Nothing by default.
+    fn fade_phase(&mut self, start: TimeUs, deadline: TimeUs) {
+        let _ = (start, deadline);
+    }
+    /// A command taken in the fade phase (a skip, or a cut) moved its
+    /// deadline to `at`, that command's receipt on the rig's clock: the
+    /// result shows from there. Nothing by default.
+    fn fade_skipped(&mut self, at: TimeUs) {
+        let _ = at;
+    }
+    /// The fade phase is over, `how` it ended, once the play is over
+    /// ([`play_over`](Self::play_over)) and reported
+    /// ([`ended`](Self::ended)): the result takes the menu input over
+    /// here, every command after it fresh. Nothing by default.
+    fn fade_ended(&mut self, how: FadeEnd) {
+        let _ = how;
     }
     /// Before a practice round's recording opens: checks that its audio can
     /// be restored at chart time `at`, the lead-in's start ([`crate::restore`]).
@@ -914,6 +945,38 @@ pub enum Leave {
     Quit,
 }
 
+/// How a full play's fade phase ended (design.md "State Model",
+/// ResultPreparing; [`Rig::fade_ended`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FadeEnd {
+    /// It ran out at its deadline.
+    RanOut,
+    /// The player skipped it to the result.
+    Skipped,
+    /// It was cut short with this cause (a retry withdraws the result, a
+    /// close leaves, anything else shows it at once).
+    Cut(AbortCause),
+}
+
+impl FadeEnd {
+    /// What `action` ends the fade phase with.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn of(action: TailAction) -> Self {
+        match action {
+            TailAction::SkipToResult => Self::Skipped,
+            TailAction::Cut(cause) => Self::Cut(cause),
+        }
+    }
+}
+
+/// A full play's fade phase while it lasts: its deadline, moved to a skip's
+/// receipt, and what ended it early, if anything did.
+#[derive(Clone, Copy, Debug)]
+struct Fade {
+    deadline: TimeUs,
+    end: Option<FadeEnd>,
+}
+
 /// What a command does once the play is complete, during its audio tail or
 /// a round's ring-out (design.md "Audio tail"). Skipping to the result is
 /// its own action, not a quit: the quit key is its only trigger for now.
@@ -1192,7 +1255,7 @@ fn run_from<R: Rig>(
     first: impl FnOnce(&mut Loaded, &mut R) -> Result<Option<Played>, LiveError<R::ScreenError>>,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
     let mut first = Some(first);
-    loop {
+    'attempts: loop {
         let played = match first.take() {
             Some(first) => first(loaded, rig)?,
             None => play_standard(loaded, rig)?,
@@ -1202,6 +1265,7 @@ fn run_from<R: Rig>(
             next,
             next_round,
             counted_down,
+            fade,
         }) = played
         else {
             return leave(rig);
@@ -1215,8 +1279,20 @@ fn run_from<R: Rig>(
         if !retried && !next_round && !counted_down {
             rig.turntable_paused();
         }
-        rig.ended(&report);
+        // A fade phase's play is reported at the phase's end, once it is
+        // over; it runs while the result is prepared.
+        let mut fade = fade.map(|deadline| Fade {
+            deadline,
+            end: None,
+        });
+        if fade.is_none() {
+            rig.ended(&report);
+        }
         if rig.quitting() || counted_down {
+            if fade.is_some() {
+                rig.withdraw_result(None);
+                end_fade(rig, &report, &mut fade, FadeEnd::Cut(AbortCause::Quit));
+            }
             return leave(rig);
         }
         if retried {
@@ -1235,7 +1311,7 @@ fn run_from<R: Rig>(
         // over.
         let mut screen =
             ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
-        let prepared = prepare_result(rig, &report, &mut screen, loaded)?;
+        let prepared = prepare_result(rig, &report, &mut screen, loaded, &mut fade)?;
         match prepared {
             Prepared::Ready => {}
             Prepared::Retry => {
@@ -1247,12 +1323,34 @@ fn run_from<R: Rig>(
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
+        rig.show_end(&report, &screen);
+        // Ready within the fade phase: the screen shows it from the
+        // phase's deadline by itself; the commands until then are the
+        // phase's.
+        while fade.is_some() {
+            if let Some(f) = fade {
+                rig.idle_wait(f.deadline);
+            }
+            match fade_step(rig, &report, &mut fade) {
+                Some(Prepared::Retry) => {
+                    retry_play_state(loaded, rig);
+                    continue 'attempts;
+                }
+                Some(Prepared::Leave) => return leave(rig),
+                Some(Prepared::Ready) | None => {}
+            }
+            // A screen lost while the fade lasts is built again here; once
+            // the fade is over the result's loop takes it, as after a tail.
+            if fade.is_some() && rig.screen_failed() {
+                rig.prepare_screen().map_err(LiveError::Screen)?;
+                rig.show_end(&report, &screen);
+            }
+        }
         // The result's show: a skin's input and scene times count from the
         // rig's origin once it has one (read after the timing, which it
         // never follows), from here before.
         let shown = rig.now();
         let start = |rig: &R| rig.result_origin().unwrap_or(shown);
-        rig.show_end(&report, &screen);
         // The leaving command accepted and its outro's end, from the pinned
         // view's timing.
         let mut outro: Option<(MenuCommand, TimeUs)> = None;
@@ -1426,6 +1524,10 @@ enum Prepared {
 /// failed meanwhile is built again, acknowledged, between polls, as on the
 /// result, so the result never shows on a failed screen.
 ///
+/// In a full play's fade phase (`fade`) the commands until its deadline
+/// are the phase's ([`fade_step`]), and its end, wherever a look finds it,
+/// takes the result's input over; the polls wake at the deadline.
+///
 /// # Errors
 ///
 /// [`LiveError::Screen`] when the failed screen cannot be built again,
@@ -1435,27 +1537,36 @@ fn prepare_result<R: Rig>(
     report: &PlayReport,
     screen: &mut ResultScreen,
     loaded: &mut Loaded,
+    fade: &mut Option<Fade>,
 ) -> Result<Prepared, LiveError<R::ScreenError>> {
+    // A retry or a close pressed during the save is served before anything
+    // of the result begins.
+    if let Some(withdrawn) = fade_step(rig, report, fade) {
+        return Ok(withdrawn);
+    }
     let mut prep = rig.begin_result(report, screen);
     screen.compare_best(report, &mut |k, p| loaded.best_before(k, p));
     screen.read_totals(&mut || loaded.totals());
-    if let Some(withdrawn) = withdrawn(rig) {
+    if let Some(withdrawn) = looked(rig, report, fade) {
         return Ok(withdrawn);
     }
     // The own view's best is in: its layout is asked for now, with the
     // view's final facts.
     rig.result_compared(report, screen);
     loop {
-        let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
+        let mut deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
+        if let Some(f) = fade {
+            deadline = TimeUs(deadline.0.min(f.deadline.0));
+        }
         let polled = rig.poll_result(&mut prep, deadline);
-        if let Some(withdrawn) = withdrawn(rig) {
+        if let Some(withdrawn) = looked(rig, report, fade) {
             return Ok(withdrawn);
         }
         if rig.screen_failed() {
             rig.prepare_screen().map_err(LiveError::Screen)?;
             // The rebuild waited on the screen: what came meanwhile is
             // served before a ready preparation shows the result.
-            if let Some(withdrawn) = withdrawn(rig) {
+            if let Some(withdrawn) = looked(rig, report, fade) {
                 return Ok(withdrawn);
             }
         }
@@ -1463,6 +1574,96 @@ fn prepare_result<R: Rig>(
             return Ok(Prepared::Ready);
         }
     }
+}
+
+/// A look of the result's preparation: the fade phase's commands while it
+/// lasts ([`fade_step`]), then, once it is over (or with none), the
+/// result's ([`withdrawn`]).
+fn looked<R: Rig>(rig: &mut R, report: &PlayReport, fade: &mut Option<Fade>) -> Option<Prepared> {
+    fade_step(rig, report, fade).or_else(|| fade.is_none().then(|| withdrawn(rig)).flatten())
+}
+
+/// The fade phase's look (design.md "State Model", ResultPreparing): the
+/// commands are the tail's until its deadline. A close leaves and a retry
+/// withdraws the result and retries, either ending the phase; the quit
+/// key skips to the result and a suspend cuts the phase, either moving the
+/// deadline to its receipt and stopping the audio; an input-thread
+/// failure, focus loss, removal of the last device and an audio failure
+/// cut it at once. The phase ends at its deadline, wherever the look that
+/// finds it passed comes ([`end_fade`]). `None` while nothing withdraws
+/// the result, and with no fade phase.
+fn fade_step<R: Rig>(
+    rig: &mut R,
+    report: &PlayReport,
+    fade: &mut Option<Fade>,
+) -> Option<Prepared> {
+    let f = fade.as_mut()?;
+    // Every early end stops the fade's sounds, as the tail's does.
+    if rig.quitting() {
+        rig.cancel_audio();
+        rig.withdraw_result(None);
+        end_fade(rig, report, fade, FadeEnd::Cut(AbortCause::Quit));
+        return Some(Prepared::Leave);
+    }
+    while let Some((c, at)) = rig.take_received() {
+        let action = TailAction::of(c);
+        if action == TailAction::Cut(AbortCause::Retry) {
+            // What is queued behind it goes with the play.
+            while rig.take().is_some() {}
+            rig.cancel_audio();
+            rig.withdraw_result(None);
+            end_fade(rig, report, fade, FadeEnd::Cut(AbortCause::Retry));
+            return Some(Prepared::Retry);
+        }
+        if f.end.is_none() {
+            f.end = Some(FadeEnd::of(action));
+            rig.cancel_audio();
+        }
+        if at.0 < f.deadline.0 {
+            f.deadline = at;
+            rig.fade_skipped(at);
+        }
+    }
+    if f.end.is_none() {
+        let cut = if rig.input_failure().is_some() {
+            Some(AbortCause::InputFailed)
+        } else if rig.focus_lost() {
+            Some(AbortCause::FocusLoss)
+        } else if !rig.connected() {
+            Some(AbortCause::LastSourceRemoved)
+        } else if rig.audio_failure().is_some() {
+            Some(AbortCause::OutputFailed)
+        } else if rig.screen_failed() {
+            Some(AbortCause::ScreenFailed)
+        } else {
+            None
+        };
+        if let Some(cause) = cut {
+            f.end = Some(FadeEnd::Cut(cause));
+            rig.cancel_audio();
+            let now = rig.now();
+            if now.0 < f.deadline.0 {
+                f.deadline = now;
+                rig.fade_skipped(now);
+            }
+        }
+    }
+    if rig.now().0 >= f.deadline.0 {
+        let how = f.end.unwrap_or(FadeEnd::RanOut);
+        end_fade(rig, report, fade, how);
+    }
+    None
+}
+
+/// The fade phase's end, `how` it ended: the play is over and reported,
+/// then the result takes the input over ([`Rig::fade_ended`]).
+fn end_fade<R: Rig>(rig: &mut R, report: &PlayReport, fade: &mut Option<Fade>, how: FadeEnd) {
+    if fade.take().is_none() {
+        return;
+    }
+    rig.play_over();
+    rig.ended(report);
+    rig.fade_ended(how);
 }
 
 /// What the commands taken now do to a result's preparation
@@ -1652,6 +1853,10 @@ pub(crate) struct Played {
     /// The quit key ended the play before its chart started: the chart is
     /// left without a result.
     counted_down: bool,
+    /// The fade phase's deadline on the rig's clock, for a full play whose
+    /// fade-out began ([`TailEnd::Fade`]): the play is over at its end, not
+    /// at its save.
+    fade: Option<TimeUs>,
 }
 
 /// How a chart's first attempt opens ([`run_chart_with`]); every later
@@ -2190,6 +2395,16 @@ pub(crate) fn open_and_play<R: Rig>(
         ),
         None => TailEnd::NoTail,
     };
+    // A fade-out begun: ResultPreparing's fade phase from here (design.md
+    // "State Model"), published before the save, so the screen holds its
+    // deadline whatever the save takes.
+    let fade = match tail {
+        TailEnd::Fade { start, deadline } => {
+            rig.fade_phase(start, deadline);
+            Some(deadline)
+        }
+        _ => None,
+    };
     // Closing, once its recording is sealed and its record's flags are
     // known: nothing it takes changes them.
     let closing_report = closing_at.map(|start| {
@@ -2233,7 +2448,10 @@ pub(crate) fn open_and_play<R: Rig>(
     // The last candidate's tuning, read before the rig's play is over;
     // the record keeps it only when that candidate played.
     let start_tuning = rig.start_tuning(generation);
-    rig.play_over();
+    // A play in its fade phase is over at the phase's end, after the save.
+    if fade.is_none() {
+        rig.play_over();
+    }
     let report = loaded.finish_play(PlayOutcome {
         start,
         end,
@@ -2270,8 +2488,10 @@ pub(crate) fn open_and_play<R: Rig>(
     // key is taken with it (for a completed play, the skip to its result:
     // a repeated round shows its result instead of starting the next),
     // never the result's back; a retry retries; a suspend means nothing
-    // there.
-    while let Some(c) = rig.take() {
+    // there. In a fade phase they are the phase's, taken by its watch.
+    while fade.is_none()
+        && let Some(c) = rig.take()
+    {
         match TailAction::of(c) {
             TailAction::SkipToResult => next_round = false,
             TailAction::Cut(AbortCause::Retry) => next = next.or(Some(c)),
@@ -2283,6 +2503,7 @@ pub(crate) fn open_and_play<R: Rig>(
         next,
         next_round,
         counted_down,
+        fade,
     }))
 }
 
@@ -2563,12 +2784,6 @@ impl FadeStage {
             None => None,
         }
     }
-
-    /// Whether it has run out at play time `now`.
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    const fn over(self, now: TimeUs) -> bool {
-        now.0 >= self.deadline.0
-    }
 }
 
 /// How a play's tail stage ended.
@@ -2582,6 +2797,10 @@ enum TailEnd {
     Skipped,
     /// It was cut short with this cause.
     Cut(AbortCause),
+    /// Its hold ran out and its fade-out began: ResultPreparing begins
+    /// there, its fade phase (design.md "State Model"), with the fade-out's
+    /// start and its deadline on the rig's clock.
+    Fade { start: TimeUs, deadline: TimeUs },
 }
 
 impl TailEnd {
@@ -2599,7 +2818,7 @@ impl TailEnd {
     const fn cut(self) -> Option<AbortCause> {
         match self {
             Self::Cut(cause) => Some(cause),
-            Self::NoTail | Self::RanOut | Self::Skipped => None,
+            Self::NoTail | Self::RanOut | Self::Skipped | Self::Fade { .. } => None,
         }
     }
 }
@@ -2614,10 +2833,11 @@ impl TailEnd {
 /// play's queues ([`Logic::feedback_to`]): its presses sound and its lanes
 /// light, and nothing is judged or recorded. A full play with a fade-out
 /// then publishes it at the play time its hold ended ([`Logic::enter_fade`])
-/// and runs it to its deadline with the same exits, converting no input.
-/// Whatever ends the tail ends the feedback first, so no press is taken
-/// after it; whatever ends it early stops its audio. The play stays
-/// complete either way.
+/// and ends the tail there ([`TailEnd::Fade`]): the fade-out is
+/// ResultPreparing's fade phase, run by the result's preparation with the
+/// same exits ([`fade_watch`]). Whatever ends the tail ends the feedback
+/// first, so no press is taken after it; whatever ends it early stops its
+/// audio. The play stays complete either way.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn run_tail<R: Rig>(
     rig: &mut R,
@@ -2659,27 +2879,18 @@ fn run_tail<R: Rig>(
     };
     // The fade-out, a full play's with a positive fadeout only: it converts
     // nothing, so no press sounds and the lanes stay as the hold left them.
+    // It is the result's preparation's from here (its fade phase).
     let Some(fade) = stage.fadeout.and_then(|fo| FadeStage::begin(held, fo)) else {
         return TailEnd::RanOut;
     };
-    #[cfg(feature = "dev-tools")]
-    rig.fade_began(
+    let (start, deadline) = (
         TimeUs(origin.0.saturating_add(held.0)),
         TimeUs(origin.0.saturating_add(fade.deadline.0)),
     );
+    #[cfg(feature = "dev-tools")]
+    rig.fade_began(start, deadline);
     logic.enter_fade(held);
-    loop {
-        if fade.over(TimeUs(rig.now().0 - origin.0)) {
-            return TailEnd::RanOut;
-        }
-        rig.wait();
-        if let Some(end) =
-            tail_exit(rig, input_error, output_error).or_else(|| tail_stepped(rig, output_error))
-        {
-            rig.cancel_audio();
-            return end;
-        }
-    }
+    TailEnd::Fade { start, deadline }
 }
 
 /// What ends the tail at a wait, in both its hold and its fade-out, if

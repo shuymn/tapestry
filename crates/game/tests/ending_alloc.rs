@@ -3,9 +3,10 @@
 //! lifecycle (`game::live::play`), from the end of the completing step's
 //! advance on, the completion and the source set's handoff, the tail
 //! stage's set-up (its finish anchor and the skin's declared ending read),
-//! every hold wake with its presses' conversion and key sounds, the
-//! fade-out's publication (`Logic::enter_fade`), and every fade-out wake
-//! with its unconverted presses, up to the final close. The rig's own
+//! every hold wake with its presses' conversion and key sounds, and the
+//! fade-out's publication (`Logic::enter_fade`), up to the feedback's end
+//! at the fade phase's start, where the result's preparation takes the
+//! fade over (design.md "State Model", ResultPreparing). The rig's own
 //! waits, standing in for the other threads, are not counted. This file
 //! holds a single test, so the harness's other threads are not tracked.
 
@@ -221,6 +222,13 @@ impl Rig for Counted {
     fn ended(&mut self, _report: &PlayReport) {}
 
     fn show_end(&mut self, _report: &PlayReport, _screen: &game::ResultScreen) {}
+
+    /// The fade-out's view, published as the fade phase begins.
+    fn fade_phase(&mut self, _start: TimeUs, _deadline: TimeUs) {
+        if let Some(screen) = &mut self.screen {
+            self.fading = screen.view().fading;
+        }
+    }
 }
 
 fn loaded(dir: &Path, chart: Chart) -> Loaded {
@@ -277,7 +285,8 @@ fn the_ending_allocates_nothing() {
     assert!(rig.checked);
     // The view published the fade-out at the hold's end.
     assert_eq!(rig.fading, Some(TimeUs(9_000 * MS)));
-    // The hit's sound and the hold's press; never the fade-out's.
+    // The hit's sound and the hold's press; the fade-out's press comes
+    // after the play, in the fade phase.
     assert_eq!(rig.key_sounds, 2);
     assert_eq!(rig.calls, 0, "the ending allocated");
 }
