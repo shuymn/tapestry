@@ -415,6 +415,17 @@ pub trait Rig {
     fn fade_began(&mut self, from: TimeUs, to: TimeUs) {
         let _ = (from, to);
     }
+    /// The play's save returned: the instant it ended, read now on the
+    /// rig's clock. With a fade phase whose deadline is `fade`, the
+    /// result's takeover (the later of the deadline and that instant) is
+    /// fixed here, and the rig publishes it with the reading, so a command
+    /// received after the save is classified against it whenever it is
+    /// taken (design.md "State Model", ResultPreparing). By default, the
+    /// clock's reading.
+    fn save_returned(&mut self, fade: Option<TimeUs>) -> TimeUs {
+        let _ = fade;
+        self.now()
+    }
     /// A full play's fade phase begins (design.md "State Model",
     /// ResultPreparing): its fade-out started at `start` and runs out at
     /// `deadline`, both on the rig's clock, before the play is saved. The
@@ -2496,8 +2507,9 @@ pub(crate) fn open_and_play<R: Rig>(
         closing: closing_report,
     });
     // The save's end, as it returned: a fade phase's result takes the
-    // input over no earlier, however long the flow takes to go on.
-    let saved = rig.now();
+    // input over no earlier, however long the flow takes to go on, and the
+    // takeover is fixed from here, so the rig publishes it now.
+    let saved = rig.save_returned(fade);
     // A completed play's tail took the carried command.
     let next = carried.filter(|_| end != PlayEnd::Completed);
     // The quit key before the chart started (in READY, or as

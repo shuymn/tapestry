@@ -3173,3 +3173,53 @@ fn a_fresh_command_after_one_the_fade_never_took_is_the_results() {
         }
     });
 }
+
+/// The takeover is published as the save returns, before the fade's last
+/// look: a quit pending through a save that outlasts the fade, then a
+/// fresh one after the save before the look, leaves the fresh one the
+/// result's back, not the phase's skip. With a save that ends before the
+/// deadline, a press between them is still the phase's (design.md "State
+/// Model", ResultPreparing).
+#[test]
+fn a_press_after_the_save_is_the_results_before_the_fade_looks() {
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        rig.controls.quit_leaves();
+        let wait_past = |rig: &PlayerRig<'_>, t: TimeUs| {
+            while rig.now().0 <= t.0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // The save outlasts the fade: deadline, a pending quit, the save's
+        // end, then a fresh quit while the game is held.
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 10_000);
+        rig.fade_phase(start, deadline);
+        rig.controls.command(Command::Quit);
+        wait_past(rig, deadline);
+        let saved = rig.save_returned(Some(deadline));
+        let takeover = TimeUs(deadline.0.max(saved.0));
+        wait_past(rig, takeover);
+        rig.controls.command(Command::Quit);
+        assert_eq!(rig.take_received(takeover), None, "the fresh quit");
+        rig.fade_ended(game::FadeEnd::RanOut, takeover);
+        assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
+        assert_eq!(rig.take_menu(), None);
+        rig.result_input.release();
+        // A save before the deadline: a press between them is the phase's.
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 50_000);
+        rig.fade_phase(start, deadline);
+        let saved = rig.save_returned(Some(deadline));
+        assert!(saved.0 < deadline.0);
+        rig.controls.command(Command::Quit);
+        let (c, at) = rig.take_received(deadline).expect("the phase's skip");
+        assert_eq!(c, Command::Quit);
+        assert!(saved.0 <= at.0 && at.0 <= deadline.0, "{at:?}");
+        rig.fade_ended(game::FadeEnd::Skipped, deadline);
+        assert_eq!(rig.take_menu(), None);
+        rig.result_input.release();
+    });
+}

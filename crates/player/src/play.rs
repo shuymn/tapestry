@@ -3736,6 +3736,18 @@ impl Rig for PlayerRig<'_> {
         self.fade_result = true;
     }
 
+    /// The save's end, read under the controls' senders' lock with a fade
+    /// phase's takeover published: a press after the save meets the
+    /// watermark before it can join one the phase owns.
+    fn save_returned(&mut self, fade: Option<TimeUs>) -> TimeUs {
+        match fade {
+            Some(deadline) => self
+                .controls
+                .mark_takeover(|saved| TimeUs(deadline.0.max(saved.0))),
+            None => self.clock.now(),
+        }
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn fade_skipped(&mut self, at: TimeUs) {
         if let Some(number) = self.fade_hold {
@@ -3756,6 +3768,7 @@ impl Rig for PlayerRig<'_> {
             game::FadeEnd::Cut(game::AbortCause::Retry | game::AbortCause::Quit)
         ) {
             self.fade_result = false;
+            self.controls.clear_takeover();
         } else {
             self.take_result_input(Some(takeover));
             // A layout the fade-layout switch held is asked for now.

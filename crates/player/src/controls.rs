@@ -419,6 +419,26 @@ impl Controls {
         Arc::clone(&self.takeover)
     }
 
+    /// Under the senders' lock, reads the clock and publishes
+    /// `takeover(reading)` as the result's watermark: every press read
+    /// after it takes the lock after it and is classified against the
+    /// watermark, and every press read before it has an earlier receipt.
+    /// The reading.
+    pub fn mark_takeover(&self, takeover: impl FnOnce(TimeUs) -> TimeUs) -> TimeUs {
+        let _sending = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = self.now();
+        self.takeover.store(takeover(at).0, Ordering::Release);
+        at
+    }
+
+    /// No result's watermark: a fade phase withdrew its result.
+    pub fn clear_takeover(&self) {
+        self.takeover.store(i64::MIN, Ordering::Release);
+    }
+
     /// [`take`](Self::take) during Closing (design.md "Play Lifecycle",
     /// Closing), where a quit does nothing: the pending quit is taken
     /// without dropping a pending retry, which the next take returns.
@@ -432,8 +452,9 @@ impl Controls {
     /// taken in one step with its first receipt, read before its bit is
     /// cleared. A quit drops a retry only when both are on one side of
     /// the result's takeover. With `receipted`, under the senders' lock, so
-    /// no press supersedes the receipt it reads; the plays' takes, which
-    /// read no receipt, take no lock.
+    /// no press supersedes the receipt it reads; the plays' takes read the
+    /// receipts only against `i64::MAX` and to classify a retry against a
+    /// quit, return none, and take no lock.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn take_with(&self, drops: u8, until: i64, receipted: bool) -> Option<(Command, TimeUs)> {
         let order = [
