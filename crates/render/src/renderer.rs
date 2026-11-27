@@ -8367,6 +8367,40 @@ impl Renderer {
         self.offscreen_wait = wait;
     }
 
+    /// The debug clear colour (dev-tools): opaque magenta, its channels
+    /// 0 or 255 so the target's encoding keeps them exact. No real
+    /// skin's captured frames hold it, so a pixel read back where
+    /// nothing was drawn shows it (design.md "Shortening Launch-Based
+    /// Checks", Transition captures).
+    #[cfg(feature = "dev-tools")]
+    pub const DEBUG_CLEAR: [u8; 3] = [255, 0, 255];
+
+    /// [`DEBUG_CLEAR`](Self::DEBUG_CLEAR) as the frame's pass clears to
+    /// it.
+    #[cfg(feature = "dev-tools")]
+    const DEBUG_CLEAR_COLOR: wgpu::Color = wgpu::Color {
+        r: 1.0,
+        g: 0.0,
+        b: 1.0,
+        a: 1.0,
+    };
+
+    /// Clears each frame to [`DEBUG_CLEAR`](Self::DEBUG_CLEAR) in place
+    /// of opaque black (dev-tools), so a pixel no draw covers is told
+    /// from a dark one a skin drew.
+    #[cfg(feature = "dev-tools")]
+    pub fn set_debug_clear(&mut self) {
+        self.clear = Self::DEBUG_CLEAR_COLOR;
+    }
+
+    /// Whether frames clear to [`DEBUG_CLEAR`](Self::DEBUG_CLEAR)
+    /// (dev-tools: a capture's provenance).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn debug_cleared(&self) -> bool {
+        self.clear == Self::DEBUG_CLEAR_COLOR
+    }
+
     /// Whether [`wait_for_frame`](Self::wait_for_frame) waits on a swap
     /// chain's frame latency waitable object.
     #[must_use]
@@ -12013,6 +12047,49 @@ mod tests {
         let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
         assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
         assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
+    }
+
+    /// The debug clear (design.md "Shortening Launch-Based Checks",
+    /// Transition captures): where nothing is drawn the frame reads back
+    /// magenta, and an opaque black sprite keeps its own black, so a
+    /// dark pixel a draw covers is told from the cleared canvas.
+    // Revert: the switch ignored -> the cleared pixel reads back black.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_debug_clear_shows_where_nothing_was_drawn() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 960,
+                height: 540,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        r.set_debug_clear();
+        let black = Sprite {
+            rect: [0.0, 0.0, 400.0, 400.0],
+            uv: solid_uv(),
+            color: [0.0, 0.0, 0.0, 1.0],
+            ..Sprite::default()
+        };
+        let text = MenuText::new(&r);
+        let timing = r
+            .menu_frame(
+                |b| {
+                    b.push(Blend::Alpha, black);
+                },
+                &text,
+            )
+            .unwrap();
+        assert!(timing.presented());
+        let pixels = r.read_back();
+        let rgb = |x: usize, y: usize| {
+            let i = (y * 960 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        // Layout (100, 200), target (50, 100) at half scale: drawn.
+        assert_eq!(rgb(50, 100), [0, 0, 0], "the drawn black");
+        assert_eq!(rgb(600, 400), Renderer::DEBUG_CLEAR, "the cleared canvas");
     }
 
     /// Multiply takes the destination's RGB times the sprite's straight

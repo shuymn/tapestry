@@ -2155,6 +2155,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 if let Some(tap) = &shot_tap {
                     tap_outcome(r.set_present_tap(Arc::clone(tap) as Arc<dyn render::PresentTap>))?;
                 }
+                #[cfg(feature = "dev-tools")]
+                if dev::debug_clear() {
+                    r.set_debug_clear();
+                }
                 let screen = MenuScreen::with_page_font(r, font, render::text::Fonts::runtime)?
                     .with_sink(Box::new(link.clone()))
                     .with_media(Arc::clone(&media));
@@ -2169,7 +2173,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 width: size.0,
                 height: size.1,
             };
-            let r = Renderer::new(target, adapter)?;
+            let mut r = Renderer::new(target, adapter)?;
+            if dev::debug_clear() {
+                r.set_debug_clear();
+            }
             // What this build got, as a test's injected fault may report it,
             // said on stdout and in the log, then admitted against what the
             // file asked for.
