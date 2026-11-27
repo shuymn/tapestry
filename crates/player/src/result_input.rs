@@ -3,6 +3,7 @@
 //! them: selection, a result or the practice page.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use game::{MenuCommand, PracticeInput};
 
@@ -86,10 +87,13 @@ pub struct ResultInput {
     pub pad: Pad,
     /// Which screen reads them.
     owner: Owner,
-    /// A full play's fade phase's takeover, for the result after it: what
-    /// the window or the controller observed by it is the phase's,
-    /// dropped wherever and however late it is taken ([`take`](Self::take)).
-    takeover: Option<bms_model::TimeUs>,
+    /// A full play's fade phase's takeover, for the result after it, on
+    /// the clock, `i64::MIN` for none: what the window or the controller
+    /// observed by it is the phase's, dropped wherever and however late it
+    /// is taken ([`take`](Self::take)). Shared with the controls'
+    /// commands ([`sharing`](Self::sharing)), so one watermark classifies
+    /// all of the result's input.
+    takeover: Arc<AtomicI64>,
 }
 
 impl ResultInput {
@@ -102,8 +106,17 @@ impl ResultInput {
                 dropped: 0,
             },
             owner: Owner::None,
-            takeover: None,
+            takeover: Arc::new(AtomicI64::new(i64::MIN)),
         }
+    }
+
+    /// This input with the controls' watermark `mark`
+    /// ([`crate::controls::Controls::takeover_mark`]) as its own.
+    #[must_use]
+    pub fn sharing(mut self, mark: Arc<AtomicI64>) -> Self {
+        mark.store(self.takeover.load(Ordering::Acquire), Ordering::Release);
+        self.takeover = mark;
+        self
     }
 
     /// Drops everything queued: what arrived while no screen read it
@@ -123,7 +136,7 @@ impl ResultInput {
     pub fn take_over(&mut self, owner: Owner) {
         self.clear();
         self.owner = owner;
-        self.takeover = None;
+        self.takeover.store(i64::MIN, Ordering::Release);
     }
 
     /// A result shows: on entry, what was queued during the play is
@@ -148,21 +161,22 @@ impl ResultInput {
             return false;
         }
         self.owner = Owner::Result;
-        self.takeover = Some(takeover);
+        self.takeover.store(takeover.0, Ordering::Release);
         true
     }
 
     /// The fade phase's takeover the result's input counts from, if the
     /// result followed one ([`enter_from`](Self::enter_from)).
-    pub const fn takeover(&self) -> Option<bms_model::TimeUs> {
-        self.takeover
+    pub fn takeover(&self) -> Option<bms_model::TimeUs> {
+        let at = self.takeover.load(Ordering::Acquire);
+        (at != i64::MIN).then_some(bms_model::TimeUs(at))
     }
 
     /// No screen reads the queues (a play is about to start); what arrives
     /// meanwhile is dropped by the next owner.
     pub fn release(&mut self) {
         self.owner = Owner::None;
-        self.takeover = None;
+        self.takeover.store(i64::MIN, Ordering::Release);
     }
 
     /// The next result command queued, while a result shows: the
@@ -173,7 +187,7 @@ impl ResultInput {
         if self.owner != Owner::Result {
             return None;
         }
-        let takeover = self.takeover;
+        let takeover = self.takeover();
         let fresh = |at: bms_model::TimeUs| takeover.is_none_or(|t| at.0 > t.0);
         while let Some((event, _, _, at)) = self.pad.pop_stamped() {
             if fresh(at) {

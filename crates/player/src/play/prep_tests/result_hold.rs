@@ -3141,3 +3141,35 @@ fn a_command_the_fade_never_took_is_not_the_results() {
         assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
     });
 }
+
+/// A command the fade phase never took, received by its takeover, then a
+/// fresh one before the result takes its input: the fresh quit is the
+/// result's back and a fresh retry its retry, neither lost to the stale
+/// command it met in the controls (design.md "State Model",
+/// ResultPreparing).
+#[test]
+fn a_fresh_command_after_one_the_fade_never_took_is_the_results() {
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        rig.controls.quit_leaves();
+        for (fresh, want) in [
+            (Command::Quit, MenuCommand::Back),
+            (Command::Retry, MenuCommand::Retry),
+        ] {
+            let start = rig.now();
+            let takeover = TimeUs(start.0 + 20_000);
+            rig.fade_phase(start, takeover);
+            rig.controls.command(Command::Quit);
+            while rig.now().0 <= takeover.0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            rig.fade_ended(game::FadeEnd::RanOut, takeover);
+            rig.controls.command(fresh);
+            assert_eq!(rig.take_menu(), Some(want), "{fresh:?}");
+            assert_eq!(rig.take_menu(), None, "{fresh:?}");
+            rig.result_input.release();
+        }
+    });
+}

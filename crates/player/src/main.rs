@@ -1016,7 +1016,8 @@ fn rig<'a>(
         end_page: None,
         screen_load_failure: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
-        result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
+        result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None)
+            .sharing(controls.takeover_mark()),
         viewed: None,
         evaluated: 0,
         #[cfg(feature = "dev-tools")]
@@ -1462,7 +1463,7 @@ fn play(
     rig.cursor = Some(window_thread.cursor());
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
-    rig.result_input = menus;
+    rig.result_input = menus.sharing(rig.controls.takeover_mark());
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = skins_then_chart(&mut loaded, &mut rig);
@@ -2276,7 +2277,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     rig.cursor = window_thread.as_ref().map(window::WindowThread::cursor);
     rig.render.pointer(Arc::clone(&pointer));
     rig.queue_most = opened.most_queued_periods;
-    rig.result_input = menus;
+    rig.result_input = menus.sharing(rig.controls.takeover_mark());
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut screen = select::SelectScreen::new(roots);
     // A script opens on the all-chart list, where its steps pick by name.
