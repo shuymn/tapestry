@@ -3035,6 +3035,43 @@ pub fn fade_layout_held() -> bool {
     *HELD.get_or_init(|| std::env::var(FADE_LAYOUT_ENV).is_ok_and(|v| v.trim() == "held"))
 }
 
+/// The environment variable of the debug clear (design.md "Shortening
+/// Launch-Based Checks", Transition captures): `magenta` clears every
+/// frame of the run to [`render::Renderer::DEBUG_CLEAR`] in place of
+/// opaque black, so a capture tells a pixel no draw covers from a dark
+/// one a skin drew.
+pub const DEBUG_CLEAR_ENV: &str = "TAPESTRY_DEV_DEBUG_CLEAR";
+
+/// Whether [`DEBUG_CLEAR_ENV`] asks for the debug clear, read once.
+pub fn debug_clear() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_debug_clear(std::env::var(DEBUG_CLEAR_ENV).ok().as_deref()))
+}
+
+/// The debug clear a value of [`DEBUG_CLEAR_ENV`] asks for: `magenta`
+/// alone; any other value is warned of and clears to black, which the
+/// captures' `clear` field then says.
+fn parse_debug_clear(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("") => false,
+        Some("magenta") => true,
+        Some(other) => {
+            log::warn!("{DEBUG_CLEAR_ENV}={other:?} is not `magenta`: frames clear to black");
+            false
+        }
+    }
+}
+
+/// The debug clear's switch takes `magenta` alone.
+#[test]
+fn the_debug_clear_takes_magenta_alone() {
+    assert!(parse_debug_clear(Some("magenta")));
+    assert!(parse_debug_clear(Some(" magenta ")));
+    for off in [None, Some(""), Some("1"), Some("black"), Some("Magenta")] {
+        assert!(!parse_debug_clear(off), "{off:?}");
+    }
+}
+
 /// The environment variable of the screens' runtime switches (the S7-07d
 /// gate's real-app checks and measurements): a comma list of
 /// `budget-select` and `budget-result`, that kind's runtime frames run

@@ -2573,7 +2573,14 @@ impl FrameSink for ScenarioFrames {
         let mut due: Vec<(Destination, PathBuf, String)> = due
             .into_iter()
             .map(|(i, path, axis, generation, stamp)| {
-                let side = sidecar(axis, self.frame, drawn, stamp, screen.adapter());
+                let side = sidecar(
+                    axis,
+                    self.frame,
+                    drawn,
+                    stamp,
+                    screen.adapter(),
+                    screen.debug_cleared(),
+                );
                 (Destination::Step(i, generation), path, side)
             })
             .collect();
@@ -2584,6 +2591,7 @@ impl FrameSink for ScenarioFrames {
                 drawn,
                 Stamp::Transition(change),
                 screen.adapter(),
+                screen.debug_cleared(),
             );
             due.push((Destination::Transition, path, side));
         }
@@ -2808,6 +2816,7 @@ fn sidecar(
     drawn: &Drawn<'_>,
     stamp: Stamp,
     adapter: Option<&render::AdapterInfo>,
+    debug_cleared: bool,
 ) -> String {
     let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
     let num = |v: Option<u64>| opt(v.and_then(|v| i64::try_from(v).ok()));
@@ -2872,13 +2881,14 @@ fn sidecar(
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
-        "\"screen\":\"{}\",\"adapter\":{},\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
+        "\"screen\":\"{}\",\"adapter\":{},\"clear\":\"{}\",\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
          \"selection_lifetime\":{},\"selection_revision\":{},\"stamp_revision\":{},\
          \"result_us\":{},\"result_origin_us\":{},\"result_seq\":{},\"result_generation\":{},\
          \"result_drawn\":{},\"result_page\":{},\"result_view\":{},\"stamp_page\":{},\
          \"stamp_view\":{},\"sampled_us\":{},\"result_timer_origin_us\":{}",
         drawn.screen.name(),
         adapter.map_or_else(|| "null".to_owned(), |a| json_string(&a.name)),
+        if debug_cleared { "magenta" } else { "black" },
         opt(select_origin.map(|o| at - o)),
         opt(select_origin),
         num(drawn.selection.map(|(l, _)| l)),
@@ -4091,6 +4101,7 @@ pub(crate) mod tests {
             &drawn(1, 0),
             super::Stamp::Play,
             Some(&gpu),
+            false,
         );
         assert!(side.contains("\"adapter\":\"Some GPU\","), "{side}");
         let side = super::sidecar(
@@ -4099,8 +4110,21 @@ pub(crate) mod tests {
             &drawn(1, 0),
             super::Stamp::Play,
             None,
+            false,
         );
         assert!(side.contains("\"adapter\":null,"), "{side}");
+        assert!(side.contains("\"clear\":\"black\","), "{side}");
+        // A screen whose frames clear to the debug colour says so (design.md
+        // "Transition captures", the debug clear).
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            1,
+            &drawn(1, 0),
+            super::Stamp::Play,
+            None,
+            true,
+        );
+        assert!(side.contains("\"clear\":\"magenta\","), "{side}");
     }
 
     /// A capture names one axis, READY's from its start; a size is in
@@ -4192,6 +4216,7 @@ pub(crate) mod tests {
             &d,
             super::Stamp::Play,
             None,
+            false,
         );
         assert!(side.contains("\"view_generation\":3,"), "{side}");
         assert!(side.contains("\"finalized_us\":1234,"), "{side}");
@@ -4293,6 +4318,7 @@ pub(crate) mod tests {
             &loading_drawn(Some(2), 1_734_000),
             super::Stamp::Play,
             None,
+            false,
         );
         assert!(side.contains("\"axis\":\"loading_at\""), "{side}");
         assert!(side.contains("\"target_us\":1500000,"), "{side}");
@@ -4307,6 +4333,7 @@ pub(crate) mod tests {
             &d,
             super::Stamp::Play,
             None,
+            false,
         );
         assert!(side.contains("\"screen_us\":3210000,"), "{side}");
         assert!(side.contains("\"loading_us\":null,"), "{side}");
@@ -4349,6 +4376,7 @@ pub(crate) mod tests {
             &closing(5_300, Some(5_000)),
             super::Stamp::Play,
             None,
+            false,
         );
         assert!(side.contains("\"closing_us\":300000,"), "{side}");
         assert!(side.contains("\"closing_start_us\":5000000,"), "{side}");

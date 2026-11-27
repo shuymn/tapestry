@@ -980,6 +980,12 @@ pub trait Screen: Send {
     fn adapter(&self) -> Option<&render::AdapterInfo> {
         None
     }
+    /// Whether its frames clear to the debug clear colour (dev-tools: a
+    /// scenario's sidecars); not by default.
+    #[cfg(feature = "dev-tools")]
+    fn debug_cleared(&self) -> bool {
+        false
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {

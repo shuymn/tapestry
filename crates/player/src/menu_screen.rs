@@ -2318,6 +2318,11 @@ impl Screen for MenuScreen {
         Some(self.renderer.gpu().adapter())
     }
 
+    #[cfg(feature = "dev-tools")]
+    fn debug_cleared(&self) -> bool {
+        self.renderer.debug_cleared()
+    }
+
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.renderer.result_quads()
