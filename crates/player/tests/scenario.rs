@@ -3501,6 +3501,42 @@ fn the_skins_outro_delays_back_and_retry() {
     );
 }
 
+/// A retry accepted with the result skin's outro ahead is prepared during
+/// it (design.md "Play Lifecycle", Preparing each attempt, a retry from an
+/// outro), for a fixed, a chart-only and a pending result skin: the run's
+/// record says so once, the result is left only after its outro has
+/// played, and the retry plays.
+#[test]
+fn a_retry_is_prepared_during_the_results_outro() {
+    for reads in [Reads::Nothing, Reads::Chart, Reads::View] {
+        let fx = Fixture::new();
+        write_chart(&fx.library(), "a", "譜面A");
+        result_skin_with(&fx, reads, ", fadeout = 400, input = 0");
+        let (out, stdout, stderr) = fx.run(&scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"retry\"",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]));
+        assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+        assert_eq!(
+            lines(&stdout, "retry: prepared during the result's outro").len(),
+            1,
+            "{reads:?}: {stdout}"
+        );
+        assert!(
+            lines(&stdout, "retry: prepared after the result's outro").is_empty(),
+            "{reads:?}: {stdout}"
+        );
+        let left = left_after_outro(&stdout);
+        assert_eq!(left.len(), 2, "{stdout}");
+        assert!(left.iter().all(|&us| us >= 400_000), "{left:?}");
+        assert!(stdout.contains("play 2: "), "{stdout}");
+    }
+}
+
 /// C16 through the real flow: a positive `scene` with no command leaves
 /// the result (back) after its outro, so selection takes the next step.
 #[test]

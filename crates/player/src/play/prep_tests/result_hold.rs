@@ -2980,6 +2980,55 @@ fn after_the_acknowledging_look_the_skins_timing_applies() {
     });
 }
 
+/// A retry accepted with the skin's 5 s outro ahead, its attempt prepared
+/// reuse-only during the outro (design.md "Play Lifecycle", Preparing each
+/// attempt, a retry from an outro): the preparation is ready with no
+/// import job, and every frame while it runs and after it is ready is
+/// the pinned result's, the result skin still installed.
+// Revert: the full PrepareAttempt part in the outro -> a frame that is not
+// the result's.
+#[test]
+fn a_retry_prepared_in_its_outro_keeps_the_result_drawn() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let _skin = timed_hand_over(rig, frames, &a, &report, &screen);
+        rig.show_end(&report, &screen);
+        until_shown(rig);
+        let o = rig.render.presented_origin().expect("the origin");
+        assert_eq!(
+            rig.begin_outro(TimeUs(o.0 + 400_000), Some(o)),
+            game::Outro::Begun(Some(timed()))
+        );
+        rig.accept_leaving(game::MenuCommand::Retry);
+        until_true(rig, "the view pinned", |rig| {
+            rig.render.result_status().pinned.is_some()
+        });
+        let pinned = rig.render.result_status().pinned;
+        let installed = rig.render.result_status().installed;
+        let jobs = imports::jobs_counted();
+        let from = frames.len();
+        let mut h = rig.begin_outro_preparation(&a, a.prep_key());
+        assert_eq!(
+            super::polled(rig, &mut h).unwrap(),
+            game::Preparation::Ready
+        );
+        let after = frames.len();
+        let seen = frames.until(rig, after, "frames after the preparation", |f| f.len() >= 5);
+        let all = frames.since(from);
+        assert!(all.len() >= seen.len());
+        assert!(
+            all.iter().all(|f| f.path.is_some() && f.view == pinned),
+            "every frame the pinned result's: {all:?}"
+        );
+        assert_eq!(imports::jobs_counted(), jobs, "no import job");
+        assert_eq!(rig.render.result_status().installed, installed);
+        rig.discard_attempt();
+        rig.leave_result();
+    });
+}
+
 /// A save that outlasts its fade phase ends the phase before the result's
 /// preparation begins: that result is still the phase's, so it begins no
 /// hold of its own, and the pending presentation the deadline activated

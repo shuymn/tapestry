@@ -3114,6 +3114,25 @@ impl Renderer {
         }
     }
 
+    /// Whether play's admission of `bundle` would release the result's
+    /// installation now (design.md "Screen Transitions and Loading", a
+    /// result arm: a retry staged during its result's outro keeps the
+    /// result until the reveal). Reads only; allocates nothing.
+    #[must_use]
+    pub fn play_releases_result(&self, bundle: &Arc<SkinBundle>) -> bool {
+        if self
+            .committed_installation(ScreenKind::Play)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return false;
+        }
+        let charge = self.candidate_charge(ScreenKind::Play, bundle);
+        matches!(
+            self.reclaim(ScreenKind::Play, charge, self.destroy_allowed),
+            Reclaim::ReleaseResult
+        )
+    }
+
     /// The result's installation released for the early staging of
     /// `bundle` (design.md "Screen Transitions and Loading", admission):
     /// the selection's pool reduced to its firm layer and the result's

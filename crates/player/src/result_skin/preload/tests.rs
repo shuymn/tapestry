@@ -825,7 +825,7 @@ fn a_claim_with_the_outcome_uncollected_finds_it_resident() {
     assert!(control.wait_ended(long()));
     let claim = control.claim();
     let (before, jobs) = (builds(), crate::imports::tests::jobs_counted());
-    let stage = rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim));
+    let stage = rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim), false);
     assert!(
         matches!(stage, ImageStage::Ready(Staged::Ready)),
         "resident"
@@ -852,7 +852,7 @@ fn the_attempt_adopts_a_claimed_pack() {
     assert_eq!(coord.held(Class::Speculative), 1);
     let jobs = crate::imports::tests::jobs_counted();
     let ImageStage::Adopted(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim))
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim), false)
     else {
         panic!("not adopted");
     };
@@ -882,9 +882,12 @@ fn the_quit_key_hands_an_adopted_pack_back_without_waiting() {
     let mut rs = held_pack(d.path(), &seam, &coord, 2);
     let control = rs.preload_control().unwrap();
     let (_, job) = rs.preload_state();
-    let ImageStage::Adopted(mut stage) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(control.claim()))
-    else {
+    let ImageStage::Adopted(mut stage) = rs.begin_image_stage(
+        chart(),
+        Some(JudgeClass::Normal),
+        Some(control.claim()),
+        false,
+    ) else {
         panic!("not adopted");
     };
     let staged = rs.poll_image_stage(&mut stage, None, || true, || false);
@@ -908,9 +911,12 @@ fn the_runs_end_joins_an_adopted_pack() {
     let coord = coordinator(1);
     let mut rs = held_pack(d.path(), &seam, &coord, 1);
     let control = rs.preload_control().unwrap();
-    let ImageStage::Adopted(mut stage) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(control.claim()))
-    else {
+    let ImageStage::Adopted(mut stage) = rs.begin_image_stage(
+        chart(),
+        Some(JudgeClass::Normal),
+        Some(control.claim()),
+        false,
+    ) else {
         panic!("not adopted");
     };
     let _ = rs.settle_image_stage(&mut stage, || true);
@@ -933,7 +939,7 @@ fn a_mode_change_while_claimed_runs_the_attempts_own_stage() {
     let (before, jobs) = (builds(), jobs_counted());
     rs.set_kept_probe(false);
     assert!(rs.image().is_none(), "nothing of the pack restored");
-    let stage = rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim));
+    let stage = rs.begin_image_stage(chart(), Some(JudgeClass::Normal), Some(claim), false);
     let ImageStage::Running(mut own) = stage else {
         panic!("not its own stage");
     };
@@ -1017,7 +1023,7 @@ fn a_close_while_the_attempt_waits_for_a_stopping_pack(how: Stopping) {
         }
     }
     let ImageStage::Running(mut stage) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None, false)
     else {
         panic!("{how:?}: the stage does not wait for the pack");
     };
@@ -1033,7 +1039,7 @@ fn a_close_while_the_attempt_waits_for_a_stopping_pack(how: Stopping) {
     assert_eq!(quit, Some(Staged::Cancelled));
     drop(stage);
     let ImageStage::Running(mut stage) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None, false)
     else {
         panic!("{how:?}: a successor took the image state");
     };

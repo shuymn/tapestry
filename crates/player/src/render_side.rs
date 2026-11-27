@@ -567,6 +567,14 @@ pub trait Screen: Send {
         let _ = (kind, bundle);
         false
     }
+    /// Whether play's admission of `bundle` would release the result's
+    /// installation now ([`render::Renderer::play_releases_result`]): a
+    /// retry staged during its result's outro waits for the reveal
+    /// instead. Never by default.
+    fn play_releases_result(&self, bundle: &Arc<SkinBundle>) -> bool {
+        let _ = bundle;
+        false
+    }
     /// [`room_waits`](Self::room_waits) for a result pages begin
     /// ([`render::Renderer::pages_room_waits`]). Never by default.
     fn pages_room_waits(&self, pages: &Arc<PackedPages>) -> bool {
@@ -1617,6 +1625,11 @@ pub enum AttemptPart {
     Early,
     /// The attempt, whole.
     Full(Box<AttemptContext>),
+    /// The attempt, whole, sent during a retry's result outro (design.md
+    /// "Play Lifecycle", Preparing each attempt, a retry from an outro):
+    /// staged behind the pinned result, which draws on, its admission
+    /// releasing no result installation before the reveal.
+    Outro(Box<AttemptContext>),
 }
 
 /// What a selection ([`RenderMsg::Select`]) selects for its kind.
@@ -2215,6 +2228,10 @@ struct RevealArm {
     at: TimeUs,
     /// The deadline once the built-in presentation takes over.
     built_in: TimeUs,
+    /// A result arm: a retry's held lifetime over its pinned result
+    /// (design.md "Screen Transitions and Loading", the reveal word, a
+    /// result arm), which only its own edges end.
+    result: bool,
 }
 
 /// Where READY's cutoff stands, as the game thread reads it
@@ -4219,6 +4236,14 @@ impl RenderLink {
     ) -> PendingAttempt {
         self.early_sender()
             .begin(AttemptPart::Full(Box::new(attempt)), skin, adopts)
+    }
+
+    /// [`begin_attempt`](Self::begin_attempt) during a retry's result
+    /// outro ([`AttemptPart::Outro`]): the result draws on until the
+    /// retry's loading state is revealed.
+    pub fn begin_behind_outro(&self, attempt: AttemptContext, skin: AttemptSkin) -> PendingAttempt {
+        self.early_sender()
+            .begin(AttemptPart::Outro(Box::new(attempt)), skin, None)
     }
 
     /// What sends a decided play's early request and ends it, from any
@@ -6340,7 +6365,9 @@ impl SkinState {
                     .text(),
                 )
             }
-            Ok(Preparation::Cancelled) => Self::Refused(Label::SkinCancelled.text().to_owned()),
+            Ok(Preparation::Cancelled | Preparation::Missed) => {
+                Self::Refused(Label::SkinCancelled.text().to_owned())
+            }
             Err(e) => {
                 crate::render_report::report(format_args!(
                     "render: the play skin cannot be installed: {}",
@@ -6583,6 +6610,7 @@ pub fn spawn_until(
                 decision: None,
                 decision_shown: None,
                 reveal_arm: None,
+                left_result: None,
                 decision_screen: None,
                 decision_side: None,
                 #[cfg(feature = "dev-tools")]
@@ -7841,6 +7869,10 @@ struct Preparing {
     /// Transitions and Loading"): a wait for its boundary past it is
     /// refused, and its array's creation runs to it.
     deadline: bms_model::Deadline,
+    /// Staged during a retry's result outro ([`AttemptPart::Outro`]):
+    /// its creation waits for the reveal rather than release the result's
+    /// installation, and its ticket's deadline starts there.
+    outro: bool,
 }
 
 /// A decided play's early request on the render thread (design.md
@@ -8692,6 +8724,10 @@ struct Run {
     /// The armed reveal of the decision screen shown ([`RevealArm`]),
     /// until it runs or the screen is left.
     reveal_arm: Option<RevealArm>,
+    /// The result lifetime a retry's result arm revealed its loading
+    /// state over: left, whatever the mode a screen lost meanwhile gave,
+    /// so no result message or recovery draws it again.
+    left_result: Option<u64>,
     /// The decision skin's state for the screen shown, made at its
     /// message.
     decision_screen: Option<skin_model::DecisionScreen>,
@@ -9268,9 +9304,12 @@ impl Run {
                         self.frames.result_taken(self.clock.now());
                         self.clear_decision();
                         // In a fade phase the play's fade draws on until
-                        // its deadline.
+                        // its deadline; a retry's revealed loading state
+                        // draws on.
+                        let over = self.result_left();
                         match self.fading() {
                             Some(h) => h.handed = Some(Handed::Result),
+                            None if over => {}
                             None => mode = Mode::Result,
                         }
                     }
@@ -9309,6 +9348,20 @@ impl Run {
                             lifetime,
                             at: if taken_over { built_in } else { at },
                             built_in,
+                            result: false,
+                        });
+                    } else if self.current_result().is_some() {
+                        // A retry's arm over its pinned result: one that
+                        // fell back already starts at the built-in deadline.
+                        self.reveal_arm = Some(RevealArm {
+                            lifetime,
+                            at: if self.result_fell_back() {
+                                built_in
+                            } else {
+                                at
+                            },
+                            built_in,
+                            result: true,
                         });
                     }
                 }
@@ -9400,6 +9453,12 @@ impl Run {
                     if self.fading().is_some() {
                         continue;
                     }
+                    // A retry's revealed loading state draws on, the
+                    // result left (design.md "Screen Transitions and
+                    // Loading", a result arm).
+                    if self.result_left() {
+                        continue;
+                    }
                     // A result lifetime draws on from what it presented.
                     if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
@@ -9440,6 +9499,17 @@ impl Run {
                             self.turntable.begin_presentation();
                             self.begin_attempt(request, lifetime, attempt, skin, reply, adopts);
                             mode = self.after_preparing(mode);
+                        }
+                        // The pinned result draws on: the reveal enters
+                        // the loading state.
+                        AttemptPart::Outro(attempt) => {
+                            self.begin_attempt(request, lifetime, attempt, skin, reply, adopts);
+                            // Its creation waits for the reveal rather than
+                            // release the result; a boundary takes it next.
+                            if let Some(p) = self.attempt.as_mut().filter(|p| p.request == request)
+                            {
+                                p.outro = true;
+                            }
                         }
                     }
                     continue;
@@ -9652,8 +9722,11 @@ impl Run {
                     };
                     // In a fade phase the play's fade draws on until its
                     // deadline, the hold kept for it.
+                    let over = self.result_left();
                     if let Some(h) = self.fading() {
                         h.handed = Some(handed);
+                    } else if over {
+                        // A retry's revealed loading state draws on.
                     } else {
                         mode = Self::handed_mode(handed);
                         // The built-in page with no lifetime ends the hold.
@@ -11890,7 +11963,7 @@ impl Run {
         if self
             .attempt
             .as_ref()
-            .is_some_and(|p| !p.taken && p.deadline.passed(now))
+            .is_some_and(|p| !p.taken && !p.outro && p.deadline.passed(now))
         {
             self.answer(Ok(refusal(room())));
         }
@@ -13302,8 +13375,20 @@ impl Run {
                     .is_some_and(|sc| sc.room_waits(kind, b))
             })
         };
+        // A retry staged during its result's outro waits for the reveal
+        // rather than release the result its outro draws.
+        let keeps_result = |p: &Preparing| {
+            p.outro
+                && p.skin.as_ref().is_some_and(|b| {
+                    self.screen
+                        .as_ref()
+                        .is_some_and(|sc| sc.play_releases_result(b))
+                })
+        };
         if self.attempt.as_ref().is_some_and(|p| {
-            !p.taken && (p.adopts.is_some() || !waits(ScreenKind::Play, p.skin.as_ref()))
+            !p.taken
+                && (p.adopts.is_some() || !waits(ScreenKind::Play, p.skin.as_ref()))
+                && !keeps_result(p)
         }) {
             Some(Creation::Play)
         } else if self.early.as_ref().is_some_and(|r| {
@@ -13477,6 +13562,7 @@ impl Run {
             adopts: adopted.then_some(adopts).flatten(),
             adopted: false,
             deadline: bms_model::Deadline::after(self.clock.now(), render::CREATE_BOUND),
+            outro: false,
         };
         if let Err(e) = self.recover() {
             let _ = p.reply.send(Err(e));
@@ -14889,6 +14975,15 @@ impl Run {
     /// reveals the held lifetime here, whatever the game thread is doing,
     /// unless a refusal came first. The lifetime to take, once.
     fn reveal_due(&mut self) -> Option<u64> {
+        // A result arm's result fell back: its built-in deadline, at once
+        // (design.md "Screen Transitions and Loading", a result arm).
+        if self.reveal_arm.is_some_and(|a| a.result)
+            && self.current_result().is_some()
+            && self.result_fell_back()
+            && let Some(arm) = self.reveal_arm.as_mut()
+        {
+            arm.at = arm.built_in;
+        }
         let arm = self.reveal_arm?;
         #[cfg(test)]
         if self.shared.reveal_paused.load(Ordering::SeqCst) {
@@ -14906,7 +15001,32 @@ impl Run {
         #[cfg(test)]
         self.shared.reveal_eligible.fetch_add(1, Ordering::SeqCst);
         self.reveal_arm = None;
-        reveal_armed(&self.shared, arm.lifetime, now).then_some(arm.lifetime)
+        let revealed = reveal_armed(&self.shared, arm.lifetime, now);
+        if revealed && arm.result {
+            // The loading state owns the screen from here: no result
+            // message or recovery draws the result again, and the
+            // retry's staging may release the result's installation.
+            self.left_result = self.result.as_ref().map(|r| r.lifetime);
+            if let Some(p) = self.attempt.as_mut().filter(|p| p.outro) {
+                p.outro = false;
+                p.deadline = bms_model::Deadline::after(now, render::CREATE_BOUND);
+            }
+        }
+        revealed.then_some(arm.lifetime)
+    }
+
+    /// Whether the current result fell back (its timing withdrawn: the
+    /// built-in presentation shows).
+    fn result_fell_back(&self) -> bool {
+        self.shared.barrier().timing.is_none()
+    }
+
+    /// Whether the result lifetime held is the one a retry's reveal left:
+    /// nothing draws it again.
+    fn result_left(&self) -> bool {
+        self.result
+            .as_ref()
+            .is_some_and(|r| Some(r.lifetime) == self.left_result)
     }
 
     /// A later mode drops the decision screen: its page, what it shows
@@ -14917,7 +15037,10 @@ impl Run {
         self.leave_decision();
         self.decision = None;
         self.decision_shown = None;
-        self.reveal_arm = None;
+        // A result arm is no decision's: only its own edges end it.
+        if self.reveal_arm.is_some_and(|a| !a.result) {
+            self.reveal_arm = None;
+        }
         self.decision_screen = None;
     }
 

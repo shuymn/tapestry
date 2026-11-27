@@ -1843,6 +1843,10 @@ impl Screen for MenuScreen {
         self.renderer.room_waits(kind, bundle)
     }
 
+    fn play_releases_result(&self, bundle: &Arc<SkinBundle>) -> bool {
+        self.renderer.play_releases_result(bundle)
+    }
+
     fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
         self.renderer.pages_room_waits(pages)
     }

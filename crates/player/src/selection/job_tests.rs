@@ -1723,6 +1723,7 @@ fn a_foreground_only_preload_leaves_a_cold_bank_its_width(alone: Alone) {
                 crate::result_skin::tests::chart(),
                 Some(skin_beatoraja::JudgeClass::Normal),
                 claim,
+                false,
             );
             assert!(
                 matches!(
@@ -1855,6 +1856,7 @@ fn a_discarded_adopted_pack_leaves_the_next_cold_bank_its_width() {
                 crate::result_skin::tests::chart(),
                 Some(skin_beatoraja::JudgeClass::Normal),
                 Some(control.claim()),
+                false,
             );
             assert!(matches!(stage, crate::result_skin::ImageStage::Adopted(_)));
             assert!(step(), "a checkpoint in the foreground");
@@ -1930,6 +1932,7 @@ fn a_quit_before_the_promoted_pack_moves_leaves_the_next_cold_bank_its_width() {
                 crate::result_skin::tests::chart(),
                 Some(skin_beatoraja::JudgeClass::Normal),
                 Some(control.claim()),
+                false,
             );
             assert!(matches!(stage, crate::result_skin::ImageStage::Adopted(_)));
             let arrived = pass();

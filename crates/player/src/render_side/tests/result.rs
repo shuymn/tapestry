@@ -2755,6 +2755,121 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
     });
 }
 
+/// A retry accepted over the pinned result, its loading state held and
+/// armed for the outro's end (as `begin_retry_loading` does), with the
+/// command's outro ahead of `length` µs (none once the result fell back):
+/// the arm's end.
+fn arm_retry(p: &mut crate::play::PlayerRig<'_>, length: i64) -> TimeUs {
+    use game::Rig as _;
+    let at = p.now();
+    assert!(matches!(p.begin_outro(at, None), game::Outro::Begun(_)));
+    p.accept_leaving(game::MenuCommand::Retry);
+    let end = TimeUs(at.0 + length);
+    p.render.begin_loading_held(&super::chosen("T"), None);
+    p.render.loading().show(super::one_line("loading"));
+    p.render.arm_reveal(end, p.now());
+    end
+}
+
+/// The result frames drawn over 300 ms from now: none once the loading
+/// state owns the screen (its frames are menu frames, not recorded).
+fn result_frames_now(drawn: &Mutex<Vec<Drawn>>) -> Vec<Drawn> {
+    drawn.lock().unwrap().clear();
+    std::thread::sleep(Duration::from_millis(300));
+    drawn.lock().unwrap().clone()
+}
+
+/// The result skin's restore refused at a screen built again: its
+/// lifetime goes on, on the built-in page, its timing withdrawn.
+fn fall_back(p: &mut crate::play::PlayerRig<'_>, faults: &Faults) {
+    use game::Rig as _;
+    faults.refuse_restore.store(true, Ordering::Release);
+    faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| p.screen_failed()));
+    p.prepare_screen().unwrap();
+    assert!(wait_until(|| p.render.result_status().disabled.is_some()));
+}
+
+/// A retry's result arm (design.md "Screen Transitions and Loading", the
+/// reveal word, a result arm): armed over the pinned result for its
+/// outro's end, the result draws on and the step stays pending through a
+/// view shown again; the render thread's frame at the end reveals the
+/// loading state, which draws on through a view shown again and a screen
+/// built again, the result never drawn again.
+// Revert: the arm dropped with the decision -> pending past the end.
+// Revert: ResultChanged clearing the arm -> pending past the end.
+// Revert: Prepare restoring the result -> a result frame after the reveal.
+#[test]
+fn a_retrys_reveal_waits_for_its_outros_end() {
+    use crate::render_side::AtStep;
+    use game::Rig as _;
+    on_shown_result(
+        "skin.fadeout = 3000\n",
+        TIMER2_DOT,
+        |p, report, screen, faults, drawn| {
+            let end = arm_retry(p, 3_000_000);
+            p.show_end(report, screen);
+            assert!(!result_frames_now(drawn).is_empty(), "the result draws on");
+            assert_eq!(p.render.reveal_at_step(), AtStep::Pending);
+            assert!(p.now() < end, "the outro plays on");
+            assert!(wait_until(|| p.render.reveal_at_step() == AtStep::Revealed));
+            assert!(p.now() >= end, "revealed at the end");
+            assert_eq!(result_frames_now(drawn), [], "the loading state draws");
+            p.show_end(report, screen);
+            assert_eq!(result_frames_now(drawn), [], "a view shown again");
+            faults.lose_menu.store(true, Ordering::Release);
+            assert!(wait_until(|| p.screen_failed()));
+            p.prepare_screen().unwrap();
+            // The flow shows the loading state again on the screen built
+            // again, as after any loss.
+            p.render.loading().show(super::one_line("loading"));
+            assert_eq!(result_frames_now(drawn), [], "a screen built again");
+        },
+    );
+}
+
+/// A result that falls back during a retry's outro (design.md "Screen
+/// Transitions and Loading", a result arm): the arm moves to its built-in
+/// deadline, the acceptance's instant, so the loading state is revealed
+/// at once, long before the outro's end.
+// Revert: the fallback not moving the arm -> pending until the end.
+#[test]
+fn a_fallback_during_a_retrys_outro_reveals_at_once() {
+    use crate::render_side::AtStep;
+    use game::Rig as _;
+    on_shown_result(
+        "skin.fadeout = 60000\n",
+        TIMER2_DOT,
+        |p, _, _, faults, drawn| {
+            let end = arm_retry(p, 60_000_000);
+            assert_eq!(p.render.reveal_at_step(), AtStep::Pending);
+            fall_back(p, faults);
+            assert!(wait_until(|| p.render.reveal_at_step() == AtStep::Revealed));
+            assert!(p.now() < end);
+            assert_eq!(result_frames_now(drawn), [], "the loading state draws");
+        },
+    );
+}
+
+/// A retry armed over a result that fell back already: its arm starts at
+/// the built-in deadline, and the loading state is revealed at once.
+#[test]
+fn a_retry_armed_after_a_fallback_reveals_at_once() {
+    use crate::render_side::AtStep;
+    use game::Rig as _;
+    on_shown_result(
+        "skin.fadeout = 60000\n",
+        TIMER2_DOT,
+        |p, _, _, faults, drawn| {
+            fall_back(p, faults);
+            let end = arm_retry(p, 60_000_000);
+            assert!(wait_until(|| p.render.reveal_at_step() == AtStep::Revealed));
+            assert!(p.now() < end);
+            assert_eq!(result_frames_now(drawn), [], "the loading state draws");
+        },
+    );
+}
+
 /// Through the real `PlayerRig`, once a command is accepted (a 5 s outro,
 /// and a 1 ms one already over, as after a settle held past it): a view
 /// shown again asks for no layout, though it does before (D4). A screen

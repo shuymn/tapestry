@@ -547,6 +547,7 @@ fn an_adoption_is_marked_before_its_hold_is_let_go() {
         crate::result_skin::tests::chart(),
         Some(skin_beatoraja::JudgeClass::Normal),
         Some(claim),
+        false,
     ) else {
         panic!("not adopted");
     };

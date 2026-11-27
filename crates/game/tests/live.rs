@@ -372,6 +372,14 @@ struct Fake {
     /// The render side's cutoff: for every attempt it does not script,
     /// cut off at once, logging nothing.
     cutoff: Option<CutoffScript>,
+    /// A retry's outro: whether its reuse is proved, and the clock time
+    /// from which its step reads the loading state revealed.
+    outro_reuse: bool,
+    outro_reveal_at: i64,
+    /// The outro's end each retry armed ([`Rig::retry_outro_began`]).
+    outro_armed: Vec<i64>,
+    /// The ticket of the preparation answered ready last.
+    answered: Option<u64>,
 }
 
 /// What happens during a preparation's first poll ([`Fake::in_first_poll`])
@@ -561,6 +569,10 @@ impl Fake {
             readies: 0,
             closings: Vec::new(),
             cutoff: None,
+            outro_reuse: true,
+            outro_reveal_at: i64::MIN,
+            outro_armed: Vec::new(),
+            answered: None,
         }
     }
 
@@ -779,9 +791,15 @@ impl Rig for Fake {
             self.pending_left -= 1;
             return Ok(game::PrepPoll::Pending);
         }
+        // As the player's: an answered preparation's answer was taken,
+        // and polling it again is an error.
+        if self.answered == Some(handle.ticket()) {
+            return Err(SurfaceLost);
+        }
         let done = self.prepare_ended()?;
         if done == Preparation::Ready {
             handle.staged_with(self.screen);
+            self.answered = Some(handle.ticket());
         }
         Ok(game::PrepPoll::Done(done))
     }
@@ -818,6 +836,41 @@ impl Rig for Fake {
 
     fn discard_attempt(&mut self) {
         self.steps.push("discard");
+    }
+
+    fn retry_outro_began(&mut self, end: TimeUs) {
+        self.steps.push("outro armed");
+        self.outro_armed.push(end.0);
+    }
+
+    fn outro_reuse(&mut self, _loaded: &Loaded) -> bool {
+        self.steps.push("outro gate");
+        self.outro_reuse
+    }
+
+    fn begin_outro_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
+        self.steps.push("outro attempt");
+        self.begin_preparation(loaded, key)
+    }
+
+    fn outro_step(&mut self) -> game::OutroReveal {
+        self.steps.push("outro step");
+        if self.outro_reveal_at == i64::MAX {
+            game::OutroReveal::Withheld
+        } else if self.clock.now().0 >= self.outro_reveal_at {
+            game::OutroReveal::Revealed
+        } else {
+            game::OutroReveal::Pending
+        }
+    }
+
+    fn outro_withdrawn(&mut self) {
+        self.steps.push("outro withdrawn");
+    }
+
+    fn outro_refused(&mut self) {
+        self.steps.push("outro refused");
+        self.outro_reveal_at = i64::MAX;
     }
 
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
@@ -6415,6 +6468,253 @@ fn an_accepted_command_is_served_after_its_outro() {
     assert_eq!(next, Some(at + 500_000), "{:?}", rig.screen_at);
 }
 
+/// The index of the first `step` in `rig`'s steps from `from` on.
+fn step_from(rig: &Fake, from: usize, step: &str) -> Option<usize> {
+    rig.steps
+        .iter()
+        .skip(from)
+        .position(|&s| s == step)
+        .map(|i| i + from)
+}
+
+/// A retry accepted with its result's outro ahead (design.md "Play
+/// Lifecycle", Preparing each attempt, a retry from an outro): its loading
+/// state is armed for the outro's end at the acceptance, its attempt
+/// prepared reuse-only during the outro once the reuse is proved, and at
+/// the end the flow reads the reveal before it leaves the result and
+/// prepares the audio (which parks the result's runtime), then goes on
+/// with that preparation (no second begin) to the commit and the second
+/// play.
+// Revert: the preparation served at the outro's end -> no outro attempt.
+// Revert: `prepare_audio` in the outro -> the audio before the step.
+#[test]
+fn a_retry_from_an_outro_is_prepared_during_it() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let end = at + 500_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), end + 30_000_000);
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.outro_armed, [end]);
+    let armed = step_from(&rig, 0, "outro armed").expect("armed");
+    let gate = step_from(&rig, armed, "outro gate").expect("the gate");
+    let begun = step_from(&rig, gate, "outro attempt").expect("begun reuse-only");
+    let step = step_from(&rig, begun, "outro step").expect("the step");
+    let screen = step_from(&rig, step, "screen").expect("the result left");
+    assert!(
+        armed < gate && gate < begun && begun < step && step < screen,
+        "{:?}",
+        rig.steps
+    );
+    // The audio's preparation, which parks the result's runtime, only
+    // once the reveal is read: the outro plays whole.
+    let audio = step_from(&rig, armed, "audio").expect("the audio");
+    assert!(screen < audio, "{:?}", rig.steps);
+    // Begun during the outro, never again at its end.
+    assert_eq!(step_from(&rig, screen, "attempt"), None, "{:?}", rig.steps);
+    assert!(
+        step_from(&rig, screen, "commit").is_some(),
+        "{:?}",
+        rig.steps
+    );
+    assert_eq!(rig.reports.len(), 2, "the retry played");
+}
+
+/// A retry from an outro whose reuse is not proved prepares nothing
+/// during it: its attempt is prepared at the outro's end, after the step,
+/// in the ordinary mode.
+#[test]
+fn an_unproved_retry_is_prepared_at_the_outros_end() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let end = at + 500_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), end + 30_000_000);
+    rig.outro_reuse = false;
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.outro_armed, [end]);
+    assert!(!rig.steps.contains(&"outro attempt"), "{:?}", rig.steps);
+    let step = step_from(&rig, 0, "outro step").expect("the step");
+    assert!(
+        step_from(&rig, step, "attempt").is_some(),
+        "{:?}",
+        rig.steps
+    );
+    assert_eq!(rig.reports.len(), 2, "the retry played");
+}
+
+/// The outro's reuse-only preparation missed (a stage that would import):
+/// the attempt is prepared again at the outro's end in the ordinary mode.
+#[test]
+fn a_missed_outro_preparation_prepares_again_at_the_end() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let end = at + 500_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), end + 30_000_000);
+    rig.preparations.push(Preparation::Ready);
+    rig.preparations.push(Preparation::Missed);
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let begun = step_from(&rig, 0, "outro attempt").expect("begun reuse-only");
+    let step = step_from(&rig, begun, "outro step").expect("the step");
+    assert!(
+        step_from(&rig, step, "attempt").is_some(),
+        "{:?}",
+        rig.steps
+    );
+    assert_eq!(rig.reports.len(), 2, "the retry played");
+}
+
+/// The window closed during a retry's outro: the run ends at once, the
+/// retry's reveal withdrawn and its preparation discarded, before the
+/// outro's end.
+#[test]
+fn a_close_during_a_retrys_outro_withdraws_it() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), at + 1_000_000);
+    rig.pending_polls = 1_000_000;
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    rig.at.push((at + 1_000_000, Box::new(|| {})));
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Quit);
+    assert!(rig.clock.now().0 < at + 5_000_000);
+    let begun = step_from(&rig, 0, "outro attempt").expect("begun reuse-only");
+    let withdrawn = step_from(&rig, begun, "outro withdrawn").expect("withdrawn");
+    assert!(
+        step_from(&rig, withdrawn, "discard").is_some(),
+        "{:?}",
+        rig.steps
+    );
+    assert_eq!(rig.reports.len(), 1, "no retry");
+}
+
+/// The render thread reveals the retry's loading state late: the flow's
+/// step stays pending, in 1 ms looks, and leaves the result only once it
+/// reads the reveal.
+#[test]
+fn a_retry_leaves_its_result_only_once_revealed() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let end = at + 500_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), end + 30_000_000);
+    rig.outro_reveal_at = end + 5_000;
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let steps = rig.steps.iter().filter(|&&s| s == "outro step").count();
+    assert!(steps >= 2, "pending first: {:?}", rig.steps);
+    let next = rig.screen_at.iter().copied().find(|&t| t > s);
+    assert!(
+        next.is_some_and(|t| t >= end + 5_000),
+        "{:?}",
+        rig.screen_at
+    );
+    assert_eq!(rig.reports.len(), 2, "the retry played");
+}
+
+/// The result skin falls back during a retry's outro (design.md "State
+/// Model", Result): the retry is served at the next look, well before the
+/// outro's end, and opens once its reveal is read.
+#[test]
+fn a_fallback_during_a_retrys_outro_opens_it_at_once() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), at + 30_000_000);
+    rig.timing_until = at + 200_000;
+    rig.outro_reveal_at = at + 200_000;
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    rig.at.push((at + 200_000, Box::new(|| {})));
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let next = rig.screen_at.iter().copied().find(|&t| t > s);
+    assert!(
+        next.is_some_and(|t| t < at + 5_000_000),
+        "{:?}",
+        rig.screen_at
+    );
+    assert_eq!(rig.reports.len(), 2, "the retry played");
+}
+
+/// The play preset edited during a retry's outro (design.md "Play
+/// Lifecycle", Preparing each attempt, a retry from an outro): what the
+/// outro prepared is keyed with the old preset, so at the end the
+/// attempt is prepared again with the edited one, which the retry plays.
+// Revert: the key check removed -> the old preset's preparation plays.
+#[test]
+fn a_preset_edited_during_a_retrys_outro_prepares_again() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let at = s + 1_000_000;
+    let end = at + 2_000_000;
+    let mut rig = outro_rig(timing(2_000_000, 0, None), end + 30_000_000);
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let mut edited = rules::tapestry();
+    edited.gauges.reverse();
+    for g in &mut edited.gauges {
+        g.id = format!("{}-edited", g.id);
+    }
+    let to = edited.clone();
+    rig.at
+        .push((at + 1_000_000, Box::new(move || rewrite_preset(&path, &to))));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let begun = step_from(&rig, 0, "outro attempt").expect("begun reuse-only");
+    let step = step_from(&rig, begun, "outro step").expect("the step");
+    assert!(
+        step_from(&rig, step, "attempt").is_some(),
+        "{:?}",
+        rig.steps
+    );
+    let [_, during, again] = &rig.begun[..] else {
+        panic!("{:?}", rig.begun);
+    };
+    assert!(during.changes(again).preset);
+    assert_eq!(rig.reports[1].preset, mine(edited));
+}
+
+/// The retry's preparation refused during its outro (design.md "Play
+/// Lifecycle", Preparing each attempt, a retry from an outro): the reveal
+/// is refused at once, and at the outro's end the retry takes the
+/// refusal's route, nothing opened.
+#[test]
+fn a_refusal_during_a_retrys_outro_refuses_its_reveal() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let at = s + 1_000_000;
+    let end = at + 500_000;
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), end + 30_000_000);
+    let why = PreparationRefusal {
+        location: None,
+        reason: "a font cannot be drawn".to_owned(),
+    };
+    rig.preparations = vec![Preparation::Ready, Preparation::Refused(why.clone())];
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    match ran {
+        Err(LiveError::Preparation(r)) => assert_eq!(r, why),
+        other => panic!("{other:?}"),
+    }
+    let begun = step_from(&rig, 0, "outro attempt").expect("begun reuse-only");
+    let refused = step_from(&rig, begun, "outro refused").expect("refused");
+    let step = step_from(&rig, refused, "outro step").expect("the step");
+    assert!(rig.clock.now().0 >= end);
+    assert!(!rig.steps[step..].contains(&"commit"), "{:?}", rig.steps);
+    assert_eq!(rig.reports.len(), 1, "no retry");
+}
+
 /// C15: the window closed during an outro ends the run at once; one closed
 /// while the settle holds ends it when the settle returns, before a
 /// recovery of a screen lost meanwhile (T10).
@@ -6603,6 +6903,38 @@ fn an_input_failure_mid_outro_ends_the_run_before_a_recovery() {
     );
     assert_eq!(rig.prepares, 1);
     assert_eq!(rig.clock.now().0, at + 1_000_000);
+}
+
+/// The input thread failing during a retry's outro ends the run with its
+/// cause at the next look, long before the outro's end: the retry's
+/// reveal withdrawn and what the outro prepared discarded once, nothing
+/// of the retry opened.
+#[test]
+fn an_input_failure_during_a_retrys_outro_withdraws_it() {
+    let s = result_start();
+    let at = s + 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(3_000_000, 0, None), i64::MAX);
+    rig.pending_polls = 1_000_000;
+    rig.input_fails_at = at + 200_000;
+    rig.at.push((at + 200_000, Box::new(|| {})));
+    press(&mut rig, &[(at, game::MenuCommand::Retry)]);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    assert!(rig.clock.now().0 < at + 3_000_000);
+    let begun = step_from(&rig, 0, "outro attempt").expect("begun reuse-only");
+    let withdrawn = step_from(&rig, begun, "outro withdrawn").expect("withdrawn");
+    let discards = rig.steps[withdrawn..]
+        .iter()
+        .filter(|&&s| s == "discard")
+        .count();
+    assert_eq!(discards, 1, "{:?}", rig.steps);
+    assert!(!rig.steps[begun..].contains(&"screen"), "{:?}", rig.steps);
+    assert_eq!(rig.reports.len(), 1, "no retry");
 }
 
 /// T7, T13: the gate and the pin judge one view. A built-in view sampled

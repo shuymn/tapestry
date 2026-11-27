@@ -101,8 +101,9 @@ pub use keys::{
 };
 pub use live::{
     AudioReadiness, CLOSE_FLOOR, Closing, ClosingEnd, Cutoff, FINISH_MARGIN, FadeEnd,
-    InputWaitError, Leave, LiveError, Opening, Outro, PlayEnding, Polled, Rearm, ResultTiming, Rig,
-    closing_deadline, closing_time, fade_deadline, finish_point, gated, hold_until,
+    InputWaitError, Leave, LiveError, Opening, Outro, OutroReveal, PlayEnding, Polled, Rearm,
+    ResultTiming, Rig, closing_deadline, closing_time, fade_deadline, finish_point, gated,
+    hold_until,
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,

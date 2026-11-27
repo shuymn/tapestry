@@ -2484,7 +2484,11 @@ pub(crate) fn take_escape(
 /// The chart chosen, `chart`, as the loading state's and the decision
 /// screen's lines name it: from its library entry, the chosen preset and
 /// the session.
-fn loading_text(sel: &Selection, chart: &std::path::Path, autoplay: bool) -> LoadingText {
+pub(crate) fn loading_text(
+    sel: &Selection,
+    chart: &std::path::Path,
+    autoplay: bool,
+) -> LoadingText {
     let entry = sel.screen.selected().filter(|e| e.path == chart);
     let header = entry.map(|e| &e.header);
     let mut title = header
@@ -3531,6 +3535,38 @@ enum PageBegin {
 }
 
 impl PlayerRig<'_> {
+    /// A retry accepted with its result's outro ending at `end` (design.md
+    /// "Play Lifecycle", Preparing each attempt, a retry from an outro):
+    /// the next attempt's loading lifetime begun held for the chart
+    /// selected, the window's withdrawal installed and the quit latch
+    /// read as the decision's entry does, and the reveal armed at `end`,
+    /// the acceptance's instant its built-in deadline ("Screen
+    /// Transitions and Loading", the reveal word, a result arm). Nothing
+    /// without a selection (a play from the command line has no loading
+    /// presentation).
+    pub(crate) fn begin_retry_loading(&mut self, end: TimeUs) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let Some(chart) = sel.screen.selected().map(|e| e.path.clone()) else {
+            return;
+        };
+        let page = loading_text(sel, &chart, self.autoplay);
+        let gauge = sel
+            .screen
+            .bests_preset()
+            .and_then(|p| crate::play::loading_gauge(p, self.gauge));
+        self.render.begin_loading_held(&page, gauge);
+        self.controls
+            .set_reveal_withdraw(self.render.reveal_withdrawer());
+        if self.controls.quitting() {
+            self.render.close_reveal();
+        }
+        self.render.arm_reveal(end, self.clock.now());
+        show_stage(&self.render, Some(&page), Stage::Screen);
+        sel.loading = Some(page);
+    }
+
     /// The decision lifetime the choice claimed ended (its step, the
     /// practice page's entry, a leave, a refused load's return):
     /// the label book is told, so the render thread retires its pinned
