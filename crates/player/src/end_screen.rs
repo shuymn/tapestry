@@ -128,6 +128,16 @@ fn cause(c: AbortCause) -> &'static str {
     }
 }
 
+/// The line naming how a full play's fade phase ended, printed at its
+/// end: the report printed at the save cannot carry it.
+pub fn fade_end_line(how: game::FadeEnd) -> String {
+    match how {
+        game::FadeEnd::RanOut => "tail: the fade ran out".to_owned(),
+        game::FadeEnd::Skipped => "tail: the fade was skipped".to_owned(),
+        game::FadeEnd::Cut(c) => format!("tail: the fade was cut by {}", cause(c)),
+    }
+}
+
 /// The line naming why the record is incomplete, if it is.
 fn incomplete_line(i: replay::Incomplete) -> Option<String> {
     let why: Vec<&str> = [
@@ -665,7 +675,22 @@ pub(crate) mod tests {
     use replay::verify::Coverage;
     use rules::GaugeValue;
 
-    use super::{COLUMNS, Hints, LoadTimes, QueueLine, SUMMARY_LINES, key_name, ms};
+    use super::{COLUMNS, Hints, LoadTimes, QueueLine, SUMMARY_LINES, fade_end_line, key_name, ms};
+
+    /// The fade phase's end line names how it ended, a cut with its cause.
+    #[test]
+    fn the_fade_end_line_names_its_end_and_cause() {
+        use game::{AbortCause, FadeEnd};
+        assert_eq!(fade_end_line(FadeEnd::RanOut), "tail: the fade ran out");
+        assert_eq!(
+            fade_end_line(FadeEnd::Skipped),
+            "tail: the fade was skipped"
+        );
+        assert_eq!(
+            fade_end_line(FadeEnd::Cut(AbortCause::FocusLoss)),
+            "tail: the fade was cut by FOCUS LOSS"
+        );
+    }
 
     #[test]
     fn key_names_follow_the_scan_code() {

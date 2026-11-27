@@ -1323,6 +1323,18 @@ fn atlas_step(
     })
 }
 
+/// Marks a result layout pass's end on the run's record as it drops, on
+/// every way out of the job (dev-tools).
+#[cfg(feature = "dev-tools")]
+struct LayoutEnded;
+
+#[cfg(feature = "dev-tools")]
+impl Drop for LayoutEnded {
+    fn drop(&mut self) {
+        crate::dev::transitions::game_mark_now("result-layout", 1);
+    }
+}
+
 impl ResultSkin {
     /// The kind's skin from startup.
     pub fn new(start: Option<ResultStart>) -> Self {
@@ -2197,6 +2209,12 @@ impl ResultSkin {
         let wake = self.wake.clone();
         match imports::spawn_job_with(
             move |cancel: &Cancel| {
+                // The layout's pass on the run's record (dev-tools): its
+                // start and end, so a measurement knows when its Lua ran.
+                #[cfg(feature = "dev-tools")]
+                crate::dev::transitions::game_mark_now("result-layout", 0);
+                #[cfg(feature = "dev-tools")]
+                let _ended = LayoutEnded;
                 let (laid, script) = layout(
                     &pending,
                     view,

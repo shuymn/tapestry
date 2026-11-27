@@ -113,6 +113,37 @@ pub struct Controls {
     command: AtomicU8,
     /// When the latest retry was received, on the clock.
     retry_at: AtomicI64,
+    /// When the pending quit that leaves the chart, the pending suspend and
+    /// the pending retry were first received, on the clock: the receipts a
+    /// fade phase's skip or cut moves its deadline to ([`take_received`]).
+    /// Each is written only while its command's bit is clear, before the
+    /// bit is set, or, under [`senders`](Self::senders), when a press after
+    /// the result's takeover supersedes a pending one received by it; it
+    /// is read before a take clears the bit.
+    ///
+    /// [`take_received`]: Self::take_received
+    leave_at: AtomicI64,
+    suspend_at: AtomicI64,
+    retry_pending_at: AtomicI64,
+    /// Held by a sender from its receipt to its bit: commands are
+    /// published one at a time, whichever thread sends them (the window's
+    /// keys, the power notification, the game thread's own retry), so no
+    /// sender's receipt is stored under another's publication.
+    senders: std::sync::Mutex<()>,
+    /// The fade phase's takeover the result after it counts its input
+    /// from, on the clock, `i64::MIN` for none: the result's one
+    /// watermark, shared with its menus' input
+    /// ([`crate::result_input::ResultInput::sharing`]). A pending command
+    /// received by it is the phase's, one received after it the result's.
+    takeover: Arc<AtomicI64>,
+    /// The next take publishes a quit once it has cleared its bit
+    /// (tests).
+    #[cfg(test)]
+    quit_during_take: AtomicBool,
+    /// Runs in the next publication between its receipt and its bit
+    /// (tests).
+    #[cfg(test)]
+    in_publication: std::sync::Mutex<Option<InPublication>>,
     /// When the latest quit key press in the decision screen's epoch was
     /// observed, on the clock; `i64::MIN` for none.
     quit_in_epoch: AtomicI64,
@@ -173,6 +204,15 @@ impl Controls {
             clock,
             command: AtomicU8::new(NONE),
             retry_at: AtomicI64::new(i64::MIN),
+            leave_at: AtomicI64::new(i64::MIN),
+            suspend_at: AtomicI64::new(i64::MIN),
+            retry_pending_at: AtomicI64::new(i64::MIN),
+            senders: std::sync::Mutex::new(()),
+            takeover: Arc::new(AtomicI64::new(i64::MIN)),
+            #[cfg(test)]
+            quit_during_take: AtomicBool::new(false),
+            #[cfg(test)]
+            in_publication: std::sync::Mutex::new(None),
             quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
             reveal_withdraw: std::sync::Mutex::new(None),
@@ -293,21 +333,67 @@ impl Controls {
             Command::Retry => RETRY,
             Command::Suspend => SUSPEND,
         };
-        // In the decision screen's epoch only a suspend is kept; a quit
-        // key press is kept apart, with the time it was observed.
-        let set = self
-            .command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                let dropped = w & EPOCH != 0 && matches!(bit, LEAVE | RETRY);
-                (!dropped).then_some(w | bit)
-            })
-            .is_ok();
+        // A command's receipt is read and stored while its bit is clear,
+        // before the bit is set, and never while it is set: one pressed
+        // again before it is taken joins the pending one, whose first
+        // receipt stays, and a take reads the receipt before it clears the
+        // bit, so a command and its receipt go together. Senders publish one
+        // at a time, so a receipt is only ever stored by the sender that
+        // sets its bit next.
+        let _sending = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.clock.now().0;
+        let set = loop {
+            let w = self.command.load(Ordering::Acquire);
+            // In the decision screen's epoch only a suspend is kept; a quit
+            // key press is kept apart, with the time it was observed.
+            if w & EPOCH != 0 && matches!(bit, LEAVE | RETRY) {
+                break false;
+            }
+            if w & bit != 0 {
+                // Classified before it is joined: a press after the result's
+                // takeover supersedes a pending one received by it, the fade
+                // phase's, so the fresh one keeps its own receipt; two on
+                // one side keep the first. Between a skip's receipt and the
+                // phase taking it the published takeover stays (the
+                // deadline, or a slow save's end), so a repeated press
+                // there joins the skip (design.md "State Model",
+                // ResultPreparing). The receipted take holds this
+                // lock too, so it never reads a receipt mid-change.
+                let mark = self.takeover.load(Ordering::Acquire);
+                let pending = self.receipt(bit);
+                if mark != i64::MIN && now > mark && pending.load(Ordering::Acquire) <= mark {
+                    pending.store(now, Ordering::Release);
+                }
+                break true;
+            }
+            self.receipt(bit).store(now, Ordering::Release);
+            #[cfg(test)]
+            {
+                let run = self
+                    .in_publication
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(InPublication(run)) = run {
+                    run();
+                }
+            }
+            if self
+                .command
+                .compare_exchange(w, w | bit, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break true;
+            }
+        };
         if set && bit == RETRY {
-            self.retry_at.store(self.clock.now().0, Ordering::Release);
+            self.retry_at.store(now, Ordering::Release);
         }
         if !set && bit == LEAVE {
-            self.quit_in_epoch
-                .store(self.clock.now().0, Ordering::Release);
+            self.quit_in_epoch.store(now, Ordering::Release);
         }
     }
 
@@ -317,7 +403,44 @@ impl Controls {
     /// left even when the system suspends too.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
-        self.take_with(RETRY)
+        self.take_with(RETRY, i64::MAX, false).map(|(c, _)| c)
+    }
+
+    /// [`take`](Self::take) of the commands received by `until`, at it
+    /// included, with the command's receipt: the clock's reading when the
+    /// window thread or the power notification handed it over, never when
+    /// it is taken (design.md "State Model", ResultPreparing: a fade
+    /// phase's commands end at its takeover, and what comes after it is
+    /// the result's). A command received later stays pending, and a quit
+    /// drops only a retry received by `until`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn take_received(&self, until: TimeUs) -> Option<(Command, TimeUs)> {
+        self.take_with(RETRY, until.0, true)
+    }
+
+    /// The result's takeover watermark, shared with its menus' input.
+    pub fn takeover_mark(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.takeover)
+    }
+
+    /// Under the senders' lock, reads the clock and publishes
+    /// `takeover(reading)` as the result's watermark: every press read
+    /// after it takes the lock after it and is classified against the
+    /// watermark, and every press read before it has an earlier receipt.
+    /// The reading.
+    pub fn mark_takeover(&self, takeover: impl FnOnce(TimeUs) -> TimeUs) -> TimeUs {
+        let _sending = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = self.now();
+        self.takeover.store(takeover(at).0, Ordering::Release);
+        at
+    }
+
+    /// No result's watermark: a fade phase withdrew its result.
+    pub fn clear_takeover(&self) {
+        self.takeover.store(i64::MIN, Ordering::Release);
     }
 
     /// [`take`](Self::take) during Closing (design.md "Play Lifecycle",
@@ -325,27 +448,72 @@ impl Controls {
     /// without dropping a pending retry, which the next take returns.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take_closing(&self) -> Option<Command> {
-        self.take_with(NONE)
+        self.take_with(NONE, i64::MAX, false).map(|(c, _)| c)
     }
 
     /// The pending quit (taking `drops` with it), else the pending
-    /// suspend, else the pending retry, taken in one step.
+    /// suspend, else the pending retry, of those received by `until`,
+    /// taken in one step with its first receipt, read before its bit is
+    /// cleared. A quit drops a retry only when both are on one side of
+    /// the result's takeover. With `receipted`, under the senders' lock, so
+    /// no press supersedes the receipt it reads; the plays' takes read the
+    /// receipts only against `i64::MAX` and to classify a retry against a
+    /// quit, return none, and take no lock.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn take_with(&self, drops: u8) -> Option<Command> {
+    fn take_with(&self, drops: u8, until: i64, receipted: bool) -> Option<(Command, TimeUs)> {
         let order = [
-            (LEAVE, LEAVE | drops, Command::Quit),
-            (SUSPEND, SUSPEND, Command::Suspend),
-            (RETRY, RETRY, Command::Retry),
+            (LEAVE, Command::Quit),
+            (SUSPEND, Command::Suspend),
+            (RETRY, Command::Retry),
         ];
-        let mut taken = None;
-        let _ = self
-            .command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                let (_, clear, c) = order.iter().find(|(bit, _, _)| w & bit != 0)?;
-                taken = Some(*c);
-                Some(w & !clear)
-            });
-        taken
+        // Only the taker clears a bit, and a sender writes a receipt only
+        // while its bit is clear: a set bit's receipt holds still.
+        let received = |w: u8, bit: u8| {
+            let at = self.receipt(bit).load(Ordering::Acquire);
+            (w & bit != 0 && at <= until).then_some(at)
+        };
+        let sending = receipted.then(|| {
+            self.senders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let mark = self.takeover.load(Ordering::Acquire);
+        let phase = |at: i64| mark != i64::MIN && at <= mark;
+        loop {
+            let w = self.command.load(Ordering::Acquire);
+            let (bit, c, at) = order
+                .iter()
+                .find_map(|&(bit, c)| received(w, bit).map(|at| (bit, c, at)))?;
+            // A quit drops a retry on its side of the published takeover:
+            // one queued with a skip the fade phase takes goes with it
+            // (design.md "State Model", ResultPreparing).
+            let clear = match received(w, drops) {
+                Some(dropped) if bit == LEAVE && phase(dropped) == phase(at) => LEAVE | drops,
+                _ => bit,
+            };
+            if self
+                .command
+                .compare_exchange(w, w & !clear, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                drop(sending);
+                #[cfg(test)]
+                if self.quit_during_take.swap(false, Ordering::AcqRel) {
+                    self.set_command(Command::Quit);
+                }
+                return Some((c, TimeUs(at)));
+            }
+        }
+    }
+
+    /// The receipt of the pending command `bit`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn receipt(&self, bit: u8) -> &AtomicI64 {
+        match bit {
+            LEAVE => &self.leave_at,
+            SUSPEND => &self.suspend_at,
+            _ => &self.retry_pending_at,
+        }
     }
 
     /// Whether a quit key press waits to be taken (while it leaves the
@@ -690,12 +858,27 @@ impl Controls {
     }
 }
 
+/// What a test runs in a publication ([`Controls`]' `in_publication`).
+#[cfg(test)]
+struct InPublication(Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for InPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InPublication")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use game::Command;
     use input::QpcClock;
 
     use super::Controls;
+    use bms_model::TimeUs;
+
+    /// A take's limit no receipt reaches.
+    const ALL: TimeUs = TimeUs(i64::MAX);
 
     /// The reveal word's close: one after the withdrawal is installed runs
     /// it, once; one before it (the first decision's) leaves the quit latch
@@ -808,6 +991,163 @@ mod tests {
         c.close();
         let stamped = crate::dev::transitions::close_qpc().expect("stamped");
         assert!(stamped >= before, "{stamped} < {before}");
+    }
+
+    /// A quit pressed again before it is taken joins the pending one and
+    /// keeps the first press's receipt, the one a fade phase's skip moves
+    /// its deadline to.
+    #[test]
+    fn a_quit_pressed_again_keeps_its_first_receipt() {
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        let before = c.now();
+        c.command(Command::Quit);
+        let first = c.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let again = c.now();
+        c.command(Command::Quit);
+        let (taken, at) = c.take_received(ALL).expect("a pending quit");
+        assert_eq!(taken, Command::Quit);
+        assert!(
+            before.0 <= at.0 && at.0 <= first.0,
+            "{at:?} not the first press, in {before:?}..={first:?} (again at {again:?})"
+        );
+        assert_eq!(c.take_received(ALL), None);
+    }
+
+    /// A command received after the limit a take is given stays pending,
+    /// for the next take; a quit taken by it drops only a retry received
+    /// by it too.
+    #[test]
+    fn a_command_received_after_the_limit_stays_pending() {
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        c.command(Command::Quit);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let limit = c.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.command(Command::Retry);
+        let (taken, at) = c.take_received(limit).expect("the quit before the limit");
+        assert_eq!(taken, Command::Quit);
+        assert!(at.0 < limit.0);
+        assert_eq!(c.take_received(limit), None, "the retry is past the limit");
+        assert_eq!(c.take(), Some(Command::Retry), "kept for the next take");
+        c.command(Command::Quit);
+        assert_eq!(c.take_received(TimeUs(i64::MIN)), None);
+        assert_eq!(c.take(), Some(Command::Quit));
+    }
+
+    /// A sender paused between its receipt and its bit holds every other
+    /// sender: a quit sent meanwhile is not published and nothing is
+    /// taken; once the first is published the second joins it, so the one
+    /// command taken has the first receipt and no receipt comes back
+    /// twice. The pause's take is a play's, which takes no lock (a
+    /// receipted take waits for the paused sender); every wait is bounded.
+    #[test]
+    fn a_sender_between_its_receipt_and_its_bit_holds_the_others() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        type Seen = (TimeUs, Option<Command>, mpsc::Receiver<()>);
+        let c = Arc::new(Controls::new(QpcClock::start()));
+        c.quit_leaves();
+        let (other, taker) = (Arc::clone(&c), Arc::clone(&c));
+        let seen: Arc<Mutex<Option<Seen>>> = Arc::default();
+        let into = Arc::clone(&seen);
+        *c.in_publication.lock().unwrap() = Some(super::InPublication(Box::new(move || {
+            let paused = taker.now();
+            let (sent, done) = mpsc::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                other.command(Command::Quit);
+                let _ = sent.send(());
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            *into.lock().unwrap() = Some((paused, taker.take(), done));
+        })));
+        c.command(Command::Quit);
+        let (paused, during, done) = seen.lock().unwrap().take().expect("the pause ran");
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("the second sender never published");
+        assert_eq!(
+            during, None,
+            "a quit published or taken while the first was paused"
+        );
+        let (taken, at) = c.take_received(ALL).expect("the first quit");
+        assert_eq!(taken, Command::Quit);
+        assert!(at.0 <= paused.0, "{at:?} is not the first quit's receipt");
+        assert_eq!(c.take_received(ALL), None, "the second joined the first");
+    }
+
+    /// After a fade phase's takeover, a pending quit received by it is the
+    /// phase's: a fresh quit supersedes it with its own receipt, two fresh
+    /// ones keep the first, and a stale quit drops no fresh retry.
+    #[test]
+    fn a_fresh_press_is_classified_before_it_joins_a_stale_one() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        let mark = c.takeover_mark();
+        // A stale quit, then a fresh one.
+        c.command(Command::Quit);
+        mark.store(c.now().0, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(5));
+        let fresh = c.now();
+        c.command(Command::Quit);
+        std::thread::sleep(Duration::from_millis(5));
+        c.command(Command::Quit);
+        let (taken, at) = c.take_received(ALL).expect("one quit");
+        assert_eq!(taken, Command::Quit);
+        assert!(at.0 >= fresh.0, "{at:?} is the stale receipt");
+        assert!(at.0 < fresh.0 + 5_000, "{at:?} is not the first fresh one");
+        assert_eq!(c.take_received(ALL), None);
+        // A stale quit, then a fresh retry: both stay.
+        c.command(Command::Quit);
+        mark.store(c.now().0, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(5));
+        c.command(Command::Retry);
+        let (quit, stale) = c.take_received(ALL).expect("the stale quit");
+        assert_eq!(quit, Command::Quit);
+        assert!(stale.0 <= mark.load(Ordering::Acquire));
+        let (retry, at) = c.take_received(ALL).expect("the fresh retry");
+        assert_eq!(retry, Command::Retry);
+        assert!(at.0 > mark.load(Ordering::Acquire));
+        // Without a takeover a quit drops the retry pressed with it.
+        mark.store(i64::MIN, Ordering::Release);
+        c.command(Command::Retry);
+        c.command(Command::Quit);
+        assert_eq!(c.take(), Some(Command::Quit));
+        assert_eq!(c.take(), None);
+    }
+
+    /// A take returns the receipt of the command it takes: a quit
+    /// published once the take has cleared the bit is the next command,
+    /// with its own receipt.
+    #[test]
+    fn a_quit_published_during_a_take_keeps_its_own_receipt() {
+        use std::sync::atomic::Ordering;
+
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        c.command(Command::Quit);
+        let first = c.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let between = c.now();
+        c.quit_during_take.store(true, Ordering::Release);
+        let (_, at) = c.take_received(ALL).expect("the first quit");
+        assert!(at.0 <= first.0, "{at:?} is not the first quit's receipt");
+        let (taken, later) = c
+            .take_received(ALL)
+            .expect("the quit published in the take");
+        assert_eq!(taken, Command::Quit);
+        assert!(
+            later.0 >= between.0,
+            "{later:?} is not the second quit's receipt"
+        );
+        assert_eq!(c.take_received(ALL), None);
     }
 
     #[test]

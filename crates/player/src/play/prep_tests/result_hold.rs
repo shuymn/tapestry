@@ -2979,3 +2979,282 @@ fn after_the_acknowledging_look_the_skins_timing_applies() {
         rig.leave_result();
     });
 }
+
+/// A save that outlasts its fade phase ends the phase before the result's
+/// preparation begins: that result is still the phase's, so it begins no
+/// hold of its own, and the pending presentation the deadline activated
+/// draws on every frame, its first view's staging included, with no
+/// outgoing frame after it (design.md "State Model", ResultPreparing).
+#[test]
+fn a_save_past_the_fade_begins_no_second_hold() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, frames| {
+        let (report, screen) = result_of(dir.path());
+        let (_skin, fixed) = fixed_skin();
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Fixed(Arc::clone(&fixed), None)));
+        prepared(rig, &a);
+        rig.render.send(RenderMsg::Menu(Box::default()));
+        frames.arm();
+        let from = frames.len();
+        // The fade runs out at 100 ms, within an ordinary hold's bound.
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + BOUND / 2);
+        rig.fade_phase(start, deadline);
+        rig.render.set_hold_clock(Some(BOUND * 3 / 4));
+        frames.until(rig, from, "pending frames past the deadline", |f| {
+            f.iter().filter(|f| f.pending()).count() >= 3
+        });
+        // The save ends: the phase is over before the preparation begins.
+        rig.fade_ended(game::FadeEnd::RanOut, deadline);
+        let begun = frames.len();
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        let held = frames.until(rig, begun, "five frames after the begin", |f| f.len() >= 5);
+        assert!(
+            held.iter().all(|f| f.pending()),
+            "pending after the preparation's begin: {held:?}"
+        );
+        let shown_from = frames.len();
+        rig.show_end(&report, &screen);
+        let shown = frames.until(rig, shown_from, "the skin's view", |f| {
+            f.iter()
+                .filter(|f| f.path == Some(ResultPath::Skin))
+                .count()
+                >= 3
+        });
+        let skin = first_view(&shown).unwrap();
+        assert!(
+            shown[..skin].iter().all(|f| f.pending()),
+            "pending until the first view: {shown:?}"
+        );
+        rig.leave_result();
+    });
+}
+
+/// The fade-layout switch holds the own view's layout request to the fade
+/// phase's end, whichever step asks for it: neither the comparison's
+/// request nor the hand-over's starts a layout job in the phase, and the
+/// phase's end asks for it once (dev-tools; design.md "Threat Model", T09).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_fade_layout_switch_holds_every_request_to_the_fades_end() {
+    let _serial = imports::serial();
+    let (dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        let (report, screen) = result_of(dir.path());
+        let d = result::skin(
+            "",
+            "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+        );
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(result::pending(
+            d.path(),
+            result::LIMITS,
+        ))));
+        rig.fade_layout_held = true;
+        prepared(rig, &a);
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 60_000_000);
+        rig.fade_phase(start, deadline);
+        rig.begin_result(&report, &screen);
+        rig.result_compared(&report, &screen);
+        assert!(!rig.result_skin.has_job(), "the comparison's request held");
+        rig.show_end(&report, &screen);
+        assert!(!rig.result_skin.has_job(), "the hand-over's request held");
+        assert!(rig.held_layout.is_some());
+        rig.fade_ended(game::FadeEnd::RanOut, deadline);
+        assert!(rig.held_layout.is_none());
+        assert!(rig.result_skin.has_job(), "asked for at the phase's end");
+        laid_out(rig);
+        rig.leave_result();
+    });
+}
+
+/// What the player pressed from the fade phase's takeover on is the
+/// result's however late the game sees the phase end: the quit key stays
+/// pending for the result's back, and a key the window observed then is
+/// the result's; one observed before the takeover was the phase's and is
+/// dropped, one the window publishes only after the phase's end included
+/// (design.md "State Model", ResultPreparing).
+#[test]
+fn input_past_the_fades_takeover_is_the_results() {
+    use crate::select::{MenuInput, MenuKey, Observed};
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        let start = rig.now();
+        let takeover = TimeUs(start.0 + 1_000);
+        rig.fade_phase(start, takeover);
+        let observed = |at: i64| {
+            Some(Observed {
+                stamp: rig.controls.ingress(),
+                at: TimeUs(at),
+            })
+        };
+        let (before, after) = (observed(takeover.0 - 10), observed(takeover.0 + 5));
+        // Stamped before the takeover by a window thread then held until
+        // the phase has ended.
+        let late = observed(takeover.0 - 5);
+        let menu = Arc::clone(&rig.result_input.menu);
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), before);
+        menu.push_stamped(MenuInput::Key(MenuKey::Down), after);
+        while rig.now().0 <= takeover.0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.controls.quit_leaves();
+        rig.controls.command(Command::Quit);
+        assert_eq!(
+            rig.take_received(takeover),
+            None,
+            "the quit is the result's"
+        );
+        rig.fade_ended(game::FadeEnd::RanOut, takeover);
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), late);
+        assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
+        assert_eq!(rig.take_menu(), Some(MenuCommand::NextPreset));
+        assert_eq!(rig.take_menu(), None);
+    });
+}
+
+/// A command received by the fade phase's takeover that no look of the
+/// phase took (its sender published it after the phase's last look) is
+/// the phase's: the result drops it as it takes its input, and a quit
+/// received after the takeover is the result's back.
+#[test]
+fn a_command_the_fade_never_took_is_not_the_results() {
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        let start = rig.now();
+        let takeover = TimeUs(start.0 + 20_000);
+        rig.fade_phase(start, takeover);
+        rig.controls.quit_leaves();
+        rig.controls.command(Command::Quit);
+        while rig.now().0 <= takeover.0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.fade_ended(game::FadeEnd::RanOut, takeover);
+        assert_eq!(rig.take_menu(), None, "the phase's quit");
+        rig.controls.command(Command::Quit);
+        assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
+    });
+}
+
+/// A command the fade phase never took, received by its takeover, then a
+/// fresh one before the result takes its input: the fresh quit is the
+/// result's back and a fresh retry its retry, neither lost to the stale
+/// command it met in the controls (design.md "State Model",
+/// ResultPreparing).
+#[test]
+fn a_fresh_command_after_one_the_fade_never_took_is_the_results() {
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        rig.controls.quit_leaves();
+        for (fresh, want) in [
+            (Command::Quit, MenuCommand::Back),
+            (Command::Retry, MenuCommand::Retry),
+        ] {
+            let start = rig.now();
+            let takeover = TimeUs(start.0 + 20_000);
+            rig.fade_phase(start, takeover);
+            rig.controls.command(Command::Quit);
+            while rig.now().0 <= takeover.0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            rig.fade_ended(game::FadeEnd::RanOut, takeover);
+            rig.controls.command(fresh);
+            assert_eq!(rig.take_menu(), Some(want), "{fresh:?}");
+            assert_eq!(rig.take_menu(), None, "{fresh:?}");
+            rig.result_input.release();
+        }
+    });
+}
+
+/// The takeover is published as the save returns, before the fade's last
+/// look: a quit pending through a save that outlasts the fade, then a
+/// fresh one after the save before the look, leaves the fresh one the
+/// result's back, not the phase's skip. With a save that ends before the
+/// deadline, a press between them is still the phase's (design.md "State
+/// Model", ResultPreparing).
+#[test]
+fn a_press_after_the_save_is_the_results_before_the_fade_looks() {
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        rig.controls.quit_leaves();
+        let wait_past = |rig: &PlayerRig<'_>, t: TimeUs| {
+            while rig.now().0 <= t.0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // The save outlasts the fade: deadline, a pending quit, the save's
+        // end, then a fresh quit while the game is held.
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 10_000);
+        rig.fade_phase(start, deadline);
+        rig.controls.command(Command::Quit);
+        wait_past(rig, deadline);
+        let saved = rig.save_returned(Some(deadline));
+        let takeover = TimeUs(deadline.0.max(saved.0));
+        wait_past(rig, takeover);
+        rig.controls.command(Command::Quit);
+        assert_eq!(rig.take_received(takeover), None, "the fresh quit");
+        rig.fade_ended(game::FadeEnd::RanOut, takeover);
+        assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
+        assert_eq!(rig.take_menu(), None);
+        rig.result_input.release();
+        // A save before the deadline: a press between them is the phase's.
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 50_000);
+        rig.fade_phase(start, deadline);
+        let saved = rig.save_returned(Some(deadline));
+        assert!(saved.0 < deadline.0);
+        rig.controls.command(Command::Quit);
+        let (c, at) = rig.take_received(deadline).expect("the phase's skip");
+        assert_eq!(c, Command::Quit);
+        assert!(saved.0 <= at.0 && at.0 <= deadline.0, "{at:?}");
+        rig.fade_ended(game::FadeEnd::Skipped, deadline);
+        assert_eq!(rig.take_menu(), None);
+        rig.result_input.release();
+    });
+}
+
+/// A quit and a retry pending together when the fade phase looks, the save
+/// over before both, through the game's fade step: the quit is the phase's
+/// skip, which moves the takeover to its receipt, and the retry queued
+/// with it goes with it, so no retry is served and the result's next take
+/// is none; a retry there may need pressing again on the result (design.md
+/// "State Model", ResultPreparing).
+#[test]
+fn a_retry_pending_with_a_skip_goes_with_it() {
+    use game::Command;
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        rig.controls.quit_leaves();
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 500_000);
+        rig.fade_phase(start, deadline);
+        let saved = rig.save_returned(Some(deadline));
+        rig.controls.command(Command::Quit);
+        std::thread::sleep(Duration::from_millis(2));
+        rig.controls.command(Command::Retry);
+        // The look, as the fade step takes it: the quit skips, its
+        // receipt the deadline and the takeover.
+        let (c, at) = rig
+            .take_received(TimeUs(deadline.0.max(saved.0)))
+            .expect("the skip");
+        assert_eq!(c, Command::Quit);
+        rig.fade_skipped(at);
+        let takeover = TimeUs(at.0.max(saved.0));
+        assert_eq!(rig.take_received(takeover), None, "no retry");
+        rig.fade_ended(game::FadeEnd::Skipped, takeover);
+        assert_eq!(rig.take_menu(), None, "the retry went with the skip");
+        rig.result_input.release();
+    });
+}

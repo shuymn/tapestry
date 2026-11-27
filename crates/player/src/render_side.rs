@@ -1807,8 +1807,16 @@ pub enum RenderMsg {
     ResultChanged,
     /// The result's hold `number` begins, the result's preparation having
     /// begun at `from` ([`RenderLink::hold_result`]; design.md "Rendering
-    /// and Skins", the result's hold).
-    HoldResult { number: u64, from: TimeUs },
+    /// and Skins", the result's hold); with `until`, a full play's fade
+    /// phase from `from` to that deadline ([`RenderLink::fade_phase`]).
+    HoldResult {
+        number: u64,
+        from: TimeUs,
+        until: Option<TimeUs>,
+    },
+    /// The fade phase of hold `number` was skipped or cut: its deadline
+    /// moves to `at` ([`RenderLink::fade_skipped`]).
+    FadeSkipped { number: u64, at: TimeUs },
     /// Draw the play screen's loading state of this loading lifetime with
     /// the lines in the slot ([`LoadingSink`]), kept through a chart's load
     /// and a preparation until something else is drawn; nothing when the
@@ -2406,6 +2414,9 @@ struct Shared {
     /// compare-and-swap (tests: a close there).
     #[cfg(test)]
     bound_cas: [RevealHook; 2],
+    /// The request of each result view staging begun, in order (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    staged_requests: Mutex<Vec<u64>>,
     /// The armed reveal's evaluations at or past its deadline (tests: the
     /// first one reveals).
     #[cfg(test)]
@@ -2739,6 +2750,8 @@ impl Shared {
             after_arm: RevealHook::default(),
             #[cfg(test)]
             bound_cas: [RevealHook::default(), RevealHook::default()],
+            #[cfg(all(test, feature = "dev-tools"))]
+            staged_requests: Mutex::new(Vec::new()),
             #[cfg(test)]
             reveal_eligible: AtomicU64::new(0),
             #[cfg(test)]
@@ -3759,9 +3772,36 @@ impl RenderLink {
     /// is numbered and marked in the result slot, under the slot's lock,
     /// before the render thread is told. Its number.
     pub fn hold_result(&self, from: TimeUs) -> u64 {
+        self.hold_until(from, None)
+    }
+
+    /// A full play's fade phase begins (design.md "State Model",
+    /// ResultPreparing): its fade-out started at `start` and runs out at
+    /// `deadline`. It is the result's hold, numbered as
+    /// [`hold_result`](Self::hold_result)'s, whose outgoing phase is the
+    /// play's fade and ends at the deadline, never at the hold's bound:
+    /// READY's cutoff ends with it, a result handed over meanwhile shows
+    /// from the first frame sampled at or past the deadline, the pending
+    /// presentation if its first view is not ready. Its number.
+    pub fn fade_phase(&self, start: TimeUs, deadline: TimeUs) -> u64 {
+        self.hold_until(start, Some(deadline))
+    }
+
+    /// The fade phase of hold `number` skipped or cut at `at`: the result
+    /// shows from there.
+    pub fn fade_skipped(&self, number: u64, at: TimeUs) {
+        self.send(RenderMsg::FadeSkipped { number, at });
+    }
+
+    /// The result's hold from `from`, until `until` if it is a fade's.
+    fn hold_until(&self, from: TimeUs, until: Option<TimeUs>) -> u64 {
         let number = self.result_holds.fetch_add(1, Ordering::Relaxed) + 1;
         self.shared.result_slot().hold(number);
-        self.send(RenderMsg::HoldResult { number, from });
+        self.send(RenderMsg::HoldResult {
+            number,
+            from,
+            until,
+        });
         number
     }
 
@@ -5001,6 +5041,17 @@ impl RenderLink {
                 hook();
             }
         }
+    }
+
+    /// The request of each result view staging begun so far, in order
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn staged_requests(&self) -> Vec<u64> {
+        self.shared
+            .staged_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// `hook` runs on the game thread at the end of the next arm, after its
@@ -7987,12 +8038,25 @@ fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
 /// The result's hold on the render thread (design.md "Rendering and
 /// Skins", the result's hold): its number, the result preparation's start
 /// on the clock, and whether the outgoing screen's phase lasts, which,
-/// once ended, never resumes.
+/// once ended, never resumes. A fade phase's hold ends that phase at its
+/// deadline `until` instead of the bound, and keeps what the result handed
+/// over meanwhile for the deadline's frame.
 #[derive(Clone, Copy, Debug)]
 struct ResultHold {
     number: u64,
     from: TimeUs,
     held: bool,
+    until: Option<TimeUs>,
+    handed: Option<Handed>,
+}
+
+/// What a result handed over during a fade phase shows from its deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handed {
+    /// The result skin's presentation.
+    Result,
+    /// The built-in end page.
+    End,
 }
 
 /// A loading lifetime's first frame: when it was shown, and whether its
@@ -9161,16 +9225,39 @@ impl Run {
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
-                Ok(RenderMsg::HoldResult { number, from }) => {
+                Ok(RenderMsg::HoldResult {
+                    number,
+                    from,
+                    until,
+                }) => {
                     self.result_hold = Some(ResultHold {
                         number,
                         from,
                         held: true,
+                        until,
+                        handed: None,
                     });
+                    // A fade phase ends READY's cutoff at its start: the
+                    // result stages between the fade's frames, and nothing
+                    // is destroyed until its first picture (design.md
+                    // "Memory Budget").
+                    if until.is_some() {
+                        self.end_cutoff();
+                        self.result_unacked = true;
+                    }
                     // The pending presentation's font, read off the frame
                     // before its first frame needs it.
                     if let Some(s) = &mut self.screen {
                         s.read_font_ahead();
+                    }
+                    continue;
+                }
+                Ok(RenderMsg::FadeSkipped { number, at }) => {
+                    if let Some(h) = &mut self.result_hold
+                        && h.number == number
+                        && let Some(until) = &mut h.until
+                    {
+                        *until = TimeUs(until.0.min(at.0));
                     }
                     continue;
                 }
@@ -9180,7 +9267,12 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         self.frames.result_taken(self.clock.now());
                         self.clear_decision();
-                        mode = Mode::Result;
+                        // In a fade phase the play's fade draws on until
+                        // its deadline.
+                        match self.fading() {
+                            Some(h) => h.handed = Some(Handed::Result),
+                            None => mode = Mode::Result,
+                        }
                     }
                 }
                 Ok(RenderMsg::SelectionChanged) => {
@@ -9302,6 +9394,12 @@ impl Run {
                     let ready = self.recover();
                     let _ = reply.send(ready);
                     mode = self.after_preparing(mode);
+                    // A fade phase holds its deadline through the rebuild:
+                    // the result its first view restages for shows from
+                    // there, as on the old screen.
+                    if self.fading().is_some() {
+                        continue;
+                    }
                     // A result lifetime draws on from what it presented.
                     if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
@@ -9547,14 +9645,21 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if shows || pinned {
-                        Mode::Result
+                    let handed = if shows || pinned {
+                        Handed::Result
                     } else {
-                        Mode::End
+                        Handed::End
                     };
-                    // The built-in page with no lifetime ends the hold.
-                    if !shows && !pinned {
-                        self.result_hold = None;
+                    // In a fade phase the play's fade draws on until its
+                    // deadline, the hold kept for it.
+                    if let Some(h) = self.fading() {
+                        h.handed = Some(handed);
+                    } else {
+                        mode = Self::handed_mode(handed);
+                        // The built-in page with no lifetime ends the hold.
+                        if handed == Handed::End {
+                            self.result_hold = None;
+                        }
                     }
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
@@ -9680,6 +9785,19 @@ impl Run {
                     mode = Mode::Idle;
                     continue;
                 }
+            } else if self
+                .result_hold
+                .is_some_and(|h| h.held && h.handed == Some(Handed::Result))
+            {
+                // A fade phase's result stages between the fade's frames:
+                // its presentations taken and its steps run each pass, the
+                // fade drawing on (design.md "beatoraja Lua Skins", the
+                // result's activation in the fade phase).
+                self.prepare_result();
+                if self.screen.is_none() {
+                    mode = Mode::Idle;
+                    continue;
+                }
             }
             // The frame boundary, outside every frame and with or without a
             // screen (design.md "Memory Budget", "Load Pipeline"): the
@@ -9753,6 +9871,15 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
+            // A fade phase whose outgoing screen was lost (a device built
+            // again) activates at its deadline from Idle too, with no
+            // outgoing frame to draw meanwhile.
+            if matches!(mode, Mode::Idle)
+                && self.fading().is_some()
+                && let Some(next) = self.result_hold_passed()
+            {
+                mode = next;
+            }
             // An Idle pass ends here, before any frame's pacing (design.md
             // "Load Pipeline", the Idle loop): its wait is the message's.
             // It draws no frame, so the skin movies' admission runs, a
@@ -9768,8 +9895,10 @@ impl Run {
             // The result's hold before the hand-over: the outgoing screen
             // (the play's) draws until the bound, the pending presentation
             // after it.
-            if !matches!(mode, Mode::Result | Mode::ResultPending) && self.result_hold_passed() {
-                mode = Mode::ResultPending;
+            if !matches!(mode, Mode::Result | Mode::ResultPending)
+                && let Some(next) = self.result_hold_passed()
+            {
+                mode = next;
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -10195,8 +10324,10 @@ impl Run {
             // result's hold). In play it is `None`: one test.
             #[cfg(all(test, feature = "dev-tools"))]
             self.after_pacing();
-            if !matches!(mode, Mode::Result | Mode::ResultPending) && self.result_hold_passed() {
-                mode = Mode::ResultPending;
+            if !matches!(mode, Mode::Result | Mode::ResultPending)
+                && let Some(next) = self.result_hold_passed()
+            {
+                mode = next;
             }
             // A test holds a result frame here, after its lifetime's
             // check: a new lifetime may begin before its commit point.
@@ -10241,6 +10372,13 @@ impl Run {
             // its instant: the presents of the last second, the local time
             // and the uptime, the clock reading 0 at launch.
             let mut frame_at = self.clock.now();
+            // A fade phase's deadline reached since the pass looked at it
+            // (design.md "beatoraja Lua Skins", the result's activation in
+            // the fade phase): no outgoing frame is drawn at its instant; the
+            // next pass activates the result.
+            if Self::fade_passed_at(self.result_hold, &self.shared, frame_at) {
+                continue;
+            }
             // Whether this frame draws the result's pending presentation.
             let mut pending_frame = false;
             // Whether a result frame was built with its skin (dev-tools:
@@ -10372,6 +10510,11 @@ impl Run {
                     // may put it up to that offset past (design.md
                     // "Rendering and Skins", the note snapshot).
                     frame_at = self.clock.now();
+                    // Nor a fade frame whose own instant, read after its
+                    // acquisition, is at or past the deadline.
+                    if Self::fade_passed_at(self.result_hold, &self.shared, frame_at) {
+                        continue;
+                    }
                     let app = self.app.readouts(frame_at);
                     #[cfg(feature = "dev-tools")]
                     {
@@ -11880,9 +12023,46 @@ impl Run {
         let now = clock.now();
         #[cfg(test)]
         let now = hold_now(shared, now, h.from);
-        (held_wait(now, h.from, first_frame_bound(shared)).is_some()
-            && image.valid(notices_of(extent)))
-        .then_some(h.from)
+        (Self::within(&h, now, shared) && image.valid(notices_of(extent))).then_some(h.from)
+    }
+
+    /// Whether the result's hold `h` is still in its outgoing phase at
+    /// `now`: a fade phase's until its deadline, any other within the
+    /// bound from the preparation's start.
+    fn within(h: &ResultHold, now: TimeUs, shared: &Shared) -> bool {
+        match h.until {
+            Some(until) => now < until,
+            None => held_wait(now, h.from, first_frame_bound(shared)).is_some(),
+        }
+    }
+
+    /// Whether `hold` is a fade phase's whose deadline a frame sampled at
+    /// `at` (on the hold's clock in tests) has reached while it is still
+    /// held: that frame draws no outgoing picture.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_passed_at(hold: Option<ResultHold>, shared: &Shared, at: TimeUs) -> bool {
+        hold.filter(|h| h.held && h.until.is_some())
+            .is_some_and(|h| {
+                #[cfg(test)]
+                let at = hold_now(shared, at, h.from);
+                !Self::within(&h, at, shared)
+            })
+    }
+
+    /// The result's hold while a fade phase's outgoing phase lasts: the
+    /// play's fade draws, and a result handed over waits for its deadline.
+    fn fading(&mut self) -> Option<&mut ResultHold> {
+        self.result_hold
+            .as_mut()
+            .filter(|h| h.held && h.until.is_some())
+    }
+
+    /// The mode a result handed over as `handed` draws.
+    const fn handed_mode(handed: Handed) -> Mode {
+        match handed {
+            Handed::Result => Mode::Result,
+            Handed::End => Mode::End,
+        }
     }
 
     /// Whether `side`'s first view is still to come: none presented, and
@@ -11943,25 +12123,45 @@ impl Run {
         }
     }
 
-    /// Whether the result's hold's outgoing phase ends now, its bound
-    /// passed on the hold's clock: it never resumes.
-    fn result_hold_passed(&mut self) -> bool {
-        let Some(h) = self.result_hold.as_mut().filter(|h| h.held) else {
-            return false;
-        };
+    /// The mode the frame draws once the result's hold's outgoing phase
+    /// ends now, its bound or a fade phase's deadline passed on the hold's
+    /// clock (it never resumes): the pending presentation, or what the
+    /// result handed over during a fade phase, whose screen draws the
+    /// pending presentation until its first view is ready. `None` while
+    /// the phase lasts.
+    fn result_hold_passed(&mut self) -> Option<Mode> {
+        let h = self.result_hold.as_mut().filter(|h| h.held)?;
         let now = self.clock.now();
         #[cfg(test)]
         let now = hold_now(&self.shared, now, h.from);
-        if held_wait(now, h.from, first_frame_bound(&self.shared)).is_some() {
-            return false;
+        if Self::within(h, now, &self.shared) {
+            return None;
         }
+        let (fade, number) = (h.until.is_some(), h.number);
+        // Activation reads the slot: a withdrawn hold (a retry or a close in
+        // the fade) shows nothing of what was handed over.
+        if fade && !self.shared.result_slot().holds(number) {
+            self.result_hold = None;
+            return None;
+        }
+        let h = self.result_hold.as_mut()?;
         h.held = false;
+        let handed = h.handed;
         #[cfg(feature = "dev-tools")]
         {
             let h = *h;
             self.result_held_ended(h, crate::measure::HoldEnd::Bound);
         }
-        true
+        Some(match handed {
+            Some(handed) => {
+                // The built-in page with no lifetime ends the hold.
+                if handed == Handed::End {
+                    self.result_hold = None;
+                }
+                Self::handed_mode(handed)
+            }
+            None => Mode::ResultPending,
+        })
     }
 
     /// Records the end of the result's hold's outgoing phase, for `why`
@@ -12247,8 +12447,13 @@ impl Run {
         }
         // An early request waiting for its room is looked at again, so its
         // deadline is seen with no frame to present.
+        // A fade phase's hold is looked at too: its result stages and its
+        // deadline activates with no frame to present (a lost device).
         let work = self.attempt.is_some()
             || self.reveal_arm.is_some()
+            || self
+                .result_hold
+                .is_some_and(|h| h.held && h.until.is_some())
             || self.early.as_ref().is_some_and(|r| !r.taken)
             || self.pages_owed.is_some()
             || self.select_hand.is_some()
@@ -16190,6 +16395,12 @@ impl Run {
                     // array takes it first at a boundary the allowance
                     // admits, any other at the first pass it needs no
                     // destruction (below).
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    self.shared
+                        .staged_requests
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(request);
                     side.staging = Some(StagingView {
                         held,
                         request,

@@ -185,6 +185,9 @@ pub(super) struct Faults {
     /// The device is destroyed at the next boundary with a result-kind
     /// staging stepping.
     pub(crate) lose_in_staging: AtomicBool,
+    /// The next menu page frame fails as a lost device (an outgoing
+    /// screen's).
+    pub(crate) lose_menu: AtomicBool,
     /// A result-kind staging was left stepping by its last look.
     pub(crate) result_stepping: AtomicBool,
     /// A result-kind staging that creates an array of its own is taken
@@ -264,6 +267,24 @@ struct Recorded {
 }
 
 impl Screen for Recorded {
+    fn menu(
+        &mut self,
+        page: &crate::menu_screen::MenuPage,
+        changed: bool,
+    ) -> Result<render::FrameTiming, render::RenderError> {
+        let _ = (page, changed);
+        if self.faults.lose_menu.swap(false, Ordering::AcqRel) {
+            return Err(render::RenderError::SurfaceLost);
+        }
+        Ok(render::FrameTiming {
+            cpu: Duration::ZERO,
+            sprites: 0,
+            dropped: 0,
+            outcome: render::FrameOutcome::Shown,
+            present_count: None,
+            movies: [false; skin_model::movie::SLOTS],
+        })
+    }
     fn load(
         &mut self,
         chart: &bms_model::Chart,
@@ -5162,13 +5183,13 @@ fn switch_reducing_the_pool(a: &Arc<render::SkinBundle>, b: &Arc<render::SkinBun
 
 /// A result frame's path and the view it presented.
 #[cfg(feature = "dev-tools")]
-type Seen = (crate::measure::ResultPath, Option<u64>);
+pub(super) type Seen = (crate::measure::ResultPath, Option<u64>);
 
 /// The result frames' paths and the view each presented, a sink saw, in
 /// order.
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Default)]
-struct Views(Arc<Mutex<Vec<Seen>>>);
+pub(super) struct Views(pub(super) Arc<Mutex<Vec<Seen>>>);
 
 #[cfg(feature = "dev-tools")]
 impl FrameSink for Views {
@@ -5689,4 +5710,322 @@ fn a_pages_room_wait_past_its_deadline_is_refused() {
     assert!(took >= bound, "answered after {took:?}");
     assert_eq!(rig.link.result_status().installed, None);
     rig.link.exit();
+}
+
+/// A full play's fade phase (design.md "State Model", ResultPreparing): a
+/// result handed over during it, its skin's view or the built-in page,
+/// draws nothing of itself while the hold's clock is short of the
+/// deadline; the first frame at or past it draws it, with no further wait.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_result_handed_over_in_the_fade_shows_from_its_deadline() {
+    for skin_view in [true, false] {
+        let (_dir, skin) = fixed_skin();
+        let rig = Rig::new();
+        let lifetime = installed(&rig, &skin);
+        // The outgoing screen draws on through the fade.
+        rig.link
+            .send(crate::render_side::RenderMsg::Menu(Box::default()));
+        rig.link.set_hold_clock(Some(0));
+        let from = bms_model::TimeSource::now(&rig.clock);
+        rig.link.fade_phase(from, TimeUs(from.0 + 1_000_000));
+        if skin_view {
+            show(
+                &rig.link,
+                lifetime,
+                1,
+                &payload(1, Some(&skin), 1_111, &[]),
+                &Overlay::default(),
+            );
+        } else {
+            rig.link.show_end(EndPage {
+                lines: vec!["end".to_owned()],
+                graphs: None,
+                id: None,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(rig.drawn(), [], "{skin_view}: drawn within the fade");
+        rig.link.set_hold_clock(Some(999_999));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rig.drawn(), [], "{skin_view}: drawn before the deadline");
+        rig.link.set_hold_clock(Some(1_000_000));
+        assert!(
+            rig.until(|d| if skin_view {
+                skin_frame(d).is_some()
+            } else {
+                matches!(d, Drawn::Page(l) if l == &["end"])
+            }),
+            "{skin_view}: not drawn at the deadline: {:?}",
+            rig.drawn()
+        );
+        rig.link.exit();
+    }
+}
+
+/// A skip in the fade phase moves its deadline to the skip's receipt: the
+/// result handed over draws from there, the fade's own deadline still
+/// ahead; a skip of another hold moves nothing.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_skip_in_the_fade_moves_its_deadline() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_hold_clock(Some(500_000));
+    let from = bms_model::TimeSource::now(&rig.clock);
+    let number = rig.link.fade_phase(from, TimeUs(from.0 + 1_000_000));
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    rig.link.fade_skipped(number + 1, TimeUs(from.0 + 400_000));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(rig.drawn(), [], "another hold's skip moved the deadline");
+    rig.link.fade_skipped(number, TimeUs(from.0 + 400_000));
+    assert!(
+        rig.until(|d| skin_frame(d).is_some()),
+        "not drawn from the skip: {:?}",
+        rig.drawn()
+    );
+    rig.link.exit();
+}
+
+/// A fade phase whose first view is not staged by its deadline, a fade
+/// shorter than its staging (design.md "beatoraja Lua Skins", the result's
+/// activation in the fade phase): the pending presentation draws from the
+/// deadline's frame, with no held pass, and the first view once it is
+/// ready.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_view_not_staged_by_the_fades_deadline_draws_pending_then_the_view() {
+    use crate::measure::ResultPath;
+    // A view of another skin than the one installed, so its staging has
+    // steps to hold (a rebind on the installed pages has none).
+    let (_x0d, x0) = fixed_skin();
+    let (_dir, skin) = fixed_skin();
+    let views = Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    let lifetime = installed(&rig, &x0);
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_hold_clock(Some(0));
+    rig.link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+    rig.link.pause_result_staging(true);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    // The result screen's frames presented, its pending presentation's
+    // included.
+    let seen = || views.0.lock().unwrap().clone();
+    let count = |path: ResultPath| seen().iter().filter(|(p, _)| *p == path).count();
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(seen(), [], "a result frame within the fade");
+    let passes = rig.link.held_passes();
+    rig.link.set_hold_clock(Some(1_000_000));
+    assert!(
+        wait_until(|| count(ResultPath::Pending) > 2),
+        "no pending frame past the deadline: {:?}",
+        seen()
+    );
+    assert!(
+        seen().iter().all(|(p, _)| *p == ResultPath::Pending),
+        "the view before its staging: {:?}",
+        seen()
+    );
+    assert_eq!(rig.link.held_passes(), passes, "a held pass in the fade");
+    rig.link.pause_result_staging(false);
+    assert!(
+        wait_until(|| count(ResultPath::Skin) > 0),
+        "the view never drawn: {:?}",
+        seen()
+    );
+    rig.link.exit();
+}
+
+/// A fade phase's result withdrawn before its deadline (a retry or a
+/// close: design.md "State Model", ResultPreparing): its hold released, the
+/// deadline's frame draws nothing of the result handed over.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_fade_withdrawn_before_its_deadline_never_draws_the_result() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_hold_clock(Some(0));
+    rig.link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    rig.link.release_result_hold();
+    rig.link.set_hold_clock(Some(1_000_000));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.drawn(), [], "the withdrawn result drawn");
+    rig.link.exit();
+}
+
+/// A fade phase's hold withdrawn on its deadline's frame, after that
+/// frame's pacing and the loop's own look at the hold (a retry or a close
+/// taken there): the activation reads the slot, so that frame draws
+/// nothing of the result handed over (design.md "State Model",
+/// ResultPreparing).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_fade_withdrawn_on_its_deadlines_frame_draws_nothing() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_hold_clock(Some(0));
+    rig.link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let shared = Arc::clone(&rig.link.shared);
+    let released = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&released);
+    rig.link.after_next_pacing(
+        1_000_000,
+        Box::new(move || {
+            shared.result_slot().release_hold();
+            seen.store(true, Ordering::SeqCst);
+        }),
+    );
+    assert!(wait_until(|| released.load(Ordering::SeqCst)), "the hook");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.drawn(), [], "the withdrawn result drawn");
+    rig.link.exit();
+}
+
+/// A fade phase ends READY's cutoff at its start, before the play's end
+/// message: the result stages between the fade's frames (design.md
+/// "Memory Budget", READY's condition; "State Model", ResultPreparing).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_fade_phase_ends_readys_cutoff_at_its_start() {
+    use crate::render_side::CutoffPhase;
+    let rig = Rig::new();
+    rig.link.ask_cutoff();
+    assert!(
+        wait_until(|| rig.link.cutoff_phase() == CutoffPhase::CutOff),
+        "never cut off: {:?}",
+        rig.link.cutoff_phase()
+    );
+    rig.link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+    assert!(
+        wait_until(|| rig.link.cutoff_phase() != CutoffPhase::CutOff),
+        "the cutoff kept in the fade: {:?}",
+        rig.link.cutoff_phase()
+    );
+    rig.link.exit();
+}
+
+/// A fade phase whose save outlasts it (design.md "State Model",
+/// ResultPreparing): nothing handed over by its deadline, the first frame
+/// at or past it draws the pending presentation, and the view once the
+/// result, prepared after the save, is handed over.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_save_past_the_fade_draws_pending_from_its_deadline() {
+    use crate::measure::ResultPath;
+    let (_dir, skin) = fixed_skin();
+    let views = Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    let lifetime = installed(&rig, &skin);
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_hold_clock(Some(0));
+    rig.link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+    let seen = || views.0.lock().unwrap().clone();
+    let count = |path: ResultPath| seen().iter().filter(|(p, _)| *p == path).count();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(seen(), [], "a result frame within the fade");
+    rig.link.set_hold_clock(Some(1_000_000));
+    assert!(
+        wait_until(|| count(ResultPath::Pending) > 2),
+        "no pending frame past the deadline: {:?}",
+        seen()
+    );
+    // The save ends: the result is prepared and handed over.
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(
+        wait_until(|| count(ResultPath::Skin) > 0),
+        "the view never drawn: {:?}",
+        seen()
+    );
+    rig.link.exit();
+}
+
+/// The result a fade phase activates takes its origin at the activating
+/// frame's sampled instant, not at the fade's start or its hand-over
+/// (design.md "beatoraja Lua Skins", the result's activation in the fade
+/// phase): that frame reads `screen` at 0 and every later one keeps that
+/// start, also when that frame is never presented (`lose`) and the
+/// screen built again draws on from it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_fade_phases_result_takes_its_origin_at_the_activating_frame() {
+    for lose in [false, true] {
+        let (_dir, skin) = fixed_skin();
+        let rig = Rig::new();
+        let lifetime = installed(&rig, &skin);
+        rig.link
+            .send(crate::render_side::RenderMsg::Menu(Box::default()));
+        rig.link.set_hold_clock(Some(0));
+        rig.link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+        show(
+            &rig.link,
+            lifetime,
+            1,
+            &payload(1, Some(&skin), 1_111, &[]),
+            &Overlay::default(),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(builds(&rig), [], "{lose}: a result frame built in the fade");
+        if lose {
+            rig.faults.lose.store(true, Ordering::Release);
+        }
+        let deadline = bms_model::TimeSource::now(&rig.clock);
+        rig.link.set_hold_clock(Some(1_000_000));
+        if lose {
+            assert!(wait_until(|| rig.link.failed()), "{lose}");
+            rig.link.prepare().unwrap();
+        }
+        assert!(built(&rig, 3), "{lose}");
+        let b = builds(&rig);
+        let (first, screen, _) = b[0];
+        assert!(first >= deadline, "{lose}: {first:?} before {deadline:?}");
+        assert_eq!(screen, Some(first), "{lose}: the first frame reads 0");
+        assert!(b.iter().all(|&(_, s, _)| s == Some(first)), "{lose}: {b:?}");
+        assert_eq!(rig.link.presented_origin(), Some(first), "{lose}");
+        rig.link.exit();
+    }
 }

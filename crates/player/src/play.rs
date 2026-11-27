@@ -287,6 +287,22 @@ pub struct PlayerRig<'a> {
     /// From recording's open to the end of the play's audio tail: the
     /// game thread parks [`PARK`] at most, else [`IDLE_PARK`].
     pub in_play: bool,
+    /// A full play's fade phase, while it lasts: its result hold's number
+    /// on the render link (design.md "State Model", ResultPreparing).
+    pub fade_hold: Option<u64>,
+    /// The result being prepared is a fade phase's, from the phase's start
+    /// to the result's preparation, past the phase's end when the save
+    /// outlasts it: the phase's hold stands for the result's, and its end
+    /// took the input over ([`Rig::begin_result`]).
+    pub fade_result: bool,
+    /// The own view's layout request the fade-layout switch holds until
+    /// the fade phase's end (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub held_layout: Option<crate::result_skin::ViewFacts>,
+    /// The fade-layout switch ([`crate::dev::FADE_LAYOUT_ENV`]), read as
+    /// the rig is made (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fade_layout_held: bool,
     /// The input offset the current play uses (a device play; autoplay
     /// plays with 0 whatever it is).
     pub input_offset_us: i64,
@@ -653,6 +669,52 @@ impl PlayerRig<'_> {
     pub(crate) fn show_cursor(&self, shown: bool) {
         if let Some(cursor) = &self.cursor {
             cursor.set(shown);
+        }
+    }
+
+    /// `facts` for the own view's layout request, unless the development
+    /// builds' fade-layout switch holds it to the fade phase's end, before
+    /// any Lua runs, the fade's frames measured without the layout pass:
+    /// every request in the phase passes here, and the phase's end asks
+    /// for the last one held ([`Rig::fade_ended`]).
+    fn unheld(
+        &mut self,
+        facts: crate::result_skin::ViewFacts,
+    ) -> Option<crate::result_skin::ViewFacts> {
+        #[cfg(feature = "dev-tools")]
+        if self.fade_hold.is_some() && self.fade_layout_held {
+            if self.held_layout.replace(facts).is_none() {
+                println!("dev: result layout held to the fade's end");
+            }
+            return None;
+        }
+        Some(facts)
+    }
+
+    /// The own view's layout asked for with `facts`.
+    fn request_layout(&mut self, facts: crate::result_skin::ViewFacts) {
+        self.fresh_result_report();
+        #[cfg(feature = "dev-tools")]
+        self.result_skin.set_stage("the first view's build");
+        self.result_skin.request(facts);
+        #[cfg(feature = "dev-tools")]
+        if self.result_skin.has_job() {
+            crate::dev::stage_began(crate::dev::SpecializingStage::ResultLayout);
+        }
+    }
+
+    /// The result takes the input over: what was queued during the play,
+    /// the save and a fade phase is no result's, and what comes from here
+    /// on is fresh; after a fade phase, what came after its `takeover`.
+    fn take_result_input(&mut self, takeover: Option<TimeUs>) {
+        self.show_cursor(true);
+        let entered = match takeover {
+            Some(at) => self.result_input.enter_from(at),
+            None => self.result_input.enter(),
+        };
+        if entered {
+            self.viewed = None;
+            self.evaluated = 0;
         }
     }
 
@@ -2543,6 +2605,18 @@ impl Rig for PlayerRig<'_> {
         c
     }
 
+    /// As [`take`](Self::take), with the command's receipt from the
+    /// window thread or the power notification (a fade phase's skip moves
+    /// its deadline there).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_received(&mut self, until: TimeUs) -> Option<(Command, TimeUs)> {
+        let (c, at) = self.controls.take_received(until)?;
+        if c == Command::Retry {
+            self.pending_retry = self.controls.retry_at();
+        }
+        Some((c, at))
+    }
+
     /// The current attempt's commit receipt: Closing's duration.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn declared_close(&self) -> Option<TimeUs> {
@@ -2574,17 +2648,22 @@ impl Rig for PlayerRig<'_> {
     /// next play's. A controller's retry carries no receipt of its own: it
     /// is received when taken here.
     fn take_menu(&mut self) -> Option<MenuCommand> {
-        loop {
-            match self.controls.take() {
-                Some(Command::Retry) => {
+        // A command received by a fade phase's takeover is the phase's,
+        // however late its sender published it: the result's one check.
+        let takeover = self.result_input.takeover();
+        while let Some((c, at)) = self.controls.take_received(TimeUs(i64::MAX)) {
+            if takeover.is_some_and(|t| at.0 <= t.0) {
+                continue;
+            }
+            match c {
+                Command::Retry => {
                     if let Some(at) = self.controls.retry_at() {
                         self.result_retries.offer(at);
                     }
                     return Some(MenuCommand::Retry);
                 }
-                Some(Command::Quit) => return Some(MenuCommand::Back),
-                Some(Command::Suspend) => {}
-                None => break,
+                Command::Quit => return Some(MenuCommand::Back),
+                Command::Suspend => {}
             }
         }
         let c = self.result_input.take();
@@ -3648,6 +3727,58 @@ impl Rig for PlayerRig<'_> {
         crate::dev::transitions::game_mark("play-fade-end", to, attempt);
     }
 
+    /// The fade phase is the result's hold until its deadline on the render
+    /// thread, which ends READY's cutoff now and shows the result from the
+    /// first frame sampled at or past the deadline.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_phase(&mut self, start: TimeUs, deadline: TimeUs) {
+        self.fade_hold = Some(self.render.fade_phase(start, deadline));
+        self.fade_result = true;
+    }
+
+    /// The save's end, read under the controls' senders' lock with a fade
+    /// phase's takeover published: a press after the save meets the
+    /// watermark before it can join one the phase owns.
+    fn save_returned(&mut self, fade: Option<TimeUs>) -> TimeUs {
+        match fade {
+            Some(deadline) => self
+                .controls
+                .mark_takeover(|saved| TimeUs(deadline.0.max(saved.0))),
+            None => self.clock.now(),
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_skipped(&mut self, at: TimeUs) {
+        if let Some(number) = self.fade_hold {
+            self.render.fade_skipped(number, at);
+        }
+    }
+
+    /// The fade phase's end: the result's input is taken over here (what
+    /// came before was the phase's), unless a retry or a close withdrew
+    /// the result.
+    fn fade_ended(&mut self, how: game::FadeEnd, takeover: TimeUs) {
+        println!("{}", end_screen::fade_end_line(how));
+        self.fade_hold = None;
+        #[cfg(feature = "dev-tools")]
+        let held = self.held_layout.take();
+        if matches!(
+            how,
+            game::FadeEnd::Cut(game::AbortCause::Retry | game::AbortCause::Quit)
+        ) {
+            self.fade_result = false;
+            self.controls.clear_takeover();
+        } else {
+            self.take_result_input(Some(takeover));
+            // A layout the fade-layout switch held is asked for now.
+            #[cfg(feature = "dev-tools")]
+            if let Some(facts) = held {
+                self.request_layout(facts);
+            }
+        }
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn audio_done(&self) -> bool {
         self.audio.control.done()
@@ -3765,11 +3896,15 @@ impl Rig for PlayerRig<'_> {
             game::probe::stamp(&game::probe::RESULT_BEGAN);
             game::probe::clear(&game::probe::STEP_ACCEPTED);
         }
-        self.show_cursor(true);
-        if self.result_input.enter() {
-            self.viewed = None;
-            self.evaluated = 0;
+        // A fade phase's result: the phase's hold stands for it, and the
+        // input is the phase's until its end ([`Rig::fade_ended`]), even
+        // when a save outlasting the phase ended it first.
+        if std::mem::take(&mut self.fade_result) {
+            #[cfg(feature = "dev-tools")]
+            self.result_began();
+            return;
         }
+        self.take_result_input(None);
         // A result its skin may present is held from here (design.md
         // "Rendering and Skins", the result's hold); the built-in result is
         // ready at once and takes none.
@@ -3803,14 +3938,9 @@ impl Rig for PlayerRig<'_> {
                 };
                 println!("dev: result layout requested: best {best}");
             }
-            self.fresh_result_report();
-            #[cfg(feature = "dev-tools")]
-            self.result_skin.set_stage("the first view's build");
-            self.result_skin
-                .request(crate::result_skin::view_facts(screen, chart));
-            #[cfg(feature = "dev-tools")]
-            if self.result_skin.has_job() {
-                crate::dev::stage_began(crate::dev::SpecializingStage::ResultLayout);
+            let facts = crate::result_skin::view_facts(screen, chart);
+            if let Some(facts) = self.unheld(facts) {
+                self.request_layout(facts);
             }
         }
     }
@@ -3847,12 +3977,12 @@ impl Rig for PlayerRig<'_> {
         if let Some(chart) = self.result_chart
             && self.result_outro.is_none()
             && !self.result_skin_suppressed()
+            && let Some(facts) = self.unheld(crate::result_skin::view_facts(screen, chart))
         {
             self.fresh_result_report();
             #[cfg(feature = "dev-tools")]
             self.result_skin.set_stage("a switch's build");
-            self.result_skin
-                .request(crate::result_skin::view_facts(screen, chart));
+            self.result_skin.request(facts);
         }
         let tuning = self.controls.tuning();
         let queue = self.queue_line.unwrap_or(QueueLine {
