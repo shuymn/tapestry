@@ -287,6 +287,13 @@ pub struct PlayerRig<'a> {
     /// From recording's open to the end of the play's audio tail: the
     /// game thread parks [`PARK`] at most, else [`IDLE_PARK`].
     pub in_play: bool,
+    /// A full play's fade phase, while it lasts: its result hold's number
+    /// on the render link (design.md "State Model", ResultPreparing).
+    pub fade_hold: Option<u64>,
+    /// The own view's layout request the fade-layout switch holds until
+    /// the fade phase's end (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub held_layout: Option<crate::result_skin::ViewFacts>,
     /// The input offset the current play uses (a device play; autoplay
     /// plays with 0 whatever it is).
     pub input_offset_us: i64,
@@ -653,6 +660,29 @@ impl PlayerRig<'_> {
     pub(crate) fn show_cursor(&self, shown: bool) {
         if let Some(cursor) = &self.cursor {
             cursor.set(shown);
+        }
+    }
+
+    /// The own view's layout asked for with `facts`.
+    fn request_layout(&mut self, facts: crate::result_skin::ViewFacts) {
+        self.fresh_result_report();
+        #[cfg(feature = "dev-tools")]
+        self.result_skin.set_stage("the first view's build");
+        self.result_skin.request(facts);
+        #[cfg(feature = "dev-tools")]
+        if self.result_skin.has_job() {
+            crate::dev::stage_began(crate::dev::SpecializingStage::ResultLayout);
+        }
+    }
+
+    /// The result takes the input over: what was queued during the play,
+    /// the save and a fade phase is no result's, and what comes from here
+    /// on is fresh.
+    fn take_result_input(&mut self) {
+        self.show_cursor(true);
+        if self.result_input.enter() {
+            self.viewed = None;
+            self.evaluated = 0;
         }
     }
 
@@ -2543,6 +2573,18 @@ impl Rig for PlayerRig<'_> {
         c
     }
 
+    /// As [`take`](Self::take), with the command's receipt from the
+    /// window thread or the power notification (a fade phase's skip moves
+    /// its deadline there).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_received(&mut self) -> Option<(Command, TimeUs)> {
+        let (c, at) = self.controls.take_received()?;
+        if c == Command::Retry {
+            self.pending_retry = self.controls.retry_at();
+        }
+        Some((c, at))
+    }
+
     /// The current attempt's commit receipt: Closing's duration.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn declared_close(&self) -> Option<TimeUs> {
@@ -3648,6 +3690,41 @@ impl Rig for PlayerRig<'_> {
         crate::dev::transitions::game_mark("play-fade-end", to, attempt);
     }
 
+    /// The fade phase is the result's hold until its deadline on the render
+    /// thread, which ends READY's cutoff now and shows the result from the
+    /// first frame sampled at or past the deadline.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_phase(&mut self, start: TimeUs, deadline: TimeUs) {
+        self.fade_hold = Some(self.render.fade_phase(start, deadline));
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_skipped(&mut self, at: TimeUs) {
+        if let Some(number) = self.fade_hold {
+            self.render.fade_skipped(number, at);
+        }
+    }
+
+    /// The fade phase's end: the result's input is taken over here (what
+    /// came before was the phase's), unless a retry or a close withdrew
+    /// the result.
+    fn fade_ended(&mut self, how: game::FadeEnd) {
+        self.fade_hold = None;
+        #[cfg(feature = "dev-tools")]
+        let held = self.held_layout.take();
+        if !matches!(
+            how,
+            game::FadeEnd::Cut(game::AbortCause::Retry | game::AbortCause::Quit)
+        ) {
+            self.take_result_input();
+            // A layout the fade-layout switch held is asked for now.
+            #[cfg(feature = "dev-tools")]
+            if let Some(facts) = held {
+                self.request_layout(facts);
+            }
+        }
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn audio_done(&self) -> bool {
         self.audio.control.done()
@@ -3765,11 +3842,14 @@ impl Rig for PlayerRig<'_> {
             game::probe::stamp(&game::probe::RESULT_BEGAN);
             game::probe::clear(&game::probe::STEP_ACCEPTED);
         }
-        self.show_cursor(true);
-        if self.result_input.enter() {
-            self.viewed = None;
-            self.evaluated = 0;
+        // In a fade phase the phase's hold stands for it, and the input is
+        // the phase's until its end ([`Rig::fade_ended`]).
+        if self.fade_hold.is_some() {
+            #[cfg(feature = "dev-tools")]
+            self.result_began();
+            return;
         }
+        self.take_result_input();
         // A result its skin may present is held from here (design.md
         // "Rendering and Skins", the result's hold); the built-in result is
         // ready at once and takes none.
@@ -3803,15 +3883,17 @@ impl Rig for PlayerRig<'_> {
                 };
                 println!("dev: result layout requested: best {best}");
             }
-            self.fresh_result_report();
+            let facts = crate::result_skin::view_facts(screen, chart);
+            // Development builds' fade-layout switch holds the request
+            // until the fade phase's end, before any Lua runs: the fade's
+            // frames measured without the layout pass.
             #[cfg(feature = "dev-tools")]
-            self.result_skin.set_stage("the first view's build");
-            self.result_skin
-                .request(crate::result_skin::view_facts(screen, chart));
-            #[cfg(feature = "dev-tools")]
-            if self.result_skin.has_job() {
-                crate::dev::stage_began(crate::dev::SpecializingStage::ResultLayout);
+            if self.fade_hold.is_some() && crate::dev::fade_layout_held() {
+                println!("dev: result layout held to the fade's end");
+                self.held_layout = Some(facts);
+                return;
             }
+            self.request_layout(facts);
         }
     }
 

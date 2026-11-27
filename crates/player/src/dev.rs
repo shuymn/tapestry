@@ -3022,6 +3022,19 @@ pub fn print_result_work(at: &str) {
     );
 }
 
+/// The environment variable of the fade-layout switch: `held` holds a full
+/// play's result layout request until its fade phase's end, before any Lua
+/// runs, so the fade's frames can be measured without the layout pass
+/// against a run with it (design.md "Threat Model", T09: the layout pass in
+/// the fade phase).
+pub const FADE_LAYOUT_ENV: &str = "TAPESTRY_DEV_FADE_LAYOUT";
+
+/// Whether [`FADE_LAYOUT_ENV`] holds the fade phase's layout, read once.
+pub fn fade_layout_held() -> bool {
+    static HELD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HELD.get_or_init(|| std::env::var(FADE_LAYOUT_ENV).is_ok_and(|v| v.trim() == "held"))
+}
+
 /// The environment variable of the screens' runtime switches (the S7-07d
 /// gate's real-app checks and measurements): a comma list of
 /// `budget-select` and `budget-result`, that kind's runtime frames run

@@ -1054,6 +1054,9 @@ fn rig<'a>(
         restore: None,
         restore_at: None,
         in_play: false,
+        fade_hold: None,
+        #[cfg(feature = "dev-tools")]
+        held_layout: None,
         #[cfg(feature = "dev-tools")]
         quit_after_end: None,
         #[cfg(feature = "dev-tools")]

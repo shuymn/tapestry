@@ -1061,3 +1061,114 @@ fn a_release_by_an_attempts_admission_is_published_with_its_request() {
     assert_eq!(status.installed, None, "{status:?}");
     rig.exit();
 }
+
+/// When a device is lost in a fade phase ([`lost_in_the_fade`]).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug)]
+enum Lost {
+    /// Before the result is handed over, so before any staging is taken.
+    BeforeStaging,
+    /// During the first view's chart write.
+    InUpload,
+    /// Once the first view's staging is ready, before the deadline.
+    AfterStaging,
+}
+
+/// A device lost in a fade phase, `when` says (design.md "beatoraja Lua
+/// Skins", the result's activation in the fade phase): the result request
+/// keeps its number across the device change, the screen built again
+/// stages that same request afresh (once, when nothing was staged on the
+/// old device), nothing of the result is drawn before the deadline, and
+/// the first frame at or past it draws the view with its images.
+#[cfg(feature = "dev-tools")]
+fn lost_in_the_fade(when: Lost) {
+    let (_x_dir, x, _) = chart_skin("");
+    let (_green, green) = images(x.side(), GREEN, BLUE);
+    let views = super::result::Views::default();
+    let rig = Rig::with_sink(Box::new(views.clone()));
+    sample(&rig);
+    let lifetime = rig.link.begin_result();
+    // The outgoing screen draws on through the fade.
+    rig.link
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    rig.link.set_hold_clock(Some(0));
+    // The hold's clock runs from the phase's start, whatever its reading.
+    let from = TimeUs(1_000);
+    rig.link.fade_phase(from, TimeUs(from.0 + 1_000_000));
+    let view = viewed(1, &x, 1_111, &["B"], &green);
+    match when {
+        Lost::BeforeStaging => {
+            rig.faults.lose_menu.store(true, Ordering::Release);
+            assert!(wait_until(|| rig.link.failed()), "{when:?}");
+            show(&rig.link, lifetime, 1, &view, &Overlay::default());
+        }
+        Lost::InUpload => {
+            rig.faults.lose_chart.store(true, Ordering::Release);
+            show(&rig.link, lifetime, 1, &view, &Overlay::default());
+        }
+        Lost::AfterStaging => {
+            show(&rig.link, lifetime, 1, &view, &Overlay::default());
+            assert!(wait_until(|| rig.link.stagings_ended() >= 1), "{when:?}");
+            rig.faults.lose_menu.store(true, Ordering::Release);
+        }
+    }
+    assert!(wait_until(|| rig.link.failed()), "{when:?}");
+    reset(&rig);
+    rig.link.prepare().unwrap();
+    let stagings = if matches!(when, Lost::BeforeStaging) {
+        1
+    } else {
+        2
+    };
+    assert!(
+        wait_until(|| rig.link.staged_requests().len() >= stagings),
+        "{when:?}: {:?}",
+        rig.link.staged_requests()
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let staged = rig.link.staged_requests();
+    assert_eq!(staged.len(), stagings, "{when:?}: {staged:?}");
+    assert!(
+        staged.iter().all(|&r| r == staged[0]),
+        "{when:?}: the same request staged again: {staged:?}"
+    );
+    // Nothing of the result, its pending presentation included, while
+    // the fade lasts.
+    assert_eq!(
+        rig.drawn(),
+        [],
+        "{when:?}: the result drawn within the fade"
+    );
+    assert_eq!(
+        *views.0.lock().unwrap(),
+        [],
+        "{when:?}: a result frame presented within the fade"
+    );
+    rig.link.set_hold_clock(Some(1_000_000));
+    let (i, q) = first_with(&rig, 1);
+    assert!(
+        draws_images(&q, x.chart_layer().unwrap()),
+        "{when:?}: {q:?}"
+    );
+    let px = sampled(&rig, i);
+    assert!(near(px[0], GREEN) && near(px[1], BLUE), "{when:?}: {px:?}");
+    rig.exit();
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_device_lost_in_the_fade_before_its_staging_stages_on_the_new_device() {
+    lost_in_the_fade(Lost::BeforeStaging);
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_device_lost_in_the_fade_stages_the_same_request_again() {
+    lost_in_the_fade(Lost::InUpload);
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_device_lost_in_the_fade_after_its_staging_stages_the_same_request_again() {
+    lost_in_the_fade(Lost::AfterStaging);
+}

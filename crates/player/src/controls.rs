@@ -113,6 +113,11 @@ pub struct Controls {
     command: AtomicU8,
     /// When the latest retry was received, on the clock.
     retry_at: AtomicI64,
+    /// When the latest quit key press that leaves the chart, and the
+    /// latest suspend, were received, on the clock: the receipts a fade
+    /// phase's skip or cut moves its deadline to.
+    leave_at: AtomicI64,
+    suspend_at: AtomicI64,
     /// When the latest quit key press in the decision screen's epoch was
     /// observed, on the clock; `i64::MIN` for none.
     quit_in_epoch: AtomicI64,
@@ -173,6 +178,8 @@ impl Controls {
             clock,
             command: AtomicU8::new(NONE),
             retry_at: AtomicI64::new(i64::MIN),
+            leave_at: AtomicI64::new(i64::MIN),
+            suspend_at: AtomicI64::new(i64::MIN),
             quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
             reveal_withdraw: std::sync::Mutex::new(None),
@@ -293,6 +300,16 @@ impl Controls {
             Command::Retry => RETRY,
             Command::Suspend => SUSPEND,
         };
+        // A quit that leaves and a suspend have their receipt stored before
+        // their bit, so whoever takes the bit reads it (a quit dropped below
+        // leaves one nothing reads). A retry's is stored once it is kept,
+        // so a dropped retry never moves it.
+        let now = self.clock.now().0;
+        match bit {
+            LEAVE => self.leave_at.store(now, Ordering::Release),
+            SUSPEND => self.suspend_at.store(now, Ordering::Release),
+            _ => {}
+        }
         // In the decision screen's epoch only a suspend is kept; a quit
         // key press is kept apart, with the time it was observed.
         let set = self
@@ -303,11 +320,10 @@ impl Controls {
             })
             .is_ok();
         if set && bit == RETRY {
-            self.retry_at.store(self.clock.now().0, Ordering::Release);
+            self.retry_at.store(now, Ordering::Release);
         }
         if !set && bit == LEAVE {
-            self.quit_in_epoch
-                .store(self.clock.now().0, Ordering::Release);
+            self.quit_in_epoch.store(now, Ordering::Release);
         }
     }
 
@@ -318,6 +334,22 @@ impl Controls {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
         self.take_with(RETRY)
+    }
+
+    /// [`take`](Self::take) with the command's receipt: the clock's
+    /// reading when the window thread or the power notification handed it
+    /// over, never when it is taken (design.md "Screen Transitions and
+    /// Loading", a skip taken in the fade).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn take_received(&self) -> Option<(Command, TimeUs)> {
+        let c = self.take()?;
+        let receipt = match c {
+            Command::Quit => &self.leave_at,
+            Command::Retry => &self.retry_at,
+            Command::Suspend => &self.suspend_at,
+        };
+        let at = receipt.load(Ordering::Acquire);
+        Some((c, TimeUs(at)))
     }
 
     /// [`take`](Self::take) during Closing (design.md "Play Lifecycle",
