@@ -401,7 +401,11 @@ fn playing(movie: &Movie, render: &Render) -> Instant {
 
 /// Asserts `at` falls within `SLACK` past `deadline` after `from`.
 fn on_time(what: &str, from: Instant, at: Instant, deadline: Duration) {
-    let took = at.duration_since(from);
+    took_on_time(what, at.duration_since(from), deadline);
+}
+
+/// Asserts `took` lies within `SLACK` of `deadline`.
+fn took_on_time(what: &str, took: Duration, deadline: Duration) {
     assert!(
         took >= deadline.saturating_sub(SLACK) && took <= deadline + SLACK,
         "{what}: {took:?}, not {deadline:?} ± {SLACK:?}"
@@ -584,10 +588,33 @@ fn missed_ack_on_a_working_transport_loses_one_player() {
     let renders = [Render::start(&frozen, false), Render::start(&peer, false)];
     let worker = rig.worker(LAUNCH);
     // Its ring is made just before its play is sent.
-    let sent = until(LAUNCH, || frozen.live().is_some()).expect("no play sent");
-    let at = lost(&frozen, Duration::from_secs(5)).expect("no loss within 5 s");
-    on_time("the play's answer", sent, at, Deadlines::GAME.answer);
+    until(LAUNCH, || frozen.live().is_some()).expect("no play sent");
+    lost(&frozen, Duration::from_secs(5)).expect("no loss within 5 s");
     assert_eq!(frozen.loss(), Some(Loss::Answer));
+    // Timed on the session's own clock, from the play's write, where the
+    // answer's deadline starts, to the loss: the test thread's sight of
+    // either can come late under load.
+    let events = rig.session.events();
+    let id = events
+        .iter()
+        .find_map(|(_, e)| match *e {
+            Event::Play { player: 1, id } => Some(id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no play of player 1: {events:?}"));
+    let sent = rig
+        .session
+        .written(id)
+        .unwrap_or_else(|| panic!("play {id} never written"));
+    let at = events
+        .iter()
+        .find_map(|(t, e)| (*e == Event::Lost { why: Loss::Answer }).then_some(*t))
+        .unwrap_or_else(|| panic!("no answer's loss: {events:?}"));
+    took_on_time(
+        "the play's answer",
+        at.saturating_sub(sent),
+        Deadlines::GAME.answer,
+    );
     // The peer goes on, and the worker with it.
     playing(&peer, &renders[1]);
     assert!(renders[1].advances_over(Duration::from_secs(3)));
