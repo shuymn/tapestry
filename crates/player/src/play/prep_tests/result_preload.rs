@@ -97,6 +97,27 @@ fn a_chosen_attempt_uploads_the_adopted_packs_pages() {
     });
 }
 
+/// A retry's gate at its outro's acceptance (design.md "Play
+/// Lifecycle", Preparing each attempt, a retry from an outro) reads the
+/// result skin read-only: with a preload pack in flight it answers no,
+/// so the attempt is prepared after the outro, and starts no job.
+// Revert: the gate's result check removed -> prepared during the outro.
+#[test]
+fn a_pack_in_flight_holds_a_retry_until_its_outros_end() {
+    let _serial = imports::serial();
+    let _g = Opened;
+    let (_dir, l) = chart(None);
+    on_warp(l.chart(), true, |rig, _| {
+        super::result_flow::prepared(rig, &l);
+        let seam = Arc::new(Seam::default());
+        let (_control, _skin) = held_on_rig(rig, &seam, 2);
+        let jobs = imports::jobs_counted();
+        assert!(!rig.outro_reuse(&l), "a pack in flight");
+        assert_eq!(imports::jobs_counted(), jobs, "no job");
+        gate(0);
+    });
+}
+
 /// The transition probe's marks in the order they were taken: each of
 /// `steps` is there once (with its value where one is given), in that
 /// order; none of `absent` is.

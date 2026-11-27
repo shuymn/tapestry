@@ -587,6 +587,9 @@ impl Screen for Recorded {
     fn room_waits(&self, kind: ScreenKind, bundle: &Arc<render::SkinBundle>) -> bool {
         self.faults.room_waits.load(Ordering::Acquire) || self.menu.room_waits(kind, bundle)
     }
+    fn play_releases_result(&self, bundle: &Arc<render::SkinBundle>) -> bool {
+        self.menu.play_releases_result(bundle)
+    }
     fn pages_room_waits(&self, pages: &Arc<skin_model::PackedPages>) -> bool {
         self.faults.room_waits.load(Ordering::Acquire) || self.menu.pages_room_waits(pages)
     }
@@ -2793,7 +2796,8 @@ fn fall_back(p: &mut crate::play::PlayerRig<'_>, faults: &Faults) {
 /// A retry's result arm (design.md "Screen Transitions and Loading", the
 /// reveal word, a result arm): armed over the pinned result for its
 /// outro's end, the result draws on and the step stays pending through a
-/// view shown again; the render thread's frame at the end reveals the
+/// view shown again and an input offset key's strip; the render thread's
+/// frame at the end reveals the
 /// loading state, which draws on through a view shown again and a screen
 /// built again, the result never drawn again.
 // Revert: the arm dropped with the decision -> pending past the end.
@@ -2809,6 +2813,17 @@ fn a_retrys_reveal_waits_for_its_outros_end() {
         |p, report, screen, faults, drawn| {
             let end = arm_retry(p, 3_000_000);
             p.show_end(report, screen);
+            // An input offset key in the outro changes the strip: a
+            // result message, which keeps the arm.
+            p.controls.tuning().open_end_screen();
+            let revision = p.render.result_status().revision;
+            assert!(p.controls.tuning().adjust(game::Adjust::InputOffsetUp));
+            let look = TimeUs(p.now().0 + 20_000);
+            p.idle_wait(look);
+            assert!(
+                wait_until(|| p.render.result_status().revision > revision),
+                "the strip updated"
+            );
             assert!(!result_frames_now(drawn).is_empty(), "the result draws on");
             assert_eq!(p.render.reveal_at_step(), AtStep::Pending);
             assert!(p.now() < end, "the outro plays on");
@@ -2851,8 +2866,9 @@ fn a_fallback_during_a_retrys_outro_reveals_at_once() {
     );
 }
 
-/// A retry armed over a result that fell back already: its arm starts at
-/// the built-in deadline, and the loading state is revealed at once.
+/// A retry armed over a result that fell back already: the first pass
+/// after the arm is taken moves it to its built-in deadline, and the
+/// loading state is revealed at once.
 #[test]
 fn a_retry_armed_after_a_fallback_reveals_at_once() {
     use crate::render_side::AtStep;

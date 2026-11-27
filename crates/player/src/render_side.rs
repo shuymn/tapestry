@@ -9351,15 +9351,13 @@ impl Run {
                             result: false,
                         });
                     } else if self.current_result().is_some() {
-                        // A retry's arm over its pinned result: one that
-                        // fell back already starts at the built-in deadline.
+                        // A retry's arm over its pinned result: a
+                        // fallback, before or after this, moves it to its
+                        // built-in deadline at the next pass
+                        // (`reveal_due`).
                         self.reveal_arm = Some(RevealArm {
                             lifetime,
-                            at: if self.result_fell_back() {
-                                built_in
-                            } else {
-                                at
-                            },
+                            at,
                             built_in,
                             result: true,
                         });
@@ -14976,7 +14974,9 @@ impl Run {
     /// unless a refusal came first. The lifetime to take, once.
     fn reveal_due(&mut self) -> Option<u64> {
         // A result arm's result fell back: its built-in deadline, at once
-        // (design.md "Screen Transitions and Loading", a result arm).
+        // (design.md "Screen Transitions and Loading", a result arm). A
+        // level check, read every pass, so a fallback before the arm was
+        // taken moves it too.
         if self.reveal_arm.is_some_and(|a| a.result)
             && self.current_result().is_some()
             && self.result_fell_back()
