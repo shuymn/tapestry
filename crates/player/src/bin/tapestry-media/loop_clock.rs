@@ -71,6 +71,22 @@ impl LoopClock {
         pts.checked_sub(self.start)?.checked_add(self.offset)
     }
 
+    /// A seek: the next frame decoded follows none of the frames before it,
+    /// so neither the jump nor an interval measured before the seek is
+    /// taken as a frame's interval; frames after it measure their own.
+    pub const fn sever(&mut self) {
+        self.last = None;
+        self.delta = None;
+    }
+
+    /// Whether a frame lasting `duration` (0 or less when unknown) has a
+    /// length other than the one-tick fallback: its own, the stream's
+    /// average frame interval, or the interval measured to it from the
+    /// frame before it.
+    pub const fn measures(&self, duration: i64) -> bool {
+        duration > 0 || self.interval.is_some() || self.delta.is_some()
+    }
+
     /// The ticks a frame lasting `duration` (0 or less when unknown) lasts:
     /// its own duration, else the stream's average frame interval, else the
     /// interval between the last two frames, else one tick.
@@ -243,6 +259,32 @@ mod tests {
         pass(&mut clock, &[0, 1000, 2500], &[None, None, None]);
         assert!(clock.wrap());
         assert_eq!(clock.ticks(0, None), Some(4000));
+    }
+
+    /// Nothing measured before a seek is a frame's interval after it
+    /// (design.md "Rendering and Skins", video frames): with no duration
+    /// and no average rate, frames 40 ms apart to 120 ms, then a seek to
+    /// the frame at 1 s; that frame measures nothing and lasts one tick,
+    /// neither the 880 ms jump nor the 40 ms measured before the seek, and
+    /// the frame after it measures its own interval.
+    // Covers: T02
+    #[test]
+    fn a_seek_is_never_a_frame_s_interval() {
+        let us = |clock: &mut LoopClock, pts| {
+            let ticks = clock.ticks(pts, None).unwrap();
+            (clock.frame_us(ticks, 0, TB.0, TB.1), clock.measures(0))
+        };
+        let mut clock = LoopClock::new(0, None);
+        pass(&mut clock, &[0, 3600, 7200, 10_800], &[None; 4]);
+        assert!(clock.measures(0));
+        clock.sever();
+        assert_eq!(us(&mut clock, 90_000), (11, false));
+        assert_eq!(us(&mut clock, 94_500), (50_000, true));
+        // A duration of its own or the stream's rate is still a length.
+        assert!(clock.measures(3600));
+        let mut rated = LoopClock::new(0, Some(3600));
+        rated.sever();
+        assert!(rated.measures(0));
     }
 
     // Covers: T02

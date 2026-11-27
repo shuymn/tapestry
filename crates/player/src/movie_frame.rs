@@ -158,10 +158,16 @@ pub trait Source {
     fn loss(&self) -> Option<Loss>;
     /// The render side wants run `run` sought ([`crate::media_host::movie::Runs::want`]).
     fn want(&self, run: u64);
+    /// Run `run` lands at media time `at`, written before it is wanted
+    /// ([`crate::media_host::movie::Runs::land`]).
+    fn land(&self, run: u64, at: i64);
     /// The newest run whose end the worker reported ([`Movie::ended`]).
     fn ended(&self) -> u64;
     /// The newest run whose seek found no frame ([`Movie::empty`]).
     fn empty(&self) -> u64;
+    /// The newest run whose landing is a last frame with no end proven
+    /// ([`Movie::open_end`]).
+    fn open_end(&self) -> u64;
 }
 
 impl Source for Movie {
@@ -212,12 +218,20 @@ impl Source for Movie {
         self.runs.want(run);
     }
 
+    fn land(&self, run: u64, at: i64) {
+        self.runs.land(run, at);
+    }
+
     fn ended(&self) -> u64 {
         self.runs.ended()
     }
 
     fn empty(&self) -> u64 {
         self.runs.empty()
+    }
+
+    fn open_end(&self) -> u64 {
+        self.runs.open()
     }
 }
 
@@ -229,6 +243,26 @@ pub struct ChartAt {
     pub now: i64,
     /// `k` of the speed `k / 20`.
     pub k: u32,
+}
+
+/// An attempt's boundary for its chart videos (design.md "Rendering and
+/// Skins", BGA): a practice round's lead-in start, where its videos land,
+/// and the attempt's speed, which the landing's media time is due at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boundary {
+    /// Chart time, µs of playback; a full play's is `i64::MIN`, every start
+    /// counted and none landed.
+    pub at: i64,
+    /// `k` of the attempt's speed `k / 20`.
+    pub k: u32,
+}
+
+impl Boundary {
+    /// A full play's.
+    pub const FULL: Self = Self {
+        at: i64::MIN,
+        k: 20,
+    };
 }
 
 /// The stamps a chart video's runs may carry: any.
@@ -384,6 +418,12 @@ enum Chart {
     /// Run `run` cued, its first frame `staged` or not, its start ahead:
     /// nothing shown.
     Waiting { run: u64, staged: bool },
+    /// Run `run` sought to land at the round's boundary for the start at
+    /// `start`, before it; its landing not staged yet: nothing shown.
+    Landing { run: u64, start: i64 },
+    /// Run `run`'s landing staged for the start at `start`, the round's
+    /// boundary not reached yet: nothing shown.
+    Landed { run: u64, start: i64 },
     /// Run `run` plays from the start at chart time `start`.
     Playing { run: u64, start: i64 },
     /// Run `run`, started at `start`, has no frame taken yet: the frame of
@@ -399,6 +439,17 @@ struct Held {
     run: u64,
     stamp: i64,
     duration: i64,
+}
+
+/// The preparation deadline's check of a staged frame (design.md "Screen
+/// Transitions and Loading", T02), sampled after its upload: past the
+/// deadline `movie` is lost, never ready, and the frame not shown.
+fn in_time<S: Source + ?Sized>(movie: &S, deadline: Instant) -> bool {
+    if Instant::now() >= deadline {
+        movie.expire();
+        return false;
+    }
+    true
 }
 
 /// The media time due at chart time `at` for a run started at `start`, the
@@ -533,7 +584,7 @@ pub struct Movies<S = Movie> {
     /// The chart's videos' starts, by slot, and the attempt's boundary:
     /// starts before it are not counted.
     videos: Option<Arc<ChartVideos>>,
-    boundary: i64,
+    boundary: Boundary,
     /// Wakes the media session when a chart video wants a run sought.
     waker: Option<Waker>,
     /// The wakes made (tests).
@@ -613,7 +664,7 @@ impl<S: Source> Movies<S> {
             deadline: preparation_deadline(start),
             hook_at: None,
             videos: None,
-            boundary: i64::MIN,
+            boundary: Boundary::FULL,
             waker: None,
             #[cfg(test)]
             wakes: 0,
@@ -637,10 +688,10 @@ impl<S: Source> Movies<S> {
     }
 
     /// The chart's videos' starts (`videos`, by slot) and the attempt's
-    /// boundary: a full play's is `i64::MIN`, every start counted; a
-    /// practice round's its lead-in's start, an earlier start not counted.
-    /// Set at the preparation, before any play frame.
-    pub fn set_chart(&mut self, videos: Arc<ChartVideos>, boundary: i64) {
+    /// boundary: a full play's counts every start; a practice round's is
+    /// its lead-in's start, an earlier start landed there when it is the
+    /// slot's latest. Set at the preparation, before any play frame.
+    pub fn set_chart(&mut self, videos: Arc<ChartVideos>, boundary: Boundary) {
         self.videos = Some(videos);
         self.boundary = boundary;
         #[cfg(feature = "dev-tools")]
@@ -1067,7 +1118,13 @@ impl<S: Source> Movies<S> {
     fn chart_frame(&mut self, planes: &mut dyn Planes, i: usize, at: Option<ChartAt>) -> MovieShow {
         let reserved = self.reserved.get(i).copied();
         let deadline = self.deadline;
-        let boundary = self.boundary;
+        let Boundary { at: boundary, k } = self.boundary;
+        // A round lands at its preparation's speed, the speed of every frame
+        // after it (design.md "Practice Speed Changes").
+        debug_assert!(
+            boundary == i64::MIN || at.is_none_or(|a| a.k == k),
+            "the attempt's speed changed"
+        );
         let Self {
             slots,
             videos,
@@ -1100,10 +1157,19 @@ impl<S: Source> Movies<S> {
         };
         let [width, height] = slot.size;
         let starts = videos.as_deref().map_or(&[][..], |v| v.starts(i));
+        // The start a round lands at its boundary: the slot's latest at or
+        // before it, when that is before it; a start at the boundary counts
+        // as after it and plays its staged first frame (none in a full
+        // play, whose boundary no start precedes).
+        let landed = starts
+            .partition_point(|s| s.0 <= boundary)
+            .checked_sub(1)
+            .filter(|j| starts.get(*j).is_some_and(|s| s.0 < boundary));
         // The worker publishes every frame of a run before it reports the
         // run's end: read first, so the peek below sees them all.
         let ended = movie.ended();
         let empty = movie.empty();
+        let open_end = movie.open_end();
         let first = slot.first.unwrap_or(0);
         let mut freed = false;
         let (due, peeked) = 'read: {
@@ -1112,11 +1178,13 @@ impl<S: Source> Movies<S> {
             let mut wanted = None;
             if let Some(at) = at {
                 // The start in effect: the latest at or before now, counted
-                // when at or after the boundary.
+                // when at or after the boundary, or when it is the landed
+                // start and the boundary is reached.
                 let n = starts.partition_point(|s| s.0 <= at.now);
-                let current = n
-                    .checked_sub(1)
-                    .filter(|j| starts.get(*j).is_some_and(|s| s.0 >= boundary));
+                let current = n.checked_sub(1).filter(|j| {
+                    starts.get(*j).is_some_and(|s| s.0 >= boundary)
+                        || (Some(*j) == landed && at.now >= boundary)
+                });
                 if let Some(j) = current
                     && slot.current != Some(j)
                     && let Some(e) = starts.get(j).map(|s| s.0)
@@ -1125,20 +1193,30 @@ impl<S: Source> Movies<S> {
                     // Source: SF-025
                     slot.chart = match slot.chart {
                         Chart::Waiting { run, .. } => Chart::Playing { run, start: e },
+                        Chart::Landed { run, start } if start == e => Chart::Playing { run, start },
                         Chart::Unstaged => Chart::Playing {
                             run: reader.run(),
                             start: e,
                         },
                         before @ (Chart::Playing { .. }
                         | Chart::Restarting { .. }
+                        | Chart::Landing { .. }
+                        | Chart::Landed { .. }
                         | Chart::Ended) => {
-                            // What the run before shows: its own frame
-                            // while playing, the frame held from the run
-                            // before it while restarting.
+                            // What the run before shows at the new start:
+                            // its own frame while playing or landed, once
+                            // that frame is due then; the frame held from
+                            // the run before it while restarting.
+                            let due_then =
+                                |start: i64| chart_due(first, start, ChartAt { now: e, ..at });
                             let (run, start, shows) = match before {
-                                Chart::Playing { run, start } => {
-                                    (run, start, slot.held.is_some_and(|h| h.run == run))
-                                }
+                                Chart::Playing { run, start } | Chart::Landed { run, start } => (
+                                    run,
+                                    start,
+                                    slot.held.is_some_and(|h| {
+                                        h.run == run && h.stamp <= due_then(start)
+                                    }),
+                                ),
                                 Chart::Restarting { run, start, hold } => (run, start, hold),
                                 _ => (0, 0, false),
                             };
@@ -1153,7 +1231,7 @@ impl<S: Source> Movies<S> {
                                         live.words,
                                         slot.held,
                                         (run, empty),
-                                        chart_due(first, start, ChartAt { now: e, ..at }),
+                                        due_then(start),
                                         &mut freed,
                                     ) {
                                         Ok(ended) => ended,
@@ -1193,7 +1271,12 @@ impl<S: Source> Movies<S> {
                 }
             }
             let (pick, due) = match (slot.chart, at) {
-                (Chart::Unstaged | Chart::Waiting { staged: false, .. }, _) => (None, None),
+                // A landing's first frame is staged whatever its stamp: the
+                // fallback after the target too, shown once due.
+                (
+                    Chart::Unstaged | Chart::Waiting { staged: false, .. } | Chart::Landing { .. },
+                    _,
+                ) => (None, None),
                 (Chart::Playing { start, .. } | Chart::Restarting { start, .. }, Some(at)) => {
                     let due = chart_due(first, start, at);
                     (Some(due), Some(due))
@@ -1224,6 +1307,9 @@ impl<S: Source> Movies<S> {
         // Whether a frame of the run stays in the ring: one newer than the
         // frame due, or the frame due itself while its take is refused.
         let mut left = peek.left;
+        // The run a round's landing wants sought, once run 1's first frame
+        // is staged.
+        let mut landing = None;
         if let Some(d) = peek.due {
             left = true;
             let mut took = None;
@@ -1269,13 +1355,32 @@ impl<S: Source> Movies<S> {
                             slot.stamp = Some(stamp);
                         }
                         if slot.first.is_none() {
-                            // Accepted past the deadline: lost, never ready.
-                            if Instant::now() >= deadline {
-                                movie.expire();
+                            if !in_time(&*movie, deadline) {
                                 return MovieShow::Lost;
                             }
                             slot.first = Some(stamp);
+                            match landed.and_then(|j| starts.get(j)) {
+                                // A round's start before its boundary: the
+                                // run sought to the frame due there, the
+                                // movie ready once that frame is staged.
+                                Some(e) => {
+                                    let target =
+                                        chart_due(stamp, e.0, ChartAt { now: boundary, k });
+                                    let run = reader.start_run(RUN_WINDOW);
+                                    movie.land(run, target);
+                                    landing = Some(run);
+                                    slot.chart = Chart::Landing { run, start: e.0 };
+                                }
+                                None => movie.staged_first(),
+                            }
+                        } else if let Chart::Landing { run: r, start } = slot.chart
+                            && r == run
+                        {
+                            if !in_time(&*movie, deadline) {
+                                return MovieShow::Lost;
+                            }
                             movie.staged_first();
+                            slot.chart = Chart::Landed { run, start };
                         }
                         slot.chart = match slot.chart {
                             Chart::Unstaged => Chart::Waiting { run, staged: true },
@@ -1295,6 +1400,29 @@ impl<S: Source> Movies<S> {
                 None => {}
             }
         }
+        if let Some(run) = landing {
+            movie.want(run);
+            if let Some(w) = waker.as_ref() {
+                w.wake();
+            }
+            #[cfg(test)]
+            {
+                *wakes += 1;
+            }
+        }
+        // A landing that found no frame: the file ended from the boundary,
+        // the movie ready, the landed start taken as in effect so it starts
+        // nothing.
+        if let Chart::Landing { run, .. } = slot.chart
+            && empty == run
+        {
+            if !in_time(&*movie, deadline) {
+                return MovieShow::Lost;
+            }
+            movie.staged_first();
+            slot.chart = Chart::Ended;
+            slot.current = landed;
+        }
         // The end: reported, nothing of the run left in the ring, and the
         // time due past its last frame's end, or its seek found no frame.
         // Source: SF-027
@@ -1303,8 +1431,12 @@ impl<S: Source> Movies<S> {
             && ended == run
             && !left
         {
+            // A last frame whose end nothing proves stays until the
+            // file's next start or the round's end.
             let done = match slot.held {
-                Some(h) if h.run == run => due >= h.stamp.saturating_add(h.duration),
+                Some(h) if h.run == run => {
+                    open_end != run && due >= h.stamp.saturating_add(h.duration)
+                }
                 _ => empty == run,
             };
             if done {
@@ -1312,10 +1444,18 @@ impl<S: Source> Movies<S> {
             }
         }
         // Source: SF-028
+        // A playing run's frame shows once it is due: a landing found after
+        // its target stays hidden until then.
         let shows = match slot.chart {
-            Chart::Playing { run, .. } => slot.held.is_some_and(|h| h.run == run),
+            Chart::Playing { run, .. } => slot
+                .held
+                .is_some_and(|h| h.run == run && due.is_some_and(|d| h.stamp <= d)),
             Chart::Restarting { run, hold, .. } => hold || slot.held.is_some_and(|h| h.run == run),
-            Chart::Unstaged | Chart::Waiting { .. } | Chart::Ended => false,
+            Chart::Unstaged
+            | Chart::Waiting { .. }
+            | Chart::Landing { .. }
+            | Chart::Landed { .. }
+            | Chart::Ended => false,
         };
         #[cfg(feature = "dev-tools")]
         if let (Chart::Playing { run, .. }, Some(due), Some(c), Some(h)) =

@@ -839,28 +839,44 @@ impl ChartVideos {
         videos
     }
 
-    /// The files a play opens (design.md "Rendering and Skins", BGA): each
-    /// id's file by its index (`file_of`, `None` for an id that is no
-    /// video), ranked by its first base or layer start, ties broken by
-    /// channel (the base first) and then by the lowest id; the first
-    /// [`MAX_CHART_FILES`] take the chart slots in that order, and a file
-    /// with no start (only the poor sequences name it) none. Returns each
-    /// id's slot and each slot's file.
+    /// The files an attempt opens (design.md "Rendering and Skins", BGA):
+    /// each id's file by its index (`file_of`, `None` for an id that is no
+    /// video), ranked by its first base or layer start after the attempt's
+    /// `boundary`, each channel's latest event at or before the boundary
+    /// counting as a start at it (a full play's boundary, `i64::MIN`, has
+    /// none, so it ranks by the first start), ties broken by channel (the
+    /// base first) and then by the lowest id; the first [`MAX_CHART_FILES`]
+    /// take the chart slots in that order, and a file with no such start
+    /// (only the poor sequences name it, or, in a round, only events the
+    /// round's start no longer shows) none. Returns each id's slot and each
+    /// slot's file.
     #[must_use]
     // Source: SF-026
     pub fn choose(
         bga: &ChartBga,
         file_of: &[Option<usize>],
+        boundary: TimeUs,
     ) -> (Vec<Option<u8>>, [Option<usize>; MAX_CHART_FILES]) {
         // Each file's first start: (time, channel, id).
         let mut first: Vec<(usize, (TimeUs, u8, u16))> = Vec::new();
         for (channel, events) in [(0_u8, bga.base()), (1, bga.layer())] {
-            for e in events {
-                let Some(id) = e.image else { continue };
+            // The channel's event in effect at the boundary, then the later
+            // ones (the events are in time order).
+            let after = events.partition_point(|e| e.time <= boundary);
+            let effect = after
+                .checked_sub(1)
+                .and_then(|j| events.get(j))
+                .map(|e| (boundary, e.image));
+            let later = events.get(after..).unwrap_or(&[]);
+            for (time, image) in effect
+                .into_iter()
+                .chain(later.iter().map(|e| (e.time, e.image)))
+            {
+                let Some(id) = image else { continue };
                 let Some(&Some(file)) = file_of.get(usize::from(id.0)) else {
                     continue;
                 };
-                let key = (e.time, channel, id.0);
+                let key = (time, channel, id.0);
                 match first.iter_mut().find(|(f, _)| *f == file) {
                     Some((_, k)) => *k = (*k).min(key),
                     None => first.push((file, key)),

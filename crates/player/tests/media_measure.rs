@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe};
-use skin_model::media::control::{Command as Order, Reply};
+use skin_model::media::control::{Command as Order, Reply, SeekTo};
 use skin_model::media::{Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -380,6 +380,7 @@ fn sustain(w: &mut Launched, players: &mut [Player], seconds: u64, poll_us: u64)
                     player: p.id,
                     run,
                     at: 0,
+                    to: SeekTo::From,
                 })
                 .unwrap();
                 loop {

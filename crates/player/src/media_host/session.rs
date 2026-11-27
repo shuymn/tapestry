@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
-use skin_model::media::control::{Command, Matrix, Range, Reply};
+use skin_model::media::control::{Command, Matrix, Range, Reply, SeekTo};
 use skin_model::media::{self, Geometry, Reader, State, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -190,6 +190,13 @@ impl Movie {
     /// none: that run's end, once reported, needs no frame of it.
     pub fn empty(&self) -> u64 {
         self.runs.empty()
+    }
+
+    /// The newest run whose landing is the clip's last frame with no end
+    /// proven, 0 for none: that run's end, once reported, leaves its last
+    /// frame shown.
+    pub fn open_end(&self) -> u64 {
+        self.runs.open()
     }
 
     /// Run `run` ended, `empty` when its seek found no frame, as the
@@ -446,6 +453,8 @@ pub enum Event {
     Opened,
     /// A player's close answered.
     Closed,
+    /// A video's loss, for `why`, written to the session's log.
+    Noted { why: Loss },
     /// A beat reached the reply queue.
     QueuedBeat,
     /// Load stage `name` stamped, of load `load`.
@@ -466,6 +475,9 @@ struct Shared {
     /// The worker's writer's account of its writes (tests).
     #[cfg(test)]
     transport: Mutex<Option<Arc<super::writer::Transport>>>,
+    /// The worker's count of close answers queued ([`Worker::closes`]).
+    #[cfg(test)]
+    closes: Mutex<Option<Arc<AtomicU64>>>,
     #[cfg(test)]
     events: Mutex<Vec<(Duration, Event)>>,
     #[cfg(test)]
@@ -747,6 +759,8 @@ impl Session {
             #[cfg(test)]
             transport: Mutex::new(None),
             #[cfg(test)]
+            closes: Mutex::new(None),
+            #[cfg(test)]
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             origin: Instant::now(),
@@ -812,6 +826,18 @@ impl Session {
         let transport = self.shared.transport.lock().ok()?.clone()?;
         let at = transport.written(id).ok()??;
         Some(at.saturating_duration_since(self.shared.origin))
+    }
+
+    /// How many close answers the current worker's replies' thread has
+    /// queued (tests): one counted is taken at the next look's first drain.
+    #[cfg(test)]
+    pub fn closes_queued(&self) -> u64 {
+        self.shared
+            .closes
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.load(Ordering::SeqCst)))
+            .unwrap_or(0)
     }
 
     /// The time on the clock of [`Self::events`] (tests).
@@ -1045,9 +1071,15 @@ struct Supervisor {
 pub enum Held {
     /// The requests are taken; the session has not read its end.
     Taken,
+    /// The look has lost the peers of the chart videos lost so far and not
+    /// yet judged the players.
+    Peered,
     /// The look has judged the players' deadlines and not yet ended a
     /// marked worker with nothing live.
     Judged,
+    /// A drop has chosen its players, lost the peers of the chart videos
+    /// lost and noted the losses, and not removed the players chosen yet.
+    Dropping,
     /// The session has looked and not slept yet.
     Looked,
 }
@@ -1176,7 +1208,7 @@ impl Supervisor {
         self.reap();
         let generation = self.shared.generation.load(Ordering::Acquire);
         // Queued players of another screen, or lost, are dropped.
-        self.players.retain(|p| {
+        self.drop_players(|p| {
             !(p.stage == Stage::Queued
                 && (p.movie.generation() != generation || p.movie.status() == Status::Lost))
         });
@@ -1224,6 +1256,10 @@ impl Supervisor {
             return;
         }
         self.lose_peers();
+        #[cfg(test)]
+        if let Some(turn) = &mut self.turn {
+            turn(Held::Peered);
+        }
         self.judge(generation, now, settled);
         #[cfg(test)]
         if let Some(turn) = &mut self.turn {
@@ -1264,6 +1300,7 @@ impl Supervisor {
             {
                 p.noted = true;
                 self.notes.note(why.line());
+                event!(self.shared, Event::Noted { why });
             }
         }
     }
@@ -1311,6 +1348,10 @@ impl Supervisor {
                 if let Ok(mut transport) = self.shared.transport.lock() {
                     *transport = worker.transport().cloned();
                 }
+                #[cfg(test)]
+                if let Ok(mut closes) = self.shared.closes.lock() {
+                    *closes = Some(worker.closes());
+                }
                 self.notes.note(format!("worker {} launched", worker.pid()));
                 self.worker = Some(worker);
                 self.marked = false;
@@ -1330,8 +1371,7 @@ impl Supervisor {
                 lose!(self.shared, p.movie, why);
             }
         }
-        self.note_losses();
-        self.players.retain(|p| p.stage != Stage::Queued);
+        self.drop_players(|p| p.stage != Stage::Queued);
     }
 
     /// Why the whole worker fails, if it does (L1, L4, its end).
@@ -1380,8 +1420,7 @@ impl Supervisor {
             self.dying.push(worker);
         }
         self.marked = false;
-        self.note_losses();
-        self.players.retain(|p| p.stage == Stage::Queued);
+        self.drop_players(|p| p.stage == Stage::Queued);
         if let Some(pid) = pid {
             self.notes.note(format!("worker {pid} fails ({why:?})"));
         }
@@ -1409,7 +1448,9 @@ impl Supervisor {
         let mut failure = None;
         for i in 0..self.players.len() {
             let Some(p) = self.players.get(i) else { break };
-            if p.stage != Stage::Queued {
+            // A queued video lost since the look's drop chose its players
+            // (its peers lost with it) is dropped at the next, never opened.
+            if p.stage != Stage::Queued || p.movie.status() == Status::Lost {
                 continue;
             }
             let Some(id) = self.free_id() else { break };
@@ -1449,9 +1490,7 @@ impl Supervisor {
             }
         }
         // Players that never reached the worker go, logged.
-        self.note_losses();
-        self.players
-            .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
+        self.drop_players(|p| !(p.stage == Stage::Idle && p.id == 0));
         if let Some(why) = failure {
             self.fail_worker(why);
         }
@@ -1580,8 +1619,15 @@ impl Supervisor {
             p.sought = run;
             // An answer with no frame: the run is empty, and its end, which
             // follows, needs no frame of it.
-            if let Reply::Sought { landed: None, .. } = reply {
-                p.movie.runs.found_empty(run);
+            match reply {
+                Reply::Sought { landed: None, .. } => p.movie.runs.found_empty(run),
+                // A landing on a last frame whose end nothing proves.
+                Reply::Sought {
+                    landed: Some(_),
+                    open_end: true,
+                    ..
+                } => p.movie.runs.found_open(run),
+                _ => {}
             }
         }
         p.stage = stage;
@@ -1689,10 +1735,29 @@ impl Supervisor {
             p.id = 0;
         }
         if any {
-            self.note_losses();
-            self.players
-                .retain(|p| !(p.stage == Stage::Idle && p.id == 0));
+            self.drop_players(|p| !(p.stage == Stage::Idle && p.id == 0));
         }
+    }
+
+    /// Drops the players `keep` refuses. They are chosen first; then,
+    /// while they are still held, the peers of every chart video lost are
+    /// lost ([`Self::lose_peers`]) and the losses noted; then the players
+    /// chosen are removed. A player dropped is out of every later peer
+    /// check and of the log, so a chart video lost since the look's own
+    /// check (the game's loss before the judgement closed it, a struck or
+    /// failed open, a queued video the game lost) still loses its peers,
+    /// and both losses are logged. A loss that comes after the choice
+    /// leaves its player for the next drop.
+    fn drop_players(&mut self, mut keep: impl FnMut(&Player) -> bool) {
+        let chosen: Vec<bool> = self.players.iter().map(|p| !keep(p)).collect();
+        self.lose_peers();
+        self.note_losses();
+        #[cfg(test)]
+        if let Some(turn) = &mut self.turn {
+            turn(Held::Dropping);
+        }
+        let mut chosen = chosen.into_iter();
+        self.players.retain(|_| !chosen.next().unwrap_or(false));
     }
 
     /// Applies the screen's pixel total to player `i`'s `probe` before any
@@ -1843,7 +1908,9 @@ impl Supervisor {
 
     /// Sends each live player of the screen shown whose video wants a run
     /// newer than its newest sought, and has no seek in flight, a seek for
-    /// that run from the clip's start ([`super::movie::seek_for`]).
+    /// that run ([`super::movie::seek_for`]): a landing at its time when
+    /// the run is the video's landing ([`Runs::land`]), else from the
+    /// clip's start.
     fn seek_wanted(&mut self, generation: u64) -> Result<(), Loss> {
         for i in 0..self.players.len() {
             let Some(p) = self.players.get(i) else { break };
@@ -1854,10 +1921,15 @@ impl Supervisor {
             if p.movie.generation() != generation || p.movie.status() != Status::Live {
                 continue;
             }
+            let (at, to) = match p.movie.runs.landing(run) {
+                Some(at) => (at, SeekTo::Landing),
+                None => (p.movie.seek_at(), SeekTo::From),
+            };
             let seek = Command::Seek {
                 player: p.id,
                 run,
-                at: p.movie.seek_at(),
+                at,
+                to,
             };
             let id = self.send(&seek)?;
             if let Some(p) = self.players.get_mut(i) {
@@ -2219,6 +2291,7 @@ mod tests {
             queue_lost: AtomicU32::new(0),
             quit: AtomicBool::new(false),
             transport: Mutex::new(None),
+            closes: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             origin: Instant::now(),
             beats: Mutex::new(Vec::new()),
@@ -2262,7 +2335,12 @@ mod tests {
 
     /// The seek of `run` for player `player` the session sends.
     fn seek(player: u8, run: u64) -> Command {
-        Command::Seek { player, run, at: 0 }
+        Command::Seek {
+            player,
+            run,
+            at: 0,
+            to: SeekTo::From,
+        }
     }
 
     /// The worker's answer to seek `id` of player 1 for `run`, landing at
@@ -2274,6 +2352,7 @@ mod tests {
             run,
             landed,
             attempts: u8::from(landed.is_some()),
+            open_end: false,
         }
     }
 
@@ -2319,6 +2398,32 @@ mod tests {
         s.take(Instant::now(), &sought(1, 4, Some(40_000))).unwrap();
         s.seek_wanted(1).unwrap();
         assert_eq!(s.sent, [seek(1, 4)], "run 4 is sought already");
+        assert_eq!(movie.loss(), None);
+    }
+
+    /// A round's landing is sought as a landing at its time; a run wanted
+    /// after it, from the clip's start.
+    // Covers: T02
+    #[test]
+    fn a_landing_is_sought_by_its_mode() {
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        movie.runs.land(2, 6_040_000);
+        movie.want(2);
+        s.seek_wanted(1).unwrap();
+        let landing = Command::Seek {
+            player: 1,
+            run: 2,
+            at: 6_040_000,
+            to: SeekTo::Landing,
+        };
+        assert_eq!(s.sent, std::slice::from_ref(&landing));
+        s.take(Instant::now(), &sought(1, 2, Some(6_000_000)))
+            .unwrap();
+        movie.want(3);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [landing, seek(1, 3)], "a restart from the start");
         assert_eq!(movie.loss(), None);
     }
 
@@ -2428,6 +2533,33 @@ mod tests {
         // A seek that lands records nothing empty.
         let (_, landed) = sought_to(5);
         assert_eq!(landed.empty(), 0);
+    }
+
+    /// A landing whose end the worker says is open (a last frame whose
+    /// length was found from nothing) records its run open, and a landing
+    /// that says nothing records none (design.md "Rendering and Skins",
+    /// Video frames).
+    // Covers: T02
+    #[test]
+    fn an_open_ended_landing_records_its_run() {
+        for (open_end, want) in [(true, 4), (false, 0)] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(4);
+            s.seek_wanted(1).unwrap();
+            let answer = Reply::Sought {
+                id: 1,
+                player: 1,
+                run: 4,
+                landed: Some(10_000_000),
+                attempts: 4,
+                open_end,
+            };
+            s.take(Instant::now(), &answer).unwrap();
+            assert_eq!(s.players[0].stage, Stage::Live);
+            assert_eq!((movie.open_end(), movie.empty()), (want, 0), "{answer:?}");
+        }
     }
 
     /// A chart video lost for its own reason loses the screen's other

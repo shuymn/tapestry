@@ -59,6 +59,7 @@ fn want(dir: &Path, names: &[&str]) -> Want {
         dir: dir.to_path_buf(),
         names: names.iter().map(|&n| n.to_owned()).collect(),
         bga: None,
+        boundary: None,
     }
 }
 
@@ -757,6 +758,44 @@ fn a_third_file_and_a_poor_only_file_are_absent() {
         );
         assert_eq!(got[0], [0; 3], "the absent picture's placeholder");
         near(got[1], grey(CLIP_LUMA[0]), "the video's first frame");
+    }
+}
+
+/// A round ranks its videos from its boundary (design.md "Rendering and
+/// Skins", BGA), and another boundary is another want: with nothing
+/// committed, the job's generation is renewed and its manifest is the new
+/// ranking's. From 2 s, v1 (on the base then) and v3 (on the layer then)
+/// open, where a full play opens v1 and v2.
+#[test]
+fn a_boundary_change_before_commit_re_ranks() {
+    let (dir, full) = video_chart();
+    let screens = Installers::default();
+    let link = render(&screens);
+    let w = worker(&link);
+    w.attempt(full.clone());
+    let before = w.generation();
+    w.attempt(full.clone());
+    assert_eq!(w.generation(), before, "the same want");
+    let round = Want {
+        boundary: Some(bms_model::TimeUs(2_000_000)),
+        ..full.clone()
+    };
+    w.attempt(round.clone());
+    assert_ne!(w.generation(), before, "another boundary renews");
+    let canonical = |v: &str| dir.path().join(v).canonicalize().unwrap();
+    for (want, files) in [
+        (&round, ["v1.mp4", "v3.mp4"]),
+        (&full, ["v1.mp4", "v2.mp4"]),
+    ] {
+        let (_, manifests, _) = answered_run(want, None);
+        let m = &manifests[0];
+        let at = |k: usize| crate::movie_screen::final_path(m.files[k].as_ref().unwrap()).unwrap();
+        assert_eq!(
+            (at(0), at(1)),
+            (canonical(files[0]), canonical(files[1])),
+            "{:?}",
+            want.boundary
+        );
     }
 }
 
