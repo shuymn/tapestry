@@ -352,6 +352,9 @@ struct Tail {
     /// How far past its deadline a fade phase's wait wakes, in µs (a
     /// descheduled game thread); zero: the next millisecond.
     wake_late: i64,
+    /// How long the turntable's pause after a save holds the game thread,
+    /// in µs (a descheduled game thread before the flow goes on).
+    pause_after_save: i64,
     /// The totals each result's own view read, as its layout is asked for.
     totals: Vec<Option<Option<game::PlayerTotals>>>,
     /// An autoplay session's input side, polled on the play's timeline in
@@ -470,6 +473,7 @@ impl Tail {
             fade_ended_at: Vec::new(),
             takeovers: Vec::new(),
             wake_late: 0,
+            pause_after_save: 0,
             totals: Vec::new(),
             feeder: None,
             audio_done_at: None,
@@ -601,6 +605,13 @@ impl Rig for Tail {
         self.wait();
         while self.in_fade && self.wake_late > 0 && self.clock.now().0 < deadline.0 + self.wake_late
         {
+            self.wait();
+        }
+    }
+
+    fn turntable_paused(&mut self) {
+        let until = self.clock.now().0 + self.pause_after_save;
+        while self.clock.now().0 < until {
             self.wait();
         }
     }
@@ -1424,6 +1435,39 @@ fn a_quit_past_the_fade_deadline_is_the_results_however_late_the_look() {
             _ => assert!(pending.is_empty(), "{quit}: {pending:?}"),
         }
     }
+}
+
+/// The result takes the input over from the save's end, read as the
+/// save returned: a game thread held after it, before the flow goes on,
+/// moves the takeover no later, so a quit received in that delay is the
+/// result's back, which withdraws its preparation, not the phase's skip
+/// (design.md "State Model", ResultPreparing).
+#[test]
+fn a_delay_after_the_save_moves_no_takeover() {
+    let save_end = T + 8_600 * MS;
+    let quit = T + 8_610 * MS;
+    let commands = [(quit, Command::Quit)];
+    let dir = tempfile::tempdir().unwrap();
+    let order = Order::default();
+    let mut rig = Tail::with_bgm(all_hits(), &commands, i64::MAX, 500);
+    rig.ending = declared(3_000, 500);
+    rig.order = std::sync::Arc::clone(&order);
+    rig.pause_after_save = 20 * MS;
+    let mut sink = NotingSink::new(dir.path(), &order);
+    sink.clock = Some(std::sync::Arc::clone(&rig.clock));
+    sink.save_for = TimeUs(600 * MS);
+    let mut loaded = loaded_sinking(dir.path(), sink);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let takeover = rig.takeovers.first().copied().expect("a takeover");
+    assert!(
+        (save_end..quit).contains(&takeover),
+        "the takeover at the save's end: {takeover}"
+    );
+    assert_eq!(rig.fade_end(), Some(FadeEnd::RanOut));
+    assert!(rig.skipped.is_empty(), "{:?}", rig.skipped);
+    // The result's back, taken in its preparation: it withdraws it.
+    assert!(rig.commands.is_empty(), "{:?}", rig.commands);
+    assert_eq!(rig.shown_at(), None, "the quit withdrew the result");
 }
 
 /// A retry received while a save outlasts its fade phase retries once the

@@ -123,10 +123,19 @@ pub struct Controls {
     leave_at: AtomicI64,
     suspend_at: AtomicI64,
     retry_pending_at: AtomicI64,
+    /// Held by a sender from its receipt to its bit: commands are
+    /// published one at a time, whichever thread sends them (the window's
+    /// keys, the power notification, the game thread's own retry), so no
+    /// sender's receipt is stored under another's publication.
+    senders: std::sync::Mutex<()>,
     /// The next take publishes a quit once it has cleared its bit
     /// (tests).
     #[cfg(test)]
     quit_during_take: AtomicBool,
+    /// Runs in the next publication between its receipt and its bit
+    /// (tests).
+    #[cfg(test)]
+    in_publication: std::sync::Mutex<Option<InPublication>>,
     /// When the latest quit key press in the decision screen's epoch was
     /// observed, on the clock; `i64::MIN` for none.
     quit_in_epoch: AtomicI64,
@@ -190,8 +199,11 @@ impl Controls {
             leave_at: AtomicI64::new(i64::MIN),
             suspend_at: AtomicI64::new(i64::MIN),
             retry_pending_at: AtomicI64::new(i64::MIN),
+            senders: std::sync::Mutex::new(()),
             #[cfg(test)]
             quit_during_take: AtomicBool::new(false),
+            #[cfg(test)]
+            in_publication: std::sync::Mutex::new(None),
             quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
             reveal_withdraw: std::sync::Mutex::new(None),
@@ -312,13 +324,18 @@ impl Controls {
             Command::Retry => RETRY,
             Command::Suspend => SUSPEND,
         };
+        // A command's receipt is read and stored while its bit is clear,
+        // before the bit is set, and never while it is set: one pressed
+        // again before it is taken joins the pending one, whose first
+        // receipt stays, and a take reads the receipt before it clears the
+        // bit, so a command and its receipt go together. Senders publish one
+        // at a time, so a receipt is only ever stored by the sender that
+        // sets its bit next.
+        let _sending = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.clock.now().0;
-        // A command's receipt is stored while its bit is clear, before the
-        // bit is set, and never while it is set: one pressed again before
-        // it is taken joins the pending one, whose first receipt stays, and
-        // a take reads the receipt before it clears the bit, so a command
-        // and its receipt go together. Two senders racing on one clear bit
-        // keep one of their receipts.
         let set = loop {
             let w = self.command.load(Ordering::Acquire);
             // In the decision screen's epoch only a suspend is kept; a quit
@@ -330,6 +347,17 @@ impl Controls {
                 break true;
             }
             self.receipt(bit).store(now, Ordering::Release);
+            #[cfg(test)]
+            {
+                let run = self
+                    .in_publication
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(InPublication(run)) = run {
+                    run();
+                }
+            }
             if self
                 .command
                 .compare_exchange(w, w | bit, Ordering::AcqRel, Ordering::Acquire)
@@ -768,6 +796,17 @@ impl Controls {
     }
 }
 
+/// What a test runs in a publication ([`Controls`]' `in_publication`).
+#[cfg(test)]
+struct InPublication(Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for InPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InPublication")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use game::Command;
@@ -934,6 +973,48 @@ mod tests {
         c.command(Command::Quit);
         assert_eq!(c.take_received(TimeUs(i64::MIN)), None);
         assert_eq!(c.take(), Some(Command::Quit));
+    }
+
+    /// A sender paused between its receipt and its bit holds every other
+    /// sender: a quit sent meanwhile is not published and nothing is
+    /// taken; once the first is published the second joins it, so the one
+    /// command taken has the first receipt and no receipt comes back
+    /// twice.
+    #[test]
+    fn a_sender_between_its_receipt_and_its_bit_holds_the_others() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        type Seen = (
+            TimeUs,
+            Option<(Command, TimeUs)>,
+            std::thread::JoinHandle<()>,
+        );
+        let c = Arc::new(Controls::new(QpcClock::start()));
+        c.quit_leaves();
+        let (other, taker) = (Arc::clone(&c), Arc::clone(&c));
+        let seen: Arc<Mutex<Option<Seen>>> = Arc::default();
+        let into = Arc::clone(&seen);
+        *c.in_publication.lock().unwrap() = Some(super::InPublication(Box::new(move || {
+            let paused = taker.now();
+            let sender = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                other.command(Command::Quit);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            *into.lock().unwrap() = Some((paused, taker.take_received(ALL), sender));
+        })));
+        c.command(Command::Quit);
+        let (paused, during, sender) = seen.lock().unwrap().take().unwrap();
+        sender.join().unwrap();
+        assert_eq!(
+            during, None,
+            "a quit published or taken while the first was paused"
+        );
+        let (taken, at) = c.take_received(ALL).expect("the first quit");
+        assert_eq!(taken, Command::Quit);
+        assert!(at.0 <= paused.0, "{at:?} is not the first quit's receipt");
+        assert_eq!(c.take_received(ALL), None, "the second joined the first");
     }
 
     /// A take returns the receipt of the command it takes: a quit

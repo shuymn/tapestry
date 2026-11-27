@@ -2648,17 +2648,22 @@ impl Rig for PlayerRig<'_> {
     /// next play's. A controller's retry carries no receipt of its own: it
     /// is received when taken here.
     fn take_menu(&mut self) -> Option<MenuCommand> {
-        loop {
-            match self.controls.take() {
-                Some(Command::Retry) => {
+        // A command received by a fade phase's takeover is the phase's,
+        // however late its sender published it: the result's one check.
+        let takeover = self.result_input.takeover();
+        while let Some((c, at)) = self.controls.take_received(TimeUs(i64::MAX)) {
+            if takeover.is_some_and(|t| at.0 <= t.0) {
+                continue;
+            }
+            match c {
+                Command::Retry => {
                     if let Some(at) = self.controls.retry_at() {
                         self.result_retries.offer(at);
                     }
                     return Some(MenuCommand::Retry);
                 }
-                Some(Command::Quit) => return Some(MenuCommand::Back),
-                Some(Command::Suspend) => {}
-                None => break,
+                Command::Quit => return Some(MenuCommand::Back),
+                Command::Suspend => {}
             }
         }
         let c = self.result_input.take();

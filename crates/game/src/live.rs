@@ -1285,6 +1285,7 @@ fn run_from<R: Rig>(
             next_round,
             counted_down,
             fade,
+            saved,
         }) = played
         else {
             return leave(rig);
@@ -1300,7 +1301,6 @@ fn run_from<R: Rig>(
         }
         // A fade phase's play is reported at the phase's end, once it is
         // over; it runs while the result is prepared.
-        let saved = rig.now();
         let mut fade = fade.map(|deadline| Fade {
             deadline,
             saved,
@@ -1878,6 +1878,9 @@ pub(crate) struct Played {
     /// fade-out began ([`TailEnd::Fade`]): the play is over at its end, not
     /// at its save.
     fade: Option<TimeUs>,
+    /// When the play's save ended, on the rig's clock, read as it returned:
+    /// a fade phase's takeover is no earlier.
+    saved: TimeUs,
 }
 
 /// How a chart's first attempt opens ([`run_chart_with`]); every later
@@ -2492,6 +2495,9 @@ pub(crate) fn open_and_play<R: Rig>(
         start_tuning,
         closing: closing_report,
     });
+    // The save's end, as it returned: a fade phase's result takes the
+    // input over no earlier, however long the flow takes to go on.
+    let saved = rig.now();
     // A completed play's tail took the carried command.
     let next = carried.filter(|_| end != PlayEnd::Completed);
     // The quit key before the chart started (in READY, or as
@@ -2525,6 +2531,7 @@ pub(crate) fn open_and_play<R: Rig>(
         next_round,
         counted_down,
         fade,
+        saved,
     }))
 }
 

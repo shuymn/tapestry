@@ -3074,7 +3074,8 @@ fn the_fade_layout_switch_holds_every_request_to_the_fades_end() {
 /// result's however late the game sees the phase end: the quit key stays
 /// pending for the result's back, and a key the window observed then is
 /// the result's; one observed before the takeover was the phase's and is
-/// dropped (design.md "State Model", ResultPreparing).
+/// dropped, one the window publishes only after the phase's end included
+/// (design.md "State Model", ResultPreparing).
 #[test]
 fn input_past_the_fades_takeover_is_the_results() {
     use crate::select::{MenuInput, MenuKey, Observed};
@@ -3092,6 +3093,9 @@ fn input_past_the_fades_takeover_is_the_results() {
             })
         };
         let (before, after) = (observed(takeover.0 - 10), observed(takeover.0 + 5));
+        // Stamped before the takeover by a window thread then held until
+        // the phase has ended.
+        let late = observed(takeover.0 - 5);
         let menu = Arc::clone(&rig.result_input.menu);
         menu.push_stamped(MenuInput::Key(MenuKey::Up), before);
         menu.push_stamped(MenuInput::Key(MenuKey::Down), after);
@@ -3106,8 +3110,34 @@ fn input_past_the_fades_takeover_is_the_results() {
             "the quit is the result's"
         );
         rig.fade_ended(game::FadeEnd::RanOut, takeover);
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), late);
         assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
         assert_eq!(rig.take_menu(), Some(MenuCommand::NextPreset));
         assert_eq!(rig.take_menu(), None);
+    });
+}
+
+/// A command received by the fade phase's takeover that no look of the
+/// phase took (its sender published it after the phase's last look) is
+/// the phase's: the result drops it as it takes its input, and a quit
+/// received after the takeover is the result's back.
+#[test]
+fn a_command_the_fade_never_took_is_not_the_results() {
+    use game::{Command, MenuCommand};
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        let start = rig.now();
+        let takeover = TimeUs(start.0 + 20_000);
+        rig.fade_phase(start, takeover);
+        rig.controls.quit_leaves();
+        rig.controls.command(Command::Quit);
+        while rig.now().0 <= takeover.0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.fade_ended(game::FadeEnd::RanOut, takeover);
+        assert_eq!(rig.take_menu(), None, "the phase's quit");
+        rig.controls.command(Command::Quit);
+        assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
     });
 }

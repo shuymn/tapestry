@@ -44,13 +44,6 @@ impl Pad {
         while self.pop().is_some() {}
     }
 
-    /// Drops the events observed by `at`, at it included.
-    pub fn drop_through(&mut self, at: bms_model::TimeUs) {
-        if let Some(r) = self.receiver.as_mut() {
-            r.drop_through(at);
-        }
-    }
-
     /// Reports events the full queue dropped since the last report.
     pub fn report_dropped(&mut self, screen: &str) {
         let Some(pad) = &self.receiver else {
@@ -93,6 +86,10 @@ pub struct ResultInput {
     pub pad: Pad,
     /// Which screen reads them.
     owner: Owner,
+    /// A full play's fade phase's takeover, for the result after it: what
+    /// the window or the controller observed by it is the phase's,
+    /// dropped wherever and however late it is taken ([`take`](Self::take)).
+    takeover: Option<bms_model::TimeUs>,
 }
 
 impl ResultInput {
@@ -105,6 +102,7 @@ impl ResultInput {
                 dropped: 0,
             },
             owner: Owner::None,
+            takeover: None,
         }
     }
 
@@ -125,6 +123,7 @@ impl ResultInput {
     pub fn take_over(&mut self, owner: Owner) {
         self.clear();
         self.owner = owner;
+        self.takeover = None;
     }
 
     /// A result shows: on entry, what was queued during the play is
@@ -139,38 +138,56 @@ impl ResultInput {
     }
 
     /// A result shows after a full play's fade phase that ended at
-    /// `takeover`: as [`enter`](Self::enter), keeping what the window and
-    /// the controller observed after `takeover`, the result's own
-    /// however late the game took the queues over (design.md "State
-    /// Model", ResultPreparing).
+    /// `takeover`: as [`enter`](Self::enter), but what the window and the
+    /// controller observed after `takeover` is the result's own, however
+    /// late the game took the queues over, and what they observed by it
+    /// the phase's, however late it is published: the one check, at each
+    /// take (design.md "State Model", ResultPreparing).
     pub fn enter_from(&mut self, takeover: bms_model::TimeUs) -> bool {
         if self.owner == Owner::Result {
             return false;
         }
-        self.menu.drop_through(takeover);
-        self.pad.drop_through(takeover);
         self.owner = Owner::Result;
+        self.takeover = Some(takeover);
         true
+    }
+
+    /// The fade phase's takeover the result's input counts from, if the
+    /// result followed one ([`enter_from`](Self::enter_from)).
+    pub const fn takeover(&self) -> Option<bms_model::TimeUs> {
+        self.takeover
     }
 
     /// No screen reads the queues (a play is about to start); what arrives
     /// meanwhile is dropped by the next owner.
     pub fn release(&mut self) {
         self.owner = Owner::None;
+        self.takeover = None;
     }
 
     /// The next result command queued, while a result shows: the
     /// controller's first, then the window's; keys and text that mean
-    /// nothing there are dropped.
+    /// nothing there are dropped, and so is what was observed by a fade
+    /// phase's takeover ([`enter_from`](Self::enter_from)).
     pub fn take(&mut self) -> Option<MenuCommand> {
         if self.owner != Owner::Result {
             return None;
         }
-        if let Some(event) = self.pad.pop() {
-            return Some(result_event(event));
+        let takeover = self.takeover;
+        let fresh = |at: bms_model::TimeUs| takeover.is_none_or(|t| at.0 > t.0);
+        while let Some((event, _, _, at)) = self.pad.pop_stamped() {
+            if fresh(at) {
+                return Some(result_event(event));
+            }
         }
         self.pad.report_dropped("result");
-        while let Some(input) = self.menu.pop() {
+        while let Some(entry) = self.menu.pop_observed() {
+            let Some((input, observed)) = entry else {
+                continue;
+            };
+            if observed.is_some_and(|o| !fresh(o.at)) {
+                continue;
+            }
             if let MenuInput::Key(key) = input
                 && let Some(c) = result_key(key)
             {
@@ -214,7 +231,8 @@ mod tests {
 
     /// A result entered after a fade phase keeps the keys the window
     /// observed after the phase's takeover, however late it is entered,
-    /// and drops those observed by it and the game thread's own.
+    /// and drops those observed by it, one published after the entry
+    /// included (a window thread held between its stamp and its push).
     #[test]
     fn a_result_entered_after_a_fade_keeps_what_came_after_its_takeover() {
         let menu = Arc::new(MenuQueue::default());
@@ -225,18 +243,85 @@ mod tests {
             })
         };
         menu.push_stamped(MenuInput::Key(MenuKey::Up), at(490));
-        menu.push(MenuInput::Key(MenuKey::Up));
         menu.push_stamped(MenuInput::Key(MenuKey::Up), at(500));
         menu.push_stamped(MenuInput::Key(MenuKey::Down), at(505));
-        menu.push_stamped(MenuInput::Key(MenuKey::Up), at(506));
         let mut input = ResultInput::new(Arc::clone(&menu), None);
+        // Stamped by the window before the takeover, pushed after the
+        // entry.
+        let held = at(495);
         assert!(input.enter_from(TimeUs(500)));
+        assert_eq!(input.takeover(), Some(TimeUs(500)));
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), held);
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), at(506));
         assert_eq!(input.take(), Some(MenuCommand::NextPreset));
         assert_eq!(input.take(), Some(MenuCommand::PrevPreset));
         assert_eq!(input.take(), None);
-        // Entered again, it keeps what came since.
-        menu.push_stamped(MenuInput::Key(MenuKey::Down), at(400));
-        assert!(!input.enter_from(TimeUs(500)));
+        // Entered again, it keeps what came since; another owner's entry
+        // ends the watermark.
+        menu.push_stamped(MenuInput::Key(MenuKey::Down), at(507));
+        assert!(!input.enter_from(TimeUs(600)));
         assert_eq!(input.take(), Some(MenuCommand::NextPreset));
+        input.release();
+        assert_eq!(input.takeover(), None);
+    }
+
+    /// The controller's events observed by the fade phase's takeover are
+    /// the phase's too, one published after the entry included; those
+    /// observed after it are the result's.
+    #[test]
+    fn a_result_after_a_fade_drops_the_controllers_events_by_its_takeover() {
+        use eval::ControlId;
+        use input::hid::HidProduct;
+        use input::{
+            DeviceId, DeviceKind, MenuAction, MenuBindings, MenuEvent, Packet, SourceConfig,
+            SourceSet,
+        };
+        let product = HidProduct {
+            vendor_id: 1,
+            product_id: 2,
+            interface: None,
+        };
+        let (tap, receiver) = input::menu_queue(MenuBindings {
+            product,
+            controls: vec![
+                (ControlId(1), MenuAction::Press(MenuEvent::Confirm)),
+                (ControlId(2), MenuAction::Press(MenuEvent::Back)),
+            ],
+            step: 2,
+            relative: None,
+            wrap: None,
+        });
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 1,
+            max_sources: 1,
+            max_held: 4,
+            queue_capacity: 8,
+            max_arrivals: 1,
+        })
+        .unwrap();
+        set.connect(DeviceId(7), DeviceKind::Controller);
+        set.set_product(DeviceId(7), product);
+        set.set_menu(tap);
+        set.menu_mut().unwrap().set_active(true);
+        let press = |set: &mut SourceSet, control: u32, at: i64| {
+            set.begin_batch(TimeUs(at));
+            for value in [1, 0] {
+                set.packet(&Packet {
+                    device: DeviceId(7),
+                    control: ControlId(control),
+                    value,
+                    background: false,
+                });
+            }
+            set.end_batch(TimeUs(at));
+        };
+        let mut input = ResultInput::new(Arc::new(MenuQueue::default()), Some(receiver));
+        press(&mut set, 1, 490);
+        assert!(input.enter_from(TimeUs(500)));
+        // Observed by the takeover, sent after the entry.
+        press(&mut set, 1, 500);
+        press(&mut set, 2, 505);
+        assert_eq!(input.take(), Some(MenuCommand::Back));
+        assert_eq!(input.take(), None);
     }
 }

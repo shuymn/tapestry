@@ -330,15 +330,6 @@ impl MenuReceiver {
             .map(|(event, panel, stamp, at)| (event, panel.map(usize::from), stamp, at))
     }
 
-    /// Drops the events whose press was observed by `at`, at it
-    /// included, oldest first, up to the first observed after it, which
-    /// stays.
-    pub fn drop_through(&mut self, at: TimeUs) {
-        while self.queue.peek().is_ok_and(|&(_, _, _, t)| t.0 <= at.0) {
-            let _ = self.queue.pop();
-        }
-    }
-
     /// Events dropped so far because the queue was full.
     #[must_use]
     pub fn dropped(&self) -> u64 {

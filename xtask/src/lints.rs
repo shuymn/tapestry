@@ -349,6 +349,7 @@ pub const IN_PLAY: &[Site] = &[
             "Controls::take",
             "Controls::take_closing",
             "Controls::take_with",
+            "Controls::receipt",
             "Controls::leaving",
             "Controls::ingress",
             "Controls::retry_at",
