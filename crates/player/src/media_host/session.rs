@@ -445,6 +445,8 @@ pub enum Event {
     Reaped { pid: u32 },
     /// A seek for `run` sent, as command `id`.
     Seek { run: u64, id: u32 },
+    /// Player `player`'s play sent, as command `id`.
+    Play { player: u8, id: u32 },
     /// A seek for `run` answered, `landed` or not.
     Sought { run: u64, landed: Option<i64> },
     /// Run `run`'s end taken as the video's ended run.
@@ -1900,6 +1902,13 @@ impl Supervisor {
         }) {
             Ok(play) => {
                 p.wait_on(Stage::Playing(play));
+                event!(
+                    self.shared,
+                    Event::Play {
+                        player: id,
+                        id: play
+                    }
+                );
                 Ok(())
             }
             Err(_) => Err(Loss::Transport),
