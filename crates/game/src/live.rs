@@ -649,8 +649,8 @@ pub trait Rig {
     /// The retry's loading state at the outro's end, read through the
     /// reveal word the render thread moves (design.md "Screen
     /// Transitions and Loading", the reveal word, a result arm): its
-    /// reveal, a reveal withheld (closed or refused), or still pending.
-    /// Revealed by default.
+    /// reveal, a reveal refused (closed, or refused with its reason),
+    /// or still pending. Revealed by default.
     fn outro_step(&mut self) -> OutroReveal {
         OutroReveal::Revealed
     }
@@ -1230,13 +1230,15 @@ pub enum Outro {
 
 /// How a retry's loading state stands at its outro's end
 /// ([`Rig::outro_step`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutroReveal {
     /// The render thread revealed it: the result is left.
     Revealed,
-    /// It will not be revealed: the window closed, or the outro's
-    /// preparation was refused, which the flow takes on.
-    Withheld,
+    /// It will not be revealed: the window closed, or the word was
+    /// refused (the outro's preparation refused, or no frame took the
+    /// reveal within the bound), for this reason. The retry opens
+    /// nothing and takes the refusal's route.
+    Refused(PreparationRefusal),
     /// The render thread has not revealed it yet; its reveal wakes the
     /// next look.
     Pending,
@@ -1933,22 +1935,29 @@ fn poll_outro<R: Rig>(
         }
     };
     let deadline = std::time::Instant::now() + PREP_SLICE;
-    *outro = Some(
-        match rig
-            .poll_preparation(&mut handle, deadline)
-            .map_err(LiveError::Screen)?
-        {
-            PrepPoll::Pending => OutroPrep::Running(handle),
-            PrepPoll::Done(Preparation::Ready) => OutroPrep::Ready(handle),
-            PrepPoll::Done(Preparation::Refused(why)) => {
-                rig.outro_refused();
-                OutroPrep::Refused(why)
-            }
-            // A miss prepares at the outro's end, and so does a
-            // cancellation, which the end's looks take on.
-            PrepPoll::Done(Preparation::Missed | Preparation::Cancelled) => OutroPrep::None,
-        },
-    );
+    let Ok(polled) = rig.poll_preparation(&mut handle, deadline) else {
+        // The screen failed under the staging (a device lost): what it
+        // staged went with it. Discarded, the screen built again as in
+        // Result, the reveal kept, and the attempt prepared at the
+        // outro's end; a screen that cannot be built again ends the run.
+        rig.discard_attempt();
+        *outro = Some(OutroPrep::None);
+        return rig.prepare_screen().map_err(LiveError::Screen);
+    };
+    *outro = Some(match polled {
+        PrepPoll::Pending => OutroPrep::Running(handle),
+        PrepPoll::Done(Preparation::Ready) => OutroPrep::Ready(handle),
+        PrepPoll::Done(Preparation::Refused(why)) => {
+            rig.outro_refused();
+            OutroPrep::Refused(why)
+        }
+        // A miss is discarded at once and prepares at the outro's end,
+        // and so does a cancellation, which the end's looks take on.
+        PrepPoll::Done(Preparation::Missed | Preparation::Cancelled) => {
+            rig.discard_attempt();
+            OutroPrep::None
+        }
+    });
     Ok(())
 }
 
@@ -1970,11 +1979,24 @@ fn drop_carried<R: Rig>(rig: &mut R, outro: Option<&OutroPrep>) {
 ///
 /// # Errors
 ///
-/// A thread's failure, with its cause.
-fn outro_revealed<R: Rig>(rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
+/// A thread's failure, with its cause; a refused reveal, with the
+/// outro's preparation's refusal when it had one, else the word's.
+fn outro_revealed<R: Rig>(
+    rig: &mut R,
+    outro: Option<&OutroPrep>,
+) -> Result<bool, LiveError<R::ScreenError>> {
     loop {
-        if rig.outro_step() != OutroReveal::Pending {
-            return Ok(!rig.quitting());
+        match rig.outro_step() {
+            OutroReveal::Revealed => return Ok(!rig.quitting()),
+            _ if rig.quitting() => return Ok(false),
+            OutroReveal::Refused(why) => {
+                let why = match outro {
+                    Some(OutroPrep::Refused(r)) => r.clone(),
+                    _ => why,
+                };
+                return Err(refused(rig, LiveError::Preparation(why)));
+            }
+            OutroReveal::Pending => {}
         }
         let next = rig.now().0.saturating_add(1_000);
         rig.idle_wait(TimeUs(next));
@@ -2181,9 +2203,27 @@ fn ready_standard<R: Rig>(
     }
     // A retry from an outro leaves the result once its loading state is
     // revealed, the render thread's own move at the outro's end.
-    if outro.is_some() && !outro_revealed(rig)? {
-        drop_carried(rig, outro.as_ref());
-        return Ok(None);
+    if outro.is_some() {
+        match outro_revealed(rig, outro.as_ref()) {
+            Ok(true) => {}
+            Ok(false) => {
+                drop_carried(rig, outro.as_ref());
+                return Ok(None);
+            }
+            // Refused: the word stays as the refusal left it, for the
+            // next arm after the refusal's route; only what the outro
+            // prepared goes.
+            Err(e @ LiveError::Preparation(_)) => {
+                if matches!(outro, Some(OutroPrep::Running(_) | OutroPrep::Ready(_))) {
+                    rig.discard_attempt();
+                }
+                return Err(e);
+            }
+            Err(e) => {
+                drop_carried(rig, outro.as_ref());
+                return Err(e);
+            }
+        }
     }
     // The device first, for the play and the menus alike; it prepares no
     // attempt.

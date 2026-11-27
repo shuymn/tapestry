@@ -9501,12 +9501,17 @@ impl Run {
                         // The pinned result draws on: the reveal enters
                         // the loading state.
                         AttemptPart::Outro(attempt) => {
+                            // Read on receipt. Behind the result arm, its
+                            // creation waits for the reveal rather than
+                            // release the result; one received after the
+                            // reveal (or once the word was refused) is an
+                            // ordinary request, its admission and deadline
+                            // unchanged.
+                            let behind = self.reveal_arm.is_some_and(|a| a.result);
                             self.begin_attempt(request, lifetime, attempt, skin, reply, adopts);
-                            // Its creation waits for the reveal rather than
-                            // release the result; a boundary takes it next.
                             if let Some(p) = self.attempt.as_mut().filter(|p| p.request == request)
                             {
-                                p.outro = true;
+                                p.outro = behind;
                             }
                         }
                     }

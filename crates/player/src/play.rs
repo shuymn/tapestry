@@ -3121,7 +3121,9 @@ impl Rig for PlayerRig<'_> {
     fn outro_step(&mut self) -> game::OutroReveal {
         match self.render.reveal_at_step() {
             crate::render_side::AtStep::Revealed => game::OutroReveal::Revealed,
-            crate::render_side::AtStep::Refused => game::OutroReveal::Withheld,
+            crate::render_side::AtStep::Refused => {
+                game::OutroReveal::Refused(crate::selection::refused_before_reveal())
+            }
             crate::render_side::AtStep::Pending => game::OutroReveal::Pending,
         }
     }
