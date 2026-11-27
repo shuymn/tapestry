@@ -604,6 +604,12 @@ pub struct AttemptPrep {
     handoff: Option<early::Handoff>,
     /// When the render thread was asked.
     staging: Instant,
+    /// Reuse-only: a retry's preparation during its result's outro,
+    /// whose Lua-bearing stages consume only a reuse proved against
+    /// what they read, any other branch [`Preparation::Missed`]
+    /// (design.md "Play Lifecycle", Preparing each attempt, a retry
+    /// from an outro).
+    reuse_only: bool,
     stage: PrepStage,
 }
 
@@ -833,18 +839,32 @@ impl PlayerRig<'_> {
         // The kept probe only while the selection's and decision's
         // charges leave room for any result atlas, decided before play.
         let menus = self.render.result_status().menus;
-        self.result_skin
-            .set_kept_probe(crate::result_skin::kept_probe_fits(menus));
+        let kept = crate::result_skin::kept_probe_fits(menus);
+        // A mode change drops what the outro's result may present.
+        if prep.reuse_only && self.result_skin.kept_probe_differs(kept) {
+            return PrepStage::Ended(Preparation::Missed);
+        }
+        self.result_skin.set_kept_probe(kept);
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
         self.fresh_result_report();
         // The choice's claim on the preload moves into the stage, which
         // adopts a claimed pack still running.
-        let claim = self.preload_claim.take();
-        match self.result_skin.begin_image_stage(chart, prep.class, claim) {
+        // A reuse-only stage adopts none: the claim stays for the stage
+        // at the outro's end.
+        let claim = if prep.reuse_only {
+            None
+        } else {
+            self.preload_claim.take()
+        };
+        match self
+            .result_skin
+            .begin_image_stage(chart, prep.class, claim, prep.reuse_only)
+        {
             crate::result_skin::ImageStage::Ready(staged) => self.after_image(prep, skin, staged),
             crate::result_skin::ImageStage::Running(job)
             | crate::result_skin::ImageStage::Adopted(job) => PrepStage::Image(skin, job),
+            crate::result_skin::ImageStage::Missed => PrepStage::Ended(Preparation::Missed),
         }
     }
 
@@ -901,6 +921,121 @@ impl PlayerRig<'_> {
     /// chart's labels). None for a chart given on the command line, which
     /// shows its own `#DIFFICULTY`.
     // Source: SF-021
+    /// [`Rig::begin_preparation`], reuse-only with `reuse_only`
+    /// ([`Rig::begin_outro_preparation`]).
+    fn begin_preparation_with(
+        &mut self,
+        loaded: &Loaded,
+        key: game::PrepKey,
+        reuse_only: bool,
+    ) -> game::PrepHandle {
+        if self.drop_prep().is_some() && self.run_ends() {
+            self.preps += 1;
+            self.prep = Some(AttemptPrep {
+                ticket: self.preps,
+                attempt: None,
+                loading_gauge: None,
+                displayed: loaded.displayed().0,
+                chart: crate::result_skin::attempt_chart(loaded),
+                class: crate::result_skin::attempt_class(loaded),
+                difficulty: None,
+                labels: None,
+                images: (std::path::PathBuf::new(), [String::new(), String::new()]),
+                scratch_notes: Vec::new(),
+                specialized: false,
+                handoff: None,
+                staging: Instant::now(),
+                reuse_only,
+                stage: PrepStage::Ended(Preparation::Cancelled),
+            });
+            return game::PrepHandle::new(key, self.preps);
+        }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("prep:begin", i64::try_from(self.preps).unwrap_or(-1));
+        self.result_skin.next_attempt();
+        self.presenter.next_attempt();
+        self.cutoff_asked = false;
+        self.preps += 1;
+        let attempt = loaded.attempt();
+        let labels = crate::result_present::labels_of(&attempt.labels, attempt.score.setting);
+        let images = (
+            crate::chart_images::folder(loaded.path()),
+            [
+                attempt.labels.stagefile.clone(),
+                attempt.labels.backbmp.clone(),
+            ],
+        );
+        let difficulty = self.chosen_difficulty(loaded);
+        let mut prep = AttemptPrep {
+            ticket: self.preps,
+            attempt: Some(attempt),
+            loading_gauge: shown_gauge(loaded.preset(), loaded.displayed().0),
+            displayed: loaded.displayed().0,
+            chart: crate::result_skin::attempt_chart(loaded).with_difficulty(difficulty),
+            class: crate::result_skin::attempt_class(loaded),
+            difficulty,
+            labels: Some(labels),
+            images,
+            // Autoplay's turntable presses its scratch notes.
+            scratch_notes: if self.autoplay {
+                game::scratch_notes(loaded.chart(), loaded.chart().meta.ln_mode)
+            } else {
+                Vec::new()
+            },
+            specialized: false,
+            handoff: None,
+            staging: Instant::now(),
+            reuse_only,
+            stage: PrepStage::Answered(None),
+        };
+        // The attempt's BGA: a retry's is a new generation, its array
+        // reused when nothing changed; begun now, beside the rest.
+        self.bga.attempt(crate::bga::Want::of(
+            loaded.path(),
+            loaded.chart(),
+            self.bga_session.shown(),
+            loaded.restore_at(),
+        ));
+        if let Some(s) = &self.selection {
+            self.bga.step(Some((&s.coord, s.spawner)), &|| false);
+        }
+        prep.stage = match self.begin_skin(loaded, &mut prep.handoff, reuse_only) {
+            Ok(SkinStep::Ready(skin)) => self.enter_facts(&mut prep, skin),
+            Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
+            Err(ended) => PrepStage::Ended(ended),
+        };
+        let handle = game::PrepHandle::new(key, prep.ticket);
+        self.prep = Some(prep);
+        handle
+    }
+
+    /// Why a retry accepted with its outro ahead cannot be prepared
+    /// during it, read only from what is resident: a Lua-bearing stage
+    /// whose reuse is not proved (design.md "Threat Model", T09). The
+    /// early answer only: the reuse-only preparation decides.
+    fn outro_miss(&mut self, loaded: &Loaded) -> Option<&'static str> {
+        if let Some(pending) = &self.pending
+            && pending
+                .kept_for(&crate::imports::facts::attempt_facts(loaded, self.autoplay))
+                .is_none()
+        {
+            return Some("the play skin's specialization must run again");
+        }
+        if self.result_run_disabled() {
+            return None;
+        }
+        let Some(images) = self.chart_images.facts() else {
+            return Some("the chart's images are not resolved");
+        };
+        let chart = crate::result_skin::attempt_chart(loaded)
+            .with_difficulty(self.chosen_difficulty(loaded))
+            .resolved(images);
+        let kept = crate::result_skin::kept_probe_fits(self.render.result_status().menus);
+        self.result_skin
+            .would_reuse(chart, crate::result_skin::attempt_class(loaded), kept)
+            .err()
+    }
+
     fn chosen_difficulty(&self, loaded: &Loaded) -> Option<u8> {
         self.selection
             .as_ref()?
@@ -954,15 +1089,25 @@ impl PlayerRig<'_> {
             return PrepStage::Ended(Preparation::Refused(refusal));
         }
         let adopts = handoff.as_ref().map(|h| h.request);
-        let pending = self.render.begin_adopting(attempt, skin, adopts);
+        // Behind a retry's outro, the result draws on until the reveal.
+        let pending = if prep.reuse_only {
+            self.render.begin_behind_outro(attempt, skin)
+        } else {
+            self.render.begin_adopting(attempt, skin, adopts)
+        };
         let request = pending.request();
         let stage = PrepStage::Screen(pending);
         // Its ticket goes once the attempt's request is out: the early
         // request's discard, if any, comes after the adoption.
         drop(handoff);
         // After its PrepareAttempt, so play's admission comes first on the
-        // render thread.
-        self.begin_pages_ticket([Some(request), adopts]);
+        // render thread. Behind an outro none: no upload replaces the
+        // installation the outro draws, and a reuse-only stage reuses
+        // what is installed; the result step after the commit takes
+        // whatever else applies.
+        if !prep.reuse_only {
+            self.begin_pages_ticket([Some(request), adopts]);
+        }
         stage
     }
 
@@ -1784,7 +1929,9 @@ impl PlayerRig<'_> {
                     return;
                 }
                 Some(Ok(Preparation::Refused(why))) => why.to_string(),
-                Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
+                Some(Ok(Preparation::Cancelled | Preparation::Missed)) => {
+                    "the upload was withdrawn".to_owned()
+                }
                 Some(Err(e)) => Chain(&e).to_string(),
             };
             println!("skin: result: built-in for this attempt: {why}");
@@ -1840,11 +1987,18 @@ impl PlayerRig<'_> {
         &mut self,
         loaded: &Loaded,
         handoff: &mut Option<early::Handoff>,
+        reuse_only: bool,
     ) -> Result<SkinStep, Preparation> {
         let Some(mut pending) = self.pending.take() else {
             return Ok(SkinStep::Ready(AttemptSkin::InUse));
         };
         let facts = crate::imports::facts::attempt_facts(loaded, self.autoplay);
+        // Reuse-only, the kept specialization or nothing: no Lua runs in
+        // a retry's outro (design.md "Threat Model", T09).
+        if reuse_only && pending.kept_for(&facts).is_none() {
+            self.pending = Some(pending);
+            return Err(Preparation::Missed);
+        }
         // What the decision screen's early preparation built is this
         // attempt's kept specialization, reused below while its facts hold
         // (design.md "Screen Transitions and Loading").
@@ -2939,82 +3093,47 @@ impl Rig for PlayerRig<'_> {
     /// is over, the run's end is looked at again: when it came, however
     /// the settle ended, nothing new begins and the handle is cancelled.
     fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
-        if self.drop_prep().is_some() && self.run_ends() {
-            self.preps += 1;
-            self.prep = Some(AttemptPrep {
-                ticket: self.preps,
-                attempt: None,
-                loading_gauge: None,
-                displayed: loaded.displayed().0,
-                chart: crate::result_skin::attempt_chart(loaded),
-                class: crate::result_skin::attempt_class(loaded),
-                difficulty: None,
-                labels: None,
-                images: (std::path::PathBuf::new(), [String::new(), String::new()]),
-                scratch_notes: Vec::new(),
-                specialized: false,
-                handoff: None,
-                staging: Instant::now(),
-                stage: PrepStage::Ended(Preparation::Cancelled),
-            });
-            return game::PrepHandle::new(key, self.preps);
+        self.begin_preparation_with(loaded, key, false)
+    }
+
+    fn begin_outro_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
+        self.begin_preparation_with(loaded, key, true)
+    }
+
+    fn retry_outro_began(&mut self, end: TimeUs) {
+        self.begin_retry_loading(end);
+    }
+
+    fn outro_reuse(&mut self, loaded: &Loaded) -> bool {
+        // The run's record tells the fast path from the miss path.
+        match self.outro_miss(loaded) {
+            None => {
+                println!("retry: prepared during the result's outro");
+                true
+            }
+            Some(why) => {
+                println!("retry: prepared after the result's outro: {why}");
+                false
+            }
         }
-        #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark("prep:begin", i64::try_from(self.preps).unwrap_or(-1));
-        self.result_skin.next_attempt();
-        self.presenter.next_attempt();
-        self.cutoff_asked = false;
-        self.preps += 1;
-        let attempt = loaded.attempt();
-        let labels = crate::result_present::labels_of(&attempt.labels, attempt.score.setting);
-        let images = (
-            crate::chart_images::folder(loaded.path()),
-            [
-                attempt.labels.stagefile.clone(),
-                attempt.labels.backbmp.clone(),
-            ],
-        );
-        let difficulty = self.chosen_difficulty(loaded);
-        let mut prep = AttemptPrep {
-            ticket: self.preps,
-            attempt: Some(attempt),
-            loading_gauge: shown_gauge(loaded.preset(), loaded.displayed().0),
-            displayed: loaded.displayed().0,
-            chart: crate::result_skin::attempt_chart(loaded).with_difficulty(difficulty),
-            class: crate::result_skin::attempt_class(loaded),
-            difficulty,
-            labels: Some(labels),
-            images,
-            // Autoplay's turntable presses its scratch notes.
-            scratch_notes: if self.autoplay {
-                game::scratch_notes(loaded.chart(), loaded.chart().meta.ln_mode)
-            } else {
-                Vec::new()
-            },
-            specialized: false,
-            handoff: None,
-            staging: Instant::now(),
-            stage: PrepStage::Answered(None),
-        };
-        // The attempt's BGA: a retry's is a new generation, its array
-        // reused when nothing changed; begun now, beside the rest.
-        self.bga.attempt(crate::bga::Want::of(
-            loaded.path(),
-            loaded.chart(),
-            self.bga_session.shown(),
-            loaded.restore_at(),
-        ));
-        if let Some(s) = &self.selection {
-            self.bga.step(Some((&s.coord, s.spawner)), &|| false);
+    }
+
+    fn outro_step(&mut self) -> game::OutroReveal {
+        match self.render.reveal_at_step() {
+            crate::render_side::AtStep::Revealed => game::OutroReveal::Revealed,
+            crate::render_side::AtStep::Refused => {
+                game::OutroReveal::Refused(crate::selection::refused_before_reveal())
+            }
+            crate::render_side::AtStep::Pending => game::OutroReveal::Pending,
         }
-        prep.stage = match self.begin_skin(loaded, &mut prep.handoff) {
-            Ok(SkinStep::Ready(skin)) => self.enter_facts(&mut prep, skin),
-            Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
-            Err(ended) => PrepStage::Ended(ended),
-        };
-        let handle = game::PrepHandle::new(key, prep.ticket);
-        self.prep = Some(prep);
-        handle
+    }
+
+    fn outro_withdrawn(&mut self) {
+        self.render.close_reveal();
+    }
+
+    fn outro_refused(&mut self) {
+        self.render.refuse_reveal();
     }
 
     /// Drives the preparation until `deadline`: the specialization's job,

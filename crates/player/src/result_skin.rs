@@ -701,6 +701,9 @@ pub enum ImageStage {
     /// It waits for the preload's claimed pack, which it adopted in place
     /// of its own import and build; polled as [`Running`](Self::Running).
     Adopted(Box<ImageJob>),
+    /// A reuse-only stage (a retry's, during its result's outro) found
+    /// no reuse: nothing was imported, built, drained or adopted.
+    Missed,
 }
 
 /// An image stage in flight: its own job, or the preload's pack it
@@ -1747,8 +1750,9 @@ impl ResultSkin {
         mut quit: impl FnMut() -> bool,
         mut end_run: impl FnMut() -> bool,
     ) -> Staged {
-        match self.begin_image_stage(chart, class, None) {
+        match self.begin_image_stage(chart, class, None, false) {
             ImageStage::Ready(staged) => staged,
+            ImageStage::Missed => unreachable!("only a reuse-only stage misses"),
             ImageStage::Running(mut job) | ImageStage::Adopted(mut job) => loop {
                 if let Some(staged) = self.poll_image_stage(&mut job, None, &mut quit, &mut end_run)
                 {
@@ -1766,20 +1770,56 @@ impl ResultSkin {
     /// the mode now preferred is adopted instead ([`ImageStage::Adopted`]):
     /// no import or build of the stage's own (design.md "beatoraja Lua
     /// Skins", the result skin's preload).
+    /// Reuse-only (`reuse_only`, a retry's stage during its result's
+    /// outro): no pack is adopted or drained and nothing is imported,
+    /// a stage that would is [`ImageStage::Missed`] (design.md "Play
+    /// Lifecycle", Preparing each attempt, a retry from an outro).
     pub fn begin_image_stage(
         &mut self,
         chart: ResultChart,
         class: Option<JudgeClass>,
         claim: Option<PreloadClaim>,
+        reuse_only: bool,
     ) -> ImageStage {
         self.chart = Some(chart);
         self.class = Some(class);
         // A pack that ended is collected first: packed, it is reused below.
         self.collect_preload(std::time::Duration::ZERO);
-        if let Some(adopted) = self.adopt_preload(claim) {
+        if !reuse_only && let Some(adopted) = self.adopt_preload(claim) {
             return ImageStage::Adopted(Box::new(ImageJob(InFlight::Adopted(adopted))));
         }
-        self.attempt_stage()
+        self.attempt_stage(reuse_only)
+    }
+
+    /// Whether the attempt's image stage for `chart` and `class` would
+    /// reuse what is resident with the kept probe's mode `kept`, read
+    /// only (a retry's early answer at its outro's acceptance, the
+    /// reuse-only stage deciding): why not, when not.
+    pub fn would_reuse(
+        &self,
+        chart: ResultChart,
+        class: Option<JudgeClass>,
+        kept: bool,
+    ) -> Result<(), &'static str> {
+        if self.kept_probe_differs(kept) {
+            return Err("the result skin's kept probe changes");
+        }
+        if self.pack_in_flight().is_some() {
+            return Err("a result pack is in flight");
+        }
+        match &self.start {
+            None | Some(ResultStart::Fixed(..)) => Ok(()),
+            Some(ResultStart::Pending(_)) => self
+                .reuse_for_attempt(&result_facts(probe_fields(chart), Some(class)))
+                .map(|_| ())
+                .ok_or("the result skin's images must be prepared again"),
+        }
+    }
+
+    /// Whether [`set_kept_probe`](Self::set_kept_probe) with `kept`
+    /// would change the mode, dropping what the other mode kept.
+    pub fn kept_probe_differs(&self, kept: bool) -> bool {
+        self.kept.is_some_and(|was| was != kept)
     }
 
     /// The attempt's image stage for the chart and judgment class set,
@@ -1791,9 +1831,12 @@ impl ResultSkin {
     /// first waits for its outcome to be collected in Preparing's polls
     /// ([`ImageStage::Running`]): nothing else takes the image state
     /// meanwhile. A packed one is reused below.
-    fn attempt_stage(&mut self) -> ImageStage {
+    fn attempt_stage(&mut self, reuse_only: bool) -> ImageStage {
         self.preload_on(Event::Attempt);
         if let Some(id) = self.pack_in_flight() {
+            if reuse_only {
+                return ImageStage::Missed;
+            }
             return ImageStage::Running(Box::new(ImageJob(InFlight::Draining(id))));
         }
         let (Some(chart), Some(class)) = (self.chart, self.class) else {
@@ -1846,6 +1889,11 @@ impl ResultSkin {
             }
             self.attempt = Some(reused);
             return ImageStage::Ready(Staged::Ready);
+        }
+        // Nothing imported in a retry's outro (design.md "Threat Model",
+        // T09): the stage runs at its end.
+        if reuse_only {
+            return ImageStage::Missed;
         }
         // A bundle for every view keeps its runtime: the probe's import
         // keeps one under a permit, taken after the eviction; laid out per
@@ -2020,9 +2068,11 @@ impl ResultSkin {
             }
             // Collected: the stage is decided from what the pack left, its
             // own job begun only when it left nothing.
-            match self.attempt_stage() {
+            // A reuse-only stage drains no pack, so this one is ordinary.
+            match self.attempt_stage(false) {
                 ImageStage::Ready(staged) => return Some(staged),
                 ImageStage::Running(next) | ImageStage::Adopted(next) => *job = *next,
+                ImageStage::Missed => return Some(Staged::Cancelled),
             }
         }
     }

@@ -1062,6 +1062,155 @@ fn a_release_by_an_attempts_admission_is_published_with_its_request() {
     rig.exit();
 }
 
+/// A retry staged during its result's outro whose play admission would
+/// release the result's installation (the result charged so that only
+/// releasing it admits a play skin at the atlas cap; design.md "Play
+/// Lifecycle", Preparing each attempt, a retry from an outro): its
+/// creation waits, so the result stays installed and drawn and no
+/// answer comes until the retry's loading state is revealed at the
+/// outro's end; then the admission releases the installation, published
+/// with the attempt's request, and the attempt is ready.
+// Revert: the release not deferred -> released before the reveal.
+#[test]
+fn a_retry_behind_an_outro_releases_the_result_only_at_the_reveal() {
+    use crate::render_side::AtStep;
+    use bms_model::TimeSource as _;
+    let (_dir, skin, _) = chart_skin("");
+    let (_a, red) = images(skin.side(), RED, BLUE);
+    let big = {
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        crate::render_decl::atlas_cap_bundle(&r, [0, 0, 255, 255])
+    };
+    let mut rig = Rig::new();
+    rig.link
+        .set_timeouts(Duration::from_secs(60), Duration::from_secs(10));
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(skin_model::ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    // The chart is loaded before the play, as the flow loads it.
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    rig.faults.charge_result.store(
+        render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + 256 * 256 * 2,
+        Ordering::Release,
+    );
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &viewed(1, &skin, 1_111, &[], &red),
+        &Overlay::default(),
+    );
+    let _ = first_with(&rig, 0);
+    let atlas = rig.link.result_status().installed;
+    assert_eq!(atlas, Some(skin.atlas_id()));
+    rig.link.begin_loading_held(&super::chosen("T"), None);
+    rig.link.loading().show(super::one_line("loading"));
+    let end = TimeUs(rig.link.clock.now().0 + 2_000_000);
+    rig.link.arm_reveal(end, rig.link.clock.now());
+    let mut attempt = rig.link.begin_behind_outro(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(big),
+    );
+    let request = attempt.request();
+    // Until the end: no answer, the result installed and drawn.
+    let mid = std::time::Instant::now() + Duration::from_millis(1_000);
+    assert!(
+        attempt.wait_until(Some(mid), || false).is_none(),
+        "answered before the reveal"
+    );
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, atlas, "{status:?}");
+    assert_eq!(status.released, None, "{status:?}");
+    reset(&rig);
+    assert!(rig.until(|d| skin_frame(d).is_some()), "the result draws");
+    assert_eq!(rig.link.reveal_at_step(), AtStep::Pending);
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    assert!(rig.link.clock.now() >= end);
+    assert_eq!(rig.link.reveal_at_step(), AtStep::Revealed);
+    let status = rig.link.result_status();
+    assert_eq!(status.released, Some(request), "{status:?}");
+    assert_eq!(status.installed, None, "{status:?}");
+    rig.exit();
+}
+
+/// A retry's staging sent behind its outro that reaches the render
+/// thread only after the reveal (its facts resolved past the outro's
+/// end) is an ordinary request: its admission releases the result at
+/// once and it is answered ready, never waiting for a reveal already
+/// taken.
+// Revert: the request kept behind the outro -> no answer.
+#[test]
+fn a_retry_staged_after_its_reveal_is_admitted_at_once() {
+    use crate::render_side::AtStep;
+    use bms_model::TimeSource as _;
+    let (_dir, skin, _) = chart_skin("");
+    let (_a, red) = images(skin.side(), RED, BLUE);
+    let big = {
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        crate::render_decl::atlas_cap_bundle(&r, [0, 0, 255, 255])
+    };
+    let mut rig = Rig::new();
+    rig.link
+        .set_timeouts(Duration::from_secs(60), Duration::from_secs(10));
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(skin_model::ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    rig.faults.charge_result.store(
+        render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + 256 * 256 * 2,
+        Ordering::Release,
+    );
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &viewed(1, &skin, 1_111, &[], &red),
+        &Overlay::default(),
+    );
+    let _ = first_with(&rig, 0);
+    rig.link.begin_loading_held(&super::chosen("T"), None);
+    rig.link.loading().show(super::one_line("loading"));
+    let end = TimeUs(rig.link.clock.now().0 + 100_000);
+    rig.link.arm_reveal(end, rig.link.clock.now());
+    assert!(wait_until(|| rig.link.reveal_at_step() == AtStep::Revealed));
+    let mut attempt = rig.link.begin_behind_outro(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(big),
+    );
+    let request = attempt.request();
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.expect("answered within its bound");
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    let status = rig.link.result_status();
+    assert_eq!(status.released, Some(request), "{status:?}");
+    assert_eq!(status.installed, None, "{status:?}");
+    rig.exit();
+}
+
 /// When a device is lost in a fade phase ([`lost_in_the_fade`]).
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Copy, Debug)]

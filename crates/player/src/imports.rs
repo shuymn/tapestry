@@ -207,7 +207,7 @@ pub fn log_staged(took: Duration, answer: Result<&Preparation, &crate::render_si
         Ok(Preparation::Refused(why)) => {
             log::info!("skin: play: its staging was refused in {ms} ms: {why}");
         }
-        Ok(Preparation::Cancelled) => {
+        Ok(Preparation::Cancelled | Preparation::Missed) => {
             log::info!("skin: play: its staging was cancelled after {ms} ms");
         }
         Err(e) => log::info!("skin: play: its staging failed after {ms} ms: {}", Chain(e)),
@@ -1730,7 +1730,7 @@ fn polled(
             None => {}
             Some(Ok(Preparation::Ready)) => return Ok(None),
             Some(Ok(Preparation::Refused(why))) => return Ok(Some(why.to_string())),
-            Some(Ok(Preparation::Cancelled)) => {
+            Some(Ok(Preparation::Cancelled | Preparation::Missed)) => {
                 return Err(StartupEnd::Failed(anyhow::anyhow!(
                     "the {} skin's installation was cancelled",
                     name(kind)

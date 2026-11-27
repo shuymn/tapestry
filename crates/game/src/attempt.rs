@@ -29,6 +29,14 @@ pub enum Preparation {
     /// healthy: the attempt is refused with the reason, and the screen
     /// stays usable for the menus.
     Refused(PreparationRefusal),
+    /// A reuse-only preparation (a retry's, begun during its result's
+    /// outro by [`Rig::begin_outro_preparation`](crate::Rig::begin_outro_preparation))
+    /// reached a stage that would import, or drain, adopt or wait on a
+    /// pack: nothing was imported and what it staged is discarded, and
+    /// the attempt is prepared again in the ordinary mode (design.md
+    /// "Play Lifecycle", Preparing each attempt, a retry from an
+    /// outro). Only that preparation answers it.
+    Missed,
 }
 
 /// Why the screen refused to prepare an attempt: an owned diagnostic, with

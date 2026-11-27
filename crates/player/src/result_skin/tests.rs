@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use skin_beatoraja::{Config, JudgeClass, read_lua_header};
 use skin_model::{AtlasLimits, ResultChart, ResultFields, Root};
 
-use super::{Published, ResultSkin, ResultStart, Staged, ViewFacts, builds, probe_view};
+use super::{
+    ImageStage, Published, ResultSkin, ResultStart, Staged, ViewFacts, builds, probe_view,
+};
 use crate::imports::ImportTarget;
 // The jobs a test counts are its own (each job carries the tally of the
 // test that started it); its builds are, as these tests run one at a time
@@ -1128,6 +1130,51 @@ fn a_reversal_keeps_a_chart_only_bundle() {
     assert!(Arc::ptr_eq(&shown(&rs), &every), "the same bundle");
 }
 
+/// A reuse-only image stage (a retry's, during its result's outro:
+/// design.md "Play Lifecycle", Preparing each attempt, a retry from an
+/// outro) reuses what is resident with no job; for a chart the resident
+/// specialization does not fit it misses, with no job, no build and no
+/// file read, and the gate's read-only answer agrees in both cases. The
+/// ordinary stage at the outro's end then prepares it.
+// Revert: the reuse-only guard removed -> an image stage job.
+#[test]
+fn a_reuse_only_stage_reuses_or_misses() {
+    let _s = serial();
+    let d = skin_reading(
+        "local lv = ms.number(96)",
+        "",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+    let class = Some(JudgeClass::Normal);
+    staged(&mut rs);
+    rs.next_attempt();
+    let (jobs, b0, read) = (jobs_started(), builds(), p.source_counts());
+    assert_eq!(rs.would_reuse(chart(), class, false), Ok(()));
+    assert!(matches!(
+        rs.begin_image_stage(chart(), class, None, true),
+        ImageStage::Ready(Staged::Ready)
+    ));
+    rs.next_attempt();
+    let other = ResultChart {
+        level: Some(13),
+        ..chart()
+    };
+    assert!(rs.would_reuse(other, class, false).is_err());
+    assert!(matches!(
+        rs.begin_image_stage(other, class, None, true),
+        ImageStage::Missed
+    ));
+    assert_eq!(jobs_started(), jobs, "no job");
+    assert_eq!(builds(), b0, "no build");
+    assert_eq!(p.source_counts(), read, "no file read");
+    assert!(!matches!(
+        rs.begin_image_stage(other, class, None, false),
+        ImageStage::Missed
+    ));
+}
+
 /// A skin that reads the play's target (number 151) while it loads is
 /// decided by the image stage as a chart read is: T is the attempt's, the
 /// same in every view, so one bundle serves every view, published with
@@ -1872,7 +1919,7 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
     let p = pending(d.path(), LIMITS);
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
     let super::ImageStage::Running(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None, false)
     else {
         panic!("a job runs");
     };
@@ -1936,7 +1983,7 @@ fn the_probe_packs_the_cells_a_runtime_draws() {
     REACHED.store(false, SeqCst);
     GATE.store(true, SeqCst);
     let super::ImageStage::Running(mut job) =
-        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None)
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal), None, false)
     else {
         GATE.store(false, SeqCst);
         panic!("a job runs");

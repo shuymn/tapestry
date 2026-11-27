@@ -357,6 +357,9 @@ impl PrepState {
             Preparation::Ready => Self::Ready,
             Preparation::Cancelled => Self::Cancelled,
             Preparation::Refused(why) => Self::Refused(why),
+            // The loading state begins no reuse-only preparation: a
+            // rig answering it anyway prepares nothing for this play.
+            Preparation::Missed => Self::Cancelled,
         }
     }
 }
@@ -718,7 +721,7 @@ fn next_generation(gate: GateState) -> u32 {
 /// Whether `now` differs from the key the preparation `was` begun with,
 /// the screen's structural inputs aside: those are found at staging, and
 /// a change of them is the final readiness's `Stale`.
-fn moved(now: &PrepKey, was: &PrepKey) -> bool {
+pub(crate) fn moved(now: &PrepKey, was: &PrepKey) -> bool {
     let changes = now.changes(was);
     !crate::prep::Changes {
         screen: false,
