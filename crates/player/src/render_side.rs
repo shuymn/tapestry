@@ -10372,6 +10372,13 @@ impl Run {
             // its instant: the presents of the last second, the local time
             // and the uptime, the clock reading 0 at launch.
             let mut frame_at = self.clock.now();
+            // A fade phase's deadline reached since the pass looked at it
+            // (design.md "State Model", ResultPreparing, the result's
+            // activation): no outgoing frame is drawn at its instant; the
+            // next pass activates the result.
+            if Self::fade_passed_at(self.result_hold, &self.shared, frame_at) {
+                continue;
+            }
             // Whether this frame draws the result's pending presentation.
             let mut pending_frame = false;
             // Whether a result frame was built with its skin (dev-tools:
@@ -10503,6 +10510,11 @@ impl Run {
                     // may put it up to that offset past (design.md
                     // "Rendering and Skins", the note snapshot).
                     frame_at = self.clock.now();
+                    // Nor a fade frame whose own instant, read after its
+                    // acquisition, is at or past the deadline.
+                    if Self::fade_passed_at(self.result_hold, &self.shared, frame_at) {
+                        continue;
+                    }
                     let app = self.app.readouts(frame_at);
                     #[cfg(feature = "dev-tools")]
                     {
@@ -12022,6 +12034,19 @@ impl Run {
             Some(until) => now < until,
             None => held_wait(now, h.from, first_frame_bound(shared)).is_some(),
         }
+    }
+
+    /// Whether `hold` is a fade phase's whose deadline a frame sampled at
+    /// `at` (on the hold's clock in tests) has reached while it is still
+    /// held: that frame draws no outgoing picture.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn fade_passed_at(hold: Option<ResultHold>, shared: &Shared, at: TimeUs) -> bool {
+        hold.filter(|h| h.held && h.until.is_some())
+            .is_some_and(|h| {
+                #[cfg(test)]
+                let at = hold_now(shared, at, h.from);
+                !Self::within(&h, at, shared)
+            })
     }
 
     /// The result's hold while a fade phase's outgoing phase lasts: the

@@ -139,3 +139,69 @@ fn a_play_frame_s_time_is_after_what_its_view_finalized() {
         "the frame's chart time {play:?} is not after its view's finalized {finalized:?}"
     );
 }
+
+/// A fade phase's deadline reached while a play frame waits for its view,
+/// after the pass looked at the deadline (design.md "beatoraja Lua Skins",
+/// the result's activation in the fade phase): the frame's own instant,
+/// read after its acquisition, is past the deadline, so it draws no fade
+/// frame, and no play frame follows.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_fade_frame_sampled_past_its_deadline_is_not_drawn() {
+    let clock = QpcClock::start();
+    let origin = clock.now();
+    let mut initial = crate::render_common::view(0, 0);
+    initial.origin = Some(origin);
+    let (_sink, _writer, side) = game::render_link(16, &initial);
+    let stamped: Stamped = Arc::new(Mutex::new(Vec::new()));
+    let make: MakeScreen = Box::new(|_| Ok(Box::new(Frames) as Box<dyn Screen>));
+    let chart = Arc::new(
+        ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(60_000 * MS))
+            .build()
+            .unwrap(),
+    );
+    let link = spawn(
+        make,
+        Some(Arc::clone(&chart)),
+        None,
+        clock,
+        view(),
+        measure(clock),
+        Box::new(Stamps(Arc::clone(&stamped))),
+    )
+    .unwrap();
+    let ready = link.prepare_attempt(super::attempt(&chart, None), || false);
+    assert_eq!(ready.unwrap(), Preparation::Ready);
+    link.send(RenderMsg::Play {
+        state_origin: origin,
+        side,
+        gauge: 0,
+        measure: play_measure(origin),
+    });
+    let play_frames = || {
+        stamped
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.is_some())
+            .count()
+    };
+    assert!(wait_until(|| play_frames() > 2), "no play frame");
+    // The fade phase: play frames draw on until its deadline.
+    link.set_hold_clock(Some(0));
+    link.fade_phase(TimeUs(1_000), TimeUs(1_001_000));
+    let fading = play_frames();
+    assert!(wait_until(|| play_frames() > fading + 2), "no fade frame");
+    // A frame holds before its acquisition, past the pass's look; the
+    // deadline is reached meanwhile.
+    let [held, holding] = &link.shared.play_frame_hold;
+    held.store(true, Ordering::SeqCst);
+    assert!(wait_until(|| holding.load(Ordering::SeqCst)));
+    link.set_hold_clock(Some(1_000_000));
+    let before = play_frames();
+    held.store(false, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(play_frames(), before, "a fade frame past the deadline");
+    link.exit();
+}
