@@ -357,9 +357,10 @@ impl Controls {
                 // takeover supersedes a pending one received by it, the fade
                 // phase's, so the fresh one keeps its own receipt; two on
                 // one side keep the first. Between a skip's receipt and the
-                // phase taking it the takeover is still the deadline, so a
-                // repeated press there joins the skip (design.md "State
-                // Model", ResultPreparing). The receipted take holds this
+                // phase taking it the published takeover stays (the
+                // deadline, or a slow save's end), so a repeated press
+                // there joins the skip (design.md "State Model",
+                // ResultPreparing). The receipted take holds this
                 // lock too, so it never reads a receipt mid-change.
                 let mark = self.takeover.load(Ordering::Acquire);
                 let pending = self.receipt(bit);
