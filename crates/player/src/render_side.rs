@@ -10373,8 +10373,8 @@ impl Run {
             // and the uptime, the clock reading 0 at launch.
             let mut frame_at = self.clock.now();
             // A fade phase's deadline reached since the pass looked at it
-            // (design.md "State Model", ResultPreparing, the result's
-            // activation): no outgoing frame is drawn at its instant; the
+            // (design.md "beatoraja Lua Skins", the result's activation in
+            // the fade phase): no outgoing frame is drawn at its instant; the
             // next pass activates the result.
             if Self::fade_passed_at(self.result_hold, &self.shared, frame_at) {
                 continue;
