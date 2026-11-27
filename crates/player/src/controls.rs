@@ -113,11 +113,20 @@ pub struct Controls {
     command: AtomicU8,
     /// When the latest retry was received, on the clock.
     retry_at: AtomicI64,
-    /// When the latest quit key press that leaves the chart, and the
-    /// latest suspend, were received, on the clock: the receipts a fade
-    /// phase's skip or cut moves its deadline to.
+    /// When the pending quit that leaves the chart, the pending suspend and
+    /// the pending retry were first received, on the clock: the receipts a
+    /// fade phase's skip or cut moves its deadline to ([`take_received`]).
+    /// Each is written only while its command's bit is clear, before the
+    /// bit is set, and read before a take clears the bit.
+    ///
+    /// [`take_received`]: Self::take_received
     leave_at: AtomicI64,
     suspend_at: AtomicI64,
+    retry_pending_at: AtomicI64,
+    /// The next take publishes a quit once it has cleared its bit
+    /// (tests).
+    #[cfg(test)]
+    quit_during_take: AtomicBool,
     /// When the latest quit key press in the decision screen's epoch was
     /// observed, on the clock; `i64::MIN` for none.
     quit_in_epoch: AtomicI64,
@@ -180,6 +189,9 @@ impl Controls {
             retry_at: AtomicI64::new(i64::MIN),
             leave_at: AtomicI64::new(i64::MIN),
             suspend_at: AtomicI64::new(i64::MIN),
+            retry_pending_at: AtomicI64::new(i64::MIN),
+            #[cfg(test)]
+            quit_during_take: AtomicBool::new(false),
             quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
             reveal_withdraw: std::sync::Mutex::new(None),
@@ -300,25 +312,32 @@ impl Controls {
             Command::Retry => RETRY,
             Command::Suspend => SUSPEND,
         };
-        // A quit that leaves and a suspend have their receipt stored before
-        // their bit, so whoever takes the bit reads it (a quit dropped below
-        // leaves one nothing reads). A retry's is stored once it is kept,
-        // so a dropped retry never moves it.
         let now = self.clock.now().0;
-        match bit {
-            LEAVE => self.leave_at.store(now, Ordering::Release),
-            SUSPEND => self.suspend_at.store(now, Ordering::Release),
-            _ => {}
-        }
-        // In the decision screen's epoch only a suspend is kept; a quit
-        // key press is kept apart, with the time it was observed.
-        let set = self
-            .command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                let dropped = w & EPOCH != 0 && matches!(bit, LEAVE | RETRY);
-                (!dropped).then_some(w | bit)
-            })
-            .is_ok();
+        // A command's receipt is stored while its bit is clear, before the
+        // bit is set, and never while it is set: one pressed again before
+        // it is taken joins the pending one, whose first receipt stays, and
+        // a take reads the receipt before it clears the bit, so a command
+        // and its receipt go together. Two senders racing on one clear bit
+        // keep one of their receipts.
+        let set = loop {
+            let w = self.command.load(Ordering::Acquire);
+            // In the decision screen's epoch only a suspend is kept; a quit
+            // key press is kept apart, with the time it was observed.
+            if w & EPOCH != 0 && matches!(bit, LEAVE | RETRY) {
+                break false;
+            }
+            if w & bit != 0 {
+                break true;
+            }
+            self.receipt(bit).store(now, Ordering::Release);
+            if self
+                .command
+                .compare_exchange(w, w | bit, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break true;
+            }
+        };
         if set && bit == RETRY {
             self.retry_at.store(now, Ordering::Release);
         }
@@ -333,23 +352,19 @@ impl Controls {
     /// left even when the system suspends too.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
-        self.take_with(RETRY)
+        self.take_with(RETRY, i64::MAX).map(|(c, _)| c)
     }
 
-    /// [`take`](Self::take) with the command's receipt: the clock's
-    /// reading when the window thread or the power notification handed it
-    /// over, never when it is taken (design.md "Screen Transitions and
-    /// Loading", a skip taken in the fade).
+    /// [`take`](Self::take) of the commands received by `until`, at it
+    /// included, with the command's receipt: the clock's reading when the
+    /// window thread or the power notification handed it over, never when
+    /// it is taken (design.md "State Model", ResultPreparing: a fade
+    /// phase's commands end at its takeover, and what comes after it is
+    /// the result's). A command received later stays pending, and a quit
+    /// drops only a retry received by `until`.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn take_received(&self) -> Option<(Command, TimeUs)> {
-        let c = self.take()?;
-        let receipt = match c {
-            Command::Quit => &self.leave_at,
-            Command::Retry => &self.retry_at,
-            Command::Suspend => &self.suspend_at,
-        };
-        let at = receipt.load(Ordering::Acquire);
-        Some((c, TimeUs(at)))
+    pub fn take_received(&self, until: TimeUs) -> Option<(Command, TimeUs)> {
+        self.take_with(RETRY, until.0)
     }
 
     /// [`take`](Self::take) during Closing (design.md "Play Lifecycle",
@@ -357,27 +372,58 @@ impl Controls {
     /// without dropping a pending retry, which the next take returns.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take_closing(&self) -> Option<Command> {
-        self.take_with(NONE)
+        self.take_with(NONE, i64::MAX).map(|(c, _)| c)
     }
 
     /// The pending quit (taking `drops` with it), else the pending
-    /// suspend, else the pending retry, taken in one step.
+    /// suspend, else the pending retry, of those received by `until`,
+    /// taken in one step with its first receipt, read before its bit is
+    /// cleared.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn take_with(&self, drops: u8) -> Option<Command> {
+    fn take_with(&self, drops: u8, until: i64) -> Option<(Command, TimeUs)> {
         let order = [
-            (LEAVE, LEAVE | drops, Command::Quit),
-            (SUSPEND, SUSPEND, Command::Suspend),
-            (RETRY, RETRY, Command::Retry),
+            (LEAVE, Command::Quit),
+            (SUSPEND, Command::Suspend),
+            (RETRY, Command::Retry),
         ];
-        let mut taken = None;
-        let _ = self
-            .command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                let (_, clear, c) = order.iter().find(|(bit, _, _)| w & bit != 0)?;
-                taken = Some(*c);
-                Some(w & !clear)
-            });
-        taken
+        // Only the taker clears a bit, and a sender writes a receipt only
+        // while its bit is clear: a set bit's receipt holds still.
+        let received = |w: u8, bit: u8| {
+            let at = self.receipt(bit).load(Ordering::Acquire);
+            (w & bit != 0 && at <= until).then_some(at)
+        };
+        loop {
+            let w = self.command.load(Ordering::Acquire);
+            let (bit, c, at) = order
+                .iter()
+                .find_map(|&(bit, c)| received(w, bit).map(|at| (bit, c, at)))?;
+            let clear = if bit == LEAVE && received(w, drops).is_some() {
+                LEAVE | drops
+            } else {
+                bit
+            };
+            if self
+                .command
+                .compare_exchange(w, w & !clear, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                #[cfg(test)]
+                if self.quit_during_take.swap(false, Ordering::AcqRel) {
+                    self.set_command(Command::Quit);
+                }
+                return Some((c, TimeUs(at)));
+            }
+        }
+    }
+
+    /// The receipt of the pending command `bit`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn receipt(&self, bit: u8) -> &AtomicI64 {
+        match bit {
+            LEAVE => &self.leave_at,
+            SUSPEND => &self.suspend_at,
+            _ => &self.retry_pending_at,
+        }
     }
 
     /// Whether a quit key press waits to be taken (while it leaves the
@@ -728,6 +774,10 @@ mod tests {
     use input::QpcClock;
 
     use super::Controls;
+    use bms_model::TimeUs;
+
+    /// A take's limit no receipt reaches.
+    const ALL: TimeUs = TimeUs(i64::MAX);
 
     /// The reveal word's close: one after the withdrawal is installed runs
     /// it, once; one before it (the first decision's) leaves the quit latch
@@ -840,6 +890,77 @@ mod tests {
         c.close();
         let stamped = crate::dev::transitions::close_qpc().expect("stamped");
         assert!(stamped >= before, "{stamped} < {before}");
+    }
+
+    /// A quit pressed again before it is taken joins the pending one and
+    /// keeps the first press's receipt, the one a fade phase's skip moves
+    /// its deadline to.
+    #[test]
+    fn a_quit_pressed_again_keeps_its_first_receipt() {
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        let before = c.now();
+        c.command(Command::Quit);
+        let first = c.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let again = c.now();
+        c.command(Command::Quit);
+        let (taken, at) = c.take_received(ALL).expect("a pending quit");
+        assert_eq!(taken, Command::Quit);
+        assert!(
+            before.0 <= at.0 && at.0 <= first.0,
+            "{at:?} not the first press, in {before:?}..={first:?} (again at {again:?})"
+        );
+        assert_eq!(c.take_received(ALL), None);
+    }
+
+    /// A command received after the limit a take is given stays pending,
+    /// for the next take; a quit taken by it drops only a retry received
+    /// by it too.
+    #[test]
+    fn a_command_received_after_the_limit_stays_pending() {
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        c.command(Command::Quit);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let limit = c.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.command(Command::Retry);
+        let (taken, at) = c.take_received(limit).expect("the quit before the limit");
+        assert_eq!(taken, Command::Quit);
+        assert!(at.0 < limit.0);
+        assert_eq!(c.take_received(limit), None, "the retry is past the limit");
+        assert_eq!(c.take(), Some(Command::Retry), "kept for the next take");
+        c.command(Command::Quit);
+        assert_eq!(c.take_received(TimeUs(i64::MIN)), None);
+        assert_eq!(c.take(), Some(Command::Quit));
+    }
+
+    /// A take returns the receipt of the command it takes: a quit
+    /// published once the take has cleared the bit is the next command,
+    /// with its own receipt.
+    #[test]
+    fn a_quit_published_during_a_take_keeps_its_own_receipt() {
+        use std::sync::atomic::Ordering;
+
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        c.command(Command::Quit);
+        let first = c.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let between = c.now();
+        c.quit_during_take.store(true, Ordering::Release);
+        let (_, at) = c.take_received(ALL).expect("the first quit");
+        assert!(at.0 <= first.0, "{at:?} is not the first quit's receipt");
+        let (taken, later) = c
+            .take_received(ALL)
+            .expect("the quit published in the take");
+        assert_eq!(taken, Command::Quit);
+        assert!(
+            later.0 >= between.0,
+            "{later:?} is not the second quit's receipt"
+        );
+        assert_eq!(c.take_received(ALL), None);
     }
 
     #[test]

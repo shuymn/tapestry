@@ -347,6 +347,11 @@ struct Tail {
     skipped: Vec<i64>,
     /// The play time of each fade phase's end ([`Rig::fade_ended`]).
     fade_ended_at: Vec<i64>,
+    /// The play time each fade phase's result took the input over from.
+    takeovers: Vec<i64>,
+    /// How far past its deadline a fade phase's wait wakes, in µs (a
+    /// descheduled game thread); zero: the next millisecond.
+    wake_late: i64,
     /// The totals each result's own view read, as its layout is asked for.
     totals: Vec<Option<Option<game::PlayerTotals>>>,
     /// An autoplay session's input side, polled on the play's timeline in
@@ -463,6 +468,8 @@ impl Tail {
             order: Order::default(),
             skipped: Vec::new(),
             fade_ended_at: Vec::new(),
+            takeovers: Vec::new(),
+            wake_late: 0,
             totals: Vec::new(),
             feeder: None,
             audio_done_at: None,
@@ -577,12 +584,25 @@ impl Rig for Tail {
     }
 
     /// A command keeps its receipt, its scripted time, however late it is
-    /// taken.
-    fn take_received(&mut self) -> Option<(Command, TimeUs)> {
+    /// taken; one received after `until` stays.
+    fn take_received(&mut self, until: TimeUs) -> Option<(Command, TimeUs)> {
         let (origin, now) = (self.origin?, self.play_time()?);
-        let i = self.commands.iter().position(|&(at, _)| at <= now)?;
+        let i = self
+            .commands
+            .iter()
+            .position(|&(at, _)| at <= now && origin.0 + at <= until.0)?;
         let (at, c) = self.commands.remove(i);
         Some((c, TimeUs(origin.0 + at)))
+    }
+
+    /// The next millisecond, or, in a fade phase that wakes late, at once
+    /// `wake_late` past `deadline`.
+    fn idle_wait(&mut self, deadline: TimeUs) {
+        self.wait();
+        while self.in_fade && self.wake_late > 0 && self.clock.now().0 < deadline.0 + self.wake_late
+        {
+            self.wait();
+        }
     }
 
     fn fade_skipped(&mut self, at: TimeUs) {
@@ -756,9 +776,10 @@ impl Rig for Tail {
 
     /// The result made ready in the phase shows at its end, unless a
     /// retry or a close withdrew it.
-    fn fade_ended(&mut self, how: FadeEnd) {
+    fn fade_ended(&mut self, how: FadeEnd, takeover: TimeUs) {
         self.order.lock().unwrap().push("fade ended");
         self.fade_ended_at.push(self.play_time().unwrap());
+        self.takeovers.push(takeover.0 - self.origin.unwrap().0);
         self.in_fade = false;
         self.fade_ends.push((self.plays, how));
         let held = self.held_show.take();
@@ -1365,6 +1386,43 @@ fn a_save_past_the_fade_takes_its_commands_as_the_plays() {
             "{quit}: the takeover at {:?}",
             rig.fade_ended_at
         );
+    }
+}
+
+/// A quit received after the fade phase's deadline, the save ended before
+/// it, is the result's however late the game looks (design.md "State
+/// Model", ResultPreparing): the phase runs out at its deadline, where the
+/// result takes the input over, and the quit stays pending for the
+/// result. One received before the deadline is the phase's skip.
+#[test]
+fn a_quit_past_the_fade_deadline_is_the_results_however_late_the_look() {
+    let deadline = T + 8_500 * MS;
+    for (quit, end, moved) in [
+        (T + 8_505 * MS, FadeEnd::RanOut, vec![]),
+        (T + 8_495 * MS, FadeEnd::Skipped, vec![T + 8_495 * MS]),
+    ] {
+        let commands = [(quit, Command::Quit)];
+        let mut rig = Tail::with_bgm(all_hits(), &commands, i64::MAX, 500);
+        rig.ending = declared(3_000, 500);
+        rig.wake_late = 10 * MS;
+        let (rig, _) = played_on(rig, |_| {});
+        assert_eq!(rig.fading(), Some(TimeUs(T + 8_000 * MS)), "{quit}");
+        assert_eq!(rig.fade_end(), Some(end), "{quit}");
+        assert_eq!(rig.skipped, moved, "{quit}");
+        assert!(
+            rig.fade_ended_at
+                .first()
+                .is_some_and(|&at| at >= deadline + 10 * MS),
+            "{quit}: the look at {:?}",
+            rig.fade_ended_at
+        );
+        let takeover = moved.first().copied().unwrap_or(deadline);
+        assert_eq!(rig.takeovers.first(), Some(&takeover), "{quit}");
+        let pending: Vec<_> = rig.commands.iter().map(|&(at, _)| at).collect();
+        match end {
+            FadeEnd::RanOut => assert_eq!(pending, [quit], "the result's quit"),
+            _ => assert!(pending.is_empty(), "{quit}: {pending:?}"),
+        }
     }
 }
 

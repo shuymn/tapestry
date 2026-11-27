@@ -426,6 +426,20 @@ impl MenuQueue {
         Some(valid.then_some((input, observed)))
     }
 
+    /// Drops the entries before the first the window observed after
+    /// `at`, which stays with those behind it: the game thread's own and
+    /// those observed by `at` go.
+    pub fn drop_through(&self, at: bms_model::TimeUs) {
+        let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        while q
+            .entries
+            .front()
+            .is_some_and(|(_, o)| o.is_none_or(|o| o.at.0 <= at.0))
+        {
+            q.pop_front();
+        }
+    }
+
     /// Whether the oldest entry is the pointer's.
     pub fn front_is_pointer(&self) -> bool {
         self.inputs

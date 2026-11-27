@@ -191,11 +191,16 @@ pub trait Rig {
     /// A pending retry or suspend (or quit, for rigs without a latch),
     /// taken.
     fn take(&mut self) -> Option<Command>;
-    /// [`take`](Self::take) with the command's receipt on the rig's clock:
-    /// the fade phase moves its deadline to a skip's receipt, never to when
-    /// it is taken (design.md "State Model", ResultPreparing). A rig that
+    /// [`take`](Self::take) of the commands received by `until`, at it
+    /// included, with the command's receipt on the rig's clock: the fade
+    /// phase moves its deadline to a skip's receipt, never to when it is
+    /// taken, and a command received after its takeover stays pending, the
+    /// result's (design.md "State Model", ResultPreparing). A rig that
     /// keeps no receipt received it now, by default.
-    fn take_received(&mut self) -> Option<(Command, TimeUs)> {
+    fn take_received(&mut self, until: TimeUs) -> Option<(Command, TimeUs)> {
+        if self.now().0 > until.0 {
+            return None;
+        }
         let c = self.take()?;
         Some((c, self.now()))
     }
@@ -428,9 +433,11 @@ pub trait Rig {
     /// The fade phase is over, `how` it ended, once the play is over
     /// ([`play_over`](Self::play_over)) and reported
     /// ([`ended`](Self::ended)): the result takes the menu input over
-    /// here, every command after it fresh. Nothing by default.
-    fn fade_ended(&mut self, how: FadeEnd) {
-        let _ = how;
+    /// here, what was observed after `takeover` (the later of the phase's
+    /// deadline and the save's end, on the rig's clock) its own.
+    /// Nothing by default.
+    fn fade_ended(&mut self, how: FadeEnd, takeover: TimeUs) {
+        let _ = (how, takeover);
     }
     /// Before a practice round's recording opens: checks that its audio can
     /// be restored at chart time `at`, the lead-in's start ([`crate::restore`]).
@@ -970,11 +977,23 @@ impl FadeEnd {
 }
 
 /// A full play's fade phase while it lasts: its deadline, moved to a skip's
-/// receipt, and what ended it early, if anything did.
+/// receipt, when the play's save ended, and what ended it early, if
+/// anything did.
 #[derive(Clone, Copy, Debug)]
 struct Fade {
     deadline: TimeUs,
+    saved: TimeUs,
     end: Option<FadeEnd>,
+}
+
+impl Fade {
+    /// Where the result takes the input over: the later of the deadline
+    /// and the save's end. A command received by it, at it included, is
+    /// the phase's, one received after it the result's, however late a look
+    /// takes it (design.md "State Model", ResultPreparing).
+    fn takeover(self) -> TimeUs {
+        TimeUs(self.deadline.0.max(self.saved.0))
+    }
 }
 
 /// What a command does once the play is complete, during its audio tail or
@@ -1281,8 +1300,10 @@ fn run_from<R: Rig>(
         }
         // A fade phase's play is reported at the phase's end, once it is
         // over; it runs while the result is prepared.
+        let saved = rig.now();
         let mut fade = fade.map(|deadline| Fade {
             deadline,
+            saved,
             end: None,
         });
         if fade.is_none() {
@@ -1605,7 +1626,7 @@ fn fade_step<R: Rig>(
         end_fade(rig, report, fade, FadeEnd::Cut(AbortCause::Quit));
         return Some(Prepared::Leave);
     }
-    while let Some((c, at)) = rig.take_received() {
+    while let Some((c, at)) = rig.take_received(f.takeover()) {
         let action = TailAction::of(c);
         if action == TailAction::Cut(AbortCause::Retry) {
             // What is queued behind it goes with the play.
@@ -1658,12 +1679,12 @@ fn fade_step<R: Rig>(
 /// The fade phase's end, `how` it ended: the play is over and reported,
 /// then the result takes the input over ([`Rig::fade_ended`]).
 fn end_fade<R: Rig>(rig: &mut R, report: &PlayReport, fade: &mut Option<Fade>, how: FadeEnd) {
-    if fade.take().is_none() {
+    let Some(f) = fade.take() else {
         return;
-    }
+    };
     rig.play_over();
     rig.ended(report);
-    rig.fade_ended(how);
+    rig.fade_ended(how, f.takeover());
 }
 
 /// What the commands taken now do to a result's preparation

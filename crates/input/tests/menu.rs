@@ -138,6 +138,21 @@ fn a_bound_button_press_sends_its_event() {
     assert!(!set.menu_mut().unwrap().take_sent());
 }
 
+/// Dropping the events observed by an instant, at it included, keeps
+/// the first one observed after it and every one behind it.
+#[test]
+fn events_observed_by_an_instant_are_dropped() {
+    let (mut set, mut rx) = set(&[(10, PAD)]);
+    for (at, control) in [(490, CONFIRM), (500, CONFIRM), (505, UP), (506, CONFIRM)] {
+        set.begin_batch(TimeUs(at));
+        set.packet(&packet(10, control, 1));
+        set.packet(&packet(10, control, 0));
+        set.end_batch(TimeUs(at));
+    }
+    rx.drop_through(TimeUs(500));
+    assert_eq!(events(&mut rx), [MenuEvent::Up, MenuEvent::Confirm]);
+}
+
 /// An absolute axis sends an event per step of movement (4) taken the
 /// short way round its revolution, higher values one way and lower the
 /// other; its first report only says where it is, and a change of

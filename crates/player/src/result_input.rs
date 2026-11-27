@@ -44,6 +44,13 @@ impl Pad {
         while self.pop().is_some() {}
     }
 
+    /// Drops the events observed by `at`, at it included.
+    pub fn drop_through(&mut self, at: bms_model::TimeUs) {
+        if let Some(r) = self.receiver.as_mut() {
+            r.drop_through(at);
+        }
+    }
+
     /// Reports events the full queue dropped since the last report.
     pub fn report_dropped(&mut self, screen: &str) {
         let Some(pad) = &self.receiver else {
@@ -131,6 +138,21 @@ impl ResultInput {
         true
     }
 
+    /// A result shows after a full play's fade phase that ended at
+    /// `takeover`: as [`enter`](Self::enter), keeping what the window and
+    /// the controller observed after `takeover`, the result's own
+    /// however late the game took the queues over (design.md "State
+    /// Model", ResultPreparing).
+    pub fn enter_from(&mut self, takeover: bms_model::TimeUs) -> bool {
+        if self.owner == Owner::Result {
+            return false;
+        }
+        self.menu.drop_through(takeover);
+        self.pad.drop_through(takeover);
+        self.owner = Owner::Result;
+        true
+    }
+
     /// No screen reads the queues (a play is about to start); what arrives
     /// meanwhile is dropped by the next owner.
     pub fn release(&mut self) {
@@ -177,5 +199,44 @@ impl ResultInput {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bms_model::TimeUs;
+    use game::MenuCommand;
+
+    use super::ResultInput;
+    use crate::select::{MenuInput, MenuKey, MenuQueue, Observed};
+
+    /// A result entered after a fade phase keeps the keys the window
+    /// observed after the phase's takeover, however late it is entered,
+    /// and drops those observed by it and the game thread's own.
+    #[test]
+    fn a_result_entered_after_a_fade_keeps_what_came_after_its_takeover() {
+        let menu = Arc::new(MenuQueue::default());
+        let at = |us| {
+            Some(Observed {
+                stamp: input::Ingress::INITIAL,
+                at: TimeUs(us),
+            })
+        };
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), at(490));
+        menu.push(MenuInput::Key(MenuKey::Up));
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), at(500));
+        menu.push_stamped(MenuInput::Key(MenuKey::Down), at(505));
+        menu.push_stamped(MenuInput::Key(MenuKey::Up), at(506));
+        let mut input = ResultInput::new(Arc::clone(&menu), None);
+        assert!(input.enter_from(TimeUs(500)));
+        assert_eq!(input.take(), Some(MenuCommand::NextPreset));
+        assert_eq!(input.take(), Some(MenuCommand::PrevPreset));
+        assert_eq!(input.take(), None);
+        // Entered again, it keeps what came since.
+        menu.push_stamped(MenuInput::Key(MenuKey::Down), at(400));
+        assert!(!input.enter_from(TimeUs(500)));
+        assert_eq!(input.take(), Some(MenuCommand::NextPreset));
     }
 }
