@@ -238,7 +238,6 @@ pub const IN_PLAY: &[Site] = &[
             "TailStage::begin",
             "TailStage::over",
             "FadeStage::begin",
-            "FadeStage::over",
             "tail_exit",
             "tail_stepped",
             "hold_until",
