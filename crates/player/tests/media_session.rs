@@ -593,7 +593,14 @@ fn missed_ack_on_a_working_transport_loses_one_player() {
     assert_eq!(frozen.loss(), Some(Loss::Answer));
     // Timed on the session's own clock, from the play's write, where the
     // answer's deadline starts, to the loss: the test thread's sight of
-    // either can come late under load.
+    // either can come late under load. The session marks the movie lost
+    // before it records the loss, so the record is waited for; the play's
+    // record comes before it.
+    let at = rig
+        .event(Duration::from_secs(5), |e| {
+            *e == Event::Lost { why: Loss::Answer }
+        })
+        .expect("no answer's loss recorded within 5 s");
     let events = rig.session.events();
     let id = events
         .iter()
@@ -606,10 +613,6 @@ fn missed_ack_on_a_working_transport_loses_one_player() {
         .session
         .written(id)
         .unwrap_or_else(|| panic!("play {id} never written"));
-    let at = events
-        .iter()
-        .find_map(|(t, e)| (*e == Event::Lost { why: Loss::Answer }).then_some(*t))
-        .unwrap_or_else(|| panic!("no answer's loss: {events:?}"));
     took_on_time(
         "the play's answer",
         at.saturating_sub(sent),
