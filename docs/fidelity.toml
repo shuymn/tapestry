@@ -548,7 +548,7 @@ id = "SF-026"
 summary = "Ids naming one video file share one playhead"
 class = "rule"
 reason = """
-A player sees the base and the layer show the same frame when their ids name one video file, and a start on either restart it for both: one player plays a file however many ids name it (design.md "Rendering and Skins", BGA)."""
+A player sees the base and the layer show the same frame when their ids name one video file, and a start on either restart it for both: one player plays a file however many ids name it (design.md "Rendering and Skins", BGA). The files a full play opens are ranked by their first start as the source ranks them; a practice round ranks them from its lead-in start, each channel's video in effect there counting as a start at it, which is tapestry's own, since the source draws no BGA in practice."""
 source = [
     "src/bms/player/beatoraja/play/bga/BGAProcessor.java:199-210 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/play/bga/BGAProcessor.java:279-283 @beatoraja-0.8.9",
@@ -578,7 +578,7 @@ id = "SF-028"
 summary = "A poor frame shows a running video and starts nothing"
 class = "rule"
 reason = """
-A player sees a poor frame naming a chart video show that video's current frame while a run of it has started and not ended, and nothing otherwise: the poor sequence never starts a video (design.md "Rendering and Skins", BGA)."""
+A player sees a poor frame naming a chart video show that video's current frame while a run of it has started and not ended, and nothing otherwise: the poor sequence never starts a video (design.md "Rendering and Skins", BGA). A run's frame shows only once it is due, so a practice round's landing found after its target stays hidden until then, which is tapestry's own."""
 source = [
     "src/bms/player/beatoraja/play/bga/BGAProcessor.java:347 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/play/bga/BGAProcessor.java:349 @beatoraja-0.8.9",

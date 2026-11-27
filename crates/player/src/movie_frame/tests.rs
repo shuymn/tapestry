@@ -23,6 +23,9 @@ struct Fake {
     want: AtomicU64,
     ended: AtomicU64,
     empty: AtomicU64,
+    open_end: AtomicU64,
+    /// The landing written: its run and media time.
+    landing: Mutex<Option<(u64, i64)>>,
 }
 
 impl Fake {
@@ -45,6 +48,8 @@ impl Fake {
             want: AtomicU64::new(0),
             ended: AtomicU64::new(0),
             empty: AtomicU64::new(0),
+            open_end: AtomicU64::new(0),
+            landing: Mutex::new(None),
         })
     }
 
@@ -147,12 +152,20 @@ impl Source for Fake {
         self.want.store(run, Ordering::SeqCst);
     }
 
+    fn land(&self, run: u64, at: i64) {
+        *self.landing.lock().unwrap() = Some((run, at));
+    }
+
     fn ended(&self) -> u64 {
         self.ended.load(Ordering::SeqCst)
     }
 
     fn empty(&self) -> u64 {
         self.empty.load(Ordering::SeqCst)
+    }
+
+    fn open_end(&self) -> u64 {
+        self.open_end.load(Ordering::SeqCst)
     }
 }
 
@@ -389,7 +402,7 @@ fn a_chart_video_s_chroma_location_follows_the_frame_its_planes_hold() {
     )
     .unwrap();
     let mut m = Movies::new(fakes.clone().map(Some), start);
-    m.set_chart(Arc::new(ChartVideos::of(&bga, &[Some(2)])), i64::MIN);
+    m.set_chart(Arc::new(ChartVideos::of(&bga, &[Some(2)])), Boundary::FULL);
     let mut planes = Kept::default();
     m.admit(&mut planes, start);
     let _ = m.prepare(&mut planes, start);
@@ -924,7 +937,7 @@ fn movie_upload_hook_alloc() {
     .unwrap();
     let videos = ChartVideos::of(&bga, &[Some(2), Some(3)]);
     let mut m = Movies::new(fakes.clone().map(Some), start);
-    m.set_chart(Arc::new(videos), i64::MIN);
+    m.set_chart(Arc::new(videos), Boundary::FULL);
     m.set_waker(crate::media_host::session::Waker::new(
         std::thread::current(),
     ));

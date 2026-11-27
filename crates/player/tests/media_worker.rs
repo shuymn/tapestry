@@ -48,7 +48,7 @@ use media_support::media_host::strikes::{FileId, Strikes};
 use media_support::media_host::verdict;
 use media_support::media_host::watch::{self, End, Event, LINE};
 use media_support::{Kind, Launched, Setup, Stage, media_host, read_tight, recipe, root};
-use skin_model::media::control::{Command as Order, Matrix, Range, Reply};
+use skin_model::media::control::{Command as Order, Matrix, Range, Reply, SeekTo};
 use skin_model::media::{ChromaLocation, Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -324,13 +324,6 @@ const READY: u64 = 2;
 /// A frame taken from a ring.
 struct Taken {
     stamp: i64,
-    #[cfg_attr(
-        not(feature = "dev-tools"),
-        expect(
-            dead_code,
-            reason = "the duration tests generate their clips with dev-tools"
-        )
-    )]
     duration: i64,
     /// Where the frame's chroma sits, as its slot said.
     chroma: ChromaLocation,
@@ -500,6 +493,7 @@ fn worker_operations_succeed_under_the_recipe() {
         player: 1,
         run,
         at: 2_000_000,
+        to: SeekTo::From,
     });
     let landed = match worker.reply() {
         Reply::Sought {
@@ -664,6 +658,7 @@ fn worker_seek_lands_on_target_after_back_off() {
         player: 3,
         run,
         at: 1_500_000,
+        to: SeekTo::From,
     });
     // The first attempt's first frame is already past the target, so the
     // seek starts again a second earlier and decodes up to the target.
@@ -675,6 +670,7 @@ fn worker_seek_lands_on_target_after_back_off() {
             run,
             landed: Some(1_500_000),
             attempts: 2,
+            open_end: false,
         },
         "the worker's log:\n{}",
         worker.log()
@@ -989,7 +985,12 @@ fn a_seek_back_is_judged_by_its_own_run_s_time() {
     assert_eq!(shown.2, 120);
     let at = stamp_of(24, 24);
     let run = ring.start_run(at);
-    worker.send(&Order::Seek { player: 1, run, at });
+    worker.send(&Order::Seek {
+        player: 1,
+        run,
+        at,
+        to: SeekTo::From,
+    });
     let landed = match worker.reply() {
         Reply::Sought {
             landed: Some(landed),
@@ -1037,6 +1038,7 @@ fn every_seek_is_answered() {
             player: 1,
             run,
             at: 10_000_000,
+            to: SeekTo::From,
         });
         let sought = Reply::Sought {
             id: worker.last,
@@ -1044,6 +1046,7 @@ fn every_seek_is_answered() {
             run,
             landed: None,
             attempts: 0,
+            open_end: false,
         };
         for want in [sought, Reply::Ended { player: 1, run }] {
             assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
@@ -1054,7 +1057,12 @@ fn every_seek_is_answered() {
     // Inside the clip, after that run ended: a landing.
     let at = stamp_of(24, 24);
     let run = ring.start_run(at);
-    worker.send(&Order::Seek { player: 1, run, at });
+    worker.send(&Order::Seek {
+        player: 1,
+        run,
+        at,
+        to: SeekTo::From,
+    });
     assert!(
         matches!(
             worker.reply(),
@@ -1559,6 +1567,7 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
             player: 2,
             run,
             at: 10_000_000,
+            to: SeekTo::From,
         });
         if seam {
             assert_eq!(
@@ -1574,6 +1583,7 @@ fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
                 run,
                 landed: None,
                 attempts: 0,
+                open_end: false,
             };
             for want in [sought, Reply::Ended { player: 2, run }] {
                 assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
@@ -2036,6 +2046,7 @@ fn worker_decodes_zlib_compressed_containers() {
             player,
             run,
             at: 2_000_000,
+            to: SeekTo::From,
         });
         let landed = match worker.reply() {
             Reply::Sought {
@@ -3941,6 +3952,7 @@ fn a_seek_landing_carries_its_own_duration() {
         player: 2,
         run,
         at: 1_000_000,
+        to: SeekTo::From,
     });
     assert!(
         matches!(
@@ -4256,4 +4268,380 @@ fn the_pinned_build_reports_each_codec_s_chroma_location() {
             }
         }
     }
+}
+
+/// Seeks run `run` of player `player` to land at `at` (a practice round's
+/// landing): the landing's stamp and the seek's attempts, or `None` with
+/// no landing. An earlier run's end, reported before the seek, is passed
+/// over.
+fn land_at(worker: &mut Worker, player: u8, run: u64, at: i64) -> Option<(i64, u8)> {
+    land_open(worker, player, run, at).map(|(l, a, _)| (l, a))
+}
+
+/// [`land_at`], with whether the landing's end is open (a last frame whose
+/// length was found from nothing).
+fn land_open(worker: &mut Worker, player: u8, run: u64, at: i64) -> Option<(i64, u8, bool)> {
+    worker.send(&Order::Seek {
+        player,
+        run,
+        at,
+        to: SeekTo::Landing,
+    });
+    loop {
+        match worker.reply() {
+            Reply::Sought {
+                player: p,
+                run: r,
+                landed,
+                attempts,
+                open_end,
+                ..
+            } if p == player && r == run => return landed.map(|l| (l, attempts, open_end)),
+            // An earlier run's end, reported before the seek arrived.
+            Reply::Ended { player: p, run: r } if p == player && r < run => {}
+            other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+        }
+    }
+}
+
+/// The clip the landings use: 30 fps MPEG-1 in a program stream, a key
+/// frame every 500 ms, on which a seek's first attempt overshoots
+/// ([`worker_seek_lands_on_target_after_back_off`]).
+#[cfg(feature = "dev-tools")]
+const GOPS: &str = "mpeg1video mpeg 320x240 30 150 15";
+
+/// Plays [`GOPS`] as player 3 and takes run 1's first frame.
+#[cfg(feature = "dev-tools")]
+fn gops(dir: &Path) -> (Worker, Ring) {
+    let path = gen_clip(dir, "s.mpg", GOPS);
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(3, &path);
+    assert!(
+        matches!(probe, Reply::Probed { player: 3, .. }),
+        "{probe:?}"
+    );
+    let mut ring = Ring::new(320, 240);
+    assert!(matches!(
+        worker.play(3, &ring),
+        Reply::Playing { player: 3, .. }
+    ));
+    let first = take_one(&worker, &mut ring, 0);
+    assert_eq!(first.stamp, 0);
+    (worker, ring)
+}
+
+/// A landing is the newest frame at or before its target (design.md
+/// "Rendering and Skins", BGA): at 1.51 s, between frames 45 (1.5 s) and
+/// 46, it is frame 45, found by backing off where the demuxer overshoots
+/// (two attempts); then frame 46, kept while the landing was found,
+/// comes once, and frame 47 after it.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_is_the_newest_frame_at_or_before_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut worker, mut ring) = gops(dir.path());
+    let run = ring.start_run(0);
+    assert_eq!(
+        land_at(&mut worker, 3, run, 1_510_000),
+        Some((1_500_000, 2)),
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    for i in [45, 46, 47] {
+        let due = stamp_of(i, 30);
+        let taken = take_one(&worker, &mut ring, due);
+        assert_eq!(
+            (taken.stamp, painted(&taken.bytes, 320)),
+            (due, u32::try_from(i).unwrap())
+        );
+    }
+    worker.close(3);
+}
+
+/// A target inside the last frame's interval lands on that frame, and the
+/// run's end follows it.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_inside_the_last_frame_stages_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut worker, mut ring) = gops(dir.path());
+    let run = ring.start_run(0);
+    let last = stamp_of(149, 30);
+    assert_eq!(
+        land_at(&mut worker, 3, run, 4_990_000).map(|(l, _)| l),
+        Some(last)
+    );
+    let taken = take_one(&worker, &mut ring, 4_990_000);
+    assert_eq!(
+        (
+            taken.stamp,
+            taken.stamp + taken.duration,
+            painted(&taken.bytes, 320)
+        ),
+        (last, 5_000_000, 149)
+    );
+    assert_eq!(worker.reply(), Reply::Ended { player: 3, run });
+    worker.close(3);
+}
+
+/// A target at the last frame's end has nothing to land on: the seek is
+/// answered with no landing, then the run's end.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_past_the_end_is_answered_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut worker, mut ring) = gops(dir.path());
+    let run = ring.start_run(0);
+    assert_eq!(land_at(&mut worker, 3, run, 5_000_000), None);
+    assert_eq!(worker.reply(), Reply::Ended { player: 3, run });
+    worker.close(3);
+}
+
+/// A seek while a landing's kept frame is unread drops that frame
+/// (design.md "Rendering and Skins", video frames): with every slot full,
+/// run 2 lands at 1.51 s (frame 45, frame 46 kept) and waits for a slot;
+/// a seek of run 3 to 0.5 s, in either mode, then plays frames 15, 16 and
+/// 17, never the kept frame.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_seek_drops_a_landing_s_unread_kept_frame() {
+    use skin_model::media::{SLOTS, State};
+    let dir = tempfile::tempdir().unwrap();
+    let path = gen_clip(dir.path(), "s.mpg", GOPS);
+    let slots = u64::try_from(SLOTS).unwrap();
+    for to in [SeekTo::From, SeekTo::Landing] {
+        let mut worker = Worker::start(&[]);
+        let probe = worker.open(3, &path);
+        assert!(
+            matches!(probe, Reply::Probed { player: 3, .. }),
+            "{probe:?}"
+        );
+        let mut ring = Ring::new(320, 240);
+        assert!(matches!(
+            worker.play(3, &ring),
+            Reply::Playing { player: 3, .. }
+        ));
+        let deadline = Instant::now() + REPLY;
+        while ring.published() < slots || ring.state() != Some(State::Waiting) {
+            assert!(Instant::now() < deadline, "the ring never filled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let run = ring.start_run(0);
+        assert_eq!(
+            land_at(&mut worker, 3, run, 1_510_000).map(|(l, _)| l),
+            Some(1_500_000)
+        );
+        assert_eq!(ring.published(), slots, "the landing waits for a slot");
+        let run = ring.start_run(500_000);
+        worker.send(&Order::Seek {
+            player: 3,
+            run,
+            at: 500_000,
+            to,
+        });
+        match worker.reply() {
+            Reply::Sought {
+                run: r,
+                landed: Some(500_000),
+                ..
+            } if r == run => {}
+            other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+        }
+        for i in [15, 16, 17] {
+            let due = stamp_of(i, 30);
+            let taken = take_one(&worker, &mut ring, due);
+            assert_eq!(
+                (taken.stamp, painted(&taken.bytes, 320)),
+                (due, u32::try_from(i).unwrap()),
+                "{to:?}"
+            );
+        }
+        worker.close(3);
+    }
+}
+
+/// A landing carries its own chroma location, not the frame's after it
+/// (design.md "Rendering and Skins", video frames): each frame of this
+/// clip is a sequence of its own, its parameter sets with it, so the
+/// decoder labels each from its own whatever the seek; at 24 fps frame 2
+/// (centre) lands before frame 3 (left), the two lasting alike.
+// Covers: T02
+#[test]
+fn a_landing_carries_its_own_chroma_location() {
+    const EACH: [(Vui, u64); 4] = [
+        (Vui::Sited(0), 1),
+        (Vui::Sited(2), 1),
+        (Vui::Sited(1), 1),
+        (Vui::Sited(0), 1),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("each.avi");
+    let units = h264_sited((32, 32), (32, 32), &EACH, &sited_sample);
+    std::fs::write(&path, avi((32, 32), 24, b"H264", &units)).unwrap();
+    let stamp = |i: i64| (i * 1_000_000 + 12) / 24;
+    let mut worker = Worker::start(&[]);
+    assert!(matches!(
+        worker.open(1, &path),
+        Reply::Probed { player: 1, .. }
+    ));
+    let mut ring = Ring::new(32, 32);
+    assert!(matches!(
+        worker.play(1, &ring),
+        Reply::Playing { player: 1, .. }
+    ));
+    take_one(&worker, &mut ring, 0);
+    let run = ring.start_run(0);
+    assert_eq!(
+        land_at(&mut worker, 1, run, 100_000).map(|(l, _)| l),
+        Some(stamp(2)),
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    for (i, want) in [(2, ChromaLocation::Centre), (3, ChromaLocation::Left)] {
+        let taken = take_one(&worker, &mut ring, stamp(i));
+        assert_eq!(
+            (taken.stamp, taken.chroma),
+            (stamp(i), want),
+            "frame {i}; the worker's log:\n{}",
+            worker.log()
+        );
+    }
+    worker.close(1);
+}
+
+/// A frame stating no duration, in a stream whose average rate is not
+/// known, lasts the interval from the frame before it, as in a play from
+/// the start, never a seek's jump nor an interval measured before the
+/// seek (design.md "Rendering and Skins", video frames): the worker takes
+/// every frame's duration and the stream's rate as unknown, and the
+/// demuxer lands directly on each motion JPEG clip's last frame, so the
+/// landing backs off for the frame before it. After run 1 has measured
+/// 40 ms frames, the constant-rate clip's last frame (frame 25 at 1 s)
+/// lasts 40 ms, and the variable-rate one's, 120 ms after frame 24 (at
+/// 1.08 s), lasts 120 ms; a target inside that interval lands on it, then
+/// the run ends, and one past it has nothing. In the sparse clip, frames at
+/// 0 and 10 s, even the furthest back-off (3 s) finds no frame before the
+/// last one: its length found from nothing (one tick of the 1 ms base),
+/// it proves no end, and a target at 14 s lands on it, the answer saying
+/// its end is open; the other landings' ends are not.
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_landing_with_no_duration_or_rate_lasts_the_frame_interval() {
+    type Case = (i64, Option<(i64, i64, bool)>);
+    let dir = tempfile::tempdir().unwrap();
+    let run_1 = [0, 40_000, 80_000, 120_000];
+    let (c, v) = ((1_000_000, 40_000, false), (1_080_000, 120_000, false));
+    let clips: [(&str, &str, &[i64], &[Case]); 3] = [
+        (
+            "c.mkv",
+            "mjpeg matroska 176x96 25 26 1",
+            &run_1,
+            &[(c.0 + c.1 / 2, Some(c)), (c.0 + c.1 + 10_000, None)],
+        ),
+        (
+            "v.mkv",
+            "mjpeg matroska 176x96 25 26 1 gap=25:2",
+            &run_1,
+            &[(v.0 + v.1 / 2, Some(v)), (v.0 + v.1 + 10_000, None)],
+        ),
+        (
+            "s.mkv",
+            "mjpeg matroska 176x96 1 2 1 gap=1:9",
+            &[0],
+            &[(14_000_000, Some((10_000_000, 1_000, true)))],
+        ),
+    ];
+    for (name, spec, played, cases) in clips {
+        let path = gen_clip(dir.path(), name, spec);
+        for &(target, want) in cases {
+            let mut worker = Worker::start(&["--dev-serve", "unstated"]);
+            let probe = worker.open(1, &path);
+            assert!(matches!(probe, Reply::Probed { .. }), "{probe:?}");
+            let mut ring = Ring::new(176, 96);
+            assert!(matches!(worker.play(1, &ring), Reply::Playing { .. }));
+            for &at in played {
+                assert_eq!(take_one(&worker, &mut ring, at).stamp, at, "{name}");
+            }
+            let run = ring.start_run(0);
+            assert_eq!(
+                land_open(&mut worker, 1, run, target).map(|(l, _, open)| (l, open)),
+                want.map(|(last, _, open)| (last, open)),
+                "{name} {target}: the worker's log:\n{}",
+                worker.log()
+            );
+            if let Some((last, duration, _)) = want {
+                let taken = take_one(&worker, &mut ring, target);
+                assert_eq!(
+                    (taken.stamp, taken.duration),
+                    (last, duration),
+                    "{name}: the worker's log:\n{}",
+                    worker.log()
+                );
+            }
+            assert_eq!(worker.reply(), Reply::Ended { player: 1, run });
+            worker.close(1);
+        }
+    }
+}
+
+/// A landing and the frame kept after it each carry the stamp and
+/// duration they were decoded with, and the frame kept its own chroma
+/// location (design.md "Rendering and Skins", Video frames): in the
+/// mid-stream change at 24 fps, frame 2 lands before frame 3, the first of
+/// a new sequence (top-left), and frame 4 (41 666 µs) before frame 5
+/// (41 667 µs). A landing's own location is not checked: after a seek
+/// back into an earlier sequence the decoder may label its first frames
+/// with the location it saw last, whichever mode the seek has.
+// Covers: T02
+#[test]
+fn a_landing_keeps_each_frame_s_own_duration_and_chroma() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("changes.avi");
+    let units = h264_sited((32, 32), (32, 32), &CHANGES, &sited_sample);
+    std::fs::write(&path, avi((32, 32), 24, b"H264", &units)).unwrap();
+    let schedule = changes_schedule();
+    let stamp = |i: i64| (i * 1_000_000 + 12) / 24;
+    let mut worker = Worker::start(&[]);
+    assert!(matches!(
+        worker.open(1, &path),
+        Reply::Probed { player: 1, .. }
+    ));
+    let mut ring = Ring::new(32, 32);
+    assert!(matches!(
+        worker.play(1, &ring),
+        Reply::Playing { player: 1, .. }
+    ));
+    take_one(&worker, &mut ring, 0);
+    for (landing, target) in [(2, 100_000), (4, 180_000)] {
+        let run = ring.start_run(0);
+        assert_eq!(
+            land_at(&mut worker, 1, run, target).map(|(l, _)| l),
+            Some(stamp(landing)),
+            "the worker's log:
+{}",
+            worker.log()
+        );
+        for i in [landing, landing + 1] {
+            let taken = take_one(&worker, &mut ring, stamp(i));
+            assert_eq!(
+                (taken.stamp, taken.duration),
+                (stamp(i), stamp(i + 1) - stamp(i)),
+                "frame {i}"
+            );
+            if i == 3 {
+                assert_eq!(
+                    taken.chroma,
+                    schedule[usize::try_from(i).unwrap()],
+                    "frame {i}"
+                );
+            }
+            assert_eq!(taken.bytes, sited_frame(u64::try_from(i).unwrap(), 32, 32));
+        }
+    }
+    worker.close(1);
 }

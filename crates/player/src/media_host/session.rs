@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
-use skin_model::media::control::{Command, Matrix, Range, Reply};
+use skin_model::media::control::{Command, Matrix, Range, Reply, SeekTo};
 use skin_model::media::{self, Geometry, Reader, State, Window};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -190,6 +190,13 @@ impl Movie {
     /// none: that run's end, once reported, needs no frame of it.
     pub fn empty(&self) -> u64 {
         self.runs.empty()
+    }
+
+    /// The newest run whose landing is the clip's last frame with no end
+    /// proven, 0 for none: that run's end, once reported, leaves its last
+    /// frame shown.
+    pub fn open_end(&self) -> u64 {
+        self.runs.open()
     }
 
     /// Run `run` ended, `empty` when its seek found no frame, as the
@@ -1612,8 +1619,15 @@ impl Supervisor {
             p.sought = run;
             // An answer with no frame: the run is empty, and its end, which
             // follows, needs no frame of it.
-            if let Reply::Sought { landed: None, .. } = reply {
-                p.movie.runs.found_empty(run);
+            match reply {
+                Reply::Sought { landed: None, .. } => p.movie.runs.found_empty(run),
+                // A landing on a last frame whose end nothing proves.
+                Reply::Sought {
+                    landed: Some(_),
+                    open_end: true,
+                    ..
+                } => p.movie.runs.found_open(run),
+                _ => {}
             }
         }
         p.stage = stage;
@@ -1894,7 +1908,9 @@ impl Supervisor {
 
     /// Sends each live player of the screen shown whose video wants a run
     /// newer than its newest sought, and has no seek in flight, a seek for
-    /// that run from the clip's start ([`super::movie::seek_for`]).
+    /// that run ([`super::movie::seek_for`]): a landing at its time when
+    /// the run is the video's landing ([`Runs::land`]), else from the
+    /// clip's start.
     fn seek_wanted(&mut self, generation: u64) -> Result<(), Loss> {
         for i in 0..self.players.len() {
             let Some(p) = self.players.get(i) else { break };
@@ -1905,10 +1921,15 @@ impl Supervisor {
             if p.movie.generation() != generation || p.movie.status() != Status::Live {
                 continue;
             }
+            let (at, to) = match p.movie.runs.landing(run) {
+                Some(at) => (at, SeekTo::Landing),
+                None => (p.movie.seek_at(), SeekTo::From),
+            };
             let seek = Command::Seek {
                 player: p.id,
                 run,
-                at: p.movie.seek_at(),
+                at,
+                to,
             };
             let id = self.send(&seek)?;
             if let Some(p) = self.players.get_mut(i) {
@@ -2314,7 +2335,12 @@ mod tests {
 
     /// The seek of `run` for player `player` the session sends.
     fn seek(player: u8, run: u64) -> Command {
-        Command::Seek { player, run, at: 0 }
+        Command::Seek {
+            player,
+            run,
+            at: 0,
+            to: SeekTo::From,
+        }
     }
 
     /// The worker's answer to seek `id` of player 1 for `run`, landing at
@@ -2326,6 +2352,7 @@ mod tests {
             run,
             landed,
             attempts: u8::from(landed.is_some()),
+            open_end: false,
         }
     }
 
@@ -2371,6 +2398,32 @@ mod tests {
         s.take(Instant::now(), &sought(1, 4, Some(40_000))).unwrap();
         s.seek_wanted(1).unwrap();
         assert_eq!(s.sent, [seek(1, 4)], "run 4 is sought already");
+        assert_eq!(movie.loss(), None);
+    }
+
+    /// A round's landing is sought as a landing at its time; a run wanted
+    /// after it, from the clip's start.
+    // Covers: T02
+    #[test]
+    fn a_landing_is_sought_by_its_mode() {
+        let mut s = supervisor(1);
+        let movie = Movie::new(1);
+        s.players = vec![live(&movie, 1)];
+        movie.runs.land(2, 6_040_000);
+        movie.want(2);
+        s.seek_wanted(1).unwrap();
+        let landing = Command::Seek {
+            player: 1,
+            run: 2,
+            at: 6_040_000,
+            to: SeekTo::Landing,
+        };
+        assert_eq!(s.sent, std::slice::from_ref(&landing));
+        s.take(Instant::now(), &sought(1, 2, Some(6_000_000)))
+            .unwrap();
+        movie.want(3);
+        s.seek_wanted(1).unwrap();
+        assert_eq!(s.sent, [landing, seek(1, 3)], "a restart from the start");
         assert_eq!(movie.loss(), None);
     }
 
@@ -2480,6 +2533,33 @@ mod tests {
         // A seek that lands records nothing empty.
         let (_, landed) = sought_to(5);
         assert_eq!(landed.empty(), 0);
+    }
+
+    /// A landing whose end the worker says is open (a last frame whose
+    /// length was found from nothing) records its run open, and a landing
+    /// that says nothing records none (design.md "Rendering and Skins",
+    /// Video frames).
+    // Covers: T02
+    #[test]
+    fn an_open_ended_landing_records_its_run() {
+        for (open_end, want) in [(true, 4), (false, 0)] {
+            let mut s = supervisor(1);
+            let movie = Movie::new(1);
+            s.players = vec![live(&movie, 1)];
+            movie.want(4);
+            s.seek_wanted(1).unwrap();
+            let answer = Reply::Sought {
+                id: 1,
+                player: 1,
+                run: 4,
+                landed: Some(10_000_000),
+                attempts: 4,
+                open_end,
+            };
+            s.take(Instant::now(), &answer).unwrap();
+            assert_eq!(s.players[0].stage, Stage::Live);
+            assert_eq!((movie.open_end(), movie.empty()), (want, 0), "{answer:?}");
+        }
     }
 
     /// A chart video lost for its own reason loses the screen's other
