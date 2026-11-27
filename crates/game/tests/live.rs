@@ -6602,14 +6602,15 @@ fn a_loss_under_a_retrys_outro_staging_builds_the_screen_again() {
     // second is the outro's.
     rig.poll_fails_on = 2;
     press(&mut rig, &[(at, game::MenuCommand::Retry)]);
-    let prepares = rig.prepares;
     let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(ran.is_ok(), "{ran:?}");
     let begun = step_from(&rig, 0, "outro attempt").expect("begun reuse-only");
     let discard = step_from(&rig, begun, "discard").expect("discarded");
     let step = step_from(&rig, begun, "outro step").expect("the step");
     assert!(discard < step, "{:?}", rig.steps);
-    assert!(rig.prepares > prepares, "the screen built again");
+    // Built again at once, before the outro's end.
+    let rebuilt = step_from(&rig, discard, "screen").expect("built again");
+    assert!(rebuilt < step, "{:?}", rig.steps);
     assert!(
         step_from(&rig, step, "attempt").is_some(),
         "{:?}",
