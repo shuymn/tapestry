@@ -581,12 +581,14 @@ fn a_step_past_the_bound_is_refused_with_its_reason() {
     let dir = timed(100, 0, 100);
     flow(&dir, |rig, f| {
         f.prepared();
-        let _d = choose(rig, &f.pick(false), 3);
-        let lifetime = rig.render.loading_lifetime();
+        // Paused before the choice arms its deadline, so no reveal can come
+        // first however the test thread is scheduled.
         rig.render
             .shared
             .reveal_paused
             .store(true, Ordering::SeqCst);
+        let _d = choose(rig, &f.pick(false), 3);
+        let lifetime = rig.render.loading_lifetime();
         let bound = i64::try_from(rig.render.answer_timeout.as_micros()).unwrap();
         let latest = rig.render.shared.reveal_latest.load(Ordering::SeqCst);
         rig.render
