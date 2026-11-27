@@ -595,6 +595,12 @@ struct Headless {
     step_refused: bool,
     /// The decision screen's epochs closed.
     closed_epochs: usize,
+    /// When the armed reveal was withdrawn ([`AppRig::refuse_reveal`]).
+    reveal_refused_at: Vec<i64>,
+    /// How many deadline steps answer pending before one steps, and when
+    /// each did ([`StepOutcome::Pending`]).
+    pending_steps: usize,
+    pending_at: Vec<i64>,
     /// Each decision look's origin and clock.
     decision_looks: Vec<(game::Origin, i64)>,
     /// Told at the first look of the wait for a late read.
@@ -625,6 +631,8 @@ struct Headless {
     /// Every load with its plays' reports.
     loads: Vec<(usize, Vec<PlayReport>)>,
     refusals: Vec<String>,
+    /// The reasons of the preparation refusals shown.
+    refusal_reasons: Vec<String>,
     /// Openings refused before the play was handed over, by chart.
     refused_opens: Vec<usize>,
     starts: usize,
@@ -814,6 +822,7 @@ impl Headless {
             violations: Vec::new(),
             loads: Vec::new(),
             refusals: Vec::new(),
+            refusal_reasons: Vec::new(),
             refused_opens: Vec::new(),
             starts: 0,
             chooses: 0,
@@ -861,6 +870,9 @@ impl Headless {
             refuse_at_step: false,
             step_refused: false,
             closed_epochs: 0,
+            reveal_refused_at: Vec::new(),
+            pending_steps: 0,
+            pending_at: Vec::new(),
             decision_looks: Vec::new(),
             waiting_seen: None,
             escape_when_waiting: false,
@@ -1484,7 +1496,8 @@ impl AppRig for Headless {
                             decision.commit_step();
                             game::Verdict::Step
                         }
-                        StepOutcome::Refused(_) => decision.refuse_step(),
+                        StepOutcome::Refused(why) => decision.refuse_step(why),
+                        StepOutcome::Pending => game::Verdict::Continue,
                     },
                     other => other,
                 };
@@ -1589,7 +1602,10 @@ impl AppRig for Headless {
             Refused::Play(e) => panic!("{e:?}"),
             Refused::Practice(game::PracticeError::Autoplay) => "autoplay",
             Refused::Practice(e) => panic!("{e:?}"),
-            Refused::Preparation(_) => "preparation",
+            Refused::Preparation(r) => {
+                self.refusal_reasons.push(r.reason.clone());
+                "preparation"
+            }
         };
         self.refusals.push(kind.to_owned());
         // The player fixes the preset file once its refusal is shown.
@@ -1805,6 +1821,11 @@ impl AppRig for Headless {
     }
 
     fn deadline_step(&mut self) -> StepOutcome {
+        if self.pending_steps > 0 {
+            self.pending_steps -= 1;
+            self.pending_at.push(self.at());
+            return StepOutcome::Pending;
+        }
         if self.refuse_at_step {
             self.step_refused = true;
             return StepOutcome::Refused(game::PreparationRefusal {
@@ -1827,7 +1848,7 @@ impl AppRig for Headless {
 
     fn early_refusal(&self) -> Option<game::PreparationRefusal> {
         let published = self.early_refused_from.is_some_and(|t| self.at() >= t);
-        (published || self.step_refused).then(|| game::PreparationRefusal {
+        published.then(|| game::PreparationRefusal {
             location: None,
             reason: "refused early".to_owned(),
         })
@@ -1835,6 +1856,10 @@ impl AppRig for Headless {
 
     fn closed_epoch(&mut self) {
         self.closed_epochs += 1;
+    }
+
+    fn refuse_reveal(&mut self) {
+        self.reveal_refused_at.push(self.at());
     }
 
     fn decision_escape(&mut self, deadline: TimeUs) -> bool {
@@ -6716,7 +6741,74 @@ fn an_early_refusal_before_the_deadline_returns_with_its_reason() {
         assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
         assert!(rig.loading_pages.is_empty(), "{served:?}: loading shown");
         assert!(rig.opened_at.is_empty(), "{served:?}: opened");
+        // App's look that reads the refusal withdraws the render thread's
+        // armed reveal, before the deadline it would reveal at. A load's own
+        // wait reads it through the early gate, which withdraws it on the
+        // worker as the refusal is published (the player's gate tests).
+        if served.is_none() {
+            assert!(
+                rig.reveal_refused_at
+                    .first()
+                    .is_some_and(|&at| at < choice + 1_500 * MS),
+                "withdrawn at {:?}, the deadline from {choice}",
+                rig.reveal_refused_at
+            );
+        }
     }
+}
+
+/// The decision's end: App's look that reads a close, or a thread's
+/// failure, before the deadline withdraws the render thread's armed reveal
+/// there, before the waits of the run's end, so no loading state is drawn
+/// past the deadline while they run.
+#[test]
+fn a_terminal_look_withdraws_the_armed_reveal() {
+    for fails in [false, true] {
+        let close = if fails { 6_000 } else { 700 };
+        let acts = vec![(0, Act::Choose(0)), (close, Act::Close)];
+        let (rig, _events, _ran) = run(Refusal::Missing, acts, |rig| {
+            decided_read_in_time(rig);
+            if fails {
+                rig.input_fails_at = CLOCK_START + 700 * MS;
+            }
+        });
+        let choice = chosen_at(&rig, 0);
+        assert!(rig.deadline_steps.is_empty(), "{fails}: stepped");
+        assert!(rig.loading_pages.is_empty(), "{fails}: loading shown");
+        assert!(
+            rig.reveal_refused_at
+                .first()
+                .is_some_and(|&at| at < choice + 1_500 * MS),
+            "{fails}: withdrawn at {:?}, the deadline from {choice}",
+            rig.reveal_refused_at
+        );
+    }
+}
+
+/// The reveal word: a deadline step answering pending (the render thread
+/// reveals by itself and has not yet) steps nothing and shows nothing: the
+/// screen goes on, its next look a short wait later, which steps it.
+#[test]
+fn a_pending_step_steps_at_a_later_look() {
+    let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided_read_in_time(rig);
+        rig.pending_steps = 1;
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 0);
+    let [pending] = rig.pending_at[..] else {
+        panic!("{:?}", rig.pending_at);
+    };
+    assert!(pending >= choice + 1_500 * MS, "pending at {pending}");
+    let [stepped] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    assert!(
+        stepped > pending && stepped <= pending + 2 * MS,
+        "stepped at {stepped}, pending at {pending}"
+    );
 }
 
 /// B9b: the deadline's step itself answers refused: nothing revealed, the
@@ -6738,6 +6830,8 @@ fn a_refusal_at_the_step_is_not_revealed() {
             rig.violations
         );
         assert_eq!(rig.refusals, ["preparation"], "{served:?}");
+        // The step's own reason, with no early refusal to read.
+        assert_eq!(rig.refusal_reasons, ["refused at the step"], "{served:?}");
         assert!(rig.deadline_steps.is_empty(), "{served:?}: stepped");
         assert!(rig.loading_pages.is_empty(), "{served:?}: loading shown");
         assert!(rig.opened_at.is_empty(), "{served:?}: opened");

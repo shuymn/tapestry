@@ -990,7 +990,23 @@ pub fn spawn_job_completing<T: Send + 'static>(
     on_outcome: impl FnOnce(&Result<T, &'static str>) + Send + 'static,
     on_sent: impl FnOnce() + Send + 'static,
 ) -> Result<Job<T>, String> {
-    let cancel = Cancel::new();
+    spawn_job_cancelled_by(Cancel::new(), job, on_outcome, on_sent)
+}
+
+/// [`spawn_job_completing`] with `cancel`, made and shared by the caller
+/// before the thread exists (the decision screen's early gate registers it
+/// with the reveal word first, so a reveal from then on cancels the job
+/// before its first check).
+///
+/// # Errors
+///
+/// Why the thread could not start; `on_outcome` is then not called.
+pub fn spawn_job_cancelled_by<T: Send + 'static>(
+    cancel: Cancel,
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+    on_outcome: impl FnOnce(&Result<T, &'static str>) + Send + 'static,
+    on_sent: impl FnOnce() + Send + 'static,
+) -> Result<Job<T>, String> {
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
     let theirs = cancel.clone();
     let body = move || {

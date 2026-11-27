@@ -16,10 +16,10 @@ fn refusal(why: &str) -> PreparationRefusal {
 }
 
 /// A job's start that spawns nothing: its cancel, and whether it ran.
-fn started(ran: &AtomicUsize) -> impl FnOnce() -> Result<Cancel, String> + '_ {
-    move || {
+fn started(ran: &AtomicUsize) -> impl FnOnce(&Cancel) -> Result<(), String> + '_ {
+    move |_| {
         ran.fetch_add(1, Ordering::SeqCst);
-        Ok(Cancel::new())
+        Ok(())
     }
 }
 
@@ -43,9 +43,14 @@ fn a_reveal_on_the_idle_gate_begins_nothing_after_it() {
 #[test]
 fn a_completion_after_the_commit_is_dropped() {
     let gate = EarlyGate::<u32>::new(None);
-    let cancel = Cancel::new();
-    let theirs = cancel.clone();
-    assert_eq!(gate.start(|| Ok(theirs)), Start::Running);
+    let mut cancel = Cancel::new();
+    assert_eq!(
+        gate.start(|c| {
+            cancel = c.clone();
+            Ok(())
+        }),
+        Start::Running
+    );
     assert_eq!(gate.commit_reveal(), Committed::Revealed);
     assert!(cancel.is_cancelled(), "cancelled at the reveal");
     assert_eq!(gate.state_name(), "cancelled at the reveal");
@@ -103,7 +108,7 @@ fn a_staging_refusal_before_the_reveal_refuses() {
 #[test]
 fn an_ended_specialization_is_taken_after_the_reveal() {
     let gate = EarlyGate::<u32>::new(None);
-    assert_eq!(gate.start(|| Ok(Cancel::new())), Start::Running);
+    assert_eq!(gate.start(|_| Ok(())), Start::Running);
     gate.complete(EarlyOutcome::Specialized(3));
     assert_eq!(gate.commit_reveal(), Committed::Revealed);
     assert_eq!(gate.state_name(), "revealed specialized");
@@ -115,9 +120,261 @@ fn an_ended_specialization_is_taken_after_the_reveal() {
 #[test]
 fn a_start_that_cannot_spawn_is_a_refusal() {
     let gate = EarlyGate::<u32>::new(None);
-    assert_eq!(gate.start(|| Err("no thread".to_owned())), Start::Ended);
+    assert_eq!(gate.start(|_| Err("no thread".to_owned())), Start::Ended);
     let r = gate.refused().expect("refused");
     assert!(r.reason.ends_with("no thread"), "{}", r.reason);
+}
+
+/// A reveal word on one thread's terms: armed until [`reveal`](Self::reveal)
+/// or a refusal; a refusal after the reveal loses. `reveal_at_refuse`
+/// reveals just before the next refusal (a reveal between a gate's read of
+/// the word and its refusal). The render side's word is the same, on an
+/// atomic.
+#[derive(Default)]
+struct Word {
+    revealed: std::sync::atomic::AtomicBool,
+    refused: std::sync::atomic::AtomicBool,
+    reveal_at_refuse: std::sync::atomic::AtomicBool,
+    refusals: AtomicUsize,
+    /// The lifetime's cancel, made with the word.
+    cancel: Cancel,
+}
+
+impl Word {
+    /// The render thread's reveal: won unless refused, the import's
+    /// cancel cancelled.
+    fn reveal(&self) -> bool {
+        if self.refused.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.revealed.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+        true
+    }
+}
+
+impl RevealWord for Word {
+    fn refuse(&self) -> bool {
+        self.refusals.fetch_add(1, Ordering::SeqCst);
+        if self.reveal_at_refuse.swap(false, Ordering::SeqCst) {
+            self.reveal();
+        }
+        if self.revealed.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.refused.store(true, Ordering::SeqCst);
+        true
+    }
+
+    fn revealed(&self) -> bool {
+        self.revealed.load(Ordering::SeqCst)
+    }
+
+    fn cancel(&self) -> Cancel {
+        self.cancel.clone()
+    }
+}
+
+/// A gate following a fresh word.
+fn ordered() -> (Arc<EarlyGate<u32>>, Arc<Word>) {
+    let gate = EarlyGate::<u32>::new(None);
+    let word = Arc::new(Word::default());
+    gate.set_order(Arc::clone(&word) as RevealOrder);
+    (gate, word)
+}
+
+/// The decision's end: a gate ending refused withdraws the armed reveal
+/// (a job's refusal, a start that cannot spawn), so the render thread
+/// reveals nothing past it; a specialization and a completion after the
+/// commit withdraw nothing.
+#[test]
+fn a_refusal_withdraws_the_armed_reveal() {
+    let (gate, word) = ordered();
+    assert_eq!(gate.start(|_| Ok(())), Start::Running);
+    assert!(gate.complete(EarlyOutcome::Refused(refusal("refused"))));
+    assert_eq!(word.refusals.load(Ordering::SeqCst), 1, "a job's refusal");
+    assert!(!word.reveal(), "the render thread reveals nothing");
+    assert_eq!(gate.commit_reveal(), Committed::Refused(refusal("refused")));
+    let (gate, word) = ordered();
+    assert_eq!(gate.start(|_| Err("no thread".to_owned())), Start::Ended);
+    assert_eq!(
+        word.refusals.load(Ordering::SeqCst),
+        1,
+        "a start that cannot spawn"
+    );
+    let (gate, word) = ordered();
+    assert_eq!(gate.start(|_| Ok(())), Start::Running);
+    gate.complete(EarlyOutcome::Specialized(3));
+    assert_eq!(word.refusals.load(Ordering::SeqCst), 0, "a specialization");
+    let (gate, word) = ordered();
+    assert_eq!(gate.start(|_| Ok(())), Start::Running);
+    assert_eq!(gate.commit_reveal(), Committed::Revealed);
+    gate.complete(EarlyOutcome::Refused(refusal("late")));
+    assert_eq!(
+        word.refusals.load(Ordering::SeqCst),
+        0,
+        "a completion after the commit"
+    );
+}
+
+/// The render thread's reveal freezes the gate (design.md "Screen
+/// Transitions and Loading", reveal and adoption): an import running at it
+/// is cancelled there, and its completion afterwards, before the game
+/// thread's commit, is dropped, not adopted; the commit then answers the
+/// reveal and Preparing imports afresh.
+#[test]
+fn an_import_ending_after_the_render_threads_reveal_is_dropped() {
+    let (gate, word) = ordered();
+    let mut cancel = Cancel::new();
+    assert_eq!(
+        gate.start(|c| {
+            cancel = c.clone();
+            Ok(())
+        }),
+        Start::Running
+    );
+    assert!(word.reveal());
+    assert!(
+        cancel.is_cancelled(),
+        "cancelled at the reveal, not at the commit"
+    );
+    assert!(!gate.complete(EarlyOutcome::Specialized(7)), "dropped");
+    assert_eq!(gate.state_name(), "cancelled at the reveal");
+    assert_eq!(gate.commit_reveal(), Committed::Revealed);
+    assert_eq!(gate.take_specialized(), None);
+    let mut sent = false;
+    gate.step(|_| {
+        sent = true;
+        Some(1)
+    });
+    assert!(!sent, "no early request after the reveal");
+}
+
+/// The render thread's reveal: what ended before it stays adoptable, the
+/// game thread's commit consuming that state, not deciding again.
+#[test]
+fn an_import_ended_before_the_render_threads_reveal_is_adopted() {
+    let (gate, word) = ordered();
+    assert_eq!(gate.start(|_| Ok(())), Start::Running);
+    assert!(gate.complete(EarlyOutcome::Specialized(3)));
+    assert!(word.reveal());
+    assert_eq!(gate.state_name(), "revealed specialized");
+    assert_eq!(gate.commit_reveal(), Committed::Revealed);
+    assert_eq!(gate.take_specialized(), Some(3));
+}
+
+/// The render thread's reveal: a refusal published after it is dropped,
+/// whether the reveal came before the gate read the word or between that
+/// read and the refusal's withdrawal; the commit never refuses a reveal
+/// already on screen (the loading state's route takes Preparing's own).
+#[test]
+fn a_refusal_after_the_render_threads_reveal_is_dropped() {
+    let (gate, word) = ordered();
+    assert_eq!(gate.start(|_| Ok(())), Start::Running);
+    assert!(word.reveal());
+    assert!(!gate.complete(EarlyOutcome::Refused(refusal("late"))));
+    assert_eq!(gate.refused(), None);
+    assert_eq!(gate.commit_reveal(), Committed::Revealed);
+
+    let (gate, word) = ordered();
+    let mut cancel = Cancel::new();
+    assert_eq!(
+        gate.start(|c| {
+            cancel = c.clone();
+            Ok(())
+        }),
+        Start::Running
+    );
+    word.reveal_at_refuse.store(true, Ordering::SeqCst);
+    assert!(!gate.complete(EarlyOutcome::Refused(refusal("lost"))));
+    assert!(cancel.is_cancelled());
+    assert_eq!(gate.state_name(), "cancelled at the reveal");
+    assert_eq!(gate.commit_reveal(), Committed::Revealed);
+}
+
+/// The render thread's reveal: no early start begins after it.
+#[test]
+fn nothing_begins_after_the_render_threads_reveal() {
+    let (gate, word) = ordered();
+    assert!(word.reveal());
+    let ran = AtomicUsize::new(0);
+    assert_eq!(gate.start(started(&ran)), Start::Late);
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "no job spawned");
+    assert_eq!(gate.state_name(), "revealed");
+}
+
+/// The render thread's reveal: a job spawned as it comes, between the
+/// gate's read of the word and the job's state, is cancelled by it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_job_spawned_as_the_render_thread_reveals_is_cancelled() {
+    let (gate, word) = ordered();
+    let mut cancel = Cancel::new();
+    let revealing = Arc::clone(&word);
+    gate.after_spawn(move || {
+        revealing.reveal();
+    });
+    assert_eq!(
+        gate.start(|c| {
+            cancel = c.clone();
+            Ok(())
+        }),
+        Start::Running
+    );
+    assert!(cancel.is_cancelled());
+    assert_eq!(gate.state_name(), "cancelled at the reveal");
+    assert!(!gate.complete(EarlyOutcome::Specialized(1)));
+}
+
+/// The decision's end: the job's cancel is given to the word before its
+/// thread is spawned, so a reveal while the spawning thread is still
+/// inside the start (its thread made, its state not yet set) cancels the
+/// job before the worker's first check.
+#[test]
+fn a_reveal_while_the_spawner_is_blocked_cancels_the_job() {
+    let (gate, word) = ordered();
+    let revealing = Arc::clone(&word);
+    assert_eq!(
+        gate.start(|c| {
+            let worker = c.clone();
+            // The worker, spawned; its spawner blocked here.
+            let first_check = std::thread::spawn(move || {
+                revealing.reveal();
+                worker.is_cancelled()
+            });
+            assert!(first_check.join().unwrap(), "the worker ran on");
+            Ok(())
+        }),
+        Start::Running
+    );
+    assert_eq!(gate.state_name(), "cancelled at the reveal");
+}
+
+/// The reveal word: a reveal after the gate read the word idle and before
+/// it spawns the job leaves nothing to register: the job is given the
+/// lifetime's cancel, which the reveal cancelled, so it starts cancelled,
+/// and the gate is cancelled at the reveal.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_reveal_before_the_spawn_starts_the_job_cancelled() {
+    let (gate, word) = ordered();
+    let revealing = Arc::clone(&word);
+    gate.before_spawn(move || {
+        assert!(revealing.reveal());
+    });
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        gate.start(|c| {
+            cancelled.store(c.is_cancelled(), Ordering::SeqCst);
+            Ok(())
+        }),
+        Start::Running
+    );
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the job began uncancelled"
+    );
+    assert_eq!(gate.state_name(), "cancelled at the reveal");
 }
 
 /// A headroom double: the values each read answers, in order, and the

@@ -18,6 +18,8 @@
 
 use bms_model::{Deadline, TimeUs};
 
+use crate::PreparationRefusal;
+
 /// The built-in presentation's time from the choice (design.md "Play
 /// Lifecycle", the decision screen).
 pub const DECISION_TIME: TimeUs = TimeUs(1_500_000);
@@ -173,6 +175,9 @@ pub struct Decision {
     /// How the screen was left inside a wait the rig owns, for the caller
     /// to route once the wait returns.
     left: Option<Verdict>,
+    /// Why the deadline's step was refused, for the caller to return with
+    /// ([`refuse_step`](Self::refuse_step)).
+    refusal: Option<PreparationRefusal>,
 }
 
 impl Decision {
@@ -188,6 +193,7 @@ impl Decision {
             latched: false,
             waiting: false,
             left: None,
+            refusal: None,
         }
     }
 
@@ -229,6 +235,16 @@ impl Decision {
     #[must_use]
     pub const fn origin(&self) -> TimeUs {
         self.origin
+    }
+
+    /// The deadline a takeover would give the screen
+    /// ([`apply_takeover`](Self::apply_takeover)): the choice plus
+    /// [`DECISION_TIME`], whatever is shown now. The render thread, where a
+    /// takeover begins, moves an armed reveal there itself (design.md
+    /// "Screen Transitions and Loading", the decision's end).
+    #[must_use]
+    pub const fn takeover_deadline(&self) -> TimeUs {
+        Deadline::after(self.origin, DECISION_TIME).at()
     }
 
     /// The presentation shown, when on.
@@ -352,14 +368,23 @@ impl Decision {
     }
 
     /// The step [`classify`](Self::classify) returned is refused at its
-    /// commit (the play's preparation refused before the reveal): a
-    /// refusal latched, the decision left unstepped and its lifetime over;
+    /// commit (the play's preparation refused, or the loading state
+    /// refused, before the reveal) for `why`: a refusal latched, the
+    /// decision left unstepped and its lifetime over, `why` kept for the
+    /// return ([`take_refusal`](Self::take_refusal));
     /// [`Verdict::Return`], the verdict the look gives instead.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub const fn refuse_step(&mut self) -> Verdict {
+    pub fn refuse_step(&mut self, why: PreparationRefusal) -> Verdict {
         self.latched = true;
         self.lifetime = None;
+        self.refusal = Some(why);
         Verdict::Return
+    }
+
+    /// Why the deadline's step was refused, taken once.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn take_refusal(&mut self) -> Option<PreparationRefusal> {
+        self.refusal.take()
     }
 
     /// [`classify`](Self::classify)'s verdict, before the lifetime ends.
@@ -648,8 +673,12 @@ mod tests {
         let mut d = begun();
         assert!(!d.apply_takeover(takeover(4, 8_000), at(8_000)));
         assert_eq!(d.deadline(), Some(at(10_000)));
+        // The deadline the render thread's armed reveal moves to at its own
+        // takeover is the one the game's takeover gives.
+        let armed = d.takeover_deadline();
         assert!(d.apply_takeover(takeover(3, 8_000), at(8_000)));
         assert_eq!(d.deadline(), Some(at(8_500)));
+        assert_eq!(d.deadline(), Some(armed));
         assert_eq!(d.shown(), Some(DecisionShown::BuiltIn));
         assert_eq!(d.origin(), at(7_000));
         let mut d = begun();
@@ -699,7 +728,13 @@ mod tests {
             d.classify(Origin::Load, at(1_500), false, false, None),
             Verdict::Step
         );
-        assert_eq!(d.refuse_step(), Verdict::Return);
+        let why = PreparationRefusal {
+            location: None,
+            reason: "refused at the step".to_owned(),
+        };
+        assert_eq!(d.refuse_step(why.clone()), Verdict::Return);
+        assert_eq!(d.take_refusal(), Some(why));
+        assert_eq!(d.take_refusal(), None);
         assert!(!d.stepped(), "left unstepped");
         assert!(d.latched());
         assert_eq!(d.lifetime(), None);

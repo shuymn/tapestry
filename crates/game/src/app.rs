@@ -51,6 +51,11 @@ use crate::settings::{DataRoot, PlayerSettings};
 /// clock: the flow looks again at least this often.
 pub const IDLE_WAIT: TimeUs = TimeUs(250_000);
 
+/// The decision screen's wait past its deadline while the step is
+/// pending ([`StepOutcome::Pending`]), on the rig's clock: the render
+/// thread's reveal wakes the game thread before it ends.
+const PENDING_WAIT: TimeUs = TimeUs(1_000);
+
 /// How often a game thread waiting for a load's job asks whether to stop
 /// it.
 pub const LOAD_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
@@ -190,11 +195,19 @@ pub trait AppRig: LoadingRig {
     /// and [`StepOutcome::Stepped`]; or, when the play's preparation begun
     /// at the read ([`chart_read`](Self::chart_read)) was refused before
     /// the reveal, nothing shown and [`StepOutcome::Refused`], which App
-    /// routes as that refusal with the decision unstepped. Waits for no
+    /// routes as that refusal with the decision unstepped; or, when the
+    /// rig's render thread reveals the loading state by itself and has not
+    /// yet, nothing shown and [`StepOutcome::Pending`]. Waits for no
     /// acknowledgement. By default stepped, showing nothing.
     fn deadline_step(&mut self) -> StepOutcome {
         StepOutcome::Stepped
     }
+    /// The play's deadline will not reveal its loading state: a refusal or
+    /// a fatal reply is in hand (held to the deadline, or returning now).
+    /// A rig whose render thread reveals at the deadline by itself withdraws
+    /// that reveal, unless it already ran (design.md "Screen Transitions
+    /// and Loading", the decision's end). Nothing by default.
+    fn refuse_reveal(&mut self) {}
     /// The chart chosen to play with a decision screen was read
     /// (`loaded`), before its load ([`load_chart`](Self::load_chart)): the
     /// rig may begin the play's preparation that needs only the chart's
@@ -342,6 +355,11 @@ pub enum StepOutcome {
     /// The play's preparation was refused before the reveal: nothing was
     /// revealed, and the flow returns with this refusal.
     Refused(PreparationRefusal),
+    /// The render thread reveals the loading state at its own deadline
+    /// and has not yet (design.md "Screen Transitions and Loading", the
+    /// reveal word): nothing was revealed or stepped, and the screen goes
+    /// on to its next look, which the reveal wakes.
+    Pending,
 }
 
 /// Why a chosen chart was refused.
@@ -860,9 +878,13 @@ impl App {
                     Some(lost) => Err(LiveError::Screen(lost)),
                     None => Ok(Chosen::Refused(Refused::Bank(e))),
                 },
-                Ok(Loading::Cancelled) => match (d.take_left(), rig.early_refusal()) {
-                    // A return the early preparation's refusal caused
-                    // (never a close: that leaves as [`Verdict::End`]).
+                Ok(Loading::Cancelled) => match (
+                    d.take_left(),
+                    d.take_refusal().or_else(|| rig.early_refusal()),
+                ) {
+                    // A return the step's refusal or the early
+                    // preparation's caused (never a close: that leaves as
+                    // [`Verdict::End`]).
                     (Some(Verdict::Return), Some(r)) => {
                         Ok(Chosen::Refused(Refused::Preparation(r)))
                     }
@@ -1101,6 +1123,12 @@ fn look<R: AppRig>(
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
     let reply = reply.or_else(|| rig.early_refusal().map(|_| Reply::Refusal));
+    // A reply in hand, a close or a thread's failure keeps the deadline
+    // from revealing the loading state: the render thread's own reveal is
+    // withdrawn as soon as it is known, before any wait that ends the run.
+    if (reply.is_some() || terminal) && !d.practice() {
+        rig.refuse_reveal();
+    }
     let mut seen = d.classify(origin, rig.now(), terminal, escape, reply);
     if seen == Verdict::Step {
         if d.practice() {
@@ -1108,7 +1136,8 @@ fn look<R: AppRig>(
         } else {
             match rig.deadline_step() {
                 StepOutcome::Stepped => d.commit_step(),
-                StepOutcome::Refused(_) => seen = d.refuse_step(),
+                StepOutcome::Refused(why) => seen = d.refuse_step(why),
+                StepOutcome::Pending => seen = Verdict::Continue,
             }
         }
     }
@@ -1220,7 +1249,12 @@ fn hold<R: AppRig>(
             return Ok(next);
         }
         let now = rig.now();
-        let until = d.deadline().map_or(now.0, |at| at.0).max(now.0 + 1);
+        // Past the deadline the step is pending on the render thread's
+        // reveal, which wakes this wait.
+        let until = d
+            .deadline()
+            .filter(|at| at.0 > now.0)
+            .map_or(now.0.saturating_add(PENDING_WAIT.0), |at| at.0);
         rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(until)));
     }
 }
@@ -1241,15 +1275,17 @@ fn hold_refusal<R: AppRig>(
 enum AtDeadline {
     /// The step ran: the play opens.
     Stepped,
-    /// The early preparation's refusal returned: back to selection with it.
+    /// The step's refusal or the early preparation's returned: back to
+    /// selection with it.
     Refused(PreparationRefusal),
     /// The run ends, or the window closes.
     Ended,
 }
 
-/// A loaded play held to its deadline's step. A return there is the early
-/// preparation's refusal when one is published ([`AppRig::early_refusal`]);
-/// any other leave ends the hold as the run's end or a close.
+/// A loaded play held to its deadline's step. A return there is the
+/// step's refusal ([`Decision::take_refusal`]), else the early
+/// preparation's when one is published ([`AppRig::early_refusal`]); any
+/// other leave ends the hold as the run's end or a close.
 fn ready_at_deadline<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
@@ -1259,8 +1295,9 @@ fn ready_at_deadline<R: AppRig>(
     }
     Ok(match hold(d, rig, Origin::Ready)? {
         Next::Stepped | Next::Go | Next::Page => AtDeadline::Stepped,
-        Next::Return => rig
-            .early_refusal()
+        Next::Return => d
+            .take_refusal()
+            .or_else(|| rig.early_refusal())
             .map_or(AtDeadline::Ended, AtDeadline::Refused),
         Next::End | Next::Back => AtDeadline::Ended,
     })
