@@ -356,7 +356,10 @@ impl Controls {
                 // Classified before it is joined: a press after the result's
                 // takeover supersedes a pending one received by it, the fade
                 // phase's, so the fresh one keeps its own receipt; two on
-                // one side keep the first. The receipted take holds this
+                // one side keep the first. Between a skip's receipt and the
+                // phase taking it the takeover is still the deadline, so a
+                // repeated press there joins the skip (design.md "State
+                // Model", ResultPreparing). The receipted take holds this
                 // lock too, so it never reads a receipt mid-change.
                 let mark = self.takeover.load(Ordering::Acquire);
                 let pending = self.receipt(bit);
@@ -480,6 +483,9 @@ impl Controls {
             let (bit, c, at) = order
                 .iter()
                 .find_map(|&(bit, c)| received(w, bit).map(|at| (bit, c, at)))?;
+            // A quit drops a retry on its side of the published takeover:
+            // one queued with a skip the fade phase takes goes with it
+            // (design.md "State Model", ResultPreparing).
             let clear = match received(w, drops) {
                 Some(dropped) if bit == LEAVE && phase(dropped) == phase(at) => LEAVE | drops,
                 _ => bit,

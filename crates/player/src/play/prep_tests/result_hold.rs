@@ -3223,3 +3223,38 @@ fn a_press_after_the_save_is_the_results_before_the_fade_looks() {
         rig.result_input.release();
     });
 }
+
+/// A quit and a retry pending together when the fade phase looks, the save
+/// over before both, through the game's fade step: the quit is the phase's
+/// skip, which moves the takeover to its receipt, and the retry queued
+/// with it goes with it, so no retry is served and the result's next take
+/// is none; a retry there may need pressing again on the result (design.md
+/// "State Model", ResultPreparing).
+#[test]
+fn a_retry_pending_with_a_skip_goes_with_it() {
+    use game::Command;
+    let _serial = imports::serial();
+    let (_dir, a) = chart(Some(RED));
+    on_warp(a.chart(), |rig, _| {
+        rig.controls.quit_leaves();
+        let start = rig.now();
+        let deadline = TimeUs(start.0 + 500_000);
+        rig.fade_phase(start, deadline);
+        let saved = rig.save_returned(Some(deadline));
+        rig.controls.command(Command::Quit);
+        std::thread::sleep(Duration::from_millis(2));
+        rig.controls.command(Command::Retry);
+        // The look, as the fade step takes it: the quit skips, its
+        // receipt the deadline and the takeover.
+        let (c, at) = rig
+            .take_received(TimeUs(deadline.0.max(saved.0)))
+            .expect("the skip");
+        assert_eq!(c, Command::Quit);
+        rig.fade_skipped(at);
+        let takeover = TimeUs(at.0.max(saved.0));
+        assert_eq!(rig.take_received(takeover), None, "no retry");
+        rig.fade_ended(game::FadeEnd::Skipped, takeover);
+        assert_eq!(rig.take_menu(), None, "the retry went with the skip");
+        rig.result_input.release();
+    });
+}

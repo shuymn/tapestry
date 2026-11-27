@@ -352,6 +352,9 @@ struct Tail {
     /// How far past its deadline a fade phase's wait wakes, in µs (a
     /// descheduled game thread); zero: the next millisecond.
     wake_late: i64,
+    /// A fade phase's waits hold the game thread to this play time (a
+    /// game thread descheduled while commands queue); zero: no hold.
+    look_after: i64,
     /// How long the turntable's pause after a save holds the game thread,
     /// in µs (a descheduled game thread before the flow goes on).
     pause_after_save: i64,
@@ -473,6 +476,7 @@ impl Tail {
             fade_ended_at: Vec::new(),
             takeovers: Vec::new(),
             wake_late: 0,
+            look_after: 0,
             pause_after_save: 0,
             totals: Vec::new(),
             feeder: None,
@@ -600,11 +604,15 @@ impl Rig for Tail {
     }
 
     /// The next millisecond, or, in a fade phase that wakes late, at once
-    /// `wake_late` past `deadline`.
+    /// `wake_late` past `deadline`; in a fade phase, never before
+    /// `look_after`.
     fn idle_wait(&mut self, deadline: TimeUs) {
         self.wait();
         while self.in_fade && self.wake_late > 0 && self.clock.now().0 < deadline.0 + self.wake_late
         {
+            self.wait();
+        }
+        while self.in_fade && self.play_time().is_some_and(|t| t < self.look_after) {
             self.wait();
         }
     }
@@ -1346,6 +1354,29 @@ fn a_quit_during_the_fade_out_shows_the_result_at_once() {
     assert_eq!(rig.cancels, 1);
     // C26-2: nor is the fade-out.
     assert_eq!((rig.readies, rig.closings), (1, 0));
+}
+
+/// A quit and a retry received in the fade phase after the save, both
+/// pending when the game looks: the quit skips to the result, its receipt
+/// the takeover, and the phase takes no retry (design.md "State Model",
+/// ResultPreparing). The result shows, and the play is saved and counted
+/// once.
+#[test]
+fn a_retry_pending_with_a_skip_retries_nothing() {
+    let quit = T + 8_200 * MS;
+    let retry = quit + 10 * MS;
+    let commands = [(quit, Command::Quit), (retry, Command::Retry)];
+    let mut rig = Tail::with_bgm(all_hits(), &commands, i64::MAX, 500);
+    rig.ending = declared(3_000, 500);
+    rig.look_after = retry + 10 * MS;
+    let (rig, report) = played_on(rig, |_| {});
+    assert_eq!(rig.fading(), Some(TimeUs(T + 8_000 * MS)));
+    assert_eq!(rig.fade_end(), Some(FadeEnd::Skipped));
+    assert_eq!(rig.skipped, vec![quit]);
+    assert_eq!(rig.takeovers, vec![quit]);
+    assert!(rig.shown_at().is_some_and(|at| at >= retry));
+    assert_eq!((rig.plays, rig.reports.len()), (1, 1));
+    assert!(!report.tail_skipped);
 }
 
 /// The chart played with every note hit, the skin declaring `ending`, with
