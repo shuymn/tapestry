@@ -5369,6 +5369,83 @@ fn warmed_scenario(
     )
 }
 
+/// A practice round's chart video lands at the round's lead-in start
+/// (design.md "Rendering and Skins", BGA), through the practice page's
+/// preparation and READY, the media worker and the renderer: a 20 s coded
+/// clip (2 fps) started on the base at 2 s, in a round from 8 s with a
+/// 2 s lead-in (its boundary at 6 s), shows nothing during READY, and
+/// from the boundary on each capture shows the frame due at its chart time
+/// counted from the start at 2 s (frame 8, 4 s of media, at the boundary),
+/// never one counted from the boundary or from the clip's start.
+#[test]
+fn round_seeks_video_to_lead_in_media_time() {
+    let fx = Fixture::new();
+    let _keep = KeepOnFailure::of(&fx, "round_seeks_video_to_lead_in_media_time");
+    let dir = fx.library().join("t");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    gen_clip(&dir.join("clip.avi"), "mjpeg avi 320x240 2 40 1");
+    let text = "#PLAYER 1\n#TITLE landing\n#BPM 120\n#WAV01 key.wav\n#BMP01 clip.avi\n\
+                #00138:01\n#00104:01\n#00411:01\n#00511:01\n";
+    fs::write(dir.join("t.bms"), text).unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    install_video_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("t.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    // READY opens 200 ms before the boundary: 100 ms into it is 100 ms
+    // before the boundary.
+    let ats = [6_000, 6_300, 7_000, 7_700];
+    let mut steps = vec![
+        "select = { path = \"library/t/t.bms\" }".to_owned(),
+        "play = { input = \"auto\", until = \"end\" }".to_owned(),
+        "result = \"back\"".to_owned(),
+        "capture = { ready_at = 100, file = \"r.png\" }".to_owned(),
+    ];
+    steps.extend(
+        ats.iter()
+            .map(|at| format!("capture = {{ at = {at}, file = \"c{at}.png\" }}")),
+    );
+    steps.push(
+        "practice = { path = \"library/t/t.bms\", from = 5, to = 5, speed = 100, \
+         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/t.tprl\", rounds = 1 }"
+            .to_owned(),
+    );
+    steps.push("quit = {}".to_owned());
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    let text = scenario(&steps).replacen(
+        "output = \"out\"\n",
+        "output = \"out\"\nsize = [320, 180]\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run_drained(&mut fx.command(&text), RUN_LIMIT);
+    fs::write(fx.base.join("run.out.txt"), format!("{stdout}\n{stderr}")).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out_dir = fx.base.join("out");
+    let b = 6_000_000;
+    let t = chart_us(&out_dir, "r");
+    assert!(t < b, "the READY capture at {t}");
+    assert!(
+        all_black(&rgb(&out_dir.join("r.png"))),
+        "nothing before the boundary"
+    );
+    for at in ats {
+        let name = format!("c{at}");
+        let t = chart_us(&out_dir, &name);
+        assert!(t >= b, "{name} at {t}");
+        let due = due_frame(t - 2_000_000, 2).unwrap();
+        let got = coded_index(&rgb(&out_dir.join(format!("{name}.png"))), 8);
+        assert!(
+            got.is_some_and(|g| is_due(g, due)),
+            "{name} at {t}: {got:?}, due {due}"
+        );
+    }
+}
+
 /// A chart's coded base video plays on chart time through the media worker
 /// (design.md "Rendering and Skins", BGA), on the chart's second play: each
 /// capture shows the frame due at its chart time, the green block of the

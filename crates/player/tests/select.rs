@@ -1391,8 +1391,8 @@ fn centre_rgb((w, h, rgba): &(usize, usize, Vec<u8>)) -> [u8; 3] {
 /// With every kind's skin configured as the same play skin, startup
 /// installs it for play before selection lists the library, and reports
 /// each other kind as refused, that skin being of another kind; the play
-/// screen then loads in it (blue over the whole canvas, no judgment line)
-/// and the chart plays to its result.
+/// screen then loads and plays in it (blue over the whole canvas, no
+/// judgment line) and the chart plays to its result.
 #[test]
 fn a_configured_play_skin_is_installed_at_startup() {
     let fx = fixture();
@@ -1431,7 +1431,10 @@ fn a_configured_play_skin_is_installed_at_startup() {
     );
     let loading = dumped_rgba(&frames.join("loading.png"));
     assert!(!has_red_run(&loading, loading.0 / 5), "a judgment line");
-    assert_eq!(centre_rgb(&loading), [0, 0, 255]);
+    first_loading_is_pending_or(&frames, [0, 0, 255], &stdout);
+    let play = dumped_rgba(&frames.join("play.png"));
+    assert!(!has_red_run(&play, play.0 / 5), "a judgment line in play");
+    assert_eq!(centre_rgb(&play), [0, 0, 255], "{stdout}");
 }
 
 /// A play skin that cannot be read admits no chart: the run reports it
@@ -1585,8 +1588,19 @@ fn no_skin_is_imported_after_startup() {
         ["dev: skin imports 1 lua passes 2"],
         "{stdout}"
     );
-    let loading = dumped_rgba(&frames.join("loading.png"));
-    assert_eq!(centre_rgb(&loading), [0, 0, 255]);
+    // The startup skin, never the edited image.
+    first_loading_is_pending_or(&frames, [0, 0, 255], &stdout);
+    let play = dumped_rgba(&frames.join("play.png"));
+    assert_eq!(centre_rgb(&play), [0, 0, 255], "{stdout}");
+}
+
+/// The first loading frame in `frames` has the skin's `rgb` at its centre,
+/// or black: when the skin's staging lands past the first frame's hold,
+/// that frame is the pending presentation, the load's lines over a cleared
+/// canvas (design.md "The pending presentation"). Any other colour fails.
+fn first_loading_is_pending_or(frames: &Path, rgb: [u8; 3], stdout: &str) {
+    let centre = centre_rgb(&dumped_rgba(&frames.join("loading.png")));
+    assert!(centre == rgb || centre == [0, 0, 0], "{centre:?} {stdout}");
 }
 
 /// A Lua play skin in `dir`, `play.luaskin`, whose configured pass reads

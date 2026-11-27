@@ -1048,6 +1048,7 @@ impl PlayerRig<'_> {
             loaded.path(),
             loaded.chart(),
             self.bga_session.shown(),
+            loaded.restore_at(),
         ));
         let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
         // No coordinator (no song selection): the preparation reads them.
@@ -2922,6 +2923,7 @@ impl Rig for PlayerRig<'_> {
             loaded.path(),
             loaded.chart(),
             self.bga_session.shown(),
+            loaded.restore_at(),
         ));
         if let Some(s) = &self.selection {
             self.bga.step(Some((&s.coord, s.spawner)), &|| false);

@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use skin_model::media::control::{self, Command, Reply};
+use skin_model::media::control::{self, Command, Reply, SeekTo};
 
 /// The most players the worker plays at once: four a screen, and those of a
 /// generation the game is closing.
@@ -113,6 +113,7 @@ pub enum ToPlayer {
         id: u32,
         run: u64,
         at: i64,
+        to: SeekTo,
     },
     Close {
         id: u32,
@@ -234,8 +235,19 @@ fn serve_on(out: &Out) -> ExitCode {
                     Err(code) => refuse_handle(out, id, player, code),
                 }
             }
-            Command::Seek { player, run, at } => {
-                to_player(&players, out, id, player, ToPlayer::Seek { id, run, at });
+            Command::Seek {
+                player,
+                run,
+                at,
+                to,
+            } => {
+                to_player(
+                    &players,
+                    out,
+                    id,
+                    player,
+                    ToPlayer::Seek { id, run, at, to },
+                );
             }
             Command::Close { player } => match players.remove(&player) {
                 Some((tx, thread)) => {
