@@ -697,6 +697,9 @@ pub enum HoldEnd {
     Image,
     /// The device was lost.
     DeviceLost,
+    /// The result was handed over with no fade phase: its pending
+    /// presentation draws from there (the result's hold only).
+    Handed,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -709,6 +712,7 @@ impl HoldEnd {
             Self::Bound => "bound",
             Self::Image => "image",
             Self::DeviceLost => "device-lost",
+            Self::Handed => "handed",
         }
     }
 }

@@ -861,9 +861,10 @@ impl Transitions {
 }
 
 /// The lines of a windowed run's raw record ([`Transitions::run_lines`]).
-/// The windowed record's format, on its first line: 2 names each play's
-/// attempt (`attempt <origin>`) and the play's and outro's marks by it.
-const RECORD_VERSION: u32 = 2;
+/// The windowed record's format, on its first line: 2 named each play's
+/// attempt (`attempt <origin>`) and the play's and outro's marks by it;
+/// 3 ends a result's hold at its hand-over (`handed`).
+const RECORD_VERSION: u32 = 3;
 
 fn run_record_lines(
     header: RunHeader,
@@ -1386,6 +1387,7 @@ mod tests {
             MarkKind::Hold(Some(HoldEnd::Skin)),
             MarkKind::Hold(Some(HoldEnd::Image)),
             MarkKind::Hold(Some(HoldEnd::DeviceLost)),
+            MarkKind::Hold(Some(HoldEnd::Handed)),
             MarkKind::Hold(None),
             MarkKind::Preparing,
         ] {
@@ -1407,9 +1409,10 @@ mod tests {
                 "dev: mark hold 10 to 20 us (ended by skin)",
                 "dev: mark hold 10 to 20 us (ended by image)",
                 "dev: mark hold 10 to 20 us (ended by device-lost)",
+                "dev: mark hold 10 to 20 us (ended by handed)",
                 "dev: mark hold 10 to 20 us",
                 "dev: mark preparing 10 to 20 us",
-                "dev: transitions: 8 records, lost 0, largest uncovered none",
+                "dev: transitions: 9 records, lost 0, largest uncovered none",
             ]
         );
     }
@@ -1468,7 +1471,7 @@ mod tests {
                 end(RunStatus::Ok)
             ),
             [
-                "run version 2 qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "run version 3 qpc-frequency 10000000 qpc-origin 40000 pid 77",
                 "present 50000 50120 0xabc0 1000 decision 3 skin 0",
                 "present - - - 5166 loading 9 pending 2",
                 "mark hold 4000 5000 skin",
@@ -1485,7 +1488,7 @@ mod tests {
         assert_eq!(
             run_record_lines(header, &[], &[], None, (2, 0), end(RunStatus::Failed)),
             [
-                "run version 2 qpc-frequency 10000000 qpc-origin 40000 pid 77",
+                "run version 3 qpc-frequency 10000000 qpc-origin 40000 pid 77",
                 "close none",
                 "lost render 2 game 0",
                 "end 70000 failed",
@@ -1529,7 +1532,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{text}");
         assert_eq!(
             lines[0],
-            "run version 2 qpc-frequency 10000000 qpc-origin 0 pid 1"
+            "run version 3 qpc-frequency 10000000 qpc-origin 0 pid 1"
         );
         assert!(
             lines[1].starts_with("end ") && lines[1].ends_with(" failed"),

@@ -2612,6 +2612,10 @@ struct Shared {
     /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     step_records: Mutex<Vec<StepRecord>>,
+    /// Each boundary's uploader slice with its pass, while `[0]` of
+    /// [`RenderLink::record_slices`] is set (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    slices: (AtomicBool, Mutex<Vec<(u64, Duration)>>),
     /// The messages the render thread took, each counted before its
     /// handler runs (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -2864,6 +2868,8 @@ impl Shared {
             refuse_step: AtomicBool::new(false),
             #[cfg(all(test, feature = "dev-tools"))]
             step_records: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "dev-tools"))]
+            slices: (AtomicBool::new(false), Mutex::new(Vec::new())),
             #[cfg(all(test, feature = "dev-tools"))]
             messages: AtomicU64::new(0),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -4788,16 +4794,6 @@ impl RenderLink {
         self.shared.step_delay_us.store(us, Ordering::SeqCst);
     }
 
-    /// While `on`, the uploader's slice clock does not move from the next
-    /// boundary on, so only the steps' sizes, the frame's gate and the
-    /// hold's bound close a boundary's steps and their writes (tests).
-    #[cfg(all(test, feature = "dev-tools"))]
-    pub fn freeze_write_slice(&self, on: bool) {
-        self.set_slice_clock(
-            on.then(|| Arc::new(bms_model::VirtualClock::new(TimeUs(0))) as Arc<dyn TimeSource>),
-        );
-    }
-
     /// Reads the uploader's slice on `clock` from the next boundary on
     /// (`None`: the renderer's own clock) (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -4818,13 +4814,6 @@ impl RenderLink {
         let [delay, clock] = &self.shared.creation_hook;
         clock.store(then, Ordering::SeqCst);
         delay.store(us, Ordering::SeqCst);
-    }
-
-    /// Moves the hold's clock `us` µs as each write of a held pass's step
-    /// after its first begins; 0 moves nothing (tests).
-    #[cfg(all(test, feature = "dev-tools"))]
-    pub fn set_write_clock_step(&self, us: i64) {
-        self.shared.write_clock_step.store(us, Ordering::SeqCst);
     }
 
     /// Has the device refuse the uploader's next staging step (tests).
@@ -4856,6 +4845,25 @@ impl RenderLink {
     pub fn step_records(&self) -> Vec<StepRecord> {
         self.shared
             .step_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records each boundary's uploader slice from now on (`true`), or
+    /// stops (`false`) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn record_slices(&self, on: bool) {
+        self.shared.slices.0.store(on, Ordering::SeqCst);
+    }
+
+    /// The boundaries' uploader slices recorded so far, each with its
+    /// pass (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn slices(&self) -> Vec<(u64, Duration)> {
+        self.shared
+            .slices
+            .1
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -6577,6 +6585,7 @@ pub fn spawn_until(
                 image: Image::default(),
                 first_frame: None,
                 result_hold: None,
+                interim: false,
                 page_font: None,
                 wait_page: None,
                 wait_laid: false,
@@ -8078,7 +8087,8 @@ fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
 /// on the clock, and whether the outgoing screen's phase lasts, which,
 /// once ended, never resumes. A fade phase's hold ends that phase at its
 /// deadline `until` instead of the bound, and keeps what the result handed
-/// over meanwhile for the deadline's frame.
+/// over meanwhile for the deadline's frame; one without a fade phase marks
+/// its hand-over there.
 #[derive(Clone, Copy, Debug)]
 struct ResultHold {
     number: u64,
@@ -8629,6 +8639,11 @@ struct Run {
     /// The result's hold, while it lasts (design.md "Rendering and
     /// Skins", the result's hold): `None` from READY through the tail.
     result_hold: Option<ResultHold>,
+    /// The interim page (design.md "beatoraja Lua Skins", the result's
+    /// hold): the result's pending presentation kept after the hold's
+    /// release or its lifetime's end, from the hand-over, no hold and no
+    /// result, until the next screen's message or the run's close.
+    interim: bool,
     /// The page font of a screen dropped, for the one built in its place.
     page_font: Option<crate::menu_screen::PageFont>,
     /// The result's pending presentation, composed once.
@@ -8984,6 +8999,11 @@ impl Run {
             if self.result_hold.is_some() {
                 self.check_result_hold(&mut mode);
             }
+            // The interim page draws on whatever a handler set (design.md
+            // "beatoraja Lua Skins", the result's hold): never an Idle wait.
+            if self.interim {
+                mode = Mode::ResultPending;
+            }
             // Every pass's end comes back here, whichever way it ended:
             // READY's cutoff asked with no entry filled is given here, and
             // a heavy operation a handler ran spends the allowance.
@@ -9079,6 +9099,7 @@ impl Run {
                 .as_ref()
                 .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
             {
+                self.enter_interim(&mode);
                 self.drop_result();
             }
             #[cfg(all(test, feature = "dev-tools"))]
@@ -9093,9 +9114,11 @@ impl Run {
                 self.result_unacked = false;
             }
             // Another screen's message ends a result hold still held, a
-            // screen built again excepted.
-            if self.result_hold.is_some() && Self::ends_result_hold(&msg) {
+            // screen built again excepted, and the interim page: its one
+            // way out besides the run's close.
+            if Self::ends_result_hold(&msg) {
                 self.result_hold = None;
+                self.interim = false;
             }
             self.allow_destruction(&mode);
             // A menu page is left: its frames are reported; and the
@@ -9316,7 +9339,10 @@ impl Run {
                         match self.fading() {
                             Some(h) => h.handed = Some(Handed::Result),
                             None if over => {}
-                            None => mode = Mode::Result,
+                            None => {
+                                self.hand_over();
+                                mode = Mode::Result;
+                            }
                         }
                     }
                 }
@@ -9737,9 +9763,11 @@ impl Run {
                         // A retry's revealed loading state draws on.
                     } else {
                         mode = Self::handed_mode(handed);
-                        // The built-in page with no lifetime ends the hold.
-                        if handed == Handed::End {
-                            self.result_hold = None;
+                        // The built-in page with no lifetime ends the hold;
+                        // the result's presentation is the hand-over.
+                        match handed {
+                            Handed::End => self.result_hold = None,
+                            Handed::Result => self.hand_over(),
                         }
                     }
                 }
@@ -9961,6 +9989,10 @@ impl Run {
             {
                 mode = next;
             }
+            // The interim page over whatever mode this turn's message set.
+            if self.interim {
+                mode = Mode::ResultPending;
+            }
             // An Idle pass ends here, before any frame's pacing (design.md
             // "Load Pipeline", the Idle loop): its wait is the message's.
             // It draws no frame, so the skin movies' admission runs, a
@@ -10131,67 +10163,6 @@ impl Run {
                     first.hold_ended(crate::measure::HoldEnd::Skin);
                 }
                 self.first_frame = Some(first);
-            }
-            // The result's held pass after the hand-over: nothing built or
-            // presented while the first view stages within the bound; its
-            // outgoing phase ends at the bound, a size notice, a target
-            // change or a lost device, never to resume.
-            if matches!(mode, Mode::Result)
-                && self.result_hold.is_some_and(|h| h.held)
-                && self
-                    .result
-                    .as_ref()
-                    .is_some_and(|s| self.first_view_waits(s))
-            {
-                let lost = self.screen.as_ref().is_some_and(|s| s.device_lost());
-                match self.result_held().filter(|_| !lost) {
-                    Some(from) => {
-                        let now = self.clock.now();
-                        #[cfg(test)]
-                        let now = hold_now(&self.shared, now, from);
-                        let wait = held_wait(now, from, first_frame_bound(&self.shared))
-                            .map_or(Duration::ZERO, |w| {
-                                Duration::from_micros(w.0.unsigned_abs())
-                            });
-                        #[cfg(test)]
-                        self.shared.held[0].fetch_add(1, Ordering::SeqCst);
-                        let paused = self.result_staging_paused();
-                        match self.screen.as_ref().map(|s| s.upload_state()) {
-                            // A step ready to write: the next pass at once.
-                            Some(render::UploadState::Ready) if !paused => {}
-                            Some(render::UploadState::InFlight) => self.wait_step(wait),
-                            _ => {
-                                #[cfg(test)]
-                                count_wait(&self.shared, WaitKind::HeldPace);
-                                std::thread::sleep(wait);
-                            }
-                        }
-                        #[cfg(test)]
-                        self.shared.held[1].fetch_add(1, Ordering::SeqCst);
-                        continue;
-                    }
-                    None => {
-                        #[cfg(feature = "dev-tools")]
-                        if let Some(h) = self.result_hold {
-                            let now = self.clock.now();
-                            #[cfg(test)]
-                            let now = hold_now(&self.shared, now, h.from);
-                            let why = if lost {
-                                crate::measure::HoldEnd::DeviceLost
-                            } else if held_wait(now, h.from, first_frame_bound(&self.shared))
-                                .is_none()
-                            {
-                                crate::measure::HoldEnd::Bound
-                            } else {
-                                crate::measure::HoldEnd::Image
-                            };
-                            self.result_held_ended(h, why);
-                        }
-                        if let Some(h) = &mut self.result_hold {
-                            h.held = false;
-                        }
-                    }
-                }
             }
             // The skin movies' admission, before the grant is waited for
             // and after the held pass, which presents nothing and so takes
@@ -10388,13 +10359,16 @@ impl Run {
                 }
                 continue;
             }
-            // The result was left during the wait: nothing of it is drawn.
+            // The result was left during the wait: nothing of it is drawn,
+            // the interim page from the next turn when its pending
+            // presentation showed.
             if matches!(mode, Mode::Result)
                 && self
                     .result
                     .as_ref()
                     .is_none_or(|r| !self.shared.result_slot().current(r.lifetime))
             {
+                self.enter_interim(&mode);
                 self.drop_result();
                 mode = Mode::Idle;
                 continue;
@@ -11071,40 +11045,6 @@ impl Run {
                         .as_ref()
                         .is_some_and(|s| s.presented.is_some())
                         .then_some(entry);
-                    // No view presented after the commit point while the
-                    // hold's outgoing phase lasts (a leaving command
-                    // pinned during the frame's pacing discarded the view
-                    // prepared there): the hold decides this frame at the
-                    // barrier, so nothing is presented and the outgoing
-                    // picture stays; past the bound the pending
-                    // presentation draws (design.md "Rendering and
-                    // Skins", the result's hold).
-                    if result_picture.is_none()
-                        && fadeout.is_some()
-                        && Self::hold_within(
-                            self.result_hold,
-                            self.clock,
-                            &self.shared,
-                            &self.image,
-                            self.extent.as_ref(),
-                        )
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    // The lifetime's first committed view ends the hold.
-                    if result_picture.is_some() {
-                        #[cfg(feature = "dev-tools")]
-                        if let Some(h) = self.result_hold.filter(|h| h.held) {
-                            self.frames.result_hold(crate::measure::HoldStamp {
-                                lifetime: h.number,
-                                from: h.from,
-                                to: self.clock.now(),
-                                ended_by: Some(crate::measure::HoldEnd::Skin),
-                            });
-                        }
-                        self.result_hold = None;
-                    }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     // A test holds the frame here, its view committed and
                     // its barrier written, before it is built.
@@ -11464,6 +11404,13 @@ impl Run {
             {
                 self.shared.result_entries.acknowledge(entry);
                 self.result_unacked = false;
+                // The lifetime's first result picture ends the hold, its
+                // outgoing phase ended at the hand-over or before: a first
+                // view committed whose frame was not presented leaves the
+                // pending presentation on screen, so the interim page can
+                // still follow a release (design.md "beatoraja Lua Skins",
+                // the result's hold).
+                self.result_hold = None;
                 // A newer payload waiting for this picture stages from the
                 // next pass (design.md "beatoraja Lua Skins", the result
                 // skin).
@@ -12070,41 +12017,43 @@ impl Run {
         )
     }
 
-    /// The result's held pass (design.md "Rendering and Skins", the
-    /// result's hold): from the hand-over, while the hold's outgoing phase
-    /// lasts, the side has no view presented or prepared, the bound has
-    /// not passed and the image on screen is valid, the pass presents
-    /// nothing; the preparation's start, then.
-    fn result_held(&self) -> Option<TimeUs> {
-        let side = self.result.as_ref()?;
-        if !self.first_view_waits(side) || self.screen.is_none() {
-            return None;
+    /// The hand-over with no fade phase (design.md "beatoraja Lua Skins",
+    /// the result's hold): the result taken ends the hold's outgoing
+    /// phase if its bound has not, never to resume, so the result's
+    /// pending presentation draws on every pass from here until its first
+    /// view commits, the view's staging stepping between those frames.
+    fn hand_over(&mut self) {
+        let Some(h) = self.result_hold.as_mut() else {
+            return;
+        };
+        h.handed = Some(Handed::Result);
+        if !h.held {
+            return;
         }
-        Self::hold_within(
-            self.result_hold,
-            self.clock,
-            &self.shared,
-            &self.image,
-            self.extent.as_ref(),
-        )
+        h.held = false;
+        #[cfg(feature = "dev-tools")]
+        {
+            let h = *h;
+            self.result_held_ended(h, crate::measure::HoldEnd::Handed);
+        }
     }
 
-    /// Whether the result's hold `hold` is in its outgoing phase now: held,
-    /// its bound not passed and the image on screen valid; the
-    /// preparation's start, then. Reads only the fields it is given, so a
-    /// frame that holds the screen can ask it.
-    fn hold_within(
-        hold: Option<ResultHold>,
-        clock: QpcClock,
-        shared: &Shared,
-        image: &Image,
-        extent: Option<&Arc<Extent>>,
-    ) -> Option<TimeUs> {
-        let h = hold.filter(|h| h.held)?;
-        let now = clock.now();
-        #[cfg(test)]
-        let now = hold_now(shared, now, h.from);
-        (Self::within(&h, now, shared) && image.valid(notices_of(extent))).then_some(h.from)
+    /// The interim page's one way in (design.md "beatoraja Lua Skins", the
+    /// result's hold): the result's hold released or its lifetime ended
+    /// while `mode` draws its pending presentation after a hand-over with
+    /// no fade phase: the hold still there, so no result picture was shown
+    /// (the first one ends it), whether the result side is still kept or a
+    /// check before dropped it. From then on every pass draws the pending
+    /// presentation, no hold and no result, until the next screen's
+    /// message or the run's close.
+    fn enter_interim(&mut self, mode: &Mode) {
+        if matches!(mode, Mode::ResultPending | Mode::Result)
+            && self
+                .result_hold
+                .is_some_and(|h| h.until.is_none() && h.handed.is_some())
+        {
+            self.interim = true;
+        }
     }
 
     /// Whether the result's hold `h` is still in its outgoing phase at
@@ -12146,19 +12095,6 @@ impl Run {
         }
     }
 
-    /// Whether `side`'s first view is still to come: none presented, and
-    /// none prepared that its commit point would commit (a leaving command
-    /// pinned before the first commit discards the view prepared, which is
-    /// then never presented). The outgoing picture or the pending
-    /// presentation stays meanwhile, never the built-in end page.
-    fn first_view_waits(&self, side: &ResultSide) -> bool {
-        side.presented.is_none()
-            && (side.prepared.is_none() || {
-                let b = self.shared.barrier();
-                b.lifetime == side.lifetime && b.fadeout.is_some()
-            })
-    }
-
     /// The hook after a frame's pacing, if one is set (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     fn after_pacing(&self) {
@@ -12189,8 +12125,8 @@ impl Run {
 
     /// The result's hold's own lifetime check, at the top of a loop turn
     /// while one lasts: a mark that no longer names it (released, or a
-    /// newer hold begun) drops it, and its pending presentation turns
-    /// Idle.
+    /// newer hold begun) drops it; its pending presentation after the
+    /// hand-over becomes the interim page, any other turns Idle.
     fn check_result_hold(&mut self, mode: &mut Mode) {
         let Some(h) = self.result_hold else {
             return;
@@ -12198,6 +12134,7 @@ impl Run {
         if self.shared.result_slot().holds(h.number) {
             return;
         }
+        self.enter_interim(mode);
         self.result_hold = None;
         if matches!(mode, Mode::ResultPending) {
             *mode = Mode::Idle;
@@ -12567,9 +12504,6 @@ impl Run {
     /// the image held is valid and the bound has not passed. Changes
     /// nothing.
     fn held(&self, mode: &Mode) -> Option<TimeUs> {
-        if matches!(mode, Mode::Result) {
-            return self.result_held();
-        }
         let (
             Mode::Menu {
                 loading: Some(lifetime),
@@ -14229,6 +14163,16 @@ impl Run {
         let mut pages_end = None;
         let frame = self.frame_due_by(mode, held);
         let slice = self.boundary_slice(mode, held);
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.shared.slices.0.load(Ordering::SeqCst) {
+            let pass = self.shared.passes.load(Ordering::SeqCst);
+            self.shared
+                .slices
+                .1
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((pass, slice));
+        }
         let chart = self
             .chart_hand
             .as_ref()
@@ -14329,7 +14273,7 @@ impl Run {
         let Some(s) = self.screen.as_ref() else {
             return;
         };
-        let (log, now) = s.steps_logged();
+        let (_, now) = s.steps_logged();
         let others = (render::probe::steps() - stepped).saturating_sub((now - logged) as u64);
         let mut records = self
             .shared
@@ -14337,10 +14281,9 @@ impl Run {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let pass = self.shared.passes.load(Ordering::SeqCst);
-        for n in logged..now {
+        for _ in logged..now {
             records.push(StepRecord {
                 atlas: true,
-                writes: log.get(n).copied(),
                 held,
                 pass,
                 at: Instant::now(),
@@ -14349,7 +14292,6 @@ impl Run {
         for _ in 0..others {
             records.push(StepRecord {
                 atlas: false,
-                writes: None,
                 held,
                 pass,
                 at: Instant::now(),
@@ -15514,13 +15456,12 @@ struct StagingView {
 }
 
 /// A step the uploader submitted (tests): whether it was a staging's
-/// atlas step and its writes, when the log kept them; whether its pass
-/// was held; its pass; when its boundary ended.
+/// atlas step; whether its pass was held; its pass; when its boundary
+/// ended.
 #[cfg(all(test, feature = "dev-tools"))]
 #[derive(Clone, Copy, Debug)]
 pub struct StepRecord {
     pub atlas: bool,
-    pub writes: Option<u64>,
     pub held: bool,
     pub pass: u64,
     pub at: Instant,
