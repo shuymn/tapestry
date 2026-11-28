@@ -4196,6 +4196,90 @@ fn paced(rig: &Rig) {
     rig.gate.pace.store(true, Ordering::Release);
 }
 
+/// A first view committed after a no-fade hand-over whose frame is tried
+/// again (not presented, so no result picture was shown), and the result
+/// left before another frame: the interim page draws from the next frame,
+/// the pending presentation on every frame through two refreshes and
+/// more, until the next screen's message (design.md "beatoraja Lua
+/// Skins", the result's hold: the interim page "until the result's first
+/// picture").
+// Revert: the hold ended at the first view's commit -> "the frames stopped
+// after the leaving".
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_first_view_never_presented_leaves_the_interim_page() {
+    use crate::measure::ResultPath;
+    use crate::render_side::RenderMsg;
+    let (_dir, skin) = fixed_skin();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let rig = Rig::with_sink(Box::new(Paths(Arc::clone(&paths))));
+    let since = |from: usize| paths.lock().unwrap().get(from..).unwrap_or(&[]).to_vec();
+    let lifetime = installed(&rig, &skin);
+    rig.link.send(RenderMsg::Menu(Box::default()));
+    rig.link.hold_result(bms_model::TimeSource::now(&rig.clock));
+    let entry = rig.link.enter_result_entry(None);
+    rig.faults
+        .outcomes
+        .lock()
+        .unwrap()
+        .push_back(render::FrameOutcome::Retry);
+    paced(&rig);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    // One frame at a time until the first view's, tried again.
+    let end = Instant::now() + Duration::from_secs(20);
+    while !rig.drawn().iter().any(|d| skin_frame(d).is_some()) {
+        assert!(Instant::now() < end, "the first view's frame never drawn");
+        rig.gate.step();
+    }
+    assert_ne!(
+        rig.link.result_acknowledged(),
+        entry,
+        "the first picture acknowledged at a frame tried again"
+    );
+    // Left before another frame: the hold released, the lifetime ended.
+    rig.link.end_result();
+    let from = paths.lock().unwrap().len();
+    rig.gate.release();
+    assert!(
+        wait_until(|| paths.lock().unwrap().len() >= from + 5),
+        "the frames stopped after the leaving: {:?}",
+        since(from)
+    );
+    let interim = since(from);
+    assert!(
+        interim.iter().all(|p| *p == Some(ResultPath::Pending)),
+        "a frame other than the pending presentation after the leaving: {interim:?}"
+    );
+    let sent = paths.lock().unwrap().len();
+    rig.link.send(RenderMsg::Menu(Box::new(
+        crate::render_side::tests::one_line("select"),
+    )));
+    assert!(
+        wait_until(|| since(sent)
+            .iter()
+            .rev()
+            .take(3)
+            .filter(|p| p.is_none())
+            .count()
+            == 3),
+        "the next screen's frames never drawn: {:?}",
+        since(sent)
+    );
+    let next = since(sent);
+    let first = next.iter().position(Option::is_none).unwrap();
+    assert!(
+        next[first..].iter().all(Option::is_none),
+        "a result frame after the next screen's message: {next:?}"
+    );
+    rig.link.exit();
+}
+
 /// V5's render half (design.md "State Model", system sounds, Result): a
 /// Result entry is acknowledged at its first result picture, a frame whose
 /// commit point holds a view of the entry, the skin's or a built-in one

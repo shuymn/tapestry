@@ -11045,11 +11045,6 @@ impl Run {
                         .as_ref()
                         .is_some_and(|s| s.presented.is_some())
                         .then_some(entry);
-                    // The lifetime's first committed view ends the hold,
-                    // its outgoing phase ended at the hand-over or before.
-                    if result_picture.is_some() {
-                        self.result_hold = None;
-                    }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     // A test holds the frame here, its view committed and
                     // its barrier written, before it is built.
@@ -11409,6 +11404,13 @@ impl Run {
             {
                 self.shared.result_entries.acknowledge(entry);
                 self.result_unacked = false;
+                // The lifetime's first result picture ends the hold, its
+                // outgoing phase ended at the hand-over or before: a first
+                // view committed whose frame was not presented leaves the
+                // pending presentation on screen, so the interim page can
+                // still follow a release (design.md "beatoraja Lua Skins",
+                // the result's hold).
+                self.result_hold = None;
                 // A newer payload waiting for this picture stages from the
                 // next pass (design.md "beatoraja Lua Skins", the result
                 // skin).
@@ -12039,8 +12041,8 @@ impl Run {
     /// The interim page's one way in (design.md "beatoraja Lua Skins", the
     /// result's hold): the result's hold released or its lifetime ended
     /// while `mode` draws its pending presentation after a hand-over with
-    /// no fade phase: the hold still there, so no view was committed (the
-    /// first one ends it), whether the result side is still kept or a
+    /// no fade phase: the hold still there, so no result picture was shown
+    /// (the first one ends it), whether the result side is still kept or a
     /// check before dropped it. From then on every pass draws the pending
     /// presentation, no hold and no result, until the next screen's
     /// message or the run's close.
