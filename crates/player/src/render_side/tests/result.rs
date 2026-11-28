@@ -2308,8 +2308,12 @@ fn a_disconnected_reply_latches_the_failure() {
 /// view prepared on the installed pages with its lines and its strip,
 /// replacing the text installed, merges an overlay, and builds the skin's
 /// frame with the strip; then a frame the skin refuses, the refusal
-/// carried out unformatted. The preparation and the submission stay
-/// outside the count; a vector made inside it is counted (the control).
+/// carried out unformatted; then the builds of pending frames after the
+/// hand-over, no view presented and the first one prepared, each answering
+/// the pending presentation (design.md "beatoraja Lua Skins", the result's
+/// hold), the wait page drawn after each outside the count. The
+/// preparation and the submission stay outside the count; a vector made
+/// inside it is counted (the control).
 /// Unoptimized builds count the standard library's own allocations: CI
 /// runs it in release.
 #[test]
@@ -2457,6 +2461,36 @@ fn result_frame_alloc() {
     );
     counts.push(crate::alloc_count::this_thread() - before);
     assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
+    // Pending frames after the hand-over: the next lifetime's first view
+    // prepared, none presented.
+    let mut waiting = ResultSide::new(2);
+    waiting.prepared = Some(PreparedView {
+        held: HeldView {
+            revision: 1,
+            payload: titled(9, Some(&skin), 9, &[], "W"),
+            overlay: Overlay::default(),
+            state: None,
+            page: None,
+            script: scripts.result_slot(None),
+        },
+        token: None,
+    });
+    let wait = crate::loading_text::skin_wait_page();
+    crate::render_side::Screen::menu(&mut screen, &wait, true).unwrap();
+    for frame in 0..5_i64 {
+        let before = crate::alloc_count::this_thread();
+        let drawn = Run::result_build(
+            &mut screen,
+            Some(&mut waiting),
+            TimeUs(3_000_000 + 16_000 * frame),
+            None,
+            true,
+            &skin_model::AppReadouts::LAUNCH,
+        );
+        counts.push(crate::alloc_count::this_thread() - before);
+        assert_eq!(drawn, ResultDrawn::Pending);
+        crate::render_side::Screen::menu(&mut screen, &wait, false).unwrap();
+    }
     // The control: the count sees an allocation in the same window.
     let before = crate::alloc_count::this_thread();
     let made = std::hint::black_box(vec![0_u8; 64]);
